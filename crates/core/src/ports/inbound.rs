@@ -1,3 +1,7 @@
+use crate::CoreError;
+use crate::domain::{Conversation, ConversationId, ConversationSummary};
+use crate::ports::llm::ChunkCallback;
+
 /// Inbound port for health/status queries.
 ///
 /// Any adapter that wants to expose assistant status (D-Bus, HTTP, etc.)
@@ -8,6 +12,35 @@ pub trait AssistantService: Send + Sync {
 
     /// Simple liveness check.
     fn ping(&self) -> &str;
+}
+
+/// Inbound port for conversation management.
+pub trait ConversationService: Send + Sync {
+    fn create_conversation(
+        &self,
+        title: String,
+    ) -> impl std::future::Future<Output = Result<Conversation, CoreError>> + Send;
+
+    fn list_conversations(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ConversationSummary>, CoreError>> + Send;
+
+    fn get_conversation(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<Conversation, CoreError>> + Send;
+
+    fn delete_conversation(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn send_prompt(
+        &self,
+        conversation_id: &ConversationId,
+        prompt: String,
+        on_chunk: ChunkCallback,
+    ) -> impl std::future::Future<Output = Result<String, CoreError>> + Send;
 }
 
 #[cfg(test)]
@@ -37,4 +70,8 @@ mod tests {
         let assistant = MockAssistant;
         assert_eq!(assistant.ping(), "pong");
     }
+
+    // ConversationService uses impl Future so not dyn-compatible,
+    // but we verify it's implementable via the service tests in service.rs.
+    fn _assert_conversation_service<T: ConversationService>() {}
 }

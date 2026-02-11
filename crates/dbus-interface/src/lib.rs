@@ -1,3 +1,5 @@
+pub mod conversation;
+
 use desktop_assistant_core::ports::inbound::AssistantService;
 
 /// D-Bus adapter that exposes an `AssistantService` over the session bus.

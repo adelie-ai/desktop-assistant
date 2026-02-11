@@ -6,10 +6,13 @@ edition = "2024"
 [dependencies]
 desktop-assistant-core.workspace = true
 desktop-assistant-dbus.workspace = true
+desktop-assistant-llm-openai.workspace = true
 tokio.workspace = true
+zbus.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

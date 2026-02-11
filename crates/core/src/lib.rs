@@ -1,4 +1,6 @@
+pub mod domain;
 pub mod ports;
+pub mod service;
 
 use thiserror::Error;
 
@@ -6,6 +8,15 @@ use thiserror::Error;
 pub enum CoreError {
     #[error("system service error: {0}")]
     SystemService(String),
+
+    #[error("conversation not found: {0}")]
+    ConversationNotFound(String),
+
+    #[error("LLM error: {0}")]
+    Llm(String),
+
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 #[cfg(test)]

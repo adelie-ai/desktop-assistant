@@ -9,6 +9,7 @@ zbus.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

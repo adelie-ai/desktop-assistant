@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/dbus-interface",
     "crates/daemon",
+    "crates/llm-openai",
 ]
 
 [workspace.dependencies]
@@ -17,3 +18,4 @@ serde = { version = "1", features = ["derive"] }
 
 desktop-assistant-core = { path = "crates/core" }
 desktop-assistant-dbus = { path = "crates/dbus-interface" }
+desktop-assistant-llm-openai = { path = "crates/llm-openai" }
