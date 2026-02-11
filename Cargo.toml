@@ -1,3 +1,19 @@
 [workspace]
 resolver = "3"
-members = []
+members = [
+    "crates/core",
+    "crates/dbus-interface",
+    "crates/daemon",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+
+desktop-assistant-core = { path = "crates/core" }
+desktop-assistant-dbus = { path = "crates/dbus-interface" }

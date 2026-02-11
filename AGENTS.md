@@ -99,8 +99,8 @@ desktop-assistant/
 │   └── daemon/                # Main binary — wires everything together
 │       ├── src/
 │       │   └── main.rs
+│       ├── tests/             # Integration tests
 │       └── Cargo.toml
-└── tests/                     # Integration tests
 ```
 
 ## Rust Conventions
