@@ -35,6 +35,8 @@ pub struct App {
     pub mode: InputMode,
     pub status_message: String,
     pub should_quit: bool,
+    /// Lines scrolled up from the bottom. 0 = auto-scroll to bottom.
+    pub scroll_offset: u16,
 }
 
 impl App {
@@ -49,6 +51,7 @@ impl App {
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
             should_quit: false,
+            scroll_offset: 0,
         }
     }
 
@@ -90,6 +93,20 @@ impl App {
         });
     }
 
+    // --- Scrolling ---
+
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
     // --- Input ---
 
     pub fn insert_char(&mut self, c: char) {
@@ -111,6 +128,7 @@ impl App {
             role: "user".to_string(),
             content: prompt.clone(),
         });
+        self.scroll_offset = 0;
         Some((conv.id.clone(), prompt))
     }
 
@@ -151,6 +169,7 @@ impl App {
             return;
         }
         self.streaming_buffer.push_str(chunk);
+        self.scroll_offset = 0;
     }
 
     pub fn complete_streaming(&mut self, request_id: &str, full_response: &str) {
@@ -573,5 +592,52 @@ mod tests {
         assert!(!app.should_quit);
         app.quit();
         assert!(app.should_quit);
+    }
+
+    // --- Scroll tests ---
+
+    #[test]
+    fn scroll_up_and_down() {
+        let mut app = App::new();
+        assert_eq!(app.scroll_offset, 0);
+        app.scroll_up(5);
+        assert_eq!(app.scroll_offset, 5);
+        app.scroll_up(3);
+        assert_eq!(app.scroll_offset, 8);
+        app.scroll_down(3);
+        assert_eq!(app.scroll_offset, 5);
+        app.scroll_down(100);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets() {
+        let mut app = App::new();
+        app.scroll_up(10);
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn receive_chunk_resets_scroll() {
+        let mut app = App::new();
+        app.start_streaming("req1".into());
+        app.scroll_up(10);
+        app.receive_chunk("req1", "data");
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn submit_prompt_resets_scroll() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "Test".into(),
+            messages: vec![],
+        });
+        app.scroll_up(10);
+        app.input = "hello".into();
+        app.submit_prompt();
+        assert_eq!(app.scroll_offset, 0);
     }
 }

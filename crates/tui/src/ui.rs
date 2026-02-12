@@ -88,24 +88,33 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         lines.push(Line::from("Press 'n' to create a new conversation."));
     }
 
-    // Auto-scroll to bottom: estimate total line count with wrapping
+    // Calculate total wrapped line height
     let inner_width = area.width.saturating_sub(2) as usize; // subtract borders
     let total_height: u16 = lines
         .iter()
         .map(|line| {
             let line_width: usize = line.width();
-            if inner_width == 0 {
+            if inner_width == 0 || line_width == 0 {
                 1
             } else {
-                ((line_width.max(1) + inner_width - 1) / inner_width) as u16
+                ((line_width + inner_width - 1) / inner_width) as u16
             }
         })
         .sum();
     let visible_height = area.height.saturating_sub(2); // subtract borders
-    let scroll = total_height.saturating_sub(visible_height);
+    let max_scroll = total_height.saturating_sub(visible_height);
+
+    // Apply manual scroll offset from bottom, or auto-scroll to bottom
+    let scroll = max_scroll.saturating_sub(app.scroll_offset);
+
+    let title = if app.scroll_offset > 0 {
+        "Chat (PageUp/PageDown to scroll, End to jump to bottom)"
+    } else {
+        "Chat"
+    };
 
     let messages = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Chat"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
 

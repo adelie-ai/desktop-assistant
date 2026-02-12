@@ -150,6 +150,9 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
                 }
             }
         }
+        Action::ScrollUp => app.scroll_up(5),
+        Action::ScrollDown => app.scroll_down(5),
+        Action::ScrollToBottom => app.scroll_to_bottom(),
         Action::InsertChar(c) => app.insert_char(c),
         Action::DeleteChar => app.delete_char(),
         Action::SubmitTitle => {

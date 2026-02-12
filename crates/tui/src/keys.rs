@@ -16,6 +16,9 @@ pub enum Action {
     InsertChar(char),
     DeleteChar,
     SubmitTitle,
+    ScrollUp,
+    ScrollDown,
+    ScrollToBottom,
 }
 
 pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
@@ -36,12 +39,18 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             KeyCode::Char('d') => Some(Action::DeleteConversation),
             KeyCode::Char('n') => Some(Action::NewConversation),
             KeyCode::Char('i') => Some(Action::EnterEditMode),
+            KeyCode::PageUp => Some(Action::ScrollUp),
+            KeyCode::PageDown => Some(Action::ScrollDown),
+            KeyCode::End => Some(Action::ScrollToBottom),
             _ => None,
         },
         InputMode::Editing => match key.code {
             KeyCode::Esc => Some(Action::ExitEditMode),
             KeyCode::Enter => Some(Action::SubmitPrompt),
             KeyCode::Backspace => Some(Action::DeleteChar),
+            KeyCode::PageUp => Some(Action::ScrollUp),
+            KeyCode::PageDown => Some(Action::ScrollDown),
+            KeyCode::End => Some(Action::ScrollToBottom),
             KeyCode::Char(c) => Some(Action::InsertChar(c)),
             _ => None,
         },
@@ -282,6 +291,56 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::F(1)), &InputMode::CreatingConversation),
             None
+        );
+    }
+
+    // --- Scroll tests ---
+
+    #[test]
+    fn normal_pageup_scrolls_up() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::PageUp), &InputMode::Normal),
+            Some(Action::ScrollUp)
+        );
+    }
+
+    #[test]
+    fn normal_pagedown_scrolls_down() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::PageDown), &InputMode::Normal),
+            Some(Action::ScrollDown)
+        );
+    }
+
+    #[test]
+    fn normal_end_scrolls_to_bottom() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::End), &InputMode::Normal),
+            Some(Action::ScrollToBottom)
+        );
+    }
+
+    #[test]
+    fn editing_pageup_scrolls_up() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::PageUp), &InputMode::Editing),
+            Some(Action::ScrollUp)
+        );
+    }
+
+    #[test]
+    fn editing_pagedown_scrolls_down() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::PageDown), &InputMode::Editing),
+            Some(Action::ScrollDown)
+        );
+    }
+
+    #[test]
+    fn editing_end_scrolls_to_bottom() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::End), &InputMode::Editing),
+            Some(Action::ScrollToBottom)
         );
     }
 }
