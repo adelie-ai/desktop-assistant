@@ -88,9 +88,26 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         lines.push(Line::from("Press 'n' to create a new conversation."));
     }
 
+    // Auto-scroll to bottom: estimate total line count with wrapping
+    let inner_width = area.width.saturating_sub(2) as usize; // subtract borders
+    let total_height: u16 = lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line.width();
+            if inner_width == 0 {
+                1
+            } else {
+                ((line_width.max(1) + inner_width - 1) / inner_width) as u16
+            }
+        })
+        .sum();
+    let visible_height = area.height.saturating_sub(2); // subtract borders
+    let scroll = total_height.saturating_sub(visible_height);
+
     let messages = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Chat"))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
 
     f.render_widget(messages, area);
 }
