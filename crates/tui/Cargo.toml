@@ -1,0 +1,18 @@
+[package]
+name = "desktop-assistant-tui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "desktop-assistant-tui"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+zbus.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"

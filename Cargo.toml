@@ -5,6 +5,7 @@ members = [
     "crates/dbus-interface",
     "crates/daemon",
     "crates/llm-openai",
+    "crates/tui",
 ]
 
 [workspace.dependencies]
