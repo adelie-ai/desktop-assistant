@@ -135,6 +135,8 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
         Action::EnterEditMode => {
             if app.current_conversation.is_some() {
                 app.enter_editing_mode();
+            } else {
+                app.status_message = "Open a conversation first (Enter) or create one (n)".into();
             }
         }
         Action::ExitEditMode => app.enter_normal_mode(),
@@ -154,10 +156,26 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
             if let Some(title) = app.submit_new_conversation_title() {
                 if let Some(client) = client.as_ref() {
                     match client.create_conversation(&title).await {
-                        Ok(_id) => match client.list_conversations().await {
-                            Ok(convs) => app.set_conversations(convs),
-                            Err(e) => app.status_message = format!("Error refreshing: {e}"),
-                        },
+                        Ok(id) => {
+                            // Refresh list and auto-open the new conversation
+                            match client.list_conversations().await {
+                                Ok(convs) => {
+                                    let new_idx = convs.iter().position(|c| c.id == id);
+                                    app.set_conversations(convs);
+                                    if let Some(idx) = new_idx {
+                                        app.selected_conversation = Some(idx);
+                                    }
+                                }
+                                Err(e) => app.status_message = format!("Error refreshing: {e}"),
+                            }
+                            match client.get_conversation(&id).await {
+                                Ok(detail) => {
+                                    app.load_conversation(detail);
+                                    app.enter_editing_mode();
+                                }
+                                Err(e) => app.status_message = format!("Error opening: {e}"),
+                            }
+                        }
                         Err(e) => app.status_message = format!("Create error: {e}"),
                     }
                 }

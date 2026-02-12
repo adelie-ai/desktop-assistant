@@ -85,7 +85,7 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ]));
         }
     } else {
-        lines.push(Line::from("Select or create a conversation to begin."));
+        lines.push(Line::from("Press 'n' to create a new conversation."));
     }
 
     let messages = Paragraph::new(lines)
