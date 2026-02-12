@@ -22,10 +22,22 @@ pub enum Action {
 }
 
 pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
-    // Ignore key events with modifier keys (except shift for typing)
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Ctrl+u / Ctrl+d for scrolling — works in all modes
+    if ctrl {
+        return match key.code {
+            KeyCode::Char('u') => Some(Action::ScrollUp),
+            KeyCode::Char('d') => Some(Action::ScrollDown),
+            KeyCode::Char('e') => Some(Action::ScrollToBottom),
+            _ => None,
+        };
+    }
+
+    // Ignore other modifier combos (Alt, Meta)
     if key
         .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META)
+        .intersects(KeyModifiers::ALT | KeyModifiers::META)
     {
         return None;
     }
@@ -294,7 +306,73 @@ mod tests {
         );
     }
 
-    // --- Scroll tests ---
+    // --- Scroll tests (Ctrl+u/d/e work in all modes) ---
+
+    #[test]
+    fn ctrl_u_scrolls_up() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::ScrollUp)
+        );
+    }
+
+    #[test]
+    fn ctrl_d_scrolls_down() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::ScrollDown)
+        );
+    }
+
+    #[test]
+    fn ctrl_e_scrolls_to_bottom() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::ScrollToBottom)
+        );
+    }
+
+    #[test]
+    fn ctrl_u_works_in_editing_mode() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &InputMode::Editing
+            ),
+            Some(Action::ScrollUp)
+        );
+    }
+
+    #[test]
+    fn ctrl_d_works_in_editing_mode() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &InputMode::Editing
+            ),
+            Some(Action::ScrollDown)
+        );
+    }
+
+    #[test]
+    fn ctrl_u_works_in_creating_mode() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &InputMode::CreatingConversation
+            ),
+            Some(Action::ScrollUp)
+        );
+    }
 
     #[test]
     fn normal_pageup_scrolls_up() {
@@ -309,38 +387,6 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::PageDown), &InputMode::Normal),
             Some(Action::ScrollDown)
-        );
-    }
-
-    #[test]
-    fn normal_end_scrolls_to_bottom() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::End), &InputMode::Normal),
-            Some(Action::ScrollToBottom)
-        );
-    }
-
-    #[test]
-    fn editing_pageup_scrolls_up() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::PageUp), &InputMode::Editing),
-            Some(Action::ScrollUp)
-        );
-    }
-
-    #[test]
-    fn editing_pagedown_scrolls_down() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::PageDown), &InputMode::Editing),
-            Some(Action::ScrollDown)
-        );
-    }
-
-    #[test]
-    fn editing_end_scrolls_to_bottom() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::End), &InputMode::Editing),
-            Some(Action::ScrollToBottom)
         );
     }
 }

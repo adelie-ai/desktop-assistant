@@ -68,21 +68,41 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 "assistant" => ("AI: ", Style::default().fg(Color::Green)),
                 _ => ("", Style::default()),
             };
-            lines.push(Line::from(vec![
-                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                Span::styled(&msg.content, style),
-            ]));
+            // Split content on newlines so ratatui renders them as separate lines
+            let mut first = true;
+            for text_line in msg.content.split('\n') {
+                if first {
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                        Span::styled(text_line.to_string(), style),
+                    ]));
+                    first = false;
+                } else {
+                    lines.push(Line::from(Span::styled(text_line.to_string(), style)));
+                }
+            }
             lines.push(Line::from("")); // spacing
         }
 
         // Show streaming buffer as in-progress assistant message
         if !app.streaming_buffer.is_empty() {
             let style = Style::default().fg(Color::Yellow);
-            lines.push(Line::from(vec![
-                Span::styled("AI: ", style.add_modifier(Modifier::BOLD)),
-                Span::styled(&app.streaming_buffer, style),
-                Span::styled("▌", style),
-            ]));
+            let mut first = true;
+            for text_line in app.streaming_buffer.split('\n') {
+                if first {
+                    lines.push(Line::from(vec![
+                        Span::styled("AI: ", style.add_modifier(Modifier::BOLD)),
+                        Span::styled(text_line.to_string(), style),
+                    ]));
+                    first = false;
+                } else {
+                    lines.push(Line::from(Span::styled(text_line.to_string(), style)));
+                }
+            }
+            // Cursor on last line
+            if let Some(last) = lines.last_mut() {
+                last.spans.push(Span::styled("▌", style));
+            }
         }
     } else {
         lines.push(Line::from("Press 'n' to create a new conversation."));
@@ -108,7 +128,7 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let scroll = max_scroll.saturating_sub(app.scroll_offset);
 
     let title = if app.scroll_offset > 0 {
-        "Chat (PageUp/PageDown to scroll, End to jump to bottom)"
+        "Chat (Ctrl+u/d scroll, Ctrl+e bottom)"
     } else {
         "Chat"
     };
