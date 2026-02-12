@@ -8,7 +8,7 @@ use crate::app::{ChatMessage, ConversationDetail, ConversationSummary};
 #[zbus::proxy(
     interface = "org.desktopAssistant.Conversations",
     default_service = "org.desktopAssistant",
-    default_path = "/org/desktopAssistant"
+    default_path = "/org/desktopAssistant/Conversations"
 )]
 trait Conversations {
     async fn create_conversation(&self, title: &str) -> zbus::fdo::Result<String>;
