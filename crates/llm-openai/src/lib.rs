@@ -71,6 +71,7 @@ impl From<&Message> for ChatMessage {
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::System => "system",
+            Role::Tool => "tool",
         };
         ChatMessage {
             role: role.to_string(),

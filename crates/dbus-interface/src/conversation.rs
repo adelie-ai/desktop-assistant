@@ -71,6 +71,7 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
                     desktop_assistant_core::domain::Role::User => "user",
                     desktop_assistant_core::domain::Role::Assistant => "assistant",
                     desktop_assistant_core::domain::Role::System => "system",
+                    desktop_assistant_core::domain::Role::Tool => "tool",
                 };
                 (role.to_string(), m.content.clone())
             })
