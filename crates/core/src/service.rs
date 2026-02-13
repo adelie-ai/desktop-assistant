@@ -1,7 +1,7 @@
 use crate::CoreError;
 use crate::domain::{Conversation, ConversationId, ConversationSummary, Message, Role};
 use crate::ports::inbound::ConversationService;
-use crate::ports::llm::{ChunkCallback, LlmClient};
+use crate::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
 use crate::ports::store::ConversationStore;
 
 /// Core service implementing conversation management.
@@ -54,13 +54,14 @@ impl<S: ConversationStore, L: LlmClient> ConversationService for ConversationHan
 
         let response = self
             .llm
-            .stream_completion(conv.messages.clone(), on_chunk)
+            .stream_completion(conv.messages.clone(), &[], on_chunk)
             .await?;
 
-        conv.messages.push(Message::new(Role::Assistant, &response));
+        conv.messages
+            .push(Message::new(Role::Assistant, &response.text));
         self.store.update(conv).await?;
 
-        Ok(response)
+        Ok(response.text)
     }
 }
 
@@ -139,16 +140,17 @@ mod tests {
         async fn stream_completion(
             &self,
             _messages: Vec<Message>,
+            _tools: &[crate::domain::ToolDefinition],
             mut on_chunk: ChunkCallback,
-        ) -> Result<String, CoreError> {
+        ) -> Result<LlmResponse, CoreError> {
             let mut full = String::new();
             for chunk in &self.response_chunks {
                 full.push_str(chunk);
                 if !on_chunk(chunk.clone()) {
-                    return Ok(full);
+                    return Ok(LlmResponse::text(full));
                 }
             }
-            Ok(full)
+            Ok(LlmResponse::text(full))
         }
     }
 

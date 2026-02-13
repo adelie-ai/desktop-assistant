@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::domain::{ConversationId, Message, Role};
 use desktop_assistant_core::ports::inbound::ConversationService;
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_core::service::ConversationHandler;
 use std::collections::HashMap;
@@ -92,16 +93,17 @@ impl LlmClient for TestLlm {
     async fn stream_completion(
         &self,
         _messages: Vec<Message>,
+        _tools: &[ToolDefinition],
         mut on_chunk: ChunkCallback,
-    ) -> Result<String, CoreError> {
+    ) -> Result<LlmResponse, CoreError> {
         let mut full = String::new();
         for chunk in &self.chunks {
             full.push_str(chunk);
             if !on_chunk(chunk.clone()) {
-                return Ok(full);
+                return Ok(LlmResponse::text(full));
             }
         }
-        Ok(full)
+        Ok(LlmResponse::text(full))
     }
 }
 
