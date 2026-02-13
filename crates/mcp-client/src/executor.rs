@@ -8,10 +8,11 @@ use tokio::sync::Mutex;
 use crate::{McpClient, McpError};
 
 /// Configuration for an MCP server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
+    #[serde(default)]
     pub args: Vec<String>,
 }
 

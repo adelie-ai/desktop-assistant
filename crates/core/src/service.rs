@@ -1,7 +1,7 @@
 use crate::CoreError;
-use crate::domain::{Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall};
+use crate::domain::{Conversation, ConversationId, ConversationSummary, Message, Role};
 use crate::ports::inbound::ConversationService;
-use crate::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use crate::ports::llm::{ChunkCallback, LlmClient};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 
@@ -150,7 +150,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ToolDefinition;
+    use crate::domain::{ToolCall, ToolDefinition};
+    use crate::ports::llm::LlmResponse;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 

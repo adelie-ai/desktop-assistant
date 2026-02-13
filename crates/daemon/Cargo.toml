@@ -7,6 +7,7 @@ edition = "2024"
 desktop-assistant-core.workspace = true
 desktop-assistant-dbus.workspace = true
 desktop-assistant-llm-openai.workspace = true
+desktop-assistant-mcp-client.workspace = true
 tokio.workspace = true
 zbus.workspace = true
 anyhow.workspace = true

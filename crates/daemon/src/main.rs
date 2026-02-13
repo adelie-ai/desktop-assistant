@@ -8,6 +8,8 @@ mod store;
 
 use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
+use desktop_assistant_mcp_client::config;
+use desktop_assistant_mcp_client::executor::McpToolExecutor;
 use store::InMemoryConversationStore;
 
 #[tokio::main]
@@ -31,10 +33,24 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Build the conversation service
-    let conversation_service = Arc::new(ConversationHandler::new(
+    // Load MCP server configuration
+    let config_path = config::default_config_path();
+    let mcp_configs = config::load_mcp_configs(&config_path).unwrap_or_else(|e| {
+        tracing::warn!("failed to load MCP config: {e}");
+        Vec::new()
+    });
+
+    // Build the MCP tool executor
+    let tool_executor = McpToolExecutor::new(mcp_configs);
+    if let Err(e) = tool_executor.start().await {
+        tracing::warn!("failed to start MCP servers: {e}");
+    }
+
+    // Build the conversation service with tool support
+    let conversation_service = Arc::new(ConversationHandler::with_tools(
         InMemoryConversationStore::new(),
         llm,
+        tool_executor,
         Box::new(|| uuid::Uuid::new_v4().to_string()),
     ));
 

@@ -1,3 +1,4 @@
+pub mod config;
 pub mod executor;
 mod jsonrpc;
 

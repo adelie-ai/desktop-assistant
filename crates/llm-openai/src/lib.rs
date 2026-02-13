@@ -165,6 +165,7 @@ struct ChatChunk {
 #[derive(Deserialize)]
 struct ChunkChoice {
     delta: Delta,
+    #[allow(dead_code)]
     finish_reason: Option<String>,
 }
 
