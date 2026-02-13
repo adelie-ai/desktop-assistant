@@ -200,14 +200,14 @@ impl App {
     pub fn set_conversations(&mut self, conversations: Vec<ConversationSummary>) {
         self.conversations = conversations;
         // Fix selection if out of bounds
-        if let Some(sel) = self.selected_conversation {
-            if sel >= self.conversations.len() {
-                self.selected_conversation = if self.conversations.is_empty() {
-                    None
-                } else {
-                    Some(self.conversations.len() - 1)
-                };
-            }
+        if let Some(sel) = self.selected_conversation
+            && sel >= self.conversations.len()
+        {
+            self.selected_conversation = if self.conversations.is_empty() {
+                None
+            } else {
+                Some(self.conversations.len() - 1)
+            };
         }
     }
 
@@ -245,6 +245,12 @@ impl App {
         }
 
         Some(id)
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

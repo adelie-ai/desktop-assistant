@@ -108,10 +108,15 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         lines.push(Line::from("Press 'n' to create a new conversation."));
     }
 
+    let chat_title = app
+        .current_conversation
+        .as_ref()
+        .map(|conv| conv.title.as_str())
+        .unwrap_or("Chat");
     let title = if app.scroll_offset > 0 {
-        "Chat (Ctrl+u/d scroll, Ctrl+e bottom)"
+        format!("{chat_title} (Ctrl+u/d scroll, Ctrl+e bottom)")
     } else {
-        "Chat"
+        chat_title.to_string()
     };
 
     let block = Block::default().borders(Borders::ALL).title(title);

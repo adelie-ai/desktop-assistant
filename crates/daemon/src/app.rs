@@ -1,6 +1,7 @@
 use desktop_assistant_core::ports::inbound::AssistantService;
 
 /// Concrete implementation of the assistant service for the daemon.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Assistant;
 
 impl AssistantService for Assistant {

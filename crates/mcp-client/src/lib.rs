@@ -2,7 +2,7 @@ pub mod config;
 pub mod executor;
 mod jsonrpc;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use desktop_assistant_core::domain::ToolDefinition;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -44,6 +44,9 @@ pub struct McpClient {
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: AtomicU64,
+    tools_list_changed: AtomicBool,
+    resources_list_changed: AtomicBool,
+    prompts_list_changed: AtomicBool,
 }
 
 impl McpClient {
@@ -66,6 +69,9 @@ impl McpClient {
             stdin,
             reader,
             next_id: AtomicU64::new(1),
+            tools_list_changed: AtomicBool::new(false),
+            resources_list_changed: AtomicBool::new(false),
+            prompts_list_changed: AtomicBool::new(false),
         };
 
         // Perform initialize handshake
@@ -109,6 +115,8 @@ impl McpClient {
 
         let raw_tools: Vec<RawToolDef> = serde_json::from_value(tools_value.clone())?;
 
+        self.tools_list_changed.store(false, Ordering::Relaxed);
+
         Ok(raw_tools
             .into_iter()
             .map(|t| {
@@ -120,6 +128,38 @@ impl McpClient {
                 )
             })
             .collect())
+    }
+
+    /// List all resources available from this MCP server.
+    pub async fn list_resources(&mut self) -> Result<Vec<serde_json::Value>, McpError> {
+        let response = self.send_request("resources/list", None).await?;
+        let resources = extract_list_field(&response, "resources")?;
+        self.resources_list_changed.store(false, Ordering::Relaxed);
+        Ok(resources)
+    }
+
+    /// List all prompts available from this MCP server.
+    pub async fn list_prompts(&mut self) -> Result<Vec<serde_json::Value>, McpError> {
+        let response = self.send_request("prompts/list", None).await?;
+        let prompts = extract_list_field(&response, "prompts")?;
+        self.prompts_list_changed.store(false, Ordering::Relaxed);
+        Ok(prompts)
+    }
+
+    /// Returns true if this client has observed a tools list change notification
+    /// since the last successful `list_tools` refresh.
+    pub fn tools_list_changed(&self) -> bool {
+        self.tools_list_changed.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if this client has observed a resources list change notification.
+    pub fn resources_list_changed(&self) -> bool {
+        self.resources_list_changed.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if this client has observed a prompts list change notification.
+    pub fn prompts_list_changed(&self) -> bool {
+        self.prompts_list_changed.load(Ordering::Relaxed)
     }
 
     /// Call a tool on this MCP server.
@@ -136,20 +176,20 @@ impl McpClient {
         let response = self.send_request("tools/call", Some(params)).await?;
 
         // Extract text content from the response
-        if let Some(content) = response.get("content") {
-            if let Some(arr) = content.as_array() {
-                let text_parts: Vec<&str> = arr
-                    .iter()
-                    .filter_map(|item| {
-                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            item.get("text").and_then(|t| t.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                return Ok(text_parts.join("\n"));
-            }
+        if let Some(content) = response.get("content")
+            && let Some(arr) = content.as_array()
+        {
+            let text_parts: Vec<&str> = arr
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        item.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            return Ok(text_parts.join("\n"));
         }
 
         // Fallback: return raw JSON
@@ -203,8 +243,22 @@ impl McpClient {
 
             tracing::debug!("MCP response: {trimmed}");
 
+            let message: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::debug!("skipping non-JSON line from MCP server");
+                    continue;
+                }
+            };
+
+            if let Some(list_kind) = list_kind_from_notification(&message) {
+                tracing::debug!("received {list_kind} list changed notification");
+                self.mark_list_changed_for_kind(list_kind);
+                continue;
+            }
+
             // Try to parse as JSON-RPC response
-            let response: JsonRpcResponse = match serde_json::from_str(trimmed) {
+            let response: JsonRpcResponse = match serde_json::from_value(message.clone()) {
                 Ok(r) => r,
                 Err(_) => {
                     // Could be a notification, skip it
@@ -227,9 +281,85 @@ impl McpClient {
                 });
             }
 
-            return Ok(response.result.unwrap_or(serde_json::Value::Null));
+            let result = response.result.unwrap_or(serde_json::Value::Null);
+            if result_has_list_changed(&result) {
+                self.mark_list_changed_for_method(method);
+            }
+
+            return Ok(result);
         }
     }
+
+    fn mark_list_changed_for_method(&self, method: &str) {
+        match method {
+            "tools/list" => self.tools_list_changed.store(true, Ordering::Relaxed),
+            "resources/list" => self.resources_list_changed.store(true, Ordering::Relaxed),
+            "prompts/list" => self.prompts_list_changed.store(true, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+
+    fn mark_list_changed_for_kind(&self, list_kind: ListKind) {
+        match list_kind {
+            ListKind::Tools => self.tools_list_changed.store(true, Ordering::Relaxed),
+            ListKind::Resources => self.resources_list_changed.store(true, Ordering::Relaxed),
+            ListKind::Prompts => self.prompts_list_changed.store(true, Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListKind {
+    Tools,
+    Resources,
+    Prompts,
+}
+
+impl std::fmt::Display for ListKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tools => write!(f, "tools"),
+            Self::Resources => write!(f, "resources"),
+            Self::Prompts => write!(f, "prompts"),
+        }
+    }
+}
+
+fn list_kind_from_notification(message: &serde_json::Value) -> Option<ListKind> {
+    let method = message.get("method").and_then(serde_json::Value::as_str)?;
+    match method {
+        "notifications/tools/list_changed" | "tools/list_changed" => Some(ListKind::Tools),
+        "notifications/resources/list_changed" | "resources/list_changed" => {
+            Some(ListKind::Resources)
+        }
+        "notifications/prompts/list_changed" | "prompts/list_changed" => Some(ListKind::Prompts),
+        _ => None,
+    }
+}
+
+fn result_has_list_changed(result: &serde_json::Value) -> bool {
+    result
+        .get("listChanged")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn extract_list_field(
+    response: &serde_json::Value,
+    field_name: &str,
+) -> Result<Vec<serde_json::Value>, McpError> {
+    let field_value = response
+        .get(field_name)
+        .ok_or_else(|| McpError::UnexpectedResponse(format!("missing '{field_name}' field")))?;
+
+    let items = field_value
+        .as_array()
+        .ok_or_else(|| {
+            McpError::UnexpectedResponse(format!("'{field_name}' field is not an array"))
+        })?
+        .clone();
+
+    Ok(items)
 }
 
 /// Raw tool definition as returned by MCP servers.
@@ -312,5 +442,93 @@ mod tests {
                 .unwrap_or(serde_json::json!({"type": "object"})),
         );
         assert_eq!(def.description, "");
+    }
+
+    #[test]
+    fn detects_tools_list_changed_notifications() {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed"
+        });
+        assert_eq!(
+            list_kind_from_notification(&notification),
+            Some(ListKind::Tools)
+        );
+
+        let short_form = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list_changed"
+        });
+        assert_eq!(
+            list_kind_from_notification(&short_form),
+            Some(ListKind::Tools)
+        );
+    }
+
+    #[test]
+    fn detects_resources_and_prompts_list_changed_notifications() {
+        let resources_notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed"
+        });
+        assert_eq!(
+            list_kind_from_notification(&resources_notification),
+            Some(ListKind::Resources)
+        );
+
+        let prompts_notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "prompts/list_changed"
+        });
+        assert_eq!(
+            list_kind_from_notification(&prompts_notification),
+            Some(ListKind::Prompts)
+        );
+    }
+
+    #[test]
+    fn ignores_non_tools_list_changed_notifications() {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        assert_eq!(list_kind_from_notification(&notification), None);
+    }
+
+    #[test]
+    fn detects_result_list_changed_flag() {
+        assert!(result_has_list_changed(
+            &serde_json::json!({"listChanged": true})
+        ));
+        assert!(!result_has_list_changed(
+            &serde_json::json!({"listChanged": false})
+        ));
+        assert!(!result_has_list_changed(
+            &serde_json::json!({"other": true})
+        ));
+    }
+
+    #[test]
+    fn extract_list_field_reads_arrays() {
+        let response = serde_json::json!({
+            "resources": [
+                {"uri": "file:///tmp/a.txt"},
+                {"uri": "file:///tmp/b.txt"}
+            ]
+        });
+
+        let resources = extract_list_field(&response, "resources").unwrap();
+        assert_eq!(resources.len(), 2);
+    }
+
+    #[test]
+    fn extract_list_field_requires_existing_array_field() {
+        let missing = serde_json::json!({"other": []});
+        let err = extract_list_field(&missing, "prompts").unwrap_err();
+        assert!(err.to_string().contains("missing 'prompts' field"));
+
+        let wrong_type = serde_json::json!({"prompts": {"name": "x"}});
+        let err = extract_list_field(&wrong_type, "prompts").unwrap_err();
+        assert!(err.to_string().contains("'prompts' field is not an array"));
     }
 }

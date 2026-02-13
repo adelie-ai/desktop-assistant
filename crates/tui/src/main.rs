@@ -123,12 +123,11 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
             }
         }
         Action::DeleteConversation => {
-            if let Some(id) = app.delete_selected_conversation() {
-                if let Some(client) = client.as_ref() {
-                    if let Err(e) = client.delete_conversation(&id).await {
-                        app.status_message = format!("Delete error: {e}");
-                    }
-                }
+            if let Some(id) = app.delete_selected_conversation()
+                && let Some(client) = client.as_ref()
+                && let Err(e) = client.delete_conversation(&id).await
+            {
+                app.status_message = format!("Delete error: {e}");
             }
         }
         Action::NewConversation => app.enter_creating_conversation_mode(),
@@ -141,12 +140,12 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
         }
         Action::ExitEditMode => app.enter_normal_mode(),
         Action::SubmitPrompt => {
-            if let Some((conv_id, prompt)) = app.submit_prompt() {
-                if let Some(client) = client.as_ref() {
-                    match client.send_prompt(&conv_id, &prompt).await {
-                        Ok(request_id) => app.start_streaming(request_id),
-                        Err(e) => app.status_message = format!("Send error: {e}"),
-                    }
+            if let Some((conv_id, prompt)) = app.submit_prompt()
+                && let Some(client) = client.as_ref()
+            {
+                match client.send_prompt(&conv_id, &prompt).await {
+                    Ok(request_id) => app.start_streaming(request_id),
+                    Err(e) => app.status_message = format!("Send error: {e}"),
                 }
             }
         }
@@ -156,31 +155,31 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
         Action::InsertChar(c) => app.insert_char(c),
         Action::DeleteChar => app.delete_char(),
         Action::SubmitTitle => {
-            if let Some(title) = app.submit_new_conversation_title() {
-                if let Some(client) = client.as_ref() {
-                    match client.create_conversation(&title).await {
-                        Ok(id) => {
-                            // Refresh list and auto-open the new conversation
-                            match client.list_conversations().await {
-                                Ok(convs) => {
-                                    let new_idx = convs.iter().position(|c| c.id == id);
-                                    app.set_conversations(convs);
-                                    if let Some(idx) = new_idx {
-                                        app.selected_conversation = Some(idx);
-                                    }
+            if let Some(title) = app.submit_new_conversation_title()
+                && let Some(client) = client.as_ref()
+            {
+                match client.create_conversation(&title).await {
+                    Ok(id) => {
+                        // Refresh list and auto-open the new conversation
+                        match client.list_conversations().await {
+                            Ok(convs) => {
+                                let new_idx = convs.iter().position(|c| c.id == id);
+                                app.set_conversations(convs);
+                                if let Some(idx) = new_idx {
+                                    app.selected_conversation = Some(idx);
                                 }
-                                Err(e) => app.status_message = format!("Error refreshing: {e}"),
                             }
-                            match client.get_conversation(&id).await {
-                                Ok(detail) => {
-                                    app.load_conversation(detail);
-                                    app.enter_editing_mode();
-                                }
-                                Err(e) => app.status_message = format!("Error opening: {e}"),
-                            }
+                            Err(e) => app.status_message = format!("Error refreshing: {e}"),
                         }
-                        Err(e) => app.status_message = format!("Create error: {e}"),
+                        match client.get_conversation(&id).await {
+                            Ok(detail) => {
+                                app.load_conversation(detail);
+                                app.enter_editing_mode();
+                            }
+                            Err(e) => app.status_message = format!("Error opening: {e}"),
+                        }
                     }
+                    Err(e) => app.status_message = format!("Create error: {e}"),
                 }
             }
         }

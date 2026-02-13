@@ -116,6 +116,16 @@ async fn executor_with_real_mcp_server() {
         "executor should have tools from fileio-mcp"
     );
 
+    // Verify additional metadata endpoints are callable
+    let resources = executor.available_resources().await;
+    let prompts = executor.available_prompts().await;
+    for resource in &resources {
+        assert!(resource.is_object(), "resource entry should be an object");
+    }
+    for prompt in &prompts {
+        assert!(prompt.is_object(), "prompt entry should be an object");
+    }
+
     // Create test file
     let tmp_dir = std::env::temp_dir().join("desktop-assistant-e2e-executor");
     std::fs::create_dir_all(&tmp_dir).unwrap();

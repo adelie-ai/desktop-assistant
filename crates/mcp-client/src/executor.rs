@@ -26,6 +26,10 @@ pub struct McpToolExecutor {
     clients: Mutex<Vec<Option<McpClient>>>,
     /// Cached list of all available tools.
     cached_tools: Mutex<Vec<ToolDefinition>>,
+    /// Cached metadata for MCP resources across all connected servers.
+    cached_resources: Mutex<Vec<serde_json::Value>>,
+    /// Cached metadata for MCP prompts across all connected servers.
+    cached_prompts: Mutex<Vec<serde_json::Value>>,
 }
 
 impl McpToolExecutor {
@@ -36,54 +40,209 @@ impl McpToolExecutor {
             tool_routing: Mutex::new(HashMap::new()),
             clients: Mutex::new(clients),
             cached_tools: Mutex::new(Vec::new()),
+            cached_resources: Mutex::new(Vec::new()),
+            cached_prompts: Mutex::new(Vec::new()),
         }
     }
 
     /// Connect to all configured MCP servers, discover their tools,
     /// and build the routing table.
     pub async fn start(&self) -> Result<(), McpError> {
-        let mut clients = self.clients.lock().await;
-        let mut routing = self.tool_routing.lock().await;
-        let mut all_tools = Vec::new();
+        {
+            let mut clients = self.clients.lock().await;
 
-        for (idx, config) in self.configs.iter().enumerate() {
-            tracing::info!(
-                "connecting to MCP server '{}': {}",
-                config.name,
-                config.command
-            );
+            for (idx, config) in self.configs.iter().enumerate() {
+                tracing::info!(
+                    "connecting to MCP server '{}': {}",
+                    config.name,
+                    config.command
+                );
 
-            match McpClient::connect(&config.command, &config.args).await {
-                Ok(mut client) => match client.list_tools().await {
-                    Ok(tools) => {
-                        tracing::info!(
-                            "MCP server '{}' provides {} tools",
-                            config.name,
-                            tools.len()
-                        );
-                        for tool in &tools {
-                            tracing::debug!("  tool: {}", tool.name);
-                            routing.insert(tool.name.clone(), idx);
-                        }
-                        all_tools.extend(tools);
+                match McpClient::connect(&config.command, &config.args).await {
+                    Ok(client) => {
                         clients[idx] = Some(client);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "failed to list tools from MCP server '{}': {e}",
-                            config.name
-                        );
-                        client.shutdown().await;
+                        tracing::error!("failed to connect to MCP server '{}': {e}", config.name);
                     }
-                },
-                Err(e) => {
-                    tracing::error!("failed to connect to MCP server '{}': {e}", config.name);
                 }
             }
         }
 
-        *self.cached_tools.lock().await = all_tools;
+        self.refresh_all_metadata().await?;
         Ok(())
+    }
+
+    async fn maybe_refresh_metadata(&self) -> Result<(), McpError> {
+        let (tools_changed, resources_changed, prompts_changed) = {
+            let clients = self.clients.lock().await;
+            (
+                clients
+                    .iter()
+                    .flatten()
+                    .any(|client| client.tools_list_changed()),
+                clients
+                    .iter()
+                    .flatten()
+                    .any(|client| client.resources_list_changed()),
+                clients
+                    .iter()
+                    .flatten()
+                    .any(|client| client.prompts_list_changed()),
+            )
+        };
+
+        if tools_changed {
+            tracing::info!("MCP reported tools/list_changed, refreshing tool cache");
+            self.refresh_tool_cache().await?;
+        }
+
+        if resources_changed {
+            tracing::info!("MCP reported resources/list_changed, refreshing resources cache");
+            self.refresh_resources_cache().await?;
+        }
+
+        if prompts_changed {
+            tracing::info!("MCP reported prompts/list_changed, refreshing prompts cache");
+            self.refresh_prompts_cache().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_all_metadata(&self) -> Result<(), McpError> {
+        self.refresh_tool_cache().await?;
+        self.refresh_resources_cache().await?;
+        self.refresh_prompts_cache().await?;
+        Ok(())
+    }
+
+    async fn refresh_tool_cache(&self) -> Result<(), McpError> {
+        let mut all_tools = Vec::new();
+        let mut new_routing = HashMap::new();
+
+        {
+            let mut clients = self.clients.lock().await;
+            for (idx, client_slot) in clients.iter_mut().enumerate() {
+                let Some(client) = client_slot.as_mut() else {
+                    continue;
+                };
+
+                match client.list_tools().await {
+                    Ok(tools) => {
+                        tracing::info!(
+                            "MCP server '{}' provides {} tools",
+                            self.configs[idx].name,
+                            tools.len()
+                        );
+                        for tool in &tools {
+                            tracing::debug!("  tool: {}", tool.name);
+                            new_routing.insert(tool.name.clone(), idx);
+                        }
+                        all_tools.extend(tools);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to refresh tools from MCP server '{}': {e}",
+                            self.configs[idx].name
+                        );
+                    }
+                }
+            }
+        }
+
+        *self.tool_routing.lock().await = new_routing;
+        *self.cached_tools.lock().await = all_tools;
+
+        Ok(())
+    }
+
+    async fn refresh_resources_cache(&self) -> Result<(), McpError> {
+        let mut all_resources = Vec::new();
+
+        let mut clients = self.clients.lock().await;
+        for (idx, client_slot) in clients.iter_mut().enumerate() {
+            let Some(client) = client_slot.as_mut() else {
+                continue;
+            };
+
+            match client.list_resources().await {
+                Ok(resources) => {
+                    tracing::info!(
+                        "MCP server '{}' provides {} resources",
+                        self.configs[idx].name,
+                        resources.len()
+                    );
+                    all_resources.extend(resources);
+                }
+                Err(e) if is_method_not_found(&e) => {
+                    tracing::debug!(
+                        "MCP server '{}' does not implement resources/list",
+                        self.configs[idx].name
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to refresh resources from MCP server '{}': {e}",
+                        self.configs[idx].name
+                    );
+                }
+            }
+        }
+
+        *self.cached_resources.lock().await = all_resources;
+        Ok(())
+    }
+
+    async fn refresh_prompts_cache(&self) -> Result<(), McpError> {
+        let mut all_prompts = Vec::new();
+
+        let mut clients = self.clients.lock().await;
+        for (idx, client_slot) in clients.iter_mut().enumerate() {
+            let Some(client) = client_slot.as_mut() else {
+                continue;
+            };
+
+            match client.list_prompts().await {
+                Ok(prompts) => {
+                    tracing::info!(
+                        "MCP server '{}' provides {} prompts",
+                        self.configs[idx].name,
+                        prompts.len()
+                    );
+                    all_prompts.extend(prompts);
+                }
+                Err(e) if is_method_not_found(&e) => {
+                    tracing::debug!(
+                        "MCP server '{}' does not implement prompts/list",
+                        self.configs[idx].name
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to refresh prompts from MCP server '{}': {e}",
+                        self.configs[idx].name
+                    );
+                }
+            }
+        }
+
+        *self.cached_prompts.lock().await = all_prompts;
+        Ok(())
+    }
+
+    pub async fn available_resources(&self) -> Vec<serde_json::Value> {
+        if let Err(e) = self.maybe_refresh_metadata().await {
+            tracing::warn!("failed to refresh MCP resources cache: {e}");
+        }
+        self.cached_resources.lock().await.clone()
+    }
+
+    pub async fn available_prompts(&self) -> Vec<serde_json::Value> {
+        if let Err(e) = self.maybe_refresh_metadata().await {
+            tracing::warn!("failed to refresh MCP prompts cache: {e}");
+        }
+        self.cached_prompts.lock().await.clone()
     }
 
     /// Shut down all connected MCP servers.
@@ -99,6 +258,9 @@ impl McpToolExecutor {
 
 impl ToolExecutor for McpToolExecutor {
     async fn available_tools(&self) -> Vec<ToolDefinition> {
+        if let Err(e) = self.maybe_refresh_metadata().await {
+            tracing::warn!("failed to refresh MCP tools cache: {e}");
+        }
         self.cached_tools.lock().await.clone()
     }
 
@@ -107,6 +269,10 @@ impl ToolExecutor for McpToolExecutor {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<String, CoreError> {
+        self.maybe_refresh_metadata()
+            .await
+            .map_err(|e| CoreError::ToolExecution(format!("failed to refresh tools: {e}")))?;
+
         let routing = self.tool_routing.lock().await;
         let server_idx = routing
             .get(name)
@@ -124,6 +290,10 @@ impl ToolExecutor for McpToolExecutor {
             .await
             .map_err(|e| CoreError::ToolExecution(format!("tool '{name}' failed: {e}")))
     }
+}
+
+fn is_method_not_found(error: &McpError) -> bool {
+    matches!(error, McpError::ServerError { code: -32601, .. })
 }
 
 #[cfg(test)]
@@ -164,6 +334,15 @@ mod tests {
         let executor = McpToolExecutor::new(vec![]);
         let tools = executor.available_tools().await;
         assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn executor_no_configs_returns_empty_resources_and_prompts() {
+        let executor = McpToolExecutor::new(vec![]);
+        let resources = executor.available_resources().await;
+        let prompts = executor.available_prompts().await;
+        assert!(resources.is_empty());
+        assert!(prompts.is_empty());
     }
 
     #[tokio::test]
