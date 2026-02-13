@@ -6,7 +6,7 @@ use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 
 /// Maximum number of tool-calling rounds before giving up.
-const MAX_TOOL_ROUNDS: usize = 10;
+const MAX_TOOL_ROUNDS: usize = 200;
 
 /// A no-op tool executor for use when no MCP servers are configured.
 pub struct NoopToolExecutor;
