@@ -62,6 +62,28 @@ cargo run -p desktop-assistant-daemon
 cargo run -p desktop-assistant-tui
 ```
 
+## Service Setup (systemd user + just)
+
+Install the user service unit and reload systemd:
+
+```bash
+just install-service
+```
+
+Enable and start backend on login:
+
+```bash
+just backend-enable
+```
+
+Common service operations:
+
+```bash
+just backend-status
+just backend-restart
+just backend-logs
+```
+
 ## Core Commands
 
 ```bash
