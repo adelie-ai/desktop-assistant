@@ -5,7 +5,9 @@ service_src := "systemd/desktop-assistant-daemon.service"
 service_dst := "{{env_var_or_default('XDG_CONFIG_HOME', env_var('HOME') + '/.config')}}/systemd/user/{{service_name}}.service"
 
 # List available commands
-@default:
+default: list
+
+@list:
     just --list
 
 # Run backend daemon in foreground (dev)
