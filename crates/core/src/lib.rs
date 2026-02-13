@@ -17,6 +17,9 @@ pub enum CoreError {
 
     #[error("storage error: {0}")]
     Storage(String),
+
+    #[error("tool execution error: {0}")]
+    ToolExecution(String),
 }
 
 #[cfg(test)]

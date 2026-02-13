@@ -10,6 +10,9 @@ pub mod llm;
 /// Conversation store port — outbound trait for persistence.
 pub mod store;
 
+/// Tool executor port — outbound trait for executing tools via MCP or other providers.
+pub mod tools;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -20,5 +23,6 @@ mod tests {
         fn _assert_llm_exists<T: super::llm::LlmClient>() {}
         fn _assert_store_exists<T: super::store::ConversationStore>() {}
         fn _assert_system_exists<T: super::outbound::SystemServiceClient>() {}
+        fn _assert_tools_exists<T: super::tools::ToolExecutor>() {}
     }
 }

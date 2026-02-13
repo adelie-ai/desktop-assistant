@@ -1,3 +1,4 @@
+pub mod executor;
 mod jsonrpc;
 
 use std::sync::atomic::{AtomicU64, Ordering};
