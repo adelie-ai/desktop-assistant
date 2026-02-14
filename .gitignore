@@ -1,3 +1,7 @@
 /target
 .env
 .claude/settings.local.json
+
+# Python bytecode/cache
+__pycache__/
+*.pyc
