@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.plasma.plasmoid
+import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents
 import org.kde.plasma.plasma5support as Plasma5Support
 
@@ -15,7 +16,7 @@ PlasmoidItem {
     property bool busy: false
     property bool debugEnabled: false
     property int currentMessageCount: 0
-    property string transcriptText: "[status] Ready"
+    property var transcriptEntries: []
     property string promptText: ""
     property var conversationChoices: []
     readonly property var pending: ({})
@@ -33,19 +34,27 @@ PlasmoidItem {
         executable.connectSource(command)
     }
 
-    function appendLine(text) {
-        transcriptText = transcriptText + "\n" + text
-    }
-
     function appendMessage(role, text) {
         if (role === "tool" && !debugEnabled) {
             return
         }
-        appendLine(role + ": " + text)
+        transcriptEntries = transcriptEntries.concat([
+            {
+                kind: "message",
+                role: role,
+                text: text,
+            }
+        ])
     }
 
     function appendStatus(text) {
-        appendLine("[status] " + text)
+        transcriptEntries = transcriptEntries.concat([
+            {
+                kind: "status",
+                role: "status",
+                text: text,
+            }
+        ])
     }
 
     function appendDebugStatus(text) {
@@ -105,7 +114,13 @@ PlasmoidItem {
                 conversationId = payload.conversation_id
                 promptText = ""
                 currentMessageCount = 0
-                transcriptText = "[status] New conversation ready"
+                transcriptEntries = [
+                    {
+                        kind: "status",
+                        role: "status",
+                        text: "New conversation ready",
+                    }
+                ]
                 appendStatus("Using conversation " + conversationId)
                 reloadConversationList()
             },
@@ -185,7 +200,7 @@ PlasmoidItem {
                     return
                 }
 
-                transcriptText = ""
+                transcriptEntries = []
                 for (let i = 0; i < payload.messages.length; i++) {
                     const message = payload.messages[i]
                     appendMessage(message.role, message.content)
@@ -202,7 +217,13 @@ PlasmoidItem {
     }
 
     function clearTranscriptView() {
-        transcriptText = "[status] View cleared"
+        transcriptEntries = [
+            {
+                kind: "status",
+                role: "status",
+                text: "View cleared",
+            }
+        ]
     }
 
     function sendPrompt(textValue) {
@@ -214,7 +235,7 @@ PlasmoidItem {
 
         ensureConversation(function() {
             busy = true
-            appendMessage("you", prompt)
+            appendMessage("user", prompt)
             promptText = ""
 
             const sendCommand = "python3 " + shellEscape(helperPath) + " send " + shellEscape(conversationId) + " " + shellEscape(prompt)
@@ -240,10 +261,11 @@ PlasmoidItem {
                             }
                             if (awaitPayload.assistant_reply && awaitPayload.assistant_reply.length > 0) {
                                 appendMessage("assistant", awaitPayload.assistant_reply)
+                                currentMessageCount = currentMessageCount + 2
                             } else {
                                 appendStatus("No assistant response before timeout")
+                                currentMessageCount = currentMessageCount + 1
                             }
-                            refreshConversation()
                         },
                         function(awaitErr) {
                             busy = false
@@ -337,12 +359,66 @@ PlasmoidItem {
             Layout.fillWidth: true
             Layout.fillHeight: true
 
-            QQC2.TextArea {
+            ListView {
                 id: transcript
-                readOnly: true
-                wrapMode: Text.Wrap
-                text: root.transcriptText
-                onTextChanged: cursorPosition = length
+                model: root.transcriptEntries
+                spacing: 6
+                clip: true
+
+                onCountChanged: {
+                    if (count > 0) {
+                        positionViewAtEnd()
+                    }
+                }
+
+                delegate: Item {
+                    required property var modelData
+                    readonly property bool isStatus: modelData.kind === "status"
+                    readonly property bool isAssistant: modelData.role === "assistant"
+
+                    width: ListView.view.width
+                    implicitHeight: bubble.height + 2
+
+                    Rectangle {
+                        id: bubble
+                        anchors.top: parent.top
+                        anchors.left: isAssistant ? undefined : parent.left
+                        anchors.right: isAssistant ? parent.right : undefined
+                        width: isStatus
+                            ? parent.width
+                            : Math.min(parent.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
+                        height: messageText.implicitHeight + 12
+                        radius: isStatus ? 0 : 8
+                        color: isStatus
+                            ? "transparent"
+                            : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor)
+                        border.width: isStatus ? 0 : 1
+                        border.color: PlasmaCore.Theme.disabledTextColor
+
+                        Text {
+                            id: messageText
+                            anchors.fill: parent
+                            anchors.margins: 6
+                            wrapMode: Text.Wrap
+                            textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
+                            text: isStatus
+                                ? "[status] " + String(modelData.text || "")
+                                : (isAssistant
+                                    ? String(modelData.text || "")
+                                    : "You:\n" + String(modelData.text || ""))
+                            color: isStatus
+                                ? PlasmaCore.Theme.disabledTextColor
+                                : (isAssistant
+                                    ? PlasmaCore.Theme.textColor
+                                    : PlasmaCore.Theme.highlightedTextColor)
+                            font.italic: isStatus
+                            font.bold: false
+                            onLinkActivated: function(link) {
+                                Qt.openUrlExternally(link)
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -389,6 +465,13 @@ PlasmoidItem {
     }
 
     Component.onCompleted: {
+        transcriptEntries = [
+            {
+                kind: "status",
+                role: "status",
+                text: "Ready",
+            }
+        ]
         appendDebugStatus("Widget loaded")
         startupTimer.start()
     }

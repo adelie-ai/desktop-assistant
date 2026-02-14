@@ -17,7 +17,7 @@ PlasmoidItem {
     property string conversationId: ""
     property bool busy: false
     property bool debugEnabled: false
-    property string transcriptText: "[status] Ready"
+    property var transcriptEntries: []
     property string promptText: ""
 
     function shellEscape(value) {
@@ -78,7 +78,18 @@ PlasmoidItem {
 
                 conversationId = payload.conversation_id
                 currentMessageCount = 0
-                transcriptText = "[status] New conversation ready\n[status] Connected to conversation " + conversationId
+                transcriptEntries = [
+                    {
+                        kind: "status",
+                        role: "status",
+                        text: "New conversation ready",
+                    },
+                    {
+                        kind: "status",
+                        role: "status",
+                        text: "Connected to conversation " + conversationId,
+                    }
+                ]
                 promptText = ""
             },
             function(stderr) {
@@ -88,7 +99,13 @@ PlasmoidItem {
     }
 
     function appendStatus(text) {
-        transcriptText += "\n[status] " + text
+        transcriptEntries = transcriptEntries.concat([
+            {
+                kind: "status",
+                role: "status",
+                text: text,
+            }
+        ])
     }
 
     function appendDebugStatus(text) {
@@ -101,7 +118,13 @@ PlasmoidItem {
         if (role === "tool" && !debugEnabled) {
             return
         }
-        transcriptText += "\n" + role + ": " + text
+        transcriptEntries = transcriptEntries.concat([
+            {
+                kind: "message",
+                role: role,
+                text: text,
+            }
+        ])
     }
 
     function messageCountFromTranscript() {
@@ -136,7 +159,7 @@ PlasmoidItem {
 
         ensureConversation(function() {
             busy = true
-            appendMessage("you", prompt)
+            appendMessage("user", prompt)
             promptText = ""
 
             let getCommand = "python3 " + shellEscape(helperPath) + " get " + shellEscape(conversationId)
@@ -199,7 +222,13 @@ PlasmoidItem {
     }
 
     function clearTranscriptView() {
-        transcriptText = "[status] View cleared"
+        transcriptEntries = [
+            {
+                kind: "status",
+                role: "status",
+                text: "View cleared",
+            }
+        ]
     }
 
     readonly property var pending: ({})
@@ -272,12 +301,66 @@ PlasmoidItem {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                QQC2.TextArea {
+                ListView {
                     id: transcript
-                    readOnly: true
-                    wrapMode: Text.Wrap
-                    text: root.transcriptText
-                    onTextChanged: cursorPosition = length
+                    model: root.transcriptEntries
+                    spacing: 6
+                    clip: true
+
+                    onCountChanged: {
+                        if (count > 0) {
+                            positionViewAtEnd()
+                        }
+                    }
+
+                    delegate: Item {
+                        required property var modelData
+                        readonly property bool isStatus: modelData.kind === "status"
+                        readonly property bool isAssistant: modelData.role === "assistant"
+
+                        width: ListView.view.width
+                        implicitHeight: bubble.height + 2
+
+                        Rectangle {
+                            id: bubble
+                            anchors.top: parent.top
+                            anchors.left: isAssistant ? undefined : parent.left
+                            anchors.right: isAssistant ? parent.right : undefined
+                            width: isStatus
+                                ? parent.width
+                                : Math.min(parent.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
+                            height: messageText.implicitHeight + 12
+                            radius: isStatus ? 0 : 8
+                            color: isStatus
+                                ? "transparent"
+                                : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor)
+                            border.width: isStatus ? 0 : 1
+                            border.color: PlasmaCore.Theme.disabledTextColor
+
+                            Text {
+                                id: messageText
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                wrapMode: Text.Wrap
+                                textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
+                                text: isStatus
+                                    ? "[status] " + String(modelData.text || "")
+                                    : (isAssistant
+                                        ? String(modelData.text || "")
+                                        : "You:\n" + String(modelData.text || ""))
+                                color: isStatus
+                                    ? PlasmaCore.Theme.disabledTextColor
+                                    : (isAssistant
+                                        ? PlasmaCore.Theme.textColor
+                                        : PlasmaCore.Theme.highlightedTextColor)
+                                font.italic: isStatus
+                                font.bold: false
+                                onLinkActivated: function(link) {
+                                    Qt.openUrlExternally(link)
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -319,6 +402,13 @@ PlasmoidItem {
     }
 
     Component.onCompleted: {
+        transcriptEntries = [
+            {
+                kind: "status",
+                role: "status",
+                text: "Ready",
+            }
+        ]
         ensureConversation(function() {
             appendDebugStatus("Connected to conversation " + conversationId)
         })
