@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::{App, InputMode};
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -43,12 +43,16 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_chat_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    // Dynamic input height: line count + 2 for borders, min 3, max 10
+    let line_count = app.textarea.lines().len() as u16;
+    let input_height = (line_count + 2).max(3).min(10);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -136,29 +140,19 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(messages, area);
 }
 
-fn draw_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let title = match app.mode {
         InputMode::Normal => "Input (press 'i' to edit)",
-        InputMode::Editing => "Input (press Esc to cancel, Enter to send)",
+        InputMode::Editing => "Input (Esc cancel, Enter send, Alt+Enter newline)",
         InputMode::CreatingConversation => {
             "New conversation title (Enter to create, Esc to cancel)"
         }
     };
 
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(title));
+    app.textarea
+        .set_block(Block::default().borders(Borders::ALL).title(title));
 
-    f.render_widget(input, area);
-
-    // Show cursor in editing/creating modes
-    if matches!(
-        app.mode,
-        InputMode::Editing | InputMode::CreatingConversation
-    ) {
-        let x = area.x + app.input.len() as u16 + 1; // +1 for border
-        let y = area.y + 1; // +1 for border
-        f.set_cursor_position((x, y));
-    }
+    f.render_widget(&app.textarea, area);
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -192,8 +186,8 @@ mod tests {
     fn draw_empty_app_does_not_panic() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::new();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        let mut app = App::new();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -214,7 +208,7 @@ mod tests {
             },
         ]);
         app.selected_conversation = Some(0);
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -236,7 +230,7 @@ mod tests {
                 },
             ],
         });
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -251,7 +245,7 @@ mod tests {
         });
         app.start_streaming("req1".into());
         app.receive_chunk("req1", "Partial response...");
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -260,8 +254,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.enter_editing_mode();
-        app.input = "typing something".into();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        app.textarea.insert_str("typing something");
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -270,8 +264,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.enter_creating_conversation_mode();
-        app.input = "New Chat".into();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        app.textarea.insert_str("New Chat");
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -280,14 +274,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.status_message = "Error: connection lost".into();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     #[test]
     fn draw_small_terminal_does_not_panic() {
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::new();
-        terminal.draw(|f| draw(f, &app)).unwrap();
+        let mut app = App::new();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 }

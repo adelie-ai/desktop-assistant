@@ -13,18 +13,20 @@ pub enum Action {
     EnterEditMode,
     ExitEditMode,
     SubmitPrompt,
-    InsertChar(char),
-    DeleteChar,
     SubmitTitle,
+    InsertNewline,
     ScrollUp,
     ScrollDown,
     ScrollToBottom,
 }
 
+/// Handle key events that we intercept before passing to textarea.
+/// Returns None for keys that should be forwarded to textarea.input().
 pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+u / Ctrl+d for scrolling — works in all modes
+    // Ctrl+u / Ctrl+d / Ctrl+e for scrolling — works in all modes
     if ctrl {
         return match key.code {
             KeyCode::Char('u') => Some(Action::ScrollUp),
@@ -34,45 +36,51 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
         };
     }
 
-    // Ignore other modifier combos (Alt, Meta)
-    if key
-        .modifiers
-        .intersects(KeyModifiers::ALT | KeyModifiers::META)
-    {
-        return None;
-    }
-
     match mode {
-        InputMode::Normal => match key.code {
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Char('j') | KeyCode::Down => Some(Action::NextConversation),
-            KeyCode::Char('k') | KeyCode::Up => Some(Action::PreviousConversation),
-            KeyCode::Enter => Some(Action::OpenConversation),
-            KeyCode::Char('d') => Some(Action::DeleteConversation),
-            KeyCode::Char('n') => Some(Action::NewConversation),
-            KeyCode::Char('i') => Some(Action::EnterEditMode),
-            KeyCode::PageUp => Some(Action::ScrollUp),
-            KeyCode::PageDown => Some(Action::ScrollDown),
-            KeyCode::End => Some(Action::ScrollToBottom),
-            _ => None,
-        },
-        InputMode::Editing => match key.code {
-            KeyCode::Esc => Some(Action::ExitEditMode),
-            KeyCode::Enter => Some(Action::SubmitPrompt),
-            KeyCode::Backspace => Some(Action::DeleteChar),
-            KeyCode::PageUp => Some(Action::ScrollUp),
-            KeyCode::PageDown => Some(Action::ScrollDown),
-            KeyCode::End => Some(Action::ScrollToBottom),
-            KeyCode::Char(c) => Some(Action::InsertChar(c)),
-            _ => None,
-        },
-        InputMode::CreatingConversation => match key.code {
-            KeyCode::Esc => Some(Action::ExitEditMode),
-            KeyCode::Enter => Some(Action::SubmitTitle),
-            KeyCode::Backspace => Some(Action::DeleteChar),
-            KeyCode::Char(c) => Some(Action::InsertChar(c)),
-            _ => None,
-        },
+        InputMode::Normal => {
+            // Ignore Alt/Meta combos in Normal mode
+            if alt || key.modifiers.intersects(KeyModifiers::META) {
+                return None;
+            }
+            match key.code {
+                KeyCode::Char('q') => Some(Action::Quit),
+                KeyCode::Char('j') | KeyCode::Down => Some(Action::NextConversation),
+                KeyCode::Char('k') | KeyCode::Up => Some(Action::PreviousConversation),
+                KeyCode::Enter => Some(Action::OpenConversation),
+                KeyCode::Char('d') => Some(Action::DeleteConversation),
+                KeyCode::Char('n') => Some(Action::NewConversation),
+                KeyCode::Char('i') => Some(Action::EnterEditMode),
+                KeyCode::PageUp => Some(Action::ScrollUp),
+                KeyCode::PageDown => Some(Action::ScrollDown),
+                KeyCode::End => Some(Action::ScrollToBottom),
+                _ => None,
+            }
+        }
+        InputMode::Editing => {
+            // Alt+Enter inserts a newline
+            if alt && key.code == KeyCode::Enter {
+                return Some(Action::InsertNewline);
+            }
+            match key.code {
+                KeyCode::Esc => Some(Action::ExitEditMode),
+                KeyCode::Enter => Some(Action::SubmitPrompt),
+                KeyCode::PageUp => Some(Action::ScrollUp),
+                KeyCode::PageDown => Some(Action::ScrollDown),
+                KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(Action::ScrollToBottom)
+                }
+                // All other keys: return None so they get forwarded to textarea
+                _ => None,
+            }
+        }
+        InputMode::CreatingConversation => {
+            match key.code {
+                KeyCode::Esc => Some(Action::ExitEditMode),
+                KeyCode::Enter => Some(Action::SubmitTitle),
+                // All other keys: return None so they get forwarded to textarea
+                _ => None,
+            }
+        }
     }
 }
 
@@ -222,44 +230,49 @@ mod tests {
     }
 
     #[test]
-    fn editing_backspace_deletes() {
+    fn editing_alt_enter_inserts_newline() {
         assert_eq!(
-            handle_key_event(key(KeyCode::Backspace), &InputMode::Editing),
-            Some(Action::DeleteChar)
+            handle_key_event(
+                key_with_mod(KeyCode::Enter, KeyModifiers::ALT),
+                &InputMode::Editing
+            ),
+            Some(Action::InsertNewline)
         );
     }
 
     #[test]
-    fn editing_char_inserts() {
+    fn editing_char_forwarded_to_textarea() {
+        // Regular chars should return None so they get forwarded to textarea
         assert_eq!(
             handle_key_event(key(KeyCode::Char('a')), &InputMode::Editing),
-            Some(Action::InsertChar('a'))
-        );
-    }
-
-    #[test]
-    fn editing_space_inserts() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char(' ')), &InputMode::Editing),
-            Some(Action::InsertChar(' '))
-        );
-    }
-
-    #[test]
-    fn editing_unknown_key_ignored() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Tab), &InputMode::Editing),
             None
         );
     }
 
     #[test]
-    fn editing_ctrl_modifier_ignored() {
+    fn editing_backspace_forwarded_to_textarea() {
         assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                &InputMode::Editing
-            ),
+            handle_key_event(key(KeyCode::Backspace), &InputMode::Editing),
+            None
+        );
+    }
+
+    #[test]
+    fn editing_arrows_forwarded_to_textarea() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::Left), &InputMode::Editing),
+            None
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Right), &InputMode::Editing),
+            None
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Up), &InputMode::Editing),
+            None
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Down), &InputMode::Editing),
             None
         );
     }
@@ -283,23 +296,15 @@ mod tests {
     }
 
     #[test]
-    fn creating_backspace_deletes() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Backspace), &InputMode::CreatingConversation),
-            Some(Action::DeleteChar)
-        );
-    }
-
-    #[test]
-    fn creating_char_inserts() {
+    fn creating_char_forwarded_to_textarea() {
         assert_eq!(
             handle_key_event(key(KeyCode::Char('Z')), &InputMode::CreatingConversation),
-            Some(Action::InsertChar('Z'))
+            None
         );
     }
 
     #[test]
-    fn creating_unknown_key_ignored() {
+    fn creating_unknown_key_forwarded_to_textarea() {
         assert_eq!(
             handle_key_event(key(KeyCode::F(1)), &InputMode::CreatingConversation),
             None

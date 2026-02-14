@@ -175,21 +175,23 @@ impl McpClient {
 
         let response = self.send_request("tools/call", Some(params)).await?;
 
-        // Extract text content from the response
+        // Extract content from the response
         if let Some(content) = response.get("content")
             && let Some(arr) = content.as_array()
         {
-            let text_parts: Vec<&str> = arr
+            let text_parts: Vec<String> = arr
                 .iter()
                 .filter_map(|item| {
                     if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        item.get("text").and_then(|t| t.as_str())
+                        item.get("text").and_then(|t| t.as_str()).map(String::from)
                     } else {
-                        None
+                        Some(serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string()))
                     }
                 })
                 .collect();
-            return Ok(text_parts.join("\n"));
+            if !text_parts.is_empty() {
+                return Ok(text_parts.join("\n"));
+            }
         }
 
         // Fallback: return raw JSON

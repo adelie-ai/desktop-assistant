@@ -15,7 +15,7 @@ use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use app::App;
+use app::{App, InputMode};
 use dbus_client::{DbusClient, SignalEvent};
 use keys::{Action, handle_key_event};
 
@@ -69,7 +69,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()
     let mut event_stream = crossterm::event::EventStream::new();
 
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {
             break;
@@ -83,6 +83,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()
                     }
                     if let Some(action) = handle_key_event(key, &app.mode) {
                         handle_action(&mut app, &client, action).await;
+                    } else if matches!(app.mode, InputMode::Editing | InputMode::CreatingConversation) {
+                        // Forward unhandled keys to textarea
+                        app.textarea.input(key);
                     }
                 }
             }
@@ -149,11 +152,12 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
                 }
             }
         }
+        Action::InsertNewline => {
+            app.textarea.insert_newline();
+        }
         Action::ScrollUp => app.scroll_up(5),
         Action::ScrollDown => app.scroll_down(5),
         Action::ScrollToBottom => app.scroll_to_bottom(),
-        Action::InsertChar(c) => app.insert_char(c),
-        Action::DeleteChar => app.delete_char(),
         Action::SubmitTitle => {
             if let Some(title) = app.submit_new_conversation_title()
                 && let Some(client) = client.as_ref()

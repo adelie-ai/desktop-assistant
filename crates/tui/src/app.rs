@@ -1,3 +1,12 @@
+use ratatui::style::Style;
+use tui_textarea::TextArea;
+
+fn new_textarea() -> TextArea<'static> {
+    let mut ta = TextArea::default();
+    ta.set_cursor_line_style(Style::default());
+    ta
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -29,7 +38,7 @@ pub struct App {
     pub conversations: Vec<ConversationSummary>,
     pub selected_conversation: Option<usize>,
     pub current_conversation: Option<ConversationDetail>,
-    pub input: String,
+    pub textarea: TextArea<'static>,
     pub streaming_buffer: String,
     pub pending_request_id: Option<String>,
     pub mode: InputMode,
@@ -45,7 +54,7 @@ impl App {
             conversations: Vec::new(),
             selected_conversation: None,
             current_conversation: None,
-            input: String::new(),
+            textarea: new_textarea(),
             streaming_buffer: String::new(),
             pending_request_id: None,
             mode: InputMode::Normal,
@@ -109,37 +118,36 @@ impl App {
 
     // --- Input ---
 
-    pub fn insert_char(&mut self, c: char) {
-        self.input.push(c);
-    }
-
-    pub fn delete_char(&mut self) {
-        self.input.pop();
+    /// Returns the textarea content as a single string (lines joined with newlines).
+    pub fn textarea_content(&self) -> String {
+        self.textarea.lines().join("\n")
     }
 
     /// Returns (conversation_id, prompt) if valid, None otherwise.
     pub fn submit_prompt(&mut self) -> Option<(String, String)> {
-        if self.input.is_empty() {
+        let content = self.textarea_content();
+        if content.is_empty() {
             return None;
         }
         let conv = self.current_conversation.as_mut()?;
-        let prompt = std::mem::take(&mut self.input);
         conv.messages.push(ChatMessage {
             role: "user".to_string(),
-            content: prompt.clone(),
+            content: content.clone(),
         });
+        self.textarea = new_textarea();
         self.scroll_offset = 0;
-        Some((conv.id.clone(), prompt))
+        Some((conv.id.clone(), content))
     }
 
     /// Returns the title for the new conversation, or None if empty.
     pub fn submit_new_conversation_title(&mut self) -> Option<String> {
-        if self.input.is_empty() {
+        let content = self.textarea_content();
+        if content.is_empty() {
             return None;
         }
-        let title = std::mem::take(&mut self.input);
+        self.textarea = new_textarea();
         self.mode = InputMode::Normal;
-        Some(title)
+        Some(content)
     }
 
     // --- Mode transitions ---
@@ -154,7 +162,7 @@ impl App {
 
     pub fn enter_creating_conversation_mode(&mut self) {
         self.mode = InputMode::CreatingConversation;
-        self.input.clear();
+        self.textarea = new_textarea();
     }
 
     // --- Streaming ---
@@ -362,25 +370,26 @@ mod tests {
     // --- Input tests ---
 
     #[test]
-    fn insert_and_delete_chars() {
+    fn textarea_insert_and_content() {
         let mut app = App::new();
-        app.insert_char('h');
-        app.insert_char('i');
-        assert_eq!(app.input, "hi");
-        app.delete_char();
-        assert_eq!(app.input, "h");
-        app.delete_char();
-        assert_eq!(app.input, "");
-        app.delete_char(); // no panic on empty
-        assert_eq!(app.input, "");
+        // Type into textarea using its input method
+        app.textarea.insert_char('h');
+        app.textarea.insert_char('i');
+        assert_eq!(app.textarea_content(), "hi");
+        app.textarea.delete_char();
+        assert_eq!(app.textarea_content(), "h");
+        app.textarea.delete_char();
+        assert_eq!(app.textarea_content(), "");
+        app.textarea.delete_char(); // no panic on empty
+        assert_eq!(app.textarea_content(), "");
     }
 
     #[test]
     fn submit_prompt_without_conversation_returns_none() {
         let mut app = App::new();
-        app.input = "hello".into();
+        app.textarea.insert_str("hello");
         assert!(app.submit_prompt().is_none());
-        assert_eq!(app.input, "hello"); // input preserved
+        assert_eq!(app.textarea_content(), "hello"); // input preserved
     }
 
     #[test]
@@ -402,14 +411,14 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
         });
-        app.input = "What is Rust?".into();
+        app.textarea.insert_str("What is Rust?");
 
         let result = app.submit_prompt();
         assert_eq!(
             result,
             Some(("conv1".to_string(), "What is Rust?".to_string()))
         );
-        assert_eq!(app.input, "");
+        assert_eq!(app.textarea_content(), "");
 
         let msgs = &app.current_conversation.as_ref().unwrap().messages;
         assert_eq!(msgs.len(), 1);
@@ -487,22 +496,22 @@ mod tests {
 
         app.enter_creating_conversation_mode();
         assert_eq!(app.mode, InputMode::CreatingConversation);
-        assert_eq!(app.input, ""); // input cleared
+        assert_eq!(app.textarea_content(), ""); // input cleared
 
-        app.input = "leftover".into();
+        app.textarea.insert_str("leftover");
         app.enter_creating_conversation_mode();
-        assert_eq!(app.input, ""); // cleared again
+        assert_eq!(app.textarea_content(), ""); // cleared again
     }
 
     #[test]
     fn submit_new_conversation_title() {
         let mut app = App::new();
         app.enter_creating_conversation_mode();
-        app.input = "My Chat".into();
+        app.textarea.insert_str("My Chat");
 
         let title = app.submit_new_conversation_title();
         assert_eq!(title, Some("My Chat".to_string()));
-        assert_eq!(app.input, "");
+        assert_eq!(app.textarea_content(), "");
         assert_eq!(app.mode, InputMode::Normal);
     }
 
@@ -642,7 +651,7 @@ mod tests {
             messages: vec![],
         });
         app.scroll_up(10);
-        app.input = "hello".into();
+        app.textarea.insert_str("hello");
         app.submit_prompt();
         assert_eq!(app.scroll_offset, 0);
     }

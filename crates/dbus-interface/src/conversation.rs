@@ -122,6 +122,7 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
                     let _ = tx.send(StreamEvent::Complete(full_response));
                 }
                 Err(e) => {
+                    tracing::error!("LLM error for conversation {llm_conv_id}: {e}");
                     let _ = tx.send(StreamEvent::Error(e.to_string()));
                 }
             }
