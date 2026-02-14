@@ -8,6 +8,47 @@ use crate::ports::tools::ToolExecutor;
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
 
+/// Remove the oldest assistant(tool_calls)+tool_result groups from a message
+/// list to reduce context size. Keeps the first user message and the most
+/// recent tool interaction intact. Returns the number of messages removed.
+fn trim_tool_pairs(messages: &mut Vec<Message>) -> usize {
+    // Find ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
+    // groups and remove roughly the oldest half.
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role == Role::Assistant && !messages[i].tool_calls.is_empty() {
+            let start = i;
+            i += 1;
+            while i < messages.len() && messages[i].role == Role::Tool {
+                i += 1;
+            }
+            groups.push(start..i);
+        } else {
+            i += 1;
+        }
+    }
+
+    if groups.len() <= 1 {
+        // Nothing safe to remove — keep the most recent group
+        return 0;
+    }
+
+    // Remove the oldest half of groups
+    let remove_count = groups.len() / 2;
+    let groups_to_remove: Vec<_> = groups[..remove_count].to_vec();
+
+    // Remove in reverse order to keep indices stable
+    let mut removed = 0;
+    for range in groups_to_remove.into_iter().rev() {
+        let len = range.len();
+        messages.drain(range);
+        removed += len;
+    }
+
+    removed
+}
+
 /// A no-op tool executor for use when no MCP servers are configured.
 pub struct NoopToolExecutor;
 
@@ -98,10 +139,38 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let tool_defs = self.tools.available_tools().await;
 
         for round in 0..MAX_TOOL_ROUNDS {
-            let response = self
+            let response = match self
                 .llm
                 .stream_completion(conv.messages.clone(), &tool_defs, on_chunk)
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) if round > 0 => {
+                    // Mid-loop LLM error (e.g. context too long) — trim old
+                    // tool call/result pairs and tell the LLM what happened
+                    // so it can adjust its approach.
+                    tracing::warn!(
+                        "LLM call failed on round {}/{}, trimming context: {e}",
+                        round + 1,
+                        MAX_TOOL_ROUNDS
+                    );
+                    let removed = trim_tool_pairs(&mut conv.messages);
+                    tracing::info!("removed {removed} messages to reduce context");
+                    conv.messages.push(Message::new(
+                        Role::System,
+                        format!(
+                            "Your previous tool call could not be processed because \
+                             the context became too long. {removed} older messages were \
+                             trimmed. The original error was: {e}\n\
+                             Please adjust your approach — for example, request less \
+                             output or take a different path."
+                        ),
+                    ));
+                    on_chunk = Box::new(|_| true);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if !response.has_tool_calls() {
                 // Text-only response — we're done
@@ -571,6 +640,184 @@ mod tests {
 
         let result = handler
             .send_prompt(&conv.id, "Loop forever".into(), noop_callback())
+            .await;
+        assert!(matches!(result, Err(CoreError::Llm(_))));
+    }
+
+    // --- trim_tool_pairs tests ---
+
+    #[test]
+    fn trim_tool_pairs_removes_oldest_half() {
+        let mut messages = vec![
+            Message::new(Role::User, "hello"),
+            // Group 1
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
+            Message::tool_result("c1", "result_1"),
+            // Group 2
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "tool_a", "{}")]),
+            Message::tool_result("c2", "result_2"),
+            // Group 3
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "tool_a", "{}")]),
+            Message::tool_result("c3", "result_3"),
+            // Group 4
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "tool_a", "{}")]),
+            Message::tool_result("c4", "result_4"),
+        ];
+
+        let removed = trim_tool_pairs(&mut messages);
+        // 4 groups, remove oldest half (2 groups = 4 messages)
+        assert_eq!(removed, 4);
+        // Should keep: user + group3 + group4
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].tool_calls[0].id, "c3");
+    }
+
+    #[test]
+    fn trim_tool_pairs_keeps_single_group() {
+        let mut messages = vec![
+            Message::new(Role::User, "hello"),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
+            Message::tool_result("c1", "result"),
+        ];
+
+        let removed = trim_tool_pairs(&mut messages);
+        assert_eq!(removed, 0);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn trim_tool_pairs_no_groups() {
+        let mut messages = vec![
+            Message::new(Role::User, "hello"),
+            Message::new(Role::Assistant, "hi there"),
+        ];
+
+        let removed = trim_tool_pairs(&mut messages);
+        assert_eq!(removed, 0);
+        assert_eq!(messages.len(), 2);
+    }
+
+    // --- Context recovery test ---
+
+    /// Mock LLM that fails on a specific call index.
+    struct FailingLlm {
+        responses: Mutex<Vec<LlmResponse>>,
+        fail_on_call: usize,
+        call_count: Mutex<usize>,
+    }
+
+    impl FailingLlm {
+        fn new(responses: Vec<LlmResponse>, fail_on_call: usize) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                fail_on_call,
+                call_count: Mutex::new(0),
+            }
+        }
+    }
+
+    impl LlmClient for FailingLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let call_idx = {
+                let mut count = self.call_count.lock().unwrap();
+                let idx = *count;
+                *count += 1;
+                idx
+            };
+
+            if call_idx == self.fail_on_call {
+                return Err(CoreError::Llm("context_length_exceeded".into()));
+            }
+
+            let response = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    return Ok(LlmResponse::text("fallback"));
+                }
+                responses.remove(0)
+            };
+            if !response.text.is_empty() {
+                on_chunk(response.text.clone());
+            }
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_recovers_from_context_length_error() {
+        let tools = vec![ToolDefinition::new(
+            "big_tool",
+            "Returns lots of data",
+            serde_json::json!({}),
+        )];
+
+        let responses = vec![
+            // Round 0: LLM requests tool call
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "big_tool", "{}")]),
+            // Round 1: fails (simulated by FailingLlm, call index 1)
+            // Round 2 (retry after trim): LLM succeeds with final text
+            LlmResponse::text("I adjusted my approach"),
+        ];
+
+        let mut tool_results = HashMap::new();
+        tool_results.insert("big_tool".to_string(), "x".repeat(1000));
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            FailingLlm::new(responses, 1), // fail on 2nd LLM call
+            MockToolExecutor::new(tools, tool_results),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "Use big tool".into(), noop_callback())
+            .await
+            .unwrap();
+        assert_eq!(result, "I adjusted my approach");
+
+        // Verify the conversation has a system message about trimming
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let has_system_msg = updated
+            .messages
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("context became too long"));
+        assert!(has_system_msg);
+    }
+
+    #[tokio::test]
+    async fn first_round_llm_error_propagates() {
+        // If the very first LLM call fails, there's nothing to trim — error propagates
+        let tools = vec![];
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            FailingLlm::new(vec![], 0), // fail on 1st call
+            MockToolExecutor::new(tools, HashMap::new()),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "hello".into(), noop_callback())
             .await;
         assert!(matches!(result, Err(CoreError::Llm(_))));
     }
