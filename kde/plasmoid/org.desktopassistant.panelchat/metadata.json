@@ -1,0 +1,20 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Id": "org.desktopassistant.panelchat",
+    "Name": "Desktop Assistant",
+    "Description": "Panel chat widget for Desktop Assistant over D-Bus",
+    "Icon": "preferences-system-network",
+    "Version": "0.1.1",
+    "Website": "https://example.invalid",
+    "License": "MIT",
+    "Authors": [
+      {
+        "Name": "Desktop Assistant Contributors"
+      }
+    ],
+    "Category": "Utilities",
+    "EnabledByDefault": true
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

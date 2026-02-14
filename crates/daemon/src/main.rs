@@ -10,7 +10,7 @@ use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
 use desktop_assistant_mcp_client::config;
 use desktop_assistant_mcp_client::executor::McpToolExecutor;
-use store::InMemoryConversationStore;
+use store::PersistentConversationStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,8 +47,15 @@ async fn main() -> Result<()> {
     }
 
     // Build the conversation service with tool support
+    let conversation_store = PersistentConversationStore::from_default_path()
+        .map_err(|e| anyhow::anyhow!("failed to initialize persistent conversation store: {e}"))?;
+    tracing::info!(
+        "conversation persistence enabled at {}",
+        store::default_conversation_store_path().display()
+    );
+
     let conversation_service = Arc::new(ConversationHandler::with_tools(
-        InMemoryConversationStore::new(),
+        conversation_store,
         llm,
         tool_executor,
         Box::new(|| uuid::Uuid::new_v4().to_string()),

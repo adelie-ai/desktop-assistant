@@ -1,5 +1,7 @@
 use crate::CoreError;
-use crate::domain::{Conversation, ConversationId, ConversationSummary, Message, Role};
+use crate::domain::{
+    Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition,
+};
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{ChunkCallback, LlmClient};
 use crate::ports::store::ConversationStore;
@@ -7,6 +9,43 @@ use crate::ports::tools::ToolExecutor;
 
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
+
+/// Per-turn runtime instruction injected for the LLM.
+const RUNTIME_SYSTEM_INSTRUCTION: &str = "You are a desktop assistant with optional tool access. \
+Do not claim a tool or capability is unavailable unless you actually attempted the relevant tool in this turn \
+or received a concrete error from a tool call. \
+For user requests that are tool-relevant (for example terminal commands, filesystem operations, D-Bus checks, or web/network lookups), \
+you must attempt an appropriate available tool before stating any limitation. \
+Do not make blanket statements such as 'I cannot run commands' or 'I cannot access the network' without a failed tool attempt in this turn. \
+When unsure whether an action is possible (for example network access, filesystem access, or command execution), \
+try the appropriate available tool first. \
+If a tool succeeds, use its result and do not contradict it. \
+If a tool fails, explain that failure briefly and cite the exact error. \
+If no relevant tool is available, state that clearly and ask for the minimal missing information or configuration needed.";
+
+fn llm_messages_for_turn(
+    conversation_messages: &[Message],
+    tool_defs: &[ToolDefinition],
+) -> Vec<Message> {
+    let tool_note = if tool_defs.is_empty() {
+        "No tools are available in this turn.".to_string()
+    } else {
+        let names = tool_defs
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Available tools in this turn: {names}.")
+    };
+
+    let mut messages = Vec::with_capacity(conversation_messages.len() + 1);
+    messages.push(Message::new(
+        Role::System,
+        format!("{RUNTIME_SYSTEM_INSTRUCTION}\n\n{tool_note}"),
+    ));
+    messages.extend_from_slice(conversation_messages);
+    messages
+}
 
 /// Remove the oldest assistant(tool_calls)+tool_result groups from a message
 /// list to reduce context size. Keeps the first user message and the most
@@ -139,9 +178,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let tool_defs = self.tools.available_tools().await;
 
         for round in 0..MAX_TOOL_ROUNDS {
+            let llm_messages = llm_messages_for_turn(&conv.messages, &tool_defs);
             let response = match self
                 .llm
-                .stream_completion(conv.messages.clone(), &tool_defs, on_chunk)
+                .stream_completion(llm_messages, &tool_defs, on_chunk)
                 .await
             {
                 Ok(r) => r,
@@ -835,5 +875,102 @@ mod tests {
             .execute_tool("anything", serde_json::json!({}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    struct CapturingLlm {
+        seen_messages: Arc<Mutex<Vec<Message>>>,
+    }
+
+    impl LlmClient for CapturingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            *self.seen_messages.lock().unwrap() = messages;
+            Ok(LlmResponse::text("ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_input_includes_runtime_instruction_message() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let seen = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            CapturingLlm {
+                seen_messages: Arc::clone(&seen),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let _ = handler
+            .send_prompt(&conv.id, "hello".into(), noop_callback())
+            .await
+            .unwrap();
+
+        let messages = seen.lock().unwrap();
+        assert!(!messages.is_empty());
+        assert_eq!(messages[0].role, Role::System);
+        assert!(
+            messages[0]
+                .content
+                .contains("Do not claim a tool or capability is unavailable")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("No tools are available in this turn.")
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_input_runtime_instruction_lists_available_tools() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let seen = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let tools = vec![ToolDefinition::new(
+            "terminal",
+            "Run terminal command",
+            serde_json::json!({"type": "object"}),
+        )];
+        let tool_results = HashMap::new();
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            CapturingLlm {
+                seen_messages: Arc::clone(&seen),
+            },
+            MockToolExecutor::new(tools, tool_results),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let _ = handler
+            .send_prompt(&conv.id, "hello".into(), noop_callback())
+            .await
+            .unwrap();
+
+        let messages = seen.lock().unwrap();
+        assert!(!messages.is_empty());
+        assert_eq!(messages[0].role, Role::System);
+        assert!(
+            messages[0]
+                .content
+                .contains("Available tools in this turn: terminal.")
+        );
     }
 }

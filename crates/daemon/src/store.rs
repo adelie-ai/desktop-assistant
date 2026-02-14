@@ -1,17 +1,149 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId};
 use desktop_assistant_core::ports::store::ConversationStore;
 
+/// Default persistent conversation file path following XDG base directories.
+///
+/// - `$XDG_DATA_HOME/desktop-assistant/conversations.json`, or
+/// - `$HOME/.local/share/desktop-assistant/conversations.json` when
+///   `XDG_DATA_HOME` is not set.
+pub fn default_conversation_store_path() -> PathBuf {
+    let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{home}/.local/share")
+    });
+
+    PathBuf::from(data_home)
+        .join("desktop-assistant")
+        .join("conversations.json")
+}
+
+/// Persistent conversation store backed by a JSON file.
+pub struct PersistentConversationStore {
+    data: Mutex<HashMap<String, Conversation>>,
+    path: PathBuf,
+}
+
+impl PersistentConversationStore {
+    pub fn new(path: PathBuf) -> Result<Self, CoreError> {
+        let mut data = HashMap::new();
+
+        if path.exists() {
+            let content = fs::read_to_string(&path).map_err(|e| {
+                CoreError::Storage(format!("failed reading store file {}: {e}", path.display()))
+            })?;
+
+            if !content.trim().is_empty() {
+                let conversations: Vec<Conversation> =
+                    serde_json::from_str(&content).map_err(|e| {
+                        CoreError::Storage(format!(
+                            "failed parsing store file {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+
+                for conversation in conversations {
+                    data.insert(conversation.id.0.clone(), conversation);
+                }
+            }
+        }
+
+        Ok(Self {
+            data: Mutex::new(data),
+            path,
+        })
+    }
+
+    pub fn from_default_path() -> Result<Self, CoreError> {
+        Self::new(default_conversation_store_path())
+    }
+
+    fn persist(&self, data: &HashMap<String, Conversation>) -> Result<(), CoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                CoreError::Storage(format!(
+                    "failed creating store directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        let conversations: Vec<Conversation> = data.values().cloned().collect();
+        let serialized = serde_json::to_string_pretty(&conversations)
+            .map_err(|e| CoreError::Storage(format!("failed serializing conversations: {e}")))?;
+
+        let tmp_path = self.path.with_extension("json.tmp");
+        fs::write(&tmp_path, serialized).map_err(|e| {
+            CoreError::Storage(format!(
+                "failed writing temporary store file {}: {e}",
+                tmp_path.display()
+            ))
+        })?;
+        fs::rename(&tmp_path, &self.path).map_err(|e| {
+            CoreError::Storage(format!(
+                "failed replacing store file {}: {e}",
+                self.path.display()
+            ))
+        })?;
+
+        Ok(())
+    }
+}
+
+impl ConversationStore for PersistentConversationStore {
+    async fn create(&self, conv: Conversation) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        data.insert(conv.id.0.clone(), conv);
+        self.persist(&data)
+    }
+
+    async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+        self.data
+            .lock()
+            .unwrap()
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+    }
+
+    async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+        Ok(self.data.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        if data.contains_key(&conv.id.0) {
+            data.insert(conv.id.0.clone(), conv);
+            self.persist(&data)
+        } else {
+            Err(CoreError::ConversationNotFound(conv.id.0.clone()))
+        }
+    }
+
+    async fn delete(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        if data.remove(&id.0).is_some() {
+            self.persist(&data)
+        } else {
+            Err(CoreError::ConversationNotFound(id.0.clone()))
+        }
+    }
+}
+
 /// In-memory conversation store backed by a `Mutex<HashMap>`.
 /// Suitable for development and testing; swap for a persistent backend later.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct InMemoryConversationStore {
     data: Mutex<HashMap<String, Conversation>>,
 }
 
 impl InMemoryConversationStore {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
         Self {
             data: Mutex::new(HashMap::new()),
@@ -62,6 +194,13 @@ impl ConversationStore for InMemoryConversationStore {
 mod tests {
     use super::*;
     use desktop_assistant_core::domain::{Message, Role};
+
+    fn temp_store_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "desktop-assistant-store-test-{}.json",
+            uuid::Uuid::new_v4()
+        ))
+    }
 
     #[tokio::test]
     async fn create_and_get() {
@@ -128,5 +267,56 @@ mod tests {
         let store = InMemoryConversationStore::new();
         let result = store.delete(&ConversationId::from("nope")).await;
         assert!(matches!(result, Err(CoreError::ConversationNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn persistent_store_survives_restart() {
+        let path = temp_store_path();
+
+        let mut conversation = Conversation::new("c1", "Persisted");
+        conversation
+            .messages
+            .push(Message::new(Role::User, "hello there"));
+
+        {
+            let store = PersistentConversationStore::new(path.clone()).unwrap();
+            store.create(conversation).await.unwrap();
+        }
+
+        let reopened = PersistentConversationStore::new(path.clone()).unwrap();
+        let loaded = reopened.get(&ConversationId::from("c1")).await.unwrap();
+        assert_eq!(loaded.title, "Persisted");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "hello there");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persistent_store_delete_persists() {
+        let path = temp_store_path();
+
+        {
+            let store = PersistentConversationStore::new(path.clone()).unwrap();
+            store
+                .create(Conversation::new("c1", "Will be deleted"))
+                .await
+                .unwrap();
+            store.delete(&ConversationId::from("c1")).await.unwrap();
+        }
+
+        let reopened = PersistentConversationStore::new(path.clone()).unwrap();
+        let missing = reopened.get(&ConversationId::from("c1")).await;
+        assert!(matches!(missing, Err(CoreError::ConversationNotFound(_))));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn default_store_path_uses_desktop_assistant_data_dir() {
+        let path = default_conversation_store_path();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("desktop-assistant"));
+        assert!(path_str.ends_with("conversations.json"));
     }
 }

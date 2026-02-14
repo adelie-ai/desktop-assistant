@@ -84,6 +84,38 @@ just backend-restart
 just backend-logs
 ```
 
+## KDE Widgets (Plasmoids)
+
+This repository includes two KDE Plasma widgets that talk to the daemon over D-Bus:
+
+- Panel widget: `kde/plasmoid/org.desktopassistant.panelchat`
+- Desktop widget: `kde/plasmoid/org.desktopassistant.desktopchat`
+
+Install both for your user:
+
+```bash
+kpackagetool6 --type Plasma/Applet --install kde/plasmoid/org.desktopassistant.panelchat
+kpackagetool6 --type Plasma/Applet --install kde/plasmoid/org.desktopassistant.desktopchat
+```
+
+Upgrade after local changes:
+
+```bash
+kpackagetool6 --type Plasma/Applet --upgrade kde/plasmoid/org.desktopassistant.panelchat
+kpackagetool6 --type Plasma/Applet --upgrade kde/plasmoid/org.desktopassistant.desktopchat
+```
+
+Usage:
+
+- Add **Desktop Assistant** to the panel/task bar for quick popup chat.
+- Add **Desktop Assistant (Desktop)** to the desktop for an always-visible chat card.
+
+Notes:
+
+- Both widgets use the service `org.desktopAssistant` at `/org/desktopAssistant/Conversations`.
+- Both widgets shell out to `python3` and `gdbus` to call methods documented in `docs/dbus-api.md`.
+- Ensure the daemon is running (`just backend-status` / `just backend-restart`) before sending prompts.
+
 ## Core Commands
 
 ```bash
@@ -108,3 +140,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - If `OPENAI_API_KEY` is missing, daemon still starts but prompt calls will fail at runtime.
 - If MCP config is missing, daemon runs with no external tools.
+- Conversations persist across daemon restarts in:
+	- `$XDG_DATA_HOME/desktop-assistant/conversations.json`, or
+	- `~/.local/share/desktop-assistant/conversations.json` if `XDG_DATA_HOME` is unset.

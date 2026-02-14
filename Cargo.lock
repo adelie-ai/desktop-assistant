@@ -249,6 +249,7 @@ dependencies = [
  "desktop-assistant-dbus",
  "desktop-assistant-llm-openai",
  "desktop-assistant-mcp-client",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
