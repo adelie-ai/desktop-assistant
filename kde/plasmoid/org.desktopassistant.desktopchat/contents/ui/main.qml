@@ -15,7 +15,7 @@ PlasmoidItem {
     property bool busy: false
     property bool debugEnabled: false
     property int currentMessageCount: 0
-    property string transcriptText: "[status] Initializing v0.1.1..."
+    property string transcriptText: "[status] Ready"
     property string promptText: ""
     property var conversationChoices: []
     readonly property var pending: ({})
@@ -201,6 +201,10 @@ PlasmoidItem {
         )
     }
 
+    function clearTranscriptView() {
+        transcriptText = "[status] View cleared"
+    }
+
     function sendPrompt(textValue) {
         const sourceText = (textValue === undefined || textValue === null) ? promptText : textValue
         const prompt = sourceText.trim()
@@ -359,6 +363,10 @@ PlasmoidItem {
                 enabled: !busy
                 onClicked: sendPrompt(root.promptText)
             }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
 
             QQC2.Button {
                 text: "New"
@@ -370,6 +378,12 @@ PlasmoidItem {
                 text: "Refresh"
                 enabled: !busy
                 onClicked: refreshConversation()
+            }
+
+            QQC2.Button {
+                text: "Clear"
+                enabled: !busy
+                onClicked: clearTranscriptView()
             }
         }
     }

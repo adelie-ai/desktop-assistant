@@ -109,6 +109,10 @@ Usage:
 
 - Add **Desktop Assistant** to the panel/task bar for quick popup chat.
 - Add **Desktop Assistant (Desktop)** to the desktop for an always-visible chat card.
+- Widget controls include:
+	- **New**: start a fresh conversation.
+	- **Debug**: show/hide low-level tool execution status lines.
+	- **Clear**: clear the visible transcript without deleting conversation history.
 
 Notes:
 

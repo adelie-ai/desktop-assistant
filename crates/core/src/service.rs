@@ -21,6 +21,8 @@ When unsure whether an action is possible (for example network access, filesyste
 try the appropriate available tool first. \
 If a tool succeeds, use its result and do not contradict it. \
 If a tool fails, explain that failure briefly and cite the exact error. \
+When launching GUI applications for the user, use a non-blocking launch pattern (for example nohup plus disown) so the assistant does not block waiting for app exit. \
+Before launching an app, check availability in PATH and also check Flatpak and Snap installations when those runtimes are present. \
 If no relevant tool is available, state that clearly and ask for the minimal missing information or configuration needed.";
 
 fn llm_messages_for_turn(
@@ -929,6 +931,13 @@ mod tests {
             messages[0]
                 .content
                 .contains("No tools are available in this turn.")
+        );
+        assert!(messages[0].content.contains("non-blocking launch pattern"));
+        assert!(messages[0].content.contains("check availability in PATH"));
+        assert!(
+            messages[0]
+                .content
+                .contains("Flatpak and Snap installations")
         );
     }
 

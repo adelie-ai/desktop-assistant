@@ -198,6 +198,10 @@ PlasmoidItem {
         })
     }
 
+    function clearTranscriptView() {
+        transcriptText = "[status] View cleared"
+    }
+
     readonly property var pending: ({})
 
     Plasma5Support.DataSource {
@@ -294,11 +298,21 @@ PlasmoidItem {
                     enabled: !busy
                     onClicked: sendPrompt(root.promptText)
                 }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
 
                 QQC2.Button {
                     text: "New"
                     enabled: !busy
                     onClicked: newConversation()
+                }
+
+                QQC2.Button {
+                    text: "Clear"
+                    enabled: !busy
+                    onClicked: clearTranscriptView()
                 }
             }
         }
