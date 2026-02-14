@@ -5,6 +5,7 @@ use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::Mutex;
 
+use crate::builtin::BuiltinToolService;
 use crate::{McpClient, McpError};
 
 /// Configuration for an MCP server.
@@ -30,6 +31,8 @@ pub struct McpToolExecutor {
     cached_resources: Mutex<Vec<serde_json::Value>>,
     /// Cached metadata for MCP prompts across all connected servers.
     cached_prompts: Mutex<Vec<serde_json::Value>>,
+    /// Built-in in-process tools (preferences + factual memory).
+    builtin_tools: BuiltinToolService,
 }
 
 impl McpToolExecutor {
@@ -42,6 +45,7 @@ impl McpToolExecutor {
             cached_tools: Mutex::new(Vec::new()),
             cached_resources: Mutex::new(Vec::new()),
             cached_prompts: Mutex::new(Vec::new()),
+            builtin_tools: BuiltinToolService::from_default_paths(),
         }
     }
 
@@ -261,7 +265,9 @@ impl ToolExecutor for McpToolExecutor {
         if let Err(e) = self.maybe_refresh_metadata().await {
             tracing::warn!("failed to refresh MCP tools cache: {e}");
         }
-        self.cached_tools.lock().await.clone()
+        let mut tools = self.cached_tools.lock().await.clone();
+        tools.extend(self.builtin_tools.tool_definitions());
+        tools
     }
 
     async fn execute_tool(
@@ -269,6 +275,10 @@ impl ToolExecutor for McpToolExecutor {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<String, CoreError> {
+        if BuiltinToolService::supports_tool(name) {
+            return self.builtin_tools.execute_tool(name, arguments);
+        }
+
         self.maybe_refresh_metadata()
             .await
             .map_err(|e| CoreError::ToolExecution(format!("failed to refresh tools: {e}")))?;
@@ -333,7 +343,12 @@ mod tests {
     async fn executor_no_configs_returns_empty_tools() {
         let executor = McpToolExecutor::new(vec![]);
         let tools = executor.available_tools().await;
-        assert!(tools.is_empty());
+        assert!(!tools.is_empty());
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "builtin_preferences_remember")
+        );
     }
 
     #[tokio::test]
@@ -352,5 +367,30 @@ mod tests {
             .execute_tool("nonexistent", serde_json::json!({}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    #[tokio::test]
+    async fn executor_includes_builtin_tools() {
+        let executor = McpToolExecutor::new(vec![]);
+        let tools = executor.available_tools().await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"builtin_preferences_remember"));
+        assert!(names.contains(&"builtin_memory_update"));
+    }
+
+    #[tokio::test]
+    async fn executor_executes_builtin_tool() {
+        let executor = McpToolExecutor::new(vec![]);
+        let result = executor
+            .execute_tool(
+                "builtin_preferences_remember",
+                serde_json::json!({
+                    "key": "editor",
+                    "value": "vscode"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("\"ok\":true"));
     }
 }

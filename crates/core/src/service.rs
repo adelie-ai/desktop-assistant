@@ -23,6 +23,8 @@ If a tool succeeds, use its result and do not contradict it. \
 If a tool fails, explain that failure briefly and cite the exact error. \
 When launching GUI applications for the user, use a non-blocking launch pattern (for example nohup plus disown) so the assistant does not block waiting for app exit. \
 Before launching an app, check availability in PATH and also check Flatpak and Snap installations when those runtimes are present. \
+Use built-in preference tools (builtin_preferences_remember/search/retrieve) for durable user preferences. \
+Use built-in memory tools (builtin_memory_remember/search/retrieve/update) for durable factual memory and corrections. \
 If no relevant tool is available, state that clearly and ask for the minimal missing information or configuration needed.";
 
 fn llm_messages_for_turn(
@@ -938,6 +940,16 @@ mod tests {
             messages[0]
                 .content
                 .contains("Flatpak and Snap installations")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("builtin_preferences_remember/search/retrieve")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("builtin_memory_remember/search/retrieve/update")
         );
     }
 

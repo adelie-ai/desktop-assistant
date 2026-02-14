@@ -140,6 +140,29 @@ cargo clippy --workspace --all-targets -- -D warnings
 - [MCP Integration](docs/mcp-integration.md)
 - [Development Guide](docs/development.md)
 
+## Built-in Memory Tools
+
+The daemon now includes built-in in-process tools exposed through the MCP executor, even when no external MCP servers are configured:
+
+- Preferences:
+	- `builtin_preferences_remember`
+	- `builtin_preferences_search`
+	- `builtin_preferences_retrieve`
+- Factual memory:
+	- `builtin_memory_remember`
+	- `builtin_memory_search`
+	- `builtin_memory_retrieve`
+	- `builtin_memory_update`
+
+Storage paths:
+
+- Preferences:
+	- `$XDG_DATA_HOME/desktop-assistant/preferences.json`, or
+	- `~/.local/share/desktop-assistant/preferences.json` when `XDG_DATA_HOME` is unset.
+- Factual memory:
+	- `$XDG_DATA_HOME/desktop-assistant/factual_memory.json`, or
+	- `~/.local/share/desktop-assistant/factual_memory.json` when `XDG_DATA_HOME` is unset.
+
 ## Notes
 
 - If `OPENAI_API_KEY` is missing, daemon still starts but prompt calls will fail at runtime.
