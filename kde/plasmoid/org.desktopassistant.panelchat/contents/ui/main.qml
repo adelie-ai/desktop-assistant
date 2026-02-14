@@ -318,8 +318,9 @@ PlasmoidItem {
                         readonly property bool isStatus: modelData.kind === "status"
                         readonly property bool isAssistant: modelData.role === "assistant"
 
+                        visible: !isStatus || root.debugEnabled
                         width: ListView.view.width
-                        implicitHeight: bubble.height + 2
+                        implicitHeight: visible ? bubble.height + 2 : 0
 
                         Rectangle {
                             id: bubble
@@ -329,7 +330,7 @@ PlasmoidItem {
                             width: isStatus
                                 ? parent.width
                                 : Math.min(parent.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
-                            height: messageText.implicitHeight + 12
+                            height: Math.max(messageText.contentHeight, messageText.implicitHeight) + 12
                             radius: isStatus ? 0 : 8
                             color: isStatus
                                 ? "transparent"
@@ -337,11 +338,14 @@ PlasmoidItem {
                             border.width: isStatus ? 0 : 1
                             border.color: PlasmaCore.Theme.disabledTextColor
 
-                            Text {
+                            TextEdit {
                                 id: messageText
                                 anchors.fill: parent
                                 anchors.margins: 6
-                                wrapMode: Text.Wrap
+                                readOnly: true
+                                selectByMouse: true
+                                selectByKeyboard: true
+                                wrapMode: TextEdit.Wrap
                                 textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
                                 text: isStatus
                                     ? "[status] " + String(modelData.text || "")
@@ -355,6 +359,9 @@ PlasmoidItem {
                                         : PlasmaCore.Theme.highlightedTextColor)
                                 font.italic: isStatus
                                 font.bold: false
+                                activeFocusOnPress: true
+                                selectedTextColor: isAssistant ? PlasmaCore.Theme.highlightedTextColor : PlasmaCore.Theme.textColor
+                                selectionColor: isAssistant ? PlasmaCore.Theme.highlightColor : PlasmaCore.Theme.backgroundColor
                                 onLinkActivated: function(link) {
                                     Qt.openUrlExternally(link)
                                 }
