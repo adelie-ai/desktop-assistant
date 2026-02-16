@@ -92,11 +92,13 @@ impl DbusClient {
         let raw = self.proxy.list_conversations(0).await?;
         Ok(raw
             .into_iter()
-            .map(|(id, title, message_count, _updated_at)| ConversationSummary {
-                id,
-                title,
-                message_count,
-            })
+            .map(
+                |(id, title, message_count, _updated_at)| ConversationSummary {
+                    id,
+                    title,
+                    message_count,
+                },
+            )
             .collect())
     }
 

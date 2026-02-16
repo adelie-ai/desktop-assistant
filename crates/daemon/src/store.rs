@@ -12,6 +12,10 @@ fn now_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn should_persist(conversation: &Conversation) -> bool {
+    !conversation.messages.is_empty()
+}
+
 /// Default persistent conversation file path following XDG base directories.
 ///
 /// - `$XDG_DATA_HOME/desktop-assistant/conversations.json`, or
@@ -54,6 +58,11 @@ impl PersistentConversationStore {
                     })?;
 
                 for mut conversation in conversations {
+                    if !should_persist(&conversation) {
+                        needs_migration = true;
+                        continue;
+                    }
+
                     let created = conversation.created_at.trim().to_string();
                     let updated = conversation.updated_at.trim().to_string();
                     if created.is_empty() && updated.is_empty() {
@@ -101,7 +110,11 @@ impl PersistentConversationStore {
             })?;
         }
 
-        let conversations: Vec<Conversation> = data.values().cloned().collect();
+        let conversations: Vec<Conversation> = data
+            .values()
+            .filter(|conversation| should_persist(conversation))
+            .cloned()
+            .collect();
         let serialized = serde_json::to_string_pretty(&conversations)
             .map_err(|e| CoreError::Storage(format!("failed serializing conversations: {e}")))?;
 
@@ -341,6 +354,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_store_does_not_persist_empty_conversation() {
+        let path = temp_store_path();
+
+        {
+            let store = PersistentConversationStore::new(path.clone()).unwrap();
+            store
+                .create(Conversation::new("empty-1", "Empty Chat"))
+                .await
+                .unwrap();
+        }
+
+        let reopened = PersistentConversationStore::new(path.clone()).unwrap();
+        let all = reopened.list().await.unwrap();
+        assert!(all.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persistent_store_load_drops_empty_conversations() {
+        let path = temp_store_path();
+
+        let legacy = serde_json::json!([
+            {
+                "id": "legacy-empty",
+                "title": "Legacy Empty",
+                "messages": []
+            },
+            {
+                "id": "legacy-non-empty",
+                "title": "Legacy Non Empty",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "hello"
+                    }
+                ]
+            }
+        ]);
+        fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let store = PersistentConversationStore::new(path.clone()).unwrap();
+        let all = store.list().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id.as_str(), "legacy-non-empty");
+
+        let reopened = PersistentConversationStore::new(path.clone()).unwrap();
+        let all_reopened = reopened.list().await.unwrap();
+        assert_eq!(all_reopened.len(), 1);
+        assert_eq!(all_reopened[0].id.as_str(), "legacy-non-empty");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn persistent_store_migrates_missing_timestamps() {
         let path = temp_store_path();
 
@@ -348,7 +416,12 @@ mod tests {
             {
                 "id": "legacy-1",
                 "title": "Legacy Chat",
-                "messages": []
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "hello"
+                    }
+                ]
             }
         ]);
         fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
@@ -362,7 +435,10 @@ mod tests {
         assert_eq!(migrated.updated_at.len(), 19);
 
         let reopened = PersistentConversationStore::new(path.clone()).unwrap();
-        let migrated_again = reopened.get(&ConversationId::from("legacy-1")).await.unwrap();
+        let migrated_again = reopened
+            .get(&ConversationId::from("legacy-1"))
+            .await
+            .unwrap();
         assert!(!migrated_again.created_at.is_empty());
         assert!(!migrated_again.updated_at.is_empty());
 

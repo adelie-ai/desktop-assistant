@@ -188,9 +188,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
         if let Some(days) = max_age_days.filter(|days| *days > 0) {
             let cutoff = cutoff_timestamp(days);
-            convs.retain(|conv| {
-                !conv.updated_at.is_empty() && conv.updated_at >= cutoff
-            });
+            convs.retain(|conv| !conv.updated_at.is_empty() && conv.updated_at >= cutoff);
         }
 
         convs.sort_by(|left, right| {
