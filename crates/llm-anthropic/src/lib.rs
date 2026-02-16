@@ -1,0 +1,607 @@
+use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncBufReadExt;
+use tokio_stream::StreamExt;
+
+/// Anthropic Messages API client that streams completions via SSE.
+pub struct AnthropicClient {
+    client: Client,
+    api_key: String,
+    model: String,
+    base_url: String,
+    max_tokens: u32,
+}
+
+impl AnthropicClient {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            client: Client::new(),
+            api_key,
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            max_tokens: 8192,
+        }
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+}
+
+// --- Request types ---
+
+#[derive(Serialize)]
+struct MessagesRequest {
+    model: String,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    messages: Vec<AnthropicMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<AnthropicTool>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct AnthropicMessage {
+    role: String,
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+#[derive(Serialize)]
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+impl From<&ToolDefinition> for AnthropicTool {
+    fn from(def: &ToolDefinition) -> Self {
+        AnthropicTool {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            input_schema: def.parameters.clone(),
+        }
+    }
+}
+
+/// Convert domain messages into Anthropic API messages, extracting the system prompt.
+fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessage>) {
+    let mut system = None;
+    let mut api_messages: Vec<AnthropicMessage> = Vec::new();
+
+    for msg in messages {
+        match msg.role {
+            Role::System => {
+                system = Some(msg.content.clone());
+            }
+            Role::User => {
+                api_messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: msg.content.clone(),
+                    }],
+                });
+            }
+            Role::Assistant => {
+                let mut content: Vec<ContentBlock> = Vec::new();
+                if !msg.content.is_empty() {
+                    content.push(ContentBlock::Text {
+                        text: msg.content.clone(),
+                    });
+                }
+                for tc in &msg.tool_calls {
+                    let input: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Object(
+                            serde_json::Map::new(),
+                        ));
+                    content.push(ContentBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        input,
+                    });
+                }
+                if content.is_empty() {
+                    content.push(ContentBlock::Text {
+                        text: String::new(),
+                    });
+                }
+                api_messages.push(AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content,
+                });
+            }
+            Role::Tool => {
+                let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
+                api_messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: msg.content.clone(),
+                    }],
+                });
+            }
+        }
+    }
+
+    (system, api_messages)
+}
+
+// --- SSE response types ---
+
+#[derive(Deserialize, Debug)]
+struct SseEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    index: Option<usize>,
+    content_block: Option<SseContentBlock>,
+    delta: Option<SseDelta>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+enum SseContentBlock {
+    #[serde(rename = "text")]
+    Text {
+        #[allow(dead_code)]
+        text: String,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+enum SseDelta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+}
+
+/// Accumulator for building tool calls from streaming content blocks.
+#[derive(Default)]
+struct ToolCallAccumulator {
+    entries: Vec<ToolCallEntry>,
+}
+
+#[derive(Default)]
+struct ToolCallEntry {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCallAccumulator {
+    fn start_tool_use(&mut self, index: usize, id: String, name: String) {
+        while self.entries.len() <= index {
+            self.entries.push(ToolCallEntry::default());
+        }
+        let entry = &mut self.entries[index];
+        entry.id = id;
+        entry.name = name;
+    }
+
+    fn append_json(&mut self, index: usize, partial_json: &str) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.arguments.push_str(partial_json);
+        }
+    }
+
+    fn into_tool_calls(self) -> Vec<ToolCall> {
+        self.entries
+            .into_iter()
+            .map(|e| ToolCall::new(e.id, e.name, e.arguments))
+            .collect()
+    }
+}
+
+impl LlmClient for AnthropicClient {
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        mut on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let api_tools: Vec<AnthropicTool> = tools.iter().map(AnthropicTool::from).collect();
+        let (system, api_messages) = convert_messages(&messages);
+
+        let request = MessagesRequest {
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            system,
+            messages: api_messages,
+            stream: true,
+            tools: api_tools,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(CoreError::Llm(format!(
+                "Anthropic API error (HTTP {status}): {body}"
+            )));
+        }
+
+        let byte_stream = response.bytes_stream();
+        let mapped_stream = byte_stream.map(|result: Result<bytes::Bytes, reqwest::Error>| {
+            result.map_err(std::io::Error::other)
+        });
+        let stream_reader = tokio_util::io::StreamReader::new(mapped_stream);
+        let mut lines = tokio::io::BufReader::new(stream_reader).lines();
+
+        let mut full_response = String::new();
+        let mut tool_acc = ToolCallAccumulator::default();
+        // Track the current content block index for mapping tool_use blocks
+        // to accumulator indices (only counting tool_use blocks).
+        let mut tool_block_count: usize = 0;
+        // Map from SSE content block index to tool accumulator index.
+        let mut block_to_tool: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?
+        {
+            let line = line.trim().to_string();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    break;
+                }
+
+                match serde_json::from_str::<SseEvent>(data) {
+                    Ok(event) => match event.event_type.as_str() {
+                        "content_block_start" => {
+                            if let (Some(index), Some(block)) =
+                                (event.index, &event.content_block)
+                            {
+                                match block {
+                                    SseContentBlock::ToolUse { id, name } => {
+                                        let tool_idx = tool_block_count;
+                                        tool_block_count += 1;
+                                        block_to_tool.insert(index, tool_idx);
+                                        tool_acc.start_tool_use(
+                                            tool_idx,
+                                            id.clone(),
+                                            name.clone(),
+                                        );
+                                    }
+                                    SseContentBlock::Text { .. } => {}
+                                }
+                            }
+                        }
+                        "content_block_delta" => {
+                            if let Some(delta) = &event.delta {
+                                match delta {
+                                    SseDelta::TextDelta { text } => {
+                                        full_response.push_str(text);
+                                        if !on_chunk(text.clone()) {
+                                            tracing::debug!("streaming aborted by callback");
+                                            return Ok(LlmResponse::text(full_response));
+                                        }
+                                    }
+                                    SseDelta::InputJsonDelta { partial_json } => {
+                                        if let Some(index) = event.index {
+                                            if let Some(&tool_idx) = block_to_tool.get(&index) {
+                                                tool_acc.append_json(tool_idx, partial_json);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "message_stop" => {
+                            break;
+                        }
+                        _ => {
+                            // message_start, content_block_stop, message_delta, ping — ignore
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("failed to parse SSE event: {e}, data: {data}");
+                    }
+                }
+            }
+        }
+
+        let tool_calls = tool_acc.into_tool_calls();
+        if tool_calls.is_empty() {
+            Ok(LlmResponse::text(full_response))
+        } else {
+            Ok(LlmResponse::with_tool_calls(full_response, tool_calls))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_builder() {
+        let client = AnthropicClient::new("test-key".into())
+            .with_model("claude-haiku-3-5")
+            .with_base_url("http://localhost:8080")
+            .with_max_tokens(4096);
+        assert_eq!(client.model, "claude-haiku-3-5");
+        assert_eq!(client.base_url, "http://localhost:8080");
+        assert_eq!(client.max_tokens, 4096);
+        assert_eq!(client.api_key, "test-key");
+    }
+
+    #[test]
+    fn client_defaults() {
+        let client = AnthropicClient::new("key".into());
+        assert_eq!(client.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(client.base_url, "https://api.anthropic.com");
+        assert_eq!(client.max_tokens, 8192);
+    }
+
+    #[test]
+    fn convert_user_message() {
+        let messages = vec![Message::new(Role::User, "hello")];
+        let (system, api_msgs) = convert_messages(&messages);
+        assert!(system.is_none());
+        assert_eq!(api_msgs.len(), 1);
+        assert_eq!(api_msgs[0].role, "user");
+        match &api_msgs[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "hello"),
+            _ => panic!("expected text block"),
+        }
+    }
+
+    #[test]
+    fn convert_system_message_extracted() {
+        let messages = vec![
+            Message::new(Role::System, "you are helpful"),
+            Message::new(Role::User, "hi"),
+        ];
+        let (system, api_msgs) = convert_messages(&messages);
+        assert_eq!(system.as_deref(), Some("you are helpful"));
+        assert_eq!(api_msgs.len(), 1); // system not in messages array
+        assert_eq!(api_msgs[0].role, "user");
+    }
+
+    #[test]
+    fn convert_assistant_message() {
+        let messages = vec![Message::new(Role::Assistant, "sure")];
+        let (_, api_msgs) = convert_messages(&messages);
+        assert_eq!(api_msgs[0].role, "assistant");
+        match &api_msgs[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "sure"),
+            _ => panic!("expected text block"),
+        }
+    }
+
+    #[test]
+    fn convert_assistant_with_tool_calls() {
+        let calls = vec![ToolCall::new("c1", "read_file", r#"{"path": "/tmp/a"}"#)];
+        let msg = Message::assistant_with_tool_calls(calls);
+        let (_, api_msgs) = convert_messages(&[msg]);
+        assert_eq!(api_msgs[0].role, "assistant");
+        assert_eq!(api_msgs[0].content.len(), 1); // no text, just tool_use
+        match &api_msgs[0].content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "c1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "/tmp/a");
+            }
+            _ => panic!("expected tool_use block"),
+        }
+    }
+
+    #[test]
+    fn convert_tool_result_message() {
+        let msg = Message::tool_result("call-1", "file contents");
+        let (_, api_msgs) = convert_messages(&[msg]);
+        assert_eq!(api_msgs[0].role, "user");
+        match &api_msgs[0].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, "call-1");
+                assert_eq!(content, "file contents");
+            }
+            _ => panic!("expected tool_result block"),
+        }
+    }
+
+    #[test]
+    fn tool_definition_conversion() {
+        let def = ToolDefinition::new("test", "A test tool", serde_json::json!({"type": "object"}));
+        let tool = AnthropicTool::from(&def);
+        assert_eq!(tool.name, "test");
+        assert_eq!(tool.description, "A test tool");
+        assert_eq!(tool.input_schema, serde_json::json!({"type": "object"}));
+    }
+
+    #[test]
+    fn parse_content_block_start_tool_use() {
+        let data = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc","name":"read_file"}}"#;
+        let event: SseEvent = serde_json::from_str(data).unwrap();
+        assert_eq!(event.event_type, "content_block_start");
+        assert_eq!(event.index, Some(1));
+        match event.content_block.unwrap() {
+            SseContentBlock::ToolUse { id, name } => {
+                assert_eq!(id, "toolu_abc");
+                assert_eq!(name, "read_file");
+            }
+            _ => panic!("expected tool_use"),
+        }
+    }
+
+    #[test]
+    fn parse_content_block_start_text() {
+        let data = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        let event: SseEvent = serde_json::from_str(data).unwrap();
+        assert_eq!(event.event_type, "content_block_start");
+        match event.content_block.unwrap() {
+            SseContentBlock::Text { text } => assert_eq!(text, ""),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn parse_content_block_delta_text() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+        let event: SseEvent = serde_json::from_str(data).unwrap();
+        assert_eq!(event.event_type, "content_block_delta");
+        match event.delta.unwrap() {
+            SseDelta::TextDelta { text } => assert_eq!(text, "Hello"),
+            _ => panic!("expected text_delta"),
+        }
+    }
+
+    #[test]
+    fn parse_content_block_delta_input_json() {
+        let data = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"pa"}}"#;
+        let event: SseEvent = serde_json::from_str(data).unwrap();
+        assert_eq!(event.event_type, "content_block_delta");
+        match event.delta.unwrap() {
+            SseDelta::InputJsonDelta { partial_json } => assert_eq!(partial_json, "{\"pa"),
+            _ => panic!("expected input_json_delta"),
+        }
+    }
+
+    #[test]
+    fn tool_call_accumulator_builds_from_blocks() {
+        let mut acc = ToolCallAccumulator::default();
+
+        acc.start_tool_use(0, "toolu_1".into(), "read_file".into());
+        acc.append_json(0, "{\"pa");
+        acc.append_json(0, "th\": \"/tmp\"}");
+
+        let calls = acc.into_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_1");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, r#"{"path": "/tmp"}"#);
+    }
+
+    #[test]
+    fn tool_call_accumulator_multiple_tools() {
+        let mut acc = ToolCallAccumulator::default();
+
+        acc.start_tool_use(0, "t1".into(), "tool_a".into());
+        acc.append_json(0, "{}");
+
+        acc.start_tool_use(1, "t2".into(), "tool_b".into());
+        acc.append_json(1, "{}");
+
+        let calls = acc.into_tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "tool_a");
+        assert_eq!(calls[1].name, "tool_b");
+    }
+
+    #[test]
+    fn request_without_tools_omits_field() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".into(),
+            max_tokens: 8192,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("tools"));
+    }
+
+    #[test]
+    fn request_with_tools_includes_field() {
+        let def = ToolDefinition::new("test", "desc", serde_json::json!({"type": "object"}));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".into(),
+            max_tokens: 8192,
+            system: Some("system prompt".into()),
+            messages: vec![],
+            stream: true,
+            tools: vec![AnthropicTool::from(&def)],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"tools\""));
+        assert!(json.contains("\"input_schema\""));
+        assert!(json.contains("\"test\""));
+    }
+
+    #[test]
+    fn request_with_system_includes_field() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".into(),
+            max_tokens: 8192,
+            system: Some("be helpful".into()),
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"system\":\"be helpful\""));
+    }
+
+    #[test]
+    fn request_without_system_omits_field() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".into(),
+            max_tokens: 8192,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("system"));
+    }
+}

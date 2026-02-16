@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 desktop-assistant-core.workspace = true
 desktop-assistant-dbus.workspace = true
+desktop-assistant-llm-anthropic.workspace = true
 desktop-assistant-llm-openai.workspace = true
 desktop-assistant-llm-ollama.workspace = true
 desktop-assistant-mcp-client.workspace = true

@@ -213,9 +213,14 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
         .filter(|c| !c.is_empty())
         .unwrap_or_else(default_connector);
 
+    let default_api_key_env = match connector.as_str() {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        _ => "OPENAI_API_KEY",
+    };
+
     let api_key_env = llm_config
         .and_then(|c| c.api_key_env.as_deref())
-        .unwrap_or("OPENAI_API_KEY");
+        .unwrap_or(default_api_key_env);
 
     let mut api_key = llm_config
         .and_then(|c| c.secret.as_ref())
@@ -230,24 +235,20 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
         .and_then(|c| c.model.clone())
         .filter(|v| !v.trim().is_empty())
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
-        .unwrap_or_else(|| {
-            if connector == "ollama" {
-                "llama3.2".to_string()
-            } else {
-                "gpt-4o".to_string()
-            }
+        .unwrap_or_else(|| match connector.as_str() {
+            "ollama" => "llama3.2".to_string(),
+            "anthropic" => "claude-sonnet-4-5-20250929".to_string(),
+            _ => "gpt-4o".to_string(),
         });
 
     let base_url = llm_config
         .and_then(|c| c.base_url.clone())
         .filter(|v| !v.trim().is_empty())
         .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
-        .unwrap_or_else(|| {
-            if connector == "ollama" {
-                "http://localhost:11434".to_string()
-            } else {
-                "https://api.openai.com/v1".to_string()
-            }
+        .unwrap_or_else(|| match connector.as_str() {
+            "ollama" => "http://localhost:11434".to_string(),
+            "anthropic" => "https://api.anthropic.com".to_string(),
+            _ => "https://api.openai.com/v1".to_string(),
         });
 
     ResolvedLlmConfig {

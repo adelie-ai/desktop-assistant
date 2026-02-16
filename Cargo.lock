@@ -247,6 +247,7 @@ dependencies = [
  "anyhow",
  "desktop-assistant-core",
  "desktop-assistant-dbus",
+ "desktop-assistant-llm-anthropic",
  "desktop-assistant-llm-ollama",
  "desktop-assistant-llm-openai",
  "desktop-assistant-mcp-client",
@@ -271,6 +272,21 @@ dependencies = [
  "tracing",
  "uuid",
  "zbus",
+]
+
+[[package]]
+name = "desktop-assistant-llm-anthropic"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "desktop-assistant-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -25,6 +25,7 @@ use store::PersistentConversationStore;
 /// This enum lets `ConversationHandler` stay monomorphic while supporting
 /// multiple backends.
 enum AnyLlmClient {
+    Anthropic(desktop_assistant_llm_anthropic::AnthropicClient),
     OpenAi(desktop_assistant_llm_openai::OpenAiClient),
     Ollama(desktop_assistant_llm_ollama::OllamaClient),
 }
@@ -37,6 +38,7 @@ impl LlmClient for AnyLlmClient {
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         match self {
+            Self::Anthropic(c) => c.stream_completion(messages, tools, on_chunk).await,
             Self::OpenAi(c) => c.stream_completion(messages, tools, on_chunk).await,
             Self::Ollama(c) => c.stream_completion(messages, tools, on_chunk).await,
         }
@@ -80,6 +82,17 @@ async fn main() -> Result<()> {
                     resolved_llm.base_url,
                     resolved_llm.model,
                 ),
+            )
+        }
+        "anthropic" => {
+            if resolved_llm.api_key.is_empty() {
+                tracing::warn!("No API key resolved from KWallet/env; LLM calls may fail");
+            }
+            tracing::info!("using Anthropic LLM backend");
+            AnyLlmClient::Anthropic(
+                desktop_assistant_llm_anthropic::AnthropicClient::new(resolved_llm.api_key)
+                    .with_model(resolved_llm.model)
+                    .with_base_url(resolved_llm.base_url),
             )
         }
         _ => {
