@@ -9,5 +9,9 @@
       <label>Selected D-Bus service for this widget instance</label>
       <default></default>
     </entry>
+    <entry name="userAvatarPath" type="String">
+      <label>Optional user avatar path or source URL</label>
+      <default></default>
+    </entry>
   </group>
 </kcfg>

@@ -243,8 +243,27 @@ pub fn set_llm_settings(
 
 pub fn set_api_key(path: &Path, api_key: &str) -> anyhow::Result<()> {
     let api_key = api_key.trim();
+    let (key_len, key_fingerprint) = redacted_secret_audit(api_key);
+
+    tracing::info!(
+        secret_len = key_len,
+        secret_fingerprint = %key_fingerprint,
+        "received SetApiKey request"
+    );
+
     if api_key.is_empty() {
         return Err(anyhow!("api key must not be empty"));
+    }
+
+    if is_placeholder_secret_value(api_key) {
+        tracing::warn!(
+            secret_len = key_len,
+            secret_fingerprint = %key_fingerprint,
+            "rejecting placeholder-like SetApiKey value"
+        );
+        return Err(anyhow!(
+            "api key looks like a placeholder or masked value; provide the real key"
+        ));
     }
 
     let mut config = load_daemon_config(path)?.unwrap_or_default();
@@ -359,8 +378,8 @@ fn read_auto_secret(secret: &SecretConfig, connector: &str) -> Option<String> {
 
 fn read_common_file_secret(account: &str) -> Option<String> {
     let path = common_secret_file_path(account);
-    let value = std::fs::read_to_string(path).ok()?.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let value = std::fs::read_to_string(path).ok()?;
+    sanitize_secret_value(&value)
 }
 
 fn read_systemd_credential(secret: &SecretConfig, connector: &str) -> Option<String> {
@@ -368,8 +387,8 @@ fn read_systemd_credential(secret: &SecretConfig, connector: &str) -> Option<Str
     let account = resolve_secret_account(secret, connector);
     let path = PathBuf::from(credentials_dir).join(account);
 
-    let value = std::fs::read_to_string(path).ok()?.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let value = std::fs::read_to_string(path).ok()?;
+    sanitize_secret_value(&value)
 }
 
 fn read_keyring_secret(secret: &SecretConfig, connector: &str) -> Option<String> {
@@ -385,8 +404,8 @@ fn read_keyring_secret(secret: &SecretConfig, connector: &str) -> Option<String>
     }
 
     let entry = Entry::new(&service, &account).ok()?;
-    let value = entry.get_password().ok()?.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let value = entry.get_password().ok()?;
+    sanitize_secret_value(&value)
 }
 
 fn write_secret_to_backend(
@@ -488,8 +507,46 @@ fn read_secret_tool_secret(service: &str, account: &str) -> Option<String> {
         return None;
     }
 
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let value = String::from_utf8_lossy(&output.stdout);
+    sanitize_secret_value(value.as_ref())
+}
+
+fn sanitize_secret_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if is_placeholder_secret_value(trimmed) {
+        tracing::warn!("ignoring placeholder-like secret value from backend");
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn is_placeholder_secret_value(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+
+    value.contains('*')
+        || normalized.starts_with("file-store")
+        || normalized.starts_with("secret-store")
+        || normalized.contains("write-only")
+        || normalized.contains("leave blank")
+}
+
+fn redacted_secret_audit(value: &str) -> (usize, String) {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    let trimmed = value.trim();
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in trimmed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    (trimmed.len(), format!("fnv1a64:{hash:016x}"))
 }
 
 fn write_secret_tool_secret(service: &str, account: &str, value: &str) -> anyhow::Result<()> {
@@ -600,8 +657,8 @@ fn read_kwallet_secret(secret: &SecretConfig, connector: &str) -> Option<String>
         return None;
     }
 
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let value = String::from_utf8_lossy(&output.stdout);
+    sanitize_secret_value(value.as_ref())
 }
 
 #[cfg(test)]
@@ -705,5 +762,36 @@ mod tests {
             resolve_secret_account(&secret, "anthropic"),
             "custom_key_account"
         );
+    }
+
+    #[test]
+    fn placeholder_secret_values_are_rejected() {
+        assert!(is_placeholder_secret_value("file-store-openai-key"));
+        assert!(is_placeholder_secret_value("file-sto********-key"));
+        assert!(is_placeholder_secret_value(
+            "Write-only; leave blank to keep existing"
+        ));
+        assert!(!is_placeholder_secret_value("sk-test-real-secret-value"));
+    }
+
+    #[test]
+    fn sanitize_secret_value_discards_empty_and_placeholder_values() {
+        assert_eq!(sanitize_secret_value("  \n\t "), None);
+        assert_eq!(sanitize_secret_value("file-store-openai-key"), None);
+        assert_eq!(
+            sanitize_secret_value("  sk-live-abc123  "),
+            Some("sk-live-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn redacted_secret_audit_is_stable_and_trimmed() {
+        let (len, fp) = redacted_secret_audit("  sk-test-abc123  ");
+        assert_eq!(len, 14);
+        assert_eq!(fp, "fnv1a64:6e6d7d2dfdec1dad");
+
+        let (empty_len, empty_fp) = redacted_secret_audit("   ");
+        assert_eq!(empty_len, 0);
+        assert_eq!(empty_fp, "fnv1a64:cbf29ce484222325");
     }
 }

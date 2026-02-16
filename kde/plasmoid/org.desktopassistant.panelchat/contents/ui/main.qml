@@ -1,6 +1,8 @@
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
+import QtCore
+import org.kde.kirigami as Kirigami
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents
@@ -28,11 +30,49 @@ PlasmoidItem {
     property bool debugEnabled: false
     property var transcriptEntries: []
     property string promptText: ""
+    readonly property string adeleAvatarSource: Qt.resolvedUrl("../images/adele.png")
+    property string configuredUserAvatarPath: String(Plasmoid.configuration.userAvatarPath || "").trim()
+    readonly property string homeDirectory: StandardPaths.writableLocation(StandardPaths.HomeLocation)
+    readonly property string accountName: {
+        const trimmedHome = String(homeDirectory || "").replace(/\/+$/, "")
+        const chunks = trimmedHome.split("/").filter(function(chunk) {
+            return chunk.length > 0
+        })
+        return chunks.length > 0 ? chunks[chunks.length - 1] : ""
+    }
     readonly property bool hasRealMessages: {
         for (let i = 0; i < transcriptEntries.length; i++) {
             if (transcriptEntries[i].kind === "message") return true
         }
         return false
+    }
+
+    function toImageSource(pathValue) {
+        const value = String(pathValue || "").trim()
+        if (value.length === 0) {
+            return ""
+        }
+        if (value.indexOf("file://") === 0 || value.indexOf("image://") === 0 || value.indexOf("qrc:/") === 0 || value.indexOf(":/") === 0) {
+            return value
+        }
+        if (value[0] === "/") {
+            return "file://" + value
+        }
+        return value
+    }
+
+    function userAvatarCandidates() {
+        const candidates = []
+        const configured = toImageSource(configuredUserAvatarPath)
+        if (configured.length > 0) {
+            candidates.push(configured)
+        }
+        candidates.push(toImageSource(homeDirectory + "/.face.icon"))
+        candidates.push(toImageSource(homeDirectory + "/.face"))
+        if (accountName.length > 0) {
+            candidates.push(toImageSource("/var/lib/AccountsService/icons/" + accountName))
+        }
+        return candidates
     }
 
     function shellEscape(value) {
@@ -539,53 +579,98 @@ PlasmoidItem {
                         required property var modelData
                         readonly property bool isStatus: modelData.kind === "status"
                         readonly property bool isAssistant: modelData.role === "assistant"
+                        readonly property real avatarSize: 24
+                        readonly property var avatarSources: isAssistant ? [root.adeleAvatarSource] : root.userAvatarCandidates()
 
                         visible: !isStatus || root.debugEnabled
                         width: ListView.view.width
-                        implicitHeight: visible ? bubble.height + 2 : 0
+                        implicitHeight: visible ? rowContainer.implicitHeight + 2 : 0
 
-                        Rectangle {
-                            id: bubble
+                        RowLayout {
+                            id: rowContainer
+                            anchors.left: parent.left
+                            anchors.right: parent.right
                             anchors.top: parent.top
-                            anchors.left: isAssistant ? undefined : parent.left
-                            anchors.right: isAssistant ? parent.right : undefined
-                            width: isStatus
-                                ? parent.width
-                                : Math.min(parent.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
-                            height: Math.max(messageText.contentHeight, messageText.implicitHeight) + 12
-                            radius: isStatus ? 0 : 8
-                            color: isStatus
-                                ? "transparent"
-                                : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor)
-                            border.width: isStatus ? 0 : 1
-                            border.color: PlasmaCore.Theme.disabledTextColor
+                            spacing: 6
+                            layoutDirection: isStatus ? Qt.LeftToRight : (isAssistant ? Qt.RightToLeft : Qt.LeftToRight)
 
-                            TextEdit {
-                                id: messageText
-                                anchors.fill: parent
-                                anchors.margins: 6
-                                readOnly: true
-                                selectByMouse: true
-                                selectByKeyboard: true
-                                wrapMode: TextEdit.Wrap
-                                textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
-                                text: isStatus
-                                    ? "[status] " + String(modelData.text || "")
-                                    : (isAssistant
-                                        ? String(modelData.text || "")
-                                        : "You:\n" + String(modelData.text || ""))
+                            Item {
+                                Layout.preferredWidth: isStatus ? 0 : avatarSize
+                                Layout.preferredHeight: isStatus ? 0 : avatarSize
+                                Layout.alignment: Qt.AlignTop
+                                visible: !isStatus
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: width / 2
+                                    color: PlasmaCore.Theme.backgroundColor
+                                    border.width: 1
+                                    border.color: PlasmaCore.Theme.disabledTextColor
+                                    clip: true
+
+                                    Image {
+                                        id: avatarImage
+                                        property int candidateIndex: 0
+                                        anchors.fill: parent
+                                        fillMode: Image.PreserveAspectCrop
+                                        source: avatarSources.length > 0 ? avatarSources[Math.min(candidateIndex, avatarSources.length - 1)] : ""
+                                        visible: status === Image.Ready
+
+                                        onStatusChanged: {
+                                            if (status === Image.Error && candidateIndex < avatarSources.length - 1) {
+                                                candidateIndex += 1
+                                            }
+                                        }
+                                    }
+
+                                    Kirigami.Icon {
+                                        anchors.fill: parent
+                                        source: isAssistant ? "preferences-desktop-user" : "user-identity"
+                                        visible: !avatarImage.visible
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                id: bubble
+                                Layout.fillWidth: true
+                                Layout.alignment: Qt.AlignTop
+                                implicitWidth: isStatus
+                                    ? rowContainer.width
+                                    : Math.min(rowContainer.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
+                                height: Math.max(messageText.contentHeight, messageText.implicitHeight) + 12
+                                radius: isStatus ? 0 : 8
                                 color: isStatus
-                                    ? PlasmaCore.Theme.disabledTextColor
-                                    : (isAssistant
-                                        ? PlasmaCore.Theme.textColor
-                                        : PlasmaCore.Theme.highlightedTextColor)
-                                font.italic: isStatus
-                                font.bold: false
-                                activeFocusOnPress: true
-                                selectedTextColor: isAssistant ? PlasmaCore.Theme.highlightedTextColor : PlasmaCore.Theme.textColor
-                                selectionColor: isAssistant ? PlasmaCore.Theme.highlightColor : PlasmaCore.Theme.backgroundColor
-                                onLinkActivated: function(link) {
-                                    Qt.openUrlExternally(link)
+                                    ? "transparent"
+                                    : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor)
+                                border.width: isStatus ? 0 : 1
+                                border.color: PlasmaCore.Theme.disabledTextColor
+
+                                TextEdit {
+                                    id: messageText
+                                    anchors.fill: parent
+                                    anchors.margins: 6
+                                    readOnly: true
+                                    selectByMouse: true
+                                    selectByKeyboard: true
+                                    wrapMode: TextEdit.Wrap
+                                    textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
+                                    text: isStatus
+                                        ? "[status] " + String(modelData.text || "")
+                                        : String(modelData.text || "")
+                                    color: isStatus
+                                        ? PlasmaCore.Theme.disabledTextColor
+                                        : (isAssistant
+                                            ? PlasmaCore.Theme.textColor
+                                            : PlasmaCore.Theme.highlightedTextColor)
+                                    font.italic: isStatus
+                                    font.bold: false
+                                    activeFocusOnPress: true
+                                    selectedTextColor: isAssistant ? PlasmaCore.Theme.highlightedTextColor : PlasmaCore.Theme.textColor
+                                    selectionColor: isAssistant ? PlasmaCore.Theme.highlightColor : PlasmaCore.Theme.backgroundColor
+                                    onLinkActivated: function(link) {
+                                        Qt.openUrlExternally(link)
+                                    }
                                 }
                             }
                         }

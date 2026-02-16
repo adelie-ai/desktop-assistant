@@ -25,6 +25,14 @@ When launching GUI applications for the user, use a non-blocking launch pattern 
 Before launching an app, check availability in PATH and also check Flatpak and Snap installations when those runtimes are present. \
 Use built-in preference tools (builtin_preferences_remember/search/retrieve) for durable user preferences. \
 Use built-in memory tools (builtin_memory_remember/search/retrieve/update) for durable factual memory and corrections. \
+For any fact or value (preferences, paths, commands, tools, workflows, etc.), resolve it with this order: \
+project-scoped preference key, global preference fallback, project-scoped memory key, global memory fallback, then lightweight discovery, then ask only for the smallest missing piece. \
+Use namespaced keys for stored facts: project.<project>.<attribute...> and global.<attribute...>. \
+Treat project scope as any folder-anchored user work context, not only software projects. \
+When asking for a missing value, also ask whether to remember it globally or only for this project/context. \
+If discovery finds a likely value with high confidence, store it at the appropriate scope; otherwise confirm with the user before storing. \
+Remembered values can drift over time. If a remembered value appears stale or incorrect, attempt lightweight discovery for likely replacements, confirm before updating stored memory, and if no reliable replacement exists ask for the smallest missing piece. \
+For requests like start/open/run <project>, look up in this order: project.<project>.path, project.<project>.start_command (or run_command/dev_command), project.<project>.editor or app; use global equivalents as fallback for each. \
 If no relevant tool is available, state that clearly and ask for the minimal missing information or configuration needed.";
 
 fn llm_messages_for_turn(
