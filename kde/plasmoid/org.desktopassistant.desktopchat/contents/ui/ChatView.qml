@@ -248,7 +248,7 @@ Item {
 
     function openSettingsDialog() {
         runCommand(
-            "kcmshell6 kcm_desktopassistant",
+            "systemsettings kcm_desktopassistant",
             function(_stdout) {},
             function(_stderr) {
                 appendStatus("Settings dialog failed to open")

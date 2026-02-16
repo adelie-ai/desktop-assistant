@@ -14,12 +14,10 @@ dbus_service_dst := dbus_service_dir + "/org.desktopAssistant.service"
 dbus_service_dev_dst := dbus_service_dir + "/org.desktopAssistant.Dev.service"
 panel_widget := "kde/plasmoid/org.desktopassistant.panelchat"
 desktop_widget := "kde/plasmoid/org.desktopassistant.desktopchat"
-settings_widget := "kde/plasmoid/org.desktopassistant.settings"
 kcm_dir := "kde/kcm/desktop-assistant-settings"
 kcm_build_dir := "build/kde-kcm"
 panel_widget_id := "org.desktopassistant.panelchat"
 desktop_widget_id := "org.desktopassistant.desktopchat"
-settings_widget_id := "org.desktopassistant.settings"
 shared_chat_module_src := "kde/shared/chat-module"
 shared_chat_module_dst := env_var_or_default("XDG_DATA_HOME", env_var("HOME") + "/.local/share") + "/desktop-assistant/chat-module"
 container_cli := env_var_or_default("CONTAINER_CLI", "docker")
@@ -149,24 +147,20 @@ widget-install:
     just chat-module-sync
     kpackagetool6 --type Plasma/Applet --install {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --install {{desktop_widget}}
-    kpackagetool6 --type Plasma/Applet --install {{settings_widget}}
 
 # Upgrade all KDE Plasma widgets after local changes
 widget-upgrade:
     just chat-module-sync
     kpackagetool6 --type Plasma/Applet --upgrade {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --upgrade {{desktop_widget}}
-    kpackagetool6 --type Plasma/Applet --upgrade {{settings_widget}}
 
 # Reinstall all KDE Plasma widgets (remove + install)
 widget-reinstall:
     just chat-module-sync
     kpackagetool6 --type Plasma/Applet --remove {{panel_widget_id}} || true
     kpackagetool6 --type Plasma/Applet --remove {{desktop_widget_id}} || true
-    kpackagetool6 --type Plasma/Applet --remove {{settings_widget_id}} || true
     kpackagetool6 --type Plasma/Applet --install {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --install {{desktop_widget}}
-    kpackagetool6 --type Plasma/Applet --install {{settings_widget}}
 
 # Hard refresh KDE widgets (reinstall + restart plasmashell)
 widget-hard-refresh:
@@ -178,7 +172,6 @@ widget-hard-refresh:
 widget-remove:
     kpackagetool6 --type Plasma/Applet --remove {{panel_widget_id}} || true
     kpackagetool6 --type Plasma/Applet --remove {{desktop_widget_id}} || true
-    kpackagetool6 --type Plasma/Applet --remove {{settings_widget_id}} || true
 
 # Configure and build KDE System Settings KCM
 kcm-build:

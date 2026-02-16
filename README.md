@@ -151,7 +151,7 @@ Run TUI against that development daemon:
 just dev-frontend
 ```
 
-In the **Desktop Assistant Settings** widget, set **Mode** to **Development** to make panel/desktop widgets target `org.desktopAssistant.Dev`.
+In either chat widget, set **Mode** to **Development** to make panel/desktop widgets target `org.desktopAssistant.Dev`.
 
 ### Activation Troubleshooting
 
@@ -199,14 +199,12 @@ This repository includes two KDE Plasma widgets that talk to the daemon over D-B
 
 - Panel widget: `kde/plasmoid/org.desktopassistant.panelchat`
 - Desktop widget: `kde/plasmoid/org.desktopassistant.desktopchat`
-- Settings widget: `kde/plasmoid/org.desktopassistant.settings`
 
 Install both for your user:
 
 ```bash
 kpackagetool6 --type Plasma/Applet --install kde/plasmoid/org.desktopassistant.panelchat
 kpackagetool6 --type Plasma/Applet --install kde/plasmoid/org.desktopassistant.desktopchat
-kpackagetool6 --type Plasma/Applet --install kde/plasmoid/org.desktopassistant.settings
 ```
 
 Upgrade after local changes:
@@ -214,14 +212,13 @@ Upgrade after local changes:
 ```bash
 kpackagetool6 --type Plasma/Applet --upgrade kde/plasmoid/org.desktopassistant.panelchat
 kpackagetool6 --type Plasma/Applet --upgrade kde/plasmoid/org.desktopassistant.desktopchat
-kpackagetool6 --type Plasma/Applet --upgrade kde/plasmoid/org.desktopassistant.settings
 ```
 
 Usage:
 
 - Add **Desktop Assistant** to the panel/task bar for quick popup chat.
 - Add **Desktop Assistant (Desktop)** to the desktop for an always-visible chat card.
-- Add **Desktop Assistant Settings** to configure supported connectors (`ollama`, `openai`, `anthropic`), model/base URL, and API key.
+- Click **Settings** in chat widgets to open **System Settings → Desktop Assistant** for connector/model/search configuration.
 - Widget controls include:
 	- **New**: start a fresh conversation.
 	- **Debug**: show/hide low-level tool execution status lines.
@@ -233,7 +230,6 @@ Notes:
 - Widgets auto-detect whether `org.desktopAssistant.Dev` currently has an owner on the session bus.
 - If the dev environment is not running, chat widgets hide themselves.
 - Both widgets shell out to `python3` and `gdbus` to call methods documented in `docs/dbus-api.md`.
-- Settings widget uses `org.desktopAssistant.Settings` D-Bus methods.
 - API keys are write-only over D-Bus (`SetApiKey` only) and are never returned to clients.
 - Daemon can auto-start on first D-Bus method call once `just install-service` is set up.
 
