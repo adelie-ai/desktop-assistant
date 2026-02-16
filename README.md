@@ -52,6 +52,29 @@ Connector key naming convention is generic:
 - Environment fallback defaults to `<CONNECTOR>_API_KEY`.
 - Connector names are normalized to alphanumeric/underscore (for example, `aws-bedrock` → `aws_bedrock_api_key` and `AWS_BEDROCK_API_KEY`).
 
+Secret backend default is `auto`:
+- `SetApiKey` writes to a DE-agnostic local file store: `$XDG_DATA_HOME/desktop-assistant/secrets/<connector>_api_key` (or `~/.local/share/desktop-assistant/secrets/...`).
+- Reads check that file store first.
+- If missing there, reads try systemd credentials (`$CREDENTIALS_DIRECTORY`).
+- If still missing, reads fall back to desktop keyring backends (`libsecret`/`kwallet`).
+- Environment variables remain the final fallback.
+
+To provide desktop-agnostic secrets with systemd user services, add a drop-in override:
+
+```bash
+mkdir -p ~/.config/systemd/user/desktop-assistant-daemon.service.d
+cat > ~/.config/systemd/user/desktop-assistant-daemon.service.d/credentials.conf <<'EOF'
+[Service]
+# one file per connector account key
+LoadCredential=openai_api_key:%h/.config/desktop-assistant/credentials/openai_api_key
+LoadCredential=anthropic_api_key:%h/.config/desktop-assistant/credentials/anthropic_api_key
+EOF
+systemctl --user daemon-reload
+systemctl --user restart desktop-assistant-daemon
+```
+
+For development service use the same pattern with `desktop-assistant-daemon-dev.service.d`.
+
 ### 3) (Optional) Configure MCP servers
 
 Create `~/.config/desktop-assistant/mcp_servers.toml` (or under `$XDG_CONFIG_HOME`):
@@ -77,17 +100,21 @@ cargo run -p desktop-assistant-tui
 
 ## Service Setup (systemd user + just)
 
-Install the user service unit and reload systemd:
+Install the user service unit + D-Bus activation mapping and reload systemd:
 
 ```bash
 just install-service
 ```
+
+With that installed, any client D-Bus method call to `org.desktopAssistant` can auto-start the daemon.
 
 Enable and start backend on login:
 
 ```bash
 just backend-enable
 ```
+
+If you only want on-demand startup (no login auto-start), skip `backend-enable`.
 
 Common service operations:
 
@@ -103,7 +130,7 @@ Run a development daemon in parallel with the regular user service (separate D-B
 just dev-backend
 ```
 
-Or install a dedicated user systemd service for development mode:
+Or install a dedicated user systemd service for development mode (plus activation mapping):
 
 ```bash
 just install-service-dev
@@ -125,6 +152,46 @@ just dev-frontend
 ```
 
 In the **Desktop Assistant Settings** widget, set **Mode** to **Development** to make panel/desktop widgets target `org.desktopAssistant.Dev`.
+
+### Activation Troubleshooting
+
+If D-Bus calls return "The name is not activatable":
+
+```bash
+just install-service
+just install-service-dev
+```
+
+Check that session bus activation entries exist:
+
+```bash
+gdbus call --session \
+	--dest org.freedesktop.DBus \
+	--object-path /org/freedesktop/DBus \
+	--method org.freedesktop.DBus.ListActivatableNames \
+	| grep -Eo 'org\.desktopAssistant(\.Dev)?' | sort -u
+```
+
+Expected output includes:
+
+- `org.desktopAssistant`
+- `org.desktopAssistant.Dev`
+
+Force a clean activation test (service should transition from inactive to active after the call):
+
+```bash
+systemctl --user stop desktop-assistant-daemon
+echo before=$(systemctl --user is-active desktop-assistant-daemon 2>/dev/null || true)
+gdbus call --session --dest org.desktopAssistant --object-path /org/desktopAssistant/Settings --method org.desktopAssistant.Settings.GetLlmSettings
+echo after=$(systemctl --user is-active desktop-assistant-daemon 2>/dev/null || true)
+```
+
+If activatable names still do not appear, reload both managers and re-check:
+
+```bash
+systemctl --user daemon-reload
+gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.ReloadConfig
+```
 
 ## KDE Widgets (Plasmoids)
 
@@ -166,7 +233,7 @@ Notes:
 - Both widgets shell out to `python3` and `gdbus` to call methods documented in `docs/dbus-api.md`.
 - Settings widget uses `org.desktopAssistant.Settings` D-Bus methods.
 - API keys are write-only over D-Bus (`SetApiKey` only) and are never returned to clients.
-- Ensure the daemon is running (`just backend-status` / `just backend-restart`) before sending prompts.
+- Daemon can auto-start on first D-Bus method call once `just install-service` is set up.
 
 ## KDE System Settings Panel (KCM)
 

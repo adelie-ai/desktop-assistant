@@ -3,7 +3,8 @@ Description=Desktop Assistant Backend Daemon (Development)
 After=default.target
 
 [Service]
-Type=simple
+Type=dbus
+BusName=org.desktopAssistant.Dev
 ExecStart=%h/.cargo/bin/desktop-assistant-daemon
 Restart=on-failure
 RestartSec=2

@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.desktopAssistant.Dev
+Exec=/bin/false
+SystemdService=desktop-assistant-daemon-dev.service

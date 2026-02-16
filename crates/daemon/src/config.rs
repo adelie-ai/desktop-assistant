@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, anyhow};
 use keyring::Entry;
@@ -87,7 +87,7 @@ fn default_connector() -> String {
 }
 
 fn default_secret_backend() -> String {
-    "keyring".to_string()
+    "auto".to_string()
 }
 
 fn default_secret_service() -> String {
@@ -166,6 +166,22 @@ pub fn default_daemon_config_path() -> PathBuf {
         });
 
     config_home.join("desktop-assistant").join("daemon.toml")
+}
+
+fn default_secret_store_dir() -> PathBuf {
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                .join(".local")
+                .join("share")
+        });
+
+    data_home.join("desktop-assistant").join("secrets")
+}
+
+fn common_secret_file_path(account: &str) -> PathBuf {
+    default_secret_store_dir().join(account)
 }
 
 pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
@@ -313,6 +329,8 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
 
 fn read_secret_from_backend(secret: &SecretConfig, connector: &str) -> Option<String> {
     match secret.backend.trim().to_lowercase().as_str() {
+        "auto" => read_auto_secret(secret, connector),
+        "systemd" | "systemd-credentials" => read_systemd_credential(secret, connector),
         "keyring" | "libsecret" => read_keyring_secret(secret, connector),
         "kwallet" => read_kwallet_secret(secret, connector),
         other => {
@@ -322,6 +340,38 @@ fn read_secret_from_backend(secret: &SecretConfig, connector: &str) -> Option<St
     }
 }
 
+fn read_auto_secret(secret: &SecretConfig, connector: &str) -> Option<String> {
+    let account = resolve_secret_account(secret, connector);
+    if let Some(value) = read_common_file_secret(&account) {
+        return Some(value);
+    }
+
+    if let Some(value) = read_systemd_credential(secret, connector) {
+        return Some(value);
+    }
+
+    if let Some(value) = read_keyring_secret(secret, connector) {
+        return Some(value);
+    }
+
+    read_kwallet_secret(secret, connector)
+}
+
+fn read_common_file_secret(account: &str) -> Option<String> {
+    let path = common_secret_file_path(account);
+    let value = std::fs::read_to_string(path).ok()?.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn read_systemd_credential(secret: &SecretConfig, connector: &str) -> Option<String> {
+    let credentials_dir = std::env::var_os("CREDENTIALS_DIRECTORY")?;
+    let account = resolve_secret_account(secret, connector);
+    let path = PathBuf::from(credentials_dir).join(account);
+
+    let value = std::fs::read_to_string(path).ok()?.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 fn read_keyring_secret(secret: &SecretConfig, connector: &str) -> Option<String> {
     let service = secret
         .service
@@ -329,6 +379,10 @@ fn read_keyring_secret(secret: &SecretConfig, connector: &str) -> Option<String>
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(default_secret_service);
     let account = resolve_secret_account(secret, connector);
+
+    if let Some(value) = read_secret_tool_secret(&service, &account) {
+        return Some(value);
+    }
 
     let entry = Entry::new(&service, &account).ok()?;
     let value = entry.get_password().ok()?.trim().to_string();
@@ -341,10 +395,54 @@ fn write_secret_to_backend(
     connector: &str,
 ) -> anyhow::Result<()> {
     match secret.backend.trim().to_lowercase().as_str() {
+        "auto" => write_auto_secret(secret, value, connector),
+        "systemd" | "systemd-credentials" => Err(anyhow!(
+            "systemd credentials backend is read-only; configure credentials via systemd and use SetLlmSettings only"
+        )),
         "keyring" | "libsecret" => write_keyring_secret(secret, value, connector),
         "kwallet" => write_kwallet_secret(secret, value, connector),
         other => Err(anyhow!("unsupported secret backend '{other}'")),
     }
+}
+
+fn write_auto_secret(secret: &SecretConfig, value: &str, connector: &str) -> anyhow::Result<()> {
+    let account = resolve_secret_account(secret, connector);
+    write_common_file_secret(&account, value)
+}
+
+fn write_common_file_secret(account: &str, value: &str) -> anyhow::Result<()> {
+    let dir = default_secret_store_dir();
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        anyhow!(
+            "failed to create secret store directory {}: {error}",
+            dir.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let path = common_secret_file_path(account);
+    std::fs::write(&path, value)
+        .map_err(|error| anyhow!("failed to write secret file {}: {error}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                anyhow!(
+                    "failed to set secret file permissions {}: {error}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+
+    Ok(())
 }
 
 fn write_keyring_secret(secret: &SecretConfig, value: &str, connector: &str) -> anyhow::Result<()> {
@@ -355,11 +453,88 @@ fn write_keyring_secret(secret: &SecretConfig, value: &str, connector: &str) -> 
         .unwrap_or_else(default_secret_service);
     let account = resolve_secret_account(secret, connector);
 
+    if command_exists("secret-tool") {
+        write_secret_tool_secret(&service, &account, value)?;
+        return Ok(());
+    }
+
     let entry = Entry::new(&service, &account)
         .map_err(|error| anyhow!("failed to initialize keyring entry: {error}"))?;
     entry
         .set_password(value)
         .map_err(|error| anyhow!("failed to write keyring secret: {error}"))
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn read_secret_tool_secret(service: &str, account: &str) -> Option<String> {
+    let output = Command::new("secret-tool")
+        .arg("lookup")
+        .arg("service")
+        .arg(service)
+        .arg("account")
+        .arg(account)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn write_secret_tool_secret(service: &str, account: &str, value: &str) -> anyhow::Result<()> {
+    let mut child = Command::new("secret-tool")
+        .arg("store")
+        .arg("--label")
+        .arg("Desktop Assistant API Key")
+        .arg("service")
+        .arg(service)
+        .arg("account")
+        .arg(account)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| anyhow!("failed to invoke secret-tool: {error}"))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write as _;
+        stdin
+            .write_all(value.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .map_err(|error| anyhow!("failed to write secret-tool stdin: {error}"))?;
+    } else {
+        return Err(anyhow!("failed to open secret-tool stdin"));
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| anyhow!("failed waiting for secret-tool: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "secret-tool returned non-zero exit status".to_string()
+        };
+        Err(anyhow!("failed to write secret-tool secret: {detail}"))
+    }
 }
 
 fn write_kwallet_secret(secret: &SecretConfig, value: &str, connector: &str) -> anyhow::Result<()> {
@@ -473,6 +648,24 @@ mod tests {
         assert_eq!(secret.backend, "keyring");
         assert_eq!(secret.service.as_deref(), Some("org.desktopAssistant"));
         assert_eq!(secret.account.as_deref(), Some("openai_api_key"));
+    }
+
+    #[test]
+    fn default_secret_backend_is_auto() {
+        let secret = SecretConfig::default();
+        assert_eq!(secret.backend, "auto");
+    }
+
+    #[test]
+    fn default_secret_store_dir_points_to_desktop_assistant_secrets() {
+        let path = default_secret_store_dir();
+        assert!(path.ends_with("desktop-assistant/secrets"));
+    }
+
+    #[test]
+    fn common_secret_file_path_uses_account_name() {
+        let path = common_secret_file_path("openai_api_key");
+        assert!(path.ends_with("desktop-assistant/secrets/openai_api_key"));
     }
 
     #[test]

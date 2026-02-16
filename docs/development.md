@@ -25,6 +25,18 @@ cargo run -p desktop-assistant-daemon
 cargo run -p desktop-assistant-tui
 ```
 
+For systemd user service + D-Bus activation setup:
+
+```bash
+just install-service
+```
+
+After install, method calls to `org.desktopAssistant` can auto-start the daemon if it is not already running.
+
+## Activation Troubleshooting
+
+Use the canonical troubleshooting checklist in [README.md](README.md#activation-troubleshooting).
+
 ## Environment
 
 Default connector is `ollama` (local, no API key required).
@@ -40,6 +52,23 @@ Connector key naming convention is generic:
 - Secret backend account key defaults to `<connector>_api_key`.
 - Environment fallback defaults to `<CONNECTOR>_API_KEY`.
 - Connector names are normalized to alphanumeric/underscore (for example, `aws-bedrock` → `aws_bedrock_api_key` and `AWS_BEDROCK_API_KEY`).
+
+Secret backend default is `auto`:
+- `SetApiKey` writes to `$XDG_DATA_HOME/desktop-assistant/secrets/<connector>_api_key` (or `~/.local/share/desktop-assistant/secrets/...`).
+- Reads check that file first, then systemd credentials, then desktop keyrings, then environment variables.
+
+For a desktop-agnostic setup, prefer systemd credentials via user-service drop-ins:
+
+```bash
+mkdir -p ~/.config/systemd/user/desktop-assistant-daemon.service.d
+cat > ~/.config/systemd/user/desktop-assistant-daemon.service.d/credentials.conf <<'EOF'
+[Service]
+LoadCredential=openai_api_key:%h/.config/desktop-assistant/credentials/openai_api_key
+LoadCredential=anthropic_api_key:%h/.config/desktop-assistant/credentials/anthropic_api_key
+EOF
+systemctl --user daemon-reload
+systemctl --user restart desktop-assistant-daemon
+```
 
 Optional:
 

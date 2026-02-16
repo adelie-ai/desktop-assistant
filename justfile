@@ -7,6 +7,11 @@ service_src := "systemd/desktop-assistant-daemon.service"
 dev_service_src := "systemd/desktop-assistant-daemon-dev.service"
 service_dst := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config") + "/systemd/user/" + service_name + ".service"
 dev_service_dst := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config") + "/systemd/user/" + dev_service_name + ".service"
+dbus_service_src := "systemd/org.desktopAssistant.service"
+dbus_service_dev_src := "systemd/org.desktopAssistant.Dev.service"
+dbus_service_dir := env_var_or_default("XDG_DATA_HOME", env_var("HOME") + "/.local/share") + "/dbus-1/services"
+dbus_service_dst := dbus_service_dir + "/org.desktopAssistant.service"
+dbus_service_dev_dst := dbus_service_dir + "/org.desktopAssistant.Dev.service"
 panel_widget := "kde/plasmoid/org.desktopassistant.panelchat"
 desktop_widget := "kde/plasmoid/org.desktopassistant.desktopchat"
 settings_widget := "kde/plasmoid/org.desktopassistant.settings"
@@ -45,16 +50,30 @@ build:
 # Install user service file and reload systemd user manager
 install-service:
     [ -f "{{service_src}}" ] || (echo "Missing service file: {{service_src}}" >&2; exit 1)
+    [ -f "{{dbus_service_src}}" ] || (echo "Missing D-Bus service file: {{dbus_service_src}}" >&2; exit 1)
     mkdir -p "$(dirname '{{service_dst}}')"
+    mkdir -p "{{dbus_service_dir}}"
     cp "{{service_src}}" "{{service_dst}}"
+    cp "{{dbus_service_src}}" "{{dbus_service_dst}}"
     systemctl --user daemon-reload
 
 # Install user development service file and reload systemd user manager
 install-service-dev:
     [ -f "{{dev_service_src}}" ] || (echo "Missing service file: {{dev_service_src}}" >&2; exit 1)
+    [ -f "{{dbus_service_dev_src}}" ] || (echo "Missing D-Bus service file: {{dbus_service_dev_src}}" >&2; exit 1)
     mkdir -p "$(dirname '{{dev_service_dst}}')"
+    mkdir -p "{{dbus_service_dir}}"
     cp "{{dev_service_src}}" "{{dev_service_dst}}"
+    cp "{{dbus_service_dev_src}}" "{{dbus_service_dev_dst}}"
     systemctl --user daemon-reload
+
+# Install only D-Bus activation service files
+install-dbus-activation:
+    [ -f "{{dbus_service_src}}" ] || (echo "Missing D-Bus service file: {{dbus_service_src}}" >&2; exit 1)
+    [ -f "{{dbus_service_dev_src}}" ] || (echo "Missing D-Bus service file: {{dbus_service_dev_src}}" >&2; exit 1)
+    mkdir -p "{{dbus_service_dir}}"
+    cp "{{dbus_service_src}}" "{{dbus_service_dst}}"
+    cp "{{dbus_service_dev_src}}" "{{dbus_service_dev_dst}}"
 
 # Enable + start backend service
 backend-enable:
@@ -172,13 +191,20 @@ kcm-cleanup:
 uninstall-service:
     systemctl --user disable --now {{service_name}} || true
     rm -f "{{service_dst}}"
+    rm -f "{{dbus_service_dst}}"
     systemctl --user daemon-reload
 
 # Remove user development service file and stop the dev daemon
 uninstall-service-dev:
     systemctl --user disable --now {{dev_service_name}} || true
     rm -f "{{dev_service_dst}}"
+    rm -f "{{dbus_service_dev_dst}}"
     systemctl --user daemon-reload
+
+# Remove only D-Bus activation service files
+uninstall-dbus-activation:
+    rm -f "{{dbus_service_dst}}"
+    rm -f "{{dbus_service_dev_dst}}"
 
 # Uninstall everything (widgets, service, KCM)
 uninstall:
