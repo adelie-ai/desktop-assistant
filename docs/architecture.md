@@ -1,5 +1,7 @@
 # Architecture
 
+The assistant persona is named **Adele**, in reference to the **Adélie penguin**.
+
 ## Design Style
 
 The project follows a ports-and-adapters (hexagonal) layout:

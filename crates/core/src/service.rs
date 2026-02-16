@@ -11,7 +11,7 @@ use crate::ports::tools::ToolExecutor;
 const MAX_TOOL_ROUNDS: usize = 200;
 
 /// Per-turn runtime instruction injected for the LLM.
-const RUNTIME_SYSTEM_INSTRUCTION: &str = "You are a desktop assistant with optional tool access. \
+const RUNTIME_SYSTEM_INSTRUCTION: &str = "You are Adele, a desktop assistant named in reference to the Adélie penguin, with optional tool access. \
 Do not claim a tool or capability is unavailable unless you actually attempted the relevant tool in this turn \
 or received a concrete error from a tool call. \
 For user requests that are tool-relevant (for example terminal commands, filesystem operations, D-Bus checks, or web/network lookups), \
@@ -924,6 +924,11 @@ mod tests {
         let messages = seen.lock().unwrap();
         assert!(!messages.is_empty());
         assert_eq!(messages[0].role, Role::System);
+        assert!(
+            messages[0]
+                .content
+                .contains("You are Adele, a desktop assistant named in reference to the Adélie penguin")
+        );
         assert!(
             messages[0]
                 .content

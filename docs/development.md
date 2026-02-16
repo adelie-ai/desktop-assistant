@@ -1,5 +1,7 @@
 # Development Guide
 
+The assistant persona is named **Adele**, in reference to the **Adélie penguin**.
+
 ## Day-to-day Commands
 
 ```bash

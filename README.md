@@ -1,10 +1,12 @@
-# Desktop Assistant
+# Adele - The Linux Desktop Assistant
 
 A Rust desktop assistant with:
 - D-Bus API for conversation lifecycle and streaming responses
 - OpenAI-compatible LLM backend
 - MCP tool integration over stdio
 - Optional terminal UI (TUI) client
+
+The assistant persona is named **Adele**, in reference to the **Adélie penguin**.
 
 ## Workspace at a Glance
 
@@ -83,6 +85,20 @@ just backend-status
 just backend-restart
 just backend-logs
 ```
+
+Run a development daemon in parallel with the regular user service (separate D-Bus name):
+
+```bash
+just dev-backend
+```
+
+Run TUI against that development daemon:
+
+```bash
+just dev-frontend
+```
+
+In the **Desktop Assistant Settings** widget, set **Mode** to **Development** to make panel/desktop widgets target `org.desktopAssistant.Dev`.
 
 ## KDE Widgets (Plasmoids)
 
