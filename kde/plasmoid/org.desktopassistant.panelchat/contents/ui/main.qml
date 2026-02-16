@@ -271,6 +271,8 @@ PlasmoidItem {
     compactRepresentation: PlasmaComponents.ToolButton {
         text: "Adele"
         icon.source: Qt.resolvedUrl("../images/adele.png")
+        icon.width: PlasmaCore.Units.iconSizes.smallMedium
+        icon.height: PlasmaCore.Units.iconSizes.smallMedium
         onClicked: root.expanded = !root.expanded
     }
 
@@ -337,14 +339,15 @@ PlasmoidItem {
 
                         Image {
                             source: Qt.resolvedUrl("../images/adele.png")
-                            sourceSize.width: 64
-                            sourceSize.height: 64
+                            sourceSize.width: 96
+                            sourceSize.height: 96
                             fillMode: Image.PreserveAspectFit
                             anchors.horizontalCenter: parent.horizontalCenter
                         }
 
                         QQC2.Label {
-                            text: "Ask me anything..."
+                            text: "Hi! I'm Adele! Ask me anything..."
+                            font.pointSize: 12
                             color: PlasmaCore.Theme.disabledTextColor
                             anchors.horizontalCenter: parent.horizontalCenter
                         }
@@ -419,7 +422,7 @@ PlasmoidItem {
 
                 QQC2.TextField {
                     Layout.fillWidth: true
-                    placeholderText: "Ask desktop assistant…"
+                    placeholderText: "Ask Adele…"
                     text: root.promptText
                     enabled: !busy
                     onTextChanged: root.promptText = text

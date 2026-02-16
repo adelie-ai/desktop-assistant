@@ -395,14 +395,15 @@ PlasmoidItem {
 
                     Image {
                         source: Qt.resolvedUrl("../images/adele.png")
-                        sourceSize.width: 64
-                        sourceSize.height: 64
+                        sourceSize.width: 96
+                        sourceSize.height: 96
                         fillMode: Image.PreserveAspectFit
                         anchors.horizontalCenter: parent.horizontalCenter
                     }
 
                     QQC2.Label {
-                        text: "Ask me anything..."
+                        text: "Hi! I'm Adele! Ask me anything..."
+                        font.pointSize: 12
                         color: PlasmaCore.Theme.disabledTextColor
                         anchors.horizontalCenter: parent.horizontalCenter
                     }
@@ -476,7 +477,7 @@ PlasmoidItem {
 
             QQC2.TextField {
                 Layout.fillWidth: true
-                placeholderText: "Ask something"
+                placeholderText: "Ask Adele…"
                 text: root.promptText
                 enabled: !busy
                 onTextChanged: root.promptText = text

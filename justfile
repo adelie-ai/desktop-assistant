@@ -60,19 +60,19 @@ backend-status:
 backend-logs:
     journalctl --user -u {{service_name}} -f
 
-# Install both KDE Plasma widgets for the current user
+# Install all KDE Plasma widgets for the current user
 widget-install:
     kpackagetool6 --type Plasma/Applet --install {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --install {{desktop_widget}}
     kpackagetool6 --type Plasma/Applet --install {{settings_widget}}
 
-# Upgrade both KDE Plasma widgets after local changes
+# Upgrade all KDE Plasma widgets after local changes
 widget-upgrade:
     kpackagetool6 --type Plasma/Applet --upgrade {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --upgrade {{desktop_widget}}
     kpackagetool6 --type Plasma/Applet --upgrade {{settings_widget}}
 
-# Reinstall both KDE Plasma widgets (remove + install)
+# Reinstall all KDE Plasma widgets (remove + install)
 widget-reinstall:
     kpackagetool6 --type Plasma/Applet --remove {{panel_widget_id}} || true
     kpackagetool6 --type Plasma/Applet --remove {{desktop_widget_id}} || true
@@ -86,6 +86,12 @@ widget-hard-refresh:
     just widget-reinstall
     kquitapp6 plasmashell || true
     nohup plasmashell --replace >/tmp/plasmashell-desktop-assistant.log 2>&1 &
+
+# Remove all KDE Plasma widgets
+widget-remove:
+    kpackagetool6 --type Plasma/Applet --remove {{panel_widget_id}} || true
+    kpackagetool6 --type Plasma/Applet --remove {{desktop_widget_id}} || true
+    kpackagetool6 --type Plasma/Applet --remove {{settings_widget_id}} || true
 
 # Configure and build KDE System Settings KCM
 kcm-build:
@@ -117,3 +123,20 @@ kcm-open:
 kcm-cleanup:
     rm -f "$HOME/.local/lib64/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so"
     sudo rm -f /usr/lib64/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so
+
+# Remove user service file and stop the daemon
+uninstall-service:
+    systemctl --user disable --now {{service_name}} || true
+    rm -f "{{service_dst}}"
+    systemctl --user daemon-reload
+
+# Uninstall everything (widgets, service, KCM)
+uninstall:
+    just widget-remove
+    just uninstall-service
+    just kcm-cleanup
+
+# Clean build artifacts
+clean:
+    cargo clean
+    rm -rf {{kcm_build_dir}} build/kde-kcm-system
