@@ -2,19 +2,40 @@
 import argparse
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
-SERVICE = "org.desktopAssistant"
+DEFAULT_SERVICE = "org.desktopAssistant"
+SETTINGS_PATH = Path.home() / ".config" / "desktop-assistant" / "widget_settings.json"
+SERVICE = DEFAULT_SERVICE
 PATH = "/org/desktopAssistant/Conversations"
 IFACE = "org.desktopAssistant.Conversations"
 
 
 class DbusError(RuntimeError):
     pass
+
+
+def _load_widget_service() -> str:
+    env_service = os.environ.get("DESKTOP_ASSISTANT_WIDGET_DBUS_SERVICE", "").strip()
+    if env_service:
+        return env_service
+
+    try:
+        payload = json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        return DEFAULT_SERVICE
+
+    if not isinstance(payload, dict):
+        return DEFAULT_SERVICE
+
+    value = str(payload.get("dbus_service", "")).strip()
+    return value or DEFAULT_SERVICE
 
 
 def _run_gdbus(method: str, *args: str) -> Any:
@@ -115,6 +136,8 @@ def ensure_conversation(title: str) -> str:
 
 
 def main() -> int:
+    global SERVICE
+
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -140,6 +163,7 @@ def main() -> int:
     await_cmd.add_argument("--interval", type=float, default=0.8)
 
     args = parser.parse_args()
+    SERVICE = _load_widget_service()
 
     try:
         if args.command == "ensure":

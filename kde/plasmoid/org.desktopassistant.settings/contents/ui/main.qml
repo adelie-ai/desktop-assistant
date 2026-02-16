@@ -20,6 +20,8 @@ PlasmoidItem {
     property string baseUrl: ""
     property string apiKey: ""
     property bool hasApiKey: false
+    property string dbusService: "org.desktopAssistant"
+    property bool devMode: false
     property string statusText: "Ready"
 
     readonly property var pending: ({})
@@ -52,8 +54,10 @@ PlasmoidItem {
                 model = payload.model || ""
                 baseUrl = payload.base_url || ""
                 hasApiKey = !!payload.has_api_key
+                dbusService = payload.dbus_service || "org.desktopAssistant"
+                devMode = dbusService === "org.desktopAssistant.Dev"
                 apiKey = ""
-                statusText = "Loaded settings"
+                statusText = "Loaded settings (D-Bus: " + dbusService + ")"
             },
             function(stderr) {
                 busy = false
@@ -69,6 +73,7 @@ PlasmoidItem {
             + " --connector " + shellEscape(connector)
             + " --model " + shellEscape(model)
             + " --base-url " + shellEscape(baseUrl)
+            + " --dbus-service " + shellEscape(devMode ? "org.desktopAssistant.Dev" : "org.desktopAssistant")
             + " --api-key " + shellEscape(apiKey)
 
         runCommand(
@@ -80,7 +85,8 @@ PlasmoidItem {
                     statusText = payload.error
                     return
                 }
-                statusText = "Saved settings"
+                dbusService = payload.dbus_service || (devMode ? "org.desktopAssistant.Dev" : "org.desktopAssistant")
+                statusText = "Saved settings (D-Bus: " + dbusService + ")"
                 if (!restartService) {
                     busy = false
                     return
@@ -230,6 +236,28 @@ PlasmoidItem {
                     text: root.apiKey
                     onTextChanged: root.apiKey = text
                 }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                QQC2.Label { text: "Mode" }
+                QQC2.ComboBox {
+                    id: modeBox
+                    Layout.fillWidth: true
+                    model: ["Production", "Development"]
+                    currentIndex: root.devMode ? 1 : 0
+                    onActivated: {
+                        root.devMode = (currentIndex === 1)
+                    }
+                }
+            }
+
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: root.devMode
+                    ? "Development mode targets org.desktopAssistant.Dev. Run `just dev-backend` to launch it."
+                    : "Production mode targets org.desktopAssistant (systemd user service)."
             }
 
             RowLayout {

@@ -1,8 +1,9 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 service_name := "desktop-assistant-daemon"
+dev_dbus_service := "org.desktopAssistant.Dev"
 service_src := "systemd/desktop-assistant-daemon.service"
-service_dst := "{{env_var_or_default('XDG_CONFIG_HOME', env_var('HOME') + '/.config')}}/systemd/user/{{service_name}}.service"
+service_dst := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config") + "/systemd/user/" + service_name + ".service"
 panel_widget := "kde/plasmoid/org.desktopassistant.panelchat"
 desktop_widget := "kde/plasmoid/org.desktopassistant.desktopchat"
 settings_widget := "kde/plasmoid/org.desktopassistant.settings"
@@ -22,9 +23,17 @@ default: list
 backend:
     cargo run -p desktop-assistant-daemon
 
+# Run backend daemon on development D-Bus name (coexists with user service)
+dev-backend:
+    DESKTOP_ASSISTANT_DBUS_SERVICE={{dev_dbus_service}} cargo run -p desktop-assistant-daemon
+
 # Run TUI frontend in foreground (dev)
 frontend:
     cargo run -p desktop-assistant-tui
+
+# Run TUI against development D-Bus name
+dev-frontend:
+    DESKTOP_ASSISTANT_DBUS_SERVICE={{dev_dbus_service}} cargo run -p desktop-assistant-tui
 
 # Build all workspace crates
 build:
@@ -32,6 +41,7 @@ build:
 
 # Install user service file and reload systemd user manager
 install-service:
+    [ -f "{{service_src}}" ] || (echo "Missing service file: {{service_src}}" >&2; exit 1)
     mkdir -p "$(dirname '{{service_dst}}')"
     cp "{{service_src}}" "{{service_dst}}"
     systemctl --user daemon-reload

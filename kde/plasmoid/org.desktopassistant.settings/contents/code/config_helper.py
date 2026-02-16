@@ -2,18 +2,51 @@
 import argparse
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
-SERVICE = "org.desktopAssistant"
+DEFAULT_SERVICE = "org.desktopAssistant"
+DEV_SERVICE = "org.desktopAssistant.Dev"
+SETTINGS_PATH = Path.home() / ".config" / "desktop-assistant" / "widget_settings.json"
+
+SERVICE = DEFAULT_SERVICE
 PATH = "/org/desktopAssistant/Settings"
 IFACE = "org.desktopAssistant.Settings"
 
 
 class DbusError(RuntimeError):
     pass
+
+
+def _load_widget_settings() -> dict[str, Any]:
+    try:
+        payload = json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_widget_service() -> str:
+    env_service = os.environ.get("DESKTOP_ASSISTANT_WIDGET_DBUS_SERVICE", "").strip()
+    if env_service:
+        return env_service
+
+    settings = _load_widget_settings()
+    value = str(settings.get("dbus_service", "")).strip()
+    return value or DEFAULT_SERVICE
+
+
+def _save_widget_service(service: str) -> str:
+    target = service.strip() or DEFAULT_SERVICE
+    settings = _load_widget_settings()
+    settings["dbus_service"] = target
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    return target
 
 
 def _run_gdbus(method: str, *args: str) -> Any:
@@ -58,22 +91,35 @@ def cmd_load() -> int:
         "model": model,
         "base_url": base_url,
         "has_api_key": bool(has_api_key),
+        "dbus_service": SERVICE,
+        "dev_service": DEV_SERVICE,
     }
     print(json.dumps(response))
     return 0
 
 
 def cmd_save(args: argparse.Namespace) -> int:
+    global SERVICE
+
+    service = _save_widget_service(args.dbus_service) if args.dbus_service else SERVICE
+    SERVICE = service
+
     _run_gdbus("SetLlmSettings", args.connector, args.model, args.base_url)
 
     if args.api_key and args.api_key.strip():
         _run_gdbus("SetApiKey", args.api_key)
 
-    print(json.dumps({"ok": True}))
+    print(json.dumps({"ok": True, "dbus_service": SERVICE}))
     return 0
 
 
 def cmd_restart() -> int:
+    if SERVICE != DEFAULT_SERVICE:
+        print(json.dumps({
+            "error": "restart is only supported for org.desktopAssistant; dev mode is expected to run via just dev-backend"
+        }))
+        return 1
+
     command = ["systemctl", "--user", "restart", "desktop-assistant-daemon"]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
@@ -84,7 +130,11 @@ def cmd_restart() -> int:
 
 
 def main() -> int:
+    global SERVICE
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--service", default="")
+
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("load")
@@ -94,10 +144,12 @@ def main() -> int:
     save.add_argument("--model", default="")
     save.add_argument("--base-url", default="")
     save.add_argument("--api-key", default="")
+    save.add_argument("--dbus-service", default="")
 
     sub.add_parser("restart")
 
     args = parser.parse_args()
+    SERVICE = args.service.strip() or _load_widget_service()
 
     try:
         if args.command == "load":

@@ -135,10 +135,16 @@ async fn main() -> Result<()> {
         Box::new(|| uuid::Uuid::new_v4().to_string()),
     ));
     let settings_service = Arc::new(DaemonSettingsService::new(config_path.clone()));
+    let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "org.desktopAssistant".to_string());
+    tracing::info!("D-Bus well-known name={dbus_service_name}");
 
     // Set up D-Bus connection
     let connection = zbus::connection::Builder::session()?
-        .name("org.desktopAssistant")?
+        .name(dbus_service_name.as_str())?
         .serve_at(
             "/org/desktopAssistant/Conversations",
             DbusConversationAdapter::new(Arc::clone(&conversation_service)),

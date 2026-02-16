@@ -5,10 +5,11 @@ use zbus::Connection;
 
 use crate::app::{ChatMessage, ConversationDetail, ConversationSummary};
 
+const DEFAULT_DBUS_SERVICE: &str = "org.desktopAssistant";
+const DBUS_CONVERSATIONS_PATH: &str = "/org/desktopAssistant/Conversations";
+
 #[zbus::proxy(
-    interface = "org.desktopAssistant.Conversations",
-    default_service = "org.desktopAssistant",
-    default_path = "/org/desktopAssistant/Conversations"
+    interface = "org.desktopAssistant.Conversations"
 )]
 trait Conversations {
     async fn create_conversation(&self, title: &str) -> zbus::fdo::Result<String>;
@@ -73,7 +74,16 @@ pub struct DbusClient {
 impl DbusClient {
     pub async fn connect() -> Result<Self> {
         let connection = Connection::session().await?;
-        let proxy = ConversationsProxy::new(&connection).await?;
+        let service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_DBUS_SERVICE.to_string());
+        let proxy = ConversationsProxy::builder(&connection)
+            .destination(service_name)?
+            .path(DBUS_CONVERSATIONS_PATH)?
+            .build()
+            .await?;
         Ok(Self { proxy })
     }
 
