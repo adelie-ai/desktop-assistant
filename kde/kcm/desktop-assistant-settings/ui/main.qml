@@ -65,6 +65,73 @@ KCM.SimpleKCM {
             }
         }
 
+        Rectangle {
+            Layout.fillWidth: true
+            height: 1
+            color: Qt.rgba(0.5, 0.5, 0.5, 0.3)
+        }
+
+        QQC2.Label {
+            text: "Embeddings"
+            font.bold: true
+            Layout.fillWidth: true
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            QQC2.Label { text: "Connector" }
+            QQC2.ComboBox {
+                id: embConnectorBox
+                Layout.fillWidth: true
+                model: ["auto (use LLM)", "ollama", "openai"]
+                currentIndex: {
+                    if (kcm.embConnector === "ollama") return 1
+                    if (kcm.embConnector === "openai") return 2
+                    return 0
+                }
+                onActivated: {
+                    if (currentIndex === 0) kcm.embConnector = ""
+                    else kcm.embConnector = currentText
+                }
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            QQC2.Label { text: "Model" }
+            QQC2.TextField {
+                Layout.fillWidth: true
+                placeholderText: {
+                    let c = kcm.embConnector || kcm.connector
+                    return c === "ollama" ? "nomic-embed-text" : "text-embedding-3-small"
+                }
+                text: kcm.embModel
+                onTextChanged: kcm.embModel = text
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            QQC2.Label { text: "Base URL" }
+            QQC2.TextField {
+                Layout.fillWidth: true
+                placeholderText: {
+                    let c = kcm.embConnector || kcm.connector
+                    return c === "ollama" ? "http://localhost:11434" : "https://api.openai.com/v1"
+                }
+                text: kcm.embBaseUrl
+                onTextChanged: kcm.embBaseUrl = text
+            }
+        }
+
+        QQC2.Label {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            visible: !kcm.embAvailable
+            color: "orange"
+            text: "Current connector does not support embeddings. Choose a different embeddings connector or switch the LLM connector."
+        }
+
         RowLayout {
             Layout.fillWidth: true
 

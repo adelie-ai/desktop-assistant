@@ -71,6 +71,69 @@ void DesktopAssistantKcm::setBaseUrl(const QString &value)
     setNeedsSave(true);
 }
 
+QString DesktopAssistantKcm::embConnector() const
+{
+    return m_embConnector;
+}
+
+void DesktopAssistantKcm::setEmbConnector(const QString &value)
+{
+    if (m_embConnector == value) {
+        return;
+    }
+
+    m_embConnector = value;
+    Q_EMIT embConnectorChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::embModel() const
+{
+    return m_embModel;
+}
+
+void DesktopAssistantKcm::setEmbModel(const QString &value)
+{
+    if (m_embModel == value) {
+        return;
+    }
+
+    m_embModel = value;
+    Q_EMIT embModelChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::embBaseUrl() const
+{
+    return m_embBaseUrl;
+}
+
+void DesktopAssistantKcm::setEmbBaseUrl(const QString &value)
+{
+    if (m_embBaseUrl == value) {
+        return;
+    }
+
+    m_embBaseUrl = value;
+    Q_EMIT embBaseUrlChanged();
+    setNeedsSave(true);
+}
+
+bool DesktopAssistantKcm::embHasApiKey() const
+{
+    return m_embHasApiKey;
+}
+
+bool DesktopAssistantKcm::embAvailable() const
+{
+    return m_embAvailable;
+}
+
+bool DesktopAssistantKcm::embIsDefault() const
+{
+    return m_embIsDefault;
+}
+
 QString DesktopAssistantKcm::apiKeyInput() const
 {
     return m_apiKeyInput;
@@ -117,11 +180,37 @@ void DesktopAssistantKcm::load()
     m_model = args[1].toString();
     m_baseUrl = args[2].toString();
     m_hasApiKey = args[3].toBool();
+
+    QDBusMessage embReply = iface.call("GetEmbeddingsSettings");
+    if (setStatusFromDbusError(embReply)) {
+        return;
+    }
+
+    const auto embArgs = embReply.arguments();
+    if (embArgs.size() < 6) {
+        m_statusText = QStringLiteral("Unexpected GetEmbeddingsSettings reply");
+        Q_EMIT statusTextChanged();
+        return;
+    }
+
+    m_embConnector = embArgs[5].toBool() ? QString() : embArgs[0].toString();
+    m_embModel = embArgs[1].toString();
+    m_embBaseUrl = embArgs[2].toString();
+    m_embHasApiKey = embArgs[3].toBool();
+    m_embAvailable = embArgs[4].toBool();
+    m_embIsDefault = embArgs[5].toBool();
+
     m_apiKeyInput.clear();
 
     Q_EMIT connectorChanged();
     Q_EMIT modelChanged();
     Q_EMIT baseUrlChanged();
+    Q_EMIT embConnectorChanged();
+    Q_EMIT embModelChanged();
+    Q_EMIT embBaseUrlChanged();
+    Q_EMIT embHasApiKeyChanged();
+    Q_EMIT embAvailableChanged();
+    Q_EMIT embIsDefaultChanged();
     Q_EMIT hasApiKeyChanged();
     Q_EMIT apiKeyInputChanged();
 
@@ -136,6 +225,11 @@ void DesktopAssistantKcm::save()
 
     QDBusMessage settingsReply = iface.call("SetLlmSettings", m_connector, m_model, m_baseUrl);
     if (setStatusFromDbusError(settingsReply)) {
+        return;
+    }
+
+    QDBusMessage embeddingsReply = iface.call("SetEmbeddingsSettings", m_embConnector, m_embModel, m_embBaseUrl);
+    if (setStatusFromDbusError(embeddingsReply)) {
         return;
     }
 
@@ -162,6 +256,9 @@ void DesktopAssistantKcm::defaults()
     setConnector(QStringLiteral("ollama"));
     setModel(QString());
     setBaseUrl(QString());
+    setEmbConnector(QString());
+    setEmbModel(QString());
+    setEmbBaseUrl(QString());
     setApiKeyInput(QString());
     m_statusText = QStringLiteral("Restored form defaults; click Apply to save");
     Q_EMIT statusTextChanged();
