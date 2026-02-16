@@ -1,11 +1,15 @@
 import QtQuick
 import QtQuick.Layouts
+import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents
 
 PlasmoidItem {
     id: root
+    readonly property string xdgDataHome: String(StandardPaths.writableLocation(StandardPaths.GenericDataLocation) || "")
+    readonly property string normalizedDataHome: xdgDataHome.indexOf("file://") === 0 ? xdgDataHome.substring(7) : xdgDataHome
+    readonly property string sharedModuleChatViewPath: "file://" + normalizedDataHome + "/desktop-assistant/chat-module/ui/ChatView.qml"
 
     preferredRepresentation: Plasmoid.compactRepresentation
     switchWidth: 320
@@ -27,10 +31,21 @@ PlasmoidItem {
         Loader {
             id: chatViewLoader
             anchors.fill: parent
-            source: Qt.resolvedUrl("../../../org.desktopassistant.desktopchat/contents/ui/ChatView.qml")
+            property int sourceIndex: 0
+            readonly property var sourceCandidates: [
+                sharedModuleChatViewPath,
+                Qt.resolvedUrl("../../../org.desktopassistant.desktopchat/contents/ui/ChatView.qml")
+            ]
+            source: sourceCandidates[sourceIndex]
             onLoaded: {
                 if (item) {
                     item.panelMode = true
+                }
+            }
+            onStatusChanged: {
+                if (status === Loader.Error && sourceIndex < sourceCandidates.length - 1) {
+                    sourceIndex += 1
+                    source = sourceCandidates[sourceIndex]
                 }
             }
         }

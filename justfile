@@ -20,7 +20,10 @@ kcm_build_dir := "build/kde-kcm"
 panel_widget_id := "org.desktopassistant.panelchat"
 desktop_widget_id := "org.desktopassistant.desktopchat"
 settings_widget_id := "org.desktopassistant.settings"
+shared_chat_module_src := "kde/shared/chat-module"
+shared_chat_module_dst := env_var_or_default("XDG_DATA_HOME", env_var("HOME") + "/.local/share") + "/desktop-assistant/chat-module"
 container_cli := env_var_or_default("CONTAINER_CLI", "docker")
+container_security_opts := env_var_or_default("CONTAINER_SECURITY_OPTS", "--security-opt label=disable")
 debian_builder_image := env_var_or_default("DEBIAN_BUILDER_IMAGE", "debian:trixie")
 rpm_builder_image := env_var_or_default("RPM_BUILDER_IMAGE", "fedora:43")
 flatpak_builder_image := env_var_or_default("FLATPAK_BUILDER_IMAGE", "fedora:43")
@@ -128,20 +131,30 @@ backend-logs:
 backend-dev-logs:
     journalctl --user -u {{dev_service_name}} -f
 
+# Sync shared chat module to XDG data path
+chat-module-sync:
+    [ -d "{{shared_chat_module_src}}" ] || (echo "Missing shared module directory: {{shared_chat_module_src}}" >&2; exit 1)
+    mkdir -p "$(dirname '{{shared_chat_module_dst}}')"
+    rm -rf "{{shared_chat_module_dst}}"
+    cp -a "{{shared_chat_module_src}}" "{{shared_chat_module_dst}}"
+
 # Install all KDE Plasma widgets for the current user
 widget-install:
+    just chat-module-sync
     kpackagetool6 --type Plasma/Applet --install {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --install {{desktop_widget}}
     kpackagetool6 --type Plasma/Applet --install {{settings_widget}}
 
 # Upgrade all KDE Plasma widgets after local changes
 widget-upgrade:
+    just chat-module-sync
     kpackagetool6 --type Plasma/Applet --upgrade {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --upgrade {{desktop_widget}}
     kpackagetool6 --type Plasma/Applet --upgrade {{settings_widget}}
 
 # Reinstall all KDE Plasma widgets (remove + install)
 widget-reinstall:
+    just chat-module-sync
     kpackagetool6 --type Plasma/Applet --remove {{panel_widget_id}} || true
     kpackagetool6 --type Plasma/Applet --remove {{desktop_widget_id}} || true
     kpackagetool6 --type Plasma/Applet --remove {{settings_widget_id}} || true
@@ -243,10 +256,11 @@ package-deb:
 # Build RPM package artifacts on host
 package-rpm:
     mkdir -p build/pkg/rpm
-    rm -rf build/pkg/rpm/src
-    git archive --format=tar HEAD | tar -xf - -C build/pkg/rpm
-    cd build/pkg/rpm && tar -czf desktop-assistant-0.1.0.tar.gz .
-    cd build/pkg/rpm && rpmbuild --define "_topdir {{invocation_directory()}}/build/pkg/rpm/rpmbuild" -ba packaging/fedora/desktop-assistant.spec
+    rm -rf build/pkg/rpm/rpmbuild
+    mkdir -p build/pkg/rpm/rpmbuild/SOURCES build/pkg/rpm/rpmbuild/SPECS
+    cp packaging/fedora/desktop-assistant.spec build/pkg/rpm/rpmbuild/SPECS/desktop-assistant.spec
+    git archive --format=tar.gz --prefix=desktop-assistant-0.1.0/ HEAD > build/pkg/rpm/rpmbuild/SOURCES/desktop-assistant-0.1.0.tar.gz
+    rpmbuild --define "_topdir {{invocation_directory()}}/build/pkg/rpm/rpmbuild" -ba build/pkg/rpm/rpmbuild/SPECS/desktop-assistant.spec
 
 # Build Flatpak bundle on host
 package-flatpak:
@@ -259,19 +273,19 @@ package-snap:
 
 # Build Debian package artifacts inside Docker
 package-deb-docker:
-    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work {{debian_builder_image}} bash -lc "apt-get update && apt-get install -y --no-install-recommends dpkg-dev debhelper pkg-config ca-certificates git rustc cargo && mkdir -p build/pkg/debian && rm -rf build/pkg/debian/src && git archive --format=tar HEAD | tar -xf - -C build/pkg/debian && cd build/pkg/debian && cp -a packaging/debian/debian ./debian && dpkg-buildpackage -us -uc -b"
+    {{container_cli}} run --rm -t {{container_security_opts}} -v "{{invocation_directory()}}:/work" -w /work {{debian_builder_image}} bash -lc "apt-get update && apt-get install -y --no-install-recommends build-essential dpkg-dev debhelper pkg-config ca-certificates git curl rustc cargo libssl-dev && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && . /root/.cargo/env && mkdir -p build/pkg/debian && rm -rf build/pkg/debian/src && git archive --format=tar HEAD | tar -xf - -C build/pkg/debian && cd build/pkg/debian && cp -a packaging/debian/debian ./debian && dpkg-buildpackage -us -uc -b"
 
 # Build RPM package artifacts inside Docker
 package-rpm-docker:
-    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work {{rpm_builder_image}} bash -lc "dnf -y install git tar gzip rust cargo rpm-build rpmdevtools && mkdir -p build/pkg/rpm && rm -rf build/pkg/rpm/src build/pkg/rpm/rpmbuild && git archive --format=tar HEAD | tar -xf - -C build/pkg/rpm && cd build/pkg/rpm && tar -czf desktop-assistant-0.1.0.tar.gz . && rpmbuild --define '_topdir /work/build/pkg/rpm/rpmbuild' -ba packaging/fedora/desktop-assistant.spec"
+    {{container_cli}} run --rm -t {{container_security_opts}} -v "{{invocation_directory()}}:/work" -w /work {{rpm_builder_image}} bash -lc "dnf -y install git tar gzip rust cargo rpm-build rpmdevtools systemd-rpm-macros openssl-devel && mkdir -p build/pkg/rpm && rm -rf build/pkg/rpm/rpmbuild && mkdir -p build/pkg/rpm/rpmbuild/SOURCES build/pkg/rpm/rpmbuild/SPECS && cp packaging/fedora/desktop-assistant.spec build/pkg/rpm/rpmbuild/SPECS/desktop-assistant.spec && git archive --format=tar.gz --prefix=desktop-assistant-0.1.0/ HEAD > build/pkg/rpm/rpmbuild/SOURCES/desktop-assistant-0.1.0.tar.gz && rpmbuild --define '_topdir /work/build/pkg/rpm/rpmbuild' -ba build/pkg/rpm/rpmbuild/SPECS/desktop-assistant.spec"
 
 # Build Flatpak bundle inside Docker
 package-flatpak-docker:
-    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work --privileged {{flatpak_builder_image}} bash -lc "dnf -y install git tar gzip rust cargo flatpak-builder && mkdir -p build/pkg/flatpak && flatpak-builder --force-clean build/pkg/flatpak/build-dir packaging/flatpak/org.desktopassistant.App.yml"
+    {{container_cli}} run --rm -t {{container_security_opts}} -v "{{invocation_directory()}}:/work" -w /work --privileged {{flatpak_builder_image}} bash -lc "dnf -y install git tar gzip rust cargo flatpak-builder && mkdir -p build/pkg/flatpak && flatpak-builder --force-clean build/pkg/flatpak/build-dir packaging/flatpak/org.desktopassistant.App.yml"
 
 # Build Snap package inside Docker
 package-snap-docker:
-    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work --privileged {{snap_builder_image}} bash -lc "apt-get update && apt-get install -y --no-install-recommends snapcraft && snapcraft --destructive-mode --dir packaging/snap"
+    {{container_cli}} run --rm -t {{container_security_opts}} -v "{{invocation_directory()}}:/work" -w /work --privileged {{snap_builder_image}} bash -lc "apt-get update && apt-get install -y --no-install-recommends snapcraft && snapcraft --destructive-mode --dir packaging/snap"
 
 # Build all package formats inside Docker containers
 package-all-docker:
