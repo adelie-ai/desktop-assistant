@@ -211,6 +211,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         self.store.delete(id).await
     }
 
+    async fn clear_all_history(&self) -> Result<u32, CoreError> {
+        let conversations = self.store.list().await?;
+        let mut deleted = 0u32;
+
+        for conversation in conversations {
+            self.store.delete(&conversation.id).await?;
+            deleted += 1;
+        }
+
+        Ok(deleted)
+    }
+
     async fn send_prompt(
         &self,
         conversation_id: &ConversationId,
@@ -522,6 +534,19 @@ mod tests {
 
         let result = handler.get_conversation(&conv.id).await;
         assert!(matches!(result, Err(CoreError::ConversationNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn clear_all_history_removes_all_conversations() {
+        let handler = make_handler(vec![]);
+        handler.create_conversation("A".into()).await.unwrap();
+        handler.create_conversation("B".into()).await.unwrap();
+
+        let deleted = handler.clear_all_history().await.unwrap();
+        assert_eq!(deleted, 2);
+
+        let summaries = handler.list_conversations(None).await.unwrap();
+        assert!(summaries.is_empty());
     }
 
     #[tokio::test]

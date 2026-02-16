@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::ports::inbound::{EmbeddingsSettingsView, LlmSettingsView, SettingsService};
+use desktop_assistant_core::ports::inbound::{
+    EmbeddingsSettingsView, LlmSettingsView, SettingsService,
+};
 
 use crate::config;
 

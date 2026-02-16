@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
+use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::Mutex;
 
@@ -37,6 +38,23 @@ pub struct McpToolExecutor {
 
 impl McpToolExecutor {
     pub fn new(configs: Vec<McpServerConfig>) -> Self {
+        Self::with_builtin_tools(configs, BuiltinToolService::from_default_paths())
+    }
+
+    pub fn new_with_embedding(
+        configs: Vec<McpServerConfig>,
+        embed_fn: EmbedFn,
+        embedding_model: String,
+    ) -> Self {
+        let builtin_tools =
+            BuiltinToolService::from_default_paths().with_embedding(embed_fn, embedding_model);
+        Self::with_builtin_tools(configs, builtin_tools)
+    }
+
+    fn with_builtin_tools(
+        configs: Vec<McpServerConfig>,
+        builtin_tools: BuiltinToolService,
+    ) -> Self {
         let clients: Vec<Option<McpClient>> = (0..configs.len()).map(|_| None).collect();
         Self {
             configs,
@@ -45,7 +63,7 @@ impl McpToolExecutor {
             cached_tools: Mutex::new(Vec::new()),
             cached_resources: Mutex::new(Vec::new()),
             cached_prompts: Mutex::new(Vec::new()),
-            builtin_tools: BuiltinToolService::from_default_paths(),
+            builtin_tools,
         }
     }
 
@@ -276,7 +294,7 @@ impl ToolExecutor for McpToolExecutor {
         arguments: serde_json::Value,
     ) -> Result<String, CoreError> {
         if BuiltinToolService::supports_tool(name) {
-            return self.builtin_tools.execute_tool(name, arguments);
+            return self.builtin_tools.execute_tool(name, arguments).await;
         }
 
         self.maybe_refresh_metadata()

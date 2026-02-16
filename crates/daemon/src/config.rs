@@ -982,10 +982,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.embeddings.connector.as_deref(), Some("ollama"));
-        assert_eq!(
-            config.embeddings.model.as_deref(),
-            Some("nomic-embed-text")
-        );
+        assert_eq!(config.embeddings.model.as_deref(), Some("nomic-embed-text"));
         assert!(config.embeddings.base_url.is_none());
     }
 
@@ -1025,10 +1022,7 @@ mod tests {
 
         let loaded = load_daemon_config(&path).unwrap().unwrap();
         assert_eq!(loaded.embeddings.connector.as_deref(), Some("ollama"));
-        assert_eq!(
-            loaded.embeddings.model.as_deref(),
-            Some("nomic-embed-text")
-        );
+        assert_eq!(loaded.embeddings.model.as_deref(), Some("nomic-embed-text"));
         assert!(loaded.embeddings.base_url.is_none());
 
         // Clear override

@@ -2,6 +2,13 @@ app-id: org.desktopassistant.App
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  prepend-ld-library-path: /usr/lib/sdk/rust-stable/lib
+  build-args:
+    - --share=network
 command: desktop-assistant-tui
 finish-args:
   - --share=network
@@ -12,11 +19,12 @@ modules:
   - name: desktop-assistant
     buildsystem: simple
     build-commands:
-      - cargo build --release --package desktop-assistant-daemon --package desktop-assistant-tui
+      - /usr/lib/sdk/rust-stable/bin/cargo build --release --package desktop-assistant-daemon --package desktop-assistant-tui
       - install -Dm755 target/release/desktop-assistant-daemon /app/bin/desktop-assistant-daemon
       - install -Dm755 target/release/desktop-assistant-tui /app/bin/desktop-assistant-tui
       - install -Dm644 packaging/flatpak/org.desktopassistant.App.desktop /app/share/applications/org.desktopassistant.App.desktop
       - install -Dm644 packaging/flatpak/org.desktopassistant.App.metainfo.xml /app/share/metainfo/org.desktopassistant.App.metainfo.xml
+      - install -Dm644 assets/adele_with_text.png /app/share/icons/hicolor/512x512/apps/org.desktopassistant.App.png
     sources:
       - type: dir
         path: ../..

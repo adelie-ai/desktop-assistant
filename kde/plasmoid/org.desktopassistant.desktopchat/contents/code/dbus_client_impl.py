@@ -126,6 +126,17 @@ def get_conversation(conversation_id: str) -> dict[str, Any]:
     }
 
 
+def delete_conversation(conversation_id: str) -> None:
+    _run_gdbus("DeleteConversation", conversation_id)
+
+
+def clear_all_history() -> int:
+    response = _run_gdbus("ClearAllHistory")
+    if isinstance(response, tuple) and len(response) > 0:
+        return int(response[0])
+    return int(response)
+
+
 def wait_for_assistant_reply(conversation_id: str, initial_count: int, timeout_sec: float, interval_sec: float) -> str:
     deadline = time.monotonic() + timeout_sec
     last_assistant = ""
@@ -210,6 +221,11 @@ def main() -> int:
     get_cmd = subparsers.add_parser("get")
     get_cmd.add_argument("conversation_id")
 
+    delete_cmd = subparsers.add_parser("delete")
+    delete_cmd.add_argument("conversation_id")
+
+    subparsers.add_parser("clear")
+
     await_cmd = subparsers.add_parser("await")
     await_cmd.add_argument("conversation_id")
     await_cmd.add_argument("--initial-count", type=int, required=True)
@@ -236,6 +252,14 @@ def main() -> int:
             return 0
         if args.command == "get":
             print(json.dumps(get_conversation(args.conversation_id)))
+            return 0
+        if args.command == "delete":
+            delete_conversation(args.conversation_id)
+            print(json.dumps({"deleted": True, "conversation_id": args.conversation_id}))
+            return 0
+        if args.command == "clear":
+            deleted_count = clear_all_history()
+            print(json.dumps({"deleted_count": deleted_count}))
             return 0
         if args.command == "await":
             content = wait_for_assistant_reply(

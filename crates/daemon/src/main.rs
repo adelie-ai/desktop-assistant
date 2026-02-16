@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition};
-use desktop_assistant_core::ports::embedding::EmbeddingClient;
+use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
 use tracing_subscriber::EnvFilter;
 
@@ -42,10 +42,7 @@ enum AnyEmbeddingClient {
 }
 
 impl EmbeddingClient for AnyEmbeddingClient {
-    async fn embed(
-        &self,
-        texts: Vec<String>,
-    ) -> Result<Vec<Vec<f32>>, CoreError> {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
         match self {
             Self::OpenAi(c) => c.embed(texts).await,
             Self::Ollama(c) => c.embed(texts).await,
@@ -150,37 +147,51 @@ async fn main() -> Result<()> {
         resolved_emb.is_default
     );
 
-    let _embedding_client: AnyEmbeddingClient = if !resolved_emb.available {
-        tracing::info!("embeddings unavailable (connector={})", resolved_emb.connector);
+    let embedding_client: AnyEmbeddingClient = if !resolved_emb.available {
+        tracing::info!(
+            "embeddings unavailable (connector={})",
+            resolved_emb.connector
+        );
         AnyEmbeddingClient::Unavailable
     } else {
         match resolved_emb.connector.as_str() {
             "ollama" => {
                 tracing::info!("using Ollama embedding backend");
                 AnyEmbeddingClient::Ollama(desktop_assistant_llm_ollama::OllamaClient::new(
-                    resolved_emb.base_url,
-                    resolved_emb.model,
+                    resolved_emb.base_url.clone(),
+                    resolved_emb.model.clone(),
                 ))
             }
             _ => {
                 tracing::info!("using OpenAI-compatible embedding backend");
-                let api_key = if resolved_emb.is_default || resolved_emb.connector == llm_connector {
+                let api_key = if resolved_emb.is_default || resolved_emb.connector == llm_connector
+                {
                     llm_api_key.clone()
                 } else {
-                    let env_key = format!(
-                        "{}_API_KEY",
-                        resolved_emb.connector.to_ascii_uppercase()
-                    );
+                    let env_key =
+                        format!("{}_API_KEY", resolved_emb.connector.to_ascii_uppercase());
                     std::env::var(env_key).unwrap_or_default()
                 };
                 AnyEmbeddingClient::OpenAi(
                     desktop_assistant_llm_openai::OpenAiClient::new(api_key)
-                        .with_model(resolved_emb.model)
-                        .with_base_url(resolved_emb.base_url),
+                        .with_model(resolved_emb.model.clone())
+                        .with_base_url(resolved_emb.base_url.clone()),
                 )
             }
         }
     };
+
+    let embedding_client = Arc::new(embedding_client);
+    let embedding_fn: Option<EmbedFn> =
+        if matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
+            None
+        } else {
+            let client = Arc::clone(&embedding_client);
+            Some(Arc::new(move |texts: Vec<String>| {
+                let client = Arc::clone(&client);
+                Box::pin(async move { client.embed(texts).await })
+            }))
+        };
 
     // Load MCP server configuration
     let mcp_config_path = mcp_config::default_config_path();
@@ -190,7 +201,16 @@ async fn main() -> Result<()> {
     });
 
     // Build the MCP tool executor
-    let tool_executor = McpToolExecutor::new(mcp_configs);
+    let tool_executor = if let Some(embed_fn) = embedding_fn {
+        tracing::info!(
+            "enabling built-in vector search for preferences/memory with model={}",
+            resolved_emb.model
+        );
+        McpToolExecutor::new_with_embedding(mcp_configs, embed_fn, resolved_emb.model.clone())
+    } else {
+        tracing::info!("built-in vector search disabled (no embedding backend available)");
+        McpToolExecutor::new(mcp_configs)
+    };
     if let Err(e) = tool_executor.start().await {
         tracing::warn!("failed to start MCP servers: {e}");
     }

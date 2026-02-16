@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
+use desktop_assistant_core::ports::embedding::EmbedFn;
 
 const TOOL_PREF_REMEMBER: &str = "builtin_preferences_remember";
 const TOOL_PREF_SEARCH: &str = "builtin_preferences_search";
@@ -20,6 +21,10 @@ struct PreferenceEntry {
     value: String,
     scope: Option<String>,
     updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -37,6 +42,10 @@ struct MemoryEntry {
     supersedes: Option<String>,
     created_at: u64,
     updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -57,6 +66,22 @@ fn normalize(text: &str) -> String {
 
 fn normalized_eq(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
 fn score_match(haystack: &str, needle: &str) -> i64 {
@@ -107,6 +132,8 @@ pub struct BuiltinToolService {
     memory_path: PathBuf,
     preferences: Mutex<PreferenceStoreData>,
     memory: Mutex<MemoryStoreData>,
+    embed_fn: Option<EmbedFn>,
+    embedding_model: String,
 }
 
 impl BuiltinToolService {
@@ -136,7 +163,16 @@ impl BuiltinToolService {
             memory_path,
             preferences: Mutex::new(preferences),
             memory: Mutex::new(memory),
+            embed_fn: None,
+            embedding_model: String::new(),
         }
+    }
+
+    /// Configure the embedding function and model name for vector indexing.
+    pub fn with_embedding(mut self, embed_fn: EmbedFn, model: String) -> Self {
+        self.embed_fn = Some(embed_fn);
+        self.embedding_model = model;
+        self
     }
 
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -259,26 +295,29 @@ impl BuiltinToolService {
         )
     }
 
-    pub fn execute_tool(
+    pub async fn execute_tool(
         &self,
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<String, CoreError> {
         match name {
-            TOOL_PREF_REMEMBER => self.preferences_remember(arguments),
-            TOOL_PREF_SEARCH => self.preferences_search(arguments),
+            TOOL_PREF_REMEMBER => self.preferences_remember(arguments).await,
+            TOOL_PREF_SEARCH => self.preferences_search(arguments).await,
             TOOL_PREF_RETRIEVE => self.preferences_retrieve(arguments),
-            TOOL_MEM_REMEMBER => self.memory_remember(arguments),
-            TOOL_MEM_SEARCH => self.memory_search(arguments),
+            TOOL_MEM_REMEMBER => self.memory_remember(arguments).await,
+            TOOL_MEM_SEARCH => self.memory_search(arguments).await,
             TOOL_MEM_RETRIEVE => self.memory_retrieve(arguments),
-            TOOL_MEM_UPDATE => self.memory_update(arguments),
+            TOOL_MEM_UPDATE => self.memory_update(arguments).await,
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
         }
     }
 
-    fn preferences_remember(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+    async fn preferences_remember(
+        &self,
+        arguments: serde_json::Value,
+    ) -> Result<String, CoreError> {
         let key = normalize(&required_string(&arguments, "key")?);
         let value = required_string(&arguments, "value")?;
         let scope = optional_string(&arguments, "scope");
@@ -288,56 +327,78 @@ impl BuiltinToolService {
             .unwrap_or(true);
 
         let now = now_ts();
-        let mut prefs = self.preferences.lock().unwrap();
 
-        if let Some(existing_idx) = prefs
-            .items
-            .iter()
-            .position(|item| normalized_eq(&item.key, &key) && item.scope == scope)
-        {
-            let updated_at;
-            prefs.items[existing_idx].key = key.clone();
-            if overwrite {
-                prefs.items[existing_idx].value = value.clone();
-                prefs.items[existing_idx].updated_at = now;
+        // Phase 1: mutate data under lock, then release
+        let (response_json, embed_text) = {
+            let mut prefs = self.preferences.lock().unwrap();
+
+            if let Some(existing_idx) = prefs
+                .items
+                .iter()
+                .position(|item| normalized_eq(&item.key, &key) && item.scope == scope)
+            {
+                let updated_at;
+                prefs.items[existing_idx].key = key.clone();
+                if overwrite {
+                    prefs.items[existing_idx].value = value.clone();
+                    prefs.items[existing_idx].updated_at = now;
+                }
+                updated_at = prefs.items[existing_idx].updated_at;
+                let embed_text = pref_embed_text(
+                    &prefs.items[existing_idx].key,
+                    &prefs.items[existing_idx].value,
+                );
+                self.persist_preferences(&prefs)?;
+                (
+                    serde_json::json!({
+                        "ok": true,
+                        "key": key,
+                        "scope": scope,
+                        "stored": overwrite,
+                        "updated_at": updated_at,
+                    }),
+                    embed_text,
+                )
+            } else {
+                let embed_text = pref_embed_text(&key, &value);
+                prefs.items.push(PreferenceEntry {
+                    key: key.clone(),
+                    value,
+                    scope: scope.clone(),
+                    updated_at: now,
+                    embedding: None,
+                    embedding_model: None,
+                });
+                self.persist_preferences(&prefs)?;
+                (
+                    serde_json::json!({
+                        "ok": true,
+                        "key": key,
+                        "scope": scope,
+                        "stored": true,
+                        "updated_at": now,
+                    }),
+                    embed_text,
+                )
             }
-            updated_at = prefs.items[existing_idx].updated_at;
-            self.persist_preferences(&prefs)?;
-            return Ok(serde_json::json!({
-                "ok": true,
-                "key": key,
-                "scope": scope,
-                "stored": overwrite,
-                "updated_at": updated_at,
-            })
-            .to_string());
-        }
+        };
 
-        prefs.items.push(PreferenceEntry {
-            key: key.clone(),
-            value,
-            scope: scope.clone(),
-            updated_at: now,
-        });
+        // Phase 2: generate embedding without holding lock
+        self.embed_preference(&key, &scope, &embed_text).await;
 
-        self.persist_preferences(&prefs)?;
-        Ok(serde_json::json!({
-            "ok": true,
-            "key": key,
-            "scope": scope,
-            "stored": true,
-            "updated_at": now,
-        })
-        .to_string())
+        Ok(response_json.to_string())
     }
 
-    fn preferences_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+    async fn preferences_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let query = required_string(&arguments, "query")?;
         let limit = arguments
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(10) as usize;
         let scope_filter = optional_string(&arguments, "scope");
+
+        // Try to embed the query for vector search
+        let query_embedding = self.embed_query(&query).await;
 
         let prefs = self.preferences.lock().unwrap();
         let mut results: Vec<serde_json::Value> = prefs
@@ -351,7 +412,12 @@ impl BuiltinToolService {
                 }
             })
             .filter_map(|item| {
-                let score = score_match(&format!("{} {}", item.key, item.value), &query);
+                let text_score = score_match(&format!("{} {}", item.key, item.value), &query);
+                let vector_score = match (&query_embedding, &item.embedding) {
+                    (Some(qe), Some(ie)) => (cosine_similarity(qe, ie) * 100.0) as i64,
+                    _ => 0,
+                };
+                let score = text_score.max(vector_score);
                 if score <= 0 {
                     return None;
                 }
@@ -416,7 +482,7 @@ impl BuiltinToolService {
         }
     }
 
-    fn memory_remember(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+    async fn memory_remember(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let fact = required_string(&arguments, "fact")?;
         let tags = optional_string_array(&arguments, "tags");
         let source = optional_string(&arguments, "source");
@@ -427,19 +493,26 @@ impl BuiltinToolService {
         let now = now_ts();
         let id = format!("mem-{}", now_ts_nanos());
 
-        let mut memory = self.memory.lock().unwrap();
-        memory.items.push(MemoryEntry {
-            id: id.clone(),
-            fact,
-            tags,
-            source,
-            confidence,
-            supersedes: None,
-            created_at: now,
-            updated_at: now,
-        });
+        let embed_text = mem_embed_text(&fact, &tags);
 
-        self.persist_memory(&memory)?;
+        {
+            let mut memory = self.memory.lock().unwrap();
+            memory.items.push(MemoryEntry {
+                id: id.clone(),
+                fact,
+                tags,
+                source,
+                confidence,
+                supersedes: None,
+                created_at: now,
+                updated_at: now,
+                embedding: None,
+                embedding_model: None,
+            });
+            self.persist_memory(&memory)?;
+        }
+
+        self.embed_memory(&id, &embed_text).await;
 
         Ok(serde_json::json!({
             "ok": true,
@@ -449,13 +522,15 @@ impl BuiltinToolService {
         .to_string())
     }
 
-    fn memory_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+    async fn memory_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let query = required_string(&arguments, "query")?;
         let limit = arguments
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(10) as usize;
         let tags_filter = optional_string_array(&arguments, "tags");
+
+        let query_embedding = self.embed_query(&query).await;
 
         let memory = self.memory.lock().unwrap();
         let mut results: Vec<serde_json::Value> = memory
@@ -471,7 +546,12 @@ impl BuiltinToolService {
             })
             .filter_map(|item| {
                 let searchable = format!("{} {}", item.fact, item.tags.join(" "));
-                let score = score_match(&searchable, &query);
+                let text_score = score_match(&searchable, &query);
+                let vector_score = match (&query_embedding, &item.embedding) {
+                    (Some(qe), Some(ie)) => (cosine_similarity(qe, ie) * 100.0) as i64,
+                    _ => 0,
+                };
+                let score = text_score.max(vector_score);
                 if score <= 0 {
                     return None;
                 }
@@ -531,7 +611,7 @@ impl BuiltinToolService {
         }
     }
 
-    fn memory_update(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+    async fn memory_update(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let id = required_string(&arguments, "id")?;
         let fact = optional_string(&arguments, "fact");
         let tags = optional_string_array_nonempty(&arguments, "tags");
@@ -541,44 +621,123 @@ impl BuiltinToolService {
             .and_then(serde_json::Value::as_f64);
         let supersedes = optional_string(&arguments, "supersedes");
 
-        let mut memory = self.memory.lock().unwrap();
-        if let Some(item_idx) = memory
-            .items
-            .iter()
-            .position(|entry| normalized_eq(&entry.id, &id))
-        {
-            if let Some(new_fact) = fact {
-                memory.items[item_idx].fact = new_fact;
-            }
-            if let Some(new_tags) = tags {
-                memory.items[item_idx].tags = new_tags;
-            }
-            if let Some(new_source) = source {
-                memory.items[item_idx].source = Some(new_source);
-            }
-            if let Some(new_confidence) = confidence {
-                memory.items[item_idx].confidence = Some(new_confidence);
-            }
-            if let Some(new_supersedes) = supersedes {
-                memory.items[item_idx].supersedes = Some(new_supersedes);
-            }
-            memory.items[item_idx].updated_at = now_ts();
+        let (response_json, embed_text, matched_id) = {
+            let mut memory = self.memory.lock().unwrap();
+            if let Some(item_idx) = memory
+                .items
+                .iter()
+                .position(|entry| normalized_eq(&entry.id, &id))
+            {
+                if let Some(new_fact) = fact {
+                    memory.items[item_idx].fact = new_fact;
+                }
+                if let Some(new_tags) = tags {
+                    memory.items[item_idx].tags = new_tags;
+                }
+                if let Some(new_source) = source {
+                    memory.items[item_idx].source = Some(new_source);
+                }
+                if let Some(new_confidence) = confidence {
+                    memory.items[item_idx].confidence = Some(new_confidence);
+                }
+                if let Some(new_supersedes) = supersedes {
+                    memory.items[item_idx].supersedes = Some(new_supersedes);
+                }
+                memory.items[item_idx].updated_at = now_ts();
 
-            let updated_id = memory.items[item_idx].id.clone();
-            let updated_at = memory.items[item_idx].updated_at;
+                let updated_id = memory.items[item_idx].id.clone();
+                let updated_at = memory.items[item_idx].updated_at;
+                let embed_text =
+                    mem_embed_text(&memory.items[item_idx].fact, &memory.items[item_idx].tags);
 
-            self.persist_memory(&memory)?;
-            return Ok(serde_json::json!({
-                "ok": true,
-                "id": updated_id,
-                "updated_at": updated_at,
-            })
-            .to_string());
+                self.persist_memory(&memory)?;
+                (
+                    serde_json::json!({
+                        "ok": true,
+                        "id": updated_id,
+                        "updated_at": updated_at,
+                    }),
+                    embed_text,
+                    updated_id,
+                )
+            } else {
+                return Err(CoreError::ToolExecution(format!(
+                    "memory id not found: {id}"
+                )));
+            }
+        };
+
+        self.embed_memory(&matched_id, &embed_text).await;
+
+        Ok(response_json.to_string())
+    }
+
+    /// Embed a single query string, returning None if embeddings are unavailable.
+    async fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
+        let embed_fn = self.embed_fn.as_ref()?;
+        match embed_fn(vec![text.to_string()]).await {
+            Ok(mut vecs) => vecs.pop(),
+            Err(e) => {
+                tracing::warn!("failed to embed query: {e}");
+                None
+            }
         }
+    }
 
-        Err(CoreError::ToolExecution(format!(
-            "memory id not found: {id}"
-        )))
+    /// Generate and store an embedding for a preference entry.
+    async fn embed_preference(&self, key: &str, scope: &Option<String>, text: &str) {
+        let Some(embed_fn) = &self.embed_fn else {
+            return;
+        };
+        let embedding = match embed_fn(vec![text.to_string()]).await {
+            Ok(mut vecs) => vecs.pop(),
+            Err(e) => {
+                tracing::warn!("failed to embed preference '{key}': {e}");
+                return;
+            }
+        };
+        let Some(embedding) = embedding else { return };
+
+        let mut prefs = self.preferences.lock().unwrap();
+        if let Some(entry) = prefs
+            .items
+            .iter_mut()
+            .find(|item| normalized_eq(&item.key, key) && item.scope == *scope)
+        {
+            entry.embedding = Some(embedding);
+            entry.embedding_model = Some(self.embedding_model.clone());
+            if let Err(e) = self.persist_preferences(&prefs) {
+                tracing::warn!("failed to persist preference embedding: {e}");
+            }
+        }
+    }
+
+    /// Generate and store an embedding for a memory entry.
+    async fn embed_memory(&self, id: &str, text: &str) {
+        let Some(embed_fn) = &self.embed_fn else {
+            return;
+        };
+        let embedding = match embed_fn(vec![text.to_string()]).await {
+            Ok(mut vecs) => vecs.pop(),
+            Err(e) => {
+                tracing::warn!("failed to embed memory '{id}': {e}");
+                return;
+            }
+        };
+        let Some(embedding) = embedding else { return };
+
+        let mut memory = self.memory.lock().unwrap();
+        if let Some(entry) = memory
+            .items
+            .iter_mut()
+            .find(|item| normalized_eq(&item.id, id))
+        {
+            entry.embedding = Some(embedding);
+            entry.embedding_model = Some(self.embedding_model.clone());
+            if let Err(e) = self.persist_memory(&memory) {
+                tracing::warn!("failed to persist memory embedding: {e}");
+            }
+        }
     }
 
     fn persist_preferences(&self, data: &PreferenceStoreData) -> Result<(), CoreError> {
@@ -587,6 +746,18 @@ impl BuiltinToolService {
 
     fn persist_memory(&self, data: &MemoryStoreData) -> Result<(), CoreError> {
         persist_json(&self.memory_path, data)
+    }
+}
+
+fn pref_embed_text(key: &str, value: &str) -> String {
+    format!("{key} {value}")
+}
+
+fn mem_embed_text(fact: &str, tags: &[String]) -> String {
+    if tags.is_empty() {
+        fact.to_string()
+    } else {
+        format!("{} {}", fact, tags.join(" "))
     }
 }
 
@@ -679,6 +850,7 @@ fn now_ts_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn temp_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -686,6 +858,35 @@ mod tests {
             name,
             now_ts_nanos()
         ))
+    }
+
+    fn semantic_embed_fn() -> EmbedFn {
+        Arc::new(|texts: Vec<String>| {
+            Box::pin(async move {
+                let vectors = texts
+                    .into_iter()
+                    .map(|text| {
+                        let t = normalize(&text);
+                        let editor_like =
+                            if t.contains("neovim") || t.contains("vim") || t.contains("modal") {
+                                1.0
+                            } else {
+                                0.0
+                            };
+                        let ide_like = if t.contains("vscode")
+                            || t.contains("visual studio code")
+                            || t.contains("ide")
+                        {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        vec![editor_like, ide_like]
+                    })
+                    .collect();
+                Ok(vectors)
+            })
+        })
     }
 
     #[test]
@@ -700,8 +901,8 @@ mod tests {
         assert!(names.contains(&TOOL_MEM_UPDATE.to_string()));
     }
 
-    #[test]
-    fn preferences_remember_and_retrieve() {
+    #[tokio::test]
+    async fn preferences_remember_and_retrieve() {
         let pref_path = temp_file("pref");
         let mem_path = temp_file("mem");
         let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
@@ -714,6 +915,7 @@ mod tests {
                     "value": "dark"
                 }),
             )
+            .await
             .unwrap();
 
         let retrieved = service
@@ -723,6 +925,7 @@ mod tests {
                     "key": "theme"
                 }),
             )
+            .await
             .unwrap();
 
         assert!(retrieved.contains("\"found\":true"));
@@ -732,8 +935,8 @@ mod tests {
         let _ = fs::remove_file(mem_path);
     }
 
-    #[test]
-    fn preferences_lookup_is_case_insensitive() {
+    #[tokio::test]
+    async fn preferences_lookup_is_case_insensitive() {
         let pref_path = temp_file("pref");
         let mem_path = temp_file("mem");
         let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
@@ -746,6 +949,7 @@ mod tests {
                     "value": "/home/dave/projects/my-app"
                 }),
             )
+            .await
             .unwrap();
 
         let retrieved = service
@@ -755,6 +959,7 @@ mod tests {
                     "key": "project.myapp.path"
                 }),
             )
+            .await
             .unwrap();
 
         let retrieved_json: serde_json::Value = serde_json::from_str(&retrieved).unwrap();
@@ -773,6 +978,7 @@ mod tests {
                     "value": "/tmp/my-app"
                 }),
             )
+            .await
             .unwrap();
 
         let search = service
@@ -783,6 +989,7 @@ mod tests {
                     "limit": 10
                 }),
             )
+            .await
             .unwrap();
 
         let search_json: serde_json::Value = serde_json::from_str(&search).unwrap();
@@ -798,8 +1005,66 @@ mod tests {
         let _ = fs::remove_file(mem_path);
     }
 
-    #[test]
-    fn memory_remember_update_retrieve() {
+    #[tokio::test]
+    async fn preferences_search_uses_embeddings_and_persists_vectors() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone())
+            .with_embedding(semantic_embed_fn(), "test-embed-model".to_string());
+
+        service
+            .execute_tool(
+                TOOL_PREF_REMEMBER,
+                serde_json::json!({
+                    "key": "global.editor",
+                    "value": "neovim"
+                }),
+            )
+            .await
+            .unwrap();
+
+        service
+            .execute_tool(
+                TOOL_PREF_REMEMBER,
+                serde_json::json!({
+                    "key": "global.ide",
+                    "value": "vscode"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let search = service
+            .execute_tool(
+                TOOL_PREF_SEARCH,
+                serde_json::json!({
+                    "query": "best modal editor",
+                    "limit": 1
+                }),
+            )
+            .await
+            .unwrap();
+        let search_json: serde_json::Value = serde_json::from_str(&search).unwrap();
+        let top_key = search_json["results"][0]["key"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(top_key, "global.editor");
+
+        let stored: PreferenceStoreData = load_json(&pref_path).unwrap();
+        let editor = stored
+            .items
+            .iter()
+            .find(|item| item.key == "global.editor")
+            .unwrap();
+        assert_eq!(editor.embedding_model.as_deref(), Some("test-embed-model"));
+        assert!(editor.embedding.as_ref().is_some_and(|v| !v.is_empty()));
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[tokio::test]
+    async fn memory_remember_update_retrieve() {
         let pref_path = temp_file("pref");
         let mem_path = temp_file("mem");
         let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
@@ -812,6 +1077,7 @@ mod tests {
                     "tags": ["location", "profile"]
                 }),
             )
+            .await
             .unwrap();
 
         let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
@@ -829,6 +1095,7 @@ mod tests {
                     "fact": "User lives in Holly Springs"
                 }),
             )
+            .await
             .unwrap();
 
         let retrieved = service
@@ -838,6 +1105,7 @@ mod tests {
                     "id": created_json["id"]
                 }),
             )
+            .await
             .unwrap();
 
         assert!(retrieved.contains("Holly Springs"));
@@ -846,8 +1114,8 @@ mod tests {
         let _ = fs::remove_file(mem_path);
     }
 
-    #[test]
-    fn memory_id_lookup_is_case_insensitive() {
+    #[tokio::test]
+    async fn memory_id_lookup_is_case_insensitive() {
         let pref_path = temp_file("pref");
         let mem_path = temp_file("mem");
         let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
@@ -860,6 +1128,7 @@ mod tests {
                     "tags": ["profile"]
                 }),
             )
+            .await
             .unwrap();
 
         let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
@@ -878,6 +1147,7 @@ mod tests {
                     "fact": "Primary email is dave+work@example.com"
                 }),
             )
+            .await
             .unwrap();
 
         let retrieved = service
@@ -887,6 +1157,7 @@ mod tests {
                     "id": id.to_uppercase()
                 }),
             )
+            .await
             .unwrap();
 
         assert!(retrieved.contains("\"found\":true"));
@@ -894,5 +1165,80 @@ mod tests {
 
         let _ = fs::remove_file(pref_path);
         let _ = fs::remove_file(mem_path);
+    }
+
+    #[tokio::test]
+    async fn memory_search_uses_embeddings_and_persists_vectors() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone())
+            .with_embedding(semantic_embed_fn(), "test-embed-model".to_string());
+
+        service
+            .execute_tool(
+                TOOL_MEM_REMEMBER,
+                serde_json::json!({
+                    "fact": "User prefers neovim",
+                    "tags": ["editor"]
+                }),
+            )
+            .await
+            .unwrap();
+
+        service
+            .execute_tool(
+                TOOL_MEM_REMEMBER,
+                serde_json::json!({
+                    "fact": "User prefers vscode",
+                    "tags": ["editor"]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let search = service
+            .execute_tool(
+                TOOL_MEM_SEARCH,
+                serde_json::json!({
+                    "query": "modal editing workflow",
+                    "limit": 1
+                }),
+            )
+            .await
+            .unwrap();
+        let search_json: serde_json::Value = serde_json::from_str(&search).unwrap();
+        let top_fact = search_json["results"][0]["fact"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(top_fact.contains("neovim"));
+
+        let stored: MemoryStoreData = load_json(&mem_path).unwrap();
+        let any_embedded = stored.items.iter().any(|item| {
+            item.embedding_model.as_deref() == Some("test-embed-model")
+                && item.embedding.as_ref().is_some_and(|v| !v.is_empty())
+        });
+        assert!(any_embedded);
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[test]
+    fn cosine_similarity_identical_vectors() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_vectors() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_empty_returns_zero() {
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
     }
 }

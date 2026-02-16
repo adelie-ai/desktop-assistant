@@ -92,6 +92,14 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
             .map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
+    /// Delete every conversation and return how many were removed.
+    async fn clear_all_history(&self) -> fdo::Result<u32> {
+        self.service
+            .clear_all_history()
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
+
     /// Send a prompt and stream the response via signals.
     /// Returns a request_id that correlates the signals.
     async fn send_prompt(
@@ -240,6 +248,10 @@ mod tests {
 
         async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
             Ok(())
+        }
+
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(1)
         }
 
         async fn send_prompt(
