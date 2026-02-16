@@ -9,5 +9,13 @@
       <label>Selected D-Bus service for this widget instance</label>
       <default></default>
     </entry>
+    <entry name="userAvatarPath" type="String">
+      <label>Optional user avatar path or source URL</label>
+      <default></default>
+    </entry>
+    <entry name="maxSessionAgeDays" type="Int">
+      <label>Hide previous sessions older than this many days (0 disables filtering)</label>
+      <default>7</default>
+    </entry>
   </group>
 </kcfg>

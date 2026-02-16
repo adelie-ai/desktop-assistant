@@ -30,8 +30,15 @@ PlasmoidItem {
     property bool debugEnabled: false
     property var transcriptEntries: []
     property string promptText: ""
+    property real uiScale: 1.0
+    readonly property real minUiScale: 0.9
+    readonly property real maxUiScale: 1.35
+    readonly property real zoomStep: 0.05
     readonly property string adeleAvatarSource: Qt.resolvedUrl("../images/adele.png")
     property string configuredUserAvatarPath: String(Plasmoid.configuration.userAvatarPath || "").trim()
+    readonly property real baseFontPointSize: Math.max(1, Number(Kirigami.Theme.defaultFont.pointSize || Qt.application.font.pointSize || 10))
+    readonly property int scaledTopIconSize: Math.max(16, Math.round(24 * uiScale))
+    readonly property int scaledHeaderIconSize: Math.max(64, Math.round(96 * uiScale))
     readonly property string homeDirectory: StandardPaths.writableLocation(StandardPaths.HomeLocation)
     readonly property string accountName: {
         const trimmedHome = String(homeDirectory || "").replace(/\/+$/, "")
@@ -67,11 +74,11 @@ PlasmoidItem {
         if (configured.length > 0) {
             candidates.push(configured)
         }
-        candidates.push(toImageSource(homeDirectory + "/.face.icon"))
-        candidates.push(toImageSource(homeDirectory + "/.face"))
         if (accountName.length > 0) {
             candidates.push(toImageSource("/var/lib/AccountsService/icons/" + accountName))
         }
+        candidates.push(toImageSource(homeDirectory + "/.face.icon"))
+        candidates.push(toImageSource(homeDirectory + "/.face"))
         return candidates
     }
 
@@ -95,6 +102,18 @@ PlasmoidItem {
             + shellEscape(activeService)
             + " "
             + commandText
+    }
+
+    function zoomInUi() {
+        uiScale = Math.min(maxUiScale, uiScale + zoomStep)
+    }
+
+    function zoomOutUi() {
+        uiScale = Math.max(minUiScale, uiScale - zoomStep)
+    }
+
+    function resetZoomUi() {
+        uiScale = 1.0
     }
 
     function loadPersistedService() {
@@ -312,11 +331,15 @@ PlasmoidItem {
         if (role === "tool" && !debugEnabled) {
             return
         }
+        const normalizedText = String(text === undefined || text === null ? "" : text)
+        if (normalizedText.trim().length === 0) {
+            return
+        }
         transcriptEntries = transcriptEntries.concat([
             {
                 kind: "message",
                 role: role,
-                text: text,
+                text: normalizedText,
             }
         ])
     }
@@ -472,6 +495,36 @@ PlasmoidItem {
         onTriggered: refreshServiceStatus()
     }
 
+    Shortcut {
+        sequence: "Ctrl++"
+        context: Qt.WindowShortcut
+        onActivated: root.zoomInUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+="
+        context: Qt.WindowShortcut
+        onActivated: root.zoomInUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+-"
+        context: Qt.WindowShortcut
+        onActivated: root.zoomOutUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+_"
+        context: Qt.WindowShortcut
+        onActivated: root.zoomOutUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+0"
+        context: Qt.WindowShortcut
+        onActivated: root.resetZoomUi()
+    }
+
     compactRepresentation: PlasmaComponents.ToolButton {
         text: root.activeService === root.developmentService ? "Adele (Dev)" : "Adele"
         icon.source: Qt.resolvedUrl("../images/adele.png")
@@ -497,11 +550,11 @@ PlasmoidItem {
                     source: root.busy
                         ? Qt.resolvedUrl("../images/adele_thinking.png")
                         : Qt.resolvedUrl("../images/adele.png")
-                    sourceSize.width: 24
-                    sourceSize.height: 24
+                    sourceSize.width: root.scaledTopIconSize
+                    sourceSize.height: root.scaledTopIconSize
                     fillMode: Image.PreserveAspectFit
-                    Layout.preferredWidth: 24
-                    Layout.preferredHeight: 24
+                    Layout.preferredWidth: root.scaledTopIconSize
+                    Layout.preferredHeight: root.scaledTopIconSize
                 }
 
                 QQC2.Label {
@@ -555,15 +608,17 @@ PlasmoidItem {
 
                         Image {
                             source: Qt.resolvedUrl("../images/adele.png")
-                            sourceSize.width: 96
-                            sourceSize.height: 96
+                            sourceSize.width: root.scaledHeaderIconSize
+                            sourceSize.height: root.scaledHeaderIconSize
+                            width: root.scaledHeaderIconSize
+                            height: root.scaledHeaderIconSize
                             fillMode: Image.PreserveAspectFit
                             anchors.horizontalCenter: parent.horizontalCenter
                         }
 
                         QQC2.Label {
                             text: "Hi! I'm Adele! Ask me anything..."
-                            font.pointSize: 12
+                            font.pointSize: root.baseFontPointSize * root.uiScale
                             color: PlasmaCore.Theme.disabledTextColor
                             anchors.horizontalCenter: parent.horizontalCenter
                         }
@@ -579,7 +634,7 @@ PlasmoidItem {
                         required property var modelData
                         readonly property bool isStatus: modelData.kind === "status"
                         readonly property bool isAssistant: modelData.role === "assistant"
-                        readonly property real avatarSize: 24
+                        readonly property real avatarSize: 24 * root.uiScale
                         readonly property var avatarSources: isAssistant ? [root.adeleAvatarSource] : root.userAvatarCandidates()
 
                         visible: !isStatus || root.debugEnabled
@@ -611,8 +666,13 @@ PlasmoidItem {
                                     Image {
                                         id: avatarImage
                                         property int candidateIndex: 0
-                                        anchors.fill: parent
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        anchors.top: parent.top
+                                        width: isAssistant ? parent.width * 1.9 : parent.width
+                                        height: isAssistant ? parent.height * 1.9 : parent.height
                                         fillMode: Image.PreserveAspectCrop
+                                        horizontalAlignment: Image.AlignHCenter
+                                        verticalAlignment: isAssistant ? Image.AlignTop : Image.AlignVCenter
                                         source: avatarSources.length > 0 ? avatarSources[Math.min(candidateIndex, avatarSources.length - 1)] : ""
                                         visible: status === Image.Ready
 
@@ -638,7 +698,8 @@ PlasmoidItem {
                                 implicitWidth: isStatus
                                     ? rowContainer.width
                                     : Math.min(rowContainer.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
-                                height: Math.max(messageText.contentHeight, messageText.implicitHeight) + 12
+                                implicitHeight: Math.max(messageText.contentHeight, messageText.implicitHeight) + 12
+                                height: implicitHeight
                                 radius: isStatus ? 0 : 8
                                 color: isStatus
                                     ? "transparent"
@@ -648,8 +709,11 @@ PlasmoidItem {
 
                                 TextEdit {
                                     id: messageText
-                                    anchors.fill: parent
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
                                     anchors.margins: 6
+                                    height: Math.max(contentHeight, implicitHeight)
                                     readOnly: true
                                     selectByMouse: true
                                     selectByKeyboard: true
@@ -663,6 +727,7 @@ PlasmoidItem {
                                         : (isAssistant
                                             ? PlasmaCore.Theme.textColor
                                             : PlasmaCore.Theme.highlightedTextColor)
+                                    font.pointSize: root.baseFontPointSize * root.uiScale
                                     font.italic: isStatus
                                     font.bold: false
                                     activeFocusOnPress: true

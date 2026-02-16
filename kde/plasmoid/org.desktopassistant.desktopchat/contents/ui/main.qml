@@ -1,6 +1,8 @@
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
+import QtCore
+import org.kde.kirigami as Kirigami
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents
@@ -28,6 +30,23 @@ PlasmoidItem {
     property var transcriptEntries: []
     property string promptText: ""
     property var conversationChoices: []
+    property real uiScale: 1.0
+    readonly property real minUiScale: 0.9
+    readonly property real maxUiScale: 1.35
+    readonly property real zoomStep: 0.05
+    readonly property string adeleAvatarSource: Qt.resolvedUrl("../images/adele.png")
+    property string configuredUserAvatarPath: String(Plasmoid.configuration.userAvatarPath || "").trim()
+    readonly property real baseFontPointSize: Math.max(1, Number(Kirigami.Theme.defaultFont.pointSize || Qt.application.font.pointSize || 10))
+    readonly property int scaledTopIconSize: Math.max(16, Math.round(24 * uiScale))
+    readonly property int scaledHeaderIconSize: Math.max(64, Math.round(96 * uiScale))
+    readonly property string homeDirectory: StandardPaths.writableLocation(StandardPaths.HomeLocation)
+    readonly property string accountName: {
+        const trimmedHome = String(homeDirectory || "").replace(/\/+$/, "")
+        const chunks = trimmedHome.split("/").filter(function(chunk) {
+            return chunk.length > 0
+        })
+        return chunks.length > 0 ? chunks[chunks.length - 1] : ""
+    }
     readonly property bool hasRealMessages: {
         for (let i = 0; i < transcriptEntries.length; i++) {
             if (transcriptEntries[i].kind === "message") return true
@@ -35,6 +54,34 @@ PlasmoidItem {
         return false
     }
     readonly property var pending: ({})
+
+    function toImageSource(pathValue) {
+        const value = String(pathValue || "").trim()
+        if (value.length === 0) {
+            return ""
+        }
+        if (value.indexOf("file://") === 0 || value.indexOf("image://") === 0 || value.indexOf("qrc:/") === 0 || value.indexOf(":/") === 0) {
+            return value
+        }
+        if (value[0] === "/") {
+            return "file://" + value
+        }
+        return value
+    }
+
+    function userAvatarCandidates() {
+        const candidates = []
+        const configured = toImageSource(configuredUserAvatarPath)
+        if (configured.length > 0) {
+            candidates.push(configured)
+        }
+        if (accountName.length > 0) {
+            candidates.push(toImageSource("/var/lib/AccountsService/icons/" + accountName))
+        }
+        candidates.push(toImageSource(homeDirectory + "/.face.icon"))
+        candidates.push(toImageSource(homeDirectory + "/.face"))
+        return candidates
+    }
 
     function shellEscape(value) {
         return "'" + value.replace(/'/g, "'\\''") + "'"
@@ -56,6 +103,26 @@ PlasmoidItem {
             + shellEscape(activeService)
             + " "
             + commandText
+    }
+
+    function zoomInUi() {
+        uiScale = Math.min(maxUiScale, uiScale + zoomStep)
+    }
+
+    function zoomOutUi() {
+        uiScale = Math.max(minUiScale, uiScale - zoomStep)
+    }
+
+    function resetZoomUi() {
+        uiScale = 1.0
+    }
+
+    function maxSessionAgeDays() {
+        const configured = Number(Plasmoid.configuration.maxSessionAgeDays)
+        if (!Number.isFinite(configured) || configured < 0) {
+            return 7
+        }
+        return Math.floor(configured)
     }
 
     function loadPersistedService() {
@@ -181,11 +248,15 @@ PlasmoidItem {
         if (role === "tool" && !debugEnabled) {
             return
         }
+        const normalizedText = String(text === undefined || text === null ? "" : text)
+        if (normalizedText.trim().length === 0) {
+            return
+        }
         transcriptEntries = transcriptEntries.concat([
             {
                 kind: "message",
                 role: role,
-                text: text,
+                text: normalizedText,
             }
         ])
     }
@@ -283,7 +354,7 @@ PlasmoidItem {
     }
 
     function reloadConversationList() {
-        const command = helperCommand("list")
+        const command = helperCommand("list --max-age-days " + maxSessionAgeDays())
         runCommand(
             command,
             function(stdout) {
@@ -295,9 +366,13 @@ PlasmoidItem {
 
                 const conversations = payload.conversations || []
                 conversationChoices = conversations.map(function(conversation) {
+                    const timestamp = String(conversation.updated_at || "").trim()
+                    const titleText = timestamp.length > 0
+                        ? (conversation.title + " · " + timestamp)
+                        : conversation.title
                     return {
                         id: conversation.id,
-                        title: conversation.title + " (" + conversation.message_count + ")",
+                        title: titleText + " (" + conversation.message_count + ")",
                     }
                 })
 
@@ -473,6 +548,36 @@ PlasmoidItem {
         onTriggered: refreshServiceStatus()
     }
 
+    Shortcut {
+        sequence: "Ctrl++"
+        context: Qt.WindowShortcut
+        onActivated: root.zoomInUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+="
+        context: Qt.WindowShortcut
+        onActivated: root.zoomInUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+-"
+        context: Qt.WindowShortcut
+        onActivated: root.zoomOutUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+_"
+        context: Qt.WindowShortcut
+        onActivated: root.zoomOutUi()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+0"
+        context: Qt.WindowShortcut
+        onActivated: root.resetZoomUi()
+    }
+
     ColumnLayout {
         visible: !root.hideWidget
         anchors.fill: parent
@@ -487,11 +592,11 @@ PlasmoidItem {
                 source: root.busy
                     ? Qt.resolvedUrl("../images/adele_thinking.png")
                     : Qt.resolvedUrl("../images/adele.png")
-                sourceSize.width: 24
-                sourceSize.height: 24
+                sourceSize.width: root.scaledTopIconSize
+                sourceSize.height: root.scaledTopIconSize
                 fillMode: Image.PreserveAspectFit
-                Layout.preferredWidth: 24
-                Layout.preferredHeight: 24
+                Layout.preferredWidth: root.scaledTopIconSize
+                Layout.preferredHeight: root.scaledTopIconSize
             }
 
             QQC2.Label {
@@ -555,15 +660,17 @@ PlasmoidItem {
 
                     Image {
                         source: Qt.resolvedUrl("../images/adele.png")
-                        sourceSize.width: 96
-                        sourceSize.height: 96
+                        sourceSize.width: root.scaledHeaderIconSize
+                        sourceSize.height: root.scaledHeaderIconSize
+                        width: root.scaledHeaderIconSize
+                        height: root.scaledHeaderIconSize
                         fillMode: Image.PreserveAspectFit
                         anchors.horizontalCenter: parent.horizontalCenter
                     }
 
                     QQC2.Label {
                         text: "Hi! I'm Adele! Ask me anything..."
-                        font.pointSize: 12
+                        font.pointSize: root.baseFontPointSize * root.uiScale
                         color: PlasmaCore.Theme.disabledTextColor
                         anchors.horizontalCenter: parent.horizontalCenter
                     }
@@ -579,52 +686,108 @@ PlasmoidItem {
                     required property var modelData
                     readonly property bool isStatus: modelData.kind === "status"
                     readonly property bool isAssistant: modelData.role === "assistant"
+                    readonly property real avatarSize: 24 * root.uiScale
+                    readonly property var avatarSources: isAssistant ? [root.adeleAvatarSource] : root.userAvatarCandidates()
 
+                    visible: !isStatus || root.debugEnabled
                     width: ListView.view.width
-                    implicitHeight: bubble.height + 2
+                    implicitHeight: visible ? rowContainer.implicitHeight + 2 : 0
 
-                    Rectangle {
-                        id: bubble
+                    RowLayout {
+                        id: rowContainer
+                        anchors.left: parent.left
+                        anchors.right: parent.right
                         anchors.top: parent.top
-                        anchors.left: isAssistant ? undefined : parent.left
-                        anchors.right: isAssistant ? parent.right : undefined
-                        width: isStatus
-                            ? parent.width
-                            : Math.min(parent.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
-                        height: Math.max(messageText.contentHeight, messageText.implicitHeight) + 12
-                        radius: isStatus ? 0 : 8
-                        color: isStatus
-                            ? "transparent"
-                            : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor)
-                        border.width: isStatus ? 0 : 1
-                        border.color: PlasmaCore.Theme.disabledTextColor
+                        spacing: 6
+                        layoutDirection: isStatus ? Qt.LeftToRight : (isAssistant ? Qt.RightToLeft : Qt.LeftToRight)
 
-                        TextEdit {
-                            id: messageText
-                            anchors.fill: parent
-                            anchors.margins: 6
-                            readOnly: true
-                            selectByMouse: true
-                            selectByKeyboard: true
-                            wrapMode: TextEdit.Wrap
-                            textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
-                            text: isStatus
-                                ? "[status] " + String(modelData.text || "")
-                                : (isAssistant
-                                    ? String(modelData.text || "")
-                                    : "You:\n" + String(modelData.text || ""))
+                        Item {
+                            Layout.preferredWidth: isStatus ? 0 : avatarSize
+                            Layout.preferredHeight: isStatus ? 0 : avatarSize
+                            Layout.alignment: Qt.AlignTop
+                            visible: !isStatus
+
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: width / 2
+                                color: PlasmaCore.Theme.backgroundColor
+                                border.width: 1
+                                border.color: PlasmaCore.Theme.disabledTextColor
+                                clip: true
+
+                                Image {
+                                    id: avatarImage
+                                    property int candidateIndex: 0
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    anchors.top: parent.top
+                                    width: isAssistant ? parent.width * 1.9 : parent.width
+                                    height: isAssistant ? parent.height * 1.9 : parent.height
+                                    fillMode: Image.PreserveAspectCrop
+                                    horizontalAlignment: Image.AlignHCenter
+                                    verticalAlignment: isAssistant ? Image.AlignTop : Image.AlignVCenter
+                                    source: avatarSources.length > 0 ? avatarSources[Math.min(candidateIndex, avatarSources.length - 1)] : ""
+                                    visible: status === Image.Ready
+
+                                    onStatusChanged: {
+                                        if (status === Image.Error && candidateIndex < avatarSources.length - 1) {
+                                            candidateIndex += 1
+                                        }
+                                    }
+                                }
+
+                                Kirigami.Icon {
+                                    anchors.fill: parent
+                                    source: isAssistant ? "preferences-desktop-user" : "user-identity"
+                                    visible: !avatarImage.visible
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            id: bubble
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignTop
+                            implicitWidth: isStatus
+                                ? rowContainer.width
+                                : Math.min(rowContainer.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
+                            implicitHeight: Math.max(messageText.contentHeight, messageText.implicitHeight) + 12
+                            height: implicitHeight
+                            radius: isStatus ? 0 : 8
                             color: isStatus
-                                ? PlasmaCore.Theme.disabledTextColor
-                                : (isAssistant
-                                    ? PlasmaCore.Theme.textColor
-                                    : PlasmaCore.Theme.highlightedTextColor)
-                            font.italic: isStatus
-                            font.bold: false
-                            activeFocusOnPress: true
-                            selectedTextColor: isAssistant ? PlasmaCore.Theme.highlightedTextColor : PlasmaCore.Theme.textColor
-                            selectionColor: isAssistant ? PlasmaCore.Theme.highlightColor : PlasmaCore.Theme.backgroundColor
-                            onLinkActivated: function(link) {
-                                Qt.openUrlExternally(link)
+                                ? "transparent"
+                                : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor)
+                            border.width: isStatus ? 0 : 1
+                            border.color: PlasmaCore.Theme.disabledTextColor
+
+                            TextEdit {
+                                id: messageText
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 6
+                                height: Math.max(contentHeight, implicitHeight)
+                                readOnly: true
+                                selectByMouse: true
+                                selectByKeyboard: true
+                                wrapMode: TextEdit.Wrap
+                                textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
+                                text: isStatus
+                                    ? "[status] " + String(modelData.text || "")
+                                    : String(modelData.text || "")
+                                color: isStatus
+                                    ? PlasmaCore.Theme.disabledTextColor
+                                    : (isAssistant
+                                        ? PlasmaCore.Theme.textColor
+                                        : PlasmaCore.Theme.highlightedTextColor)
+                                font.pointSize: root.baseFontPointSize * root.uiScale
+                                font.italic: isStatus
+                                font.bold: false
+                                activeFocusOnPress: true
+                                selectedTextColor: isAssistant ? PlasmaCore.Theme.highlightedTextColor : PlasmaCore.Theme.textColor
+                                selectionColor: isAssistant ? PlasmaCore.Theme.highlightColor : PlasmaCore.Theme.backgroundColor
+                                onLinkActivated: function(link) {
+                                    Qt.openUrlExternally(link)
+                                }
                             }
                         }
                     }

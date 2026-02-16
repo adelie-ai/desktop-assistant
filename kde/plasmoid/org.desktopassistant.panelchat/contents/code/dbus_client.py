@@ -145,21 +145,23 @@ def wait_for_assistant_reply(conversation_id: str, initial_count: int, timeout_s
     return last_assistant
 
 
-def list_conversations() -> list[dict[str, Any]]:
-    response = _run_gdbus("ListConversations")
+def list_conversations(max_age_days: int | None = None) -> list[dict[str, Any]]:
+    age = max(0, int(max_age_days or 0))
+    response = _run_gdbus("ListConversations", str(age))
     rows = response[0] if isinstance(response, tuple) and len(response) == 1 else response
     return [
         {
             "id": item[0],
             "title": item[1],
             "message_count": item[2],
+            "updated_at": item[3] if len(item) > 3 else "",
         }
         for item in rows
     ]
 
 
 def ensure_conversation(title: str) -> str:
-    conversations = list_conversations()
+    conversations = list_conversations(max_age_days=0)
     for conversation in conversations:
         if conversation["title"] == title:
             return str(conversation["id"])
@@ -198,7 +200,8 @@ def main() -> int:
     create_cmd = subparsers.add_parser("create")
     create_cmd.add_argument("--title", default="Panel Chat")
 
-    subparsers.add_parser("list")
+    list_cmd = subparsers.add_parser("list")
+    list_cmd.add_argument("--max-age-days", type=int, default=7)
 
     send_cmd = subparsers.add_parser("send")
     send_cmd.add_argument("conversation_id")
@@ -226,7 +229,7 @@ def main() -> int:
             print(json.dumps({"conversation_id": create_conversation(args.title)}))
             return 0
         if args.command == "list":
-            print(json.dumps({"conversations": list_conversations()}))
+            print(json.dumps({"conversations": list_conversations(args.max_age_days)}))
             return 0
         if args.command == "send":
             print(json.dumps({"request_id": send_prompt(args.conversation_id, args.prompt)}))
