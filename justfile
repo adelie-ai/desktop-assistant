@@ -20,6 +20,11 @@ kcm_build_dir := "build/kde-kcm"
 panel_widget_id := "org.desktopassistant.panelchat"
 desktop_widget_id := "org.desktopassistant.desktopchat"
 settings_widget_id := "org.desktopassistant.settings"
+container_cli := env_var_or_default("CONTAINER_CLI", "docker")
+debian_builder_image := env_var_or_default("DEBIAN_BUILDER_IMAGE", "debian:trixie")
+rpm_builder_image := env_var_or_default("RPM_BUILDER_IMAGE", "fedora:43")
+flatpak_builder_image := env_var_or_default("FLATPAK_BUILDER_IMAGE", "fedora:43")
+snap_builder_image := env_var_or_default("SNAP_BUILDER_IMAGE", "ubuntu:25.10")
 
 # List available commands
 default: list
@@ -226,3 +231,51 @@ packaging-check:
 packaging-ci:
     cargo build --release --package desktop-assistant-daemon --package desktop-assistant-tui
     ./packaging/ci/check-packaging.sh
+
+# Build Debian package artifacts on host
+package-deb:
+    mkdir -p build/pkg/debian
+    rm -rf build/pkg/debian/src
+    git archive --format=tar HEAD | tar -xf - -C build/pkg/debian
+    cd build/pkg/debian && cp -a packaging/debian/debian ./debian
+    cd build/pkg/debian && dpkg-buildpackage -us -uc -b
+
+# Build RPM package artifacts on host
+package-rpm:
+    mkdir -p build/pkg/rpm
+    rm -rf build/pkg/rpm/src
+    git archive --format=tar HEAD | tar -xf - -C build/pkg/rpm
+    cd build/pkg/rpm && tar -czf desktop-assistant-0.1.0.tar.gz .
+    cd build/pkg/rpm && rpmbuild --define "_topdir {{invocation_directory()}}/build/pkg/rpm/rpmbuild" -ba packaging/fedora/desktop-assistant.spec
+
+# Build Flatpak bundle on host
+package-flatpak:
+    mkdir -p build/pkg/flatpak
+    flatpak-builder --force-clean build/pkg/flatpak/build-dir packaging/flatpak/org.desktopassistant.App.yml
+
+# Build Snap package on host
+package-snap:
+    snapcraft --destructive-mode --dir packaging/snap
+
+# Build Debian package artifacts inside Docker
+package-deb-docker:
+    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work {{debian_builder_image}} bash -lc "apt-get update && apt-get install -y --no-install-recommends dpkg-dev debhelper pkg-config ca-certificates git rustc cargo && mkdir -p build/pkg/debian && rm -rf build/pkg/debian/src && git archive --format=tar HEAD | tar -xf - -C build/pkg/debian && cd build/pkg/debian && cp -a packaging/debian/debian ./debian && dpkg-buildpackage -us -uc -b"
+
+# Build RPM package artifacts inside Docker
+package-rpm-docker:
+    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work {{rpm_builder_image}} bash -lc "dnf -y install git tar gzip rust cargo rpm-build rpmdevtools && mkdir -p build/pkg/rpm && rm -rf build/pkg/rpm/src build/pkg/rpm/rpmbuild && git archive --format=tar HEAD | tar -xf - -C build/pkg/rpm && cd build/pkg/rpm && tar -czf desktop-assistant-0.1.0.tar.gz . && rpmbuild --define '_topdir /work/build/pkg/rpm/rpmbuild' -ba packaging/fedora/desktop-assistant.spec"
+
+# Build Flatpak bundle inside Docker
+package-flatpak-docker:
+    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work --privileged {{flatpak_builder_image}} bash -lc "dnf -y install git tar gzip rust cargo flatpak-builder && mkdir -p build/pkg/flatpak && flatpak-builder --force-clean build/pkg/flatpak/build-dir packaging/flatpak/org.desktopassistant.App.yml"
+
+# Build Snap package inside Docker
+package-snap-docker:
+    {{container_cli}} run --rm -t -v "{{invocation_directory()}}:/work" -w /work --privileged {{snap_builder_image}} bash -lc "apt-get update && apt-get install -y --no-install-recommends snapcraft && snapcraft --destructive-mode --dir packaging/snap"
+
+# Build all package formats inside Docker containers
+package-all-docker:
+    just package-deb-docker
+    just package-rpm-docker
+    just package-flatpak-docker
+    just package-snap-docker
