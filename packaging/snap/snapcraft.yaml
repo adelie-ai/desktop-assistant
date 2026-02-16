@@ -14,8 +14,14 @@ parts:
     source: ../..
     build-packages:
       - pkg-config
+      - cargo
+      - rustc
+      - libssl-dev
+      - curl
+      - ca-certificates
     override-build: |
-      craftctl default
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+      . "$HOME/.cargo/env"
       cargo build --release --workspace
       install -Dm755 target/release/desktop-assistant-daemon "$CRAFT_PART_INSTALL/bin/desktop-assistant-daemon"
       install -Dm755 target/release/desktop-assistant-tui "$CRAFT_PART_INSTALL/bin/desktop-assistant-tui"

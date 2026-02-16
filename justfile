@@ -27,7 +27,7 @@ container_security_opts := env_var_or_default("CONTAINER_SECURITY_OPTS", "--secu
 debian_builder_image := env_var_or_default("DEBIAN_BUILDER_IMAGE", "debian:trixie")
 rpm_builder_image := env_var_or_default("RPM_BUILDER_IMAGE", "fedora:43")
 flatpak_builder_image := env_var_or_default("FLATPAK_BUILDER_IMAGE", "fedora:43")
-snap_builder_image := env_var_or_default("SNAP_BUILDER_IMAGE", "ubuntu:25.10")
+snap_builder_image := env_var_or_default("SNAP_BUILDER_IMAGE", "docker.io/snapcore/snapcraft:stable")
 
 # List available commands
 default: list
@@ -190,21 +190,31 @@ kcm-install:
     cmake -S {{kcm_dir}} -B {{kcm_build_dir}} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local" -DKDE_INSTALL_PLUGINDIR="$HOME/.local/lib64/qt6/plugins"
     cmake --build {{kcm_build_dir}}
     cmake --install {{kcm_build_dir}}
+    rm -f "$HOME/.local/share/kservices5/kcm_desktopassistant_service.desktop"
 
 # Install KDE System Settings KCM into system paths (requires sudo)
 kcm-install-system:
     cmake -S {{kcm_dir}} -B build/kde-kcm-system -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DKDE_INSTALL_PLUGINDIR=/usr/lib64/qt6/plugins
     cmake --build build/kde-kcm-system
     sudo cmake --install build/kde-kcm-system
+    sudo rm -f /usr/share/kservices5/kcm_desktopassistant_service.desktop
 
 # Refresh KDE cache and list Desktop Assistant KCM in current shell
 kcm-refresh:
     kbuildsycoca6 || true
-    kcmshell6 --list | grep -i kcm_desktopassistant || (if [ -f {{kcm_build_dir}}/prefix.sh ]; then set +u; source {{kcm_build_dir}}/prefix.sh; set -u; kcmshell6 --list | grep -i kcm_desktopassistant || true; fi)
+    kcmshell6 --list | grep -i kcm_desktopassistant || (if [ -f {{kcm_build_dir}}/prefix.sh ]; then set +u; source {{kcm_build_dir}}/prefix.sh; set -u; export QT_PLUGIN_PATH="$HOME/.local/lib64/qt6/plugins:${QT_PLUGIN_PATH:-}"; kcmshell6 --list | grep -i kcm_desktopassistant || true; fi)
 
 # Open Desktop Assistant KCM with local plugin environment
 kcm-open:
-    kcmshell6 kcm_desktopassistant || (if [ -f {{kcm_build_dir}}/prefix.sh ]; then set +u; source {{kcm_build_dir}}/prefix.sh; set -u; kcmshell6 kcm_desktopassistant; fi)
+    if [ -f {{kcm_build_dir}}/prefix.sh ]; then set +u; source {{kcm_build_dir}}/prefix.sh; set -u; fi
+    export QT_PLUGIN_PATH="$HOME/.local/lib64/qt6/plugins:${QT_PLUGIN_PATH:-}"
+    unset DESKTOP_STARTUP_ID
+    unset GTK_USE_PORTAL
+    unset GIO_USE_PORTALS
+    kquitapp6 systemsettings || true
+    pkill -f '^systemsettings' || true
+    sleep 0.3
+    QT_LOGGING_RULES="qt.qpa.services.warning=false" systemsettings kcm_desktopassistant
 
 # Remove stale KCM plugin copies from legacy plugin paths
 kcm-cleanup:
@@ -295,11 +305,12 @@ package-flatpak-docker:
 
 # Build Snap package inside Docker
 package-snap-docker:
-    {{container_cli}} run --rm -t {{container_security_opts}} -v "{{invocation_directory()}}:/work" -w /work --privileged {{snap_builder_image}} bash -lc "apt-get update && apt-get install -y --no-install-recommends snapcraft && snapcraft --destructive-mode --dir packaging/snap"
+    {{container_cli}} run --rm -t {{container_security_opts}} -v "{{invocation_directory()}}:/work" -w /work/packaging/snap --privileged {{snap_builder_image}} snapcraft --destructive-mode
 
-# Build all package formats inside Docker containers
+# Build all package formats that are reliable inside Docker containers
 package-all-docker:
+    # Snap is intentionally excluded here: core24/snapd runtime requirements
+    # are not reliably available in Docker/Podman container builds.
     just package-deb-docker
     just package-rpm-docker
     just package-flatpak-docker
-    just package-snap-docker

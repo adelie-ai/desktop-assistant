@@ -24,10 +24,8 @@ kcmutils_add_qml_kcm(kcm_desktopassistant
         desktopassistantkcm.cpp
     INSTALL_NAMESPACE
         plasma/kcms/systemsettings
-    DISABLE_DESKTOP_FILE_GENERATION
 )
 
-install(FILES kcm_desktopassistant.desktop DESTINATION ${KDE_INSTALL_APPDIR})
 install(FILES settings-applications-desktopassistant.desktop DESTINATION ${KDE_INSTALL_DATADIR}/systemsettings/categories)
 
 target_link_libraries(kcm_desktopassistant

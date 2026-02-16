@@ -292,6 +292,19 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Packaging
+
+```bash
+# Docker-friendly package builds (deb, rpm, flatpak)
+just package-all-docker
+
+# Snap package build (run on host with snapd/core24 available)
+just package-snap
+```
+
+Note: `package-all-docker` intentionally excludes Snap because Snap builds for `base: core24`
+require a working `snapd`/`core24` runtime that is not reliable inside Docker/Podman container builds.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)

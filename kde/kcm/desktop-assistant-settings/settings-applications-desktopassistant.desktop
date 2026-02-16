@@ -2,6 +2,7 @@
 Type=Service
 X-KDE-System-Settings-Category=desktopassistant
 X-KDE-System-Settings-Parent-Category=applications
+X-KDE-System-Settings-Category-Module=kcm_desktopassistant
 X-KDE-Weight=80
 Icon=settings-configure
 Name=Desktop Assistant
