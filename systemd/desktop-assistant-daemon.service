@@ -7,7 +7,6 @@ Type=simple
 ExecStart=%h/.cargo/bin/desktop-assistant-daemon
 Restart=on-failure
 RestartSec=2
-EnvironmentFile=-%h/.config/desktop-assistant/daemon.env
 Environment=RUST_LOG=info
 
 [Install]

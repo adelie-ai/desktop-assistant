@@ -1,0 +1,20 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Id": "org.desktopassistant.settings",
+    "Name": "Desktop Assistant Settings",
+    "Description": "Configure Desktop Assistant connectors, models, and API keys",
+    "Icon": "settings-configure",
+    "Version": "0.1.0",
+    "Website": "https://example.invalid",
+    "License": "MIT",
+    "Authors": [
+      {
+        "Name": "Desktop Assistant Contributors"
+      }
+    ],
+    "Category": "Utilities",
+    "EnabledByDefault": true
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -19,7 +19,7 @@ impl OpenAiClient {
         Self {
             client: Client::new(),
             api_key,
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.2".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
         }
     }

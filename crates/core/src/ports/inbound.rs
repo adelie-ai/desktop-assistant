@@ -2,6 +2,14 @@ use crate::CoreError;
 use crate::domain::{Conversation, ConversationId, ConversationSummary};
 use crate::ports::llm::ChunkCallback;
 
+#[derive(Debug, Clone)]
+pub struct LlmSettingsView {
+    pub connector: String,
+    pub model: String,
+    pub base_url: String,
+    pub has_api_key: bool,
+}
+
 /// Inbound port for health/status queries.
 ///
 /// Any adapter that wants to expose assistant status (D-Bus, HTTP, etc.)
@@ -43,6 +51,27 @@ pub trait ConversationService: Send + Sync {
     ) -> impl std::future::Future<Output = Result<String, CoreError>> + Send;
 }
 
+/// Inbound port for assistant settings.
+///
+/// Secret values are write-only through this interface and never returned.
+pub trait SettingsService: Send + Sync {
+    fn get_llm_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<LlmSettingsView, CoreError>> + Send;
+
+    fn set_llm_settings(
+        &self,
+        connector: String,
+        model: Option<String>,
+        base_url: Option<String>,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn set_api_key(
+        &self,
+        api_key: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,4 +103,5 @@ mod tests {
     // ConversationService uses impl Future so not dyn-compatible,
     // but we verify it's implementable via the service tests in service.rs.
     fn _assert_conversation_service<T: ConversationService>() {}
+    fn _assert_settings_service<T: SettingsService>() {}
 }

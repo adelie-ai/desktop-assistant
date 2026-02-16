@@ -1,4 +1,5 @@
 pub mod conversation;
+pub mod settings;
 
 use desktop_assistant_core::ports::inbound::AssistantService;
 

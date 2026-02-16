@@ -1,0 +1,11 @@
+{
+  "KPlugin": {
+    "Name": "Desktop Assistant",
+    "Description": "Configure Desktop Assistant model and API settings",
+    "Icon": "settings-configure",
+    "License": "MIT",
+    "Category": "desktopassistant",
+    "X-KDE-System-Settings-Parent-Category": "applications",
+    "X-KDE-Weight": 80
+  }
+}
