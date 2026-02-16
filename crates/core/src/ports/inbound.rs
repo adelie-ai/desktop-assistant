@@ -31,6 +31,7 @@ pub trait ConversationService: Send + Sync {
 
     fn list_conversations(
         &self,
+        max_age_days: Option<u32>,
     ) -> impl std::future::Future<Output = Result<Vec<ConversationSummary>, CoreError>> + Send;
 
     fn get_conversation(

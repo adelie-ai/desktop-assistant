@@ -1,0 +1,22 @@
+app-id: org.desktopassistant.App
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: desktop-assistant-tui
+finish-args:
+  - --share=network
+  - --socket=session-bus
+  - --filesystem=home
+
+modules:
+  - name: desktop-assistant
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --package desktop-assistant-daemon --package desktop-assistant-tui
+      - install -Dm755 target/release/desktop-assistant-daemon /app/bin/desktop-assistant-daemon
+      - install -Dm755 target/release/desktop-assistant-tui /app/bin/desktop-assistant-tui
+      - install -Dm644 packaging/flatpak/org.desktopassistant.App.desktop /app/share/applications/org.desktopassistant.App.desktop
+      - install -Dm644 packaging/flatpak/org.desktopassistant.App.metainfo.xml /app/share/metainfo/org.desktopassistant.App.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..

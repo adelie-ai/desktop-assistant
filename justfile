@@ -217,3 +217,12 @@ uninstall:
 clean:
     cargo clean
     rm -rf {{kcm_build_dir}} build/kde-kcm-system
+
+# Validate packaging manifests and metadata
+packaging-check:
+    ./packaging/ci/check-packaging.sh
+
+# Build packaged binaries and run packaging checks
+packaging-ci:
+    cargo build --release --package desktop-assistant-daemon --package desktop-assistant-tui
+    ./packaging/ci/check-packaging.sh

@@ -1,0 +1,35 @@
+name: Packaging Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  packaging-checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            rpm \
+            flatpak-builder \
+            yamllint \
+            dpkg-dev
+
+      - name: Build packaged binaries
+        run: |
+          cargo build --release --package desktop-assistant-daemon --package desktop-assistant-tui
+
+      - name: Run packaging checks
+        run: |
+          ./packaging/ci/check-packaging.sh

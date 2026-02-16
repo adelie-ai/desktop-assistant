@@ -3,9 +3,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use chrono::Local;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId};
 use desktop_assistant_core::ports::store::ConversationStore;
+
+fn now_timestamp() -> String {
+    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
 
 /// Default persistent conversation file path following XDG base directories.
 ///
@@ -32,6 +37,7 @@ pub struct PersistentConversationStore {
 impl PersistentConversationStore {
     pub fn new(path: PathBuf) -> Result<Self, CoreError> {
         let mut data = HashMap::new();
+        let mut needs_migration = false;
 
         if path.exists() {
             let content = fs::read_to_string(&path).map_err(|e| {
@@ -47,16 +53,38 @@ impl PersistentConversationStore {
                         ))
                     })?;
 
-                for conversation in conversations {
+                for mut conversation in conversations {
+                    let created = conversation.created_at.trim().to_string();
+                    let updated = conversation.updated_at.trim().to_string();
+                    if created.is_empty() && updated.is_empty() {
+                        let timestamp = now_timestamp();
+                        conversation.created_at = timestamp.clone();
+                        conversation.updated_at = timestamp;
+                        needs_migration = true;
+                    } else if created.is_empty() {
+                        conversation.created_at = updated;
+                        needs_migration = true;
+                    } else if updated.is_empty() {
+                        conversation.updated_at = created;
+                        needs_migration = true;
+                    }
+
                     data.insert(conversation.id.0.clone(), conversation);
                 }
             }
         }
 
-        Ok(Self {
+        let store = Self {
             data: Mutex::new(data),
             path,
-        })
+        };
+
+        if needs_migration {
+            let data = store.data.lock().unwrap();
+            store.persist(&data)?;
+        }
+
+        Ok(store)
     }
 
     pub fn from_default_path() -> Result<Self, CoreError> {
@@ -308,6 +336,35 @@ mod tests {
         let reopened = PersistentConversationStore::new(path.clone()).unwrap();
         let missing = reopened.get(&ConversationId::from("c1")).await;
         assert!(matches!(missing, Err(CoreError::ConversationNotFound(_))));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persistent_store_migrates_missing_timestamps() {
+        let path = temp_store_path();
+
+        let legacy = serde_json::json!([
+            {
+                "id": "legacy-1",
+                "title": "Legacy Chat",
+                "messages": []
+            }
+        ]);
+        fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let store = PersistentConversationStore::new(path.clone()).unwrap();
+        let migrated = store.get(&ConversationId::from("legacy-1")).await.unwrap();
+
+        assert!(!migrated.created_at.is_empty());
+        assert!(!migrated.updated_at.is_empty());
+        assert_eq!(migrated.created_at.len(), 19);
+        assert_eq!(migrated.updated_at.len(), 19);
+
+        let reopened = PersistentConversationStore::new(path.clone()).unwrap();
+        let migrated_again = reopened.get(&ConversationId::from("legacy-1")).await.unwrap();
+        assert!(!migrated_again.created_at.is_empty());
+        assert!(!migrated_again.updated_at.is_empty());
 
         let _ = fs::remove_file(path);
     }

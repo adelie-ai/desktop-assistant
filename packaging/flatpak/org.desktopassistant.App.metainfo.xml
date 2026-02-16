@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.desktopassistant.App</id>
+  <name>Desktop Assistant</name>
+  <summary>Desktop assistant daemon and terminal UI</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Desktop Assistant provides a user-session D-Bus daemon and terminal UI,
+      with modular LLM connectors and MCP tool integration.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.desktopassistant.App.desktop</launchable>
+</component>

@@ -10,8 +10,9 @@ Interface: `org.desktopAssistant.Settings`
 ## Methods
 
 - `CreateConversation(title: s) -> id: s`
-- `ListConversations() -> a(ssu)`
-  - tuple: `(id, title, message_count)`
+- `ListConversations(max_age_days: i) -> a(ssus)`
+  - `max_age_days = 0` disables filtering
+  - tuple: `(id, title, message_count, updated_at)` where `updated_at` is `YYYY-MM-DD HH:MM:SS`
 - `GetConversation(id: s) -> (id: s, title: s, messages: a(ss))`
   - message tuple: `(role, content)`
 - `DeleteConversation(id: s) -> ()`
@@ -35,7 +36,7 @@ Interface: `org.desktopAssistant.Settings`
 # list conversations
 busctl --user call org.desktopAssistant \
   /org/desktopAssistant/Conversations \
-  org.desktopAssistant.Conversations ListConversations
+  org.desktopAssistant.Conversations ListConversations i 7
 
 # create conversation
 busctl --user call org.desktopAssistant \

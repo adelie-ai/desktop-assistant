@@ -2,8 +2,8 @@
   "KPackageStructure": "Plasma/Applet",
   "KPlugin": {
     "Id": "org.desktopassistant.desktopchat",
-    "Name": "Adele (Desktop)",
-    "Description": "Desktop chat card for Adele desktop assistant over D-Bus",
+    "Name": "Adele AI (Desktop)",
+    "Description": "Desktop chat card for Adele AI over D-Bus",
     "Icon": "preferences-system-network",
     "Version": "0.1.1",
     "Website": "https://example.invalid",

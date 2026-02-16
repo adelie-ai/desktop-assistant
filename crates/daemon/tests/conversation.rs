@@ -130,7 +130,7 @@ async fn full_conversation_lifecycle() {
     assert!(conv.messages.is_empty());
 
     // 2. List conversations — should have one
-    let summaries = service.list_conversations().await.unwrap();
+    let summaries = service.list_conversations(None).await.unwrap();
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].id.as_str(), "conv-1");
     assert_eq!(summaries[0].message_count, 0);
@@ -161,7 +161,7 @@ async fn full_conversation_lifecycle() {
     assert_eq!(updated.messages[1].content, "Hello, world!");
 
     // 5. List should show message_count = 2
-    let summaries = service.list_conversations().await.unwrap();
+    let summaries = service.list_conversations(None).await.unwrap();
     assert_eq!(summaries[0].message_count, 2);
 
     // 6. Delete the conversation
@@ -172,7 +172,7 @@ async fn full_conversation_lifecycle() {
     assert!(matches!(result, Err(CoreError::ConversationNotFound(_))));
 
     // 8. List should be empty
-    let summaries = service.list_conversations().await.unwrap();
+    let summaries = service.list_conversations(None).await.unwrap();
     assert!(summaries.is_empty());
 }
 
@@ -185,7 +185,7 @@ async fn multiple_conversations() {
 
     assert_ne!(c1.id, c2.id);
 
-    let summaries = service.list_conversations().await.unwrap();
+    let summaries = service.list_conversations(None).await.unwrap();
     assert_eq!(summaries.len(), 2);
 
     // Send prompt only to c1

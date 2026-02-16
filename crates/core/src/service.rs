@@ -6,9 +6,20 @@ use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{ChunkCallback, LlmClient};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
+use chrono::{Duration, Local};
 
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
+
+fn now_timestamp() -> String {
+    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn cutoff_timestamp(max_age_days: u32) -> String {
+    (Local::now() - Duration::days(i64::from(max_age_days)))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
 
 /// Per-turn runtime instruction injected for the LLM.
 const RUNTIME_SYSTEM_INSTRUCTION: &str = "You are Adele, a desktop assistant named in reference to the Adélie penguin, with optional tool access. \
@@ -25,6 +36,7 @@ When launching GUI applications for the user, use a non-blocking launch pattern 
 Before launching an app, check availability in PATH and also check Flatpak and Snap installations when those runtimes are present. \
 Use built-in preference tools (builtin_preferences_remember/search/retrieve) for durable user preferences. \
 Use built-in memory tools (builtin_memory_remember/search/retrieve/update) for durable factual memory and corrections. \
+Before handling any user request that is unlikely to be solved in one turn, first search for relevant preferences and memories (project-scoped first, then global) and apply what you find before asking new questions. \
 For any fact or value (preferences, paths, commands, tools, workflows, etc.), resolve it with this order: \
 project-scoped preference key, global preference fallback, project-scoped memory key, global memory fallback, then lightweight discovery, then ask only for the smallest missing piece. \
 Use namespaced keys for stored facts: project.<project>.<attribute...> and global.<attribute...>. \
@@ -160,13 +172,36 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 {
     async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
         let id = (self.id_generator)();
-        let conv = Conversation::new(id, title);
+        let mut conv = Conversation::new(id, title);
+        let timestamp = now_timestamp();
+        conv.created_at = timestamp.clone();
+        conv.updated_at = timestamp;
         self.store.create(conv.clone()).await?;
         Ok(conv)
     }
 
-    async fn list_conversations(&self) -> Result<Vec<ConversationSummary>, CoreError> {
-        let convs = self.store.list().await?;
+    async fn list_conversations(
+        &self,
+        max_age_days: Option<u32>,
+    ) -> Result<Vec<ConversationSummary>, CoreError> {
+        let mut convs = self.store.list().await?;
+
+        if let Some(days) = max_age_days.filter(|days| *days > 0) {
+            let cutoff = cutoff_timestamp(days);
+            convs.retain(|conv| {
+                !conv.updated_at.is_empty() && conv.updated_at >= cutoff
+            });
+        }
+
+        convs.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| left.title.cmp(&right.title))
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+
         Ok(convs.iter().map(ConversationSummary::from).collect())
     }
 
@@ -228,6 +263,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // Text-only response — we're done
                 conv.messages
                     .push(Message::new(Role::Assistant, &response.text));
+                conv.updated_at = now_timestamp();
                 self.store.update(conv).await?;
                 return Ok(response.text);
             }
@@ -376,6 +412,32 @@ mod tests {
         Box::new(|_| true)
     }
 
+    struct ListOnlyStore {
+        conversations: Vec<Conversation>,
+    }
+
+    impl ConversationStore for ListOnlyStore {
+        async fn create(&self, _conv: Conversation) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, _id: &ConversationId) -> Result<Conversation, CoreError> {
+            Err(CoreError::ConversationNotFound("unused".to_string()))
+        }
+
+        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+            Ok(self.conversations.clone())
+        }
+
+        async fn update(&self, _conv: Conversation) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn create_assigns_unique_ids() {
         let handler = make_handler(vec![]);
@@ -384,6 +446,17 @@ mod tests {
         assert_ne!(c1.id, c2.id);
         assert_eq!(c1.id.as_str(), "conv-1");
         assert_eq!(c2.id.as_str(), "conv-2");
+    }
+
+    #[tokio::test]
+    async fn create_sets_human_readable_timestamps() {
+        let handler = make_handler(vec![]);
+        let conv = handler.create_conversation("A".into()).await.unwrap();
+        assert!(!conv.created_at.is_empty());
+        assert!(!conv.updated_at.is_empty());
+        assert_eq!(conv.created_at.len(), 19);
+        assert_eq!(conv.updated_at.len(), 19);
+        assert_eq!(conv.created_at, conv.updated_at);
     }
 
     #[tokio::test]
@@ -400,11 +473,47 @@ mod tests {
         handler.create_conversation("A".into()).await.unwrap();
         handler.create_conversation("B".into()).await.unwrap();
 
-        let summaries = handler.list_conversations().await.unwrap();
+        let summaries = handler.list_conversations(None).await.unwrap();
         assert_eq!(summaries.len(), 2);
         for s in &summaries {
             assert_eq!(s.message_count, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_age_and_sorts_descending() {
+        let now = Local::now();
+
+        let mut old_conv = Conversation::new("old", "Old");
+        old_conv.created_at = (now - Duration::days(30))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        old_conv.updated_at = old_conv.created_at.clone();
+
+        let mut newer_conv = Conversation::new("newer", "Newer");
+        newer_conv.created_at = (now - Duration::days(2))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        newer_conv.updated_at = newer_conv.created_at.clone();
+
+        let mut newest_conv = Conversation::new("newest", "Newest");
+        newest_conv.created_at = (now - Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        newest_conv.updated_at = newest_conv.created_at.clone();
+
+        let handler = ConversationHandler::new(
+            ListOnlyStore {
+                conversations: vec![old_conv, newer_conv, newest_conv],
+            },
+            MockLlm::new(vec![]),
+            Box::new(|| "unused".to_string()),
+        );
+
+        let filtered = handler.list_conversations(Some(7)).await.unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].id.as_str(), "newest");
+        assert_eq!(filtered[1].id.as_str(), "newer");
     }
 
     #[tokio::test]
@@ -934,6 +1043,9 @@ mod tests {
         assert_eq!(messages[0].role, Role::System);
         assert!(messages[0].content.contains(
             "You are Adele, a desktop assistant named in reference to the Adélie penguin"
+        ));
+        assert!(messages[0].content.contains(
+            "Before handling any user request that is unlikely to be solved in one turn"
         ));
         assert!(
             messages[0]

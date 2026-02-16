@@ -29,6 +29,10 @@ impl From<&str> for ConversationId {
 pub struct Conversation {
     pub id: ConversationId,
     pub title: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
     pub messages: Vec<Message>,
 }
 
@@ -37,6 +41,8 @@ impl Conversation {
         Self {
             id: id.into(),
             title: title.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
             messages: Vec::new(),
         }
     }
@@ -47,6 +53,8 @@ impl Conversation {
 pub struct ConversationSummary {
     pub id: ConversationId,
     pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
     pub message_count: usize,
 }
 
@@ -55,6 +63,8 @@ impl From<&Conversation> for ConversationSummary {
         Self {
             id: conv.id.clone(),
             title: conv.title.clone(),
+            created_at: conv.created_at.clone(),
+            updated_at: conv.updated_at.clone(),
             message_count: conv.messages.len(),
         }
     }
@@ -98,6 +108,8 @@ mod tests {
         let conv = Conversation::new("id-1", "Test Chat");
         assert_eq!(conv.id.as_str(), "id-1");
         assert_eq!(conv.title, "Test Chat");
+        assert!(conv.created_at.is_empty());
+        assert!(conv.updated_at.is_empty());
         assert!(conv.messages.is_empty());
     }
 
@@ -110,6 +122,8 @@ mod tests {
         let summary = ConversationSummary::from(&conv);
         assert_eq!(summary.id.as_str(), "id-1");
         assert_eq!(summary.title, "Chat");
+        assert_eq!(summary.created_at, "");
+        assert_eq!(summary.updated_at, "");
         assert_eq!(summary.message_count, 2);
     }
 
@@ -121,6 +135,16 @@ mod tests {
         let deserialized: Conversation = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.id, conv.id);
         assert_eq!(deserialized.title, conv.title);
+        assert_eq!(deserialized.created_at, conv.created_at);
+        assert_eq!(deserialized.updated_at, conv.updated_at);
         assert_eq!(deserialized.messages.len(), 1);
+    }
+
+    #[test]
+    fn conversation_deserializes_without_timestamps() {
+        let json = r#"{"id":"id-1","title":"Chat","messages":[]}"#;
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert_eq!(conv.created_at, "");
+        assert_eq!(conv.updated_at, "");
     }
 }

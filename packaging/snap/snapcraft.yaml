@@ -1,0 +1,32 @@
+name: desktop-assistant
+base: core24
+version: '0.1.0'
+summary: Desktop assistant daemon and terminal UI
+description: |
+  Desktop Assistant provides a user-session D-Bus daemon and terminal UI,
+  with modular LLM connectors and MCP tool integration.
+grade: devel
+confinement: classic
+
+parts:
+  desktop-assistant:
+    plugin: rust
+    source: ../..
+    build-packages:
+      - pkg-config
+    override-build: |
+      craftctl default
+      cargo build --release --workspace
+      install -Dm755 target/release/desktop-assistant-daemon "$CRAFT_PART_INSTALL/bin/desktop-assistant-daemon"
+      install -Dm755 target/release/desktop-assistant-tui "$CRAFT_PART_INSTALL/bin/desktop-assistant-tui"
+
+apps:
+  daemon:
+    command: bin/desktop-assistant-daemon
+    daemon: simple
+    restart-condition: on-failure
+    plugs: [network, network-bind, home]
+
+  tui:
+    command: bin/desktop-assistant-tui
+    plugs: [network, home]

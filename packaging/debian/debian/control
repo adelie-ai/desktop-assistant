@@ -1,0 +1,15 @@
+Source: desktop-assistant
+Section: utils
+Priority: optional
+Maintainer: Desktop Assistant Maintainers <packaging@example.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://example.com/desktop-assistant
+
+Package: desktop-assistant
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: Modular desktop assistant daemon and TUI
+ Desktop Assistant provides a user-session D-Bus daemon and a terminal UI.
+ It includes LLM connector backends and MCP integration support.

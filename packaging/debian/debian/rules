@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --workspace
+
+override_dh_auto_test:
+	:
+
+override_dh_auto_install:
+	install -Dm0755 target/release/desktop-assistant-daemon debian/desktop-assistant/usr/bin/desktop-assistant-daemon
+	install -Dm0755 target/release/desktop-assistant-tui debian/desktop-assistant/usr/bin/desktop-assistant-tui
+	install -Dm0644 systemd/desktop-assistant-daemon.service debian/desktop-assistant/usr/lib/systemd/user/desktop-assistant-daemon.service
+	install -Dm0644 systemd/org.desktopAssistant.service debian/desktop-assistant/usr/share/dbus-1/services/org.desktopAssistant.service

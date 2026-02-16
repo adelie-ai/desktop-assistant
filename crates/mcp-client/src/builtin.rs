@@ -55,6 +55,10 @@ fn normalize(text: &str) -> String {
     text.trim().to_lowercase()
 }
 
+fn normalized_eq(left: &str, right: &str) -> bool {
+    normalize(left) == normalize(right)
+}
+
 fn score_match(haystack: &str, needle: &str) -> i64 {
     let haystack = normalize(haystack);
     let needle = normalize(needle);
@@ -275,7 +279,7 @@ impl BuiltinToolService {
     }
 
     fn preferences_remember(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let key = required_string(&arguments, "key")?;
+        let key = normalize(&required_string(&arguments, "key")?);
         let value = required_string(&arguments, "value")?;
         let scope = optional_string(&arguments, "scope");
         let overwrite = arguments
@@ -289,9 +293,10 @@ impl BuiltinToolService {
         if let Some(existing_idx) = prefs
             .items
             .iter()
-            .position(|item| item.key == key && item.scope == scope)
+            .position(|item| normalized_eq(&item.key, &key) && item.scope == scope)
         {
             let updated_at;
+            prefs.items[existing_idx].key = key.clone();
             if overwrite {
                 prefs.items[existing_idx].value = value.clone();
                 prefs.items[existing_idx].updated_at = now;
@@ -388,7 +393,7 @@ impl BuiltinToolService {
         let found = prefs
             .items
             .iter()
-            .find(|item| item.key == key && item.scope == scope);
+            .find(|item| normalized_eq(&item.key, &key) && item.scope == scope);
 
         if let Some(item) = found {
             Ok(serde_json::json!({
@@ -506,7 +511,11 @@ impl BuiltinToolService {
         let id = required_string(&arguments, "id")?;
 
         let memory = self.memory.lock().unwrap();
-        if let Some(item) = memory.items.iter().find(|entry| entry.id == id) {
+        if let Some(item) = memory
+            .items
+            .iter()
+            .find(|entry| normalized_eq(&entry.id, &id))
+        {
             Ok(serde_json::json!({
                 "ok": true,
                 "found": true,
@@ -533,7 +542,11 @@ impl BuiltinToolService {
         let supersedes = optional_string(&arguments, "supersedes");
 
         let mut memory = self.memory.lock().unwrap();
-        if let Some(item_idx) = memory.items.iter().position(|entry| entry.id == id) {
+        if let Some(item_idx) = memory
+            .items
+            .iter()
+            .position(|entry| normalized_eq(&entry.id, &id))
+        {
             if let Some(new_fact) = fact {
                 memory.items[item_idx].fact = new_fact;
             }
@@ -720,6 +733,72 @@ mod tests {
     }
 
     #[test]
+    fn preferences_lookup_is_case_insensitive() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
+
+        let _ = service
+            .execute_tool(
+                TOOL_PREF_REMEMBER,
+                serde_json::json!({
+                    "key": "Project.MyApp.Path",
+                    "value": "/home/dave/projects/my-app"
+                }),
+            )
+            .unwrap();
+
+        let retrieved = service
+            .execute_tool(
+                TOOL_PREF_RETRIEVE,
+                serde_json::json!({
+                    "key": "project.myapp.path"
+                }),
+            )
+            .unwrap();
+
+        let retrieved_json: serde_json::Value = serde_json::from_str(&retrieved).unwrap();
+        assert_eq!(
+            retrieved_json["item"]["key"],
+            serde_json::Value::String("project.myapp.path".to_string())
+        );
+        assert!(retrieved.contains("\"found\":true"));
+        assert!(retrieved.contains("/home/dave/projects/my-app"));
+
+        let _ = service
+            .execute_tool(
+                TOOL_PREF_REMEMBER,
+                serde_json::json!({
+                    "key": "PROJECT.MYAPP.PATH",
+                    "value": "/tmp/my-app"
+                }),
+            )
+            .unwrap();
+
+        let search = service
+            .execute_tool(
+                TOOL_PREF_SEARCH,
+                serde_json::json!({
+                    "query": "project.myapp.path",
+                    "limit": 10
+                }),
+            )
+            .unwrap();
+
+        let search_json: serde_json::Value = serde_json::from_str(&search).unwrap();
+        let results_len = search_json
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(results_len, 1);
+        assert!(search.contains("/tmp/my-app"));
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[test]
     fn memory_remember_update_retrieve() {
         let pref_path = temp_file("pref");
         let mem_path = temp_file("mem");
@@ -762,6 +841,56 @@ mod tests {
             .unwrap();
 
         assert!(retrieved.contains("Holly Springs"));
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[test]
+    fn memory_id_lookup_is_case_insensitive() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
+
+        let created = service
+            .execute_tool(
+                TOOL_MEM_REMEMBER,
+                serde_json::json!({
+                    "fact": "Primary email is dave@example.com",
+                    "tags": ["profile"]
+                }),
+            )
+            .unwrap();
+
+        let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let id = created_json
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+        let upper_id = id.to_uppercase();
+
+        let _ = service
+            .execute_tool(
+                TOOL_MEM_UPDATE,
+                serde_json::json!({
+                    "id": upper_id,
+                    "fact": "Primary email is dave+work@example.com"
+                }),
+            )
+            .unwrap();
+
+        let retrieved = service
+            .execute_tool(
+                TOOL_MEM_RETRIEVE,
+                serde_json::json!({
+                    "id": id.to_uppercase()
+                }),
+            )
+            .unwrap();
+
+        assert!(retrieved.contains("\"found\":true"));
+        assert!(retrieved.contains("dave+work@example.com"));
 
         let _ = fs::remove_file(pref_path);
         let _ = fs::remove_file(mem_path);

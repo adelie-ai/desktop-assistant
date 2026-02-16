@@ -2,8 +2,8 @@
   "KPackageStructure": "Plasma/Applet",
   "KPlugin": {
     "Id": "org.desktopassistant.settings",
-    "Name": "Desktop Assistant Settings",
-    "Description": "Configure Desktop Assistant connectors, models, and API keys",
+    "Name": "Adele AI Settings",
+    "Description": "Configure Adele AI connectors, models, and API keys",
     "Icon": "settings-configure",
     "Version": "0.1.0",
     "Website": "https://example.invalid",

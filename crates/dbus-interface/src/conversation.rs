@@ -39,16 +39,21 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         Ok(conv.id.0)
     }
 
-    /// List all conversations as an array of (id, title, message_count).
-    async fn list_conversations(&self) -> fdo::Result<Vec<(String, String, u32)>> {
+    /// List conversations as an array of (id, title, message_count, updated_at),
+    /// optionally filtered by max age in days (0 means no filtering).
+    async fn list_conversations(
+        &self,
+        max_age_days: i32,
+    ) -> fdo::Result<Vec<(String, String, u32, String)>> {
+        let max_age = u32::try_from(max_age_days).ok().filter(|days| *days > 0);
         let summaries = self
             .service
-            .list_conversations()
+            .list_conversations(max_age)
             .await
             .map_err(|e| fdo::Error::Failed(e.to_string()))?;
         Ok(summaries
             .into_iter()
-            .map(|s| (s.id.0, s.title, s.message_count as u32))
+            .map(|s| (s.id.0, s.title, s.message_count as u32, s.updated_at))
             .collect())
     }
 
@@ -214,10 +219,15 @@ mod tests {
             Ok(Conversation::new("test-id", title))
         }
 
-        async fn list_conversations(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
             Ok(vec![ConversationSummary {
                 id: ConversationId::from("test-id"),
                 title: "Test".to_string(),
+                created_at: "2026-02-16 00:00:00".to_string(),
+                updated_at: "2026-02-16 00:00:00".to_string(),
                 message_count: 0,
             }])
         }
@@ -268,7 +278,7 @@ mod tests {
     async fn adapter_list_conversations() {
         let service = Arc::new(FakeConversationService);
         let adapter = DbusConversationAdapter::new(service);
-        let summaries = adapter.service.list_conversations().await.unwrap();
+        let summaries = adapter.service.list_conversations(None).await.unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].title, "Test");
     }

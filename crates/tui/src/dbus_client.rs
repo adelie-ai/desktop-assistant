@@ -12,7 +12,10 @@ const DBUS_CONVERSATIONS_PATH: &str = "/org/desktopAssistant/Conversations";
 trait Conversations {
     async fn create_conversation(&self, title: &str) -> zbus::fdo::Result<String>;
 
-    async fn list_conversations(&self) -> zbus::fdo::Result<Vec<(String, String, u32)>>;
+    async fn list_conversations(
+        &self,
+        max_age_days: i32,
+    ) -> zbus::fdo::Result<Vec<(String, String, u32, String)>>;
 
     async fn get_conversation(
         &self,
@@ -86,10 +89,10 @@ impl DbusClient {
     }
 
     pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
-        let raw = self.proxy.list_conversations().await?;
+        let raw = self.proxy.list_conversations(0).await?;
         Ok(raw
             .into_iter()
-            .map(|(id, title, message_count)| ConversationSummary {
+            .map(|(id, title, message_count, _updated_at)| ConversationSummary {
                 id,
                 title,
                 message_count,

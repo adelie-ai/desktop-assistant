@@ -28,3 +28,4 @@ desktop-assistant-llm-ollama = { path = "crates/llm-ollama" }
 desktop-assistant-mcp-client = { path = "crates/mcp-client" }
 serde_json = "1"
 toml = "0.8"
+chrono = { version = "0.4", features = ["clock"] }

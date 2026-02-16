@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Desktop Assistant
+Comment=Terminal interface for Desktop Assistant
+Exec=desktop-assistant-tui
+Terminal=true
+Categories=Utility;
