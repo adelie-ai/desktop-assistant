@@ -1,9 +1,12 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 service_name := "desktop-assistant-daemon"
+dev_service_name := "desktop-assistant-daemon-dev"
 dev_dbus_service := "org.desktopAssistant.Dev"
 service_src := "systemd/desktop-assistant-daemon.service"
+dev_service_src := "systemd/desktop-assistant-daemon-dev.service"
 service_dst := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config") + "/systemd/user/" + service_name + ".service"
+dev_service_dst := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config") + "/systemd/user/" + dev_service_name + ".service"
 panel_widget := "kde/plasmoid/org.desktopassistant.panelchat"
 desktop_widget := "kde/plasmoid/org.desktopassistant.desktopchat"
 settings_widget := "kde/plasmoid/org.desktopassistant.settings"
@@ -46,29 +49,60 @@ install-service:
     cp "{{service_src}}" "{{service_dst}}"
     systemctl --user daemon-reload
 
+# Install user development service file and reload systemd user manager
+install-service-dev:
+    [ -f "{{dev_service_src}}" ] || (echo "Missing service file: {{dev_service_src}}" >&2; exit 1)
+    mkdir -p "$(dirname '{{dev_service_dst}}')"
+    cp "{{dev_service_src}}" "{{dev_service_dst}}"
+    systemctl --user daemon-reload
+
 # Enable + start backend service
 backend-enable:
     systemctl --user enable --now {{service_name}}
+
+# Enable + start development backend service
+backend-dev-enable:
+    systemctl --user enable --now {{dev_service_name}}
 
 # Start backend service
 backend-start:
     systemctl --user start {{service_name}}
 
+# Start development backend service
+backend-dev-start:
+    systemctl --user start {{dev_service_name}}
+
 # Stop backend service
 backend-stop:
     systemctl --user stop {{service_name}}
+
+# Stop development backend service
+backend-dev-stop:
+    systemctl --user stop {{dev_service_name}}
 
 # Restart backend service
 backend-restart:
     systemctl --user restart {{service_name}}
 
+# Restart development backend service
+backend-dev-restart:
+    systemctl --user restart {{dev_service_name}}
+
 # Show backend service status
 backend-status:
     systemctl --user status {{service_name}}
 
+# Show development backend service status
+backend-dev-status:
+    systemctl --user status {{dev_service_name}}
+
 # Tail backend logs
 backend-logs:
     journalctl --user -u {{service_name}} -f
+
+# Tail development backend logs
+backend-dev-logs:
+    journalctl --user -u {{dev_service_name}} -f
 
 # Install all KDE Plasma widgets for the current user
 widget-install:
@@ -140,10 +174,17 @@ uninstall-service:
     rm -f "{{service_dst}}"
     systemctl --user daemon-reload
 
+# Remove user development service file and stop the dev daemon
+uninstall-service-dev:
+    systemctl --user disable --now {{dev_service_name}} || true
+    rm -f "{{dev_service_dst}}"
+    systemctl --user daemon-reload
+
 # Uninstall everything (widgets, service, KCM)
 uninstall:
     just widget-remove
     just uninstall-service
+    just uninstall-service-dev
     just kcm-cleanup
 
 # Clean build artifacts

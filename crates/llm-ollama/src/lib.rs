@@ -109,10 +109,8 @@ impl From<&Message> for ChatMessage {
                 msg.tool_calls
                     .iter()
                     .map(|tc| {
-                        let arguments: serde_json::Value =
-                            serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Object(
-                                serde_json::Map::new(),
-                            ));
+                        let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                         ChatMessageToolCall {
                             function: ChatMessageFunction {
                                 name: tc.name.clone(),
@@ -204,9 +202,7 @@ impl LlmClient for OllamaClient {
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
-            buffer.push_str(
-                &String::from_utf8_lossy(&bytes),
-            );
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
 
             // Process complete lines from the buffer
             while let Some(newline_pos) = buffer.find('\n') {
@@ -272,11 +268,7 @@ impl LlmClient for OllamaClient {
                             let id = format!("ollama_call_{}", tool_calls.len() + i);
                             let arguments = serde_json::to_string(&tc.function.arguments)
                                 .unwrap_or_else(|_| "{}".to_string());
-                            tool_calls.push(ToolCall::new(
-                                id,
-                                tc.function.name.clone(),
-                                arguments,
-                            ));
+                            tool_calls.push(ToolCall::new(id, tc.function.name.clone(), arguments));
                         }
                     }
                 }

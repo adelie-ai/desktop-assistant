@@ -2,7 +2,7 @@
 
 A Rust desktop assistant with:
 - D-Bus API for conversation lifecycle and streaming responses
-- OpenAI-compatible LLM backend
+- Multiple LLM backends (`ollama`, `openai`, `anthropic`)
 - MCP tool integration over stdio
 - Optional terminal UI (TUI) client
 
@@ -21,7 +21,7 @@ The assistant persona is named **Adele**, in reference to the **Adélie penguin*
 
 - Rust (stable, edition 2024)
 - Linux session D-Bus (`DBUS_SESSION_BUS_ADDRESS` available)
-- `OPENAI_API_KEY` for real LLM calls
+- For cloud connectors, a connector-specific API key (for example `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`)
 - Optional MCP servers (for tools)
 
 ## Quick Start
@@ -32,14 +32,25 @@ The assistant persona is named **Adele**, in reference to the **Adélie penguin*
 cargo build --workspace
 ```
 
-### 2) Configure OpenAI
+### 2) Configure connector
+
+Default connector is `ollama` (no API key required for local Ollama).
+
+For cloud connectors, export the matching API key environment variable:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
-# optional:
+export ANTHROPIC_API_KEY=your_key_here
+
+# optional connector overrides:
 export OPENAI_MODEL=gpt-4o
 export OPENAI_BASE_URL=https://api.openai.com/v1
 ```
+
+Connector key naming convention is generic:
+- Secret backend account key defaults to `<connector>_api_key`.
+- Environment fallback defaults to `<CONNECTOR>_API_KEY`.
+- Connector names are normalized to alphanumeric/underscore (for example, `aws-bedrock` → `aws_bedrock_api_key` and `AWS_BEDROCK_API_KEY`).
 
 ### 3) (Optional) Configure MCP servers
 
@@ -92,6 +103,21 @@ Run a development daemon in parallel with the regular user service (separate D-B
 just dev-backend
 ```
 
+Or install a dedicated user systemd service for development mode:
+
+```bash
+just install-service-dev
+just backend-dev-enable
+```
+
+Common dev service operations:
+
+```bash
+just backend-dev-status
+just backend-dev-restart
+just backend-dev-logs
+```
+
 Run TUI against that development daemon:
 
 ```bash
@@ -128,7 +154,7 @@ Usage:
 
 - Add **Desktop Assistant** to the panel/task bar for quick popup chat.
 - Add **Desktop Assistant (Desktop)** to the desktop for an always-visible chat card.
-- Add **Desktop Assistant Settings** to configure connector/model/base URL and API key.
+- Add **Desktop Assistant Settings** to configure supported connectors (`ollama`, `openai`, `anthropic`), model/base URL, and API key.
 - Widget controls include:
 	- **New**: start a fresh conversation.
 	- **Debug**: show/hide low-level tool execution status lines.
@@ -229,7 +255,7 @@ Storage paths:
 
 ## Notes
 
-- If `OPENAI_API_KEY` is missing, daemon still starts but prompt calls will fail at runtime.
+- If a cloud connector is selected and its API key is missing, daemon still starts but prompt calls fail at runtime.
 - If MCP config is missing, daemon runs with no external tools.
 - Daemon LLM settings are read from:
 	- `$XDG_CONFIG_HOME/desktop-assistant/daemon.toml`, or

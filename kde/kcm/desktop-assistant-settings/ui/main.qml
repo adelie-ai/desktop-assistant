@@ -25,7 +25,7 @@ KCM.SimpleKCM {
             QQC2.ComboBox {
                 id: connectorBox
                 Layout.fillWidth: true
-                model: ["openai", "ollama", "custom"]
+                model: ["ollama", "openai", "anthropic"]
                 currentIndex: Math.max(0, model.indexOf(kcm.connector))
                 onActivated: kcm.connector = currentText
             }

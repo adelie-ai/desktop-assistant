@@ -123,10 +123,8 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessa
                     });
                 }
                 for tc in &msg.tool_calls {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Object(
-                            serde_json::Map::new(),
-                        ));
+                    let input: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     content.push(ContentBlock::ToolUse {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
@@ -303,19 +301,14 @@ impl LlmClient for AnthropicClient {
                 match serde_json::from_str::<SseEvent>(data) {
                     Ok(event) => match event.event_type.as_str() {
                         "content_block_start" => {
-                            if let (Some(index), Some(block)) =
-                                (event.index, &event.content_block)
+                            if let (Some(index), Some(block)) = (event.index, &event.content_block)
                             {
                                 match block {
                                     SseContentBlock::ToolUse { id, name } => {
                                         let tool_idx = tool_block_count;
                                         tool_block_count += 1;
                                         block_to_tool.insert(index, tool_idx);
-                                        tool_acc.start_tool_use(
-                                            tool_idx,
-                                            id.clone(),
-                                            name.clone(),
-                                        );
+                                        tool_acc.start_tool_use(tool_idx, id.clone(), name.clone());
                                     }
                                     SseContentBlock::Text { .. } => {}
                                 }
@@ -484,7 +477,8 @@ mod tests {
 
     #[test]
     fn parse_content_block_start_text() {
-        let data = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        let data =
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
         let event: SseEvent = serde_json::from_str(data).unwrap();
         assert_eq!(event.event_type, "content_block_start");
         match event.content_block.unwrap() {

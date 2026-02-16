@@ -49,8 +49,8 @@ pub struct SecretConfig {
     pub wallet: String,
     #[serde(default = "default_wallet_folder")]
     pub folder: String,
-    #[serde(default = "default_wallet_entry")]
-    pub entry: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
 }
 
 impl Default for SecretConfig {
@@ -58,10 +58,10 @@ impl Default for SecretConfig {
         Self {
             backend: default_secret_backend(),
             service: Some(default_secret_service()),
-            account: Some(default_secret_account()),
+            account: None,
             wallet: default_wallet_name(),
             folder: default_wallet_folder(),
-            entry: default_wallet_entry(),
+            entry: None,
         }
     }
 }
@@ -83,7 +83,7 @@ pub struct LlmSettingsView {
 }
 
 fn default_connector() -> String {
-    "openai".to_string()
+    "ollama".to_string()
 }
 
 fn default_secret_backend() -> String {
@@ -94,8 +94,40 @@ fn default_secret_service() -> String {
     "org.desktopAssistant".to_string()
 }
 
-fn default_secret_account() -> String {
-    "openai_api_key".to_string()
+fn default_secret_account(connector: &str) -> String {
+    format!("{}_api_key", normalized_connector_key_prefix(connector))
+}
+
+fn default_api_key_env(connector: &str) -> String {
+    format!(
+        "{}_API_KEY",
+        normalized_connector_key_prefix(connector).to_ascii_uppercase()
+    )
+}
+
+fn normalized_connector_key_prefix(connector: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_separator = false;
+
+    for ch in connector.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !normalized.is_empty() && !previous_was_separator {
+            normalized.push('_');
+            previous_was_separator = true;
+        }
+    }
+
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+
+    if normalized.is_empty() {
+        default_connector()
+    } else {
+        normalized
+    }
 }
 
 fn default_wallet_name() -> String {
@@ -106,8 +138,24 @@ fn default_wallet_folder() -> String {
     "desktop-assistant".to_string()
 }
 
-fn default_wallet_entry() -> String {
-    "openai_api_key".to_string()
+fn default_wallet_entry(connector: &str) -> String {
+    default_secret_account(connector)
+}
+
+fn resolve_secret_account(secret: &SecretConfig, connector: &str) -> String {
+    secret
+        .account
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_secret_account(connector))
+}
+
+fn resolve_wallet_entry(secret: &SecretConfig, connector: &str) -> String {
+    secret
+        .entry
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_wallet_entry(connector))
 }
 
 pub fn default_daemon_config_path() -> PathBuf {
@@ -194,7 +242,14 @@ pub fn set_api_key(path: &Path, api_key: &str) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(SecretConfig::default);
 
-    write_secret_to_backend(&secret, api_key)?;
+    let connector = config.llm.connector.trim().to_lowercase();
+    let connector = if connector.is_empty() {
+        default_connector()
+    } else {
+        connector
+    };
+
+    write_secret_to_backend(&secret, api_key, &connector)?;
     save_daemon_config(path, &config)
 }
 
@@ -213,18 +268,15 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
         .filter(|c| !c.is_empty())
         .unwrap_or_else(default_connector);
 
-    let default_api_key_env = match connector.as_str() {
-        "anthropic" => "ANTHROPIC_API_KEY",
-        _ => "OPENAI_API_KEY",
-    };
+    let default_api_key_env = default_api_key_env(&connector);
 
     let api_key_env = llm_config
         .and_then(|c| c.api_key_env.as_deref())
-        .unwrap_or(default_api_key_env);
+        .unwrap_or(default_api_key_env.as_str());
 
     let mut api_key = llm_config
         .and_then(|c| c.secret.as_ref())
-        .and_then(read_secret_from_backend)
+        .and_then(|secret| read_secret_from_backend(secret, &connector))
         .unwrap_or_default();
 
     if api_key.is_empty() {
@@ -259,10 +311,10 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
     }
 }
 
-fn read_secret_from_backend(secret: &SecretConfig) -> Option<String> {
+fn read_secret_from_backend(secret: &SecretConfig, connector: &str) -> Option<String> {
     match secret.backend.trim().to_lowercase().as_str() {
-        "keyring" | "libsecret" => read_keyring_secret(secret),
-        "kwallet" => read_kwallet_secret(secret),
+        "keyring" | "libsecret" => read_keyring_secret(secret, connector),
+        "kwallet" => read_kwallet_secret(secret, connector),
         other => {
             tracing::warn!("unsupported secret backend '{}', falling back", other);
             None
@@ -270,42 +322,38 @@ fn read_secret_from_backend(secret: &SecretConfig) -> Option<String> {
     }
 }
 
-fn read_keyring_secret(secret: &SecretConfig) -> Option<String> {
+fn read_keyring_secret(secret: &SecretConfig, connector: &str) -> Option<String> {
     let service = secret
         .service
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(default_secret_service);
-    let account = secret
-        .account
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(default_secret_account);
+    let account = resolve_secret_account(secret, connector);
 
     let entry = Entry::new(&service, &account).ok()?;
     let value = entry.get_password().ok()?.trim().to_string();
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn write_secret_to_backend(secret: &SecretConfig, value: &str) -> anyhow::Result<()> {
+fn write_secret_to_backend(
+    secret: &SecretConfig,
+    value: &str,
+    connector: &str,
+) -> anyhow::Result<()> {
     match secret.backend.trim().to_lowercase().as_str() {
-        "keyring" | "libsecret" => write_keyring_secret(secret, value),
-        "kwallet" => write_kwallet_secret(secret, value),
+        "keyring" | "libsecret" => write_keyring_secret(secret, value, connector),
+        "kwallet" => write_kwallet_secret(secret, value, connector),
         other => Err(anyhow!("unsupported secret backend '{other}'")),
     }
 }
 
-fn write_keyring_secret(secret: &SecretConfig, value: &str) -> anyhow::Result<()> {
+fn write_keyring_secret(secret: &SecretConfig, value: &str, connector: &str) -> anyhow::Result<()> {
     let service = secret
         .service
         .clone()
         .filter(|candidate| !candidate.trim().is_empty())
         .unwrap_or_else(default_secret_service);
-    let account = secret
-        .account
-        .clone()
-        .filter(|candidate| !candidate.trim().is_empty())
-        .unwrap_or_else(default_secret_account);
+    let account = resolve_secret_account(secret, connector);
 
     let entry = Entry::new(&service, &account)
         .map_err(|error| anyhow!("failed to initialize keyring entry: {error}"))?;
@@ -314,21 +362,22 @@ fn write_keyring_secret(secret: &SecretConfig, value: &str) -> anyhow::Result<()
         .map_err(|error| anyhow!("failed to write keyring secret: {error}"))
 }
 
-fn write_kwallet_secret(secret: &SecretConfig, value: &str) -> anyhow::Result<()> {
+fn write_kwallet_secret(secret: &SecretConfig, value: &str, connector: &str) -> anyhow::Result<()> {
+    let entry = resolve_wallet_entry(secret, connector);
     let attempts = [
         vec![
             "-f".to_string(),
             secret.folder.clone(),
             "-w".to_string(),
             value.to_string(),
-            secret.entry.clone(),
+            entry.clone(),
             secret.wallet.clone(),
         ],
         vec![
             "-f".to_string(),
             secret.folder.clone(),
             "-e".to_string(),
-            secret.entry.clone(),
+            entry,
             "-w".to_string(),
             value.to_string(),
             secret.wallet.clone(),
@@ -361,12 +410,13 @@ fn write_kwallet_secret(secret: &SecretConfig, value: &str) -> anyhow::Result<()
     Err(anyhow!("failed to write KWallet secret: {last_error}"))
 }
 
-fn read_kwallet_secret(secret: &SecretConfig) -> Option<String> {
+fn read_kwallet_secret(secret: &SecretConfig, connector: &str) -> Option<String> {
+    let entry = resolve_wallet_entry(secret, connector);
     let output = Command::new("kwallet-query")
         .arg("-f")
         .arg(&secret.folder)
         .arg("-r")
-        .arg(&secret.entry)
+        .arg(&entry)
         .arg(&secret.wallet)
         .output()
         .ok()?;
@@ -428,8 +478,39 @@ mod tests {
     #[test]
     fn resolve_defaults_without_config() {
         let resolved = resolve_llm_config(None);
-        assert_eq!(resolved.connector, "openai");
+        assert_eq!(resolved.connector, "ollama");
         assert!(!resolved.model.is_empty());
         assert!(!resolved.base_url.is_empty());
+    }
+
+    #[test]
+    fn default_secret_account_depends_on_connector() {
+        assert_eq!(default_secret_account("openai"), "openai_api_key");
+        assert_eq!(default_secret_account("anthropic"), "anthropic_api_key");
+        assert_eq!(default_secret_account("aws-bedrock"), "aws_bedrock_api_key");
+    }
+
+    #[test]
+    fn default_api_key_env_depends_on_connector() {
+        assert_eq!(default_api_key_env("openai"), "OPENAI_API_KEY");
+        assert_eq!(default_api_key_env("anthropic"), "ANTHROPIC_API_KEY");
+        assert_eq!(default_api_key_env("aws-bedrock"), "AWS_BEDROCK_API_KEY");
+    }
+
+    #[test]
+    fn resolve_secret_account_uses_explicit_override() {
+        let secret = SecretConfig {
+            backend: "keyring".to_string(),
+            service: Some("org.desktopAssistant".to_string()),
+            account: Some("custom_key_account".to_string()),
+            wallet: "kdewallet".to_string(),
+            folder: "desktop-assistant".to_string(),
+            entry: None,
+        };
+
+        assert_eq!(
+            resolve_secret_account(&secret, "anthropic"),
+            "custom_key_account"
+        );
     }
 }

@@ -77,16 +77,16 @@ async fn main() -> Result<()> {
     let llm: AnyLlmClient = match resolved_llm.connector.as_str() {
         "ollama" => {
             tracing::info!("using Ollama LLM backend");
-            AnyLlmClient::Ollama(
-                desktop_assistant_llm_ollama::OllamaClient::new(
-                    resolved_llm.base_url,
-                    resolved_llm.model,
-                ),
-            )
+            AnyLlmClient::Ollama(desktop_assistant_llm_ollama::OllamaClient::new(
+                resolved_llm.base_url,
+                resolved_llm.model,
+            ))
         }
         "anthropic" => {
             if resolved_llm.api_key.is_empty() {
-                tracing::warn!("No API key resolved from KWallet/env; LLM calls may fail");
+                tracing::warn!(
+                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
+                );
             }
             tracing::info!("using Anthropic LLM backend");
             AnyLlmClient::Anthropic(
@@ -97,7 +97,9 @@ async fn main() -> Result<()> {
         }
         _ => {
             if resolved_llm.api_key.is_empty() {
-                tracing::warn!("No API key resolved from KWallet/env; LLM calls may fail");
+                tracing::warn!(
+                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
+                );
             }
             AnyLlmClient::OpenAi(
                 desktop_assistant_llm_openai::OpenAiClient::new(resolved_llm.api_key)

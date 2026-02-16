@@ -159,7 +159,7 @@ void DesktopAssistantKcm::save()
 
 void DesktopAssistantKcm::defaults()
 {
-    setConnector(QStringLiteral("openai"));
+    setConnector(QStringLiteral("ollama"));
     setModel(QString());
     setBaseUrl(QString());
     setApiKeyInput(QString());

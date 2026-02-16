@@ -1,0 +1,14 @@
+[Unit]
+Description=Desktop Assistant Backend Daemon (Development)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/desktop-assistant-daemon
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+Environment=DESKTOP_ASSISTANT_DBUS_SERVICE=org.desktopAssistant.Dev
+
+[Install]
+WantedBy=default.target

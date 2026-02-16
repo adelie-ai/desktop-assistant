@@ -924,11 +924,9 @@ mod tests {
         let messages = seen.lock().unwrap();
         assert!(!messages.is_empty());
         assert_eq!(messages[0].role, Role::System);
-        assert!(
-            messages[0]
-                .content
-                .contains("You are Adele, a desktop assistant named in reference to the Adélie penguin")
-        );
+        assert!(messages[0].content.contains(
+            "You are Adele, a desktop assistant named in reference to the Adélie penguin"
+        ));
         assert!(
             messages[0]
                 .content

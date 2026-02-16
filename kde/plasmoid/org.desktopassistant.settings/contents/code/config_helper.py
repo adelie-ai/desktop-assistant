@@ -140,7 +140,7 @@ def main() -> int:
     sub.add_parser("load")
 
     save = sub.add_parser("save")
-    save.add_argument("--connector", default="openai")
+    save.add_argument("--connector", default="ollama")
     save.add_argument("--model", default="")
     save.add_argument("--base-url", default="")
     save.add_argument("--api-key", default="")

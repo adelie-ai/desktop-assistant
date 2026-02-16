@@ -39,6 +39,17 @@ PlasmoidItem {
         executable.connectSource(command)
     }
 
+    function openSettingsDialog() {
+        let command = "kcmshell6 kcm_desktopassistant"
+        runCommand(
+            command,
+            function(_stdout) {},
+            function(stderr) {
+                appendStatus("Settings error: " + stderr)
+            }
+        )
+    }
+
     function ensureConversation(onReady) {
         if (conversationId.length > 0) {
             if (onReady) {
@@ -238,6 +249,14 @@ PlasmoidItem {
     }
 
     readonly property var pending: ({})
+
+    Plasmoid.contextualActions: [
+        PlasmaCore.Action {
+            text: "Settings"
+            icon.name: "settings-configure"
+            onTriggered: root.openSettingsDialog()
+        }
+    ]
 
     Plasma5Support.DataSource {
         id: executable

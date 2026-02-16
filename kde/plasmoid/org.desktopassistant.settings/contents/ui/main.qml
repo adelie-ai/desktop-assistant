@@ -15,7 +15,7 @@ PlasmoidItem {
     property string helperPath: Qt.resolvedUrl("../code/config_helper.py").toString().replace("file://", "")
     property bool busy: false
 
-    property string connector: "openai"
+    property string connector: "ollama"
     property string model: ""
     property string baseUrl: ""
     property string apiKey: ""
@@ -50,7 +50,7 @@ PlasmoidItem {
                     statusText = payload.error
                     return
                 }
-                connector = payload.connector || "openai"
+                connector = payload.connector || "ollama"
                 model = payload.model || ""
                 baseUrl = payload.base_url || ""
                 hasApiKey = !!payload.has_api_key
@@ -193,7 +193,7 @@ PlasmoidItem {
                 QQC2.ComboBox {
                     id: connectorBox
                     Layout.fillWidth: true
-                    model: ["openai", "ollama", "custom"]
+                    model: ["ollama", "openai", "anthropic"]
                     currentIndex: Math.max(0, model.indexOf(root.connector))
                     onActivated: {
                         root.connector = currentText

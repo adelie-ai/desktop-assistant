@@ -27,11 +27,19 @@ cargo run -p desktop-assistant-tui
 
 ## Environment
 
-Required for real LLM responses:
+Default connector is `ollama` (local, no API key required).
+
+For cloud connectors, set the matching API key:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
+export ANTHROPIC_API_KEY=your_key_here
 ```
+
+Connector key naming convention is generic:
+- Secret backend account key defaults to `<connector>_api_key`.
+- Environment fallback defaults to `<CONNECTOR>_API_KEY`.
+- Connector names are normalized to alphanumeric/underscore (for example, `aws-bedrock` → `aws_bedrock_api_key` and `AWS_BEDROCK_API_KEY`).
 
 Optional:
 
