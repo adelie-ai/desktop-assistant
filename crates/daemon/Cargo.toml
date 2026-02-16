@@ -7,14 +7,18 @@ edition = "2024"
 desktop-assistant-core.workspace = true
 desktop-assistant-dbus.workspace = true
 desktop-assistant-llm-openai.workspace = true
+desktop-assistant-llm-ollama.workspace = true
 desktop-assistant-mcp-client.workspace = true
 tokio.workspace = true
 zbus.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 uuid = { version = "1", features = ["v4"] }
+keyring = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -5,6 +5,7 @@ members = [
     "crates/dbus-interface",
     "crates/daemon",
     "crates/llm-openai",
+    "crates/llm-ollama",
     "crates/mcp-client",
     "crates/tui",
 ]
@@ -21,5 +22,7 @@ serde = { version = "1", features = ["derive"] }
 desktop-assistant-core = { path = "crates/core" }
 desktop-assistant-dbus = { path = "crates/dbus-interface" }
 desktop-assistant-llm-openai = { path = "crates/llm-openai" }
+desktop-assistant-llm-ollama = { path = "crates/llm-ollama" }
 desktop-assistant-mcp-client = { path = "crates/mcp-client" }
 serde_json = "1"
+toml = "0.8"

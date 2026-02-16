@@ -1,16 +1,47 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::{Message, ToolDefinition};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
 use tracing_subscriber::EnvFilter;
 
 mod app;
+mod config;
+mod settings_service;
 mod store;
 
 use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
-use desktop_assistant_mcp_client::config;
+use desktop_assistant_dbus::settings::DbusSettingsAdapter;
+use desktop_assistant_mcp_client::config as mcp_config;
 use desktop_assistant_mcp_client::executor::McpToolExecutor;
+use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
+
+/// Enum wrapper to dispatch between LLM backends at runtime.
+///
+/// `LlmClient` uses `impl Future` returns, so it isn't dyn-compatible.
+/// This enum lets `ConversationHandler` stay monomorphic while supporting
+/// multiple backends.
+enum AnyLlmClient {
+    OpenAi(desktop_assistant_llm_openai::OpenAiClient),
+    Ollama(desktop_assistant_llm_ollama::OllamaClient),
+}
+
+impl LlmClient for AnyLlmClient {
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        match self {
+            Self::OpenAi(c) => c.stream_completion(messages, tools, on_chunk).await,
+            Self::Ollama(c) => c.stream_completion(messages, tools, on_chunk).await,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,22 +51,52 @@ async fn main() -> Result<()> {
 
     tracing::info!("desktop-assistant starting");
 
-    // Build the LLM client from environment
-    let llm = match desktop_assistant_llm_openai::OpenAiClient::from_env() {
-        Ok(client) => {
-            tracing::info!("OpenAI LLM client initialized");
-            client
+    // Build the LLM client from daemon.toml + KWallet (fallback to env)
+    let config_path = config::default_daemon_config_path();
+    let daemon_config = match config::load_daemon_config(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(
+                "failed to load daemon config at {}: {error}",
+                config_path.display()
+            );
+            None
         }
-        Err(e) => {
-            tracing::warn!("OpenAI client not available: {e}. LLM features will fail at runtime.");
-            // Create a client with a dummy key — calls will fail with auth errors
-            desktop_assistant_llm_openai::OpenAiClient::new(String::new())
+    };
+
+    let resolved_llm = config::resolve_llm_config(daemon_config.as_ref());
+    tracing::info!(
+        "LLM connector={}, model={}, base_url={}",
+        resolved_llm.connector,
+        resolved_llm.model,
+        resolved_llm.base_url
+    );
+
+    let llm: AnyLlmClient = match resolved_llm.connector.as_str() {
+        "ollama" => {
+            tracing::info!("using Ollama LLM backend");
+            AnyLlmClient::Ollama(
+                desktop_assistant_llm_ollama::OllamaClient::new(
+                    resolved_llm.base_url,
+                    resolved_llm.model,
+                ),
+            )
+        }
+        _ => {
+            if resolved_llm.api_key.is_empty() {
+                tracing::warn!("No API key resolved from KWallet/env; LLM calls may fail");
+            }
+            AnyLlmClient::OpenAi(
+                desktop_assistant_llm_openai::OpenAiClient::new(resolved_llm.api_key)
+                    .with_model(resolved_llm.model)
+                    .with_base_url(resolved_llm.base_url),
+            )
         }
     };
 
     // Load MCP server configuration
-    let config_path = config::default_config_path();
-    let mcp_configs = config::load_mcp_configs(&config_path).unwrap_or_else(|e| {
+    let mcp_config_path = mcp_config::default_config_path();
+    let mcp_configs = mcp_config::load_mcp_configs(&mcp_config_path).unwrap_or_else(|e| {
         tracing::warn!("failed to load MCP config: {e}");
         Vec::new()
     });
@@ -60,6 +121,7 @@ async fn main() -> Result<()> {
         tool_executor,
         Box::new(|| uuid::Uuid::new_v4().to_string()),
     ));
+    let settings_service = Arc::new(DaemonSettingsService::new(config_path.clone()));
 
     // Set up D-Bus connection
     let connection = zbus::connection::Builder::session()?
@@ -67,6 +129,10 @@ async fn main() -> Result<()> {
         .serve_at(
             "/org/desktopAssistant/Conversations",
             DbusConversationAdapter::new(Arc::clone(&conversation_service)),
+        )?
+        .serve_at(
+            "/org/desktopAssistant/Settings",
+            DbusSettingsAdapter::new(Arc::clone(&settings_service)),
         )?
         .build()
         .await?;
