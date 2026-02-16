@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct DaemonConfig {
     #[serde(default)]
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -80,6 +82,26 @@ pub struct LlmSettingsView {
     pub model: String,
     pub base_url: String,
     pub has_api_key: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct EmbeddingsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingsSettingsView {
+    pub connector: String,
+    pub model: String,
+    pub base_url: String,
+    pub has_api_key: bool,
+    pub available: bool,
+    pub is_default: bool,
 }
 
 fn default_connector() -> String {
@@ -286,6 +308,91 @@ pub fn set_api_key(path: &Path, api_key: &str) -> anyhow::Result<()> {
 
     write_secret_to_backend(&secret, api_key, &connector)?;
     save_daemon_config(path, &config)
+}
+
+pub fn get_embeddings_settings_view(path: &Path) -> anyhow::Result<EmbeddingsSettingsView> {
+    let config = load_daemon_config(path)?;
+    let resolved = resolve_embeddings_config(config.as_ref());
+    Ok(resolved)
+}
+
+pub fn set_embeddings_settings(
+    path: &Path,
+    connector: Option<&str>,
+    model: Option<&str>,
+    base_url: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut config = load_daemon_config(path)?.unwrap_or_default();
+
+    config.embeddings.connector = connector
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_lowercase());
+    config.embeddings.model = normalize_optional_value(model);
+    config.embeddings.base_url = normalize_optional_value(base_url);
+
+    save_daemon_config(path, &config)
+}
+
+pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSettingsView {
+    let llm_connector = config
+        .map(|c| c.llm.connector.trim().to_lowercase())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(default_connector);
+
+    let emb_config = config.map(|c| &c.embeddings);
+
+    let explicit_connector = emb_config
+        .and_then(|c| c.connector.as_deref())
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty());
+
+    let is_default = explicit_connector.is_none();
+    let connector = explicit_connector.unwrap_or_else(|| llm_connector.clone());
+    let available = connector != "anthropic";
+
+    let model = emb_config
+        .and_then(|c| c.model.clone())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_embedding_model(&connector));
+
+    let base_url = emb_config
+        .and_then(|c| c.base_url.clone())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_base_url(&connector));
+
+    // Resolve API key: reuse LLM secret config if connectors match, otherwise use env fallback
+    let has_api_key = if is_default || connector == llm_connector {
+        let resolved_llm = resolve_llm_config(config);
+        !resolved_llm.api_key.is_empty()
+    } else {
+        let env_key = default_api_key_env(&connector);
+        !std::env::var(env_key).unwrap_or_default().trim().is_empty()
+    };
+
+    EmbeddingsSettingsView {
+        connector,
+        model,
+        base_url,
+        has_api_key,
+        available,
+        is_default,
+    }
+}
+
+fn default_embedding_model(connector: &str) -> String {
+    match connector {
+        "ollama" => "nomic-embed-text".to_string(),
+        _ => "text-embedding-3-small".to_string(),
+    }
+}
+
+fn default_base_url(connector: &str) -> String {
+    match connector {
+        "ollama" => "http://localhost:11434".to_string(),
+        "anthropic" => "https://api.anthropic.com".to_string(),
+        _ => "https://api.openai.com/v1".to_string(),
+    }
 }
 
 fn normalize_optional_value(value: Option<&str>) -> Option<String> {
@@ -793,5 +900,142 @@ mod tests {
         let (empty_len, empty_fp) = redacted_secret_audit("   ");
         assert_eq!(empty_len, 0);
         assert_eq!(empty_fp, "fnv1a64:cbf29ce484222325");
+    }
+
+    #[test]
+    fn embeddings_defaults_from_llm_connector() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+            "#,
+        )
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, "ollama");
+        assert_eq!(view.model, "nomic-embed-text");
+        assert_eq!(view.base_url, "http://localhost:11434");
+        assert!(view.available);
+        assert!(view.is_default);
+    }
+
+    #[test]
+    fn embeddings_explicit_override() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "anthropic"
+
+            [embeddings]
+            connector = "openai"
+            model = "text-embedding-3-large"
+            "#,
+        )
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, "openai");
+        assert_eq!(view.model, "text-embedding-3-large");
+        assert!(view.available);
+        assert!(!view.is_default);
+    }
+
+    #[test]
+    fn embeddings_unavailable_for_anthropic_without_override() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "anthropic"
+            "#,
+        )
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, "anthropic");
+        assert!(!view.available);
+        assert!(view.is_default);
+    }
+
+    #[test]
+    fn embeddings_defaults_without_config() {
+        let view = resolve_embeddings_config(None);
+        assert_eq!(view.connector, "ollama");
+        assert_eq!(view.model, "nomic-embed-text");
+        assert!(view.available);
+        assert!(view.is_default);
+    }
+
+    #[test]
+    fn parse_toml_with_embeddings_section() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "anthropic"
+            model = "claude-sonnet-4-5-20250929"
+
+            [embeddings]
+            connector = "ollama"
+            model = "nomic-embed-text"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.embeddings.connector.as_deref(), Some("ollama"));
+        assert_eq!(
+            config.embeddings.model.as_deref(),
+            Some("nomic-embed-text")
+        );
+        assert!(config.embeddings.base_url.is_none());
+    }
+
+    #[test]
+    fn parse_toml_without_embeddings_section() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.embeddings.connector.is_none());
+        assert!(config.embeddings.model.is_none());
+        assert!(config.embeddings.base_url.is_none());
+    }
+
+    #[test]
+    fn set_embeddings_settings_roundtrip() {
+        let dir = std::env::temp_dir().join("da-test-emb-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.toml");
+
+        // Start with an LLM-only config
+        let config = DaemonConfig {
+            llm: LlmConfig {
+                connector: "anthropic".to_string(),
+                ..LlmConfig::default()
+            },
+            ..DaemonConfig::default()
+        };
+        save_daemon_config(&path, &config).unwrap();
+
+        // Set embeddings override
+        set_embeddings_settings(&path, Some("ollama"), Some("nomic-embed-text"), None).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        assert_eq!(loaded.embeddings.connector.as_deref(), Some("ollama"));
+        assert_eq!(
+            loaded.embeddings.model.as_deref(),
+            Some("nomic-embed-text")
+        );
+        assert!(loaded.embeddings.base_url.is_none());
+
+        // Clear override
+        set_embeddings_settings(&path, None, None, None).unwrap();
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        assert!(loaded.embeddings.connector.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

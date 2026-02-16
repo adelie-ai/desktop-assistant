@@ -16,6 +16,7 @@ Interface: `org.desktopAssistant.Settings`
 - `GetConversation(id: s) -> (id: s, title: s, messages: a(ss))`
   - message tuple: `(role, content)`
 - `DeleteConversation(id: s) -> ()`
+- `ClearAllHistory() -> deleted_count: u`
 - `SendPrompt(conversation_id: s, prompt: s) -> request_id: s`
 
 ### Settings Methods
@@ -23,6 +24,9 @@ Interface: `org.desktopAssistant.Settings`
 - `GetLlmSettings() -> (connector: s, model: s, base_url: s, has_api_key: b)`
 - `SetLlmSettings(connector: s, model: s, base_url: s) -> ()`
 - `SetApiKey(api_key: s) -> ()`
+- `GetEmbeddingsSettings() -> (connector: s, model: s, base_url: s, has_api_key: b, available: b, is_default: b)`
+- `SetEmbeddingsSettings(connector: s, model: s, base_url: s) -> ()`
+  - Empty `connector` clears the override and reverts to defaulting from the LLM connector
 
 ## Signals
 
@@ -52,4 +56,4 @@ busctl --user call org.desktopAssistant \
 - Secret handling over D-Bus is write-only by design:
   - API keys can be written with `SetApiKey`.
   - There is no method that returns secret values.
-  - `GetLlmSettings` only returns non-sensitive fields plus `has_api_key`.
+  - `GetLlmSettings` and `GetEmbeddingsSettings` only return non-sensitive fields plus `has_api_key`.

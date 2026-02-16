@@ -86,6 +86,9 @@ def _run_gdbus(method: str, *args: str) -> Any:
 
 def cmd_load() -> int:
     connector, model, base_url, has_api_key = _run_gdbus("GetLlmSettings")
+    emb_connector, emb_model, emb_base_url, emb_has_key, emb_available, emb_is_default = _run_gdbus(
+        "GetEmbeddingsSettings"
+    )
     response = {
         "connector": connector,
         "model": model,
@@ -93,6 +96,12 @@ def cmd_load() -> int:
         "has_api_key": bool(has_api_key),
         "dbus_service": SERVICE,
         "dev_service": DEV_SERVICE,
+        "emb_connector": emb_connector if not emb_is_default else "",
+        "emb_model": emb_model,
+        "emb_base_url": emb_base_url,
+        "emb_available": bool(emb_available),
+        "emb_is_default": bool(emb_is_default),
+        "emb_has_api_key": bool(emb_has_key),
     }
     print(json.dumps(response))
     return 0
@@ -105,6 +114,7 @@ def cmd_save(args: argparse.Namespace) -> int:
     SERVICE = service
 
     _run_gdbus("SetLlmSettings", args.connector, args.model, args.base_url)
+    _run_gdbus("SetEmbeddingsSettings", args.emb_connector, args.emb_model, args.emb_base_url)
 
     if args.api_key and args.api_key.strip():
         _run_gdbus("SetApiKey", args.api_key)
@@ -145,6 +155,9 @@ def main() -> int:
     save.add_argument("--base-url", default="")
     save.add_argument("--api-key", default="")
     save.add_argument("--dbus-service", default="")
+    save.add_argument("--emb-connector", default="")
+    save.add_argument("--emb-model", default="")
+    save.add_argument("--emb-base-url", default="")
 
     sub.add_parser("restart")
 

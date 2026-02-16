@@ -10,6 +10,16 @@ pub struct LlmSettingsView {
     pub has_api_key: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct EmbeddingsSettingsView {
+    pub connector: String,
+    pub model: String,
+    pub base_url: String,
+    pub has_api_key: bool,
+    pub available: bool,
+    pub is_default: bool,
+}
+
 /// Inbound port for health/status queries.
 ///
 /// Any adapter that wants to expose assistant status (D-Bus, HTTP, etc.)
@@ -44,6 +54,9 @@ pub trait ConversationService: Send + Sync {
         id: &ConversationId,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
+    fn clear_all_history(&self)
+    -> impl std::future::Future<Output = Result<u32, CoreError>> + Send;
+
     fn send_prompt(
         &self,
         conversation_id: &ConversationId,
@@ -70,6 +83,17 @@ pub trait SettingsService: Send + Sync {
     fn set_api_key(
         &self,
         api_key: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn get_embeddings_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<EmbeddingsSettingsView, CoreError>> + Send;
+
+    fn set_embeddings_settings(
+        &self,
+        connector: Option<String>,
+        model: Option<String>,
+        base_url: Option<String>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 

@@ -24,6 +24,12 @@ PlasmoidItem {
     property bool devMode: false
     property string statusText: "Ready"
 
+    property string embConnector: ""
+    property string embModel: ""
+    property string embBaseUrl: ""
+    property bool embAvailable: true
+    property bool embIsDefault: true
+
     readonly property var pending: ({})
 
     function shellEscape(value) {
@@ -57,6 +63,11 @@ PlasmoidItem {
                 dbusService = payload.dbus_service || "org.desktopAssistant"
                 devMode = dbusService === "org.desktopAssistant.Dev"
                 apiKey = ""
+                embConnector = payload.emb_connector || ""
+                embModel = payload.emb_model || ""
+                embBaseUrl = payload.emb_base_url || ""
+                embAvailable = payload.emb_available !== false
+                embIsDefault = payload.emb_is_default !== false
                 statusText = "Loaded settings (D-Bus: " + dbusService + ")"
             },
             function(stderr) {
@@ -75,6 +86,9 @@ PlasmoidItem {
             + " --base-url " + shellEscape(baseUrl)
             + " --dbus-service " + shellEscape(devMode ? "org.desktopAssistant.Dev" : "org.desktopAssistant")
             + " --api-key " + shellEscape(apiKey)
+            + " --emb-connector " + shellEscape(embConnector)
+            + " --emb-model " + shellEscape(embModel)
+            + " --emb-base-url " + shellEscape(embBaseUrl)
 
         runCommand(
             command,
@@ -258,6 +272,74 @@ PlasmoidItem {
                 text: root.devMode
                     ? "Development mode targets org.desktopAssistant.Dev. Run `just dev-backend` to launch it."
                     : "Production mode targets org.desktopAssistant (systemd user service)."
+            }
+
+            // --- Embeddings section ---
+            Rectangle {
+                Layout.fillWidth: true
+                height: 1
+                color: Qt.rgba(0.5, 0.5, 0.5, 0.3)
+            }
+
+            QQC2.Label {
+                text: "Embeddings"
+                font.bold: true
+                Layout.fillWidth: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                QQC2.Label { text: "Connector" }
+                QQC2.ComboBox {
+                    id: embConnectorBox
+                    Layout.fillWidth: true
+                    model: ["auto (use LLM)", "ollama", "openai"]
+                    currentIndex: {
+                        if (root.embConnector === "ollama") return 1
+                        if (root.embConnector === "openai") return 2
+                        return 0
+                    }
+                    onActivated: {
+                        if (currentIndex === 0) root.embConnector = ""
+                        else root.embConnector = currentText
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                QQC2.Label { text: "Model" }
+                QQC2.TextField {
+                    Layout.fillWidth: true
+                    placeholderText: {
+                        let c = root.embConnector || root.connector
+                        return c === "ollama" ? "nomic-embed-text" : "text-embedding-3-small"
+                    }
+                    text: root.embModel
+                    onTextChanged: root.embModel = text
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                QQC2.Label { text: "Base URL" }
+                QQC2.TextField {
+                    Layout.fillWidth: true
+                    placeholderText: {
+                        let c = root.embConnector || root.connector
+                        return c === "ollama" ? "http://localhost:11434" : "https://api.openai.com/v1"
+                    }
+                    text: root.embBaseUrl
+                    onTextChanged: root.embBaseUrl = text
+                }
+            }
+
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                visible: !root.embAvailable
+                color: "orange"
+                text: "Current connector does not support embeddings. Choose a different embeddings connector or switch the LLM connector."
             }
 
             RowLayout {

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::ports::inbound::{LlmSettingsView, SettingsService};
+use desktop_assistant_core::ports::inbound::{EmbeddingsSettingsView, LlmSettingsView, SettingsService};
 
 use crate::config;
 
@@ -46,6 +46,35 @@ impl SettingsService for DaemonSettingsService {
     async fn set_api_key(&self, api_key: String) -> Result<(), CoreError> {
         config::set_api_key(&self.config_path, &api_key)
             .map_err(|error| CoreError::SystemService(error.to_string()))
+    }
+
+    async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
+        let view = config::get_embeddings_settings_view(&self.config_path)
+            .map_err(|error| CoreError::SystemService(error.to_string()))?;
+
+        Ok(EmbeddingsSettingsView {
+            connector: view.connector,
+            model: view.model,
+            base_url: view.base_url,
+            has_api_key: view.has_api_key,
+            available: view.available,
+            is_default: view.is_default,
+        })
+    }
+
+    async fn set_embeddings_settings(
+        &self,
+        connector: Option<String>,
+        model: Option<String>,
+        base_url: Option<String>,
+    ) -> Result<(), CoreError> {
+        config::set_embeddings_settings(
+            &self.config_path,
+            connector.as_deref(),
+            model.as_deref(),
+            base_url.as_deref(),
+        )
+        .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 }
 

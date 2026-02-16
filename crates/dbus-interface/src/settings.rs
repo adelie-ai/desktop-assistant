@@ -68,13 +68,68 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .await
             .map_err(|e| fdo::Error::Failed(e.to_string()))
     }
+
+    /// Return resolved embeddings settings.
+    ///
+    /// Returns: (connector, model, base_url, has_api_key, available, is_default)
+    async fn get_embeddings_settings(
+        &self,
+    ) -> fdo::Result<(String, String, String, bool, bool, bool)> {
+        let settings = self
+            .service
+            .get_embeddings_settings()
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        Ok((
+            settings.connector,
+            settings.model,
+            settings.base_url,
+            settings.has_api_key,
+            settings.available,
+            settings.is_default,
+        ))
+    }
+
+    /// Update embeddings settings. Empty connector clears override (reverts to LLM default).
+    async fn set_embeddings_settings(
+        &self,
+        connector: &str,
+        model: &str,
+        base_url: &str,
+    ) -> fdo::Result<()> {
+        let connector = if connector.trim().is_empty() {
+            None
+        } else {
+            Some(connector.to_string())
+        };
+
+        let model = if model.trim().is_empty() {
+            None
+        } else {
+            Some(model.to_string())
+        };
+
+        let base_url = if base_url.trim().is_empty() {
+            None
+        } else {
+            Some(base_url.to_string())
+        };
+
+        self.service
+            .set_embeddings_settings(connector, model, base_url)
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use desktop_assistant_core::CoreError;
-    use desktop_assistant_core::ports::inbound::{LlmSettingsView, SettingsService};
+    use desktop_assistant_core::ports::inbound::{
+        EmbeddingsSettingsView, LlmSettingsView, SettingsService,
+    };
 
     struct FakeSettingsService;
 
@@ -98,6 +153,26 @@ mod tests {
         }
 
         async fn set_api_key(&self, _api_key: String) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
+            Ok(EmbeddingsSettingsView {
+                connector: "ollama".to_string(),
+                model: "nomic-embed-text".to_string(),
+                base_url: "http://localhost:11434".to_string(),
+                has_api_key: false,
+                available: true,
+                is_default: true,
+            })
+        }
+
+        async fn set_embeddings_settings(
+            &self,
+            _connector: Option<String>,
+            _model: Option<String>,
+            _base_url: Option<String>,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
     }

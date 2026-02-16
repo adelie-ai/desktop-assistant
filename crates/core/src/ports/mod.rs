@@ -7,6 +7,9 @@ pub mod outbound;
 /// LLM client port — outbound trait for LLM completion.
 pub mod llm;
 
+/// Embedding client port — outbound trait for generating vector embeddings.
+pub mod embedding;
+
 /// Conversation store port — outbound trait for persistence.
 pub mod store;
 
@@ -24,5 +27,6 @@ mod tests {
         fn _assert_store_exists<T: super::store::ConversationStore>() {}
         fn _assert_system_exists<T: super::outbound::SystemServiceClient>() {}
         fn _assert_tools_exists<T: super::tools::ToolExecutor>() {}
+        fn _assert_embedding_exists<T: super::embedding::EmbeddingClient>() {}
     }
 }

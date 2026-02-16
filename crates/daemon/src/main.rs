@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition};
+use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
 use tracing_subscriber::EnvFilter;
 
@@ -28,6 +29,32 @@ enum AnyLlmClient {
     Anthropic(desktop_assistant_llm_anthropic::AnthropicClient),
     OpenAi(desktop_assistant_llm_openai::OpenAiClient),
     Ollama(desktop_assistant_llm_ollama::OllamaClient),
+}
+
+/// Enum wrapper to dispatch between embedding backends at runtime.
+///
+/// Mirrors `AnyLlmClient` but for the `EmbeddingClient` trait.
+/// `Unavailable` is used when the resolved connector doesn't support embeddings (e.g. Anthropic).
+enum AnyEmbeddingClient {
+    OpenAi(desktop_assistant_llm_openai::OpenAiClient),
+    Ollama(desktop_assistant_llm_ollama::OllamaClient),
+    Unavailable,
+}
+
+impl EmbeddingClient for AnyEmbeddingClient {
+    async fn embed(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<Vec<Vec<f32>>, CoreError> {
+        match self {
+            Self::OpenAi(c) => c.embed(texts).await,
+            Self::Ollama(c) => c.embed(texts).await,
+            Self::Unavailable => Err(CoreError::Llm(
+                "embeddings are not available: current connector does not support embeddings"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 impl LlmClient for AnyLlmClient {
@@ -74,6 +101,9 @@ async fn main() -> Result<()> {
         resolved_llm.base_url
     );
 
+    let llm_connector = resolved_llm.connector.clone();
+    let llm_api_key = resolved_llm.api_key.clone();
+
     let llm: AnyLlmClient = match resolved_llm.connector.as_str() {
         "ollama" => {
             tracing::info!("using Ollama LLM backend");
@@ -106,6 +136,49 @@ async fn main() -> Result<()> {
                     .with_model(resolved_llm.model)
                     .with_base_url(resolved_llm.base_url),
             )
+        }
+    };
+
+    // Build the embedding client from resolved config
+    let resolved_emb = config::resolve_embeddings_config(daemon_config.as_ref());
+    tracing::info!(
+        "Embeddings connector={}, model={}, base_url={}, available={}, is_default={}",
+        resolved_emb.connector,
+        resolved_emb.model,
+        resolved_emb.base_url,
+        resolved_emb.available,
+        resolved_emb.is_default
+    );
+
+    let _embedding_client: AnyEmbeddingClient = if !resolved_emb.available {
+        tracing::info!("embeddings unavailable (connector={})", resolved_emb.connector);
+        AnyEmbeddingClient::Unavailable
+    } else {
+        match resolved_emb.connector.as_str() {
+            "ollama" => {
+                tracing::info!("using Ollama embedding backend");
+                AnyEmbeddingClient::Ollama(desktop_assistant_llm_ollama::OllamaClient::new(
+                    resolved_emb.base_url,
+                    resolved_emb.model,
+                ))
+            }
+            _ => {
+                tracing::info!("using OpenAI-compatible embedding backend");
+                let api_key = if resolved_emb.is_default || resolved_emb.connector == llm_connector {
+                    llm_api_key.clone()
+                } else {
+                    let env_key = format!(
+                        "{}_API_KEY",
+                        resolved_emb.connector.to_ascii_uppercase()
+                    );
+                    std::env::var(env_key).unwrap_or_default()
+                };
+                AnyEmbeddingClient::OpenAi(
+                    desktop_assistant_llm_openai::OpenAiClient::new(api_key)
+                        .with_model(resolved_emb.model)
+                        .with_base_url(resolved_emb.base_url),
+                )
+            }
         }
     };
 

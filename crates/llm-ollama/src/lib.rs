@@ -33,6 +33,44 @@ impl OllamaClient {
         self.base_url = url.into();
         self
     }
+
+    /// Generate embeddings for a batch of texts.
+    ///
+    /// Sends a `POST {base_url}/api/embed` request and returns one vector per input.
+    pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+        let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CoreError::Llm(format!("embedding HTTP request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(CoreError::Llm(format!(
+                "Ollama embeddings API error (HTTP {status}): {body}"
+            )));
+        }
+
+        let parsed: OllamaEmbedResponse = response
+            .json()
+            .await
+            .map_err(|e| CoreError::Llm(format!("failed to parse embedding response: {e}")))?;
+
+        Ok(parsed.embeddings)
+    }
 }
 
 // --- Request types ---
@@ -129,6 +167,13 @@ impl From<&Message> for ChatMessage {
             tool_call_id: msg.tool_call_id.clone(),
         }
     }
+}
+
+// --- Embedding response types ---
+
+#[derive(Deserialize)]
+struct OllamaEmbedResponse {
+    embeddings: Vec<Vec<f32>>,
 }
 
 // --- Response types ---

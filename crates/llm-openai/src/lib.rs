@@ -38,6 +38,44 @@ impl OpenAiClient {
     /// Reads `OPENAI_API_KEY` for the API key.
     /// Optionally reads `OPENAI_MODEL` (defaults to gpt-4o)
     /// and `OPENAI_BASE_URL` (defaults to https://api.openai.com/v1).
+    /// Generate embeddings for a batch of texts.
+    ///
+    /// Sends a `POST {base_url}/embeddings` request and returns one vector per input.
+    pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+
+        let response = self
+            .client
+            .post(format!("{}/embeddings", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CoreError::Llm(format!("embedding HTTP request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(CoreError::Llm(format!(
+                "OpenAI embeddings API error (HTTP {status}): {body}"
+            )));
+        }
+
+        let parsed: EmbeddingResponse = response
+            .json()
+            .await
+            .map_err(|e| CoreError::Llm(format!("failed to parse embedding response: {e}")))?;
+
+        Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+    }
+
     pub fn from_env() -> Result<Self, CoreError> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| CoreError::Llm("OPENAI_API_KEY environment variable not set".into()))?;
@@ -153,6 +191,18 @@ impl From<&Message> for ChatMessage {
             tool_call_id: msg.tool_call_id.clone(),
         }
     }
+}
+
+// --- Embedding response types ---
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
 }
 
 // --- Response deserialization types ---
