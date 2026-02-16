@@ -11,10 +11,14 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_SERVICE = "org.desktopAssistant"
+DEV_SERVICE = "org.desktopAssistant.Dev"
 SETTINGS_PATH = Path.home() / ".config" / "desktop-assistant" / "widget_settings.json"
 SERVICE = DEFAULT_SERVICE
 PATH = "/org/desktopAssistant/Conversations"
 IFACE = "org.desktopAssistant.Conversations"
+DBUS_DAEMON_DEST = "org.freedesktop.DBus"
+DBUS_DAEMON_PATH = "/org/freedesktop/DBus"
+DBUS_DAEMON_IFACE = "org.freedesktop.DBus"
 
 
 class DbusError(RuntimeError):
@@ -38,6 +42,30 @@ def _load_widget_service() -> str:
     return value or DEFAULT_SERVICE
 
 
+def _parse_gdbus_output(output: str) -> Any:
+    normalized = output
+    normalized = re.sub(r"@[A-Za-z0-9_(){}\[\],]+\s+", "", normalized)
+    normalized = re.sub(r"\b(?:u?int(?:16|32|64)|byte)\s+(-?\d+)", r"\1", normalized)
+    normalized = re.sub(r"\btrue\b", "True", normalized)
+    normalized = re.sub(r"\bfalse\b", "False", normalized)
+    try:
+        parsed = ast.literal_eval(normalized)
+    except Exception as exc:  # pragma: no cover
+        raise DbusError(f"unexpected gdbus output: {output}") from exc
+    return parsed
+
+
+def _run_command(command: list[str], error_hint: str) -> Any:
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise DbusError("gdbus command not found; install glib2 tools") from exc
+    except subprocess.CalledProcessError as exc:
+        raise DbusError(exc.stderr.strip() or exc.stdout.strip() or error_hint) from exc
+
+    return _parse_gdbus_output(result.stdout.strip())
+
+
 def _run_gdbus(method: str, *args: str) -> Any:
     command = [
         "gdbus",
@@ -51,25 +79,28 @@ def _run_gdbus(method: str, *args: str) -> Any:
         f"{IFACE}.{method}",
         *args,
     ]
+    return _run_command(command, "gdbus call failed")
 
-    try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise DbusError("gdbus command not found; install glib2 tools") from exc
-    except subprocess.CalledProcessError as exc:
-        raise DbusError(exc.stderr.strip() or exc.stdout.strip() or "gdbus call failed") from exc
 
-    output = result.stdout.strip()
-    normalized = output
-    normalized = re.sub(r"@[A-Za-z0-9_(){}\[\],]+\s+", "", normalized)
-    normalized = re.sub(r"\b(?:u?int(?:16|32|64)|byte)\s+(-?\d+)", r"\1", normalized)
-    normalized = re.sub(r"\btrue\b", "True", normalized)
-    normalized = re.sub(r"\bfalse\b", "False", normalized)
-    try:
-        parsed = ast.literal_eval(normalized)
-    except Exception as exc:  # pragma: no cover
-        raise DbusError(f"unexpected gdbus output: {output}") from exc
-    return parsed
+def _name_has_owner(name: str) -> bool:
+    command = [
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        DBUS_DAEMON_DEST,
+        "--object-path",
+        DBUS_DAEMON_PATH,
+        "--method",
+        f"{DBUS_DAEMON_IFACE}.NameHasOwner",
+        name,
+    ]
+    parsed = _run_command(command, "NameHasOwner call failed")
+    if isinstance(parsed, tuple) and len(parsed) > 0:
+        return bool(parsed[0])
+    if isinstance(parsed, bool):
+        return parsed
+    raise DbusError(f"unexpected NameHasOwner response for {name}: {parsed}")
 
 
 def create_conversation(title: str) -> str:
@@ -135,10 +166,30 @@ def ensure_conversation(title: str) -> str:
     return create_conversation(title)
 
 
+def cmd_status() -> int:
+    payload: dict[str, Any] = {
+        "selected_service": SERVICE,
+        "default_service": DEFAULT_SERVICE,
+        "dev_service": DEV_SERVICE,
+    }
+
+    try:
+        payload["production_running"] = _name_has_owner(DEFAULT_SERVICE)
+        payload["dev_running"] = _name_has_owner(DEV_SERVICE)
+    except DbusError as exc:
+        payload["production_running"] = False
+        payload["dev_running"] = False
+        payload["error"] = str(exc)
+
+    print(json.dumps(payload))
+    return 0
+
+
 def main() -> int:
     global SERVICE
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--service", default="")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     ensure_cmd = subparsers.add_parser("ensure")
@@ -162,8 +213,10 @@ def main() -> int:
     await_cmd.add_argument("--timeout", type=float, default=45.0)
     await_cmd.add_argument("--interval", type=float, default=0.8)
 
+    subparsers.add_parser("status")
+
     args = parser.parse_args()
-    SERVICE = _load_widget_service()
+    SERVICE = args.service.strip() or _load_widget_service()
 
     try:
         if args.command == "ensure":
@@ -190,6 +243,8 @@ def main() -> int:
             )
             print(json.dumps({"assistant_reply": content}))
             return 0
+        if args.command == "status":
+            return cmd_status()
         raise DbusError("unknown command")
     except DbusError as exc:
         print(json.dumps({"error": str(exc)}))

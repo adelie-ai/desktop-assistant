@@ -10,8 +10,17 @@ PlasmoidItem {
     id: root
     implicitWidth: 460
     implicitHeight: 560
+    Plasmoid.status: root.hideWidget ? PlasmaCore.Types.HiddenStatus : PlasmaCore.Types.ActiveStatus
 
     property string helperPath: Qt.resolvedUrl("../code/dbus_client.py").toString().replace("file://", "")
+    property string productionService: "org.desktopAssistant"
+    property string developmentService: "org.desktopAssistant.Dev"
+    property string activeService: productionService
+    property bool serviceInitialized: false
+    property bool productionServiceRunning: false
+    property bool devServiceRunning: false
+    readonly property bool hideWidget: !devServiceRunning
+    property var serviceChoices: []
     property string conversationId: ""
     property bool busy: false
     property bool debugEnabled: false
@@ -38,6 +47,134 @@ PlasmoidItem {
             error: onError,
         }
         executable.connectSource(command)
+    }
+
+    function helperCommand(commandText) {
+        return "python3 "
+            + shellEscape(helperPath)
+            + " --service "
+            + shellEscape(activeService)
+            + " "
+            + commandText
+    }
+
+    function loadPersistedService() {
+        const persisted = String(Plasmoid.configuration.selectedService || "").trim()
+        if (persisted === productionService || persisted === developmentService) {
+            activeService = persisted
+        }
+        serviceInitialized = true
+    }
+
+    function persistActiveService() {
+        if (Plasmoid.configuration.selectedService !== activeService) {
+            Plasmoid.configuration.selectedService = activeService
+        }
+    }
+
+    function serviceIndexByValue(serviceName) {
+        for (let i = 0; i < serviceChoices.length; i++) {
+            if (serviceChoices[i].value === serviceName) {
+                return i
+            }
+        }
+        return -1
+    }
+
+    function syncServicePicker() {
+        const idx = serviceIndexByValue(activeService)
+        if (idx >= 0) {
+            servicePicker.currentIndex = idx
+        }
+    }
+
+    function switchService(index) {
+        if (index < 0 || index >= serviceChoices.length || busy) {
+            return
+        }
+
+        const selectedService = serviceChoices[index].value
+        if (selectedService === developmentService && !devServiceRunning) {
+            appendStatus("Development service is not running")
+            syncServicePicker()
+            return
+        }
+        if (selectedService === activeService) {
+            return
+        }
+
+        activeService = selectedService
+        persistActiveService()
+        conversationId = ""
+        promptText = ""
+        currentMessageCount = 0
+        transcriptEntries = [
+            {
+                kind: "status",
+                role: "status",
+                text: "Switched to " + activeService,
+            }
+        ]
+        reloadConversationList()
+        refreshConversation()
+    }
+
+    function refreshServiceStatus(onReady) {
+        const command = "python3 " + shellEscape(helperPath) + " status"
+        runCommand(
+            command,
+            function(stdout) {
+                const payload = JSON.parse(stdout)
+                productionServiceRunning = !!payload.production_running
+                devServiceRunning = !!payload.dev_running
+                if (payload.default_service && payload.default_service.length > 0) {
+                    productionService = payload.default_service
+                }
+                if (payload.dev_service && payload.dev_service.length > 0) {
+                    developmentService = payload.dev_service
+                }
+
+                serviceChoices = [
+                    {
+                        value: productionService,
+                        label: "Production",
+                    }
+                ]
+
+                if (devServiceRunning) {
+                    serviceChoices = serviceChoices.concat([
+                        {
+                            value: developmentService,
+                            label: "Development",
+                        }
+                    ])
+                }
+
+                if (!serviceInitialized) {
+                    loadPersistedService()
+                }
+
+                if (activeService !== productionService && activeService !== developmentService) {
+                    activeService = String(payload.selected_service || productionService)
+                }
+
+                if (!devServiceRunning && activeService === developmentService) {
+                    appendStatus("Development service stopped")
+                }
+
+                syncServicePicker()
+
+                if (onReady) {
+                    onReady()
+                }
+            },
+            function(stderr) {
+                appendStatus("Service status error: " + stderr)
+                if (onReady) {
+                    onReady()
+                }
+            }
+        )
     }
 
     function appendMessage(role, text) {
@@ -77,7 +214,7 @@ PlasmoidItem {
             return
         }
 
-        const command = "python3 " + shellEscape(helperPath) + " ensure --title 'Desktop Chat'"
+        const command = helperCommand("ensure --title 'Desktop Chat'")
         appendDebugStatus("Initializing conversation…")
         runCommand(
             command,
@@ -107,7 +244,7 @@ PlasmoidItem {
         }
 
         const title = "Desktop Chat " + Date.now()
-        const command = "python3 " + shellEscape(helperPath) + " create --title " + shellEscape(title)
+        const command = helperCommand("create --title " + shellEscape(title))
         runCommand(
             command,
             function(stdout) {
@@ -146,7 +283,7 @@ PlasmoidItem {
     }
 
     function reloadConversationList() {
-        const command = "python3 " + shellEscape(helperPath) + " list"
+        const command = helperCommand("list")
         runCommand(
             command,
             function(stdout) {
@@ -196,7 +333,7 @@ PlasmoidItem {
             return
         }
 
-        const command = "python3 " + shellEscape(helperPath) + " get " + shellEscape(conversationId)
+        const command = helperCommand("get " + shellEscape(conversationId))
         runCommand(
             command,
             function(stdout) {
@@ -244,7 +381,7 @@ PlasmoidItem {
             appendMessage("user", prompt)
             promptText = ""
 
-            const sendCommand = "python3 " + shellEscape(helperPath) + " send " + shellEscape(conversationId) + " " + shellEscape(prompt)
+            const sendCommand = helperCommand("send " + shellEscape(conversationId) + " " + shellEscape(prompt))
             runCommand(
                 sendCommand,
                 function(sendOut) {
@@ -255,7 +392,7 @@ PlasmoidItem {
                         return
                     }
                     appendStatus("Waiting for assistant response…")
-                    const awaitCommand = "python3 " + shellEscape(helperPath) + " await " + shellEscape(conversationId) + " --initial-count " + currentMessageCount
+                    const awaitCommand = helperCommand("await " + shellEscape(conversationId) + " --initial-count " + currentMessageCount)
                     runCommand(
                         awaitCommand,
                         function(awaitOut) {
@@ -321,10 +458,23 @@ PlasmoidItem {
         interval: 250
         repeat: false
         running: false
-        onTriggered: ensureConversation()
+        onTriggered: {
+            if (!root.hideWidget) {
+                ensureConversation()
+            }
+        }
+    }
+
+    Timer {
+        id: servicePollTimer
+        interval: 5000
+        repeat: true
+        running: true
+        onTriggered: refreshServiceStatus()
     }
 
     ColumnLayout {
+        visible: !root.hideWidget
         anchors.fill: parent
         anchors.margins: 8
         spacing: 8
@@ -345,7 +495,7 @@ PlasmoidItem {
             }
 
             QQC2.Label {
-                text: "Adele"
+                text: root.activeService === root.developmentService ? "Adele (Dev)" : "Adele"
                 font.bold: true
                 Layout.fillWidth: true
             }
@@ -358,6 +508,16 @@ PlasmoidItem {
                 text: "Debug"
                 checked: root.debugEnabled
                 onToggled: root.debugEnabled = checked
+            }
+
+            QQC2.ComboBox {
+                id: servicePicker
+                Layout.preferredWidth: 170
+                model: root.serviceChoices
+                textRole: "label"
+                onActivated: function(index) {
+                    switchService(index)
+                }
             }
 
             PlasmaComponents.ComboBox {
@@ -523,6 +683,12 @@ PlasmoidItem {
             }
         ]
         appendDebugStatus("Widget loaded")
-        startupTimer.start()
+        refreshServiceStatus(function() {
+            if (root.hideWidget) {
+                appendStatus("Development service not running; widget hidden")
+                return
+            }
+            startupTimer.start()
+        })
     }
 }

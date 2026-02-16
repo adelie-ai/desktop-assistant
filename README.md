@@ -229,7 +229,9 @@ Usage:
 
 Notes:
 
-- Both widgets use the service `org.desktopAssistant` at `/org/desktopAssistant/Conversations`.
+- Both chat widgets include a **service selector** (Production/Development) and call the selected D-Bus service at `/org/desktopAssistant/Conversations`.
+- Widgets auto-detect whether `org.desktopAssistant.Dev` currently has an owner on the session bus.
+- If the dev environment is not running, chat widgets hide themselves.
 - Both widgets shell out to `python3` and `gdbus` to call methods documented in `docs/dbus-api.md`.
 - Settings widget uses `org.desktopAssistant.Settings` D-Bus methods.
 - API keys are write-only over D-Bus (`SetApiKey` only) and are never returned to clients.
