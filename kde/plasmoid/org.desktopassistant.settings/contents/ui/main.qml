@@ -138,7 +138,7 @@ PlasmoidItem {
     }
 
     compactRepresentation: PlasmaComponents.ToolButton {
-        text: "DA Settings"
+        text: "Adele Settings"
         icon.name: "settings-configure"
         onClicked: root.expanded = !root.expanded
     }
@@ -152,10 +152,24 @@ PlasmoidItem {
             anchors.margins: 10
             spacing: 8
 
-            QQC2.Label {
-                text: "Desktop Assistant Settings"
-                font.bold: true
+            RowLayout {
                 Layout.fillWidth: true
+                spacing: 6
+
+                Image {
+                    source: Qt.resolvedUrl("../images/adele_with_text.png")
+                    sourceSize.width: 28
+                    sourceSize.height: 28
+                    fillMode: Image.PreserveAspectFit
+                    Layout.preferredWidth: 28
+                    Layout.preferredHeight: 28
+                }
+
+                QQC2.Label {
+                    text: "Adele Settings"
+                    font.bold: true
+                    Layout.fillWidth: true
+                }
             }
 
             QQC2.Label {

@@ -19,6 +19,12 @@ PlasmoidItem {
     property var transcriptEntries: []
     property string promptText: ""
     property var conversationChoices: []
+    readonly property bool hasRealMessages: {
+        for (let i = 0; i < transcriptEntries.length; i++) {
+            if (transcriptEntries[i].kind === "message") return true
+        }
+        return false
+    }
     readonly property var pending: ({})
 
     function shellEscape(value) {
@@ -323,10 +329,26 @@ PlasmoidItem {
         anchors.margins: 8
         spacing: 8
 
-        QQC2.Label {
-            text: "Desktop Assistant"
-            font.bold: true
+        RowLayout {
             Layout.fillWidth: true
+            spacing: 6
+
+            Image {
+                source: root.busy
+                    ? Qt.resolvedUrl("../images/adele_thinking.png")
+                    : Qt.resolvedUrl("../images/adele.png")
+                sourceSize.width: 24
+                sourceSize.height: 24
+                fillMode: Image.PreserveAspectFit
+                Layout.preferredWidth: 24
+                Layout.preferredHeight: 24
+            }
+
+            QQC2.Label {
+                text: "Adele"
+                font.bold: true
+                Layout.fillWidth: true
+            }
         }
 
         RowLayout {
@@ -364,6 +386,27 @@ PlasmoidItem {
                 model: root.transcriptEntries
                 spacing: 6
                 clip: true
+
+                header: Column {
+                    width: transcript.width
+                    visible: !root.hasRealMessages
+                    spacing: 8
+                    topPadding: 40
+
+                    Image {
+                        source: Qt.resolvedUrl("../images/adele.png")
+                        sourceSize.width: 64
+                        sourceSize.height: 64
+                        fillMode: Image.PreserveAspectFit
+                        anchors.horizontalCenter: parent.horizontalCenter
+                    }
+
+                    QQC2.Label {
+                        text: "Ask me anything..."
+                        color: PlasmaCore.Theme.disabledTextColor
+                        anchors.horizontalCenter: parent.horizontalCenter
+                    }
+                }
 
                 onCountChanged: {
                     if (count > 0) {
