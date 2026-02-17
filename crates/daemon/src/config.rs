@@ -105,7 +105,7 @@ pub struct EmbeddingsSettingsView {
 }
 
 fn default_connector() -> String {
-    "ollama".to_string()
+    "openai".to_string()
 }
 
 fn default_secret_backend() -> String {
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn resolve_defaults_without_config() {
         let resolved = resolve_llm_config(None);
-        assert_eq!(resolved.connector, "ollama");
+        assert_eq!(resolved.connector, "openai");
         assert!(!resolved.model.is_empty());
         assert!(!resolved.base_url.is_empty());
     }
@@ -960,8 +960,8 @@ mod tests {
     #[test]
     fn embeddings_defaults_without_config() {
         let view = resolve_embeddings_config(None);
-        assert_eq!(view.connector, "ollama");
-        assert_eq!(view.model, "nomic-embed-text");
+        assert_eq!(view.connector, "openai");
+        assert_eq!(view.model, "text-embedding-3-small");
         assert!(view.available);
         assert!(view.is_default);
     }
