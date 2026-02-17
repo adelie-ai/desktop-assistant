@@ -19,6 +19,7 @@ IFACE = "org.desktopAssistant.Conversations"
 DBUS_DAEMON_DEST = "org.freedesktop.DBus"
 DBUS_DAEMON_PATH = "/org/freedesktop/DBus"
 DBUS_DAEMON_IFACE = "org.freedesktop.DBus"
+DEFAULT_GDBUS_TIMEOUT_SEC = 12.0
 
 
 class DbusError(RuntimeError):
@@ -55,11 +56,13 @@ def _parse_gdbus_output(output: str) -> Any:
     return parsed
 
 
-def _run_command(command: list[str], error_hint: str) -> Any:
+def _run_command(command: list[str], error_hint: str, timeout_sec: float = DEFAULT_GDBUS_TIMEOUT_SEC) -> Any:
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout_sec)
     except FileNotFoundError as exc:
         raise DbusError("gdbus command not found; install glib2 tools") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DbusError(f"{error_hint} (timed out after {timeout_sec:.1f}s)") from exc
     except subprocess.CalledProcessError as exc:
         raise DbusError(exc.stderr.strip() or exc.stdout.strip() or error_hint) from exc
 
@@ -79,7 +82,7 @@ def _run_gdbus(method: str, *args: str) -> Any:
         f"{IFACE}.{method}",
         *args,
     ]
-    return _run_command(command, "gdbus call failed")
+    return _run_command(command, f"gdbus call failed: {method}")
 
 
 def _name_has_owner(name: str) -> bool:
@@ -95,7 +98,7 @@ def _name_has_owner(name: str) -> bool:
         f"{DBUS_DAEMON_IFACE}.NameHasOwner",
         name,
     ]
-    parsed = _run_command(command, "NameHasOwner call failed")
+    parsed = _run_command(command, "NameHasOwner call failed", timeout_sec=6.0)
     if isinstance(parsed, tuple) and len(parsed) > 0:
         return bool(parsed[0])
     if isinstance(parsed, bool):

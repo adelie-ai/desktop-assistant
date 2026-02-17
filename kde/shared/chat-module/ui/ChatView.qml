@@ -585,16 +585,21 @@ Item {
             const stdout = (data.stdout || "").trim()
             const stderr = (data.stderr || "").trim()
 
-            if (exitCode === 0) {
-                appendDebugStatus("ok: " + sourceName)
-                callbacks.success(stdout)
-            } else {
-                appendDebugStatus("error: " + sourceName)
-                callbacks.error(stderr.length > 0 ? stderr : stdout)
+            try {
+                if (exitCode === 0) {
+                    appendDebugStatus("ok: " + sourceName)
+                    callbacks.success(stdout)
+                } else {
+                    appendDebugStatus("error: " + sourceName)
+                    callbacks.error(stderr.length > 0 ? stderr : stdout)
+                }
+            } catch (callbackError) {
+                appendStatus("Widget callback error: " + callbackError)
+                busy = false
+            } finally {
+                delete pending[sourceName]
+                disconnectSource(sourceName)
             }
-
-            delete pending[sourceName]
-            disconnectSource(sourceName)
         }
     }
 
