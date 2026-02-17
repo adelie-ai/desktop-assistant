@@ -46,7 +46,7 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
 fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // Dynamic input height: line count + 2 for borders, min 3, max 10
     let line_count = app.textarea.lines().len() as u16;
-    let input_height = (line_count + 2).max(3).min(10);
+    let input_height = (line_count + 2).clamp(3, 10);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

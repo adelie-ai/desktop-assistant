@@ -127,6 +127,14 @@ fn default_memory_path() -> PathBuf {
         .join("factual_memory.json")
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PersistenceConfig {
+    pub remote_url: Option<String>,
+    pub remote_name: String,
+    pub push_on_update: bool,
+}
+
 pub struct BuiltinToolService {
     preferences_path: PathBuf,
     memory_path: PathBuf,
@@ -134,11 +142,16 @@ pub struct BuiltinToolService {
     memory: Mutex<MemoryStoreData>,
     embed_fn: Option<EmbedFn>,
     embedding_model: String,
+    persistence: Option<PersistenceConfig>,
 }
 
 impl BuiltinToolService {
     pub fn from_default_paths() -> Self {
         Self::new(default_preferences_path(), default_memory_path())
+    }
+
+    pub fn from_default_paths_with_persistence(persistence: Option<PersistenceConfig>) -> Self {
+        Self::new(default_preferences_path(), default_memory_path()).with_persistence(persistence)
     }
 
     pub fn new(preferences_path: PathBuf, memory_path: PathBuf) -> Self {
@@ -165,7 +178,13 @@ impl BuiltinToolService {
             memory: Mutex::new(memory),
             embed_fn: None,
             embedding_model: String::new(),
+            persistence: None,
         }
+    }
+
+    pub fn with_persistence(mut self, persistence: Option<PersistenceConfig>) -> Self {
+        self.persistence = persistence;
+        self
     }
 
     /// Configure the embedding function and model name for vector indexing.
@@ -337,13 +356,12 @@ impl BuiltinToolService {
                 .iter()
                 .position(|item| normalized_eq(&item.key, &key) && item.scope == scope)
             {
-                let updated_at;
                 prefs.items[existing_idx].key = key.clone();
                 if overwrite {
                     prefs.items[existing_idx].value = value.clone();
                     prefs.items[existing_idx].updated_at = now;
                 }
-                updated_at = prefs.items[existing_idx].updated_at;
+                let updated_at = prefs.items[existing_idx].updated_at;
                 let embed_text = pref_embed_text(
                     &prefs.items[existing_idx].key,
                     &prefs.items[existing_idx].value,

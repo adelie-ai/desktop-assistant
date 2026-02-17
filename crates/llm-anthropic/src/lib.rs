@@ -325,10 +325,10 @@ impl LlmClient for AnthropicClient {
                                         }
                                     }
                                     SseDelta::InputJsonDelta { partial_json } => {
-                                        if let Some(index) = event.index {
-                                            if let Some(&tool_idx) = block_to_tool.get(&index) {
-                                                tool_acc.append_json(tool_idx, partial_json);
-                                            }
+                                        if let Some(index) = event.index
+                                            && let Some(&tool_idx) = block_to_tool.get(&index)
+                                        {
+                                            tool_acc.append_json(tool_idx, partial_json);
                                         }
                                     }
                                 }

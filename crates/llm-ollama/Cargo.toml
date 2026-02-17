@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 desktop-assistant-core.workspace = true
-reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest = { version = "0.13", features = ["stream", "json"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

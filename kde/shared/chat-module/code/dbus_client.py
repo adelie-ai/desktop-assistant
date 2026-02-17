@@ -147,9 +147,19 @@ def wait_for_assistant_reply(conversation_id: str, initial_count: int, timeout_s
         messages = conversation["messages"]
         if len(messages) > initial_count:
             new_messages = messages[initial_count:]
-            for message in reversed(new_messages):
-                if message["role"] == "assistant":
-                    return message["content"]
+            latest_new_user_index = -1
+            for i, message in enumerate(new_messages):
+                if message.get("role") == "user":
+                    latest_new_user_index = i
+
+            if latest_new_user_index >= 0:
+                for message in new_messages[latest_new_user_index + 1 :]:
+                    if message.get("role") == "assistant":
+                        return message.get("content", "")
+            else:
+                for message in reversed(new_messages):
+                    if message.get("role") == "assistant":
+                        return message.get("content", "")
         time.sleep(interval_sec)
 
     return ""

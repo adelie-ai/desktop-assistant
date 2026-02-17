@@ -25,6 +25,8 @@ Item {
     property var serviceChoices: []
     property string conversationId: ""
     property bool busy: false
+    property bool loadingConversation: false
+    property int conversationLoadSequence: 0
     property bool debugEnabled: false
     property int currentMessageCount: 0
     property var transcriptEntries: []
@@ -55,6 +57,7 @@ Item {
         }
         return false
     }
+    property int lateResponsePollRemaining: 0
     readonly property var pending: ({})
 
     function toImageSource(pathValue) {
@@ -466,18 +469,52 @@ Item {
         refreshConversation()
     }
 
-    function refreshConversation() {
-        if (conversationId.length === 0 || busy) {
+    function loadSelectedConversation() {
+        if (busy || loadingConversation) {
             return
         }
 
-        const command = helperCommand("get " + shellEscape(conversationId))
+        const idx = conversationPicker.currentIndex
+        if (idx < 0 || idx >= conversationChoices.length) {
+            appendStatus("No conversation selected")
+            return
+        }
+
+        const selectedId = conversationChoices[idx].id
+        if (selectedId !== conversationId) {
+            switchConversation(idx)
+            return
+        }
+
+        refreshConversation()
+    }
+
+    function refreshConversation() {
+        if (conversationId.length === 0 || busy || loadingConversation) {
+            return
+        }
+
+        const requestId = conversationId
+        conversationLoadSequence = conversationLoadSequence + 1
+        const sequence = conversationLoadSequence
+        loadingConversation = true
+        appendStatus("Loading conversation…")
+
+        const command = helperCommand("get " + shellEscape(requestId))
         runCommand(
             command,
             function(stdout) {
+                if (sequence !== conversationLoadSequence) {
+                    return
+                }
+                loadingConversation = false
                 const payload = JSON.parse(stdout)
                 if (payload.error) {
                     appendStatus(payload.error)
+                    return
+                }
+
+                if (requestId !== conversationId) {
                     return
                 }
 
@@ -492,6 +529,10 @@ Item {
                 }
             },
             function(stderr) {
+                if (sequence !== conversationLoadSequence) {
+                    return
+                }
+                loadingConversation = false
                 appendStatus(stderr)
             }
         )
@@ -516,6 +557,8 @@ Item {
 
         ensureConversation(function() {
             busy = true
+            lateResponsePollTimer.stop()
+            lateResponsePollRemaining = 0
             appendMessage("user", prompt)
             promptText = ""
 
@@ -545,19 +588,21 @@ Item {
                             const awaitPayload = JSON.parse(awaitOut)
                             if (awaitPayload.error) {
                                 appendStatus(awaitPayload.error)
-                                return
-                            }
-                            if (awaitPayload.assistant_reply && awaitPayload.assistant_reply.length > 0) {
+                            } else if (awaitPayload.assistant_reply && awaitPayload.assistant_reply.length > 0) {
                                 appendMessage("assistant", awaitPayload.assistant_reply)
-                                currentMessageCount = currentMessageCount + 2
                             } else {
                                 appendStatus("No assistant response before timeout")
-                                currentMessageCount = currentMessageCount + 1
+                                lateResponsePollRemaining = panelMode ? 18 : 36
+                                lateResponsePollTimer.start()
                             }
+                            refreshConversation()
+                            reloadConversationList()
                         },
                         function(awaitErr) {
                             busy = false
                             appendStatus(awaitErr)
+                            refreshConversation()
+                            reloadConversationList()
                         }
                     )
                 },
@@ -621,6 +666,24 @@ Item {
         repeat: true
         running: true
         onTriggered: refreshServiceStatus()
+    }
+
+    Timer {
+        id: lateResponsePollTimer
+        interval: 5000
+        repeat: true
+        running: false
+        onTriggered: {
+            if (busy || conversationId.length === 0) {
+                return
+            }
+            refreshConversation()
+            reloadConversationList()
+            lateResponsePollRemaining = Math.max(0, lateResponsePollRemaining - 1)
+            if (lateResponsePollRemaining <= 0) {
+                stop()
+            }
+        }
     }
 
     Shortcut {
@@ -718,6 +781,7 @@ Item {
                 id: conversationPicker
                 visible: true
                 Layout.fillWidth: true
+                enabled: !root.busy && !root.loadingConversation
                 model: root.conversationChoices
                 textRole: "title"
                 delegate: QQC2.ItemDelegate {
@@ -758,9 +822,9 @@ Item {
             }
 
             QQC2.Button {
-                text: "Load"
-                enabled: !busy
-                onClicked: panelMode ? refreshServiceStatus() : reloadConversationList()
+                text: loadingConversation ? "Loading…" : "Load"
+                enabled: !busy && !loadingConversation
+                onClicked: panelMode ? refreshServiceStatus() : loadSelectedConversation()
             }
 
             QQC2.Button {

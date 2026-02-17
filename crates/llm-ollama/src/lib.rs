@@ -369,13 +369,13 @@ impl LlmClient for OllamaClient {
                 match serde_json::from_str::<ChatChunk>(&line) {
                     Ok(chunk) => {
                         if let Some(message) = &chunk.message {
-                            if let Some(content) = &message.content {
-                                if !content.is_empty() {
-                                    full_response.push_str(content);
-                                    if !on_chunk(content.clone()) {
-                                        tracing::debug!("streaming aborted by callback");
-                                        return Ok(build_response(full_response, tool_calls));
-                                    }
+                            if let Some(content) = &message.content
+                                && !content.is_empty()
+                            {
+                                full_response.push_str(content);
+                                if !on_chunk(content.clone()) {
+                                    tracing::debug!("streaming aborted by callback");
+                                    return Ok(build_response(full_response, tool_calls));
                                 }
                             }
 
@@ -406,24 +406,23 @@ impl LlmClient for OllamaClient {
 
         // Process any remaining data in the buffer
         let remaining = buffer.trim().to_string();
-        if !remaining.is_empty() {
-            if let Ok(chunk) = serde_json::from_str::<ChatChunk>(&remaining) {
-                if let Some(message) = &chunk.message {
-                    if let Some(content) = &message.content {
-                        if !content.is_empty() {
-                            full_response.push_str(content);
-                            let _ = on_chunk(content.clone());
-                        }
-                    }
+        if !remaining.is_empty()
+            && let Ok(chunk) = serde_json::from_str::<ChatChunk>(&remaining)
+            && let Some(message) = &chunk.message
+        {
+            if let Some(content) = &message.content
+                && !content.is_empty()
+            {
+                full_response.push_str(content);
+                let _ = on_chunk(content.clone());
+            }
 
-                    if let Some(tcs) = &message.tool_calls {
-                        for (i, tc) in tcs.iter().enumerate() {
-                            let id = format!("ollama_call_{}", tool_calls.len() + i);
-                            let arguments = serde_json::to_string(&tc.function.arguments)
-                                .unwrap_or_else(|_| "{}".to_string());
-                            tool_calls.push(ToolCall::new(id, tc.function.name.clone(), arguments));
-                        }
-                    }
+            if let Some(tcs) = &message.tool_calls {
+                for (i, tc) in tcs.iter().enumerate() {
+                    let id = format!("ollama_call_{}", tool_calls.len() + i);
+                    let arguments = serde_json::to_string(&tc.function.arguments)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    tool_calls.push(ToolCall::new(id, tc.function.name.clone(), arguments));
                 }
             }
         }
