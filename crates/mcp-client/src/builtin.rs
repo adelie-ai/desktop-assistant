@@ -10,11 +10,13 @@ use desktop_assistant_core::ports::embedding::EmbedFn;
 const TOOL_PREF_REMEMBER: &str = "builtin_preferences_remember";
 const TOOL_PREF_SEARCH: &str = "builtin_preferences_search";
 const TOOL_PREF_RETRIEVE: &str = "builtin_preferences_retrieve";
+const TOOL_PREF_DELETE: &str = "builtin_preferences_delete";
 const TOOL_PREF_DELETE_OLD: &str = "builtin_preferences_delete_old";
 const TOOL_MEM_REMEMBER: &str = "builtin_memory_remember";
 const TOOL_MEM_SEARCH: &str = "builtin_memory_search";
 const TOOL_MEM_RETRIEVE: &str = "builtin_memory_retrieve";
 const TOOL_MEM_UPDATE: &str = "builtin_memory_update";
+const TOOL_MEM_DELETE: &str = "builtin_memory_delete";
 const TOOL_MEM_DELETE_OLD: &str = "builtin_memory_delete_old";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -219,6 +221,18 @@ impl BuiltinToolService {
                 }),
             ),
             ToolDefinition::new(
+                TOOL_PREF_DELETE,
+                "Delete a specific user preference by key and optional scope",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "scope": {"type": "string"}
+                    },
+                    "required": ["key"]
+                }),
+            ),
+            ToolDefinition::new(
                 TOOL_PREF_DELETE_OLD,
                 "Delete stale user preferences older than a number of days",
                 serde_json::json!({
@@ -294,6 +308,17 @@ impl BuiltinToolService {
                 }),
             ),
             ToolDefinition::new(
+                TOOL_MEM_DELETE,
+                "Delete a specific factual memory by id",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"}
+                    },
+                    "required": ["id"]
+                }),
+            ),
+            ToolDefinition::new(
                 TOOL_MEM_DELETE_OLD,
                 "Delete stale factual memory older than a number of days",
                 serde_json::json!({
@@ -317,11 +342,13 @@ impl BuiltinToolService {
             TOOL_PREF_REMEMBER
                 | TOOL_PREF_SEARCH
                 | TOOL_PREF_RETRIEVE
+                | TOOL_PREF_DELETE
                 | TOOL_PREF_DELETE_OLD
                 | TOOL_MEM_REMEMBER
                 | TOOL_MEM_SEARCH
                 | TOOL_MEM_RETRIEVE
                 | TOOL_MEM_UPDATE
+                | TOOL_MEM_DELETE
                 | TOOL_MEM_DELETE_OLD
         )
     }
@@ -335,11 +362,13 @@ impl BuiltinToolService {
             TOOL_PREF_REMEMBER => self.preferences_remember(arguments).await,
             TOOL_PREF_SEARCH => self.preferences_search(arguments).await,
             TOOL_PREF_RETRIEVE => self.preferences_retrieve(arguments),
+            TOOL_PREF_DELETE => self.preferences_delete(arguments),
             TOOL_PREF_DELETE_OLD => self.preferences_delete_old(arguments),
             TOOL_MEM_REMEMBER => self.memory_remember(arguments).await,
             TOOL_MEM_SEARCH => self.memory_search(arguments).await,
             TOOL_MEM_RETRIEVE => self.memory_retrieve(arguments),
             TOOL_MEM_UPDATE => self.memory_update(arguments).await,
+            TOOL_MEM_DELETE => self.memory_delete(arguments),
             TOOL_MEM_DELETE_OLD => self.memory_delete_old(arguments),
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
@@ -547,6 +576,33 @@ impl BuiltinToolService {
             "remaining": after,
             "older_than_days": older_than_days,
             "scope": scope_filter,
+        })
+        .to_string())
+    }
+
+    fn preferences_delete(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let key = required_string(&arguments, "key")?;
+        let scope = optional_string(&arguments, "scope");
+
+        let mut prefs = self.preferences.lock().unwrap();
+        let before = prefs.items.len();
+        prefs
+            .items
+            .retain(|item| !(normalized_eq(&item.key, &key) && item.scope == scope));
+        let after = prefs.items.len();
+        let deleted = before.saturating_sub(after);
+
+        if deleted > 0 {
+            self.persist_preferences(&prefs)?;
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "deleted": deleted,
+            "found": deleted > 0,
+            "key": normalize(&key),
+            "scope": scope,
+            "remaining": after,
         })
         .to_string())
     }
@@ -777,6 +833,29 @@ impl BuiltinToolService {
             "remaining": after,
             "older_than_days": older_than_days,
             "tags": tags_filter,
+        })
+        .to_string())
+    }
+
+    fn memory_delete(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let id = required_string(&arguments, "id")?;
+
+        let mut memory = self.memory.lock().unwrap();
+        let before = memory.items.len();
+        memory.items.retain(|item| !normalized_eq(&item.id, &id));
+        let after = memory.items.len();
+        let deleted = before.saturating_sub(after);
+
+        if deleted > 0 {
+            self.persist_memory(&memory)?;
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "deleted": deleted,
+            "found": deleted > 0,
+            "id": id,
+            "remaining": after,
         })
         .to_string())
     }
@@ -1016,8 +1095,10 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert!(names.contains(&TOOL_PREF_REMEMBER.to_string()));
+        assert!(names.contains(&TOOL_PREF_DELETE.to_string()));
         assert!(names.contains(&TOOL_PREF_DELETE_OLD.to_string()));
         assert!(names.contains(&TOOL_MEM_UPDATE.to_string()));
+        assert!(names.contains(&TOOL_MEM_DELETE.to_string()));
         assert!(names.contains(&TOOL_MEM_DELETE_OLD.to_string()));
     }
 
@@ -1394,6 +1475,53 @@ mod tests {
     }
 
     #[test]
+    fn preferences_delete_removes_exact_key_and_scope() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+
+        let initial = PreferenceStoreData {
+            items: vec![
+                PreferenceEntry {
+                    key: "project.editor".to_string(),
+                    value: "nvim".to_string(),
+                    scope: Some("project.alpha".to_string()),
+                    updated_at: now_ts(),
+                    embedding: None,
+                    embedding_model: None,
+                },
+                PreferenceEntry {
+                    key: "project.editor".to_string(),
+                    value: "code".to_string(),
+                    scope: Some("project.beta".to_string()),
+                    updated_at: now_ts(),
+                    embedding: None,
+                    embedding_model: None,
+                },
+            ],
+        };
+
+        persist_json(&pref_path, &initial).unwrap();
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
+
+        let deleted = service
+            .preferences_delete(serde_json::json!({
+                "key": "PROJECT.EDITOR",
+                "scope": "project.alpha"
+            }))
+            .unwrap();
+        let deleted_json: serde_json::Value = serde_json::from_str(&deleted).unwrap();
+        assert_eq!(deleted_json["deleted"], serde_json::json!(1));
+        assert_eq!(deleted_json["found"], serde_json::json!(true));
+
+        let stored: PreferenceStoreData = load_json(&pref_path).unwrap();
+        assert_eq!(stored.items.len(), 1);
+        assert_eq!(stored.items[0].scope.as_deref(), Some("project.beta"));
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[test]
     fn memory_delete_old_removes_stale_items() {
         let pref_path = temp_file("pref");
         let mem_path = temp_file("mem");
@@ -1446,6 +1574,60 @@ mod tests {
         let stored: MemoryStoreData = load_json(&mem_path).unwrap();
         assert_eq!(stored.items.len(), 1);
         assert_eq!(stored.items[0].id, "mem-new");
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[test]
+    fn memory_delete_removes_exact_id_case_insensitive() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+
+        let initial = MemoryStoreData {
+            items: vec![
+                MemoryEntry {
+                    id: "mem-abc".to_string(),
+                    fact: "first".to_string(),
+                    tags: vec!["a".to_string()],
+                    source: None,
+                    confidence: None,
+                    supersedes: None,
+                    created_at: now_ts(),
+                    updated_at: now_ts(),
+                    embedding: None,
+                    embedding_model: None,
+                },
+                MemoryEntry {
+                    id: "mem-def".to_string(),
+                    fact: "second".to_string(),
+                    tags: vec!["b".to_string()],
+                    source: None,
+                    confidence: None,
+                    supersedes: None,
+                    created_at: now_ts(),
+                    updated_at: now_ts(),
+                    embedding: None,
+                    embedding_model: None,
+                },
+            ],
+        };
+
+        persist_json(&mem_path, &initial).unwrap();
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
+
+        let deleted = service
+            .memory_delete(serde_json::json!({
+                "id": "MEM-ABC"
+            }))
+            .unwrap();
+        let deleted_json: serde_json::Value = serde_json::from_str(&deleted).unwrap();
+        assert_eq!(deleted_json["deleted"], serde_json::json!(1));
+        assert_eq!(deleted_json["found"], serde_json::json!(true));
+
+        let stored: MemoryStoreData = load_json(&mem_path).unwrap();
+        assert_eq!(stored.items.len(), 1);
+        assert_eq!(stored.items[0].id, "mem-def");
 
         let _ = fs::remove_file(pref_path);
         let _ = fs::remove_file(mem_path);
