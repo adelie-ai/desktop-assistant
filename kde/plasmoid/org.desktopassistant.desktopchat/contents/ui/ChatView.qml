@@ -365,7 +365,7 @@ Item {
         return -1
     }
 
-    function reloadConversationList() {
+    function reloadConversationList(onLoaded) {
         const command = helperCommand("list --max-age-days " + maxSessionAgeDays())
         runCommand(
             command,
@@ -392,6 +392,57 @@ Item {
                 if (idx >= 0 && !panelMode) {
                     conversationPicker.currentIndex = idx
                 }
+
+                if (onLoaded) {
+                    onLoaded(conversations)
+                }
+            },
+            function(stderr) {
+                appendStatus(stderr)
+            }
+        )
+    }
+
+    function deleteConversation(targetId) {
+        if (busy || targetId.length === 0) {
+            return
+        }
+
+        const deletingCurrent = targetId === conversationId
+        const command = helperCommand("delete " + shellEscape(targetId))
+        runCommand(
+            command,
+            function(stdout) {
+                const payload = JSON.parse(stdout)
+                if (payload.error) {
+                    appendStatus("Failed to delete conversation: " + payload.error)
+                    return
+                }
+
+                appendStatus("Deleted conversation " + targetId)
+                reloadConversationList(function(conversations) {
+                    if (!deletingCurrent) {
+                        return
+                    }
+
+                    if (conversations.length > 0) {
+                        conversationId = conversations[0].id
+                        conversationPicker.currentIndex = 0
+                        refreshConversation()
+                        return
+                    }
+
+                    conversationId = ""
+                    promptText = ""
+                    currentMessageCount = 0
+                    transcriptEntries = [
+                        {
+                            kind: "status",
+                            role: "status",
+                            text: "No conversations yet",
+                        }
+                    ]
+                })
             },
             function(stderr) {
                 appendStatus(stderr)
@@ -635,6 +686,7 @@ Item {
             QQC2.Label {
                 text: root.activeService === root.developmentService ? "Adele (Dev)" : "Adele"
                 font.bold: true
+                color: PlasmaCore.Theme.textColor
                 Layout.fillWidth: true
             }
         }
@@ -650,10 +702,13 @@ Item {
 
             QQC2.ComboBox {
                 id: servicePicker
-                Layout.preferredWidth: panelMode ? -1 : 170
-                Layout.fillWidth: panelMode
+                visible: root.devServiceRunning
+                Layout.preferredWidth: 170
+                Layout.fillWidth: false
                 model: root.serviceChoices
                 textRole: "label"
+                palette.text: PlasmaCore.Theme.textColor
+                palette.buttonText: PlasmaCore.Theme.textColor
                 onActivated: function(index) {
                     switchService(index)
                 }
@@ -661,10 +716,42 @@ Item {
 
             PlasmaComponents.ComboBox {
                 id: conversationPicker
-                visible: !panelMode
+                visible: true
                 Layout.fillWidth: true
                 model: root.conversationChoices
                 textRole: "title"
+                delegate: QQC2.ItemDelegate {
+                    required property var modelData
+                    width: conversationPicker.width
+
+                    contentItem: RowLayout {
+                        spacing: 6
+
+                        QQC2.Label {
+                            Layout.fillWidth: true
+                            text: modelData.title
+                            color: PlasmaCore.Theme.textColor
+                            elide: Text.ElideRight
+                        }
+
+                        QQC2.ToolButton {
+                            icon.name: "edit-delete"
+                            display: QQC2.AbstractButton.IconOnly
+                            enabled: !root.busy
+                            onClicked: {
+                                root.deleteConversation(modelData.id)
+                                conversationPicker.popup.close()
+                            }
+                        }
+                    }
+
+                    onClicked: {
+                        const idx = root.conversationIndexById(modelData.id)
+                        conversationPicker.currentIndex = idx
+                        conversationPicker.popup.close()
+                        switchConversation(idx)
+                    }
+                }
                 onActivated: function(index) {
                     switchConversation(index)
                 }
@@ -840,16 +927,36 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            QQC2.TextField {
+            QQC2.TextArea {
+                id: promptInput
                 Layout.fillWidth: true
+                Layout.preferredHeight: Math.max(Math.round(72 * root.uiScale), sendButton.implicitHeight)
+                Layout.maximumHeight: Math.round(180 * root.uiScale)
                 placeholderText: "Ask Adele…"
+                wrapMode: TextEdit.Wrap
                 text: root.promptText
                 enabled: !busy
                 onTextChanged: root.promptText = text
-                onAccepted: sendPrompt(text)
+                Keys.onPressed: function(event) {
+                    const isEnterKey = event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                    if (!isEnterKey) {
+                        return
+                    }
+
+                    if (event.modifiers & Qt.MetaModifier) {
+                        insert(cursorPosition, "\n")
+                        event.accepted = true
+                        return
+                    }
+
+                    sendPrompt(text)
+                    event.accepted = true
+                }
             }
 
             QQC2.Button {
+                id: sendButton
+                Layout.alignment: Qt.AlignBottom
                 text: busy ? "…" : "Send"
                 enabled: !busy
                 onClicked: sendPrompt(root.promptText)

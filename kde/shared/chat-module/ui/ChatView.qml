@@ -927,16 +927,36 @@ Item {
         RowLayout {
             Layout.fillWidth: true
 
-            QQC2.TextField {
+            QQC2.TextArea {
+                id: promptInput
                 Layout.fillWidth: true
+                Layout.preferredHeight: Math.max(Math.round(72 * root.uiScale), sendButton.implicitHeight)
+                Layout.maximumHeight: Math.round(180 * root.uiScale)
                 placeholderText: "Ask Adele…"
+                wrapMode: TextEdit.Wrap
                 text: root.promptText
                 enabled: !busy
                 onTextChanged: root.promptText = text
-                onAccepted: sendPrompt(text)
+                Keys.onPressed: function(event) {
+                    const isEnterKey = event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                    if (!isEnterKey) {
+                        return
+                    }
+
+                    if (event.modifiers & Qt.MetaModifier) {
+                        insert(cursorPosition, "\n")
+                        event.accepted = true
+                        return
+                    }
+
+                    sendPrompt(text)
+                    event.accepted = true
+                }
             }
 
             QQC2.Button {
+                id: sendButton
+                Layout.alignment: Qt.AlignBottom
                 text: busy ? "…" : "Send"
                 enabled: !busy
                 onClicked: sendPrompt(root.promptText)

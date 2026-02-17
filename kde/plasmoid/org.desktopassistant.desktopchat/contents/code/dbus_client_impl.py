@@ -142,21 +142,17 @@ def clear_all_history() -> int:
 
 def wait_for_assistant_reply(conversation_id: str, initial_count: int, timeout_sec: float, interval_sec: float) -> str:
     deadline = time.monotonic() + timeout_sec
-    last_assistant = ""
     while time.monotonic() < deadline:
         conversation = get_conversation(conversation_id)
         messages = conversation["messages"]
         if len(messages) > initial_count:
-            for message in reversed(messages):
+            new_messages = messages[initial_count:]
+            for message in reversed(new_messages):
                 if message["role"] == "assistant":
                     return message["content"]
-        for message in reversed(messages):
-            if message["role"] == "assistant":
-                last_assistant = message["content"]
-                break
         time.sleep(interval_sec)
 
-    return last_assistant
+    return ""
 
 
 def list_conversations(max_age_days: int | None = None) -> list[dict[str, Any]]:

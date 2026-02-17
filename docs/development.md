@@ -80,6 +80,23 @@ export OPENAI_BASE_URL=https://api.openai.com/v1
 export RUST_LOG=info
 ```
 
+To enable local git versioning for built-in memory/preferences:
+
+```toml
+[persistence.git]
+enabled = true
+```
+
+To push updates to a remote:
+
+```toml
+[persistence.git]
+enabled = true
+remote_url = "git@github.com:you/assistant-memory.git"
+remote_name = "origin"
+push_on_update = true
+```
+
 ## Testing MCP Integration
 
 - E2E tests may require external binaries (`fileio-mcp`, `python3`)

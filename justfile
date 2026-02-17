@@ -20,6 +20,8 @@ panel_widget_id := "org.desktopassistant.panelchat"
 desktop_widget_id := "org.desktopassistant.desktopchat"
 shared_chat_module_src := "kde/shared/chat-module"
 shared_chat_module_dst := env_var_or_default("XDG_DATA_HOME", env_var("HOME") + "/.local/share") + "/desktop-assistant/chat-module"
+shared_chatview_src := "kde/shared/chat-module/ui/ChatView.qml"
+desktop_chatview_fallback := "kde/plasmoid/org.desktopassistant.desktopchat/contents/ui/ChatView.qml"
 container_cli := env_var_or_default("CONTAINER_CLI", "docker")
 container_security_opts := env_var_or_default("CONTAINER_SECURITY_OPTS", "--security-opt label=disable")
 debian_builder_image := env_var_or_default("DEBIAN_BUILDER_IMAGE", "debian:trixie")
@@ -142,20 +144,35 @@ chat-module-sync:
     rm -rf "{{shared_chat_module_dst}}"
     cp -a "{{shared_chat_module_src}}" "{{shared_chat_module_dst}}"
 
+# Sync shared ChatView into desktop plasmoid fallback copy
+chatview-sync:
+    [ -f "{{shared_chatview_src}}" ] || (echo "Missing shared ChatView: {{shared_chatview_src}}" >&2; exit 1)
+    mkdir -p "$(dirname '{{desktop_chatview_fallback}}')"
+    cp -a "{{shared_chatview_src}}" "{{desktop_chatview_fallback}}"
+
+# Verify desktop plasmoid fallback ChatView matches shared ChatView
+chatview-verify:
+    [ -f "{{shared_chatview_src}}" ] || (echo "Missing shared ChatView: {{shared_chatview_src}}" >&2; exit 1)
+    [ -f "{{desktop_chatview_fallback}}" ] || (echo "Missing fallback ChatView: {{desktop_chatview_fallback}}" >&2; exit 1)
+    cmp -s "{{shared_chatview_src}}" "{{desktop_chatview_fallback}}" || (echo "ChatView drift detected: run 'just chatview-sync'" >&2; exit 1)
+
 # Install all KDE Plasma widgets for the current user
 widget-install:
+    just chatview-sync
     just chat-module-sync
     kpackagetool6 --type Plasma/Applet --install {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --install {{desktop_widget}}
 
 # Upgrade all KDE Plasma widgets after local changes
 widget-upgrade:
+    just chatview-sync
     just chat-module-sync
     kpackagetool6 --type Plasma/Applet --upgrade {{panel_widget}}
     kpackagetool6 --type Plasma/Applet --upgrade {{desktop_widget}}
 
 # Reinstall all KDE Plasma widgets (remove + install)
 widget-reinstall:
+    just chatview-sync
     just chat-module-sync
     kpackagetool6 --type Plasma/Applet --remove {{panel_widget_id}} || true
     kpackagetool6 --type Plasma/Applet --remove {{desktop_widget_id}} || true

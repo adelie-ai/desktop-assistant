@@ -16,7 +16,7 @@ use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
 use desktop_assistant_dbus::settings::DbusSettingsAdapter;
 use desktop_assistant_mcp_client::config as mcp_config;
-use desktop_assistant_mcp_client::executor::McpToolExecutor;
+use desktop_assistant_mcp_client::executor::{BuiltinPersistenceConfig, McpToolExecutor};
 use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
 
@@ -201,15 +201,41 @@ async fn main() -> Result<()> {
     });
 
     // Build the MCP tool executor
+    let resolved_persistence = config::resolve_persistence_config(daemon_config.as_ref());
+    let builtin_persistence = if resolved_persistence.enabled {
+        Some(BuiltinPersistenceConfig {
+            enabled: true,
+            remote_url: resolved_persistence.remote_url.clone(),
+            remote_name: resolved_persistence.remote_name.clone(),
+            push_on_update: resolved_persistence.push_on_update,
+        })
+    } else {
+        None
+    };
+
+    if let Some(persistence) = &builtin_persistence {
+        tracing::info!(
+            remote_name = persistence.remote_name,
+            push_on_update = persistence.push_on_update,
+            has_remote = persistence.remote_url.is_some(),
+            "built-in memory/preferences git persistence enabled"
+        );
+    }
+
     let tool_executor = if let Some(embed_fn) = embedding_fn {
         tracing::info!(
             "enabling built-in vector search for preferences/memory with model={}",
             resolved_emb.model
         );
-        McpToolExecutor::new_with_embedding(mcp_configs, embed_fn, resolved_emb.model.clone())
+        McpToolExecutor::new_with_embedding_and_persistence(
+            mcp_configs,
+            embed_fn,
+            resolved_emb.model.clone(),
+            builtin_persistence,
+        )
     } else {
         tracing::info!("built-in vector search disabled (no embedding backend available)");
-        McpToolExecutor::new(mcp_configs)
+        McpToolExecutor::new_with_persistence(mcp_configs, builtin_persistence)
     };
     if let Err(e) = tool_executor.start().await {
         tracing::warn!("failed to start MCP servers: {e}");

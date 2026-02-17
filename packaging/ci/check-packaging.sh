@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+SHARED_CHATVIEW="kde/shared/chat-module/ui/ChatView.qml"
+FALLBACK_CHATVIEW="kde/plasmoid/org.desktopassistant.desktopchat/contents/ui/ChatView.qml"
+
 fail() {
   echo "[packaging-check] ERROR: $*" >&2
   exit 1
@@ -29,6 +32,12 @@ require_file packaging/snap/snapcraft.yaml
 require_file packaging/flatpak/org.desktopassistant.App.yml
 require_file packaging/flatpak/org.desktopassistant.App.desktop
 require_file packaging/flatpak/org.desktopassistant.App.metainfo.xml
+require_file "$SHARED_CHATVIEW"
+require_file "$FALLBACK_CHATVIEW"
+
+echo "[packaging-check] ChatView sync guard"
+cmp -s "$SHARED_CHATVIEW" "$FALLBACK_CHATVIEW" \
+  || fail "ChatView drift detected between $SHARED_CHATVIEW and $FALLBACK_CHATVIEW (run: just chatview-sync)"
 
 if [[ ! -x packaging/debian/debian/rules ]]; then
   fail "packaging/debian/debian/rules must be executable"

@@ -6,7 +6,7 @@ use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::Mutex;
 
-use crate::builtin::BuiltinToolService;
+use crate::builtin::{BuiltinToolService, PersistenceConfig};
 use crate::{McpClient, McpError};
 
 /// Configuration for an MCP server.
@@ -16,6 +16,39 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuiltinPersistenceConfig {
+    pub enabled: bool,
+    pub remote_url: Option<String>,
+    pub remote_name: String,
+    pub push_on_update: bool,
+}
+
+impl Default for BuiltinPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            remote_url: None,
+            remote_name: "origin".to_string(),
+            push_on_update: true,
+        }
+    }
+}
+
+impl BuiltinPersistenceConfig {
+    fn into_builtin(self) -> Option<PersistenceConfig> {
+        if !self.enabled {
+            return None;
+        }
+
+        Some(PersistenceConfig {
+            remote_url: self.remote_url,
+            remote_name: self.remote_name,
+            push_on_update: self.push_on_update,
+        })
+    }
 }
 
 /// Adapter implementing `ToolExecutor` by managing multiple MCP server connections.
@@ -38,7 +71,20 @@ pub struct McpToolExecutor {
 
 impl McpToolExecutor {
     pub fn new(configs: Vec<McpServerConfig>) -> Self {
-        Self::with_builtin_tools(configs, BuiltinToolService::from_default_paths())
+        Self::new_with_persistence(configs, None)
+    }
+
+    pub fn new_with_persistence(
+        configs: Vec<McpServerConfig>,
+        persistence: Option<BuiltinPersistenceConfig>,
+    ) -> Self {
+        let builtin_tools = match persistence {
+            Some(config) => {
+                BuiltinToolService::from_default_paths_with_persistence(config.into_builtin())
+            }
+            None => BuiltinToolService::from_default_paths(),
+        };
+        Self::with_builtin_tools(configs, builtin_tools)
     }
 
     pub fn new_with_embedding(
@@ -46,8 +92,22 @@ impl McpToolExecutor {
         embed_fn: EmbedFn,
         embedding_model: String,
     ) -> Self {
-        let builtin_tools =
-            BuiltinToolService::from_default_paths().with_embedding(embed_fn, embedding_model);
+        Self::new_with_embedding_and_persistence(configs, embed_fn, embedding_model, None)
+    }
+
+    pub fn new_with_embedding_and_persistence(
+        configs: Vec<McpServerConfig>,
+        embed_fn: EmbedFn,
+        embedding_model: String,
+        persistence: Option<BuiltinPersistenceConfig>,
+    ) -> Self {
+        let builtin_tools = match persistence {
+            Some(config) => {
+                BuiltinToolService::from_default_paths_with_persistence(config.into_builtin())
+            }
+            None => BuiltinToolService::from_default_paths(),
+        }
+        .with_embedding(embed_fn, embedding_model);
         Self::with_builtin_tools(configs, builtin_tools)
     }
 

@@ -88,6 +88,27 @@ command = "fileio-mcp"
 args = ["serve", "--mode", "stdio"]
 ```
 
+### 3b) (Optional) Git persistence for memories/preferences
+
+To version built-in memory and preferences locally, enable git persistence:
+
+```toml
+[persistence.git]
+enabled = true
+```
+
+With this mode, updates are committed to a git repo in your assistant data directory (`$XDG_DATA_HOME/desktop-assistant`, or `~/.local/share/desktop-assistant`).
+
+To also push each update to a remote backup:
+
+```toml
+[persistence.git]
+enabled = true
+remote_url = "git@github.com:you/assistant-memory.git"
+remote_name = "origin"
+push_on_update = true
+```
+
 ### 4) Run daemon
 
 ```bash

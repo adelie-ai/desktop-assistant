@@ -11,6 +11,37 @@ pub struct DaemonConfig {
     pub llm: LlmConfig,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PersistenceConfig {
+    #[serde(default)]
+    pub git: GitPersistenceConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitPersistenceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    #[serde(default = "default_git_remote_name")]
+    pub remote_name: String,
+    #[serde(default = "default_push_on_update")]
+    pub push_on_update: bool,
+}
+
+impl Default for GitPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            remote_url: None,
+            remote_name: default_git_remote_name(),
+            push_on_update: default_push_on_update(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,12 +135,28 @@ pub struct EmbeddingsSettingsView {
     pub is_default: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedPersistenceConfig {
+    pub enabled: bool,
+    pub remote_url: Option<String>,
+    pub remote_name: String,
+    pub push_on_update: bool,
+}
+
 fn default_connector() -> String {
     "openai".to_string()
 }
 
 fn default_secret_backend() -> String {
     "auto".to_string()
+}
+
+fn default_git_remote_name() -> String {
+    "origin".to_string()
+}
+
+fn default_push_on_update() -> bool {
+    true
 }
 
 fn default_secret_service() -> String {
@@ -377,6 +424,33 @@ pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSet
         has_api_key,
         available,
         is_default,
+    }
+}
+
+pub fn resolve_persistence_config(config: Option<&DaemonConfig>) -> ResolvedPersistenceConfig {
+    let persistence = config.map(|c| &c.persistence.git);
+
+    let enabled = persistence.map(|p| p.enabled).unwrap_or(false);
+    let remote_url = persistence
+        .and_then(|p| p.remote_url.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+
+    let remote_name = persistence
+        .map(|p| p.remote_name.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(default_git_remote_name);
+
+    let push_on_update = persistence
+        .map(|p| p.push_on_update)
+        .unwrap_or_else(default_push_on_update);
+
+    ResolvedPersistenceConfig {
+        enabled,
+        remote_url,
+        remote_name,
+        push_on_update,
     }
 }
 
@@ -1031,5 +1105,56 @@ mod tests {
         assert!(loaded.embeddings.connector.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_toml_with_persistence_section() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [persistence.git]
+            enabled = true
+            remote_url = "https://example.com/dave/assistant-memory.git"
+            remote_name = "backup"
+            push_on_update = true
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.persistence.git.enabled);
+        assert_eq!(
+            config.persistence.git.remote_url.as_deref(),
+            Some("https://example.com/dave/assistant-memory.git")
+        );
+        assert_eq!(config.persistence.git.remote_name, "backup");
+        assert!(config.persistence.git.push_on_update);
+    }
+
+    #[test]
+    fn resolve_persistence_defaults_when_missing() {
+        let resolved = resolve_persistence_config(None);
+        assert!(!resolved.enabled);
+        assert!(resolved.remote_url.is_none());
+        assert_eq!(resolved.remote_name, "origin");
+        assert!(resolved.push_on_update);
+    }
+
+    #[test]
+    fn resolve_persistence_trims_remote_url() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [persistence.git]
+            enabled = true
+            remote_url = "   "
+            remote_name = "  "
+            push_on_update = false
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_persistence_config(Some(&config));
+        assert!(resolved.enabled);
+        assert!(resolved.remote_url.is_none());
+        assert_eq!(resolved.remote_name, "origin");
+        assert!(!resolved.push_on_update);
     }
 }
