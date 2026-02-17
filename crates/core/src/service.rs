@@ -97,6 +97,39 @@ fn sanitize_assistant_text(text: &str) -> String {
     sanitized
 }
 
+fn user_visible_llm_error_message(error: &CoreError) -> String {
+    let raw = error.to_string();
+    let normalized = raw.to_ascii_lowercase();
+
+    if normalized.contains("does not support tools") {
+        return format!(
+            "This Ollama model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: {raw}"
+        );
+    }
+
+    if normalized.contains("unable to load model")
+        || normalized.contains("model not found")
+        || normalized.contains("pull model manifest")
+        || normalized.contains("no such file")
+    {
+        return format!(
+            "The selected model could not be loaded or found. Please verify the model name and that it is installed in Ollama. Details: {raw}"
+        );
+    }
+
+    if normalized.contains("downloading")
+        || normalized.contains("currently loading")
+        || normalized.contains("is loading")
+        || normalized.contains("loading model")
+    {
+        return format!(
+            "The model is still downloading or loading. Please wait a moment and try again. Details: {raw}"
+        );
+    }
+
+    format!("I hit an LLM backend error and could not complete this request. Details: {raw}")
+}
+
 fn sanitize_assistant_text_for_stream(text: &str) -> String {
     let mut remaining = text;
     let mut output = String::with_capacity(text.len());
@@ -358,7 +391,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     on_chunk = Box::new(|_| true);
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let friendly = user_visible_llm_error_message(&e);
+                    conv.messages.push(Message::new(Role::Assistant, &friendly));
+                    conv.updated_at = now_timestamp();
+                    self.store.update(conv).await?;
+                    return Ok(friendly);
+                }
             };
 
             if !response.has_tool_calls() {
@@ -1121,8 +1160,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_round_llm_error_propagates() {
-        // If the very first LLM call fails, there's nothing to trim — error propagates
+    async fn first_round_llm_error_is_saved_as_assistant_message() {
+        // If the first LLM call fails, return a user-visible assistant message
         let tools = vec![];
 
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1141,8 +1180,44 @@ mod tests {
 
         let result = handler
             .send_prompt(&conv.id, "hello".into(), noop_callback())
-            .await;
-        assert!(matches!(result, Err(CoreError::Llm(_))));
+            .await
+            .unwrap();
+        assert!(result.contains("LLM backend error"));
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.messages.len(), 2);
+        assert_eq!(updated.messages[1].role, Role::Assistant);
+        assert!(updated.messages[1].content.contains("LLM backend error"));
+    }
+
+    #[test]
+    fn user_visible_error_for_unsupported_tools() {
+        let err = CoreError::Llm(
+            r#"Ollama API error (HTTP 400 Bad Request): {\"error\":\"registry.ollama.ai/library/phi4:14b does not support tools\"}"#
+                .to_string(),
+        );
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("does not support tool use"));
+    }
+
+    #[test]
+    fn user_visible_error_for_missing_model() {
+        let err = CoreError::Llm(
+            r#"Ollama API error (HTTP 500 Internal Server Error): {\"error\":\"unable to load model\"}"#
+                .to_string(),
+        );
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("could not be loaded or found"));
+    }
+
+    #[test]
+    fn user_visible_error_for_loading_model() {
+        let err = CoreError::Llm(
+            r#"Ollama API error (HTTP 503 Service Unavailable): {\"error\":\"model is currently loading\"}"#
+                .to_string(),
+        );
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("still downloading or loading"));
     }
 
     #[tokio::test]
