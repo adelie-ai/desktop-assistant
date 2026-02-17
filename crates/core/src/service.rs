@@ -23,29 +23,25 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
 
 /// Per-turn runtime instruction injected for the LLM.
 const RUNTIME_SYSTEM_INSTRUCTION: &str = "You are Adele, a desktop assistant named in reference to the Adélie penguin, with optional tool access. \
-Do not claim a tool or capability is unavailable unless you actually attempted the relevant tool in this turn \
-or received a concrete error from a tool call. \
-For user requests that are tool-relevant (for example terminal commands, filesystem operations, D-Bus checks, or web/network lookups), \
-you must attempt an appropriate available tool before stating any limitation. \
-Do not make blanket statements such as 'I cannot run commands' or 'I cannot access the network' without a failed tool attempt in this turn. \
-When unsure whether an action is possible (for example network access, filesystem access, or command execution), \
-try the appropriate available tool first. \
-If a tool succeeds, use its result and do not contradict it. \
-If a tool fails, explain that failure briefly and cite the exact error. \
-When launching GUI applications for the user, use a non-blocking launch pattern (for example nohup plus disown) so the assistant does not block waiting for app exit. \
-Before launching an app, check availability in PATH and also check Flatpak and Snap installations when those runtimes are present. \
-Use built-in preference tools (builtin_preferences_remember/search/retrieve) for durable user preferences. \
-Use built-in memory tools (builtin_memory_remember/search/retrieve/update) for durable factual memory and corrections. \
-Before handling any user request that is unlikely to be solved in one turn, first search for relevant preferences and memories (project-scoped first, then global) and apply what you find before asking new questions. \
-For any fact or value (preferences, paths, commands, tools, workflows, etc.), resolve it with this order: \
-project-scoped preference key, global preference fallback, project-scoped memory key, global memory fallback, then lightweight discovery, then ask only for the smallest missing piece. \
-Use namespaced keys for stored facts: project.<project>.<attribute...> and global.<attribute...>. \
-Treat project scope as any folder-anchored user work context, not only software projects. \
-When asking for a missing value, also ask whether to remember it globally or only for this project/context. \
-If discovery finds a likely value with high confidence, store it at the appropriate scope; otherwise confirm with the user before storing. \
-Remembered values can drift over time. If a remembered value appears stale or incorrect, attempt lightweight discovery for likely replacements, confirm before updating stored memory, and if no reliable replacement exists ask for the smallest missing piece. \
-For requests like start/open/run <project>, look up in this order: project.<project>.path, project.<project>.start_command (or run_command/dev_command), project.<project>.editor or app; use global equivalents as fallback for each. \
-If no relevant tool is available, state that clearly and ask for the minimal missing information or configuration needed.";
+Your name is Adele. If asked your name or who you are, answer: 'I'm Adele.' \
+Follow these rules in order and keep responses concise and practical. \
+1) For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming any limitation. \
+2) Do not say a capability is unavailable unless a relevant tool failed in this turn or no relevant tool exists. \
+3) If a tool succeeds, use its output and do not contradict it. \
+4) If a tool fails, report the exact error briefly and give the next best step. \
+5) If unsure whether an action is possible, try the appropriate tool first. \
+6) When launching GUI apps, use a non-blocking launch pattern (for example nohup plus disown). \
+7) Before launching an app, check PATH and also check Flatpak and Snap when available. \
+8) Use built-in preference tools (builtin_preferences_remember/search/retrieve) for durable user preferences. \
+9) Use built-in memory tools (builtin_memory_remember/search/retrieve/update) for durable factual memory and corrections. \
+10) For requests likely to span multiple turns, first search relevant preferences and memories (project scope first, then global) before asking new questions. \
+11) Resolve facts in this order: project preference, global preference, project memory, global memory, lightweight discovery, then ask for the smallest missing piece. \
+12) Use namespaced keys: project.<project>.<attribute...> and global.<attribute...>. \
+13) Treat project scope as any folder-anchored work context, not only software projects. \
+14) When asking for missing values, ask whether to remember them globally or only for this project/context. \
+15) If remembered values appear stale, do lightweight discovery, confirm updates before storing, and otherwise ask for the smallest missing piece. \
+16) For requests like start/open/run <project>, check in order: project.<project>.path, project.<project>.start_command (or run_command/dev_command), project.<project>.editor/app, then global fallbacks. \
+17) If no relevant tool is available, say that clearly and ask for the minimum missing configuration.";
 
 fn llm_messages_for_turn(
     conversation_messages: &[Message],
@@ -69,6 +65,76 @@ fn llm_messages_for_turn(
     ));
     messages.extend_from_slice(conversation_messages);
     messages
+}
+
+fn sanitize_assistant_text(text: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+
+    loop {
+        let Some(start) = remaining.find("<think>") else {
+            output.push_str(remaining);
+            break;
+        };
+
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + "<think>".len()..];
+
+        match after_start.find("</think>") {
+            Some(end) => {
+                remaining = &after_start[end + "</think>".len()..];
+            }
+            None => {
+                break;
+            }
+        }
+    }
+
+    let mut sanitized = output.trim().to_string();
+    while sanitized.contains("\n\n\n") {
+        sanitized = sanitized.replace("\n\n\n", "\n\n");
+    }
+    sanitized
+}
+
+fn sanitize_assistant_text_for_stream(text: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+
+    loop {
+        let Some(start) = remaining.find("<think>") else {
+            output.push_str(remaining);
+            break;
+        };
+
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + "<think>".len()..];
+
+        match after_start.find("</think>") {
+            Some(end) => {
+                remaining = &after_start[end + "</think>".len()..];
+            }
+            None => {
+                break;
+            }
+        }
+    }
+
+    let partial_len = trailing_tag_prefix_len(&output, "<think>");
+    if partial_len > 0 {
+        output.truncate(output.len() - partial_len);
+    }
+
+    output
+}
+
+fn trailing_tag_prefix_len(text: &str, tag: &str) -> usize {
+    for len in (1..tag.len()).rev() {
+        if text.ends_with(&tag[..len]) {
+            return len;
+        }
+    }
+    0
 }
 
 /// Remove the oldest assistant(tool_calls)+tool_result groups from a message
@@ -236,9 +302,35 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
         for round in 0..MAX_TOOL_ROUNDS {
             let llm_messages = llm_messages_for_turn(&conv.messages, &tool_defs);
+            let mut raw_stream = String::new();
+            let mut emitted_visible_len = 0usize;
+            let mut visible_chunk_callback = on_chunk;
+            let filtered_chunk_callback: ChunkCallback = Box::new(move |chunk| {
+                raw_stream.push_str(&chunk);
+                let sanitized = sanitize_assistant_text_for_stream(&raw_stream);
+
+                if sanitized.len() < emitted_visible_len {
+                    emitted_visible_len = sanitized.len();
+                    return true;
+                }
+
+                if sanitized.len() <= emitted_visible_len {
+                    return true;
+                }
+
+                let visible = sanitized[emitted_visible_len..].to_string();
+                emitted_visible_len = sanitized.len();
+
+                if visible.is_empty() {
+                    true
+                } else {
+                    visible_chunk_callback(visible)
+                }
+            });
+
             let response = match self
                 .llm
-                .stream_completion(llm_messages, &tool_defs, on_chunk)
+                .stream_completion(llm_messages, &tool_defs, filtered_chunk_callback)
                 .await
             {
                 Ok(r) => r,
@@ -271,11 +363,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
             if !response.has_tool_calls() {
                 // Text-only response — we're done
+                let visible_text = sanitize_assistant_text(&response.text);
                 conv.messages
-                    .push(Message::new(Role::Assistant, &response.text));
+                    .push(Message::new(Role::Assistant, &visible_text));
                 conv.updated_at = now_timestamp();
                 self.store.update(conv).await?;
-                return Ok(response.text);
+                return Ok(visible_text);
             }
 
             // LLM wants to call tools — record the assistant message with tool calls
@@ -588,6 +681,52 @@ mod tests {
             .unwrap();
         assert_eq!(response, "abc");
         assert_eq!(*chunks.lock().unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn send_prompt_hides_thinking_blocks_in_final_response() {
+        let handler = make_handler(vec!["<think>internal reasoning</think>\n\nVisible answer"]);
+        let conv = handler.create_conversation("Chat".into()).await.unwrap();
+
+        let response = handler
+            .send_prompt(&conv.id, "Hi".into(), noop_callback())
+            .await
+            .unwrap();
+        assert_eq!(response, "Visible answer");
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.messages[1].role, Role::Assistant);
+        assert_eq!(updated.messages[1].content, "Visible answer");
+    }
+
+    #[tokio::test]
+    async fn send_prompt_hides_thinking_blocks_in_streamed_chunks() {
+        let handler = make_handler(vec!["Visible ", "<th", "ink>internal</think>", "answer"]);
+        let conv = handler.create_conversation("Chat".into()).await.unwrap();
+
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let chunks_clone = Arc::clone(&chunks);
+        let response = handler
+            .send_prompt(
+                &conv.id,
+                "Hi".into(),
+                Box::new(move |chunk| {
+                    chunks_clone.lock().unwrap().push(chunk);
+                    true
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response, "Visible answer");
+        assert_eq!(*chunks.lock().unwrap(), vec!["Visible ", "answer"]);
+    }
+
+    #[test]
+    fn sanitize_assistant_text_handles_unclosed_think_block() {
+        let input = "Visible before <think>internal";
+        let output = sanitize_assistant_text(input);
+        assert_eq!(output, "Visible before");
     }
 
     #[tokio::test]
@@ -1067,13 +1206,12 @@ mod tests {
         assert!(messages[0].content.contains(
             "You are Adele, a desktop assistant named in reference to the Adélie penguin"
         ));
-        assert!(messages[0].content.contains(
-            "Before handling any user request that is unlikely to be solved in one turn"
-        ));
+        assert!(messages[0].content.contains("Your name is Adele"));
+        assert!(messages[0].content.contains("Follow these rules in order"));
         assert!(
             messages[0]
                 .content
-                .contains("Do not claim a tool or capability is unavailable")
+                .contains("attempt one best-fit available tool")
         );
         assert!(
             messages[0]
@@ -1081,12 +1219,8 @@ mod tests {
                 .contains("No tools are available in this turn.")
         );
         assert!(messages[0].content.contains("non-blocking launch pattern"));
-        assert!(messages[0].content.contains("check availability in PATH"));
-        assert!(
-            messages[0]
-                .content
-                .contains("Flatpak and Snap installations")
-        );
+        assert!(messages[0].content.contains("check PATH"));
+        assert!(messages[0].content.contains("check Flatpak and Snap"));
         assert!(
             messages[0]
                 .content
