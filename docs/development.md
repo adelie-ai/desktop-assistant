@@ -39,7 +39,9 @@ Use the canonical troubleshooting checklist in [README.md](README.md#activation-
 
 ## Environment
 
-Default connector is `ollama` (local, no API key required).
+Default connector is `openai`.
+
+To opt into local Ollama, set `llm.connector = "ollama"` in `$XDG_CONFIG_HOME/desktop-assistant/daemon.toml` (or `~/.config/desktop-assistant/daemon.toml`).
 
 For cloud connectors, set the matching API key:
 

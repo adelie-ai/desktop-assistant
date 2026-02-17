@@ -34,7 +34,9 @@ cargo build --workspace
 
 ### 2) Configure connector
 
-Default connector is `ollama` (no API key required for local Ollama).
+Default connector is `openai`.
+
+To opt into local Ollama instead, set `llm.connector = "ollama"` in your daemon config (`$XDG_CONFIG_HOME/desktop-assistant/daemon.toml`, or `~/.config/desktop-assistant/daemon.toml`).
 
 For cloud connectors, export the matching API key environment variable:
 
