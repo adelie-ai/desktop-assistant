@@ -34,8 +34,8 @@ Follow these rules in order and keep responses concise and practical. \
 7) If unsure whether an action is possible, try the appropriate tool first. \
 8) When launching GUI apps, use a non-blocking launch pattern (for example nohup plus disown). \
 9) Before launching an app, check PATH and also check Flatpak and Snap when available. \
-10) Use built-in preference tools (builtin_preferences_remember/search/retrieve) for durable user preferences. \
-11) Use built-in memory tools (builtin_memory_remember/search/retrieve/update) for durable factual memory and corrections. \
+10) Use built-in preference tools (builtin_preferences_remember/search/retrieve/delete_old) for durable user preferences. \
+11) Use built-in memory tools (builtin_memory_remember/search/retrieve/update/delete_old) for durable factual memory and corrections. \
 12) For requests likely to span multiple turns, first search relevant preferences and memories (project scope first, then global) before asking new questions. \
 13) Resolve facts in this order: project preference, global preference, project memory, global memory, lightweight discovery, then ask for the smallest missing piece. \
 14) Use namespaced keys: project.<project>.<attribute...> and global.<attribute...>. \
@@ -1301,12 +1301,12 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("builtin_preferences_remember/search/retrieve")
+                .contains("builtin_preferences_remember/search/retrieve/delete_old")
         );
         assert!(
             messages[0]
                 .content
-                .contains("builtin_memory_remember/search/retrieve/update")
+                .contains("builtin_memory_remember/search/retrieve/update/delete_old")
         );
     }
 

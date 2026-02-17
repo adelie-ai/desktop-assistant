@@ -10,10 +10,12 @@ use desktop_assistant_core::ports::embedding::EmbedFn;
 const TOOL_PREF_REMEMBER: &str = "builtin_preferences_remember";
 const TOOL_PREF_SEARCH: &str = "builtin_preferences_search";
 const TOOL_PREF_RETRIEVE: &str = "builtin_preferences_retrieve";
+const TOOL_PREF_DELETE_OLD: &str = "builtin_preferences_delete_old";
 const TOOL_MEM_REMEMBER: &str = "builtin_memory_remember";
 const TOOL_MEM_SEARCH: &str = "builtin_memory_search";
 const TOOL_MEM_RETRIEVE: &str = "builtin_memory_retrieve";
 const TOOL_MEM_UPDATE: &str = "builtin_memory_update";
+const TOOL_MEM_DELETE_OLD: &str = "builtin_memory_delete_old";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PreferenceEntry {
@@ -217,6 +219,18 @@ impl BuiltinToolService {
                 }),
             ),
             ToolDefinition::new(
+                TOOL_PREF_DELETE_OLD,
+                "Delete stale user preferences older than a number of days",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "older_than_days": {"type": "integer", "minimum": 1},
+                        "scope": {"type": "string"}
+                    },
+                    "required": ["older_than_days"]
+                }),
+            ),
+            ToolDefinition::new(
                 TOOL_MEM_REMEMBER,
                 "Store a factual memory item",
                 serde_json::json!({
@@ -279,6 +293,21 @@ impl BuiltinToolService {
                     "required": ["id"]
                 }),
             ),
+            ToolDefinition::new(
+                TOOL_MEM_DELETE_OLD,
+                "Delete stale factual memory older than a number of days",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "older_than_days": {"type": "integer", "minimum": 1},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["older_than_days"]
+                }),
+            ),
         ]
     }
 
@@ -288,10 +317,12 @@ impl BuiltinToolService {
             TOOL_PREF_REMEMBER
                 | TOOL_PREF_SEARCH
                 | TOOL_PREF_RETRIEVE
+                | TOOL_PREF_DELETE_OLD
                 | TOOL_MEM_REMEMBER
                 | TOOL_MEM_SEARCH
                 | TOOL_MEM_RETRIEVE
                 | TOOL_MEM_UPDATE
+                | TOOL_MEM_DELETE_OLD
         )
     }
 
@@ -304,10 +335,12 @@ impl BuiltinToolService {
             TOOL_PREF_REMEMBER => self.preferences_remember(arguments).await,
             TOOL_PREF_SEARCH => self.preferences_search(arguments).await,
             TOOL_PREF_RETRIEVE => self.preferences_retrieve(arguments),
+            TOOL_PREF_DELETE_OLD => self.preferences_delete_old(arguments),
             TOOL_MEM_REMEMBER => self.memory_remember(arguments).await,
             TOOL_MEM_SEARCH => self.memory_search(arguments).await,
             TOOL_MEM_RETRIEVE => self.memory_retrieve(arguments),
             TOOL_MEM_UPDATE => self.memory_update(arguments).await,
+            TOOL_MEM_DELETE_OLD => self.memory_delete_old(arguments),
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
@@ -480,6 +513,42 @@ impl BuiltinToolService {
             })
             .to_string())
         }
+    }
+
+    fn preferences_delete_old(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let older_than_days = required_positive_u64(&arguments, "older_than_days")?;
+        let scope_filter = optional_string(&arguments, "scope");
+        let cutoff = now_ts().saturating_sub(older_than_days.saturating_mul(24 * 60 * 60));
+
+        let mut prefs = self.preferences.lock().unwrap();
+        let before = prefs.items.len();
+        prefs.items.retain(|item| {
+            let in_scope = match &scope_filter {
+                Some(scope) => item.scope.as_deref() == Some(scope.as_str()),
+                None => true,
+            };
+
+            if !in_scope {
+                return true;
+            }
+
+            item.updated_at >= cutoff
+        });
+        let after = prefs.items.len();
+        let deleted = before.saturating_sub(after);
+
+        if deleted > 0 {
+            self.persist_preferences(&prefs)?;
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "deleted": deleted,
+            "remaining": after,
+            "older_than_days": older_than_days,
+            "scope": scope_filter,
+        })
+        .to_string())
     }
 
     async fn memory_remember(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -672,6 +741,46 @@ impl BuiltinToolService {
         Ok(response_json.to_string())
     }
 
+    fn memory_delete_old(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let older_than_days = required_positive_u64(&arguments, "older_than_days")?;
+        let tags_filter = optional_string_array(&arguments, "tags");
+        let cutoff = now_ts().saturating_sub(older_than_days.saturating_mul(24 * 60 * 60));
+
+        let mut memory = self.memory.lock().unwrap();
+        let before = memory.items.len();
+        memory.items.retain(|item| {
+            let matches_tags = if tags_filter.is_empty() {
+                true
+            } else {
+                tags_filter
+                    .iter()
+                    .all(|tag| item.tags.iter().any(|it| normalize(it) == normalize(tag)))
+            };
+
+            if !matches_tags {
+                return true;
+            }
+
+            item.updated_at >= cutoff
+        });
+
+        let after = memory.items.len();
+        let deleted = before.saturating_sub(after);
+
+        if deleted > 0 {
+            self.persist_memory(&memory)?;
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "deleted": deleted,
+            "remaining": after,
+            "older_than_days": older_than_days,
+            "tags": tags_filter,
+        })
+        .to_string())
+    }
+
     /// Embed a single query string, returning None if embeddings are unavailable.
     async fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
         let embed_fn = self.embed_fn.as_ref()?;
@@ -810,6 +919,15 @@ fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreEr
         .ok_or_else(|| CoreError::ToolExecution(format!("missing required string argument: {key}")))
 }
 
+fn required_positive_u64(args: &serde_json::Value, key: &str) -> Result<u64, CoreError> {
+    args.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            CoreError::ToolExecution(format!("missing required positive integer argument: {key}"))
+        })
+}
+
 fn optional_string(args: &serde_json::Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(serde_json::Value::as_str)
@@ -898,7 +1016,9 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert!(names.contains(&TOOL_PREF_REMEMBER.to_string()));
+        assert!(names.contains(&TOOL_PREF_DELETE_OLD.to_string()));
         assert!(names.contains(&TOOL_MEM_UPDATE.to_string()));
+        assert!(names.contains(&TOOL_MEM_DELETE_OLD.to_string()));
     }
 
     #[tokio::test]
@@ -1218,6 +1338,114 @@ mod tests {
                 && item.embedding.as_ref().is_some_and(|v| !v.is_empty())
         });
         assert!(any_embedded);
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[test]
+    fn preferences_delete_old_removes_stale_items() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+
+        let now = now_ts();
+        let ten_days_ago = now.saturating_sub(10 * 24 * 60 * 60);
+        let two_days_ago = now.saturating_sub(2 * 24 * 60 * 60);
+
+        let initial = PreferenceStoreData {
+            items: vec![
+                PreferenceEntry {
+                    key: "global.old_pref".to_string(),
+                    value: "deprecated".to_string(),
+                    scope: Some("global".to_string()),
+                    updated_at: ten_days_ago,
+                    embedding: None,
+                    embedding_model: None,
+                },
+                PreferenceEntry {
+                    key: "global.new_pref".to_string(),
+                    value: "current".to_string(),
+                    scope: Some("global".to_string()),
+                    updated_at: two_days_ago,
+                    embedding: None,
+                    embedding_model: None,
+                },
+            ],
+        };
+
+        persist_json(&pref_path, &initial).unwrap();
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
+
+        let deleted = service
+            .preferences_delete_old(serde_json::json!({
+                "older_than_days": 7,
+                "scope": "global"
+            }))
+            .unwrap();
+        let deleted_json: serde_json::Value = serde_json::from_str(&deleted).unwrap();
+        assert_eq!(deleted_json["deleted"], serde_json::json!(1));
+
+        let stored: PreferenceStoreData = load_json(&pref_path).unwrap();
+        assert_eq!(stored.items.len(), 1);
+        assert_eq!(stored.items[0].key, "global.new_pref");
+
+        let _ = fs::remove_file(pref_path);
+        let _ = fs::remove_file(mem_path);
+    }
+
+    #[test]
+    fn memory_delete_old_removes_stale_items() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+
+        let now = now_ts();
+        let fifteen_days_ago = now.saturating_sub(15 * 24 * 60 * 60);
+        let one_day_ago = now.saturating_sub(1 * 24 * 60 * 60);
+
+        let initial = MemoryStoreData {
+            items: vec![
+                MemoryEntry {
+                    id: "mem-old".to_string(),
+                    fact: "Old project detail".to_string(),
+                    tags: vec!["project".to_string()],
+                    source: None,
+                    confidence: None,
+                    supersedes: None,
+                    created_at: fifteen_days_ago,
+                    updated_at: fifteen_days_ago,
+                    embedding: None,
+                    embedding_model: None,
+                },
+                MemoryEntry {
+                    id: "mem-new".to_string(),
+                    fact: "Fresh project detail".to_string(),
+                    tags: vec!["project".to_string()],
+                    source: None,
+                    confidence: None,
+                    supersedes: None,
+                    created_at: one_day_ago,
+                    updated_at: one_day_ago,
+                    embedding: None,
+                    embedding_model: None,
+                },
+            ],
+        };
+
+        persist_json(&mem_path, &initial).unwrap();
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
+
+        let deleted = service
+            .memory_delete_old(serde_json::json!({
+                "older_than_days": 7,
+                "tags": ["project"]
+            }))
+            .unwrap();
+        let deleted_json: serde_json::Value = serde_json::from_str(&deleted).unwrap();
+        assert_eq!(deleted_json["deleted"], serde_json::json!(1));
+
+        let stored: MemoryStoreData = load_json(&mem_path).unwrap();
+        assert_eq!(stored.items.len(), 1);
+        assert_eq!(stored.items[0].id, "mem-new");
 
         let _ = fs::remove_file(pref_path);
         let _ = fs::remove_file(mem_path);
