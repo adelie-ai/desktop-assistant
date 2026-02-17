@@ -241,13 +241,13 @@ Build the Desktop Assistant KCM module:
 just kcm-build
 ```
 
-Install it user-locally:
+Install it user-locally (development copy):
 
 ```bash
 just kcm-install
 ```
 
-Install system-wide (recommended for normal KDE discovery, requires sudo):
+Install system-wide (recommended for daily use + KDE discovery, requires sudo):
 
 ```bash
 just kcm-install-system
@@ -259,14 +259,63 @@ Refresh cache and verify discovery:
 just kcm-refresh
 ```
 
-Open directly from shell with the required user-local plugin environment:
+Open using the user-local plugin environment:
 
 ```bash
 just kcm-open
 ```
 
-Note: KDE loads KCM plugins from Qt6 plugin paths (for example `/usr/lib64/qt6/plugins`).
-The `just` recipes install to that location to ensure `kcmshell6` can find the module.
+Open using system plugin paths:
+
+```bash
+just kcm-open-system
+```
+
+### KCM install modes (important)
+
+KDE can see both a **system** KCM install (`/usr/...`) and a **user-local** KCM install (`~/.local/...`).
+If both exist, it can look like settings/UI changes are "randomly" reverting depending on which one is loaded.
+
+Choose one mode and stick to it:
+
+- **System mode (recommended for stability):**
+	- Install/update with `just kcm-install-system`
+	- Open with `just kcm-open-system`
+	- Do not keep a user-local KCM copy installed
+- **Local mode (recommended for active KCM development):**
+	- Install/update with `just kcm-install`
+	- Open with `just kcm-open`
+	- Do not keep a system KCM copy installed
+
+### One-shot cleanup commands
+
+- Remove only **local** KCM artifacts (keeps system install intact):
+
+```bash
+just kcm-cleanup
+```
+
+- Remove only **system** KCM artifacts (requires sudo):
+
+```bash
+just kcm-cleanup-system
+```
+
+- Then refresh cache:
+
+```bash
+just kcm-refresh
+```
+
+### Recovery playbook (if UI looks wrong or old)
+
+1. Pick target mode (**system** or **local**).
+2. Remove the other mode's artifacts using the cleanup command above.
+3. Reinstall target mode (`just kcm-install-system` or `just kcm-install`).
+4. Refresh (`just kcm-refresh`).
+5. Open with matching command (`just kcm-open-system` or `just kcm-open`).
+
+Note: KDE loads KCM plugins from Qt6 plugin paths (for example `/usr/lib64/qt6/plugins` and `~/.local/lib64/qt6/plugins`).
 
 After install, open KDE System Settings and search for **Desktop Assistant**.
 You can also launch directly:

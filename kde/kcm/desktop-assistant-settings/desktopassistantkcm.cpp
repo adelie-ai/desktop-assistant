@@ -11,6 +11,42 @@ namespace {
 constexpr auto SERVICE = "org.desktopAssistant";
 constexpr auto PATH = "/org/desktopAssistant/Settings";
 constexpr auto IFACE = "org.desktopAssistant.Settings";
+
+QString normalizeConnector(const QString &connector)
+{
+    const auto normalized = connector.trimmed().toLower();
+    return normalized.isEmpty() ? QStringLiteral("openai") : normalized;
+}
+
+QString defaultModelForConnector(const QString &connector)
+{
+    if (connector == QLatin1String("ollama")) {
+        return QStringLiteral("qwen3:0.6b");
+    }
+    if (connector == QLatin1String("anthropic")) {
+        return QStringLiteral("claude-sonnet-4-5-20250929");
+    }
+    return QStringLiteral("gpt-5.2");
+}
+
+QString defaultEmbeddingModelForConnector(const QString &connector)
+{
+    if (connector == QLatin1String("ollama")) {
+        return QStringLiteral("nomic-embed-text");
+    }
+    return QStringLiteral("text-embedding-3-small");
+}
+
+QString defaultBaseUrlForConnector(const QString &connector)
+{
+    if (connector == QLatin1String("ollama")) {
+        return QStringLiteral("http://localhost:11434");
+    }
+    if (connector == QLatin1String("anthropic")) {
+        return QStringLiteral("https://api.anthropic.com");
+    }
+    return QStringLiteral("https://api.openai.com/v1");
+}
 }
 
 K_PLUGIN_CLASS_WITH_JSON(DesktopAssistantKcm, "kcm_desktopassistant.json")
@@ -19,7 +55,7 @@ DesktopAssistantKcm::DesktopAssistantKcm(QObject *parent, const KPluginMetaData 
     : KQuickConfigModule(parent, metaData)
 {
     Q_UNUSED(args);
-    setButtons(Apply | Default);
+    setButtons(Apply);
     load();
 }
 
@@ -253,14 +289,20 @@ void DesktopAssistantKcm::save()
 
 void DesktopAssistantKcm::defaults()
 {
-    setConnector(QStringLiteral("ollama"));
-    setModel(QString());
-    setBaseUrl(QString());
-    setEmbConnector(QString());
-    setEmbModel(QString());
-    setEmbBaseUrl(QString());
+    const auto llmConnector = normalizeConnector(m_connector);
+    setModel(defaultModelForConnector(llmConnector));
+    setBaseUrl(defaultBaseUrlForConnector(llmConnector));
+
+    auto embeddingConnector = normalizeConnector(m_embConnector.isEmpty() ? llmConnector : m_embConnector);
+    if (embeddingConnector == QLatin1String("anthropic")) {
+        embeddingConnector = QStringLiteral("openai");
+        setEmbConnector(embeddingConnector);
+    }
+
+    setEmbModel(defaultEmbeddingModelForConnector(embeddingConnector));
+    setEmbBaseUrl(defaultBaseUrlForConnector(embeddingConnector));
     setApiKeyInput(QString());
-    m_statusText = QStringLiteral("Restored form defaults; click Apply to save");
+    m_statusText = QStringLiteral("Applied connector defaults; click Apply to save");
     Q_EMIT statusTextChanged();
 }
 

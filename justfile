@@ -209,10 +209,31 @@ kcm-open:
     sleep 0.3
     QT_LOGGING_RULES="qt.qpa.services.warning=false" systemsettings kcm_desktopassistant
 
-# Remove stale KCM plugin copies from legacy plugin paths
+# Open Desktop Assistant KCM from system install paths
+kcm-open-system:
+    unset QT_PLUGIN_PATH
+    unset DESKTOP_STARTUP_ID
+    unset GTK_USE_PORTAL
+    unset GIO_USE_PORTALS
+    kquitapp6 systemsettings || true
+    pkill -f '^systemsettings' || true
+    sleep 0.3
+    QT_LOGGING_RULES="qt.qpa.services.warning=false" systemsettings kcm_desktopassistant
+
+# Remove stale/local KCM plugin copies (keeps system install intact)
 kcm-cleanup:
     rm -f "$HOME/.local/lib64/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so"
+    rm -f "$HOME/.local/lib64/qt6/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so"
+    rm -f "$HOME/.local/share/applications/kcm_desktopassistant.desktop"
+    rm -f "$HOME/.local/share/systemsettings/categories/settings-applications-desktopassistant.desktop"
+
+# Remove system KCM install copies (requires sudo)
+kcm-cleanup-system:
     sudo rm -f /usr/lib64/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so
+    sudo rm -f /usr/lib64/qt6/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so
+    sudo rm -f /usr/share/applications/kcm_desktopassistant.desktop
+    sudo rm -f /usr/share/systemsettings/categories/settings-applications-desktopassistant.desktop
+    kbuildsycoca6 || true
 
 # Remove user service file and stop the daemon
 uninstall-service:

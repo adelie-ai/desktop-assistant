@@ -7,6 +7,52 @@ KCM.SimpleKCM {
     implicitWidth: 520
     implicitHeight: 420
 
+    function normalizedConnector(value) {
+        const connector = (value || "").toLowerCase()
+        return connector.length > 0 ? connector : "openai"
+    }
+
+    function applyChatDefaults() {
+        const connector = normalizedConnector(kcm.connector)
+        if (connector === "ollama") {
+            kcm.model = "qwen3:0.6b"
+            kcm.baseUrl = "http://localhost:11434"
+            return
+        }
+
+        if (connector === "anthropic") {
+            kcm.model = "claude-sonnet-4-5-20250929"
+            kcm.baseUrl = "https://api.anthropic.com"
+            return
+        }
+
+        kcm.model = "gpt-5.2"
+        kcm.baseUrl = "https://api.openai.com/v1"
+    }
+
+    function effectiveSearchConnector() {
+        const connector = normalizedConnector(kcm.embConnector || kcm.connector)
+        return connector === "anthropic" ? "openai" : connector
+    }
+
+    function applySearchDefaults() {
+        const connector = effectiveSearchConnector()
+        if (connector === "ollama") {
+            kcm.embModel = "nomic-embed-text"
+            kcm.embBaseUrl = "http://localhost:11434"
+            if (kcm.embConnector === "anthropic") {
+                kcm.embConnector = "ollama"
+            }
+            return
+        }
+
+        kcm.embModel = "text-embedding-3-small"
+        kcm.embBaseUrl = "https://api.openai.com/v1"
+        if (kcm.embConnector === "anthropic") {
+            kcm.embConnector = "openai"
+        }
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 10
@@ -51,14 +97,20 @@ KCM.SimpleKCM {
                         }
                     }
 
+                    QQC2.Button {
+                        text: "Set Defaults"
+                        onClicked: applyChatDefaults()
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
                         QQC2.Label { text: "Model" }
                         QQC2.TextField {
+                            id: llmModelField
                             Layout.fillWidth: true
                             placeholderText: "gpt-4o / llama3.1 / ..."
                             text: kcm.model
-                            onTextChanged: kcm.model = text
+                            onTextEdited: kcm.model = text
                         }
                     }
 
@@ -66,10 +118,11 @@ KCM.SimpleKCM {
                         Layout.fillWidth: true
                         QQC2.Label { text: "Base URL" }
                         QQC2.TextField {
+                            id: llmBaseUrlField
                             Layout.fillWidth: true
                             placeholderText: "https://api.openai.com/v1"
                             text: kcm.baseUrl
-                            onTextChanged: kcm.baseUrl = text
+                            onTextEdited: kcm.baseUrl = text
                         }
                     }
 
@@ -77,11 +130,12 @@ KCM.SimpleKCM {
                         Layout.fillWidth: true
                         QQC2.Label { text: "API Key" }
                         QQC2.TextField {
+                            id: apiKeyField
                             Layout.fillWidth: true
                             echoMode: TextInput.Password
                             placeholderText: "Write-only; leave blank to keep existing"
                             text: kcm.apiKeyInput
-                            onTextChanged: kcm.apiKeyInput = text
+                            onTextEdited: kcm.apiKeyInput = text
                         }
                     }
 
@@ -99,7 +153,7 @@ KCM.SimpleKCM {
                     QQC2.Label {
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap
-                        text: "Search uses semantic matching to find relevant memories and preferences. Configure the provider below."
+                        text: "Search helps Adele find relevant past messages and preferences. Choose which service powers search below."
                     }
 
                     RowLayout {
@@ -108,7 +162,7 @@ KCM.SimpleKCM {
                         QQC2.ComboBox {
                             id: embConnectorBox
                             Layout.fillWidth: true
-                            model: ["auto (use Chat LLM)", "ollama", "openai"]
+                            model: ["auto (same as Chat LLM)", "ollama", "openai"]
                             currentIndex: {
                                 if (kcm.embConnector === "ollama") return 1
                                 if (kcm.embConnector === "openai") return 2
@@ -121,17 +175,23 @@ KCM.SimpleKCM {
                         }
                     }
 
+                    QQC2.Button {
+                        text: "Set Defaults"
+                        onClicked: applySearchDefaults()
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
                         QQC2.Label { text: "Model" }
                         QQC2.TextField {
+                            id: embModelField
                             Layout.fillWidth: true
                             placeholderText: {
                                 let c = kcm.embConnector || kcm.connector
                                 return c === "ollama" ? "nomic-embed-text" : "text-embedding-3-small"
                             }
                             text: kcm.embModel
-                            onTextChanged: kcm.embModel = text
+                            onTextEdited: kcm.embModel = text
                         }
                     }
 
@@ -139,13 +199,14 @@ KCM.SimpleKCM {
                         Layout.fillWidth: true
                         QQC2.Label { text: "Base URL" }
                         QQC2.TextField {
+                            id: embBaseUrlField
                             Layout.fillWidth: true
                             placeholderText: {
                                 let c = kcm.embConnector || kcm.connector
                                 return c === "ollama" ? "http://localhost:11434" : "https://api.openai.com/v1"
                             }
                             text: kcm.embBaseUrl
-                            onTextChanged: kcm.embBaseUrl = text
+                            onTextEdited: kcm.embBaseUrl = text
                         }
                     }
 
@@ -154,7 +215,7 @@ KCM.SimpleKCM {
                         wrapMode: Text.Wrap
                         visible: !kcm.embAvailable
                         color: "orange"
-                        text: "Current connector does not support search indexing. Choose a different search provider or switch the Chat LLM connector."
+                        text: "The current choice cannot power Search right now. Pick another Search provider, or switch the Chat LLM connector."
                     }
 
                     Item { Layout.fillHeight: true }
@@ -185,6 +246,40 @@ KCM.SimpleKCM {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             text: kcm.statusText
+        }
+
+        Connections {
+            target: kcm
+
+            function onModelChanged() {
+                if (llmModelField.text !== kcm.model) {
+                    llmModelField.text = kcm.model
+                }
+            }
+
+            function onBaseUrlChanged() {
+                if (llmBaseUrlField.text !== kcm.baseUrl) {
+                    llmBaseUrlField.text = kcm.baseUrl
+                }
+            }
+
+            function onApiKeyInputChanged() {
+                if (apiKeyField.text !== kcm.apiKeyInput) {
+                    apiKeyField.text = kcm.apiKeyInput
+                }
+            }
+
+            function onEmbModelChanged() {
+                if (embModelField.text !== kcm.embModel) {
+                    embModelField.text = kcm.embModel
+                }
+            }
+
+            function onEmbBaseUrlChanged() {
+                if (embBaseUrlField.text !== kcm.embBaseUrl) {
+                    embBaseUrlField.text = kcm.embBaseUrl
+                }
+            }
         }
     }
 }
