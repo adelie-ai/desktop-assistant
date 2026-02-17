@@ -3,6 +3,7 @@ use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 
 /// Ollama LLM client that streams completions via the native `/api/chat` endpoint.
@@ -13,6 +14,7 @@ pub struct OllamaClient {
     client: Client,
     model: String,
     base_url: String,
+    model_ready: OnceCell<()>,
 }
 
 impl OllamaClient {
@@ -21,23 +23,102 @@ impl OllamaClient {
             client: Client::new(),
             model: model.into(),
             base_url: base_url.into(),
+            model_ready: OnceCell::new(),
         }
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self.model_ready = OnceCell::new();
         self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self.model_ready = OnceCell::new();
         self
+    }
+
+    async fn ensure_model_available(&self) -> Result<(), CoreError> {
+        self.model_ready
+            .get_or_try_init(|| async { self.ensure_model_available_impl().await })
+            .await
+            .map(|_| ())
+    }
+
+    async fn ensure_model_available_impl(&self) -> Result<(), CoreError> {
+        let base_url = self.base_url.trim_end_matches('/');
+        let tags_url = format!("{base_url}/api/tags");
+
+        let tags_response = self
+            .client
+            .get(&tags_url)
+            .send()
+            .await
+            .map_err(|e| CoreError::Llm(format!("failed to check Ollama models: {e}")))?;
+
+        if !tags_response.status().is_success() {
+            let status = tags_response.status();
+            let body = tags_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(CoreError::Llm(format!(
+                "Ollama model list API error (HTTP {status}): {body}"
+            )));
+        }
+
+        let tags: OllamaTagsResponse = tags_response
+            .json()
+            .await
+            .map_err(|e| CoreError::Llm(format!("failed to parse Ollama model list: {e}")))?;
+
+        if tags
+            .models
+            .iter()
+            .any(|installed| model_matches(&self.model, installed))
+        {
+            return Ok(());
+        }
+
+        tracing::info!(model = %self.model, "ollama model missing locally; pulling");
+
+        let pull_url = format!("{base_url}/api/pull");
+        let pull_response = self
+            .client
+            .post(&pull_url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": self.model,
+                "stream": false,
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::Llm(format!("failed to pull Ollama model '{}': {e}", self.model))
+            })?;
+
+        if !pull_response.status().is_success() {
+            let status = pull_response.status();
+            let body = pull_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(CoreError::Llm(format!(
+                "Ollama model pull API error for '{}' (HTTP {status}): {body}",
+                self.model
+            )));
+        }
+
+        Ok(())
     }
 
     /// Generate embeddings for a batch of texts.
     ///
     /// Sends a `POST {base_url}/api/embed` request and returns one vector per input.
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+        self.ensure_model_available().await?;
+
         let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
@@ -176,6 +257,31 @@ struct OllamaEmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
+#[derive(Deserialize)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaModelTag>,
+}
+
+#[derive(Deserialize)]
+struct OllamaModelTag {
+    name: String,
+    model: Option<String>,
+}
+
+fn model_matches(configured: &str, installed: &OllamaModelTag) -> bool {
+    model_name_matches(configured, &installed.name)
+        || installed
+            .model
+            .as_deref()
+            .is_some_and(|model| model_name_matches(configured, model))
+}
+
+fn model_name_matches(configured: &str, candidate: &str) -> bool {
+    configured == candidate
+        || (!configured.contains(':') && candidate == format!("{configured}:latest"))
+}
+
 // --- Response types ---
 
 #[derive(Deserialize)]
@@ -208,6 +314,8 @@ impl LlmClient for OllamaClient {
         tools: &[ToolDefinition],
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
+        self.ensure_model_available().await?;
+
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
 
         let request = ChatRequest {
@@ -335,6 +443,8 @@ fn build_response(text: String, tool_calls: Vec<ToolCall>) -> LlmResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::Method::{GET, POST};
+    use httpmock::MockServer;
 
     #[test]
     fn chat_message_from_user() {
@@ -396,6 +506,21 @@ mod tests {
             .with_base_url("http://localhost:9999");
         assert_eq!(client.model, "mistral");
         assert_eq!(client.base_url, "http://localhost:9999");
+    }
+
+    #[test]
+    fn model_name_matches_exact() {
+        assert!(model_name_matches("llama3.2", "llama3.2"));
+    }
+
+    #[test]
+    fn model_name_matches_latest_tag_for_untagged_model() {
+        assert!(model_name_matches("llama3.2", "llama3.2:latest"));
+    }
+
+    #[test]
+    fn model_name_does_not_match_different_tag_when_configured_tagged() {
+        assert!(!model_name_matches("llama3.2:8b", "llama3.2:latest"));
     }
 
     #[test]
@@ -476,5 +601,101 @@ mod tests {
         let args = serde_json::json!({"path": "/tmp/a"});
         let serialized = serde_json::to_string(&args).unwrap();
         assert_eq!(serialized, r#"{"path":"/tmp/a"}"#);
+    }
+
+    #[tokio::test]
+    async fn stream_completion_pulls_missing_model_once_before_chat() {
+        let server = MockServer::start();
+
+        let tags_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"other-model:latest"}]}"#);
+        });
+
+        let pull_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/pull");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"status":"success"}"#);
+        });
+
+        let chat_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body(
+                    r#"{"message":{"content":"Hello"},"done":true}
+"#,
+                );
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+
+        let response_first = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                Box::new(|_| true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_first.text, "Hello");
+
+        let response_second = client
+            .stream_completion(
+                vec![Message::new(Role::User, "again")],
+                &[],
+                Box::new(|_| true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_second.text, "Hello");
+
+        tags_mock.assert_hits(1);
+        pull_mock.assert_hits(1);
+        chat_mock.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn embed_pulls_missing_model_once_before_embed() {
+        let server = MockServer::start();
+
+        let tags_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"another-model:latest"}]}"#);
+        });
+
+        let pull_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/pull");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"status":"success"}"#);
+        });
+
+        let embed_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/embed");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"embeddings":[[0.1,0.2],[0.3,0.4]]}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+
+        let first = client
+            .embed(vec!["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(first, vec![vec![0.1_f32, 0.2_f32], vec![0.3_f32, 0.4_f32]]);
+
+        let second = client.embed(vec!["c".to_string()]).await.unwrap();
+        assert_eq!(second, vec![vec![0.1_f32, 0.2_f32], vec![0.3_f32, 0.4_f32]]);
+
+        tags_mock.assert_hits(1);
+        pull_mock.assert_hits(1);
+        embed_mock.assert_hits(2);
     }
 }
