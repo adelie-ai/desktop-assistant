@@ -1310,6 +1310,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_instruction_enforces_memory_first_for_user_specific_requests() {
+        let memory_first = "first check built-in preferences and memory before any non-memory tool";
+        let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming any limitation, but only after memory/preference checks when rule 1 applies.";
+
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(memory_first));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(tool_fallback));
+
+        let memory_first_pos = RUNTIME_SYSTEM_INSTRUCTION.find(memory_first).unwrap();
+        let tool_fallback_pos = RUNTIME_SYSTEM_INSTRUCTION.find(tool_fallback).unwrap();
+
+        assert!(
+            memory_first_pos < tool_fallback_pos,
+            "memory-first rule must remain before non-memory tool fallback rule"
+        );
+    }
+
     #[tokio::test]
     async fn llm_input_runtime_instruction_lists_available_tools() {
         use std::sync::atomic::{AtomicU64, Ordering};
