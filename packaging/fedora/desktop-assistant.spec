@@ -2,7 +2,7 @@ Name:           desktop-assistant
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Desktop assistant daemon and terminal UI
-License:        MIT
+License:        AGPL-3.0-or-later
 URL:            https://example.com/desktop-assistant
 Source0:        %{name}-%{version}.tar.gz
 
@@ -29,7 +29,7 @@ install -Dpm0644 systemd/desktop-assistant-daemon.service %{buildroot}%{_useruni
 install -Dpm0644 systemd/org.desktopAssistant.service %{buildroot}%{_datadir}/dbus-1/services/org.desktopAssistant.service
 
 %files
-%license packaging/LICENSE-MIT
+%license LICENSE
 %doc README.md
 %{_bindir}/desktop-assistant-daemon
 %{_bindir}/desktop-assistant-tui

@@ -55,6 +55,7 @@ Connector key naming convention is generic:
 - Connector names are normalized to alphanumeric/underscore (for example, `aws-bedrock` → `aws_bedrock_api_key` and `AWS_BEDROCK_API_KEY`).
 
 Secret backend default is `auto`:
+
 - `SetApiKey` writes to a DE-agnostic local file store: `$XDG_DATA_HOME/desktop-assistant/secrets/<connector>_api_key` (or `~/.local/share/desktop-assistant/secrets/...`).
 - Reads check that file store first.
 - If missing there, reads try systemd credentials (`$CREDENTIALS_DIRECTORY`).
@@ -415,3 +416,8 @@ Storage paths:
 - Conversations persist across daemon restarts in:
 	- `$XDG_DATA_HOME/desktop-assistant/conversations.json`, or
 	- `~/.local/share/desktop-assistant/conversations.json` if `XDG_DATA_HOME` is unset.
+
+## License
+
+Desktop Assistant is licensed under **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`).
+See the [LICENSE](LICENSE) file for the full text.
