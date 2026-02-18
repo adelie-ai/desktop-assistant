@@ -1,10 +1,12 @@
-# Adele - Linux AI Platform
+# Adelie Linux AI Platform
 
-A Rust AI platform for Linux desktops and applications, with:
+An API-first AI platform for Linux desktops and applications, with:
 - D-Bus API for conversation lifecycle and streaming responses
 - Multiple LLM backends (`ollama`, `openai`, `anthropic`)
 - MCP tool integration over stdio
 - Optional terminal UI (TUI) client
+
+Provides the **Adele** desktop assistant.
 
 ## Project Status
 
