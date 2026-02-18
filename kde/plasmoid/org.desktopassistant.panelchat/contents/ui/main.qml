@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import QtCore
+import org.kde.kirigami as Kirigami
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents
@@ -11,7 +12,7 @@ PlasmoidItem {
     readonly property string normalizedDataHome: xdgDataHome.indexOf("file://") === 0 ? xdgDataHome.substring(7) : xdgDataHome
     readonly property string sharedModuleChatViewPath: "file://" + normalizedDataHome + "/desktop-assistant/chat-module/ui/ChatView.qml"
 
-    preferredRepresentation: Plasmoid.compactRepresentation
+    preferredRepresentation: compactRepresentation
     switchWidth: 320
     switchHeight: 420
     Plasmoid.status: PlasmaCore.Types.ActiveStatus
@@ -19,8 +20,8 @@ PlasmoidItem {
     compactRepresentation: PlasmaComponents.ToolButton {
         text: "Adele AI"
         icon.source: Qt.resolvedUrl("../images/adele.png")
-        icon.width: PlasmaCore.Units.iconSizes.smallMedium
-        icon.height: PlasmaCore.Units.iconSizes.smallMedium
+        icon.width: Kirigami.Units.iconSizes.smallMedium
+        icon.height: Kirigami.Units.iconSizes.smallMedium
         onClicked: root.expanded = !root.expanded
     }
 

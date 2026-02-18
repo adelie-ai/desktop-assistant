@@ -58,6 +58,7 @@ Item {
         return false
     }
     property int lateResponsePollRemaining: 0
+    property int postSendRefreshRemaining: 0
     readonly property var pending: ({})
 
     function toImageSource(pathValue) {
@@ -597,12 +598,16 @@ Item {
                             }
                             refreshConversation()
                             reloadConversationList()
+                            postSendRefreshRemaining = 3
+                            postSendRefreshTimer.restart()
                         },
                         function(awaitErr) {
                             busy = false
                             appendStatus(awaitErr)
                             refreshConversation()
                             reloadConversationList()
+                            postSendRefreshRemaining = 3
+                            postSendRefreshTimer.restart()
                         }
                     )
                 },
@@ -681,6 +686,30 @@ Item {
             reloadConversationList()
             lateResponsePollRemaining = Math.max(0, lateResponsePollRemaining - 1)
             if (lateResponsePollRemaining <= 0) {
+                stop()
+            }
+        }
+    }
+
+    Timer {
+        id: postSendRefreshTimer
+        interval: 1000
+        repeat: true
+        running: false
+        onTriggered: {
+            if (conversationId.length === 0) {
+                stop()
+                return
+            }
+            if (busy) {
+                return
+            }
+
+            refreshConversation()
+            reloadConversationList()
+
+            postSendRefreshRemaining = Math.max(0, postSendRefreshRemaining - 1)
+            if (postSendRefreshRemaining <= 0) {
                 stop()
             }
         }
@@ -777,16 +806,25 @@ Item {
                 }
             }
 
-            PlasmaComponents.ComboBox {
+            QQC2.ComboBox {
                 id: conversationPicker
                 visible: true
                 Layout.fillWidth: true
                 enabled: !root.busy && !root.loadingConversation
                 model: root.conversationChoices
                 textRole: "title"
+                palette.text: PlasmaCore.Theme.textColor
+                palette.buttonText: PlasmaCore.Theme.textColor
                 delegate: QQC2.ItemDelegate {
+                    id: conversationDelegate
                     required property var modelData
                     width: conversationPicker.width
+                    highlighted: conversationPicker.highlightedIndex === index
+                    background: Rectangle {
+                        color: conversationDelegate.highlighted
+                            ? PlasmaCore.Theme.highlightColor
+                            : "transparent"
+                    }
 
                     contentItem: RowLayout {
                         spacing: 6
@@ -794,7 +832,9 @@ Item {
                         QQC2.Label {
                             Layout.fillWidth: true
                             text: modelData.title
-                            color: PlasmaCore.Theme.textColor
+                            color: conversationDelegate.highlighted
+                                ? PlasmaCore.Theme.highlightedTextColor
+                                : PlasmaCore.Theme.textColor
                             elide: Text.ElideRight
                         }
 
