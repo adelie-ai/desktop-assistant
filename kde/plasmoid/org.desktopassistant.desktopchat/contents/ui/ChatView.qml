@@ -21,15 +21,17 @@ Item {
     property bool serviceInitialized: false
     property bool productionServiceRunning: false
     property bool devServiceRunning: false
-    readonly property bool hideWidget: !devServiceRunning
+    readonly property bool hideWidget: false
     property var serviceChoices: []
     property string conversationId: ""
     property bool busy: false
     property bool loadingConversation: false
     property int conversationLoadSequence: 0
     property bool debugEnabled: false
+    property bool serviceStatusRequestInFlight: false
     property int currentMessageCount: 0
     property var transcriptEntries: []
+    readonly property int maxTranscriptEntries: 400
     property string promptText: ""
     property var conversationChoices: []
     property real uiScale: 1.0
@@ -93,11 +95,15 @@ Item {
         return "'" + value.replace(/'/g, "'\\''") + "'"
     }
 
-    function runCommand(command, onSuccess, onError) {
-        appendDebugStatus("run: " + command)
+    function runCommand(command, onSuccess, onError, logDebug) {
+        const shouldLogDebug = logDebug !== false
+        if (shouldLogDebug) {
+            appendDebugStatus("run: " + command)
+        }
         pending[command] = {
             success: onSuccess,
             error: onError,
+            debug: shouldLogDebug,
         }
         executable.connectSource(command)
     }
@@ -154,6 +160,18 @@ Item {
         return -1
     }
 
+    function sameServiceChoices(left, right) {
+        if (!left || !right || left.length !== right.length) {
+            return false
+        }
+        for (let i = 0; i < left.length; i++) {
+            if (left[i].value !== right[i].value || left[i].label !== right[i].label) {
+                return false
+            }
+        }
+        return true
+    }
+
     function syncServicePicker() {
         const idx = serviceIndexByValue(activeService)
         if (idx >= 0) {
@@ -192,61 +210,90 @@ Item {
         refreshConversation()
     }
 
-    function refreshServiceStatus(onReady) {
+    function refreshServiceStatus(onReady, options) {
+        const opts = options || {}
+        const silent = opts.silent === true
+        if (serviceStatusRequestInFlight) {
+            if (onReady) {
+                onReady()
+            }
+            return
+        }
+        serviceStatusRequestInFlight = true
+
         const command = "python3 " + shellEscape(helperPath) + " status"
         runCommand(
             command,
             function(stdout) {
-                const payload = JSON.parse(stdout)
-                productionServiceRunning = !!payload.production_running
-                devServiceRunning = !!payload.dev_running
-                if (payload.default_service && payload.default_service.length > 0) {
-                    productionService = payload.default_service
-                }
-                if (payload.dev_service && payload.dev_service.length > 0) {
-                    developmentService = payload.dev_service
-                }
-
-                serviceChoices = [
-                    {
-                        value: productionService,
-                        label: "Production",
+                try {
+                    const payload = JSON.parse(stdout)
+                    productionServiceRunning = !!payload.production_running
+                    devServiceRunning = !!payload.dev_running
+                    if (payload.default_service && payload.default_service.length > 0) {
+                        productionService = payload.default_service
                     }
-                ]
+                    if (payload.dev_service && payload.dev_service.length > 0) {
+                        developmentService = payload.dev_service
+                    }
 
-                if (devServiceRunning) {
-                    serviceChoices = serviceChoices.concat([
+                    let nextServiceChoices = [
                         {
-                            value: developmentService,
-                            label: "Development",
+                            value: productionService,
+                            label: "Production",
                         }
-                    ])
+                    ]
+
+                    if (devServiceRunning) {
+                        nextServiceChoices = nextServiceChoices.concat([
+                            {
+                                value: developmentService,
+                                label: "Development",
+                            }
+                        ])
+                    }
+
+                    if (!sameServiceChoices(serviceChoices, nextServiceChoices)) {
+                        serviceChoices = nextServiceChoices
+                    }
+
+                    if (!serviceInitialized) {
+                        loadPersistedService()
+                    }
+
+                    if (activeService !== productionService && activeService !== developmentService) {
+                        activeService = String(payload.selected_service || productionService)
+                    }
+
+                    if (!devServiceRunning && activeService === developmentService) {
+                        if (!silent) {
+                            appendStatus("Development service stopped; switching to production")
+                        }
+                        activeService = productionService
+                        persistActiveService()
+                    }
+
+                    syncServicePicker()
+                } catch (parseError) {
+                    if (!silent) {
+                        appendStatus("Service status parse error: " + parseError)
+                    }
+                } finally {
+                    serviceStatusRequestInFlight = false
+                    if (onReady) {
+                        onReady()
+                    }
                 }
-
-                if (!serviceInitialized) {
-                    loadPersistedService()
+            },
+            function(stderr) {
+                serviceStatusRequestInFlight = false
+                if (!silent) {
+                    appendStatus("Service status error: " + stderr)
                 }
-
-                if (activeService !== productionService && activeService !== developmentService) {
-                    activeService = String(payload.selected_service || productionService)
-                }
-
-                if (!devServiceRunning && activeService === developmentService) {
-                    appendStatus("Development service stopped")
-                }
-
-                syncServicePicker()
-
                 if (onReady) {
                     onReady()
                 }
             },
-            function(stderr) {
-                appendStatus("Service status error: " + stderr)
-                if (onReady) {
-                    onReady()
-                }
-            }
+            false
         )
     }
 
@@ -268,23 +315,25 @@ Item {
         if (normalizedText.trim().length === 0) {
             return
         }
-        transcriptEntries = transcriptEntries.concat([
-            {
-                kind: "message",
-                role: role,
-                text: normalizedText,
-            }
-        ])
+        appendTranscriptEntry({
+            kind: "message",
+            role: role,
+            text: normalizedText,
+        })
     }
 
     function appendStatus(text) {
-        transcriptEntries = transcriptEntries.concat([
-            {
-                kind: "status",
-                role: "status",
-                text: text,
-            }
-        ])
+        appendTranscriptEntry({
+            kind: "status",
+            role: "status",
+            text: text,
+        })
+    }
+
+    function appendTranscriptEntry(entry) {
+        const nextEntries = transcriptEntries.concat([entry])
+        const overflow = nextEntries.length - maxTranscriptEntries
+        transcriptEntries = overflow > 0 ? nextEntries.slice(overflow) : nextEntries
     }
 
     function appendDebugStatus(text) {
@@ -637,10 +686,14 @@ Item {
 
             try {
                 if (exitCode === 0) {
-                    appendDebugStatus("ok: " + sourceName)
+                    if (callbacks.debug) {
+                        appendDebugStatus("ok: " + sourceName)
+                    }
                     callbacks.success(stdout)
                 } else {
-                    appendDebugStatus("error: " + sourceName)
+                    if (callbacks.debug) {
+                        appendDebugStatus("error: " + sourceName)
+                    }
                     callbacks.error(stderr.length > 0 ? stderr : stdout)
                 }
             } catch (callbackError) {
@@ -670,7 +723,9 @@ Item {
         interval: 5000
         repeat: true
         running: true
-        onTriggered: refreshServiceStatus()
+        onTriggered: refreshServiceStatus(undefined, {
+            silent: true,
+        })
     }
 
     Timer {
@@ -785,26 +840,6 @@ Item {
 
         RowLayout {
             Layout.fillWidth: true
-
-            QQC2.CheckBox {
-                text: "Debug"
-                checked: root.debugEnabled
-                onToggled: root.debugEnabled = checked
-            }
-
-            QQC2.ComboBox {
-                id: servicePicker
-                visible: root.devServiceRunning
-                Layout.preferredWidth: 170
-                Layout.fillWidth: false
-                model: root.serviceChoices
-                textRole: "label"
-                palette.text: PlasmaCore.Theme.textColor
-                palette.buttonText: PlasmaCore.Theme.textColor
-                onActivated: function(index) {
-                    switchService(index)
-                }
-            }
 
             QQC2.ComboBox {
                 id: conversationPicker
@@ -1034,7 +1069,7 @@ Item {
             QQC2.TextArea {
                 id: promptInput
                 Layout.fillWidth: true
-                Layout.preferredHeight: Math.max(Math.round(72 * root.uiScale), sendButton.implicitHeight)
+                Layout.preferredHeight: Math.round(72 * root.uiScale)
                 Layout.maximumHeight: Math.round(180 * root.uiScale)
                 placeholderText: "Ask Adele…"
                 wrapMode: TextEdit.Wrap
@@ -1057,18 +1092,17 @@ Item {
                     event.accepted = true
                 }
             }
-
-            QQC2.Button {
-                id: sendButton
-                Layout.alignment: Qt.AlignBottom
-                text: busy ? "…" : "Send"
-                enabled: !busy
-                onClicked: sendPrompt(root.promptText)
-            }
         }
 
         RowLayout {
             Layout.fillWidth: true
+
+            QQC2.Button {
+                id: sendButton
+                text: busy ? "…" : "Send"
+                enabled: !busy
+                onClicked: sendPrompt(root.promptText)
+            }
 
             QQC2.Button {
                 text: "New"
@@ -1088,6 +1122,42 @@ Item {
                 enabled: !busy
                 onClicked: clearTranscriptView()
             }
+
+            Item {
+                Layout.fillWidth: true
+            }
+
+            QQC2.ComboBox {
+                id: servicePicker
+                visible: root.devServiceRunning
+                Layout.preferredWidth: 170
+                Layout.fillWidth: false
+                model: root.serviceChoices
+                textRole: "label"
+                palette.text: PlasmaCore.Theme.textColor
+                palette.buttonText: PlasmaCore.Theme.textColor
+                onActivated: function(index) {
+                    switchService(index)
+                }
+            }
+
+            QQC2.CheckBox {
+                id: debugCheckBox
+                text: "Debug"
+                checked: root.debugEnabled
+                palette.text: PlasmaCore.Theme.textColor
+                palette.buttonText: PlasmaCore.Theme.textColor
+                palette.windowText: PlasmaCore.Theme.textColor
+                contentItem: QQC2.Label {
+                    text: debugCheckBox.text
+                    color: PlasmaCore.Theme.textColor
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: debugCheckBox.indicator && debugCheckBox.indicator.visible
+                        ? debugCheckBox.indicator.width + debugCheckBox.spacing
+                        : 0
+                }
+                onToggled: root.debugEnabled = checked
+            }
         }
     }
 
@@ -1101,10 +1171,6 @@ Item {
         ]
         appendDebugStatus("Widget loaded")
         refreshServiceStatus(function() {
-            if (root.hideWidget) {
-                appendStatus("Development service not running; widget hidden")
-                return
-            }
             if (panelMode) {
                 ensureConversation()
             } else {
