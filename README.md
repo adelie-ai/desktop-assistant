@@ -34,8 +34,9 @@ This branding is fairly superficial and isn't extensively reflected in code at t
 
 ## Desktop Integrations
 
-- KDE widgets (Plasmoids) are provided in this repository.
-- A KDE app/integration surface is also provided for interacting with the assistant.
+- KDE widgets (Plasmoids) and app are provided in this repository.
+- TUI provided for terminal useage (more basic CLI also planned)
+- A DBUS integration surface is provided for interacting with the assistant from any program.
 - GNOME, COSMIC, and generic desktop integration support are planned.
 
 ## Integration Model
@@ -46,7 +47,7 @@ This branding is fairly superficial and isn't extensively reflected in code at t
 
 ## Privacy and Connectivity
 
-The system is designed for privacy first, while still offering cloud LLM connectors as a pragmatic option.
+The system is designed for privacy first, while still offering cloud LLM connectors as a pragmatic option. As always, privacy is a choose-your-own-adventure.
 
 If you use Ollama, the assistant can run entirely offline, preserving privacy. In practice, strong offline quality usually requires larger models and suitable hardware.
 
