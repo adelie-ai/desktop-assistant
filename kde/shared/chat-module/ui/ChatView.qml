@@ -31,7 +31,10 @@ Item {
     property bool serviceStatusRequestInFlight: false
     property int currentMessageCount: 0
     property var transcriptEntries: []
+    property int transcriptEntryIdSeq: 0
+    property var expandedToolEntries: ({})
     readonly property int maxTranscriptEntries: 400
+    readonly property int maxDebugPayloadChars: 1200
     property string promptText: ""
     property var conversationChoices: []
     property real uiScale: 1.0
@@ -95,10 +98,66 @@ Item {
         return "'" + value.replace(/'/g, "'\\''") + "'"
     }
 
+    function limitDebugPayload(text) {
+        const normalized = String(text || "")
+        if (normalized.length <= maxDebugPayloadChars) {
+            return normalized
+        }
+        return normalized.substring(0, maxDebugPayloadChars) + "…"
+    }
+
+    function parseToolCommand(command) {
+        const normalized = String(command || "").trim()
+        const helperMatch = normalized.match(/^python3\s+'([^']+)'\s+--service\s+'([^']+)'\s*(.*)$/)
+        if (helperMatch) {
+            const args = String(helperMatch[3] || "").trim()
+            return {
+                toolName: "dbus_client.py",
+                inputText: args.length > 0
+                    ? ("service=" + helperMatch[2] + "\nargs: " + args)
+                    : ("service=" + helperMatch[2]),
+            }
+        }
+
+        const settingsMatch = normalized.match(/^systemsettings\s+(.+)$/)
+        if (settingsMatch) {
+            return {
+                toolName: "systemsettings",
+                inputText: settingsMatch[1],
+            }
+        }
+
+        return {
+            toolName: "shell",
+            inputText: normalized,
+        }
+    }
+
+    function appendToolExecutionDebug(phase, command, details) {
+        if (!debugEnabled) {
+            return
+        }
+        const parsed = parseToolCommand(command)
+        const lines = [
+            "tool: " + parsed.toolName,
+            "phase: " + phase,
+            "input:",
+            limitDebugPayload(parsed.inputText),
+        ]
+        const trimmedDetails = String(details || "").trim()
+        if (trimmedDetails.length > 0) {
+            lines.push("result:")
+            lines.push(limitDebugPayload(trimmedDetails))
+        }
+        appendMessage("tool", lines.join("\n"), {
+            toolName: parsed.toolName,
+        })
+    }
+
     function runCommand(command, onSuccess, onError, logDebug) {
         const shouldLogDebug = logDebug !== false
         if (shouldLogDebug) {
-            appendDebugStatus("run: " + command)
+            appendToolExecutionDebug("run", command, "")
         }
         pending[command] = {
             success: onSuccess,
@@ -307,7 +366,7 @@ Item {
         )
     }
 
-    function appendMessage(role, text) {
+    function appendMessage(role, text, meta) {
         if (role === "tool" && !debugEnabled) {
             return
         }
@@ -315,11 +374,17 @@ Item {
         if (normalizedText.trim().length === 0) {
             return
         }
-        appendTranscriptEntry({
+        const entry = {
             kind: "message",
             role: role,
             text: normalizedText,
-        })
+        }
+        if (meta) {
+            for (const key in meta) {
+                entry[key] = meta[key]
+            }
+        }
+        appendTranscriptEntry(entry)
     }
 
     function appendStatus(text) {
@@ -331,14 +396,31 @@ Item {
     }
 
     function appendTranscriptEntry(entry) {
-        const nextEntries = transcriptEntries.concat([entry])
+        const nextEntry = Object.assign({}, entry)
+        if (nextEntry.entryId === undefined) {
+            transcriptEntryIdSeq = transcriptEntryIdSeq + 1
+            nextEntry.entryId = transcriptEntryIdSeq
+        }
+        const nextEntries = transcriptEntries.concat([nextEntry])
         const overflow = nextEntries.length - maxTranscriptEntries
         transcriptEntries = overflow > 0 ? nextEntries.slice(overflow) : nextEntries
     }
 
+    function isToolEntryExpanded(entryId) {
+        return expandedToolEntries[String(entryId)] === true
+    }
+
+    function toggleToolEntryExpanded(entryId) {
+        const key = String(entryId)
+        const nextValue = !isToolEntryExpanded(entryId)
+        const nextMap = Object.assign({}, expandedToolEntries)
+        nextMap[key] = nextValue
+        expandedToolEntries = nextMap
+    }
+
     function appendDebugStatus(text) {
         if (debugEnabled) {
-            appendStatus(text)
+            appendMessage("tool", text)
         }
     }
 
@@ -393,6 +475,7 @@ Item {
                 conversationId = payload.conversation_id
                 promptText = ""
                 currentMessageCount = 0
+                expandedToolEntries = ({})
                 transcriptEntries = [
                     {
                         kind: "status",
@@ -488,6 +571,7 @@ Item {
                     conversationId = ""
                     promptText = ""
                     currentMessageCount = 0
+                    expandedToolEntries = ({})
                     transcriptEntries = [
                         {
                             kind: "status",
@@ -568,6 +652,7 @@ Item {
                     return
                 }
 
+                expandedToolEntries = ({})
                 transcriptEntries = []
                 for (let i = 0; i < payload.messages.length; i++) {
                     const message = payload.messages[i]
@@ -589,6 +674,7 @@ Item {
     }
 
     function clearTranscriptView() {
+        expandedToolEntries = ({})
         transcriptEntries = [
             {
                 kind: "status",
@@ -687,12 +773,12 @@ Item {
             try {
                 if (exitCode === 0) {
                     if (callbacks.debug) {
-                        appendDebugStatus("ok: " + sourceName)
+                        appendToolExecutionDebug("ok", sourceName, stdout)
                     }
                     callbacks.success(stdout)
                 } else {
                     if (callbacks.debug) {
-                        appendDebugStatus("error: " + sourceName)
+                        appendToolExecutionDebug("error", sourceName, stderr.length > 0 ? stderr : stdout)
                     }
                     callbacks.error(stderr.length > 0 ? stderr : stdout)
                 }
@@ -853,6 +939,7 @@ Item {
                 delegate: QQC2.ItemDelegate {
                     id: conversationDelegate
                     required property var modelData
+                    required property int index
                     width: conversationPicker.width
                     highlighted: conversationPicker.highlightedIndex === index
                     background: Rectangle {
@@ -953,11 +1040,14 @@ Item {
                 delegate: Item {
                     required property var modelData
                     readonly property bool isStatus: modelData.kind === "status"
+                    readonly property bool isTool: modelData.role === "tool"
+                    readonly property string toolName: String(modelData.toolName || "Tool")
                     readonly property bool isAssistant: modelData.role === "assistant"
+                    readonly property bool toolExpanded: root.isToolEntryExpanded(modelData.entryId)
                     readonly property real avatarSize: 24 * root.uiScale
                     readonly property var avatarSources: isAssistant ? [root.adeleAvatarSource] : root.userAvatarCandidates()
 
-                    visible: !isStatus || root.debugEnabled
+                    visible: !(isStatus || isTool) || root.debugEnabled
                     width: ListView.view.width
                     implicitHeight: visible ? rowContainer.implicitHeight + 2 : 0
 
@@ -967,13 +1057,13 @@ Item {
                         anchors.right: parent.right
                         anchors.top: parent.top
                         spacing: 6
-                        layoutDirection: isStatus ? Qt.LeftToRight : (isAssistant ? Qt.RightToLeft : Qt.LeftToRight)
+                        layoutDirection: (isStatus || isTool) ? Qt.LeftToRight : (isAssistant ? Qt.RightToLeft : Qt.LeftToRight)
 
                         Item {
-                            Layout.preferredWidth: isStatus ? 0 : avatarSize
-                            Layout.preferredHeight: isStatus ? 0 : avatarSize
+                            Layout.preferredWidth: (isStatus || isTool) ? 0 : avatarSize
+                            Layout.preferredHeight: (isStatus || isTool) ? 0 : avatarSize
                             Layout.alignment: Qt.AlignTop
-                            visible: !isStatus
+                            visible: !(isStatus || isTool)
 
                             Rectangle {
                                 anchors.fill: parent
@@ -1018,22 +1108,37 @@ Item {
                             implicitWidth: isStatus
                                 ? rowContainer.width
                                 : Math.min(rowContainer.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
-                            implicitHeight: messageText.implicitHeight + 12
+                            implicitHeight: bubbleContent.implicitHeight + 12
                             height: implicitHeight
                             radius: isStatus ? 0 : 8
                             color: isStatus
                                 ? "transparent"
-                                : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor)
+                                : (isTool
+                                    ? PlasmaCore.Theme.backgroundColor
+                                    : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor))
                             border.width: isStatus ? 0 : 1
                             border.color: PlasmaCore.Theme.disabledTextColor
 
-                            TextEdit {
-                                id: messageText
+                            ColumnLayout {
+                                id: bubbleContent
                                 anchors.left: parent.left
                                 anchors.right: parent.right
                                 anchors.top: parent.top
                                 anchors.margins: 6
-                                height: contentHeight
+                                spacing: 4
+
+                                QQC2.Button {
+                                    visible: isTool
+                                    Layout.fillWidth: true
+                                    text: (toolExpanded ? "▾" : "▸") + " " + toolName
+                                    onClicked: root.toggleToolEntryExpanded(modelData.entryId)
+                                }
+
+                            TextEdit {
+                                id: messageText
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: visible ? contentHeight : 0
+                                visible: !isTool || toolExpanded
                                 readOnly: true
                                 selectByMouse: true
                                 selectByKeyboard: true
@@ -1044,18 +1149,21 @@ Item {
                                     : String(modelData.text || "")
                                 color: isStatus
                                     ? PlasmaCore.Theme.disabledTextColor
-                                    : (isAssistant
+                                    : (isTool
                                         ? PlasmaCore.Theme.textColor
-                                        : PlasmaCore.Theme.highlightedTextColor)
+                                        : (isAssistant
+                                        ? PlasmaCore.Theme.textColor
+                                        : PlasmaCore.Theme.highlightedTextColor))
                                 font.pointSize: root.baseFontPointSize * root.uiScale
                                 font.italic: isStatus
                                 font.bold: false
                                 activeFocusOnPress: true
-                                selectedTextColor: isAssistant ? PlasmaCore.Theme.highlightedTextColor : PlasmaCore.Theme.textColor
-                                selectionColor: isAssistant ? PlasmaCore.Theme.highlightColor : PlasmaCore.Theme.backgroundColor
+                                selectedTextColor: (isAssistant || isTool) ? PlasmaCore.Theme.textColor : PlasmaCore.Theme.highlightedTextColor
+                                selectionColor: (isAssistant || isTool) ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor
                                 onLinkActivated: function(link) {
                                     Qt.openUrlExternally(link)
                                 }
+                            }
                             }
                         }
                     }
@@ -1156,12 +1264,18 @@ Item {
                         ? debugCheckBox.indicator.width + debugCheckBox.spacing
                         : 0
                 }
-                onToggled: root.debugEnabled = checked
+                onToggled: {
+                    root.debugEnabled = checked
+                    if (root.debugEnabled && root.conversationId.length > 0 && !root.loadingConversation) {
+                        root.refreshConversation()
+                    }
+                }
             }
         }
     }
 
     Component.onCompleted: {
+        expandedToolEntries = ({})
         transcriptEntries = [
             {
                 kind: "status",

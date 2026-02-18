@@ -318,16 +318,15 @@ fn apply_stream_event(
 ) -> bool {
     match event {
         aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStart(start) => {
-            if let Some(content_start) = start.start() {
-                if let aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(tool_use) =
+            if let Some(content_start) = start.start()
+                && let aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(tool_use) =
                     content_start
-                {
-                    tool_acc.start_tool_use(
-                        start.content_block_index(),
-                        tool_use.tool_use_id(),
-                        tool_use.name(),
-                    );
-                }
+            {
+                tool_acc.start_tool_use(
+                    start.content_block_index(),
+                    tool_use.tool_use_id(),
+                    tool_use.name(),
+                );
             }
         }
         aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockDelta(delta) => {
