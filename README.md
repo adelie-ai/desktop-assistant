@@ -5,6 +5,7 @@ An API-first AI platform for Linux desktops and applications, with:
 - Multiple LLM backends (`ollama`, `openai`, `anthropic`)
 - MCP tool integration over stdio
 - Optional terminal UI (TUI) client
+- KDE plasmoids and control panel, with other DEs to come
 
 Provides the **Adele** desktop assistant.
 
