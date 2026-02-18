@@ -1208,13 +1208,16 @@ Item {
                                     onClicked: root.toggleToolEntryExpanded(modelData.entryId)
                                 }
 
-                            Text {
+                            TextEdit {
                                 id: messageText
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: visible ? implicitHeight : 0
+                                Layout.preferredHeight: visible ? contentHeight : 0
                                 visible: !isTool || toolExpanded
-                                wrapMode: Text.Wrap
-                                textFormat: Text.PlainText
+                                readOnly: true
+                                selectByMouse: true
+                                selectByKeyboard: true
+                                wrapMode: TextEdit.Wrap
+                                textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
                                 text: isStatus
                                     ? "[status] " + String(modelData.text || "")
                                     : String(modelData.text || "")
@@ -1228,6 +1231,12 @@ Item {
                                 font.pointSize: root.baseFontPointSize * root.uiScale
                                 font.italic: isStatus
                                 font.bold: false
+                                activeFocusOnPress: true
+                                selectedTextColor: (isAssistant || isTool) ? root.themeHighlightedTextColor : root.themeTextColor
+                                selectionColor: (isAssistant || isTool) ? root.themeHighlightColor : root.themeBackgroundColor
+                                onLinkActivated: function(link) {
+                                    Qt.openUrlExternally(link)
+                                }
                             }
                             }
                         }
