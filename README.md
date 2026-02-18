@@ -1,10 +1,18 @@
-# Adele - The Linux Desktop Assistant
+# Adele - Linux AI Platform
 
-A Rust desktop assistant with:
+A Rust AI platform for Linux desktops and applications, with:
 - D-Bus API for conversation lifecycle and streaming responses
 - Multiple LLM backends (`ollama`, `openai`, `anthropic`)
 - MCP tool integration over stdio
 - Optional terminal UI (TUI) client
+
+## Project Status
+
+Much of this codebase is currently AI-generated, and it has not yet been comprehensively reviewed by humans. It appears to work well in practice, but it should still be treated as experimental.
+
+The current phase of the project is focused on mapping the landscape and getting core functionality in place, so this experimental status is expected to remain for a while.
+
+Community feedback and contributions are very welcome as the platform matures.
 
 The assistant persona is named **Adele**, in reference to the **Adélie penguin**.
 
@@ -16,6 +24,26 @@ The assistant persona is named **Adele**, in reference to the **Adélie penguin*
 - `crates/llm-openai` — streaming OpenAI-compatible client
 - `crates/mcp-client` — MCP process client + tool executor
 - `crates/tui` — interactive terminal client
+
+## Desktop Integrations
+
+- KDE widgets (Plasmoids) are provided in this repository.
+- A KDE app/integration surface is also provided for interacting with the assistant.
+- GNOME, COSMIC, and generic desktop integration support are planned.
+
+## Integration Model
+
+- This project is intended to be an AI platform with integration points for desktop environments and applications, not only a standalone desktop assistant.
+- The platform exposes extensive D-Bus-based APIs for integration with desktop environments and applications.
+- The platform makes extensive use of MCP services for pluggable (and un-pluggable) functionality.
+
+## Privacy and Connectivity
+
+The system is designed for privacy first, while still offering cloud LLM connectors as a pragmatic option.
+
+If you use Ollama, the assistant can run entirely offline, preserving privacy. In practice, strong offline quality usually requires larger models and suitable hardware.
+
+If local hardware is limited, cloud services may currently provide better results when that tradeoff is acceptable to you. Nothing in the assistant architecture inherently requires cloud services, and as hardware becomes cheaper over time, fully local operation is expected to become the default for more users.
 
 ## Requirements
 
