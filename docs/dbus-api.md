@@ -27,6 +27,8 @@ Interface: `org.desktopAssistant.Settings`
 - `GetEmbeddingsSettings() -> (connector: s, model: s, base_url: s, has_api_key: b, available: b, is_default: b)`
 - `SetEmbeddingsSettings(connector: s, model: s, base_url: s) -> ()`
   - Empty `connector` clears the override and reverts to defaulting from the LLM connector
+- `GetConnectorDefaults(connector: s) -> (llm_model: s, llm_base_url: s, embeddings_model: s, embeddings_base_url: s, embeddings_available: b)`
+  - Returns provider defaults for the requested connector (empty `connector` resolves to the default connector)
 
 ## Signals
 

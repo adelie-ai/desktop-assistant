@@ -2,7 +2,7 @@
 
 An API-first AI platform for Linux desktops and applications, with:
 - D-Bus API for conversation lifecycle and streaming responses
-- Multiple LLM backends (`ollama`, `openai`, `anthropic`)
+- Multiple LLM backends (`ollama`, `openai`, `anthropic`, `bedrock`)
 - MCP tool integration over stdio
 - Optional terminal UI (TUI) client
 - KDE plasmoids and control panel, with other DEs to come
@@ -23,12 +23,21 @@ The core platform is called the **Adelie** AI platform. The assistant persona im
 
 This branding is fairly superficial and isn't extensively reflected in code at this point, but once it settles, that will probably change. 
 
+## The Future
+
+The platform itself is not necessarily desktop-specific, and could be used as a non-dbus web service. This is planned, but we need to choose our battles. The desktop platform route is great for hammering out features for the short term. 
+
+Connectors are being developed for a wide range of cloud services, from standard OpenAI and Anthropic to less common AWS Bedrock and others. This is to allow the user to choose "effort" vs "ease", and the associated levels of privacy and control. 
+
 ## Workspace at a Glance
 
 - `crates/core` — domain model + ports (hexagonal core)
 - `crates/dbus-interface` — D-Bus adapter for conversation service
 - `crates/daemon` — runtime wiring and D-Bus service host
 - `crates/llm-openai` — streaming OpenAI-compatible client
+- `crates/llm-anthropic` — streaming Anthropic Messages client
+- `crates/llm-ollama` — streaming Ollama chat + embedding client
+- `crates/llm-bedrock` — streaming AWS Bedrock client
 - `crates/mcp-client` — MCP process client + tool executor
 - `crates/tui` — interactive terminal client
 
@@ -51,13 +60,17 @@ The system is designed for privacy first, while still offering cloud LLM connect
 
 If you use Ollama, the assistant can run entirely offline, preserving privacy. In practice, strong offline quality usually requires larger models and suitable hardware.
 
-If local hardware is limited, cloud services may currently provide better results when that tradeoff is acceptable to you. Nothing in the assistant architecture inherently requires cloud services, and as hardware becomes cheaper over time, fully local operation is expected to become the default for more users.
+If local hardware is limited, cloud services may currently provide better results when that tradeoff is acceptable to you. Nothing in the assistant architecture inherently requires cloud services, and as hardware becomes cheaper over time, fully local operation is expected to become the default for more users. 
+
+**Adelie Platform uses API calls to the cloud AI providers. By and large, cloud AI providers do NOT use API call data for training purposes, but you are responsible for understanding the privacy implications of your chosen provider.**
+
+Quick provider privacy + setup links: [docs/cloud-providers.md](docs/cloud-providers.md)
 
 ## Requirements
 
 - Rust (stable, edition 2024)
 - Linux session D-Bus (`DBUS_SESSION_BUS_ADDRESS` available)
-- For cloud connectors, a connector-specific API key (for example `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`)
+- For cloud connectors, connector credentials (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or AWS credentials for Bedrock)
 - Optional MCP servers (for tools)
 
 ## Quick Start
@@ -71,19 +84,32 @@ cargo build --workspace
 ### 2) Configure connector
 
 Default connector is `openai`.
+Default OpenAI model is `gpt-5.2`.
 
 To opt into local Ollama instead, set `llm.connector = "ollama"` in your daemon config (`$XDG_CONFIG_HOME/desktop-assistant/daemon.toml`, or `~/.config/desktop-assistant/daemon.toml`).
 
-For cloud connectors, export the matching API key environment variable:
+For cloud connectors, set credentials for the connector you use:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
 export ANTHROPIC_API_KEY=your_key_here
+export AWS_REGION=us-east-1
 
 # optional connector overrides:
-export OPENAI_MODEL=gpt-4o
+export OPENAI_MODEL=gpt-5.2
 export OPENAI_BASE_URL=https://api.openai.com/v1
+
+# optional Bedrock API key field format accepted by this daemon:
+# export AWS_BEDROCK_API_KEY=ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]
 ```
+
+Bedrock notes:
+- Set `llm.connector = "bedrock"` (or `"aws-bedrock"`).
+- `llm.base_url` is interpreted as AWS region by default (for example `us-east-1`).
+- You can also use a Bedrock runtime endpoint URL (for example `https://bedrock-runtime.us-east-1.amazonaws.com`).
+- Credentials resolve via the standard AWS SDK credential provider chain (for example `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, shared AWS CLI config from `aws configure`, SSO profiles, or IAM role credentials).
+- If you are running locally, configure AWS CLI/profile first (`aws configure` or `aws configure sso`) and ensure the selected profile has Bedrock permissions in the target region.
+- Optional connector key format `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]` is supported for parity with single-field API key flows.
 
 Connector key naming convention is generic:
 - Secret backend account key defaults to `<connector>_api_key`.
@@ -416,6 +442,7 @@ require a working `snapd`/`core24` runtime that is not reliable inside Docker/Po
 - [D-Bus API](docs/dbus-api.md)
 - [MCP Integration](docs/mcp-integration.md)
 - [Development Guide](docs/development.md)
+- [Cloud Providers](docs/cloud-providers.md)
 
 ## Built-in Memory Tools
 
@@ -447,7 +474,7 @@ Storage paths:
 - Daemon LLM settings are read from:
 	- `$XDG_CONFIG_HOME/desktop-assistant/daemon.toml`, or
 	- `~/.config/desktop-assistant/daemon.toml` if `XDG_CONFIG_HOME` is unset.
-- API keys can be stored in the desktop keyring via `libsecret`/Secret Service (default backend).
+- Secret backend default is `auto` (local file store first, then systemd credentials, then keyrings).
 - KDE Wallet remains supported via `llm.secret.backend = "kwallet"` in `daemon.toml`.
 - Conversations persist across daemon restarts in:
 	- `$XDG_DATA_HOME/desktop-assistant/conversations.json`, or

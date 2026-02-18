@@ -39,6 +39,16 @@ impl LlmResponse {
 
 /// Outbound port for LLM completion requests.
 pub trait LlmClient: Send + Sync {
+    /// Return the connector's built-in default model, if it has one.
+    fn get_default_model(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return the connector's built-in default base URL, if it has one.
+    fn get_default_base_url(&self) -> Option<&str> {
+        None
+    }
+
     /// Stream a completion from the LLM given a message history.
     /// Calls `on_chunk` for each text token/chunk received.
     /// Optionally accepts tool definitions to enable tool calling.
@@ -61,6 +71,14 @@ mod tests {
     }
 
     impl LlmClient for MockLlm {
+        fn get_default_model(&self) -> Option<&str> {
+            Some("mock")
+        }
+
+        fn get_default_base_url(&self) -> Option<&str> {
+            Some("mock://")
+        }
+
         async fn stream_completion(
             &self,
             _messages: Vec<Message>,

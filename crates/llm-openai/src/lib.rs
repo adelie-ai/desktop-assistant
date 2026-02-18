@@ -15,12 +15,20 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
+    pub fn get_default_model() -> Option<&'static str> {
+        Some("gpt-5.2")
+    }
+
+    pub fn get_default_base_url() -> Option<&'static str> {
+        Some("https://api.openai.com/v1")
+    }
+
     pub fn new(api_key: String) -> Self {
         Self {
             client: Client::new(),
             api_key,
-            model: "gpt-5.2".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
+            model: Self::get_default_model().unwrap_or_default().to_string(),
+            base_url: Self::get_default_base_url().unwrap_or_default().to_string(),
         }
     }
 
@@ -36,7 +44,7 @@ impl OpenAiClient {
 
     /// Create from environment variables.
     /// Reads `OPENAI_API_KEY` for the API key.
-    /// Optionally reads `OPENAI_MODEL` (defaults to gpt-4o)
+    /// Optionally reads `OPENAI_MODEL` (defaults to gpt-5.2)
     /// and `OPENAI_BASE_URL` (defaults to https://api.openai.com/v1).
     /// Generate embeddings for a batch of texts.
     ///
@@ -283,6 +291,14 @@ impl ToolCallAccumulator {
 }
 
 impl LlmClient for OpenAiClient {
+    fn get_default_model(&self) -> Option<&str> {
+        Self::get_default_model()
+    }
+
+    fn get_default_base_url(&self) -> Option<&str> {
+        Self::get_default_base_url()
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
@@ -538,7 +554,7 @@ mod tests {
     #[test]
     fn request_without_tools_omits_field() {
         let req = ChatRequest {
-            model: "gpt-4o".into(),
+            model: "gpt-5.2".into(),
             messages: vec![],
             stream: true,
             tools: vec![],
@@ -551,7 +567,7 @@ mod tests {
     fn request_with_tools_includes_field() {
         let def = ToolDefinition::new("test", "desc", serde_json::json!({"type": "object"}));
         let req = ChatRequest {
-            model: "gpt-4o".into(),
+            model: "gpt-5.2".into(),
             messages: vec![],
             stream: true,
             tools: vec![ChatTool::from(&def)],

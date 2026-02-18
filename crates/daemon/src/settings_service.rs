@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
-    EmbeddingsSettingsView, LlmSettingsView, SettingsService,
+    ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, SettingsService,
 };
 
 use crate::config;
@@ -77,6 +77,20 @@ impl SettingsService for DaemonSettingsService {
             base_url.as_deref(),
         )
         .map_err(|error| CoreError::SystemService(error.to_string()))
+    }
+
+    async fn get_connector_defaults(
+        &self,
+        connector: String,
+    ) -> Result<ConnectorDefaultsView, CoreError> {
+        let defaults = config::get_connector_defaults(&connector);
+        Ok(ConnectorDefaultsView {
+            llm_model: defaults.llm_model,
+            llm_base_url: defaults.llm_base_url,
+            embeddings_model: defaults.embeddings_model,
+            embeddings_base_url: defaults.embeddings_base_url,
+            embeddings_available: defaults.embeddings_available,
+        })
     }
 }
 

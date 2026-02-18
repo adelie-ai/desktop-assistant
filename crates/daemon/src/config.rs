@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, anyhow};
+use desktop_assistant_llm_anthropic::AnthropicClient;
+use desktop_assistant_llm_bedrock::BedrockClient;
+use desktop_assistant_llm_ollama::OllamaClient;
+use desktop_assistant_llm_openai::OpenAiClient;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +140,15 @@ pub struct EmbeddingsSettingsView {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConnectorDefaultsView {
+    pub llm_model: String,
+    pub llm_base_url: String,
+    pub embeddings_model: String,
+    pub embeddings_base_url: String,
+    pub embeddings_available: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResolvedPersistenceConfig {
     pub enabled: bool,
     pub remote_url: Option<String>,
@@ -170,6 +183,20 @@ fn default_secret_account(connector: &str) -> String {
 fn default_api_key_env(connector: &str) -> String {
     format!(
         "{}_API_KEY",
+        normalized_connector_key_prefix(connector).to_ascii_uppercase()
+    )
+}
+
+fn default_model_env(connector: &str) -> String {
+    format!(
+        "{}_MODEL",
+        normalized_connector_key_prefix(connector).to_ascii_uppercase()
+    )
+}
+
+fn default_base_url_env(connector: &str) -> String {
+    format!(
+        "{}_BASE_URL",
         normalized_connector_key_prefix(connector).to_ascii_uppercase()
     )
 }
@@ -381,6 +408,33 @@ pub fn set_embeddings_settings(
     save_daemon_config(path, &config)
 }
 
+pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
+    let connector = connector.trim().to_lowercase();
+    let connector = if connector.is_empty() {
+        default_connector()
+    } else {
+        connector
+    };
+
+    let llm_model = default_llm_model(&connector);
+    let llm_base_url = default_base_url(&connector);
+
+    let embeddings_available = connector != "anthropic";
+    let embeddings_connector = if embeddings_available {
+        connector.as_str()
+    } else {
+        "openai"
+    };
+
+    ConnectorDefaultsView {
+        llm_model,
+        llm_base_url,
+        embeddings_model: default_embedding_model(embeddings_connector),
+        embeddings_base_url: default_base_url(embeddings_connector),
+        embeddings_available,
+    }
+}
+
 pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSettingsView {
     let llm_connector = config
         .map(|c| c.llm.connector.trim().to_lowercase())
@@ -457,16 +511,31 @@ pub fn resolve_persistence_config(config: Option<&DaemonConfig>) -> ResolvedPers
 fn default_embedding_model(connector: &str) -> String {
     match connector {
         "ollama" => "nomic-embed-text".to_string(),
+        "bedrock" | "aws-bedrock" => "amazon.titan-embed-text-v2:0".to_string(),
         _ => "text-embedding-3-small".to_string(),
     }
 }
 
 fn default_base_url(connector: &str) -> String {
     match connector {
-        "ollama" => "http://localhost:11434".to_string(),
-        "anthropic" => "https://api.anthropic.com".to_string(),
-        _ => "https://api.openai.com/v1".to_string(),
+        "ollama" => OllamaClient::get_default_base_url(),
+        "anthropic" => AnthropicClient::get_default_base_url(),
+        "bedrock" | "aws-bedrock" => BedrockClient::get_default_base_url(),
+        _ => OpenAiClient::get_default_base_url(),
     }
+    .unwrap_or_default()
+    .to_string()
+}
+
+fn default_llm_model(connector: &str) -> String {
+    match connector {
+        "ollama" => OllamaClient::get_default_model(),
+        "anthropic" => AnthropicClient::get_default_model(),
+        "bedrock" | "aws-bedrock" => BedrockClient::get_default_model(),
+        _ => OpenAiClient::get_default_model(),
+    }
+    .unwrap_or_default()
+    .to_string()
 }
 
 fn normalize_optional_value(value: Option<&str>) -> Option<String> {
@@ -485,6 +554,8 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
         .unwrap_or_else(default_connector);
 
     let default_api_key_env = default_api_key_env(&connector);
+    let default_model_env = default_model_env(&connector);
+    let default_base_url_env = default_base_url_env(&connector);
 
     let api_key_env = llm_config
         .and_then(|c| c.api_key_env.as_deref())
@@ -502,20 +573,17 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
     let model = llm_config
         .and_then(|c| c.model.clone())
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| std::env::var("OPENAI_MODEL").ok())
-        .unwrap_or_else(|| match connector.as_str() {
-            "ollama" => "llama3.2".to_string(),
-            "anthropic" => "claude-sonnet-4-5-20250929".to_string(),
-            _ => "gpt-4o".to_string(),
-        });
+        .or_else(|| std::env::var(default_model_env).ok())
+        .unwrap_or_else(|| default_llm_model(&connector));
 
     let base_url = llm_config
         .and_then(|c| c.base_url.clone())
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+        .or_else(|| std::env::var(default_base_url_env).ok())
         .unwrap_or_else(|| match connector.as_str() {
             "ollama" => "http://localhost:11434".to_string(),
             "anthropic" => "https://api.anthropic.com".to_string(),
+            "bedrock" | "aws-bedrock" => "us-east-1".to_string(),
             _ => "https://api.openai.com/v1".to_string(),
         });
 
@@ -858,13 +926,13 @@ mod tests {
             r#"
             [llm]
             connector = "openai"
-            model = "gpt-4o-mini"
+            model = "gpt-5.2"
             "#,
         )
         .unwrap();
 
         assert_eq!(parsed.llm.connector, "openai");
-        assert_eq!(parsed.llm.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(parsed.llm.model.as_deref(), Some("gpt-5.2"));
     }
 
     #[test]
@@ -926,6 +994,20 @@ mod tests {
         assert_eq!(default_api_key_env("openai"), "OPENAI_API_KEY");
         assert_eq!(default_api_key_env("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(default_api_key_env("aws-bedrock"), "AWS_BEDROCK_API_KEY");
+    }
+
+    #[test]
+    fn default_model_env_depends_on_connector() {
+        assert_eq!(default_model_env("openai"), "OPENAI_MODEL");
+        assert_eq!(default_model_env("anthropic"), "ANTHROPIC_MODEL");
+        assert_eq!(default_model_env("aws-bedrock"), "AWS_BEDROCK_MODEL");
+    }
+
+    #[test]
+    fn default_base_url_env_depends_on_connector() {
+        assert_eq!(default_base_url_env("openai"), "OPENAI_BASE_URL");
+        assert_eq!(default_base_url_env("anthropic"), "ANTHROPIC_BASE_URL");
+        assert_eq!(default_base_url_env("aws-bedrock"), "AWS_BEDROCK_BASE_URL");
     }
 
     #[test]
@@ -1038,6 +1120,59 @@ mod tests {
         assert_eq!(view.model, "text-embedding-3-small");
         assert!(view.available);
         assert!(view.is_default);
+    }
+
+    #[test]
+    fn bedrock_llm_defaults() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "bedrock"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_config(Some(&config));
+        assert_eq!(resolved.connector, "bedrock");
+        assert_eq!(resolved.model, "anthropic.claude-3-5-sonnet-20241022-v2:0");
+        assert_eq!(resolved.base_url, "us-east-1");
+    }
+
+    #[test]
+    fn bedrock_embedding_defaults() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "bedrock"
+            "#,
+        )
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, "bedrock");
+        assert_eq!(view.model, "amazon.titan-embed-text-v2:0");
+        assert_eq!(view.base_url, "us-east-1");
+        assert!(view.available);
+    }
+
+    #[test]
+    fn connector_defaults_openai() {
+        let defaults = get_connector_defaults("openai");
+        assert_eq!(defaults.llm_model, "gpt-5.2");
+        assert_eq!(defaults.llm_base_url, "https://api.openai.com/v1");
+        assert_eq!(defaults.embeddings_model, "text-embedding-3-small");
+        assert_eq!(defaults.embeddings_base_url, "https://api.openai.com/v1");
+        assert!(defaults.embeddings_available);
+    }
+
+    #[test]
+    fn connector_defaults_anthropic_embeddings_fallback_to_openai() {
+        let defaults = get_connector_defaults("anthropic");
+        assert_eq!(defaults.llm_model, "claude-sonnet-4-5-20250929");
+        assert_eq!(defaults.llm_base_url, "https://api.anthropic.com");
+        assert_eq!(defaults.embeddings_model, "text-embedding-3-small");
+        assert_eq!(defaults.embeddings_base_url, "https://api.openai.com/v1");
+        assert!(!defaults.embeddings_available);
     }
 
     #[test]

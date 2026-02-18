@@ -20,6 +20,15 @@ pub struct EmbeddingsSettingsView {
     pub is_default: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConnectorDefaultsView {
+    pub llm_model: String,
+    pub llm_base_url: String,
+    pub embeddings_model: String,
+    pub embeddings_base_url: String,
+    pub embeddings_available: bool,
+}
+
 /// Inbound port for health/status queries.
 ///
 /// Any adapter that wants to expose assistant status (D-Bus, HTTP, etc.)
@@ -95,6 +104,11 @@ pub trait SettingsService: Send + Sync {
         model: Option<String>,
         base_url: Option<String>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn get_connector_defaults(
+        &self,
+        connector: String,
+    ) -> impl std::future::Future<Output = Result<ConnectorDefaultsView, CoreError>> + Send;
 }
 
 #[cfg(test)]

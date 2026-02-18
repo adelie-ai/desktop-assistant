@@ -16,12 +16,20 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
+    pub fn get_default_model() -> Option<&'static str> {
+        Some("claude-sonnet-4-5-20250929")
+    }
+
+    pub fn get_default_base_url() -> Option<&'static str> {
+        Some("https://api.anthropic.com")
+    }
+
     pub fn new(api_key: String) -> Self {
         Self {
             client: Client::new(),
             api_key,
-            model: "claude-sonnet-4-5-20250929".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
+            model: Self::get_default_model().unwrap_or_default().to_string(),
+            base_url: Self::get_default_base_url().unwrap_or_default().to_string(),
             max_tokens: 8192,
         }
     }
@@ -227,6 +235,14 @@ impl ToolCallAccumulator {
 }
 
 impl LlmClient for AnthropicClient {
+    fn get_default_model(&self) -> Option<&str> {
+        Self::get_default_model()
+    }
+
+    fn get_default_base_url(&self) -> Option<&str> {
+        Self::get_default_base_url()
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,

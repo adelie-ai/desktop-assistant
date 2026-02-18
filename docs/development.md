@@ -39,16 +39,25 @@ Use the canonical troubleshooting checklist in [README.md](README.md#activation-
 
 ## Environment
 
+Quick provider privacy + console links: [cloud-providers.md](cloud-providers.md)
+
 Default connector is `openai`.
 
 To opt into local Ollama, set `llm.connector = "ollama"` in `$XDG_CONFIG_HOME/desktop-assistant/daemon.toml` (or `~/.config/desktop-assistant/daemon.toml`).
 
-For cloud connectors, set the matching API key:
+For cloud connectors, set connector credentials:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
 export ANTHROPIC_API_KEY=your_key_here
+export AWS_REGION=us-east-1
+# optional single-field Bedrock credentials format:
+# export AWS_BEDROCK_API_KEY=ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]
 ```
+
+For Bedrock, set `llm.connector = "bedrock"` (or `"aws-bedrock"`) and use `llm.base_url` as region (for example `us-east-1`) or a Bedrock runtime endpoint URL.
+
+Bedrock credentials use the standard AWS SDK credential provider chain, so local development should normally use configured AWS CLI credentials/profile (`aws configure` or `aws configure sso`) with Bedrock permissions in the target region.
 
 Connector key naming convention is generic:
 - Secret backend account key defaults to `<connector>_api_key`.
@@ -75,10 +84,12 @@ systemctl --user restart desktop-assistant-daemon
 Optional:
 
 ```bash
-export OPENAI_MODEL=gpt-4o
+export OPENAI_MODEL=gpt-5.2
 export OPENAI_BASE_URL=https://api.openai.com/v1
 export RUST_LOG=info
 ```
+
+If `OPENAI_MODEL` is not set, the daemon defaults OpenAI to `gpt-5.2`.
 
 To enable local git versioning for built-in memory/preferences:
 

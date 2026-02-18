@@ -1,0 +1,19 @@
+[package]
+name = "desktop-assistant-llm-bedrock"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+aws-config = "1"
+aws-credential-types = "1"
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
+desktop-assistant-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

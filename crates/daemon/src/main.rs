@@ -27,6 +27,7 @@ use store::PersistentConversationStore;
 /// multiple backends.
 enum AnyLlmClient {
     Anthropic(desktop_assistant_llm_anthropic::AnthropicClient),
+    Bedrock(desktop_assistant_llm_bedrock::BedrockClient),
     OpenAi(desktop_assistant_llm_openai::OpenAiClient),
     Ollama(desktop_assistant_llm_ollama::OllamaClient),
 }
@@ -36,6 +37,7 @@ enum AnyLlmClient {
 /// Mirrors `AnyLlmClient` but for the `EmbeddingClient` trait.
 /// `Unavailable` is used when the resolved connector doesn't support embeddings (e.g. Anthropic).
 enum AnyEmbeddingClient {
+    Bedrock(desktop_assistant_llm_bedrock::BedrockClient),
     OpenAi(desktop_assistant_llm_openai::OpenAiClient),
     Ollama(desktop_assistant_llm_ollama::OllamaClient),
     Unavailable,
@@ -44,6 +46,7 @@ enum AnyEmbeddingClient {
 impl EmbeddingClient for AnyEmbeddingClient {
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
         match self {
+            Self::Bedrock(c) => c.embed(texts).await,
             Self::OpenAi(c) => c.embed(texts).await,
             Self::Ollama(c) => c.embed(texts).await,
             Self::Unavailable => Err(CoreError::Llm(
@@ -55,6 +58,24 @@ impl EmbeddingClient for AnyEmbeddingClient {
 }
 
 impl LlmClient for AnyLlmClient {
+    fn get_default_model(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(c) => c.get_default_model(),
+            Self::Bedrock(c) => c.get_default_model(),
+            Self::OpenAi(c) => c.get_default_model(),
+            Self::Ollama(c) => c.get_default_model(),
+        }
+    }
+
+    fn get_default_base_url(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(c) => c.get_default_base_url(),
+            Self::Bedrock(c) => c.get_default_base_url(),
+            Self::OpenAi(c) => c.get_default_base_url(),
+            Self::Ollama(c) => c.get_default_base_url(),
+        }
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
@@ -63,6 +84,7 @@ impl LlmClient for AnyLlmClient {
     ) -> Result<LlmResponse, CoreError> {
         match self {
             Self::Anthropic(c) => c.stream_completion(messages, tools, on_chunk).await,
+            Self::Bedrock(c) => c.stream_completion(messages, tools, on_chunk).await,
             Self::OpenAi(c) => c.stream_completion(messages, tools, on_chunk).await,
             Self::Ollama(c) => c.stream_completion(messages, tools, on_chunk).await,
         }
@@ -122,6 +144,14 @@ async fn main() -> Result<()> {
                     .with_base_url(resolved_llm.base_url),
             )
         }
+        "bedrock" | "aws-bedrock" => {
+            tracing::info!("using AWS Bedrock LLM backend");
+            AnyLlmClient::Bedrock(
+                desktop_assistant_llm_bedrock::BedrockClient::new(resolved_llm.api_key)
+                    .with_model(resolved_llm.model)
+                    .with_base_url(resolved_llm.base_url),
+            )
+        }
         _ => {
             if resolved_llm.api_key.is_empty() {
                 tracing::warn!(
@@ -161,6 +191,14 @@ async fn main() -> Result<()> {
                     resolved_emb.base_url.clone(),
                     resolved_emb.model.clone(),
                 ))
+            }
+            "bedrock" | "aws-bedrock" => {
+                tracing::info!("using Bedrock embedding backend");
+                AnyEmbeddingClient::Bedrock(
+                    desktop_assistant_llm_bedrock::BedrockClient::new(String::new())
+                        .with_model(resolved_emb.model.clone())
+                        .with_base_url(resolved_emb.base_url.clone()),
+                )
             }
             _ => {
                 tracing::info!("using OpenAI-compatible embedding backend");

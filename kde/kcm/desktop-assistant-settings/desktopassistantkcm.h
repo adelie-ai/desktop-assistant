@@ -53,6 +53,8 @@ public:
     Q_INVOKABLE void load() override;
     Q_INVOKABLE void save() override;
     Q_INVOKABLE void defaults() override;
+    Q_INVOKABLE void applyChatDefaults();
+    Q_INVOKABLE void applySearchDefaults();
     Q_INVOKABLE void restartDaemon();
 
 Q_SIGNALS:

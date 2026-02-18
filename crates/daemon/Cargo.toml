@@ -10,6 +10,7 @@ desktop-assistant-dbus.workspace = true
 desktop-assistant-llm-anthropic.workspace = true
 desktop-assistant-llm-openai.workspace = true
 desktop-assistant-llm-ollama.workspace = true
+desktop-assistant-llm-bedrock.workspace = true
 desktop-assistant-mcp-client.workspace = true
 tokio.workspace = true
 zbus.workspace = true

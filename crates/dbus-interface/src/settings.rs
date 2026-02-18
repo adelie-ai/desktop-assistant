@@ -121,6 +121,28 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .await
             .map_err(|e| fdo::Error::Failed(e.to_string()))
     }
+
+    /// Return connector defaults.
+    ///
+    /// Returns: (llm_model, llm_base_url, embeddings_model, embeddings_base_url, embeddings_available)
+    async fn get_connector_defaults(
+        &self,
+        connector: &str,
+    ) -> fdo::Result<(String, String, String, String, bool)> {
+        let defaults = self
+            .service
+            .get_connector_defaults(connector.to_string())
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        Ok((
+            defaults.llm_model,
+            defaults.llm_base_url,
+            defaults.embeddings_model,
+            defaults.embeddings_base_url,
+            defaults.embeddings_available,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +150,7 @@ mod tests {
     use super::*;
     use desktop_assistant_core::CoreError;
     use desktop_assistant_core::ports::inbound::{
-        EmbeddingsSettingsView, LlmSettingsView, SettingsService,
+        ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, SettingsService,
     };
 
     struct FakeSettingsService;
@@ -137,7 +159,7 @@ mod tests {
         async fn get_llm_settings(&self) -> Result<LlmSettingsView, CoreError> {
             Ok(LlmSettingsView {
                 connector: "openai".to_string(),
-                model: "gpt-4o".to_string(),
+                model: "gpt-5.2".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
                 has_api_key: true,
             })
@@ -174,6 +196,19 @@ mod tests {
             _base_url: Option<String>,
         ) -> Result<(), CoreError> {
             Ok(())
+        }
+
+        async fn get_connector_defaults(
+            &self,
+            _connector: String,
+        ) -> Result<ConnectorDefaultsView, CoreError> {
+            Ok(ConnectorDefaultsView {
+                llm_model: "gpt-5.2".to_string(),
+                llm_base_url: "https://api.openai.com/v1".to_string(),
+                embeddings_model: "text-embedding-3-small".to_string(),
+                embeddings_base_url: "https://api.openai.com/v1".to_string(),
+                embeddings_available: true,
+            })
         }
     }
 

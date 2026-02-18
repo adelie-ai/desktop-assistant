@@ -7,52 +7,6 @@ KCM.SimpleKCM {
     implicitWidth: 520
     implicitHeight: 420
 
-    function normalizedConnector(value) {
-        const connector = (value || "").toLowerCase()
-        return connector.length > 0 ? connector : "openai"
-    }
-
-    function applyChatDefaults() {
-        const connector = normalizedConnector(kcm.connector)
-        if (connector === "ollama") {
-            kcm.model = "qwen3:0.6b"
-            kcm.baseUrl = "http://localhost:11434"
-            return
-        }
-
-        if (connector === "anthropic") {
-            kcm.model = "claude-sonnet-4-5-20250929"
-            kcm.baseUrl = "https://api.anthropic.com"
-            return
-        }
-
-        kcm.model = "gpt-5.2"
-        kcm.baseUrl = "https://api.openai.com/v1"
-    }
-
-    function effectiveSearchConnector() {
-        const connector = normalizedConnector(kcm.embConnector || kcm.connector)
-        return connector === "anthropic" ? "openai" : connector
-    }
-
-    function applySearchDefaults() {
-        const connector = effectiveSearchConnector()
-        if (connector === "ollama") {
-            kcm.embModel = "nomic-embed-text"
-            kcm.embBaseUrl = "http://localhost:11434"
-            if (kcm.embConnector === "anthropic") {
-                kcm.embConnector = "ollama"
-            }
-            return
-        }
-
-        kcm.embModel = "text-embedding-3-small"
-        kcm.embBaseUrl = "https://api.openai.com/v1"
-        if (kcm.embConnector === "anthropic") {
-            kcm.embConnector = "openai"
-        }
-    }
-
     ColumnLayout {
         anchors.fill: parent
         spacing: 10
@@ -91,7 +45,7 @@ KCM.SimpleKCM {
                         QQC2.ComboBox {
                             id: connectorBox
                             Layout.fillWidth: true
-                            model: ["ollama", "openai", "anthropic"]
+                            model: ["ollama", "openai", "anthropic", "bedrock"]
                             currentIndex: Math.max(0, model.indexOf(kcm.connector))
                             onActivated: kcm.connector = currentText
                         }
@@ -99,7 +53,7 @@ KCM.SimpleKCM {
 
                     QQC2.Button {
                         text: "Set Defaults"
-                        onClicked: applyChatDefaults()
+                        onClicked: kcm.applyChatDefaults()
                     }
 
                     RowLayout {
@@ -108,7 +62,7 @@ KCM.SimpleKCM {
                         QQC2.TextField {
                             id: llmModelField
                             Layout.fillWidth: true
-                            placeholderText: "gpt-4o / llama3.1 / ..."
+                            placeholderText: "gpt-5.2 / llama3.1 / ..."
                             text: kcm.model
                             onTextEdited: kcm.model = text
                         }
@@ -162,10 +116,11 @@ KCM.SimpleKCM {
                         QQC2.ComboBox {
                             id: embConnectorBox
                             Layout.fillWidth: true
-                            model: ["auto (same as Chat LLM)", "ollama", "openai"]
+                            model: ["auto (same as Chat LLM)", "ollama", "openai", "bedrock"]
                             currentIndex: {
                                 if (kcm.embConnector === "ollama") return 1
                                 if (kcm.embConnector === "openai") return 2
+                                if (kcm.embConnector === "bedrock" || kcm.embConnector === "aws-bedrock") return 3
                                 return 0
                             }
                             onActivated: {
@@ -177,7 +132,7 @@ KCM.SimpleKCM {
 
                     QQC2.Button {
                         text: "Set Defaults"
-                        onClicked: applySearchDefaults()
+                        onClicked: kcm.applySearchDefaults()
                     }
 
                     RowLayout {
@@ -188,6 +143,7 @@ KCM.SimpleKCM {
                             Layout.fillWidth: true
                             placeholderText: {
                                 let c = kcm.embConnector || kcm.connector
+                                if (c === "bedrock" || c === "aws-bedrock") return "amazon.titan-embed-text-v2:0"
                                 return c === "ollama" ? "nomic-embed-text" : "text-embedding-3-small"
                             }
                             text: kcm.embModel
@@ -203,6 +159,7 @@ KCM.SimpleKCM {
                             Layout.fillWidth: true
                             placeholderText: {
                                 let c = kcm.embConnector || kcm.connector
+                                if (c === "bedrock" || c === "aws-bedrock") return "us-east-1"
                                 return c === "ollama" ? "http://localhost:11434" : "https://api.openai.com/v1"
                             }
                             text: kcm.embBaseUrl

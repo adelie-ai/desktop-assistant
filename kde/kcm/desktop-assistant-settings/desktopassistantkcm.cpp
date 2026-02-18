@@ -18,34 +18,46 @@ QString normalizeConnector(const QString &connector)
     return normalized.isEmpty() ? QStringLiteral("openai") : normalized;
 }
 
-QString defaultModelForConnector(const QString &connector)
-{
-    if (connector == QLatin1String("ollama")) {
-        return QStringLiteral("qwen3:0.6b");
-    }
-    if (connector == QLatin1String("anthropic")) {
-        return QStringLiteral("claude-sonnet-4-5-20250929");
-    }
-    return QStringLiteral("gpt-5.2");
-}
+struct ConnectorDefaults {
+    QString llmModel;
+    QString llmBaseUrl;
+    QString embeddingsModel;
+    QString embeddingsBaseUrl;
+    bool embeddingsAvailable = true;
+};
 
-QString defaultEmbeddingModelForConnector(const QString &connector)
+bool fetchConnectorDefaults(
+    QDBusInterface &iface,
+    const QString &connector,
+    ConnectorDefaults *out,
+    QString *errorText
+)
 {
-    if (connector == QLatin1String("ollama")) {
-        return QStringLiteral("nomic-embed-text");
+    QDBusMessage reply = iface.call("GetConnectorDefaults", connector);
+    if (reply.type() == QDBusMessage::ErrorMessage) {
+        if (errorText != nullptr) {
+            *errorText = reply.errorMessage().isEmpty() ? QStringLiteral("D-Bus call failed") : reply.errorMessage();
+        }
+        return false;
     }
-    return QStringLiteral("text-embedding-3-small");
-}
 
-QString defaultBaseUrlForConnector(const QString &connector)
-{
-    if (connector == QLatin1String("ollama")) {
-        return QStringLiteral("http://localhost:11434");
+    const auto args = reply.arguments();
+    if (args.size() < 5) {
+        if (errorText != nullptr) {
+            *errorText = QStringLiteral("Unexpected GetConnectorDefaults reply");
+        }
+        return false;
     }
-    if (connector == QLatin1String("anthropic")) {
-        return QStringLiteral("https://api.anthropic.com");
+
+    if (out != nullptr) {
+        out->llmModel = args[0].toString();
+        out->llmBaseUrl = args[1].toString();
+        out->embeddingsModel = args[2].toString();
+        out->embeddingsBaseUrl = args[3].toString();
+        out->embeddingsAvailable = args[4].toBool();
     }
-    return QStringLiteral("https://api.openai.com/v1");
+
+    return true;
 }
 }
 
@@ -289,21 +301,58 @@ void DesktopAssistantKcm::save()
 
 void DesktopAssistantKcm::defaults()
 {
-    const auto llmConnector = normalizeConnector(m_connector);
-    setModel(defaultModelForConnector(llmConnector));
-    setBaseUrl(defaultBaseUrlForConnector(llmConnector));
-
-    auto embeddingConnector = normalizeConnector(m_embConnector.isEmpty() ? llmConnector : m_embConnector);
-    if (embeddingConnector == QLatin1String("anthropic")) {
-        embeddingConnector = QStringLiteral("openai");
-        setEmbConnector(embeddingConnector);
-    }
-
-    setEmbModel(defaultEmbeddingModelForConnector(embeddingConnector));
-    setEmbBaseUrl(defaultBaseUrlForConnector(embeddingConnector));
+    applyChatDefaults();
+    applySearchDefaults();
     setApiKeyInput(QString());
     m_statusText = QStringLiteral("Applied connector defaults; click Apply to save");
     Q_EMIT statusTextChanged();
+}
+
+void DesktopAssistantKcm::applyChatDefaults()
+{
+    QDBusInterface iface(SERVICE, PATH, IFACE, QDBusConnection::sessionBus());
+    const auto llmConnector = normalizeConnector(m_connector);
+
+    ConnectorDefaults defaults;
+    QString errorText;
+    if (!fetchConnectorDefaults(iface, llmConnector, &defaults, &errorText)) {
+        m_statusText = errorText;
+        Q_EMIT statusTextChanged();
+        return;
+    }
+
+    setModel(defaults.llmModel);
+    setBaseUrl(defaults.llmBaseUrl);
+}
+
+void DesktopAssistantKcm::applySearchDefaults()
+{
+    QDBusInterface iface(SERVICE, PATH, IFACE, QDBusConnection::sessionBus());
+    auto embeddingConnector = normalizeConnector(m_embConnector.isEmpty() ? m_connector : m_embConnector);
+
+    ConnectorDefaults defaults;
+    QString errorText;
+    if (!fetchConnectorDefaults(iface, embeddingConnector, &defaults, &errorText)) {
+        m_statusText = errorText;
+        Q_EMIT statusTextChanged();
+        return;
+    }
+
+    if (!defaults.embeddingsAvailable) {
+        embeddingConnector = QStringLiteral("openai");
+        if (m_embConnector == QLatin1String("anthropic")) {
+            setEmbConnector(embeddingConnector);
+        }
+
+        if (!fetchConnectorDefaults(iface, embeddingConnector, &defaults, &errorText)) {
+            m_statusText = errorText;
+            Q_EMIT statusTextChanged();
+            return;
+        }
+    }
+
+    setEmbModel(defaults.embeddingsModel);
+    setEmbBaseUrl(defaults.embeddingsBaseUrl);
 }
 
 void DesktopAssistantKcm::restartDaemon()

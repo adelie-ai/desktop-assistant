@@ -9,7 +9,7 @@ The project follows a ports-and-adapters (hexagonal) layout:
 - Inbound ports define what the app can do
 - Core domain implements behavior without infrastructure coupling
 - Outbound ports abstract external systems (LLM, storage, tools)
-- Adapters implement protocol/runtime details (D-Bus, OpenAI, MCP)
+- Adapters implement protocol/runtime details (D-Bus, OpenAI, Bedrock, MCP)
 
 ## Crate Responsibilities
 
@@ -28,7 +28,7 @@ The project follows a ports-and-adapters (hexagonal) layout:
 
 ## `daemon`
 
-- Initializes logging, LLM, MCP executor, in-memory store
+- Initializes logging, LLM, MCP executor, persistent conversation store
 - Wires `ConversationHandler` with adapters
 - Registers service on session bus name `org.desktopAssistant`
 
@@ -37,6 +37,12 @@ The project follows a ports-and-adapters (hexagonal) layout:
 - OpenAI-compatible Chat Completions streaming client
 - SSE chunk parsing and tool-call delta accumulation
 - Converts core messages/tool definitions to provider payloads
+
+## `llm-bedrock`
+
+- Amazon Bedrock ConverseStream API client
+- Tool-use mapping between Bedrock content blocks and core tool-call model
+- Bedrock `InvokeModel` embedding support for search vectors
 
 ## `mcp-client`
 

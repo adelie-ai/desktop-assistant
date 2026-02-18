@@ -18,6 +18,14 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
+    pub fn get_default_model() -> Option<&'static str> {
+        Some("llama3.2")
+    }
+
+    pub fn get_default_base_url() -> Option<&'static str> {
+        Some("http://localhost:11434")
+    }
+
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -308,6 +316,14 @@ struct ResponseFunction {
 }
 
 impl LlmClient for OllamaClient {
+    fn get_default_model(&self) -> Option<&str> {
+        Self::get_default_model()
+    }
+
+    fn get_default_base_url(&self) -> Option<&str> {
+        Self::get_default_base_url()
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
