@@ -79,12 +79,31 @@ After every set of changes:
 2. `cargo test`
 3. Commit with a clear message describing the change.
 
+### 7. KDE ChatView Source of Truth (Critical)
+
+The Plasma chat UI has a shared module and a fallback copy. To avoid drift and "blank widget" regressions:
+
+- **Edit only this source file for chat UI logic**: `kde/shared/chat-module/ui/ChatView.qml`
+- **Do not edit generated/fallback/runtime copies directly**:
+  - `kde/plasmoid/org.desktopassistant.desktopchat/contents/ui/ChatView.qml` (fallback copy, overwritten)
+  - `~/.local/share/desktop-assistant/chat-module/...` (runtime sync target)
+  - `~/.local/share/plasma/plasmoids/...` (installed package files)
+- **After any shared ChatView change**, run:
+  1. `just chatview-verify` (optional pre-check)
+  2. `just widget-upgrade` (runs `chatview-sync` + `chat-module-sync` + plasmoid upgrade)
+- If Plasma still shows stale/blank UI after upgrade, run `just widget-hard-refresh` to restart `plasmashell`.
+- Service outages must not hide the entire UI: keep the shell rendered and degrade gracefully (status text / fallback service).
+
 ## Project Structure
 
 ```
 desktop-assistant/
 ├── Cargo.toml                 # Workspace root
 ├── AGENTS.md                  # This file
+├── kde/
+│   ├── shared/chat-module/    # Source of truth for shared QML chat module
+│   │   └── ui/ChatView.qml
+│   └── plasmoid/              # Plasma applet packages (desktop/panel)
 ├── tasks/                     # Task tracking
 │   └── PRIORITY.md            # Ordered task queue
 ├── crates/
