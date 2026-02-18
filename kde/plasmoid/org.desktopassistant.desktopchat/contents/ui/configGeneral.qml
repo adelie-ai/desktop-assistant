@@ -5,8 +5,11 @@ import QtQuick.Controls as QQC2
 import org.kde.kirigami as Kirigami
 
 Kirigami.FormLayout {
+    Kirigami.Theme.colorSet: Kirigami.Theme.View
+    Kirigami.Theme.inherit: false
     property alias cfg_userAvatarPath: userAvatarPathField.text
     property alias cfg_maxSessionAgeDays: maxSessionAgeSpinBox.value
+    property alias cfg_maxRenderedMessages: maxRenderedMessagesSpinBox.value
     readonly property string homeDirectory: StandardPaths.writableLocation(StandardPaths.HomeLocation)
     readonly property string accountName: {
         const trimmedHome = String(homeDirectory || "").replace(/\/+$/, "")
@@ -72,6 +75,18 @@ Kirigami.FormLayout {
         value: 7
         ToolTip.visible: hovered
         ToolTip.text: i18n("Hide previous sessions older than this many days (0 disables filtering)")
+    }
+
+    QQC2.SpinBox {
+        id: maxRenderedMessagesSpinBox
+        Kirigami.FormData.label: i18n("Messages to load")
+        from: 0
+        to: 500
+        stepSize: 5
+        editable: true
+        value: 50
+        ToolTip.visible: hovered
+        ToolTip.text: i18n("Maximum recent messages to load in chat view (0 loads full conversation)")
     }
 
     Item {

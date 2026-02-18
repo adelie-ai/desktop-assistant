@@ -182,8 +182,25 @@ widget-reinstall:
 # Hard refresh KDE widgets (reinstall + restart plasmashell)
 widget-hard-refresh:
     just widget-reinstall
-    kquitapp6 plasmashell || true
+    kquitapp6 plasmashell >/dev/null 2>&1 || pkill -TERM -x plasmashell || true
+    sleep 0.5
+    pgrep -x plasmashell >/dev/null && pkill -KILL -x plasmashell || true
+    sleep 0.2
     nohup plasmashell --replace >/tmp/plasmashell-desktop-assistant.log 2>&1 &
+
+# Reset Plasma shell layout/config to defaults (backs up only shell config files)
+# Use the standalone script `scripts/plasma-shell-reset.sh` instead of an embedded just recipe.
+# Example: bash scripts/plasma-shell-reset.sh
+
+# Restore Plasma shell config files from a backup directory created by plasma-shell-reset
+plasma-shell-restore backup_dir:
+    [ -d "{{backup_dir}}" ] || (echo "Missing backup directory: {{backup_dir}}" >&2; exit 1)
+    [ -f "{{backup_dir}}/plasma-org.kde.plasma.desktop-appletsrc" ] || (echo "Missing file: {{backup_dir}}/plasma-org.kde.plasma.desktop-appletsrc" >&2; exit 1)
+    cp -a "{{backup_dir}}/plasma-org.kde.plasma.desktop-appletsrc" "$HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+    if [ -f "{{backup_dir}}/plasmashellrc" ]; then cp -a "{{backup_dir}}/plasmashellrc" "$HOME/.config/plasmashellrc"; fi
+    systemctl --user restart plasma-plasmashell.service >/dev/null 2>&1 || systemctl --user restart plasmashell.service >/dev/null 2>&1 || true
+    sleep 1
+    systemctl --user --no-pager --full status plasma-plasmashell.service 2>/dev/null | sed -n '1,80p' || systemctl --user --no-pager --full status plasmashell.service 2>/dev/null | sed -n '1,80p' || true
 
 # Remove all KDE Plasma widgets
 widget-remove:
@@ -236,6 +253,33 @@ kcm-open-system:
     pkill -f '^systemsettings' || true
     sleep 0.3
     QT_LOGGING_RULES="qt.qpa.services.warning=false" systemsettings kcm_desktopassistant
+
+# Diagnose which KCM plugin copy is active and whether Bedrock strings are present
+kcm-doctor:
+    @echo "Qt plugin dir:"
+    @qtpaths6 --plugin-dir || true
+    @echo
+    @echo "KCM plugin copies:"
+    @for p in "$HOME/.local/lib64/qt6/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so" \
+        "/usr/lib64/qt6/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so"; do \
+        if [ -f "$p" ]; then \
+            ls -l "$p"; \
+        else \
+            echo "missing: $p"; \
+        fi; \
+    done
+    @echo
+    @echo "Embedded connector strings:"
+    @for p in "$HOME/.local/lib64/qt6/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so" \
+        "/usr/lib64/qt6/plugins/plasma/kcms/systemsettings/kcm_desktopassistant.so"; do \
+        if [ -f "$p" ]; then \
+            echo "=== $p ==="; \
+            strings -a "$p" | grep -E "aws-bedrock|bedrock|anthropic|ollama|openai" || true; \
+        fi; \
+    done
+    @echo
+    @echo "KCM service registration:"
+    @kcmshell6 --list | grep -i kcm_desktopassistant || true
 
 # Remove stale/local KCM plugin copies (keeps system install intact)
 kcm-cleanup:

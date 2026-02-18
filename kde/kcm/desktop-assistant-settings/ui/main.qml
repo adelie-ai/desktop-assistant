@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.kcmutils as KCM
+import org.kde.kirigami as Kirigami
 
 KCM.SimpleKCM {
     implicitWidth: 520
@@ -45,8 +46,14 @@ KCM.SimpleKCM {
                         QQC2.ComboBox {
                             id: connectorBox
                             Layout.fillWidth: true
-                            model: ["ollama", "openai", "anthropic", "bedrock"]
-                            currentIndex: Math.max(0, model.indexOf(kcm.connector))
+                            model: ["ollama", "openai", "anthropic", "aws-bedrock"]
+                            currentIndex: {
+                                if (kcm.connector === "ollama") return 0
+                                if (kcm.connector === "openai") return 1
+                                if (kcm.connector === "anthropic") return 2
+                                if (kcm.connector === "bedrock" || kcm.connector === "aws-bedrock") return 3
+                                return 1
+                            }
                             onActivated: kcm.connector = currentText
                         }
                     }
@@ -116,7 +123,7 @@ KCM.SimpleKCM {
                         QQC2.ComboBox {
                             id: embConnectorBox
                             Layout.fillWidth: true
-                            model: ["auto (same as Chat LLM)", "ollama", "openai", "bedrock"]
+                            model: ["auto (same as Chat LLM)", "ollama", "openai", "aws-bedrock"]
                             currentIndex: {
                                 if (kcm.embConnector === "ollama") return 1
                                 if (kcm.embConnector === "openai") return 2
@@ -171,7 +178,7 @@ KCM.SimpleKCM {
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap
                         visible: !kcm.embAvailable
-                        color: "orange"
+                        color: Kirigami.Theme.neutralTextColor
                         text: "The current choice cannot power Search right now. Pick another Search provider, or switch the Chat LLM connector."
                     }
 

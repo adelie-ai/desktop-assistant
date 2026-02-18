@@ -10,9 +10,17 @@ import org.kde.plasma.plasma5support as Plasma5Support
 
 Item {
     id: root
+    clip: true
+    Kirigami.Theme.colorSet: Kirigami.Theme.View
+    Kirigami.Theme.inherit: false
     property bool panelMode: false
-    implicitWidth: 460
-    implicitHeight: 560
+    implicitWidth: 520
+    implicitHeight: 620
+    readonly property color themeBackgroundColor: Kirigami.Theme.backgroundColor
+    readonly property color themeTextColor: Kirigami.Theme.textColor
+    readonly property color themeDisabledTextColor: Kirigami.Theme.disabledTextColor
+    readonly property color themeHighlightColor: Kirigami.Theme.highlightColor
+    readonly property color themeHighlightedTextColor: Kirigami.Theme.highlightedTextColor
 
     property string helperPath: Qt.resolvedUrl("../code/dbus_client.py").toString().replace("file://", "")
     property string productionService: "org.desktopAssistant"
@@ -26,15 +34,23 @@ Item {
     property string conversationId: ""
     property bool busy: false
     property bool loadingConversation: false
+    property double loadingConversationStartedAtMs: 0
     property int conversationLoadSequence: 0
     property bool debugEnabled: false
     property bool serviceStatusRequestInFlight: false
     property int currentMessageCount: 0
     property var transcriptEntries: []
+    property bool transcriptBulkLoading: false
     property int transcriptEntryIdSeq: 0
     property var expandedToolEntries: ({})
     readonly property int maxTranscriptEntries: 400
+    // Configurable UI back-load limit. 0 means full history.
+    // Default is 50 to balance responsiveness and context visibility.
+    readonly property int defaultMaxRenderedMessages: 50
+    readonly property int maxLoadedMessageChars: 6000
+    readonly property int maxLiveMessageChars: 3000
     readonly property int maxDebugPayloadChars: 1200
+    readonly property int conversationLoadTimeoutMs: 15000
     property string promptText: ""
     property var conversationChoices: []
     property real uiScale: 1.0
@@ -48,6 +64,14 @@ Item {
     readonly property real baseFontPointSize: Math.max(1, Number(Kirigami.Theme.defaultFont.pointSize || Qt.application.font.pointSize || 10))
     readonly property int scaledTopIconSize: Math.max(16, Math.round(24 * uiScale))
     readonly property int scaledHeaderIconSize: Math.max(64, Math.round(96 * uiScale))
+    readonly property bool ultraNarrow: width > 0 && width < 430
+    readonly property real transcriptAvatarSize: 24 * uiScale
+    readonly property real transcriptBubbleSpacing: 6
+    readonly property real transcriptWideBubbleWidth: Math.max(120, transcript.width)
+    readonly property real transcriptMessageBubbleWidth: {
+        const available = Math.max(120, transcript.width - (transcriptAvatarSize + transcriptBubbleSpacing))
+        return Math.max(120, available * 0.88)
+    }
     readonly property string homeDirectory: StandardPaths.writableLocation(StandardPaths.HomeLocation)
     readonly property string accountName: {
         const trimmedHome = String(homeDirectory || "").replace(/\/+$/, "")
@@ -63,7 +87,6 @@ Item {
         return false
     }
     property int lateResponsePollRemaining: 0
-    property int postSendRefreshRemaining: 0
     readonly property var pending: ({})
 
     function toImageSource(pathValue) {
@@ -192,6 +215,14 @@ Item {
         const configured = Number(Plasmoid.configuration.maxSessionAgeDays)
         if (!Number.isFinite(configured) || configured < 0) {
             return 7
+        }
+        return Math.floor(configured)
+    }
+
+    function maxRenderedMessages() {
+        const configured = Number(Plasmoid.configuration.maxRenderedMessages)
+        if (!Number.isFinite(configured) || configured < 0) {
+            return defaultMaxRenderedMessages
         }
         return Math.floor(configured)
     }
@@ -371,13 +402,16 @@ Item {
             return
         }
         const normalizedText = String(text === undefined || text === null ? "" : text)
-        if (normalizedText.trim().length === 0) {
+        const clippedText = normalizedText.length > maxLiveMessageChars
+            ? normalizedText.substring(0, maxLiveMessageChars) + "\n\n[…message truncated for widget stability…]"
+            : normalizedText
+        if (clippedText.trim().length === 0) {
             return
         }
         const entry = {
             kind: "message",
             role: role,
-            text: normalizedText,
+            text: clippedText,
         }
         if (meta) {
             for (const key in meta) {
@@ -393,6 +427,14 @@ Item {
             role: "status",
             text: text,
         })
+    }
+
+    function clipLoadedMessageText(textValue) {
+        const normalized = String(textValue === undefined || textValue === null ? "" : textValue)
+        if (normalized.length <= maxLoadedMessageChars) {
+            return normalized
+        }
+        return normalized.substring(0, maxLoadedMessageChars) + "\n\n[…message truncated for performance…]"
     }
 
     function appendTranscriptEntry(entry) {
@@ -632,16 +674,23 @@ Item {
         conversationLoadSequence = conversationLoadSequence + 1
         const sequence = conversationLoadSequence
         loadingConversation = true
+        loadingConversationStartedAtMs = Date.now()
+        conversationLoadTimeoutTimer.stop()
+        conversationLoadTimeoutTimer.start()
         appendStatus("Loading conversation…")
 
-        const command = helperCommand("get " + shellEscape(requestId))
+        // NOTE: `--tail` is a UI-only fetch limit. Core conversation context remains
+        // intact in the daemon store for model prompting.
+        const command = helperCommand("get " + shellEscape(requestId) + " --tail " + maxRenderedMessages())
         runCommand(
             command,
             function(stdout) {
                 if (sequence !== conversationLoadSequence) {
                     return
                 }
+                conversationLoadTimeoutTimer.stop()
                 loadingConversation = false
+                loadingConversationStartedAtMs = 0
                 const payload = JSON.parse(stdout)
                 if (payload.error) {
                     appendStatus(payload.error)
@@ -653,12 +702,21 @@ Item {
                 }
 
                 expandedToolEntries = ({})
+                transcriptBulkLoading = true
                 transcriptEntries = []
-                for (let i = 0; i < payload.messages.length; i++) {
-                    const message = payload.messages[i]
-                    appendMessage(message.role, message.content)
+                const allMessages = payload.messages || []
+                for (let i = 0; i < allMessages.length; i++) {
+                    const message = allMessages[i]
+                    appendMessage(message.role, clipLoadedMessageText(message.content), {
+                        historicalLoad: true,
+                    })
                 }
-                currentMessageCount = payload.messages.length
+                transcriptBulkLoading = false
+                transcript.positionViewAtEnd()
+                currentMessageCount = Number(payload.message_count || allMessages.length)
+                if (payload.truncated) {
+                    appendStatus("Showing latest " + allMessages.length + " of " + currentMessageCount + " messages")
+                }
                 if (currentMessageCount === 0) {
                     appendStatus("No messages yet")
                 }
@@ -667,7 +725,9 @@ Item {
                 if (sequence !== conversationLoadSequence) {
                     return
                 }
+                conversationLoadTimeoutTimer.stop()
                 loadingConversation = false
+                loadingConversationStartedAtMs = 0
                 appendStatus(stderr)
             }
         )
@@ -733,16 +793,12 @@ Item {
                             }
                             refreshConversation()
                             reloadConversationList()
-                            postSendRefreshRemaining = 3
-                            postSendRefreshTimer.restart()
                         },
                         function(awaitErr) {
                             busy = false
                             appendStatus(awaitErr)
                             refreshConversation()
                             reloadConversationList()
-                            postSendRefreshRemaining = 3
-                            postSendRefreshTimer.restart()
                         }
                     )
                 },
@@ -793,13 +849,36 @@ Item {
     }
 
     Timer {
+        id: conversationLoadTimeoutTimer
+        interval: root.conversationLoadTimeoutMs
+        repeat: false
+        running: false
+        onTriggered: {
+            if (!loadingConversation) {
+                return
+            }
+            loadingConversation = false
+            loadingConversationStartedAtMs = 0
+            appendStatus("Loading timed out. Please try Refresh.")
+        }
+    }
+
+    Timer {
         id: startupTimer
         interval: 250
         repeat: false
         running: false
         onTriggered: {
             if (!root.hideWidget) {
-                ensureConversation()
+                reloadConversationList(function(conversations) {
+                    if (conversations.length > 0) {
+                        conversationId = conversations[0].id
+                        conversationPicker.currentIndex = 0
+                        appendStatus("Conversation selected. Click Load to open history.")
+                        return
+                    }
+                    appendStatus("No conversations yet. Send a message to start.")
+                })
             }
         }
     }
@@ -809,9 +888,19 @@ Item {
         interval: 5000
         repeat: true
         running: true
-        onTriggered: refreshServiceStatus(undefined, {
-            silent: true,
-        })
+        onTriggered: {
+            if (root.loadingConversation && root.loadingConversationStartedAtMs > 0) {
+                const elapsedMs = Date.now() - root.loadingConversationStartedAtMs
+                if (elapsedMs >= root.conversationLoadTimeoutMs + 1000) {
+                    root.loadingConversation = false
+                    root.loadingConversationStartedAtMs = 0
+                    root.appendStatus("Loading timed out. Please try Refresh.")
+                }
+            }
+            refreshServiceStatus(undefined, {
+                silent: true,
+            })
+        }
     }
 
     Timer {
@@ -827,30 +916,6 @@ Item {
             reloadConversationList()
             lateResponsePollRemaining = Math.max(0, lateResponsePollRemaining - 1)
             if (lateResponsePollRemaining <= 0) {
-                stop()
-            }
-        }
-    }
-
-    Timer {
-        id: postSendRefreshTimer
-        interval: 1000
-        repeat: true
-        running: false
-        onTriggered: {
-            if (conversationId.length === 0) {
-                stop()
-                return
-            }
-            if (busy) {
-                return
-            }
-
-            refreshConversation()
-            reloadConversationList()
-
-            postSendRefreshRemaining = Math.max(0, postSendRefreshRemaining - 1)
-            if (postSendRefreshRemaining <= 0) {
                 stop()
             }
         }
@@ -889,9 +954,9 @@ Item {
     Rectangle {
         anchors.fill: parent
         visible: !root.hideWidget
-        color: PlasmaCore.Theme.backgroundColor
+        color: root.themeBackgroundColor
         border.width: 1
-        border.color: PlasmaCore.Theme.disabledTextColor
+        border.color: root.themeDisabledTextColor
         radius: 8
     }
 
@@ -919,23 +984,27 @@ Item {
             QQC2.Label {
                 text: root.activeService === root.developmentService ? "Adele (Dev)" : "Adele"
                 font.bold: true
-                color: PlasmaCore.Theme.textColor
+                color: root.themeTextColor
                 Layout.fillWidth: true
             }
         }
 
-        RowLayout {
+        Flow {
+            id: conversationControls
             Layout.fillWidth: true
+            spacing: 6
 
             QQC2.ComboBox {
                 id: conversationPicker
                 visible: true
-                Layout.fillWidth: true
+                width: {
+                    const buttonWidths = loadButton.implicitWidth
+                        + (settingsButton.visible ? (settingsButton.implicitWidth + conversationControls.spacing) : 0)
+                    return Math.max(root.ultraNarrow ? 140 : 180, conversationControls.width - buttonWidths - conversationControls.spacing)
+                }
                 enabled: !root.busy && !root.loadingConversation
                 model: root.conversationChoices
                 textRole: "title"
-                palette.text: PlasmaCore.Theme.textColor
-                palette.buttonText: PlasmaCore.Theme.textColor
                 delegate: QQC2.ItemDelegate {
                     id: conversationDelegate
                     required property var modelData
@@ -944,7 +1013,7 @@ Item {
                     highlighted: conversationPicker.highlightedIndex === index
                     background: Rectangle {
                         color: conversationDelegate.highlighted
-                            ? PlasmaCore.Theme.highlightColor
+                            ? root.themeHighlightColor
                             : "transparent"
                     }
 
@@ -955,8 +1024,8 @@ Item {
                             Layout.fillWidth: true
                             text: modelData.title
                             color: conversationDelegate.highlighted
-                                ? PlasmaCore.Theme.highlightedTextColor
-                                : PlasmaCore.Theme.textColor
+                                ? root.themeHighlightedTextColor
+                                : root.themeTextColor
                             elide: Text.ElideRight
                         }
 
@@ -984,13 +1053,15 @@ Item {
             }
 
             QQC2.Button {
+                id: loadButton
                 text: loadingConversation ? "Loading…" : "Load"
                 enabled: !busy && !loadingConversation
                 onClicked: panelMode ? refreshServiceStatus() : loadSelectedConversation()
             }
 
             QQC2.Button {
-                visible: panelMode
+                id: settingsButton
+                visible: panelMode && !root.ultraNarrow
                 text: "Settings"
                 enabled: !busy
                 onClicked: openSettingsDialog()
@@ -1026,13 +1097,13 @@ Item {
                     QQC2.Label {
                         text: "Hi! I'm Adele! Ask me anything..."
                         font.pointSize: root.baseFontPointSize * root.uiScale
-                        color: PlasmaCore.Theme.disabledTextColor
+                        color: root.themeDisabledTextColor
                         anchors.horizontalCenter: parent.horizontalCenter
                     }
                 }
 
                 onCountChanged: {
-                    if (count > 0) {
+                    if (count > 0 && !root.transcriptBulkLoading) {
                         positionViewAtEnd()
                     }
                 }
@@ -1044,7 +1115,10 @@ Item {
                     readonly property string toolName: String(modelData.toolName || "Tool")
                     readonly property bool isAssistant: modelData.role === "assistant"
                     readonly property bool toolExpanded: root.isToolEntryExpanded(modelData.entryId)
-                    readonly property real avatarSize: 24 * root.uiScale
+                    readonly property real avatarSize: root.transcriptAvatarSize
+                    readonly property real bubbleWidth: (isStatus || isTool)
+                        ? root.transcriptWideBubbleWidth
+                        : root.transcriptMessageBubbleWidth
                     readonly property var avatarSources: isAssistant ? [root.adeleAvatarSource] : root.userAvatarCandidates()
 
                     visible: !(isStatus || isTool) || root.debugEnabled
@@ -1068,9 +1142,9 @@ Item {
                             Rectangle {
                                 anchors.fill: parent
                                 radius: width / 2
-                                color: PlasmaCore.Theme.backgroundColor
+                                color: root.themeBackgroundColor
                                 border.width: 1
-                                border.color: PlasmaCore.Theme.disabledTextColor
+                                border.color: root.themeDisabledTextColor
                                 clip: true
 
                                 Image {
@@ -1104,20 +1178,20 @@ Item {
                         Rectangle {
                             id: bubble
                             Layout.fillWidth: true
+                            Layout.maximumWidth: bubbleWidth
                             Layout.alignment: Qt.AlignTop
-                            implicitWidth: isStatus
-                                ? rowContainer.width
-                                : Math.min(rowContainer.width * 0.88, Math.max(120, messageText.implicitWidth + 12))
+                            Layout.preferredWidth: bubbleWidth
+                            implicitWidth: Layout.preferredWidth
                             implicitHeight: bubbleContent.implicitHeight + 12
                             height: implicitHeight
                             radius: isStatus ? 0 : 8
                             color: isStatus
                                 ? "transparent"
                                 : (isTool
-                                    ? PlasmaCore.Theme.backgroundColor
-                                    : (isAssistant ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor))
+                                    ? root.themeBackgroundColor
+                                    : (isAssistant ? root.themeBackgroundColor : root.themeHighlightColor))
                             border.width: isStatus ? 0 : 1
-                            border.color: PlasmaCore.Theme.disabledTextColor
+                            border.color: root.themeDisabledTextColor
 
                             ColumnLayout {
                                 id: bubbleContent
@@ -1134,35 +1208,26 @@ Item {
                                     onClicked: root.toggleToolEntryExpanded(modelData.entryId)
                                 }
 
-                            TextEdit {
+                            Text {
                                 id: messageText
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: visible ? contentHeight : 0
+                                Layout.preferredHeight: visible ? implicitHeight : 0
                                 visible: !isTool || toolExpanded
-                                readOnly: true
-                                selectByMouse: true
-                                selectByKeyboard: true
-                                wrapMode: TextEdit.Wrap
-                                textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
+                                wrapMode: Text.Wrap
+                                textFormat: Text.PlainText
                                 text: isStatus
                                     ? "[status] " + String(modelData.text || "")
                                     : String(modelData.text || "")
                                 color: isStatus
-                                    ? PlasmaCore.Theme.disabledTextColor
+                                    ? root.themeDisabledTextColor
                                     : (isTool
-                                        ? PlasmaCore.Theme.textColor
+                                        ? root.themeTextColor
                                         : (isAssistant
-                                        ? PlasmaCore.Theme.textColor
-                                        : PlasmaCore.Theme.highlightedTextColor))
+                                        ? root.themeTextColor
+                                        : root.themeHighlightedTextColor))
                                 font.pointSize: root.baseFontPointSize * root.uiScale
                                 font.italic: isStatus
                                 font.bold: false
-                                activeFocusOnPress: true
-                                selectedTextColor: (isAssistant || isTool) ? PlasmaCore.Theme.textColor : PlasmaCore.Theme.highlightedTextColor
-                                selectionColor: (isAssistant || isTool) ? PlasmaCore.Theme.backgroundColor : PlasmaCore.Theme.highlightColor
-                                onLinkActivated: function(link) {
-                                    Qt.openUrlExternally(link)
-                                }
                             }
                             }
                         }
@@ -1202,8 +1267,10 @@ Item {
             }
         }
 
-        RowLayout {
+        Flow {
+            id: actionControls
             Layout.fillWidth: true
+            spacing: 6
 
             QQC2.Button {
                 id: sendButton
@@ -1231,19 +1298,12 @@ Item {
                 onClicked: clearTranscriptView()
             }
 
-            Item {
-                Layout.fillWidth: true
-            }
-
             QQC2.ComboBox {
                 id: servicePicker
-                visible: root.devServiceRunning
-                Layout.preferredWidth: 170
-                Layout.fillWidth: false
+                visible: root.devServiceRunning && !root.ultraNarrow
+                width: 170
                 model: root.serviceChoices
                 textRole: "label"
-                palette.text: PlasmaCore.Theme.textColor
-                palette.buttonText: PlasmaCore.Theme.textColor
                 onActivated: function(index) {
                     switchService(index)
                 }
@@ -1251,14 +1311,12 @@ Item {
 
             QQC2.CheckBox {
                 id: debugCheckBox
+                visible: !root.ultraNarrow
                 text: "Debug"
                 checked: root.debugEnabled
-                palette.text: PlasmaCore.Theme.textColor
-                palette.buttonText: PlasmaCore.Theme.textColor
-                palette.windowText: PlasmaCore.Theme.textColor
                 contentItem: QQC2.Label {
                     text: debugCheckBox.text
-                    color: PlasmaCore.Theme.textColor
+                    color: root.themeTextColor
                     verticalAlignment: Text.AlignVCenter
                     leftPadding: debugCheckBox.indicator && debugCheckBox.indicator.visible
                         ? debugCheckBox.indicator.width + debugCheckBox.spacing

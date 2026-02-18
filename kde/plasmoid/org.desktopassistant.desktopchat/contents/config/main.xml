@@ -17,5 +17,9 @@
       <label>Hide previous sessions older than this many days (0 disables filtering)</label>
       <default>7</default>
     </entry>
+    <entry name="maxRenderedMessages" type="Int">
+      <label>Number of latest messages to load in chat view (0 loads full conversation)</label>
+      <default>50</default>
+    </entry>
   </group>
 </kcfg>

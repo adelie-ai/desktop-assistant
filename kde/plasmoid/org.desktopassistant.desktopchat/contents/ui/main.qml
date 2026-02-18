@@ -1,12 +1,17 @@
 import QtQuick
 import QtCore
+import org.kde.kirigami as Kirigami
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 
 PlasmoidItem {
     id: root
-    implicitWidth: 460
-    implicitHeight: 560
+    Kirigami.Theme.colorSet: Kirigami.Theme.View
+    Kirigami.Theme.inherit: false
+    readonly property int minWidgetWidth: 460
+    readonly property int minWidgetHeight: 560
+    implicitWidth: 520
+    implicitHeight: 620
     readonly property string xdgDataHome: String(StandardPaths.writableLocation(StandardPaths.GenericDataLocation) || "")
     readonly property string normalizedDataHome: xdgDataHome.indexOf("file://") === 0 ? xdgDataHome.substring(7) : xdgDataHome
     readonly property string sharedModuleChatViewPath: "file://" + normalizedDataHome + "/desktop-assistant/chat-module/ui/ChatView.qml"
@@ -34,6 +39,27 @@ PlasmoidItem {
                 sourceIndex += 1
                 source = sourceCandidates[sourceIndex]
             }
+        }
+    }
+
+    Component.onCompleted: {
+        if (width > 0 && width < minWidgetWidth) {
+            width = minWidgetWidth
+        }
+        if (height > 0 && height < minWidgetHeight) {
+            height = minWidgetHeight
+        }
+    }
+
+    onWidthChanged: {
+        if (width > 0 && width < minWidgetWidth) {
+            width = minWidgetWidth
+        }
+    }
+
+    onHeightChanged: {
+        if (height > 0 && height < minWidgetHeight) {
+            height = minWidgetHeight
         }
     }
 }
