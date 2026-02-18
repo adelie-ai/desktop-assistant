@@ -17,7 +17,11 @@ The current phase of the project is focused on mapping the landscape and getting
 
 Community feedback and contributions are very welcome as the platform matures.
 
-The assistant persona is named **Adele**, in reference to the **Adélie penguin**.
+## The Name
+
+The core platform is called the **Adelie** AI platform. The assistant persona implemented on it is named **Adele**.
+
+This branding is fairly superficial and isn't extensively reflected in code at this point, but once it settles, that will probably change. 
 
 ## Workspace at a Glance
 
