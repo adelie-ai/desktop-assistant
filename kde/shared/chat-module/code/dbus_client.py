@@ -116,16 +116,28 @@ def send_prompt(conversation_id: str, prompt: str) -> str:
     return response[0]
 
 
-def get_conversation(conversation_id: str, tail: int | None = None) -> dict[str, Any]:
+def get_conversation(
+    conversation_id: str,
+    tail: int | None = None,
+    after_count: int | None = None,
+) -> dict[str, Any]:
     response = _run_gdbus("GetConversation", conversation_id)
     conv_id, title, messages = response
     total_messages = len(messages)
-    # Performance guardrail for widget callers: keep historical back-loads bounded.
-    # Large message batches can cause expensive QML layout/render work and freeze
-    # the desktop shell, so callers should prefer a small `--tail` value.
-    normalized_tail = max(0, int(tail or 0))
-    truncated = normalized_tail > 0 and total_messages > normalized_tail
-    visible_messages = messages[-normalized_tail:] if truncated else messages
+    normalized_after = max(0, int(after_count or 0))
+    use_after = after_count is not None
+
+    if use_after:
+        visible_messages = messages[normalized_after:] if normalized_after < total_messages else []
+        truncated = False
+    else:
+        # Performance guardrail for widget callers: keep historical back-loads bounded.
+        # Large message batches can cause expensive QML layout/render work and freeze
+        # the desktop shell, so callers should prefer a small `--tail` value.
+        normalized_tail = max(0, int(tail or 0))
+        truncated = normalized_tail > 0 and total_messages > normalized_tail
+        visible_messages = messages[-normalized_tail:] if truncated else messages
+
     items = []
     for role, content in visible_messages:
         items.append({"role": role, "content": content})
@@ -135,6 +147,7 @@ def get_conversation(conversation_id: str, tail: int | None = None) -> dict[str,
         "messages": items,
         "message_count": total_messages,
         "truncated": truncated,
+        "after_count": normalized_after if use_after else None,
     }
 
 
@@ -239,6 +252,7 @@ def main() -> int:
     get_cmd = subparsers.add_parser("get")
     get_cmd.add_argument("conversation_id")
     get_cmd.add_argument("--tail", type=int, default=0)
+    get_cmd.add_argument("--after-count", type=int)
 
     delete_cmd = subparsers.add_parser("delete")
     delete_cmd.add_argument("conversation_id")
@@ -270,7 +284,7 @@ def main() -> int:
             print(json.dumps({"request_id": send_prompt(args.conversation_id, args.prompt)}))
             return 0
         if args.command == "get":
-            print(json.dumps(get_conversation(args.conversation_id, args.tail)))
+            print(json.dumps(get_conversation(args.conversation_id, args.tail, args.after_count)))
             return 0
         if args.command == "delete":
             delete_conversation(args.conversation_id)
