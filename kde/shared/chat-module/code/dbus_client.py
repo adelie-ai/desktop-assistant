@@ -179,9 +179,15 @@ def wait_for_assistant_reply(conversation_id: str, initial_count: int, timeout_s
                     if message.get("role") == "assistant":
                         return message.get("content", "")
             else:
-                for message in reversed(new_messages):
-                    if message.get("role") == "assistant":
-                        return message.get("content", "")
+                # Only accept an assistant reply without a new user inside this
+                # window when the boundary is immediately after a user message.
+                boundary_is_after_user = initial_count > 0 and initial_count <= len(messages) and (
+                    messages[initial_count - 1].get("role") == "user"
+                )
+                if boundary_is_after_user:
+                    for message in new_messages:
+                        if message.get("role") == "assistant":
+                            return message.get("content", "")
         time.sleep(interval_sec)
 
     return ""

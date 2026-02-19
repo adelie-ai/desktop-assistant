@@ -37,13 +37,10 @@ Item {
     property double loadingConversationStartedAtMs: 0
     property int conversationLoadSequence: 0
     property bool initialLoadAutoScrollPending: true
-    property int initialLoadBottomSnapRemaining: 0
     property bool debugEnabled: false
     property bool serviceStatusRequestInFlight: false
     property int currentMessageCount: 0
     property var transcriptEntries: []
-    property bool transcriptBulkLoading: false
-    property bool forceStickToBottomOnNextMessage: false
     property int transcriptEntryIdSeq: 0
     property var expandedToolEntries: ({})
     readonly property int maxTranscriptEntries: 400
@@ -477,23 +474,39 @@ Item {
         return normalized.substring(0, maxLoadedMessageChars) + "\n\n[…message truncated for performance…]"
     }
 
-    function appendTranscriptEntry(entry) {
-        const isMessageEntry = entry && entry.kind === "message"
-        const viewportHeight = Math.max(0, Number(transcript ? transcript.height : 0))
-        const contentHeight = Math.max(0, Number(transcript ? transcript.contentHeight : 0))
+    function transcriptIsAtBottom() {
+        if (!transcript) {
+            return true
+        }
+        const viewportHeight = Math.max(0, Number(transcript.height || 0))
+        const contentHeight = Math.max(0, Number(transcript.contentHeight || 0))
         const maxContentY = Math.max(0, contentHeight - viewportHeight)
-        const previousContentY = Number(transcript ? transcript.contentY : 0)
-        const wasAtBottom = maxContentY <= 0 || previousContentY >= maxContentY - 1
-        const shouldStickToBottom = isMessageEntry && (wasAtBottom || forceStickToBottomOnNextMessage)
-        if (isMessageEntry) {
-            forceStickToBottomOnNextMessage = false
+        const currentY = Math.max(0, Number(transcript.contentY || 0))
+        return maxContentY <= 0 || currentY >= maxContentY - 2 || transcript.atYEnd
+    }
+
+    function appendTranscriptEntries(entries, stickIfAlreadyAtBottom) {
+        if (!entries || entries.length === 0) {
+            return
         }
-        const nextEntry = Object.assign({}, entry)
-        if (nextEntry.entryId === undefined) {
-            transcriptEntryIdSeq = transcriptEntryIdSeq + 1
-            nextEntry.entryId = transcriptEntryIdSeq
+        const previousContentY = Math.max(0, Number(transcript ? transcript.contentY : 0))
+        const shouldStickToBottom = stickIfAlreadyAtBottom === true && transcriptIsAtBottom()
+        const preparedEntries = []
+        for (let i = 0; i < entries.length; i++) {
+            if (!entries[i]) {
+                continue
+            }
+            const nextEntry = Object.assign({}, entries[i])
+            if (nextEntry.entryId === undefined) {
+                transcriptEntryIdSeq = transcriptEntryIdSeq + 1
+                nextEntry.entryId = transcriptEntryIdSeq
+            }
+            preparedEntries.push(nextEntry)
         }
-        const nextEntries = transcriptEntries.concat([nextEntry])
+        if (preparedEntries.length === 0) {
+            return
+        }
+        const nextEntries = transcriptEntries.concat(preparedEntries)
         const overflow = nextEntries.length - maxTranscriptEntries
         transcriptEntries = overflow > 0 ? nextEntries.slice(overflow) : nextEntries
         Qt.callLater(function() {
@@ -509,6 +522,11 @@ Item {
             const nowMaxContentY = Math.max(0, nowContentHeight - nowViewportHeight)
             transcript.contentY = Math.max(0, Math.min(nowMaxContentY, previousContentY))
         })
+    }
+
+    function appendTranscriptEntry(entry) {
+        const isMessageEntry = entry && entry.kind === "message"
+        appendTranscriptEntries([entry], isMessageEntry)
     }
 
     function keepPromptCursorVisible() {
@@ -537,8 +555,17 @@ Item {
             return
         }
         initialLoadAutoScrollPending = false
-        initialLoadBottomSnapRemaining = 5
-        initialLoadBottomSnapTimer.start()
+        Qt.callLater(function() {
+            if (!transcript || Number(transcript.count || 0) <= 0) {
+                return
+            }
+            transcript.positionViewAtEnd()
+            Qt.callLater(function() {
+                if (transcript && Number(transcript.count || 0) > 0) {
+                    transcript.positionViewAtEnd()
+                }
+            })
+        })
     }
 
     function isToolEntryExpanded(entryId) {
@@ -762,7 +789,7 @@ Item {
     }
 
     function refreshConversation() {
-        if (conversationId.length === 0 || busy || loadingConversation) {
+        if (conversationId.length === 0 || loadingConversation) {
             return
         }
 
@@ -805,46 +832,41 @@ Item {
 
                 const allMessages = payload.messages || []
                 const payloadCount = Number(payload.message_count || allMessages.length)
-                if (useIncrementalLoad && payloadCount >= baselineCount) {
-                    transcriptBulkLoading = true
-                    for (let i = 0; i < allMessages.length; i++) {
-                        const message = allMessages[i]
-                        const entry = buildMessageEntry(message.role, clipLoadedMessageText(message.content), {
-                            historicalLoad: true,
-                        })
-                        if (entry) {
-                            appendTranscriptEntry(entry)
-                        }
-                    }
-                    transcriptBulkLoading = false
-                    currentMessageCount = payloadCount
-                    applyInitialLoadAutoScrollIfNeeded()
-                    return
-                }
-
-                // Bootstrap path (or if counts drift): reset once, then append entries.
-                expandedToolEntries = ({})
-                transcriptEntryIdSeq = 0
-                transcriptEntries = []
-                transcriptBulkLoading = true
+                const newEntries = []
                 for (let i = 0; i < allMessages.length; i++) {
                     const message = allMessages[i]
                     const entry = buildMessageEntry(message.role, clipLoadedMessageText(message.content), {
                         historicalLoad: true,
                     })
                     if (entry) {
-                        appendTranscriptEntry(entry)
+                        newEntries.push(entry)
                     }
                 }
-                transcriptBulkLoading = false
+
+                if (useIncrementalLoad) {
+                    if (payloadCount < baselineCount) {
+                        currentMessageCount = payloadCount
+                        return
+                    }
+                    appendTranscriptEntries(newEntries, true)
+                    currentMessageCount = payloadCount
+                    applyInitialLoadAutoScrollIfNeeded()
+                    return
+                }
+
+                // Bootstrap path: populate visible history once from tail.
+                expandedToolEntries = ({})
+                transcriptEntryIdSeq = 0
+                transcriptEntries = []
+                appendTranscriptEntries(newEntries, false)
                 currentMessageCount = payloadCount
-                applyInitialLoadAutoScrollIfNeeded()
                 if (payload.truncated) {
                     appendStatus("Showing latest " + allMessages.length + " of " + currentMessageCount + " messages")
                 }
                 if (currentMessageCount === 0) {
                     appendStatus("No messages yet")
                 }
+                applyInitialLoadAutoScrollIfNeeded()
             },
             function(stderr) {
                 if (sequence !== conversationLoadSequence) {
@@ -880,12 +902,6 @@ Item {
             busy = true
             lateResponsePollTimer.stop()
             lateResponsePollRemaining = 0
-            const viewportHeight = Math.max(0, Number(transcript ? transcript.height : 0))
-            const contentHeight = Math.max(0, Number(transcript ? transcript.contentHeight : 0))
-            const maxContentY = Math.max(0, contentHeight - viewportHeight)
-            const currentY = Math.max(0, Number(transcript ? transcript.contentY : 0))
-            forceStickToBottomOnNextMessage = maxContentY <= 0 || currentY >= maxContentY - 1
-            appendMessage("user", prompt)
             promptText = ""
 
             const sendCommand = helperCommand("send " + shellEscape(conversationId) + " " + shellEscape(prompt))
@@ -898,43 +914,55 @@ Item {
                         appendStatus(payload.error)
                         return
                     }
-                    currentMessageCount = currentMessageCount + 1
-                    appendStatus("Waiting for assistant response…")
-                    const awaitCommand = helperCommand(
-                        "await "
-                        + shellEscape(conversationId)
-                        + " --initial-count "
-                        + currentMessageCount
-                        + " --timeout "
-                        + awaitTimeoutSeconds
-                    )
-                    runCommand(
-                        awaitCommand,
-                        function(awaitOut) {
-                            busy = false
-                            const awaitPayload = JSON.parse(awaitOut)
-                            let receivedAssistantReply = false
-                            if (awaitPayload.error) {
-                                appendStatus(awaitPayload.error)
-                            } else if (awaitPayload.assistant_reply && awaitPayload.assistant_reply.length > 0) {
-                                appendMessage("assistant", awaitPayload.assistant_reply)
-                                currentMessageCount = currentMessageCount + 1
-                                receivedAssistantReply = true
-                            } else {
-                                appendStatus("No assistant response before timeout")
-                                lateResponsePollRemaining = panelMode ? 18 : 36
+                    refreshConversation()
+                    reloadConversationList()
+                    const startAwait = function(initialCount) {
+                        const awaitCommand = helperCommand(
+                            "await "
+                            + shellEscape(conversationId)
+                            + " --initial-count "
+                            + initialCount
+                            + " --timeout "
+                            + awaitTimeoutSeconds
+                        )
+                        runCommand(
+                            awaitCommand,
+                            function(awaitOut) {
+                                busy = false
+                                const awaitPayload = JSON.parse(awaitOut)
+                                if (awaitPayload.error) {
+                                    appendStatus(awaitPayload.error)
+                                }
+                                refreshConversation()
+                                reloadConversationList()
+                                lateResponsePollRemaining = panelMode ? 6 : 12
+                                lateResponsePollTimer.start()
+                            },
+                            function(awaitErr) {
+                                busy = false
+                                appendStatus(awaitErr)
+                                refreshConversation()
+                                reloadConversationList()
+                                lateResponsePollRemaining = panelMode ? 6 : 12
                                 lateResponsePollTimer.start()
                             }
-                            if (!receivedAssistantReply) {
-                                refreshConversation()
+                        )
+                    }
+
+                    const countCommand = helperCommand("get " + shellEscape(conversationId) + " --after-count 2147483647")
+                    runCommand(
+                        countCommand,
+                        function(countOut) {
+                            const countPayload = JSON.parse(countOut)
+                            if (countPayload.error) {
+                                startAwait(currentMessageCount)
+                                return
                             }
-                            reloadConversationList()
+                            currentMessageCount = Number(countPayload.message_count || currentMessageCount)
+                            startAwait(currentMessageCount)
                         },
-                        function(awaitErr) {
-                            busy = false
-                            appendStatus(awaitErr)
-                            refreshConversation()
-                            reloadConversationList()
+                        function(_countErr) {
+                            startAwait(currentMessageCount)
                         }
                     )
                 },
@@ -1052,26 +1080,6 @@ Item {
             reloadConversationList()
             lateResponsePollRemaining = Math.max(0, lateResponsePollRemaining - 1)
             if (lateResponsePollRemaining <= 0) {
-                stop()
-            }
-        }
-    }
-
-    Timer {
-        id: initialLoadBottomSnapTimer
-        interval: 50
-        repeat: true
-        running: false
-        onTriggered: {
-            if (root.initialLoadBottomSnapRemaining <= 0) {
-                stop()
-                return
-            }
-            root.initialLoadBottomSnapRemaining = root.initialLoadBottomSnapRemaining - 1
-            if (transcript && Number(transcript.count || 0) > 0) {
-                transcript.positionViewAtEnd()
-            }
-            if (root.initialLoadBottomSnapRemaining <= 0) {
                 stop()
             }
         }
