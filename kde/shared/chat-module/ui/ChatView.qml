@@ -227,6 +227,35 @@ Item {
         return Math.floor(configured)
     }
 
+    function markdownListLineCount(textValue) {
+        const normalized = String(textValue === undefined || textValue === null ? "" : textValue)
+            .replace(/\r\n/g, "\n")
+            .replace(/\r/g, "\n")
+        if (normalized.length === 0) {
+            return 0
+        }
+
+        const lines = normalized.split("\n")
+        let count = 0
+        for (let i = 0; i < lines.length; i++) {
+            if (/^\s{0,3}(?:[-*+]|\d+[.)])\s+/.test(lines[i])) {
+                count = count + 1
+            }
+        }
+        return count
+    }
+
+    function shouldRenderAssistantAsMarkdown(textValue) {
+        const normalized = String(textValue === undefined || textValue === null ? "" : textValue)
+        if (normalized.length === 0) {
+            return false
+        }
+
+        const listLines = markdownListLineCount(normalized)
+        const hasLargeList = listLines >= 45 && normalized.length >= 1800
+        return !hasLargeList
+    }
+
     function loadPersistedService() {
         const persisted = String(Plasmoid.configuration.selectedService || "").trim()
         if (persisted === productionService || persisted === developmentService) {
@@ -401,12 +430,20 @@ Item {
         if (role === "tool" && !debugEnabled) {
             return
         }
+        const entry = buildMessageEntry(role, text, meta)
+        if (!entry) {
+            return
+        }
+        appendTranscriptEntry(entry)
+    }
+
+    function buildMessageEntry(role, text, meta) {
         const normalizedText = String(text === undefined || text === null ? "" : text)
         const clippedText = normalizedText.length > maxLiveMessageChars
             ? normalizedText.substring(0, maxLiveMessageChars) + "\n\n[…message truncated for widget stability…]"
             : normalizedText
         if (clippedText.trim().length === 0) {
-            return
+            return null
         }
         const entry = {
             kind: "message",
@@ -418,7 +455,7 @@ Item {
                 entry[key] = meta[key]
             }
         }
-        appendTranscriptEntry(entry)
+        return entry
     }
 
     function appendStatus(text) {
@@ -677,7 +714,9 @@ Item {
         loadingConversationStartedAtMs = Date.now()
         conversationLoadTimeoutTimer.stop()
         conversationLoadTimeoutTimer.start()
-        appendStatus("Loading conversation…")
+        if (!hasRealMessages) {
+            appendStatus("Loading conversation…")
+        }
 
         // NOTE: `--tail` is a UI-only fetch limit. Core conversation context remains
         // intact in the daemon store for model prompting.
@@ -703,14 +742,24 @@ Item {
 
                 expandedToolEntries = ({})
                 transcriptBulkLoading = true
-                transcriptEntries = []
                 const allMessages = payload.messages || []
+                const loadedEntries = []
                 for (let i = 0; i < allMessages.length; i++) {
                     const message = allMessages[i]
-                    appendMessage(message.role, clipLoadedMessageText(message.content), {
+                    const entry = buildMessageEntry(message.role, clipLoadedMessageText(message.content), {
                         historicalLoad: true,
                     })
+                    if (entry) {
+                        loadedEntries.push(entry)
+                    }
                 }
+                const overflow = loadedEntries.length - maxTranscriptEntries
+                const visibleEntries = overflow > 0 ? loadedEntries.slice(overflow) : loadedEntries
+                transcriptEntryIdSeq = transcriptEntryIdSeq + visibleEntries.length
+                for (let i = 0; i < visibleEntries.length; i++) {
+                    visibleEntries[i].entryId = transcriptEntryIdSeq - visibleEntries.length + i + 1
+                }
+                transcriptEntries = visibleEntries
                 transcriptBulkLoading = false
                 transcript.positionViewAtEnd()
                 currentMessageCount = Number(payload.message_count || allMessages.length)
@@ -999,6 +1048,7 @@ Item {
                 visible: true
                 width: {
                     const buttonWidths = loadButton.implicitWidth
+                        + refreshListButton.implicitWidth + conversationControls.spacing
                         + (settingsButton.visible ? (settingsButton.implicitWidth + conversationControls.spacing) : 0)
                     return Math.max(root.ultraNarrow ? 140 : 180, conversationControls.width - buttonWidths - conversationControls.spacing)
                 }
@@ -1060,6 +1110,13 @@ Item {
             }
 
             QQC2.Button {
+                id: refreshListButton
+                text: "Refresh List"
+                enabled: !busy && !loadingConversation
+                onClicked: reloadConversationList()
+            }
+
+            QQC2.Button {
                 id: settingsButton
                 visible: panelMode && !root.ultraNarrow
                 text: "Settings"
@@ -1114,6 +1171,8 @@ Item {
                     readonly property bool isTool: modelData.role === "tool"
                     readonly property string toolName: String(modelData.toolName || "Tool")
                     readonly property bool isAssistant: modelData.role === "assistant"
+                    readonly property string messageBodyText: String(modelData.text || "")
+                    readonly property bool renderAssistantAsMarkdown: root.shouldRenderAssistantAsMarkdown(messageBodyText)
                     readonly property bool toolExpanded: root.isToolEntryExpanded(modelData.entryId)
                     readonly property real avatarSize: root.transcriptAvatarSize
                     readonly property real bubbleWidth: (isStatus || isTool)
@@ -1217,10 +1276,12 @@ Item {
                                 selectByMouse: true
                                 selectByKeyboard: true
                                 wrapMode: TextEdit.Wrap
-                                textFormat: (modelData.kind === "message" && isAssistant) ? Text.MarkdownText : Text.PlainText
+                                textFormat: (modelData.kind === "message" && isAssistant && renderAssistantAsMarkdown)
+                                    ? Text.MarkdownText
+                                    : Text.PlainText
                                 text: isStatus
-                                    ? "[status] " + String(modelData.text || "")
-                                    : String(modelData.text || "")
+                                    ? "[status] " + messageBodyText
+                                    : messageBodyText
                                 color: isStatus
                                     ? root.themeDisabledTextColor
                                     : (isTool
