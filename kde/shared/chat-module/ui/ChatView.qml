@@ -43,6 +43,10 @@ Item {
     property var transcriptEntries: []
     property int transcriptEntryIdSeq: 0
     property var expandedToolEntries: ({})
+    // NOTE: must NOT be readonly — QV4 does not reliably root readonly var properties
+    // under GC pressure, leading to SEGV in Object::insertMember when writing to
+    // pending[cmd] during a GC cycle triggered by heavy Object.assign usage.
+    property var pending: ({})
     readonly property int maxTranscriptEntries: 400
     // Configurable UI back-load limit. 0 means full history.
     // Default is 50 to balance responsiveness and context visibility.
@@ -87,7 +91,6 @@ Item {
         return false
     }
     property int lateResponsePollRemaining: 0
-    readonly property var pending: ({})
 
     function toImageSource(pathValue) {
         const value = String(pathValue || "").trim()
