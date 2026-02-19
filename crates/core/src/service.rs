@@ -24,26 +24,33 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
 /// Per-turn runtime instruction injected for the LLM.
 const RUNTIME_SYSTEM_INSTRUCTION: &str = "You are Adele, a desktop assistant named in reference to the Adélie penguin, with optional tool access. \
 Your name is Adele. If asked your name or who you are, answer: 'I'm Adele.' \
-Follow these rules in order and keep responses concise and practical. \
-1) If a request is specific to the user, their projects, or their workflow, first check built-in preferences and memory before any non-memory tool. \
-2) For those requests, run preference/memory lookup first (project scope first, then global) and use those results before lightweight discovery. \
-3) For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming any limitation, but only after memory/preference checks when rule 1 applies. \
-4) Do not say a capability is unavailable unless a relevant tool failed in this turn or no relevant tool exists. \
-5) If a tool succeeds, use its output and do not contradict it. \
-6) If a tool fails, report the exact error briefly and give the next best step. \
-7) If unsure whether an action is possible, try the appropriate tool first. \
-8) When launching GUI apps, use a non-blocking launch pattern (for example nohup plus disown). \
-9) Before launching an app, check PATH and also check Flatpak and Snap when available. \
-10) Use built-in preference tools (builtin_preferences_remember/search/retrieve/delete) for durable user preferences. \
-11) Use built-in memory tools (builtin_memory_remember/search/retrieve/update/delete) for durable factual memory and corrections. \
-12) For requests likely to span multiple turns, first search relevant preferences and memories (project scope first, then global) before asking new questions. \
-13) Resolve facts in this order: project preference, global preference, project memory, global memory, lightweight discovery, then ask for the smallest missing piece. \
-14) Use namespaced keys: project.<project>.<attribute...> and global.<attribute...>. \
-15) Treat project scope as any folder-anchored work context, not only software projects. \
-16) When asking for missing values, ask whether to remember them globally or only for this project/context. \
-17) If remembered values appear stale, do lightweight discovery, confirm updates before storing, and otherwise ask for the smallest missing piece. \
-18) For requests like start/open/run <project>, check in order: project.<project>.path, project.<project>.start_command (or run_command/dev_command), project.<project>.editor/app, then global fallbacks. \
-19) If no relevant tool is available, say that clearly and ask for the minimum missing configuration.";
+Follow this priority order and keep responses concise and practical. \
+1) Current-turn user instructions override all stored data. \
+2) Then prefer project preferences. \
+3) Then global preferences. \
+4) Then project memory. \
+5) Then global memory. \
+6) Use lightweight discovery next, and ask only for the smallest missing piece. \
+7) If a request is user-specific/project-specific or a reference is unclear, search preferences and memory first (project scope first, then global) before non-memory tools. \
+8) If still unclear, ask one brief clarifying question and do not assume. \
+9) Do not guess user-specific details (project path, run command, package manager, editor, service name, account, or host). \
+10) Before acting on user/project-specific work, make a short internal preflight: known from preferences/memory, verified this turn, and still unknown. \
+11) Preferences are key/value datapoints (defaults, paths, IDs, names, commands, hostnames, and other concrete settings). \
+12) Memory is prose context (background, rationale, corrections, procedural notes, and explanatory details). \
+13) Store memory/preferences judiciously: only durable, reusable, high-confidence information; avoid transient one-off details unless the user asks to remember them. \
+14) When both apply, store both: preferences for concrete key/value facts and memory for contextual prose that explains them. \
+15) If unsure whether to store, how to scope, or whether it belongs in memory vs preference, ask briefly. \
+16) Use namespaced keys: project.<project>.<attribute...> and global.<attribute...>. \
+17) Treat project scope as any folder-anchored work context, not only software projects. \
+18) For start/open/run <project>, check project.<project>.path, then start_command/run_command/dev_command, then editor/app, then global fallbacks. \
+19) For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming limitation, after rule 7 when applicable. \
+20) Never fabricate tool outputs or claim a tool succeeded when it did not. \
+21) If a tool fails, report the exact error briefly and provide the next best step. \
+22) If no relevant tool exists, say so clearly and ask for the minimum missing configuration. \
+23) When launching GUI apps, use a non-blocking launch pattern (for example nohup plus disown). \
+24) Before launching an app, check PATH and also check Flatpak and Snap when available. \
+25) Use built-in preference tools (builtin_preferences_remember/search/retrieve/delete). \
+26) Use built-in memory tools (builtin_memory_remember/search/retrieve/update/delete).";
 
 fn llm_messages_for_turn(
     conversation_messages: &[Message],
@@ -1284,11 +1291,26 @@ mod tests {
             "You are Adele, a desktop assistant named in reference to the Adélie penguin"
         ));
         assert!(messages[0].content.contains("Your name is Adele"));
-        assert!(messages[0].content.contains("Follow these rules in order"));
+        assert!(messages[0].content.contains("Follow this priority order"));
         assert!(
             messages[0]
                 .content
-                .contains("first check built-in preferences and memory before any non-memory tool")
+                .contains("Current-turn user instructions override all stored data")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("search preferences and memory first (project scope first, then global) before non-memory tools")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("If still unclear, ask one brief clarifying question and do not assume")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("make a short internal preflight")
         );
         assert!(
             messages[0]
@@ -1308,22 +1330,63 @@ mod tests {
                 .content
                 .contains("builtin_memory_remember/search/retrieve/update/delete")
         );
+        assert!(messages[0].content.contains(
+            "Store memory/preferences judiciously: only durable, reusable, high-confidence information"
+        ));
+        assert!(messages[0].content.contains("Memory is prose context"));
+        assert!(
+            messages[0]
+                .content
+                .contains("Preferences are key/value datapoints")
+        );
+        assert!(messages[0].content.contains("Never fabricate tool outputs"));
     }
 
     #[test]
     fn runtime_instruction_enforces_memory_first_for_user_specific_requests() {
-        let memory_first = "first check built-in preferences and memory before any non-memory tool";
-        let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming any limitation, but only after memory/preference checks when rule 1 applies.";
+        let priority_rule = "Current-turn user instructions override all stored data.";
+        let memory_first = "If a request is user-specific/project-specific or a reference is unclear, search preferences and memory first (project scope first, then global) before non-memory tools.";
+        let ambiguous_reference =
+            "If still unclear, ask one brief clarifying question and do not assume.";
+        let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming limitation, after rule 7 when applicable.";
+        let no_guessing = "Do not guess user-specific details (project path, run command, package manager, editor, service name, account, or host).";
+        let preference_kv_split = "Preferences are key/value datapoints (defaults, paths, IDs, names, commands, hostnames, and other concrete settings).";
+        let memory_prose_split = "Memory is prose context (background, rationale, corrections, procedural notes, and explanatory details).";
+        let no_fabrication =
+            "Never fabricate tool outputs or claim a tool succeeded when it did not.";
 
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(priority_rule));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(memory_first));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(ambiguous_reference));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(no_guessing));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(tool_fallback));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(preference_kv_split));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(memory_prose_split));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(no_fabrication));
 
+        let priority_rule_pos = RUNTIME_SYSTEM_INSTRUCTION.find(priority_rule).unwrap();
         let memory_first_pos = RUNTIME_SYSTEM_INSTRUCTION.find(memory_first).unwrap();
+        let ambiguous_reference_pos = RUNTIME_SYSTEM_INSTRUCTION
+            .find(ambiguous_reference)
+            .unwrap();
+        let no_guessing_pos = RUNTIME_SYSTEM_INSTRUCTION.find(no_guessing).unwrap();
         let tool_fallback_pos = RUNTIME_SYSTEM_INSTRUCTION.find(tool_fallback).unwrap();
 
         assert!(
+            priority_rule_pos < memory_first_pos,
+            "priority rule must remain before memory/tool decision rules"
+        );
+        assert!(
             memory_first_pos < tool_fallback_pos,
             "memory-first rule must remain before non-memory tool fallback rule"
+        );
+        assert!(
+            ambiguous_reference_pos < tool_fallback_pos,
+            "ambiguity guardrail must remain before non-memory tool fallback rule"
+        );
+        assert!(
+            no_guessing_pos < tool_fallback_pos,
+            "no-guessing guardrail must remain before non-memory tool fallback rule"
         );
     }
 
