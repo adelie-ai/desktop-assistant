@@ -43,9 +43,24 @@ Item {
     property var transcriptEntries: []
     property int transcriptEntryIdSeq: 0
     property var expandedToolEntries: ({})
-    // NOTE: must NOT be readonly — QV4 does not reliably root readonly var properties
-    // under GC pressure, leading to SEGV in Object::insertMember when writing to
-    // pending[cmd] during a GC cycle triggered by heavy Object.assign usage.
+    // ── QV4 GC HAZARD — read before touching any of the three sites below ────
+    // QV4 does not reliably root plain JS local variables (const/let/var) under
+    // GC pressure.  If you create a heap object into a local and then write a
+    // property to it in a *separate statement*, the GC can collect the object
+    // between the two statements, causing a SEGV in Object::insertMember.
+    //
+    // Safe patterns:
+    //   • Build the whole object in one Object.assign() expression.            (site 1)
+    //   • Compute all fields before calling Object.assign, pass them as the    (site 2)
+    //     initial literal so no post-creation mutation is needed.
+    //   • Assign to a QML property var first (a GC root), then mutate.        (site 3)
+    //
+    // DO NOT "clean up" these sites by introducing a local variable and then
+    // writing fields to it in separate statements — that is exactly the pattern
+    // that caused confirmed plasmawindowed SEGV crashes (Feb 2026).
+    //
+    // This property must NOT be readonly for the same reason: QV4 does not
+    // reliably root readonly var properties under GC pressure.
     property var pending: ({})
     readonly property int maxTranscriptEntries: 400
     // Configurable UI back-load limit. 0 means full history.
@@ -445,9 +460,10 @@ Item {
         if (clippedText.trim().length === 0) {
             return null
         }
-        // NOTE: build in a single Object.assign expression — do NOT create a temp
-        // and then mutate it in a second step; QV4 does not reliably root JS stack
-        // locals under GC pressure, which causes SEGV in Object::insertMember.
+        // QV4 GC HAZARD (site 1) — DO NOT split into: const entry = {}; entry.x = y
+        // Build the whole object in one Object.assign expression so QV4 never
+        // sees an incompletely-constructed object that could be collected mid-write.
+        // See the QV4 GC HAZARD comment near the `pending` property declaration.
         return Object.assign({ kind: "message", role: role, text: clippedText }, meta || {})
     }
 
@@ -489,8 +505,10 @@ Item {
             if (!entries[i]) {
                 continue
             }
-            // Compute the id before Object.assign so the whole object is built
-            // in one expression — see NOTE in buildMessageEntry about GC safety.
+            // QV4 GC HAZARD (site 2) — DO NOT rewrite as: const e = Object.assign({}, src); e.entryId = id
+            // Compute entryId before calling Object.assign and pass it in the
+            // initial literal so the object is fully formed in one expression.
+            // See the QV4 GC HAZARD comment near the `pending` property declaration.
             const src = entries[i]
             const entryId = src.entryId !== undefined
                 ? src.entryId
@@ -569,8 +587,10 @@ Item {
     function toggleToolEntryExpanded(entryId) {
         const key = String(entryId)
         const nextValue = !isToolEntryExpanded(entryId)
-        // Assign to the QML property first so the new object is immediately
-        // GC-rooted, then write the key — same fix as the pending property.
+        // QV4 GC HAZARD (site 3) — DO NOT rewrite as: const m = Object.assign({}, expandedToolEntries); m[key] = v
+        // Assign the Object.assign result directly to the QML property var, which
+        // is a GC root, before writing the toggled key into it.
+        // See the QV4 GC HAZARD comment near the `pending` property declaration.
         expandedToolEntries = Object.assign({}, expandedToolEntries)
         expandedToolEntries[key] = nextValue
     }
