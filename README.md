@@ -54,6 +54,10 @@ Connectors are being developed for a wide range of cloud services, from standard
 - The platform exposes extensive D-Bus-based APIs for integration with desktop environments and applications.
 - The platform makes extensive use of MCP services for pluggable (and un-pluggable) functionality.
 
+> **MCP servers are essential for real-world usefulness.** Without configured MCP servers, the assistant can hold conversations but cannot take actions (file I/O, task management, time tracking, shell execution, etc.). The built-in memory tools are always present, but meaningful capability comes from external MCP servers.
+>
+> Companion servers developed for this platform include `fileio-mcp`, `terminal-mcp`, `tasks-mcp`, `timeclock-mcp`, `skills-mcp`, and `calendar-mcp`. See [docs/mcp-services.md](docs/mcp-services.md) for the full list and configuration.
+
 ## Privacy and Connectivity
 
 The system is designed for privacy first, while still offering cloud LLM connectors as a pragmatic option. As always, privacy is a choose-your-own-adventure.
@@ -140,16 +144,32 @@ systemctl --user restart desktop-assistant-daemon
 
 For development service use the same pattern with `desktop-assistant-daemon-dev.service.d`.
 
-### 3) (Optional) Configure MCP servers
+### 3) Configure MCP servers
+
+> **Recommended.** MCP servers provide the tools (file I/O, task management, shell execution, etc.) that make the assistant genuinely useful. See [docs/mcp-services.md](docs/mcp-services.md) for the full list of available servers and their configuration options.
 
 Create `~/.config/desktop-assistant/mcp_servers.toml` (or under `$XDG_CONFIG_HOME`):
 
 ```toml
 [[servers]]
-name = "fileio"
+name    = "fileio"
 command = "fileio-mcp"
-args = ["serve", "--mode", "stdio"]
+args    = ["serve", "--mode", "stdio"]
+
+[[servers]]
+name    = "terminal"
+command = "terminal-mcp"
+args    = ["serve", "--mode", "stdio"]
+
+[[servers]]
+name    = "tasks"
+command = "tasks-mcp"
+args    = ["serve", "--mode", "stdio"]
 ```
+
+Each `[[servers]]` entry requires a `name` (used in logs) and a `command` (must be on `$PATH`). `args` is optional.
+
+See [docs/mcp-services.md](docs/mcp-services.md) for the full server list and configuration reference.
 
 ### 3b) (Optional) Git persistence for memories/preferences
 
@@ -440,7 +460,8 @@ require a working `snapd`/`core24` runtime that is not reliable inside Docker/Po
 
 - [Architecture](docs/architecture.md)
 - [D-Bus API](docs/dbus-api.md)
-- [MCP Integration](docs/mcp-integration.md)
+- [Adding MCP Services](docs/mcp-services.md)
+- [MCP Integration internals](docs/mcp-integration.md)
 - [Development Guide](docs/development.md)
 - [Cloud Providers](docs/cloud-providers.md)
 
