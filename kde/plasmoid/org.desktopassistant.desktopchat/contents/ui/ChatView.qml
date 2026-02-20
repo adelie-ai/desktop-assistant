@@ -448,17 +448,10 @@ Item {
         if (clippedText.trim().length === 0) {
             return null
         }
-        const entry = {
-            kind: "message",
-            role: role,
-            text: clippedText,
-        }
-        if (meta) {
-            for (const key in meta) {
-                entry[key] = meta[key]
-            }
-        }
-        return entry
+        // NOTE: build in a single Object.assign expression — do NOT create a temp
+        // and then mutate it in a second step; QV4 does not reliably root JS stack
+        // locals under GC pressure, which causes SEGV in Object::insertMember.
+        return Object.assign({ kind: "message", role: role, text: clippedText }, meta || {})
     }
 
     function appendStatus(text) {
@@ -499,12 +492,13 @@ Item {
             if (!entries[i]) {
                 continue
             }
-            const nextEntry = Object.assign({}, entries[i])
-            if (nextEntry.entryId === undefined) {
-                transcriptEntryIdSeq = transcriptEntryIdSeq + 1
-                nextEntry.entryId = transcriptEntryIdSeq
-            }
-            preparedEntries.push(nextEntry)
+            // Compute the id before Object.assign so the whole object is built
+            // in one expression — see NOTE in buildMessageEntry about GC safety.
+            const src = entries[i]
+            const entryId = src.entryId !== undefined
+                ? src.entryId
+                : (transcriptEntryIdSeq = transcriptEntryIdSeq + 1, transcriptEntryIdSeq)
+            preparedEntries.push(Object.assign({ entryId: entryId }, src))
         }
         if (preparedEntries.length === 0) {
             return
@@ -578,9 +572,10 @@ Item {
     function toggleToolEntryExpanded(entryId) {
         const key = String(entryId)
         const nextValue = !isToolEntryExpanded(entryId)
-        const nextMap = Object.assign({}, expandedToolEntries)
-        nextMap[key] = nextValue
-        expandedToolEntries = nextMap
+        // Assign to the QML property first so the new object is immediately
+        // GC-rooted, then write the key — same fix as the pending property.
+        expandedToolEntries = Object.assign({}, expandedToolEntries)
+        expandedToolEntries[key] = nextValue
     }
 
     function appendDebugStatus(text) {
