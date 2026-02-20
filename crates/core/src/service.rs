@@ -224,7 +224,7 @@ fn sanitize_generated_title(raw: &str) -> String {
     let first_line = raw.lines().next().unwrap_or("").trim();
     let stripped = first_line
         .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
-        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
+        .trim_end_matches(['.', ',', ';', '!', '?']);
     stripped
         .split_whitespace()
         .take(8)
