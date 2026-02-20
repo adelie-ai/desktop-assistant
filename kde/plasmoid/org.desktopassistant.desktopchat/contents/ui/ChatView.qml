@@ -43,25 +43,39 @@ Item {
     property var transcriptEntries: []
     property int transcriptEntryIdSeq: 0
     property var expandedToolEntries: ({})
-    // ── QV4 GC HAZARD — read before touching any of the three sites below ────
+    // ── QV4 GC HAZARD — read before touching any of the sites below ──────────
     // QV4 does not reliably root plain JS local variables (const/let/var) under
-    // GC pressure.  If you create a heap object into a local and then write a
-    // property to it in a *separate statement*, the GC can collect the object
-    // between the two statements, causing a SEGV in Object::insertMember.
+    // GC pressure, and its JIT may hold heap objects in CPU registers that the
+    // GC does not scan.  Creating a multi-property JS object literal and then
+    // storing it under a dynamic string key causes a confirmed plasmawindowed
+    // SEGV in Object::insertMember (Feb 2026): each property set during the
+    // literal's construction calls insertMember, which can trigger a GC cycle,
+    // and if the partially-constructed object is only live in an un-scanned
+    // CPU register the GC collects it mid-construction.
     //
     // Safe patterns:
     //   • Build the whole object in one Object.assign() expression.            (site 1)
     //   • Compute all fields before calling Object.assign, pass them as the    (site 2)
     //     initial literal so no post-creation mutation is needed.
     //   • Assign to a QML property var first (a GC root), then mutate.        (site 3)
+    //   • Use Array.push() for new entries: push uses integer-indexed putIndexed (site 4)
+    //     rather than insertMember, so it never triggers the hazardous code path.
     //
     // DO NOT "clean up" these sites by introducing a local variable and then
     // writing fields to it in separate statements — that is exactly the pattern
     // that caused confirmed plasmawindowed SEGV crashes (Feb 2026).
     //
-    // This property must NOT be readonly for the same reason: QV4 does not
-    // reliably root readonly var properties under GC pressure.
-    property var pending: ({})
+    // These properties must NOT be readonly: QV4 does not reliably root
+    // readonly var properties under GC pressure.
+    //
+    // pending callbacks are stored in four parallel arrays (site 4) rather than
+    // a plain-object map to avoid the insertMember hazard entirely.  Each
+    // Array.push() call writes to an integer-indexed slot (putIndexed), which
+    // does NOT go through Object::insertMember.
+    property var _pendingCmds: []
+    property var _pendingSuccess: []
+    property var _pendingError: []
+    property var _pendingDebug: []
     readonly property int maxTranscriptEntries: 400
     // Configurable UI back-load limit. 0 means full history.
     // Default is 50 to balance responsiveness and context visibility.
@@ -200,11 +214,13 @@ Item {
         if (shouldLogDebug) {
             appendToolExecutionDebug("run", command, "")
         }
-        pending[command] = {
-            success: onSuccess,
-            error: onError,
-            debug: shouldLogDebug,
-        }
+        // QV4 GC HAZARD (site 4) — use parallel arrays + push, not pending[cmd] = {}
+        // Array.push writes to an integer index (putIndexed), bypassing insertMember
+        // entirely.  See the QV4 GC HAZARD block near the _pendingCmds declaration.
+        _pendingCmds.push(command)
+        _pendingSuccess.push(onSuccess)
+        _pendingError.push(onError)
+        _pendingDebug.push(shouldLogDebug)
         executable.connectSource(command)
     }
 
@@ -998,11 +1014,19 @@ Item {
         connectedSources: []
 
         onNewData: function(sourceName, data) {
-            const callbacks = pending[sourceName]
-            if (!callbacks) {
+            const i = _pendingCmds.indexOf(sourceName)
+            if (i < 0) {
                 disconnectSource(sourceName)
                 return
             }
+            // Read all slot values before splicing so the indices stay valid.
+            const successCb = _pendingSuccess[i]
+            const errorCb = _pendingError[i]
+            const debugFlag = _pendingDebug[i]
+            _pendingCmds.splice(i, 1)
+            _pendingSuccess.splice(i, 1)
+            _pendingError.splice(i, 1)
+            _pendingDebug.splice(i, 1)
 
             const exitCode = data["exit code"]
             const stdout = (data.stdout || "").trim()
@@ -1010,21 +1034,20 @@ Item {
 
             try {
                 if (exitCode === 0) {
-                    if (callbacks.debug) {
+                    if (debugFlag) {
                         appendToolExecutionDebug("ok", sourceName, stdout)
                     }
-                    callbacks.success(stdout)
+                    successCb(stdout)
                 } else {
-                    if (callbacks.debug) {
+                    if (debugFlag) {
                         appendToolExecutionDebug("error", sourceName, stderr.length > 0 ? stderr : stdout)
                     }
-                    callbacks.error(stderr.length > 0 ? stderr : stdout)
+                    errorCb(stderr.length > 0 ? stderr : stdout)
                 }
             } catch (callbackError) {
                 appendStatus("Widget callback error: " + callbackError)
                 busy = false
             } finally {
-                delete pending[sourceName]
                 disconnectSource(sourceName)
             }
         }
