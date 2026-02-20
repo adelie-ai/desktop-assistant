@@ -430,9 +430,6 @@ Item {
     }
 
     function appendMessage(role, text, meta) {
-        if (role === "tool" && !debugEnabled) {
-            return
-        }
         const entry = buildMessageEntry(role, text, meta)
         if (!entry) {
             return
@@ -806,9 +803,12 @@ Item {
 
         // NOTE: `--tail` is a UI-only fetch limit. Core conversation context remains
         // intact in the daemon store for model prompting.
+        // Role filtering is done server-side: include tool messages only when
+        // debug mode is on so they count against the tail budget correctly.
+        const roles = debugEnabled ? "user,assistant,tool" : "user,assistant"
         const command = useIncrementalLoad
-            ? helperCommand("get " + shellEscape(requestId) + " --after-count " + baselineCount)
-            : helperCommand("get " + shellEscape(requestId) + " --tail " + maxRenderedMessages())
+            ? helperCommand("get " + shellEscape(requestId) + " --after-count " + baselineCount + " --roles " + shellEscape(roles))
+            : helperCommand("get " + shellEscape(requestId) + " --tail " + maxRenderedMessages() + " --roles " + shellEscape(roles))
         runCommand(
             command,
             function(stdout) {
