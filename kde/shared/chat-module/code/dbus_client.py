@@ -151,6 +151,37 @@ def get_conversation(
     }
 
 
+def get_messages(
+    conversation_id: str,
+    tail: int | None = None,
+    after_count: int | None = None,
+    include_roles: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fetch messages via GetMessages, with server-side filtering and pagination.
+
+    - ``tail``: max visible messages to return (applied after filtering); 0 = unlimited.
+    - ``after_count``: raw message index to start from; None means use tail mode.
+    - ``include_roles``: allowlist of roles to return (e.g. ``["user", "assistant"]``).
+      Defaults to ``["user", "assistant"]``.  Pass ``[]`` to receive all roles.
+
+    The returned ``message_count`` is the *total* unfiltered count so callers
+    can use it as the next ``after_count`` for incremental fetches.
+    """
+    tail_arg = str(max(0, int(tail or 0)))
+    after_arg = str(max(-1, int(after_count if after_count is not None else -1)))
+    roles = include_roles if include_roles is not None else ["user", "assistant"]
+    # Build a D-Bus array-of-strings literal: ["role1", "role2"]
+    roles_arg = "[" + ", ".join(f'"{r}"' for r in roles) + "]"
+    response = _run_gdbus("GetMessages", conversation_id, tail_arg, after_arg, roles_arg)
+    total_count, truncated, messages = response
+    items = [{"role": role, "content": content} for role, content in messages]
+    return {
+        "messages": items,
+        "message_count": int(total_count),
+        "truncated": bool(truncated),
+    }
+
+
 def delete_conversation(conversation_id: str) -> None:
     _run_gdbus("DeleteConversation", conversation_id)
 
@@ -259,6 +290,12 @@ def main() -> int:
     get_cmd.add_argument("conversation_id")
     get_cmd.add_argument("--tail", type=int, default=0)
     get_cmd.add_argument("--after-count", type=int)
+    get_cmd.add_argument(
+        "--roles",
+        default="user,assistant",
+        help="Comma-separated role allowlist (default: user,assistant). "
+             "Pass an empty string to return all roles.",
+    )
 
     delete_cmd = subparsers.add_parser("delete")
     delete_cmd.add_argument("conversation_id")
@@ -290,7 +327,8 @@ def main() -> int:
             print(json.dumps({"request_id": send_prompt(args.conversation_id, args.prompt)}))
             return 0
         if args.command == "get":
-            print(json.dumps(get_conversation(args.conversation_id, args.tail, args.after_count)))
+            include = [r.strip() for r in args.roles.split(",") if r.strip()]
+            print(json.dumps(get_messages(args.conversation_id, args.tail, args.after_count, include)))
             return 0
         if args.command == "delete":
             delete_conversation(args.conversation_id)

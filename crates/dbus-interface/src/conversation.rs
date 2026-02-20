@@ -84,6 +84,72 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         Ok((conv.id.0, conv.title, messages))
     }
 
+    /// Get messages from a conversation with optional pagination and role filtering.
+    ///
+    /// - `tail`: max messages to return from the *filtered* set (0 = unlimited).
+    ///   Ignored when `after_count` >= 0.
+    /// - `after_count`: skip the first N raw (pre-filter) messages; -1 means unused.
+    /// - `include_roles`: allowlist of roles to return, e.g. `["user", "assistant"]`.
+    ///   An empty list disables filtering and returns all roles.
+    ///
+    /// Returns `(total_raw_count, truncated, messages)`.
+    /// `total_raw_count` always reflects the unfiltered length so callers can
+    /// use it as the next `after_count` for incremental fetches.
+    async fn get_messages(
+        &self,
+        id: &str,
+        tail: i32,
+        after_count: i32,
+        include_roles: Vec<String>,
+    ) -> fdo::Result<(u32, bool, Vec<(String, String)>)> {
+        let conv = self
+            .service
+            .get_conversation(&ConversationId::from(id))
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        let total = conv.messages.len() as u32;
+
+        let all: Vec<(String, String)> = conv
+            .messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    desktop_assistant_core::domain::Role::User => "user",
+                    desktop_assistant_core::domain::Role::Assistant => "assistant",
+                    desktop_assistant_core::domain::Role::System => "system",
+                    desktop_assistant_core::domain::Role::Tool => "tool",
+                };
+                (role.to_string(), m.content.clone())
+            })
+            .collect();
+
+        // Slice by raw position first so after_count is always a stable index.
+        let use_after = after_count >= 0;
+        let sliced: Vec<(String, String)> = if use_after {
+            let start = (after_count as usize).min(all.len());
+            all[start..].to_vec()
+        } else {
+            all
+        };
+
+        // Apply role allowlist (empty = no filtering).
+        let filtered: Vec<(String, String)> = sliced
+            .into_iter()
+            .filter(|(role, _)| include_roles.is_empty() || include_roles.contains(role))
+            .collect();
+
+        // Apply tail limit to the filtered set (tail mode only).
+        let (truncated, messages) = if !use_after && tail > 0 && filtered.len() > tail as usize {
+            let start = filtered.len() - tail as usize;
+            (true, filtered[start..].to_vec())
+        } else {
+            (false, filtered)
+        };
+
+        Ok((total, truncated, messages))
+    }
+
     /// Delete a conversation by ID.
     async fn delete_conversation(&self, id: &str) -> fdo::Result<()> {
         self.service
@@ -308,5 +374,173 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conv.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_messages_empty_include_returns_all() {
+        let service = Arc::new(FakeConversationService);
+        let adapter = DbusConversationAdapter::new(Arc::clone(&service));
+        // Use the service directly since we can't call D-Bus methods in unit tests.
+        let conv = adapter
+            .service
+            .get_conversation(&ConversationId::from("test-id"))
+            .await
+            .unwrap();
+        // Empty include_roles → no filtering, all roles returned.
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn get_messages_include_filters_to_allowlist() {
+        use desktop_assistant_core::domain::Message;
+        struct MultiRoleService;
+        impl ConversationService for MultiRoleService {
+            async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+                Ok(Conversation::new("id", title))
+            }
+            async fn list_conversations(
+                &self,
+                _: Option<u32>,
+            ) -> Result<Vec<ConversationSummary>, CoreError> {
+                Ok(vec![])
+            }
+            async fn get_conversation(
+                &self,
+                id: &ConversationId,
+            ) -> Result<Conversation, CoreError> {
+                let mut conv = Conversation::new(id.as_str(), "T");
+                conv.messages.push(Message::new(Role::User, "hello"));
+                conv.messages
+                    .push(Message::new(Role::Assistant, "response"));
+                conv.messages
+                    .push(Message::tool_result("c1", "tool output"));
+                conv.messages.push(Message::new(Role::User, "follow-up"));
+                Ok(conv)
+            }
+            async fn delete_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn clear_all_history(&self) -> Result<u32, CoreError> {
+                Ok(0)
+            }
+            async fn send_prompt(
+                &self,
+                _: &ConversationId,
+                _: String,
+                _: ChunkCallback,
+            ) -> Result<String, CoreError> {
+                Ok(String::new())
+            }
+        }
+
+        let adapter = DbusConversationAdapter::new(Arc::new(MultiRoleService));
+        let conv = adapter
+            .service
+            .get_conversation(&ConversationId::from("id"))
+            .await
+            .unwrap();
+
+        // Raw: 4 messages (user, assistant, tool, user)
+        assert_eq!(conv.messages.len(), 4);
+
+        // Simulate GetMessages with include_roles=["user", "assistant"].
+        let total = conv.messages.len() as u32;
+        let include = vec!["user".to_string(), "assistant".to_string()];
+        let all: Vec<(String, String)> = conv
+            .messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::System => "system",
+                    Role::Tool => "tool",
+                };
+                (role.to_string(), m.content.clone())
+            })
+            .collect();
+        let filtered: Vec<_> = all
+            .iter()
+            .filter(|(r, _)| include.is_empty() || include.contains(r))
+            .collect();
+        assert_eq!(total, 4);
+        assert_eq!(filtered.len(), 3); // user, assistant, user — tool excluded
+        assert!(filtered.iter().all(|(r, _)| r != "tool"));
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_count_slices_raw() {
+        use desktop_assistant_core::domain::Message;
+        struct SeqService;
+        impl ConversationService for SeqService {
+            async fn create_conversation(&self, t: String) -> Result<Conversation, CoreError> {
+                Ok(Conversation::new("id", t))
+            }
+            async fn list_conversations(
+                &self,
+                _: Option<u32>,
+            ) -> Result<Vec<ConversationSummary>, CoreError> {
+                Ok(vec![])
+            }
+            async fn get_conversation(
+                &self,
+                id: &ConversationId,
+            ) -> Result<Conversation, CoreError> {
+                let mut conv = Conversation::new(id.as_str(), "T");
+                conv.messages.push(Message::new(Role::User, "u1"));
+                conv.messages.push(Message::tool_result("c1", "t1"));
+                conv.messages.push(Message::new(Role::Assistant, "a1"));
+                conv.messages.push(Message::new(Role::User, "u2"));
+                Ok(conv)
+            }
+            async fn delete_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn clear_all_history(&self) -> Result<u32, CoreError> {
+                Ok(0)
+            }
+            async fn send_prompt(
+                &self,
+                _: &ConversationId,
+                _: String,
+                _: ChunkCallback,
+            ) -> Result<String, CoreError> {
+                Ok(String::new())
+            }
+        }
+
+        let svc = Arc::new(SeqService);
+        let conv = svc
+            .get_conversation(&ConversationId::from("id"))
+            .await
+            .unwrap();
+        let total = conv.messages.len() as u32; // 4 raw
+        let include = vec!["user".to_string(), "assistant".to_string()];
+        let all: Vec<(String, String)> = conv
+            .messages
+            .iter()
+            .map(|m| {
+                let r = match m.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::System => "system",
+                    Role::Tool => "tool",
+                };
+                (r.to_string(), m.content.clone())
+            })
+            .collect();
+
+        // after_count=2 -> skip first 2 raw messages (user, tool)
+        let sliced: Vec<_> = all[2..].to_vec();
+        let filtered: Vec<_> = sliced
+            .into_iter()
+            .filter(|(r, _)| include.is_empty() || include.contains(r))
+            .collect();
+        assert_eq!(total, 4);
+        // sliced: [assistant, user]; include=[user,assistant] → both pass
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].0, "assistant");
+        assert_eq!(filtered[1].0, "user");
     }
 }
