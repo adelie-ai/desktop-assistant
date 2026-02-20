@@ -104,6 +104,7 @@ async fn executor_with_real_mcp_server() {
         name: "fileio".into(),
         command: "fileio-mcp".into(),
         args: vec!["serve".into(), "--mode".into(), "stdio".into()],
+        namespace: None,
     }];
 
     let executor = McpToolExecutor::new(configs);
@@ -135,7 +136,7 @@ async fn executor_with_real_mcp_server() {
     // Execute a tool through the executor
     let result = executor
         .execute_tool(
-            "fileio__fileio_read_lines",
+            "fileio_read_lines",
             serde_json::json!({
                 "path": test_file.to_str().unwrap()
             }),

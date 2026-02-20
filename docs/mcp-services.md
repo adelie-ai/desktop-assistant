@@ -88,54 +88,81 @@ args    = ["serve", "--mode", "stdio"]
 
 Fields:
 
-| Field     | Required | Description                                                                   |
-|-----------|----------|-------------------------------------------------------------------------------|
-| `name`    | yes      | Namespace prefix for tools from this server (used in logs and tool names)     |
-| `command` | yes      | Executable to spawn — must be on `$PATH` or an absolute path                  |
-| `args`    | no       | Command-line arguments passed to the process (default: empty list)            |
+| Field       | Required | Description                                                                          |
+|-------------|----------|--------------------------------------------------------------------------------------|
+| `name`      | yes      | Logical label for this server; used in logs and startup diagnostics                  |
+| `command`   | yes      | Executable to spawn — must be on `$PATH` or an absolute path                         |
+| `args`      | no       | Command-line arguments passed to the process (default: empty list)                   |
+| `namespace` | no       | If set, all tools from this server are exposed as `{namespace}__{tool_name}`; if absent, tool names are passed through unchanged |
 
 The daemon communicates with each server over stdio using the MCP JSON-RPC protocol.
 
 ## Tool Namespacing
 
-All tools from an MCP server are prefixed with the server's `name` using a double-underscore separator:
+By default, tool names are passed through exactly as the MCP server reports them. Set the optional `namespace` field to prefix all tools from that server:
 
 ```
-{name}__{tool_name}
+{namespace}__{tool_name}
 ```
 
-For example, if `fileio-mcp` exposes a tool `fileio_read_file` and the server is configured with `name = "fileio"`, the LLM sees it as `fileio__fileio_read_file`.
-
-This means choosing a short, meaningful `name` matters. You can use a minimal prefix to keep names clean:
+For example:
 
 ```toml
 [[servers]]
-name    = "fs"
-command = "fileio-mcp"
-args    = ["serve", "--mode", "stdio"]
+name      = "fileio"
+command   = "fileio-mcp"
+args      = ["serve", "--mode", "stdio"]
+namespace = "fs"
 ```
 
-This would expose tools as `fs__fileio_read_file`, `fs__fileio_write_file`, etc.
+This exposes `fileio-mcp`'s `fileio_read_file` as `fs__fileio_read_file`.
 
-Namespacing also makes it trivial to run two instances of the same server without collisions:
+**When to use namespacing:**
+
+- **Collision avoidance** — multiple servers that expose tools with the same name (for example, `open_ticket` from a built-in tasks server, Jira, and Bugzilla):
 
 ```toml
 [[servers]]
-name    = "work"
-command = "fileio-mcp"
-args    = ["--root", "/home/user/work"]
+name      = "tasks-builtin"
+command   = "tasks-mcp"
+namespace = "tasks"
 
 [[servers]]
-name    = "personal"
-command = "fileio-mcp"
-args    = ["--root", "/home/user/personal"]
+name      = "jira"
+command   = "jira-mcp"
+namespace = "jira"
+
+[[servers]]
+name      = "bugzilla"
+command   = "bugzilla-mcp"
+namespace = "bz"
+```
+
+This exposes `tasks__open_ticket`, `jira__open_ticket`, and `bz__open_ticket` as distinct tools.
+
+- **Multiple instances of the same server** — two `fileio-mcp` processes scoped to different directories:
+
+```toml
+[[servers]]
+name      = "work-files"
+command   = "fileio-mcp"
+args      = ["--root", "/home/user/work"]
+namespace = "work"
+
+[[servers]]
+name      = "personal-files"
+command   = "fileio-mcp"
+args      = ["--root", "/home/user/personal"]
+namespace = "personal"
 ```
 
 This exposes `work__fileio_read_file` and `personal__fileio_read_file` as distinct tools.
 
+When `namespace` is absent, tool names are forwarded to the LLM exactly as reported by the server — suitable for servers that already use unique, self-describing names (`fileio_read_file`, `terminal_execute`, etc.).
+
 ## Multiple Servers
 
-Add as many `[[servers]]` blocks as needed. Because all tools are namespaced by server name, tool name collisions between servers are not possible.
+Add as many `[[servers]]` blocks as needed:
 
 ```toml
 [[servers]]

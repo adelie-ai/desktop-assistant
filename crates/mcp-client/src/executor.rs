@@ -16,6 +16,10 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Optional namespace prefix. When set, all tools from this server are
+    /// exposed as `{namespace}__{tool_name}`. When absent, tool names are
+    /// passed through unchanged.
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,13 +221,24 @@ impl McpToolExecutor {
                             self.configs[idx].name,
                             tools.len()
                         );
-                        let prefix = &self.configs[idx].name;
+                        let ns = self.configs[idx].namespace.as_deref();
                         for tool in tools {
-                            let namespaced = format!("{}__{}", prefix, tool.name);
-                            tracing::debug!("  tool: {} (exposed as {})", tool.name, namespaced);
-                            new_routing.insert(namespaced.clone(), (idx, tool.name.clone()));
+                            let exposed_name = match ns {
+                                Some(prefix) => format!("{}__{}", prefix, tool.name),
+                                None => tool.name.clone(),
+                            };
+                            if ns.is_some() {
+                                tracing::debug!(
+                                    "  tool: {} (exposed as {})",
+                                    tool.name,
+                                    exposed_name
+                                );
+                            } else {
+                                tracing::debug!("  tool: {}", tool.name);
+                            }
+                            new_routing.insert(exposed_name.clone(), (idx, tool.name.clone()));
                             all_tools.push(ToolDefinition::new(
-                                namespaced,
+                                exposed_name,
                                 tool.description,
                                 tool.parameters,
                             ));
@@ -435,10 +450,23 @@ mod tests {
             name: "fileio".into(),
             command: "fileio-mcp".into(),
             args: vec![],
+            namespace: None,
         };
         assert_eq!(config.name, "fileio");
         assert_eq!(config.command, "fileio-mcp");
         assert!(config.args.is_empty());
+        assert!(config.namespace.is_none());
+    }
+
+    #[test]
+    fn server_config_with_namespace() {
+        let config = McpServerConfig {
+            name: "tickets-jira".into(),
+            command: "jira-mcp".into(),
+            args: vec![],
+            namespace: Some("jira".into()),
+        };
+        assert_eq!(config.namespace.as_deref(), Some("jira"));
     }
 
     #[test]
@@ -447,6 +475,7 @@ mod tests {
             name: "genmcp".into(),
             command: "genmcp".into(),
             args: vec!["--config".into(), "/path/to/config.toml".into()],
+            namespace: None,
         };
         assert_eq!(config.args.len(), 2);
     }
