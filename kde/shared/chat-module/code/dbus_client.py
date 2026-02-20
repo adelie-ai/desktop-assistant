@@ -168,10 +168,14 @@ def get_messages(
     can use it as the next ``after_count`` for incremental fetches.
     """
     tail_arg = str(max(0, int(tail or 0)))
-    after_arg = str(max(-1, int(after_count if after_count is not None else -1)))
+    # gdbus parses arguments starting with '-' as option flags, so negative
+    # sentinel values must be prefixed with the explicit GVariant type.
+    raw_after = int(after_count if after_count is not None else -1)
+    after_arg = f"int32 {raw_after}" if raw_after < 0 else str(raw_after)
     roles = include_roles if include_roles is not None else ["user", "assistant"]
-    # Build a D-Bus array-of-strings literal: ["role1", "role2"]
-    roles_arg = "[" + ", ".join(f'"{r}"' for r in roles) + "]"
+    # Build a GVariant array-of-strings literal for gdbus: ['role1', 'role2']
+    # NOTE: GVariant text format uses single-quoted strings, not double-quoted.
+    roles_arg = "[" + ", ".join(f"'{r}'" for r in roles) + "]"
     response = _run_gdbus("GetMessages", conversation_id, tail_arg, after_arg, roles_arg)
     total_count, truncated, messages = response
     items = [{"role": role, "content": content} for role, content in messages]
