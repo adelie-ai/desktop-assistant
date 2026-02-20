@@ -18,6 +18,8 @@ KCM.SimpleKCM {
 
             QQC2.TabButton { text: "Chat LLM" }
             QQC2.TabButton { text: "Search" }
+            QQC2.TabButton { text: "Data Sync" }
+            QQC2.TabButton { text: "Data Sync" }
         }
 
         StackLayout {
@@ -185,6 +187,64 @@ KCM.SimpleKCM {
                     Item { Layout.fillHeight: true }
                 }
             }
+
+            QQC2.ScrollView {
+                clip: true
+
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 12
+
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: "Version built-in memory and preferences in a local git repository. Optionally push each update to a remote for backup."
+                    }
+
+                    QQC2.CheckBox {
+                        id: gitEnabledCheck
+                        text: "Enable git versioning for data directory"
+                        checked: kcm.gitEnabled
+                        onToggled: kcm.gitEnabled = checked
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: gitEnabledCheck.checked
+                        QQC2.Label { text: "Remote URL" }
+                        QQC2.TextField {
+                            id: gitRemoteUrlField
+                            Layout.fillWidth: true
+                            placeholderText: "git@github.com:you/assistant-memory.git (optional)"
+                            text: kcm.gitRemoteUrl
+                            onTextEdited: kcm.gitRemoteUrl = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: gitEnabledCheck.checked
+                        QQC2.Label { text: "Remote name" }
+                        QQC2.TextField {
+                            id: gitRemoteNameField
+                            Layout.fillWidth: true
+                            placeholderText: "origin"
+                            text: kcm.gitRemoteName
+                            onTextEdited: kcm.gitRemoteName = text
+                        }
+                    }
+
+                    QQC2.CheckBox {
+                        id: gitPushOnUpdateCheck
+                        enabled: gitEnabledCheck.checked && gitRemoteUrlField.text.trim() !== ""
+                        text: "Push to remote on every update"
+                        checked: kcm.gitPushOnUpdate
+                        onToggled: kcm.gitPushOnUpdate = checked
+                    }
+
+                    Item { Layout.fillHeight: true }
+                }
+            }
         }
 
         RowLayout {
@@ -242,6 +302,18 @@ KCM.SimpleKCM {
             function onEmbBaseUrlChanged() {
                 if (embBaseUrlField.text !== kcm.embBaseUrl) {
                     embBaseUrlField.text = kcm.embBaseUrl
+                }
+            }
+
+            function onGitRemoteUrlChanged() {
+                if (gitRemoteUrlField.text !== kcm.gitRemoteUrl) {
+                    gitRemoteUrlField.text = kcm.gitRemoteUrl
+                }
+            }
+
+            function onGitRemoteNameChanged() {
+                if (gitRemoteNameField.text !== kcm.gitRemoteName) {
+                    gitRemoteNameField.text = kcm.gitRemoteName
                 }
             }
         }

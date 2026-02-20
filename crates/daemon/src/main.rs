@@ -279,6 +279,19 @@ async fn main() -> Result<()> {
         tracing::warn!("failed to start MCP servers: {e}");
     }
 
+    let registered_tools = tool_executor.tools_by_service().await;
+    if registered_tools.is_empty() {
+        tracing::info!("MCP startup complete: no tools registered");
+    } else {
+        tracing::info!(
+            "MCP startup complete: {} tool(s) registered",
+            registered_tools.len()
+        );
+        for (i, (service, tool)) in registered_tools.iter().enumerate() {
+            tracing::info!("  {}. [{}] {}", i + 1, service, tool);
+        }
+    }
+
     // Build the conversation service with tool support
     let conversation_store = PersistentConversationStore::from_default_path()
         .map_err(|e| anyhow::anyhow!("failed to initialize persistent conversation store: {e}"))?;

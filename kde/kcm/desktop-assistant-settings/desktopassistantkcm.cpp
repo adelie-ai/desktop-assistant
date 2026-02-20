@@ -208,6 +208,66 @@ QString DesktopAssistantKcm::statusText() const
     return m_statusText;
 }
 
+bool DesktopAssistantKcm::gitEnabled() const
+{
+    return m_gitEnabled;
+}
+
+void DesktopAssistantKcm::setGitEnabled(bool value)
+{
+    if (m_gitEnabled == value) {
+        return;
+    }
+    m_gitEnabled = value;
+    Q_EMIT gitEnabledChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::gitRemoteUrl() const
+{
+    return m_gitRemoteUrl;
+}
+
+void DesktopAssistantKcm::setGitRemoteUrl(const QString &value)
+{
+    if (m_gitRemoteUrl == value) {
+        return;
+    }
+    m_gitRemoteUrl = value;
+    Q_EMIT gitRemoteUrlChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::gitRemoteName() const
+{
+    return m_gitRemoteName;
+}
+
+void DesktopAssistantKcm::setGitRemoteName(const QString &value)
+{
+    if (m_gitRemoteName == value) {
+        return;
+    }
+    m_gitRemoteName = value;
+    Q_EMIT gitRemoteNameChanged();
+    setNeedsSave(true);
+}
+
+bool DesktopAssistantKcm::gitPushOnUpdate() const
+{
+    return m_gitPushOnUpdate;
+}
+
+void DesktopAssistantKcm::setGitPushOnUpdate(bool value)
+{
+    if (m_gitPushOnUpdate == value) {
+        return;
+    }
+    m_gitPushOnUpdate = value;
+    Q_EMIT gitPushOnUpdateChanged();
+    setNeedsSave(true);
+}
+
 void DesktopAssistantKcm::load()
 {
     QDBusInterface iface(SERVICE, PATH, IFACE, QDBusConnection::sessionBus());
@@ -250,6 +310,23 @@ void DesktopAssistantKcm::load()
 
     m_apiKeyInput.clear();
 
+    QDBusMessage gitReply = iface.call("GetPersistenceSettings");
+    if (setStatusFromDbusError(gitReply)) {
+        return;
+    }
+
+    const auto gitArgs = gitReply.arguments();
+    if (gitArgs.size() < 4) {
+        m_statusText = QStringLiteral("Unexpected GetPersistenceSettings reply");
+        Q_EMIT statusTextChanged();
+        return;
+    }
+
+    m_gitEnabled = gitArgs[0].toBool();
+    m_gitRemoteUrl = gitArgs[1].toString();
+    m_gitRemoteName = gitArgs[2].toString();
+    m_gitPushOnUpdate = gitArgs[3].toBool();
+
     Q_EMIT connectorChanged();
     Q_EMIT modelChanged();
     Q_EMIT baseUrlChanged();
@@ -261,6 +338,10 @@ void DesktopAssistantKcm::load()
     Q_EMIT embIsDefaultChanged();
     Q_EMIT hasApiKeyChanged();
     Q_EMIT apiKeyInputChanged();
+    Q_EMIT gitEnabledChanged();
+    Q_EMIT gitRemoteUrlChanged();
+    Q_EMIT gitRemoteNameChanged();
+    Q_EMIT gitPushOnUpdateChanged();
 
     m_statusText = QStringLiteral("Loaded settings from desktop-assistant daemon");
     Q_EMIT statusTextChanged();
@@ -278,6 +359,17 @@ void DesktopAssistantKcm::save()
 
     QDBusMessage embeddingsReply = iface.call("SetEmbeddingsSettings", m_embConnector, m_embModel, m_embBaseUrl);
     if (setStatusFromDbusError(embeddingsReply)) {
+        return;
+    }
+
+    QDBusMessage gitSaveReply = iface.call(
+        "SetPersistenceSettings",
+        m_gitEnabled,
+        m_gitRemoteUrl,
+        m_gitRemoteName,
+        m_gitPushOnUpdate
+    );
+    if (setStatusFromDbusError(gitSaveReply)) {
         return;
     }
 

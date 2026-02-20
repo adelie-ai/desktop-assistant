@@ -143,6 +143,50 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             defaults.embeddings_available,
         ))
     }
+
+    /// Return git persistence settings.
+    ///
+    /// Returns: (enabled, remote_url, remote_name, push_on_update)
+    async fn get_persistence_settings(&self) -> fdo::Result<(bool, String, String, bool)> {
+        let settings = self
+            .service
+            .get_persistence_settings()
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+
+        Ok((
+            settings.enabled,
+            settings.remote_url,
+            settings.remote_name,
+            settings.push_on_update,
+        ))
+    }
+
+    /// Update git persistence settings.
+    async fn set_persistence_settings(
+        &self,
+        enabled: bool,
+        remote_url: &str,
+        remote_name: &str,
+        push_on_update: bool,
+    ) -> fdo::Result<()> {
+        let remote_url = if remote_url.trim().is_empty() {
+            None
+        } else {
+            Some(remote_url.to_string())
+        };
+
+        let remote_name = if remote_name.trim().is_empty() {
+            None
+        } else {
+            Some(remote_name.to_string())
+        };
+
+        self.service
+            .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -150,7 +194,8 @@ mod tests {
     use super::*;
     use desktop_assistant_core::CoreError;
     use desktop_assistant_core::ports::inbound::{
-        ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, SettingsService,
+        ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
+        SettingsService,
     };
 
     struct FakeSettingsService;
@@ -209,6 +254,25 @@ mod tests {
                 embeddings_base_url: "https://api.openai.com/v1".to_string(),
                 embeddings_available: true,
             })
+        }
+
+        async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
+            Ok(PersistenceSettingsView {
+                enabled: false,
+                remote_url: String::new(),
+                remote_name: "origin".to_string(),
+                push_on_update: true,
+            })
+        }
+
+        async fn set_persistence_settings(
+            &self,
+            _enabled: bool,
+            _remote_url: Option<String>,
+            _remote_name: Option<String>,
+            _push_on_update: bool,
+        ) -> Result<(), CoreError> {
+            Ok(())
         }
     }
 

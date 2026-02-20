@@ -327,6 +327,34 @@ impl McpToolExecutor {
         self.cached_prompts.lock().await.clone()
     }
 
+    /// Returns every registered tool as a `(service_name, tool_name)` pair.
+    ///
+    /// MCP server tools are labelled with their configured service name.
+    /// Built-in tools are labelled `"builtin"`.
+    /// Intended for startup diagnostics.
+    pub async fn tools_by_service(&self) -> Vec<(String, String)> {
+        let routing = self.tool_routing.lock().await;
+        let cached = self.cached_tools.lock().await;
+
+        let mut entries: Vec<(String, String)> = cached
+            .iter()
+            .map(|tool| {
+                let service = routing
+                    .get(&tool.name)
+                    .and_then(|&idx| self.configs.get(idx))
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                (service, tool.name.clone())
+            })
+            .collect();
+
+        for tool in self.builtin_tools.tool_definitions() {
+            entries.push(("builtin".to_string(), tool.name));
+        }
+
+        entries
+    }
+
     /// Shut down all connected MCP servers.
     pub async fn shutdown(self) {
         let mut clients = self.clients.lock().await;

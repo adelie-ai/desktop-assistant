@@ -29,6 +29,15 @@ pub struct ConnectorDefaultsView {
     pub embeddings_available: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersistenceSettingsView {
+    pub enabled: bool,
+    /// Empty string means no remote is configured.
+    pub remote_url: String,
+    pub remote_name: String,
+    pub push_on_update: bool,
+}
+
 /// Inbound port for health/status queries.
 ///
 /// Any adapter that wants to expose assistant status (D-Bus, HTTP, etc.)
@@ -109,6 +118,18 @@ pub trait SettingsService: Send + Sync {
         &self,
         connector: String,
     ) -> impl std::future::Future<Output = Result<ConnectorDefaultsView, CoreError>> + Send;
+
+    fn get_persistence_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<PersistenceSettingsView, CoreError>> + Send;
+
+    fn set_persistence_settings(
+        &self,
+        enabled: bool,
+        remote_url: Option<String>,
+        remote_name: Option<String>,
+        push_on_update: bool,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
 #[cfg(test)]

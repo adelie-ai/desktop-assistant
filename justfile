@@ -131,11 +131,11 @@ backend-dev-status:
 
 # Tail backend logs
 backend-logs:
-    journalctl --user -u {{service_name}} -f
+    journalctl --user -u {{service_name}} -n 200 -f
 
 # Tail development backend logs
 backend-dev-logs:
-    journalctl --user -u {{dev_service_name}} -f
+    journalctl --user -u {{dev_service_name}} -n 200 -f
 
 # Sync shared chat module to XDG data path
 chat-module-sync:

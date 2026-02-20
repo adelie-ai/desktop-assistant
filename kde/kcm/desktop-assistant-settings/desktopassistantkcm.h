@@ -18,6 +18,10 @@ class DesktopAssistantKcm : public KQuickConfigModule {
     Q_PROPERTY(QString apiKeyInput READ apiKeyInput WRITE setApiKeyInput NOTIFY apiKeyInputChanged)
     Q_PROPERTY(bool hasApiKey READ hasApiKey NOTIFY hasApiKeyChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
+    Q_PROPERTY(bool gitEnabled READ gitEnabled WRITE setGitEnabled NOTIFY gitEnabledChanged)
+    Q_PROPERTY(QString gitRemoteUrl READ gitRemoteUrl WRITE setGitRemoteUrl NOTIFY gitRemoteUrlChanged)
+    Q_PROPERTY(QString gitRemoteName READ gitRemoteName WRITE setGitRemoteName NOTIFY gitRemoteNameChanged)
+    Q_PROPERTY(bool gitPushOnUpdate READ gitPushOnUpdate WRITE setGitPushOnUpdate NOTIFY gitPushOnUpdateChanged)
 
 public:
     DesktopAssistantKcm(QObject *parent, const KPluginMetaData &metaData, const QVariantList &args);
@@ -50,6 +54,18 @@ public:
     bool hasApiKey() const;
     QString statusText() const;
 
+    bool gitEnabled() const;
+    void setGitEnabled(bool value);
+
+    QString gitRemoteUrl() const;
+    void setGitRemoteUrl(const QString &value);
+
+    QString gitRemoteName() const;
+    void setGitRemoteName(const QString &value);
+
+    bool gitPushOnUpdate() const;
+    void setGitPushOnUpdate(bool value);
+
     Q_INVOKABLE void load() override;
     Q_INVOKABLE void save() override;
     Q_INVOKABLE void defaults() override;
@@ -70,6 +86,10 @@ Q_SIGNALS:
     void apiKeyInputChanged();
     void hasApiKeyChanged();
     void statusTextChanged();
+    void gitEnabledChanged();
+    void gitRemoteUrlChanged();
+    void gitRemoteNameChanged();
+    void gitPushOnUpdateChanged();
 
 private:
     bool setStatusFromDbusError(const QDBusMessage &message);
@@ -86,4 +106,8 @@ private:
     QString m_apiKeyInput;
     bool m_hasApiKey = false;
     QString m_statusText;
+    bool m_gitEnabled = false;
+    QString m_gitRemoteUrl;
+    QString m_gitRemoteName = QStringLiteral("origin");
+    bool m_gitPushOnUpdate = true;
 };

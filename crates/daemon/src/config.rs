@@ -408,6 +408,32 @@ pub fn set_embeddings_settings(
     save_daemon_config(path, &config)
 }
 
+pub fn get_persistence_settings_view(path: &Path) -> anyhow::Result<ResolvedPersistenceConfig> {
+    let config = load_daemon_config(path)?;
+    Ok(resolve_persistence_config(config.as_ref()))
+}
+
+pub fn set_persistence_settings(
+    path: &Path,
+    enabled: bool,
+    remote_url: Option<&str>,
+    remote_name: Option<&str>,
+    push_on_update: bool,
+) -> anyhow::Result<()> {
+    let mut config = load_daemon_config(path)?.unwrap_or_default();
+
+    config.persistence.git.enabled = enabled;
+    config.persistence.git.remote_url = normalize_optional_value(remote_url);
+    config.persistence.git.remote_name = remote_name
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(default_git_remote_name);
+    config.persistence.git.push_on_update = push_on_update;
+
+    save_daemon_config(path, &config)
+}
+
 pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
     let connector = connector.trim().to_lowercase();
     let connector = if connector.is_empty() {
