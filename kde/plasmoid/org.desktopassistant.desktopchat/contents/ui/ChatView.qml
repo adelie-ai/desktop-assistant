@@ -85,6 +85,7 @@ Item {
     readonly property int maxDebugPayloadChars: 1200
     readonly property int conversationLoadTimeoutMs: 15000
     property string promptText: ""
+    property int _optimisticUserMsgId: -1
     property var conversationChoices: []
     property real uiScale: 1.0
     readonly property string conversationTitle: panelMode ? "Panel Chat" : "Desktop Chat"
@@ -510,14 +511,19 @@ Item {
         return maxContentY <= 0 || currentY >= maxContentY - 2 || transcript.atYEnd
     }
 
-    function appendTranscriptEntries(entries, stickIfAlreadyAtBottom) {
-        if (!entries || entries.length === 0) {
+    // removeIds: optional array of entryId values to atomically remove from the
+    // existing transcript in the same assignment as the new entries are appended.
+    // This avoids the two-step filter-then-append pattern that causes a spurious
+    // QML ListView re-render between the two assignments (jump + flash).
+    function appendTranscriptEntries(entries, stickIfAlreadyAtBottom, removeIds) {
+        const hasRemove = removeIds && removeIds.length > 0
+        if ((!entries || entries.length === 0) && !hasRemove) {
             return
         }
         const previousContentY = Math.max(0, Number(transcript ? transcript.contentY : 0))
         const shouldStickToBottom = stickIfAlreadyAtBottom === true && transcriptIsAtBottom()
         const preparedEntries = []
-        for (let i = 0; i < entries.length; i++) {
+        for (let i = 0; i < (entries ? entries.length : 0); i++) {
             if (!entries[i]) {
                 continue
             }
@@ -531,10 +537,15 @@ Item {
                 : (transcriptEntryIdSeq = transcriptEntryIdSeq + 1, transcriptEntryIdSeq)
             preparedEntries.push(Object.assign({ entryId: entryId }, src))
         }
-        if (preparedEntries.length === 0) {
+        if (preparedEntries.length === 0 && !hasRemove) {
             return
         }
-        const nextEntries = transcriptEntries.concat(preparedEntries)
+        // One assignment: filter out removed ids and concat new entries atomically
+        // so the ListView never sees an intermediate state.
+        const base = hasRemove
+            ? transcriptEntries.filter(function(e) { return removeIds.indexOf(e.entryId) < 0 })
+            : transcriptEntries
+        const nextEntries = base.concat(preparedEntries)
         const overflow = nextEntries.length - maxTranscriptEntries
         transcriptEntries = overflow > 0 ? nextEntries.slice(overflow) : nextEntries
         Qt.callLater(function() {
@@ -882,13 +893,25 @@ Item {
                         currentMessageCount = payloadCount
                         return
                     }
-                    appendTranscriptEntries(newEntries, true)
+                    // Atomically strip the optimistic entry (if any) and append
+                    // the server-confirmed messages in a single transcriptEntries
+                    // assignment to avoid a jump/flash between the two steps.
+                    const removeIds = _optimisticUserMsgId >= 0 ? [_optimisticUserMsgId] : []
+                    if (_optimisticUserMsgId >= 0) {
+                        _optimisticUserMsgId = -1
+                    }
+                    appendTranscriptEntries(newEntries, true, removeIds)
                     currentMessageCount = payloadCount
                     applyInitialLoadAutoScrollIfNeeded()
                     return
                 }
 
                 // Bootstrap path: populate visible history once from tail.
+                // transcriptEntries = [] clears any optimistic entry, so just
+                // reset the tracking id.
+                if (_optimisticUserMsgId >= 0) {
+                    _optimisticUserMsgId = -1
+                }
                 expandedToolEntries = ({})
                 transcriptEntryIdSeq = 0
                 transcriptEntries = []
@@ -938,6 +961,16 @@ Item {
             lateResponsePollRemaining = 0
             promptText = ""
 
+            // Optimistically render the user's message immediately so the UI
+            // feels responsive without waiting for the network round-trip.
+            transcriptEntryIdSeq = transcriptEntryIdSeq + 1
+            const optimisticId = transcriptEntryIdSeq
+            const optimisticRaw = buildMessageEntry("user", prompt)
+            if (optimisticRaw) {
+                appendTranscriptEntries([Object.assign({ entryId: optimisticId }, optimisticRaw)], true)
+                _optimisticUserMsgId = optimisticId
+            }
+
             const sendCommand = helperCommand("send " + shellEscape(conversationId) + " " + shellEscape(prompt))
             runCommand(
                 sendCommand,
@@ -945,9 +978,16 @@ Item {
                     const payload = JSON.parse(sendOut)
                     if (payload.error) {
                         busy = false
+                        if (_optimisticUserMsgId >= 0) {
+                            transcriptEntries = transcriptEntries.filter(function(e) { return e.entryId !== _optimisticUserMsgId })
+                            _optimisticUserMsgId = -1
+                        }
                         appendStatus(payload.error)
                         return
                     }
+                    // Leave the optimistic entry visible; refreshConversation
+                    // will strip it atomically when it appends the server-
+                    // confirmed messages (avoids jump + vanish flash).
                     refreshConversation()
                     reloadConversationList()
                     const startAwait = function(initialCount) {
@@ -1002,6 +1042,10 @@ Item {
                 },
                 function(sendErr) {
                     busy = false
+                    if (_optimisticUserMsgId >= 0) {
+                        transcriptEntries = transcriptEntries.filter(function(e) { return e.entryId !== _optimisticUserMsgId })
+                        _optimisticUserMsgId = -1
+                    }
                     appendStatus(sendErr)
                 }
             )
