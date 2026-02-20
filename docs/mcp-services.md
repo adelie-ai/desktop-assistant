@@ -6,6 +6,8 @@ The Adelie platform uses [Model Context Protocol (MCP)](https://spec.modelcontex
 
 The built-in tools (preference memory, factual memory) are always available, but real-world usefulness depends heavily on external MCP servers providing capabilities relevant to your workflow.
 
+These MCP servers are not the full extent of Adelie platform's functionality. It is usually capable of working out very complex tasks for which it has not been explicitly programmed. You should think of these MCP servers as the building blocks it uses to synthesize more complex behaviors. By providing deterministic abstractions over complex behaviors in this way, the service doesn't need to think so hard and can worry about other things and get to your end result more quickly. 
+
 ## Available MCP Servers
 
 The following MCP servers (not an exhaustive list) are developed alongside the Adelie platform and are designed to work with it out of the box.
