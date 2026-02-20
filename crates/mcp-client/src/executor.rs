@@ -55,8 +55,8 @@ impl BuiltinPersistenceConfig {
 /// Routes tool calls to the correct MCP server based on tool name.
 pub struct McpToolExecutor {
     configs: Vec<McpServerConfig>,
-    /// Map from tool name to the index of the server that provides it.
-    tool_routing: Mutex<HashMap<String, usize>>,
+    /// Map from namespaced tool name (`server__original`) to (server index, original tool name).
+    tool_routing: Mutex<HashMap<String, (usize, String)>>,
     /// Connected MCP client instances, indexed by config position.
     clients: Mutex<Vec<Option<McpClient>>>,
     /// Cached list of all available tools.
@@ -217,11 +217,17 @@ impl McpToolExecutor {
                             self.configs[idx].name,
                             tools.len()
                         );
-                        for tool in &tools {
-                            tracing::debug!("  tool: {}", tool.name);
-                            new_routing.insert(tool.name.clone(), idx);
+                        let prefix = &self.configs[idx].name;
+                        for tool in tools {
+                            let namespaced = format!("{}__{}", prefix, tool.name);
+                            tracing::debug!("  tool: {} (exposed as {})", tool.name, namespaced);
+                            new_routing.insert(namespaced.clone(), (idx, tool.name.clone()));
+                            all_tools.push(ToolDefinition::new(
+                                namespaced,
+                                tool.description,
+                                tool.parameters,
+                            ));
                         }
-                        all_tools.extend(tools);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -341,7 +347,7 @@ impl McpToolExecutor {
             .map(|tool| {
                 let service = routing
                     .get(&tool.name)
-                    .and_then(|&idx| self.configs.get(idx))
+                    .and_then(|(idx, _)| self.configs.get(*idx))
                     .map(|c| c.name.clone())
                     .unwrap_or_else(|| "unknown".to_string());
                 (service, tool.name.clone())
@@ -390,10 +396,10 @@ impl ToolExecutor for McpToolExecutor {
             .map_err(|e| CoreError::ToolExecution(format!("failed to refresh tools: {e}")))?;
 
         let routing = self.tool_routing.lock().await;
-        let server_idx = routing
+        let (idx, original_name) = routing
             .get(name)
-            .ok_or_else(|| CoreError::ToolExecution(format!("unknown tool: {name}")))?;
-        let idx = *server_idx;
+            .ok_or_else(|| CoreError::ToolExecution(format!("unknown tool: {name}")))?
+            .clone();
         drop(routing);
 
         let mut clients = self.clients.lock().await;
@@ -402,7 +408,7 @@ impl ToolExecutor for McpToolExecutor {
         })?;
 
         client
-            .call_tool(name, arguments)
+            .call_tool(&original_name, arguments)
             .await
             .map_err(|e| CoreError::ToolExecution(format!("tool '{name}' failed: {e}")))
     }

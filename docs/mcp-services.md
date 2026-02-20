@@ -88,17 +88,54 @@ args    = ["serve", "--mode", "stdio"]
 
 Fields:
 
-| Field     | Required | Description                                                        |
-|-----------|----------|--------------------------------------------------------------------|
-| `name`    | yes      | Logical name for this server; used in logs and tool routing        |
-| `command` | yes      | Executable to spawn — must be on `$PATH` or an absolute path       |
-| `args`    | no       | Command-line arguments passed to the process (default: empty list) |
+| Field     | Required | Description                                                                   |
+|-----------|----------|-------------------------------------------------------------------------------|
+| `name`    | yes      | Namespace prefix for tools from this server (used in logs and tool names)     |
+| `command` | yes      | Executable to spawn — must be on `$PATH` or an absolute path                  |
+| `args`    | no       | Command-line arguments passed to the process (default: empty list)            |
 
 The daemon communicates with each server over stdio using the MCP JSON-RPC protocol.
 
+## Tool Namespacing
+
+All tools from an MCP server are prefixed with the server's `name` using a double-underscore separator:
+
+```
+{name}__{tool_name}
+```
+
+For example, if `fileio-mcp` exposes a tool `fileio_read_file` and the server is configured with `name = "fileio"`, the LLM sees it as `fileio__fileio_read_file`.
+
+This means choosing a short, meaningful `name` matters. You can use a minimal prefix to keep names clean:
+
+```toml
+[[servers]]
+name    = "fs"
+command = "fileio-mcp"
+args    = ["serve", "--mode", "stdio"]
+```
+
+This would expose tools as `fs__fileio_read_file`, `fs__fileio_write_file`, etc.
+
+Namespacing also makes it trivial to run two instances of the same server without collisions:
+
+```toml
+[[servers]]
+name    = "work"
+command = "fileio-mcp"
+args    = ["--root", "/home/user/work"]
+
+[[servers]]
+name    = "personal"
+command = "fileio-mcp"
+args    = ["--root", "/home/user/personal"]
+```
+
+This exposes `work__fileio_read_file` and `personal__fileio_read_file` as distinct tools.
+
 ## Multiple Servers
 
-Add as many `[[servers]]` blocks as needed. Tool names must be unique across all servers; if two servers expose a tool with the same name, the first one registered wins.
+Add as many `[[servers]]` blocks as needed. Because all tools are namespaced by server name, tool name collisions between servers are not possible.
 
 ```toml
 [[servers]]

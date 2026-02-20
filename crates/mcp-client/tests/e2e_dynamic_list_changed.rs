@@ -165,7 +165,7 @@ async fn executor_refreshes_resources_and_prompts_after_live_list_changed() {
         sleep(Duration::from_millis(20)).await;
 
         let _ = executor
-            .execute_tool("ping", serde_json::json!({}))
+            .execute_tool("dynamic-mock__ping", serde_json::json!({}))
             .await
             .expect("ping tool should succeed");
 
