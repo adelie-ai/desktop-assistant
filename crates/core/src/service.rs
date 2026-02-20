@@ -218,6 +218,48 @@ fn trim_tool_pairs(messages: &mut Vec<Message>) -> usize {
     removed
 }
 
+/// Strip surrounding quotes/backticks and trailing punctuation from a raw LLM title,
+/// then limit to at most 8 words as a guard-rail.
+fn sanitize_generated_title(raw: &str) -> String {
+    let first_line = raw.lines().next().unwrap_or("").trim();
+    let stripped = first_line
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
+    stripped
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Ask the LLM for a concise 3-5-word channel name based on the initial prompt.
+/// Returns an empty string on failure so the caller can keep the existing title.
+async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L) -> String {
+    let messages = vec![
+        Message::new(
+            Role::System,
+            "Generate a concise channel name for a new conversation. \
+             Use 3-5 words. Front-load the most specific and meaningful words first — \
+             the name may be truncated at the end. Use title case. No punctuation at \
+             the edges, no quotes, no explanation. Respond with ONLY the channel name.",
+        ),
+        Message::new(
+            Role::User,
+            format!("First message in the conversation: {initial_prompt}"),
+        ),
+    ];
+    match llm
+        .stream_completion(messages, &[], Box::new(|_| true))
+        .await
+    {
+        Ok(response) => sanitize_generated_title(&response.text),
+        Err(e) => {
+            tracing::warn!("conversation title generation failed: {e}");
+            String::new()
+        }
+    }
+}
+
 /// A no-op tool executor for use when no MCP servers are configured.
 pub struct NoopToolExecutor;
 
@@ -336,6 +378,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         mut on_chunk: ChunkCallback,
     ) -> Result<String, CoreError> {
         let mut conv = self.store.get(conversation_id).await?;
+        let is_first_message = conv.messages.is_empty();
         conv.messages.push(Message::new(Role::User, &prompt));
 
         let tool_defs = self.tools.available_tools().await;
@@ -412,6 +455,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 let visible_text = sanitize_assistant_text(&response.text);
                 conv.messages
                     .push(Message::new(Role::Assistant, &visible_text));
+                // On the first message, generate a descriptive title via the LLM
+                // so the conversation list shows meaningful names rather than
+                // timestamp-based placeholders.
+                if is_first_message {
+                    let generated = generate_conversation_title(&prompt, &self.llm).await;
+                    if !generated.is_empty() {
+                        conv.title = generated;
+                    }
+                }
                 conv.updated_at = now_timestamp();
                 self.store.update(conv).await?;
                 return Ok(visible_text);
@@ -1253,7 +1305,13 @@ mod tests {
             _tools: &[ToolDefinition],
             _on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
-            *self.seen_messages.lock().unwrap() = messages;
+            // Only capture the first call (the main LLM turn). The second call
+            // triggered by title generation must not overwrite the captured state
+            // that the test assertions rely on.
+            let mut seen = self.seen_messages.lock().unwrap();
+            if seen.is_empty() {
+                *seen = messages;
+            }
             Ok(LlmResponse::text("ok"))
         }
     }
@@ -1386,6 +1444,139 @@ mod tests {
             no_guessing_pos < tool_fallback_pos,
             "no-guessing guardrail must remain before non-memory tool fallback rule"
         );
+    }
+
+    // --- Title generation tests ---
+
+    #[test]
+    fn sanitize_generated_title_basic() {
+        assert_eq!(
+            sanitize_generated_title("Weather Forecast Today"),
+            "Weather Forecast Today"
+        );
+    }
+
+    #[test]
+    fn sanitize_generated_title_strips_quotes_and_punctuation() {
+        assert_eq!(
+            sanitize_generated_title("\"Fix Broken Build Pipeline\""),
+            "Fix Broken Build Pipeline"
+        );
+        assert_eq!(
+            sanitize_generated_title("'Deploy to Production.'"),
+            "Deploy to Production"
+        );
+    }
+
+    #[test]
+    fn sanitize_generated_title_takes_first_line_only() {
+        assert_eq!(
+            sanitize_generated_title("Rust Memory Debug\nSome explanation here"),
+            "Rust Memory Debug"
+        );
+    }
+
+    #[test]
+    fn sanitize_generated_title_limits_to_eight_words() {
+        let long = "One Two Three Four Five Six Seven Eight Nine Ten";
+        assert_eq!(
+            sanitize_generated_title(long),
+            "One Two Three Four Five Six Seven Eight"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_generates_title_on_first_message() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![
+                LlmResponse::text("That sounds great!"),   // main response
+                LlmResponse::text("Plan Weekend Getaway"), // title generation
+            ]),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("New Chat".into())
+            .await
+            .unwrap();
+        assert_eq!(conv.title, "New Chat");
+
+        handler
+            .send_prompt(&conv.id, "Let's plan a trip!".into(), noop_callback())
+            .await
+            .unwrap();
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.title, "Plan Weekend Getaway");
+    }
+
+    #[tokio::test]
+    async fn send_prompt_does_not_overwrite_title_on_second_message() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![
+                LlmResponse::text("First response"), // main response round 1
+                LlmResponse::text("Generated Title Here"), // title generation round 1
+                LlmResponse::text("Second response"), // main response round 2
+            ]),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("New Chat".into())
+            .await
+            .unwrap();
+
+        // First prompt — sets the title
+        handler
+            .send_prompt(&conv.id, "Hello".into(), noop_callback())
+            .await
+            .unwrap();
+        let after_first = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(after_first.title, "Generated Title Here");
+
+        // Second prompt — title must remain unchanged
+        handler
+            .send_prompt(&conv.id, "Follow-up question".into(), noop_callback())
+            .await
+            .unwrap();
+        let after_second = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(after_second.title, "Generated Title Here");
+    }
+
+    #[tokio::test]
+    async fn send_prompt_keeps_original_title_when_generation_returns_empty() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![
+                LlmResponse::text("Sure, I can help."), // main response
+                LlmResponse::text(""),                  // title generation returns empty
+            ]),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+        let conv = handler.create_conversation("My Chat".into()).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "Hi".into(), noop_callback())
+            .await
+            .unwrap();
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.title, "My Chat");
     }
 
     #[tokio::test]
