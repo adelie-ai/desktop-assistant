@@ -22,33 +22,7 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
 }
 
 /// Per-turn runtime instruction injected for the LLM.
-const RUNTIME_SYSTEM_INSTRUCTION: &str = "You are Adele, a desktop assistant named in reference to the Adélie penguin, with optional tool access. \
-Your name is Adele. If asked your name or who you are, answer: 'I'm Adele.' \
-CRITICAL: Always check memory and preferences before processing a user request. Follow this priority order to resolve request uncertainty, and keep responses concise and practical. \
-1) Current-turn user instructions override all stored data. \
-2) Then prefer project memory and preferences. \
-3) Then global memory and preferences. \
-4) Use lightweight discovery next, and ask only for the smallest missing piece. \
-5) If a request is user-specific/project-specific or a reference is unclear, search preferences and memory first (project scope first, then global) before non-memory tools. \
-6) If still unclear, ask one brief clarifying question and do not assume. \
-7) Do not guess user-specific details (project path, run command, package manager, editor, service name, account, or host). \
-8) Before acting on user/project-specific work, make a short internal preflight: known from preferences/memory, verified this turn, and still unknown. \
-9) Preferences are key/value datapoints (defaults, paths, IDs, names, commands, hostnames, and other concrete settings). \
-10) Memory is prose context (background, rationale, corrections, procedural notes, and explanatory details). \
-11) Store memory/preferences judiciously: only durable, reusable, high-confidence information; avoid transient one-off details unless the user asks to remember them. \
-12) When both apply, store both: preferences for concrete key/value facts and memory for contextual prose that explains them. \
-13) If unsure whether to store, how to scope, or whether it belongs in memory vs preference, ask briefly. \
-14) Use namespaced keys: project.<project>.<attribute...> and global.<attribute...>. \
-15) Treat project scope as any folder-anchored work context, not only software projects. \
-16) For start/open/run <project>, check project.<project>.path, then start_command/run_command/dev_command, then editor/app, then global fallbacks. \
-17) For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming limitation, after rule 7 when applicable. \
-18) Never fabricate tool outputs or claim a tool succeeded when it did not. \
-19) If a tool fails, report the exact error briefly and provide the next best step. \
-20) If no relevant tool exists, say so clearly and ask for the minimum missing configuration. \
-21) When launching GUI apps, use a non-blocking launch pattern (for example nohup plus disown). \
-22) Before launching an app, check PATH and also check Flatpak and Snap when available. \
-23) Use built-in preference tools (builtin_preferences_remember/search/retrieve/delete). \
-24) Use built-in memory tools (builtin_memory_remember/search/retrieve/update/delete).";
+const RUNTIME_SYSTEM_INSTRUCTION: &str = include_str!("prompts/runtime_system_instruction.txt");
 
 fn llm_messages_for_turn(
     conversation_messages: &[Message],
@@ -1371,6 +1345,11 @@ mod tests {
         assert!(
             messages[0]
                 .content
+                .contains("Validate facts that are relevant to the request before relying on them")
+        );
+        assert!(
+            messages[0]
+                .content
                 .contains("No tools are available in this turn.")
         );
         assert!(messages[0].content.contains("non-blocking launch pattern"));
@@ -1386,6 +1365,7 @@ mod tests {
                 .content
                 .contains("builtin_memory_remember/search/retrieve/update/delete")
         );
+        assert!(messages[0].content.contains("builtin_sys_props"));
         assert!(messages[0].content.contains(
             "Store memory/preferences judiciously: only durable, reusable, high-confidence information"
         ));
@@ -1406,6 +1386,7 @@ mod tests {
             "If still unclear, ask one brief clarifying question and do not assume.";
         let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming limitation, after rule 7 when applicable.";
         let no_guessing = "Do not guess user-specific details (project path, run command, package manager, editor, service name, account, or host).";
+        let verify_relevant_facts = "Validate facts that are relevant to the request before relying on them, especially user circumstances and temporally variable details (machine settings, personal preferences, and current date/time); use tools when required.";
         let preference_kv_split = "Preferences are key/value datapoints (defaults, paths, IDs, names, commands, hostnames, and other concrete settings).";
         let memory_prose_split = "Memory is prose context (background, rationale, corrections, procedural notes, and explanatory details).";
         let no_fabrication =
@@ -1415,6 +1396,7 @@ mod tests {
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(memory_first));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(ambiguous_reference));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(no_guessing));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(verify_relevant_facts));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(tool_fallback));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(preference_kv_split));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(memory_prose_split));
@@ -1426,6 +1408,9 @@ mod tests {
             .find(ambiguous_reference)
             .unwrap();
         let no_guessing_pos = RUNTIME_SYSTEM_INSTRUCTION.find(no_guessing).unwrap();
+        let verify_relevant_facts_pos = RUNTIME_SYSTEM_INSTRUCTION
+            .find(verify_relevant_facts)
+            .unwrap();
         let tool_fallback_pos = RUNTIME_SYSTEM_INSTRUCTION.find(tool_fallback).unwrap();
 
         assert!(
@@ -1443,6 +1428,10 @@ mod tests {
         assert!(
             no_guessing_pos < tool_fallback_pos,
             "no-guessing guardrail must remain before non-memory tool fallback rule"
+        );
+        assert!(
+            verify_relevant_facts_pos < tool_fallback_pos,
+            "fact-validation guardrail must remain before non-memory tool fallback rule"
         );
     }
 

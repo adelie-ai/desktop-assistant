@@ -1117,6 +1117,7 @@ dependencies = [
 name = "desktop-assistant-mcp-client"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "desktop-assistant-core",
  "serde",
  "serde_json",

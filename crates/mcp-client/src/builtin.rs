@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{Local, SecondsFormat, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::embedding::EmbedFn;
@@ -14,6 +15,7 @@ const TOOL_MEM_REMEMBER: &str = "builtin_memory_remember";
 const TOOL_MEM_SEARCH: &str = "builtin_memory_search";
 const TOOL_MEM_RETRIEVE: &str = "builtin_memory_retrieve";
 const TOOL_MEM_UPDATE: &str = "builtin_memory_update";
+const TOOL_SYS_PROPS: &str = "builtin_sys_props";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PreferenceEntry {
@@ -298,6 +300,15 @@ impl BuiltinToolService {
                     "required": ["id"]
                 }),
             ),
+            ToolDefinition::new(
+                TOOL_SYS_PROPS,
+                "Return a compact property sheet with basic runtime/system context",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            ),
         ]
     }
 
@@ -311,6 +322,7 @@ impl BuiltinToolService {
                 | TOOL_MEM_SEARCH
                 | TOOL_MEM_RETRIEVE
                 | TOOL_MEM_UPDATE
+                | TOOL_SYS_PROPS
         )
     }
 
@@ -327,10 +339,37 @@ impl BuiltinToolService {
             TOOL_MEM_SEARCH => self.memory_search(arguments).await,
             TOOL_MEM_RETRIEVE => self.memory_retrieve(arguments),
             TOOL_MEM_UPDATE => self.memory_update(arguments).await,
+            TOOL_SYS_PROPS => Ok(self.sys_props(arguments)),
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
         }
+    }
+
+    fn sys_props(&self, _arguments: serde_json::Value) -> String {
+        let local_now = Local::now();
+        serde_json::json!({
+            "ok": true,
+            "props": {
+                "note": "Relative paths are interpreted from daemon_cwd unless a tool specifies otherwise.",
+                "generated_at_epoch": now_ts(),
+                "generated_at_utc": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "generated_at_local": local_now.to_rfc3339_opts(SecondsFormat::Secs, false),
+                "timezone": format!("{} ({})", local_now.format("%:z"), local_now.format("%Z")),
+                "username": detect_username(),
+                "home_dir": detect_home_dir(),
+                "daemon_cwd": detect_daemon_cwd(),
+                "xdg_dirs": detect_xdg_dirs(),
+                "shell": detect_shell(),
+                "locale": detect_locale(),
+                "session_type": detect_session_type(),
+                "hostname": detect_hostname(),
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "os_version": detect_os_version(),
+            },
+        })
+        .to_string()
     }
 
     async fn preferences_remember(
@@ -865,6 +904,132 @@ fn now_ts_nanos() -> u128 {
         .unwrap_or(0)
 }
 
+fn detect_username() -> Option<String> {
+    ["USER", "LOGNAME", "USERNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+fn detect_home_dir() -> Option<String> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+fn detect_daemon_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn detect_xdg_dirs() -> serde_json::Value {
+    let home = detect_home_dir();
+    let fallback_base = home
+        .as_ref()
+        .map(|h| PathBuf::from(h).join(".local"))
+        .unwrap_or_else(|| PathBuf::from(".local"));
+
+    let config = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| fallback_base.join("config").display().to_string());
+    let data = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| fallback_base.join("share").display().to_string());
+    let state = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| fallback_base.join("state").display().to_string());
+    let cache = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| fallback_base.join("cache").display().to_string());
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    serde_json::json!({
+        "config": config,
+        "data": data,
+        "state": state,
+        "cache": cache,
+        "runtime": runtime,
+    })
+}
+
+fn detect_shell() -> Option<String> {
+    ["SHELL", "COMSPEC"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+fn detect_locale() -> Option<String> {
+    ["LC_ALL", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+fn detect_session_type() -> Option<String> {
+    std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn detect_hostname() -> Option<String> {
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        let trimmed = hostname.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Ok(contents) = fs::read_to_string("/etc/hostname") {
+        let trimmed = contents.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn detect_os_version() -> Option<String> {
+    if std::env::consts::OS != "linux" {
+        return None;
+    }
+
+    let contents = fs::read_to_string("/etc/os-release").ok()?;
+    parse_os_release_field(&contents, "PRETTY_NAME")
+        .or_else(|| parse_os_release_field(&contents, "VERSION"))
+        .or_else(|| parse_os_release_field(&contents, "VERSION_ID"))
+}
+
+fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (line_key, raw_value) = line.split_once('=')?;
+        if line_key.trim() != key {
+            return None;
+        }
+        let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +1082,89 @@ mod tests {
             .collect();
         assert!(names.contains(&TOOL_PREF_REMEMBER.to_string()));
         assert!(names.contains(&TOOL_MEM_UPDATE.to_string()));
+        assert!(names.contains(&"builtin_sys_props".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sys_props_returns_compact_property_sheet() {
+        let pref_path = temp_file("pref");
+        let mem_path = temp_file("mem");
+        let service = BuiltinToolService::new(pref_path.clone(), mem_path.clone());
+
+        let response = service
+            .execute_tool("builtin_sys_props", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            json.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let props = json
+            .get("props")
+            .and_then(serde_json::Value::as_object)
+            .expect("props object");
+        assert_eq!(
+            props.get("note").and_then(serde_json::Value::as_str),
+            Some(
+                "Relative paths are interpreted from daemon_cwd unless a tool specifies otherwise."
+            )
+        );
+        assert!(
+            props
+                .get("generated_at_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            props
+                .get("generated_at_utc")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            props
+                .get("generated_at_local")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            props
+                .get("timezone")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            props
+                .get("os")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            props
+                .get("arch")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            props
+                .get("daemon_cwd")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        let xdg_dirs = props
+            .get("xdg_dirs")
+            .and_then(serde_json::Value::as_object)
+            .expect("xdg_dirs object");
+        assert!(xdg_dirs.contains_key("config"));
+        assert!(xdg_dirs.contains_key("data"));
+        assert!(xdg_dirs.contains_key("state"));
+        assert!(xdg_dirs.contains_key("cache"));
+        assert!(xdg_dirs.contains_key("runtime"));
+        assert!(props.get("shell").is_some());
+        assert!(props.get("locale").is_some());
+        assert!(props.get("session_type").is_some());
     }
 
     #[tokio::test]
