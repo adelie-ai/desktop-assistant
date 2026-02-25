@@ -32,11 +32,11 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 - [x] Unit tests: ping + send message streaming emits deltas then completion
 
 ### 3) WebSocket adapter
-- [ ] Add crate `crates/ws-interface` (or similar)
-- [ ] Implement WS server:
-  - accept connections
-  - request/reply for commands
-  - stream events (chat deltas, status/config changes)
+- [x] Add crate `crates/ws-interface`
+- [x] Implement WS server (axum):
+  - accept connections on `/ws`
+  - request/reply for non-streaming commands
+  - `SendMessage` spawns streaming handler and forwards canonical events
 - [ ] Integration tests for WS protocol (connect, ping, get status)
 
 ### 4) Wire into daemon
