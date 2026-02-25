@@ -22,4 +22,7 @@ axum = { version = "0.8", features = ["ws"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+desktop-assistant-core = { path = "../core" }
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
 tokio.workspace = true
