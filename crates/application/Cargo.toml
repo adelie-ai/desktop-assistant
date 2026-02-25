@@ -1,0 +1,18 @@
+[package]
+name = "desktop-assistant-application"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+desktop-assistant-core.workspace = true
+desktop-assistant-api-model = { path = "../api-model" }
+thiserror.workspace = true
+serde_json.workspace = true
+
+[dependencies.tokio]
+workspace = true
+features = ["sync"]
+
+[dev-dependencies]
+tokio.workspace = true
