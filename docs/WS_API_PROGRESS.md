@@ -25,10 +25,11 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - [ ] add golden JSON fixtures to lock schema (recommended)
 
 ### 2) Application handlers (common logic)
-- [ ] Add crate `crates/application` (or module) with:
+- [x] Add crate `crates/application` with:
   - `trait AssistantApiHandler` (async)
-  - Implementations that delegate to existing domain/services
-- [ ] Unit tests: given a command, emits expected results/events
+  - `DefaultAssistantApiHandler` delegating to existing inbound ports
+  - `EventSink` trait for adapters to forward canonical events
+- [x] Unit tests: ping + send message streaming emits deltas then completion
 
 ### 3) WebSocket adapter
 - [ ] Add crate `crates/ws-interface` (or similar)
@@ -60,6 +61,7 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - `org.desktopAssistant.Settings`: LLM + embeddings + persistence settings, write-only API key
 - Added `crates/api-model` with canonical `Command` / `CommandResult` / `Event` types and view structs.
   - Naming: `SendMessage` (not `SendPrompt`), streaming events `AssistantDelta`/`AssistantCompleted`/`AssistantError`.
+- Added `crates/application` with protocol-neutral handlers that map `Command` to existing core inbound ports, plus a streaming `handle_send_message` that emits canonical `Assistant*` events via an `EventSink`.
 
 - Created branch `feature/ws-api`.
 - Added docs: `docs/API_TRANSPORT.md`.
