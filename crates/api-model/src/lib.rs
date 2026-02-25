@@ -30,12 +30,12 @@ pub enum Command {
     },
     ClearAllHistory,
 
-    /// Send a prompt to an existing conversation.
+    /// Send a content to an existing conversation.
     ///
-    /// The response is streamed via [`Event::MessageDelta`] events.
-    SendPrompt {
+    /// The response is streamed via [`Event::AssistantDelta`] events.
+    SendMessage {
         conversation_id: String,
-        prompt: String,
+        content: String,
     },
 
     // Settings
@@ -93,22 +93,22 @@ pub enum CommandResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
-    /// Streaming chunk for a prompt response.
-    MessageDelta {
+    /// Streaming chunk for a content response.
+    AssistantDelta {
         conversation_id: String,
         request_id: String,
         chunk: String,
     },
 
     /// Full response (terminal event).
-    MessageCompleted {
+    AssistantCompleted {
         conversation_id: String,
         request_id: String,
         full_response: String,
     },
 
     /// Streaming failure (terminal event).
-    MessageError {
+    AssistantError {
         conversation_id: String,
         request_id: String,
         error: String,
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn event_json_roundtrip_message_delta() {
-        let ev = Event::MessageDelta {
+        let ev = Event::AssistantDelta {
             conversation_id: "c1".into(),
             request_id: "r1".into(),
             chunk: "hello".into(),
