@@ -1,0 +1,25 @@
+[package]
+name = "desktop-assistant-ws"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# API + handlers
+desktop-assistant-api-model = { path = "../api-model" }
+desktop-assistant-application = { path = "../application" }
+
+# Async + WS
+futures = "0.3"
+tokio.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio.workspace = true
