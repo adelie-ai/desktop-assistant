@@ -20,7 +20,7 @@ This mirrors the Ports & Adapters approach in `AGENTS.md`.
 ### Commands
 - `Ping`
 - `GetStatus`
-- `SendMessage { conversation_id?, text }` (streaming response)
+- `SendMessage { conversation_id?, content }` (streaming response)
 - `GetConfig { keys? }`
 - `SetConfig { changes }`
 
@@ -28,8 +28,8 @@ This mirrors the Ports & Adapters approach in `AGENTS.md`.
 - `StatusChanged(Status)`
 - `ConfigChanged { changes }`
 - `MessageStarted { message_id, role }` (optional)
-- `MessageDelta { message_id, text_delta }`
-- `MessageCompleted { message_id }`
+- `AssistantDelta { request_id, chunk }`
+- `AssistantCompleted { request_id, full_response }`
 - `Error { code, message, retryable }`
 
 ## Config

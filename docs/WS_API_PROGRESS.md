@@ -49,15 +49,17 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 - [ ] Emit `ConfigChanged`
 
 ### 6) Chat streaming parity
-- [ ] Implement `SendMessage` streaming (`MessageDelta`, `MessageCompleted`)
+- [ ] Implement `SendMessage` streaming (`AssistantDelta`, `AssistantCompleted`)
 - [ ] Backpressure + cancellation
 
 ## Progress log
 
-### 2026-02-25- Surveyed existing D-Bus APIs:
+### 2026-02-25
+- Surveyed existing D-Bus APIs:
   - `org.desktopAssistant.Conversations`: create/list/get/delete/clear, plus `send_prompt` streaming via signals
   - `org.desktopAssistant.Settings`: LLM + embeddings + persistence settings, write-only API key
 - Added `crates/api-model` with canonical `Command` / `CommandResult` / `Event` types and view structs.
+  - Naming: `SendMessage` (not `SendPrompt`), streaming events `AssistantDelta`/`AssistantCompleted`/`AssistantError`.
 
 - Created branch `feature/ws-api`.
 - Added docs: `docs/API_TRANSPORT.md`.
