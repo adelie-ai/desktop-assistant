@@ -11,16 +11,18 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 ## TODO (planned pieces)
 
 ### 0) Repo hygiene / discovery
-- [ ] Identify existing D-Bus interface methods/signals relevant to: status, send message, config
-- [ ] Decide whether to reuse existing types or introduce new shared API model crate
+- [x] Identify existing D-Bus interface methods/signals relevant to: status, send message, config
+- [x] Decide whether to reuse existing types or introduce new shared API model crate (added `crates/api-model`)
 
 ### 1) Shared API model (canonical types)
-- [ ] Add crate `crates/api-model` (or similar) with serde types:
+- [x] Add crate `crates/api-model` with serde types:
   - `Command`
   - `CommandResult`
   - `Event`
-  - IDs/correlation (`request_id`, `message_id`, etc.)
-- [ ] Unit tests for (de)serialization stability (golden JSON examples)
+  - view structs for conversations + settings
+- [~] Unit tests for (de)serialization stability
+  - [x] basic JSON roundtrip tests
+  - [ ] add golden JSON fixtures to lock schema (recommended)
 
 ### 2) Application handlers (common logic)
 - [ ] Add crate `crates/application` (or module) with:
@@ -52,7 +54,11 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 
 ## Progress log
 
-### 2026-02-25
+### 2026-02-25- Surveyed existing D-Bus APIs:
+  - `org.desktopAssistant.Conversations`: create/list/get/delete/clear, plus `send_prompt` streaming via signals
+  - `org.desktopAssistant.Settings`: LLM + embeddings + persistence settings, write-only API key
+- Added `crates/api-model` with canonical `Command` / `CommandResult` / `Event` types and view structs.
+
 - Created branch `feature/ws-api`.
 - Added docs: `docs/API_TRANSPORT.md`.
 - Created this progress tracker.
