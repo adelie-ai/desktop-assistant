@@ -12,11 +12,14 @@ mod config;
 mod settings_service;
 mod store;
 
+use crate::app::Assistant;
+use desktop_assistant_application::DefaultAssistantApiHandler;
 use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
 use desktop_assistant_dbus::settings::DbusSettingsAdapter;
 use desktop_assistant_mcp_client::config as mcp_config;
 use desktop_assistant_mcp_client::executor::{BuiltinPersistenceConfig, McpToolExecutor};
+use desktop_assistant_ws as ws;
 use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
 
@@ -332,6 +335,30 @@ async fn main() -> Result<()> {
         "D-Bus service registered at {}",
         connection.unique_name().unwrap()
     );
+
+    // WebSocket API (remote-friendly). Defaults to localhost only.
+    let ws_bind = std::env::var("DESKTOP_ASSISTANT_WS_BIND")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:11339".to_string());
+
+    let ws_addr: std::net::SocketAddr = ws_bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid DESKTOP_ASSISTANT_WS_BIND '{ws_bind}': {e}"))?;
+
+    let api_handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(Assistant),
+        Arc::clone(&conversation_service),
+        Arc::clone(&settings_service),
+    ));
+
+    tokio::spawn(async move {
+        tracing::info!("WebSocket listening on {ws_addr} (/ws)");
+        if let Err(e) = ws::serve(api_handler, ws_addr).await {
+            tracing::error!("WebSocket server error: {e}");
+        }
+    });
 
     // Run until stopped
     std::future::pending::<()>().await;
