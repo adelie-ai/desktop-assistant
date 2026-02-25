@@ -37,11 +37,12 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - accept connections on `/ws`
   - request/reply for non-streaming commands
   - `SendMessage` spawns streaming handler and forwards canonical events
-- [ ] Integration tests for WS protocol (connect, ping, get status)
+- [x] Integration tests for WS protocol (connect + ping)
+- [ ] Integration tests for WS protocol (get status)
 
 ### 4) Wire into daemon
-- [ ] Add flags/config for WS bind address + port (default localhost)
-- [ ] Start WS server in daemon main
+- [x] Add env/config for WS bind address + port (default localhost): `DESKTOP_ASSISTANT_WS_BIND` (e.g. `127.0.0.1:11339`)
+- [x] Start WS server in daemon main (spawned task)
 - [ ] Ensure clean shutdown
 
 ### 5) Config endpoints parity
