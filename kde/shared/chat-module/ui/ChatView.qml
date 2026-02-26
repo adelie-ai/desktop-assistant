@@ -90,6 +90,7 @@ Item {
     readonly property int conversationLoadTimeoutMs: 15000
     property string promptText: ""
     property int _optimisticUserMsgId: -1
+    property string _optimisticUserMsgText: ""
     property var conversationChoices: []
     property real uiScale: 1.0
     readonly property string conversationTitle: panelMode ? "Panel Chat" : "Desktop Chat"
@@ -359,6 +360,7 @@ Item {
         conversationId = ""
         promptText = ""
         currentMessageCount = 0
+        resetOptimisticUserTracking(false)
         transcriptEntries = [
             {
                 kind: "status",
@@ -500,6 +502,37 @@ Item {
             role: "status",
             text: text,
         })
+    }
+
+    function resetOptimisticUserTracking(removeFromTranscript) {
+        if (removeFromTranscript === true && _optimisticUserMsgId >= 0) {
+            transcriptEntries = transcriptEntries.filter(function(e) { return e.entryId !== _optimisticUserMsgId })
+        }
+        _optimisticUserMsgId = -1
+        _optimisticUserMsgText = ""
+    }
+
+    function normalizeOptimisticCompareText(textValue) {
+        const normalized = String(textValue === undefined || textValue === null ? "" : textValue)
+        return normalized.replace(/\n\n\[…message truncated for [^\]]+\]$/, "")
+    }
+
+    function hasConfirmedOptimisticUserEntry(entries) {
+        if (_optimisticUserMsgId < 0 || _optimisticUserMsgText.length === 0 || !entries || entries.length === 0) {
+            return false
+        }
+        const optimisticNormalized = normalizeOptimisticCompareText(_optimisticUserMsgText)
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i]
+            if (!entry || entry.kind !== "message" || entry.role !== "user") {
+                continue
+            }
+            const candidate = normalizeOptimisticCompareText(entry.text)
+            if (candidate === optimisticNormalized) {
+                return true
+            }
+        }
+        return false
     }
 
     function clipLoadedMessageText(textValue) {
@@ -689,6 +722,7 @@ Item {
                 conversationId = payload.conversation_id
                 promptText = ""
                 currentMessageCount = 0
+                resetOptimisticUserTracking(false)
                 expandedToolEntries = ({})
                 transcriptEntries = [
                     {
@@ -785,6 +819,7 @@ Item {
                     conversationId = ""
                     promptText = ""
                     currentMessageCount = 0
+                    resetOptimisticUserTracking(false)
                     expandedToolEntries = ({})
                     transcriptEntries = [
                         {
@@ -814,6 +849,7 @@ Item {
         conversationId = selectedId
         promptText = ""
         currentMessageCount = 0
+        resetOptimisticUserTracking(false)
         expandedToolEntries = ({})
         transcriptEntries = []
         appendStatus("Switched to conversation " + conversationId)
@@ -846,7 +882,7 @@ Item {
         }
 
         const baselineCount = Math.max(0, Number(currentMessageCount || 0))
-        const useIncrementalLoad = baselineCount > 0
+        const useIncrementalLoad = baselineCount > 0 || _optimisticUserMsgId >= 0
         const requestId = conversationId
         conversationLoadSequence = conversationLoadSequence + 1
         const sequence = conversationLoadSequence
@@ -906,9 +942,10 @@ Item {
                     // Atomically strip the optimistic entry (if any) and append
                     // the server-confirmed messages in a single transcriptEntries
                     // assignment to avoid a jump/flash between the two steps.
-                    const removeIds = _optimisticUserMsgId >= 0 ? [_optimisticUserMsgId] : []
-                    if (_optimisticUserMsgId >= 0) {
-                        _optimisticUserMsgId = -1
+                    const shouldRemoveOptimistic = hasConfirmedOptimisticUserEntry(newEntries)
+                    const removeIds = shouldRemoveOptimistic ? [_optimisticUserMsgId] : []
+                    if (shouldRemoveOptimistic) {
+                        resetOptimisticUserTracking(false)
                     }
                     appendTranscriptEntries(newEntries, true, removeIds)
                     currentMessageCount = payloadCount
@@ -919,9 +956,7 @@ Item {
                 // Bootstrap path: populate visible history once from tail.
                 // transcriptEntries = [] clears any optimistic entry, so just
                 // reset the tracking id.
-                if (_optimisticUserMsgId >= 0) {
-                    _optimisticUserMsgId = -1
-                }
+                resetOptimisticUserTracking(false)
                 expandedToolEntries = ({})
                 transcriptEntryIdSeq = 0
                 transcriptEntries = []
@@ -979,6 +1014,9 @@ Item {
             if (optimisticRaw) {
                 appendTranscriptEntries([Object.assign({ entryId: optimisticId }, optimisticRaw)], true)
                 _optimisticUserMsgId = optimisticId
+                _optimisticUserMsgText = String(optimisticRaw.text || prompt)
+            } else {
+                resetOptimisticUserTracking(false)
             }
 
             const sendCommand = helperCommand("send " + shellEscape(conversationId) + " " + shellEscape(prompt))
@@ -988,10 +1026,7 @@ Item {
                     const payload = JSON.parse(sendOut)
                     if (payload.error) {
                         busy = false
-                        if (_optimisticUserMsgId >= 0) {
-                            transcriptEntries = transcriptEntries.filter(function(e) { return e.entryId !== _optimisticUserMsgId })
-                            _optimisticUserMsgId = -1
-                        }
+                        resetOptimisticUserTracking(true)
                         appendStatus(payload.error)
                         return
                     }
@@ -1042,8 +1077,14 @@ Item {
                                 startAwait(currentMessageCount)
                                 return
                             }
-                            currentMessageCount = Number(countPayload.message_count || currentMessageCount)
-                            startAwait(currentMessageCount)
+                            const candidateInitialCount = Number(countPayload.message_count)
+                            if (!Number.isFinite(candidateInitialCount) || candidateInitialCount < 0) {
+                                startAwait(currentMessageCount)
+                                return
+                            }
+                            // Await from the freshest server count without moving the
+                            // local incremental baseline ahead of rendered entries.
+                            startAwait(Math.floor(candidateInitialCount))
                         },
                         function(_countErr) {
                             startAwait(currentMessageCount)
@@ -1052,10 +1093,7 @@ Item {
                 },
                 function(sendErr) {
                     busy = false
-                    if (_optimisticUserMsgId >= 0) {
-                        transcriptEntries = transcriptEntries.filter(function(e) { return e.entryId !== _optimisticUserMsgId })
-                        _optimisticUserMsgId = -1
-                    }
+                    resetOptimisticUserTracking(true)
                     appendStatus(sendErr)
                 }
             )
