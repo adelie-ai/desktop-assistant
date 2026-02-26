@@ -68,7 +68,7 @@ def _normalize_transport(value: str) -> str:
 def _load_widget_connections(payload: dict[str, Any]) -> tuple[dict[str, dict[str, str]], str]:
     raw_connections = payload.get("connections")
     parsed: dict[str, dict[str, str]] = {}
-    local_service = str(payload.get("dbus_service", "")).strip() or DEFAULT_SERVICE
+    default_dbus_service = str(payload.get("dbus_service", "")).strip() or DEFAULT_SERVICE
 
     if isinstance(raw_connections, list):
         for item in raw_connections:
@@ -79,14 +79,15 @@ def _load_widget_connections(payload: dict[str, Any]) -> tuple[dict[str, dict[st
             if not name or name in parsed:
                 continue
 
-            if name == DEFAULT_CONNECTION_NAME:
+            raw_transport = str(item.get("transport", "")).strip()
+            if raw_transport:
+                transport = _normalize_transport(raw_transport)
+            elif name == DEFAULT_CONNECTION_NAME:
                 transport = "dbus"
             else:
-                transport = _normalize_transport(str(item.get("transport", "ws")))
-                if transport != "ws":
-                    transport = "ws"
+                transport = "ws"
 
-            dbus_service = str(item.get("dbus_service", "")).strip() or local_service
+            dbus_service = str(item.get("dbus_service", "")).strip() or default_dbus_service
             ws_url = str(item.get("ws_url", "")).strip() or DEFAULT_WS_URL
             ws_subject = str(item.get("ws_subject", "")).strip() or DEFAULT_WS_SUBJECT
 
@@ -97,25 +98,6 @@ def _load_widget_connections(payload: dict[str, Any]) -> tuple[dict[str, dict[st
                 "ws_url": ws_url,
                 "ws_subject": ws_subject,
             }
-
-    local = parsed.get(
-        DEFAULT_CONNECTION_NAME,
-        {
-            "name": DEFAULT_CONNECTION_NAME,
-            "transport": "dbus",
-            "dbus_service": local_service,
-            "ws_url": DEFAULT_WS_URL,
-            "ws_subject": DEFAULT_WS_SUBJECT,
-        },
-    )
-    local["transport"] = "dbus"
-    local["dbus_service"] = str(local.get("dbus_service", "")).strip() or local_service
-    local["ws_url"] = str(local.get("ws_url", "")).strip() or DEFAULT_WS_URL
-    local["ws_subject"] = str(local.get("ws_subject", "")).strip() or DEFAULT_WS_SUBJECT
-    parsed[DEFAULT_CONNECTION_NAME] = local
-    for connection in parsed.values():
-        if connection.get("transport") == "ws":
-            connection["dbus_service"] = local["dbus_service"]
 
     default_connection = str(payload.get("default_connection", "")).strip()
 
@@ -129,15 +111,28 @@ def _load_widget_connections(payload: dict[str, Any]) -> tuple[dict[str, dict[st
             parsed[legacy_name] = {
                 "name": legacy_name,
                 "transport": "ws",
-                "dbus_service": local_service,
+                "dbus_service": default_dbus_service,
                 "ws_url": legacy_ws_url or DEFAULT_WS_URL,
                 "ws_subject": legacy_ws_subject or DEFAULT_WS_SUBJECT,
             }
             if not default_connection:
                 default_connection = legacy_name
 
+    if not parsed:
+        parsed[DEFAULT_CONNECTION_NAME] = {
+            "name": DEFAULT_CONNECTION_NAME,
+            "transport": "dbus",
+            "dbus_service": default_dbus_service,
+            "ws_url": DEFAULT_WS_URL,
+            "ws_subject": DEFAULT_WS_SUBJECT,
+        }
+
     if default_connection not in parsed:
-        default_connection = DEFAULT_CONNECTION_NAME
+        default_connection = (
+            DEFAULT_CONNECTION_NAME
+            if DEFAULT_CONNECTION_NAME in parsed
+            else next(iter(parsed.keys()))
+        )
 
     return parsed, default_connection
 
@@ -783,7 +778,9 @@ def main() -> int:
     if requested_connection not in connections:
         requested_connection = default_connection
 
-    resolved = connections.get(requested_connection, connections[DEFAULT_CONNECTION_NAME])
+    resolved = connections.get(requested_connection)
+    if resolved is None:
+        resolved = next(iter(connections.values()))
     CONNECTION_NAME = requested_connection
     TRANSPORT = _normalize_transport(str(resolved.get("transport", DEFAULT_TRANSPORT)))
     SERVICE = str(resolved.get("dbus_service", "")).strip() or DEFAULT_SERVICE

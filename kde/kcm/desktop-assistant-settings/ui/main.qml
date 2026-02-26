@@ -268,7 +268,7 @@ KCM.SimpleKCM {
                     QQC2.Label {
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap
-                        text: "Define Adelie connections once, set a global default, and let each widget pick a connection by name. 'local' is always a D-Bus connection; all other named connections use WebSocket."
+                        text: "Define Adelie connections once, set a global default, and let each widget pick a connection by name. 'local' is the default fallback, but any configured connection can be selected as default."
                     }
 
                     RowLayout {

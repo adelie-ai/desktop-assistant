@@ -146,7 +146,6 @@ private:
     int selectedConnectionIndex() const;
     void loadWidgetConnectionSettings();
     bool saveWidgetConnectionSettings();
-    void ensureLocalConnection();
     void setSelectedConnectionByIndex(int index);
     void emitConnectionSelectionChanged();
 
