@@ -688,9 +688,9 @@ void DesktopAssistantKcm::removeSelectedConnection()
     const auto name = m_connections[index].name;
     m_connections.removeAt(index);
     if (m_defaultConnectionName == name) {
-        const auto localIndex = connectionIndexByName(QStringLiteral(DEFAULT_CONNECTION_NAME));
+        const auto localIndex = connectionIndexByName(QString::fromUtf8(DEFAULT_CONNECTION_NAME));
         m_defaultConnectionName = localIndex >= 0
-            ? QStringLiteral(DEFAULT_CONNECTION_NAME)
+            ? QString::fromUtf8(DEFAULT_CONNECTION_NAME)
             : m_connections.front().name;
         Q_EMIT defaultConnectionNameChanged();
     }
@@ -735,8 +735,8 @@ int DesktopAssistantKcm::selectedConnectionIndex() const
 void DesktopAssistantKcm::loadWidgetConnectionSettings()
 {
     m_connections.clear();
-    m_defaultConnectionName = QStringLiteral(DEFAULT_CONNECTION_NAME);
-    m_selectedConnectionName = QStringLiteral(DEFAULT_CONNECTION_NAME);
+    m_defaultConnectionName = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
+    m_selectedConnectionName = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
 
     QString localDbusService = QString::fromUtf8(SERVICE);
     QString legacyTransport;
@@ -814,7 +814,7 @@ void DesktopAssistantKcm::loadWidgetConnectionSettings()
 
     if (m_connections.isEmpty()) {
         ConnectionProfile localConnection;
-        localConnection.name = QStringLiteral(DEFAULT_CONNECTION_NAME);
+        localConnection.name = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
         localConnection.transport = QStringLiteral("dbus");
         localConnection.dbusService = localDbusService;
         m_connections.push_back(localConnection);
@@ -831,7 +831,7 @@ void DesktopAssistantKcm::loadWidgetConnectionSettings()
         }
 
         if (legacyTransport == QLatin1String("dbus")) {
-            m_defaultConnectionName = QStringLiteral(DEFAULT_CONNECTION_NAME);
+            m_defaultConnectionName = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
         }
     }
 
@@ -840,13 +840,13 @@ void DesktopAssistantKcm::loadWidgetConnectionSettings()
     }
 
     if (connectionIndexByName(m_defaultConnectionName) < 0) {
-        const auto localIndex = connectionIndexByName(QStringLiteral(DEFAULT_CONNECTION_NAME));
+        const auto localIndex = connectionIndexByName(QString::fromUtf8(DEFAULT_CONNECTION_NAME));
         if (localIndex >= 0) {
-            m_defaultConnectionName = QStringLiteral(DEFAULT_CONNECTION_NAME);
+            m_defaultConnectionName = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
         } else if (!m_connections.isEmpty()) {
             m_defaultConnectionName = m_connections.front().name;
         } else {
-            m_defaultConnectionName = QStringLiteral(DEFAULT_CONNECTION_NAME);
+            m_defaultConnectionName = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
         }
     }
     m_selectedConnectionName = m_defaultConnectionName;
@@ -855,13 +855,13 @@ void DesktopAssistantKcm::loadWidgetConnectionSettings()
 bool DesktopAssistantKcm::saveWidgetConnectionSettings()
 {
     if (connectionIndexByName(m_defaultConnectionName) < 0) {
-        const auto localIndex = connectionIndexByName(QStringLiteral(DEFAULT_CONNECTION_NAME));
+        const auto localIndex = connectionIndexByName(QString::fromUtf8(DEFAULT_CONNECTION_NAME));
         if (localIndex >= 0) {
-            m_defaultConnectionName = QStringLiteral(DEFAULT_CONNECTION_NAME);
+            m_defaultConnectionName = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
         } else if (!m_connections.isEmpty()) {
             m_defaultConnectionName = m_connections.front().name;
         } else {
-            m_defaultConnectionName = QStringLiteral(DEFAULT_CONNECTION_NAME);
+            m_defaultConnectionName = QString::fromUtf8(DEFAULT_CONNECTION_NAME);
         }
     }
 
@@ -892,7 +892,7 @@ bool DesktopAssistantKcm::saveWidgetConnectionSettings()
     root.insert(QStringLiteral("connections"), connections);
     root.insert(QStringLiteral("default_connection"), m_defaultConnectionName);
 
-    const auto localIndex = connectionIndexByName(QStringLiteral(DEFAULT_CONNECTION_NAME));
+    const auto localIndex = connectionIndexByName(QString::fromUtf8(DEFAULT_CONNECTION_NAME));
     if (localIndex >= 0 && m_connections[localIndex].transport == QLatin1String("dbus")) {
         root.insert(
             QStringLiteral("dbus_service"),
