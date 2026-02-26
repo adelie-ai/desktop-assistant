@@ -20,6 +20,13 @@ pub enum Action {
     ScrollToBottom,
 }
 
+fn is_enter_key(code: &KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
+    )
+}
+
 /// Handle key events that we intercept before passing to textarea.
 /// Returns None for keys that should be forwarded to textarea.input().
 pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
@@ -42,11 +49,13 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             if alt || key.modifiers.intersects(KeyModifiers::META) {
                 return None;
             }
+            if is_enter_key(&key.code) {
+                return Some(Action::OpenConversation);
+            }
             match key.code {
                 KeyCode::Char('q') => Some(Action::Quit),
                 KeyCode::Char('j') | KeyCode::Down => Some(Action::NextConversation),
                 KeyCode::Char('k') | KeyCode::Up => Some(Action::PreviousConversation),
-                KeyCode::Enter => Some(Action::OpenConversation),
                 KeyCode::Char('d') => Some(Action::DeleteConversation),
                 KeyCode::Char('n') => Some(Action::NewConversation),
                 KeyCode::Char('i') => Some(Action::EnterEditMode),
@@ -58,13 +67,17 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
         }
         InputMode::Editing => {
             // Shift+Enter inserts a newline while plain Enter submits.
-            if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
+            if key.modifiers.contains(KeyModifiers::SHIFT) && is_enter_key(&key.code) {
                 return Some(Action::InsertNewline);
+            }
+            if is_enter_key(&key.code) {
+                if key.modifiers.is_empty() {
+                    return Some(Action::SubmitPrompt);
+                }
+                return None;
             }
             match key.code {
                 KeyCode::Esc => Some(Action::ExitEditMode),
-                KeyCode::Enter if key.modifiers.is_empty() => Some(Action::SubmitPrompt),
-                KeyCode::Enter => None,
                 KeyCode::PageUp => Some(Action::ScrollUp),
                 KeyCode::PageDown => Some(Action::ScrollDown),
                 KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -75,9 +88,11 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             }
         }
         InputMode::CreatingConversation => {
+            if is_enter_key(&key.code) {
+                return Some(Action::SubmitTitle);
+            }
             match key.code {
                 KeyCode::Esc => Some(Action::ExitEditMode),
-                KeyCode::Enter => Some(Action::SubmitTitle),
                 // All other keys: return None so they get forwarded to textarea
                 _ => None,
             }
@@ -159,6 +174,14 @@ mod tests {
     }
 
     #[test]
+    fn normal_char_newline_opens() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('\n')), &InputMode::Normal),
+            Some(Action::OpenConversation)
+        );
+    }
+
+    #[test]
     fn normal_d_deletes() {
         assert_eq!(
             handle_key_event(key(KeyCode::Char('d')), &InputMode::Normal),
@@ -235,6 +258,17 @@ mod tests {
         assert_eq!(
             handle_key_event(
                 key_with_mod(KeyCode::Enter, KeyModifiers::SHIFT),
+                &InputMode::Editing
+            ),
+            Some(Action::InsertNewline)
+        );
+    }
+
+    #[test]
+    fn editing_shift_newline_char_inserts_newline() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('\n'), KeyModifiers::SHIFT),
                 &InputMode::Editing
             ),
             Some(Action::InsertNewline)

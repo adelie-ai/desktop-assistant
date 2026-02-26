@@ -40,6 +40,15 @@ fn mode_chip_style(mode: &InputMode) -> Style {
     }
 }
 
+fn split_display_lines(content: &str) -> Vec<String> {
+    content
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -117,15 +126,15 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             };
             // Split content on newlines so ratatui renders them as separate lines
             let mut first = true;
-            for text_line in msg.content.split('\n') {
+            for text_line in split_display_lines(&msg.content) {
                 if first {
                     lines.push(Line::from(vec![
                         Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                        Span::styled(text_line.to_string(), style),
+                        Span::styled(text_line, style),
                     ]));
                     first = false;
                 } else {
-                    lines.push(Line::from(Span::styled(text_line.to_string(), style)));
+                    lines.push(Line::from(Span::styled(text_line, style)));
                 }
             }
             lines.push(Line::from("")); // spacing
@@ -135,15 +144,15 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         if !app.streaming_buffer.is_empty() {
             let style = Style::default().fg(COLOR_ASSISTANT_STREAMING);
             let mut first = true;
-            for text_line in app.streaming_buffer.split('\n') {
+            for text_line in split_display_lines(&app.streaming_buffer) {
                 if first {
                     lines.push(Line::from(vec![
                         Span::styled("Adele: ", style.add_modifier(Modifier::BOLD)),
-                        Span::styled(text_line.to_string(), style),
+                        Span::styled(text_line, style),
                     ]));
                     first = false;
                 } else {
-                    lines.push(Line::from(Span::styled(text_line.to_string(), style)));
+                    lines.push(Line::from(Span::styled(text_line, style)));
                 }
             }
             // Cursor on last line
