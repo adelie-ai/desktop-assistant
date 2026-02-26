@@ -7,8 +7,9 @@ use axum::{
     extract::{State, ws::Message, ws::WebSocket, ws::WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
+use base64::Engine;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
 use futures::{sink::SinkExt, stream::StreamExt};
@@ -45,6 +46,7 @@ pub enum WsFrame {
 pub struct WsServerState {
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
 }
 
 #[async_trait::async_trait]
@@ -52,17 +54,33 @@ pub trait WsAuthValidator: Send + Sync {
     async fn validate_bearer_token(&self, token: &str) -> bool;
 }
 
+#[async_trait::async_trait]
+pub trait WsLoginService: Send + Sync {
+    async fn authenticate_basic(&self, username: &str, password: &str) -> bool;
+    async fn issue_token_for_subject(&self, subject: &str) -> Result<String, String>;
+}
+
 pub fn router(
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
 ) -> Router {
+    router_with_login(handler, auth_validator, None)
+}
+
+pub fn router_with_login(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+) -> Router {
     let state = WsServerState {
         handler,
         auth_validator,
+        login_service,
     };
 
     Router::new()
         .route("/ws", get(ws_handler))
+        .route("/login", post(login_handler))
         .with_state(state)
 }
 
@@ -80,6 +98,21 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let raw = headers.get("authorization")?.to_str().ok()?.trim();
+    let (scheme, encoded) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsServerState>,
@@ -94,6 +127,43 @@ async fn ws_handler(
     }
 
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LoginResponse {
+    token: String,
+    token_type: &'static str,
+    subject: String,
+}
+
+async fn login_handler(
+    State(state): State<WsServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(login_service) = state.login_service else {
+        return (StatusCode::NOT_FOUND, "login is not enabled").into_response();
+    };
+
+    let Some((username, password)) = extract_basic_credentials(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing basic auth").into_response();
+    };
+
+    if !login_service.authenticate_basic(&username, &password).await {
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+
+    match login_service.issue_token_for_subject(&username).await {
+        Ok(token) => (
+            StatusCode::OK,
+            axum::Json(LoginResponse {
+                token,
+                token_type: "bearer",
+                subject: username,
+            }),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
 }
 
 struct ChannelSink {
@@ -295,7 +365,20 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let app = router(handler, auth_validator);
+    serve_with_shutdown_and_login(handler, auth_validator, None, bind, shutdown).await
+}
+
+pub async fn serve_with_shutdown_and_login<F>(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    bind: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let app = router_with_login(handler, auth_validator, login_service);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

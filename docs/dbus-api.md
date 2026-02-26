@@ -25,6 +25,7 @@ Interface: `org.desktopAssistant.Settings`
 - `SetLlmSettings(connector: s, model: s, base_url: s) -> ()`
 - `SetApiKey(api_key: s) -> ()`
 - `GenerateWsJwt(subject: s) -> token: s`
+  - Token subject is always the current OS username on the user bus.
 - `GetEmbeddingsSettings() -> (connector: s, model: s, base_url: s, has_api_key: b, available: b, is_default: b)`
 - `SetEmbeddingsSettings(connector: s, model: s, base_url: s) -> ()`
   - Empty `connector` clears the override and reverts to defaulting from the LLM connector

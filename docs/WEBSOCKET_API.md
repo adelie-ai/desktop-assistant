@@ -7,6 +7,7 @@ This document describes the desktop-assistant WebSocket API exposed by the daemo
 - Path: `/ws`
 - Default bind: `127.0.0.1:11339` (set with `DESKTOP_ASSISTANT_WS_BIND`)
 - URL example: `ws://127.0.0.1:11339/ws`
+- Login path: `/login` (HTTP `POST`, Basic auth)
 
 ## Authentication
 
@@ -18,6 +19,31 @@ The WebSocket handshake requires a bearer token:
 For local clients, JWTs are typically minted via D-Bus:
 
 - `org.desktopAssistant.Settings.GenerateWsJwt(subject)`
+- Subject resolves to current OS username on the user bus.
+
+For remote clients (no D-Bus), use `/login` with HTTP Basic auth to mint a bearer JWT:
+
+```http
+POST /login HTTP/1.1
+Host: daemon.example.com
+Authorization: Basic <base64(username:password)>
+```
+
+Successful response:
+
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "token_type": "bearer",
+  "subject": "alice"
+}
+```
+
+`/login` credential validation modes:
+- Local Linux host (non-container): validates against current OS user password
+  and uses the current OS username (ignores `DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`).
+- Container/remote mode: validates against daemon env credentials
+  (`DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`, `DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD`).
 
 ## Message Model
 
@@ -116,31 +142,35 @@ Current event variants:
 ## Typical Session Flow
 
 1. Acquire JWT (local clients)
-- Call D-Bus `GenerateWsJwt("my-client")`.
+- Call D-Bus `GenerateWsJwt("my-client")` (token subject is current OS username).
 
-2. Open WebSocket
+2. Acquire JWT (remote clients, no D-Bus)
+- `POST /login` with Basic auth.
+- Receive `token`.
+
+3. Open WebSocket
 - Connect to `ws://127.0.0.1:11339/ws`.
 - Include `Authorization: Bearer <token>`.
 
-3. Health check
+4. Health check
 - Send `ping`.
 - Expect `result -> pong`.
 
-4. Discover or create a conversation
+5. Discover or create a conversation
 - Send `list_conversations`.
 - If needed, send `create_conversation`.
 
-5. Send a user message
+6. Send a user message
 - Send `send_message`.
 - First response is `result -> ack`.
 - Then receive streamed events:
   - one or more `assistant_delta`
   - terminal `assistant_completed` (or `assistant_error`)
 
-6. Refresh conversation state
+7. Refresh conversation state
 - Send `get_conversation` if you need the full canonical message list.
 
-7. Optional live configuration
+8. Optional live configuration
 - Send `set_config`.
 - Expect:
   - `result -> config`

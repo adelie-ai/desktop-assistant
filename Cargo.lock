@@ -1214,6 +1214,7 @@ dependencies = [
  "desktop-assistant-ws",
  "jsonwebtoken",
  "keyring",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
@@ -1338,6 +1339,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "desktop-assistant-api-model",
  "desktop-assistant-application",
  "desktop-assistant-core",
@@ -1347,6 +1349,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "tracing",
  "uuid",
 ]

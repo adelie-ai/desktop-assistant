@@ -33,6 +33,7 @@ docker build -t desktop-assistant-daemon .
 # exposes ws://localhost:11339/ws from container
 docker run --rm -p 11339:11339 \
   -e OPENAI_API_KEY=your_key_here \
+  -e DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD=change-me \
   desktop-assistant-daemon
 ```
 
@@ -84,9 +85,24 @@ Secret backend default is `auto`:
 - Reads check that file first, then systemd credentials, then desktop keyrings, then environment variables.
 
 WebSocket auth uses bearer JWTs:
-- Generate a token over D-Bus with `GenerateWsJwt(subject)`.
+- Generate a token over D-Bus with `GenerateWsJwt(subject)` (subject resolves to current OS username).
 - Connect to `/ws` with `Authorization: Bearer <token>`.
 - Tokens are locally signed by the daemon and multiple tokens can coexist until expiry.
+
+For remote clients without D-Bus access, enable HTTP login:
+
+```bash
+export DESKTOP_ASSISTANT_WS_LOGIN_USERNAME=alice
+export DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD='change-me'
+```
+
+Then call `POST /login` with Basic auth (`alice:change-me`) to mint a bearer token.
+
+Default login behavior:
+- Local Linux host (non-container): `/login` authenticates against the current OS user password
+  and current OS username.
+- Container/remote: set `DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD` (and optional username) for env-based auth.
+- Override local-mode detection with `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true|false`.
 
 TUI transport defaults to WebSocket and can be configured:
 

@@ -45,6 +45,56 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
     }
 }
 
+struct WsBasicLogin<S: SettingsService + 'static> {
+    settings: Arc<S>,
+    username: String,
+    mode: WsLoginMode,
+}
+
+enum WsLoginMode {
+    StaticPassword(String),
+    SystemPassword,
+}
+
+impl<S: SettingsService + 'static> WsBasicLogin<S> {
+    fn new(settings: Arc<S>, username: String, mode: WsLoginMode) -> Self {
+        Self {
+            settings,
+            username,
+            mode,
+        }
+    }
+}
+
+#[async_trait]
+impl<S: SettingsService + 'static> ws::WsLoginService for WsBasicLogin<S> {
+    async fn authenticate_basic(&self, username: &str, password: &str) -> bool {
+        if username != self.username {
+            return false;
+        }
+
+        match &self.mode {
+            WsLoginMode::StaticPassword(expected) => password == expected,
+            WsLoginMode::SystemPassword => {
+                match config::authenticate_os_user_password(username, password) {
+                    Ok(valid) => valid,
+                    Err(error) => {
+                        tracing::warn!("system-password auth check failed: {error}");
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    async fn issue_token_for_subject(&self, subject: &str) -> std::result::Result<String, String> {
+        self.settings
+            .generate_ws_jwt(Some(subject.to_string()))
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn env_bool(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
@@ -54,6 +104,57 @@ fn env_bool(name: &str, default: bool) -> bool {
         },
         Err(_) => default,
     }
+}
+
+fn is_container_environment() -> bool {
+    std::env::var("container")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+}
+
+fn resolve_ws_login_mode_decision(
+    current_username: String,
+    configured_username: Option<String>,
+    configured_password: Option<String>,
+    local_system_auth_enabled: bool,
+    is_container: bool,
+) -> Option<(String, WsLoginMode)> {
+    if let Some(password) = configured_password {
+        let username = configured_username.unwrap_or(current_username);
+        return Some((username, WsLoginMode::StaticPassword(password)));
+    }
+
+    if local_system_auth_enabled && !is_container {
+        return Some((current_username, WsLoginMode::SystemPassword));
+    }
+
+    None
+}
+
+fn resolve_ws_login_mode() -> Option<(String, WsLoginMode)> {
+    let current_username = config::current_username();
+    let configured_username = std::env::var("DESKTOP_ASSISTANT_WS_LOGIN_USERNAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let configured_password = std::env::var("DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let local_system_auth_enabled = env_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH", true);
+    resolve_ws_login_mode_decision(
+        current_username,
+        configured_username,
+        configured_password,
+        local_system_auth_enabled,
+        is_container_environment(),
+    )
 }
 
 async fn shutdown_signal() {
@@ -454,13 +555,43 @@ async fn main() -> Result<()> {
         Arc::clone(&settings_service),
     ));
     let ws_auth = Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)));
+    let ws_login_service: Option<Arc<dyn ws::WsLoginService>> =
+        resolve_ws_login_mode().map(|(username, mode)| {
+            match &mode {
+                WsLoginMode::StaticPassword(_) => {
+                    tracing::info!("Web login enabled (env-password mode) for username={username}");
+                }
+                WsLoginMode::SystemPassword => {
+                    tracing::info!(
+                        "Web login enabled (local system-password mode) for username={username}"
+                    );
+                }
+            }
+
+            Arc::new(WsBasicLogin::new(
+                Arc::clone(&settings_service),
+                username,
+                mode,
+            )) as Arc<dyn ws::WsLoginService>
+        });
+    if ws_login_service.is_none() {
+        tracing::warn!(
+            "Web login disabled: set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD or enable local auth via DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true"
+        );
+    }
 
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let ws_task = tokio::spawn(async move {
         tracing::info!("WebSocket listening on {ws_addr} (/ws)");
-        if let Err(e) = ws::serve_with_shutdown(api_handler, ws_auth, ws_addr, async {
-            let _ = ws_shutdown_rx.await;
-        })
+        if let Err(e) = ws::serve_with_shutdown_and_login(
+            api_handler,
+            ws_auth,
+            ws_login_service,
+            ws_addr,
+            async {
+                let _ = ws_shutdown_rx.await;
+            },
+        )
         .await
         {
             tracing::error!("WebSocket server error: {e}");
@@ -479,4 +610,79 @@ async fn main() -> Result<()> {
     drop(dbus_connection);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WsLoginMode, resolve_ws_login_mode_decision};
+
+    #[test]
+    fn static_password_mode_uses_configured_username() {
+        let result = resolve_ws_login_mode_decision(
+            "local-user".to_string(),
+            Some("api-user".to_string()),
+            Some("secret".to_string()),
+            true,
+            false,
+        );
+
+        match result {
+            Some((username, WsLoginMode::StaticPassword(password))) => {
+                assert_eq!(username, "api-user");
+                assert_eq!(password, "secret");
+            }
+            _ => panic!("expected static password mode"),
+        }
+    }
+
+    #[test]
+    fn static_password_mode_defaults_to_current_username() {
+        let result = resolve_ws_login_mode_decision(
+            "local-user".to_string(),
+            None,
+            Some("secret".to_string()),
+            true,
+            false,
+        );
+
+        match result {
+            Some((username, WsLoginMode::StaticPassword(password))) => {
+                assert_eq!(username, "local-user");
+                assert_eq!(password, "secret");
+            }
+            _ => panic!("expected static password mode"),
+        }
+    }
+
+    #[test]
+    fn system_password_mode_ignores_configured_username() {
+        let result = resolve_ws_login_mode_decision(
+            "local-user".to_string(),
+            Some("other-user".to_string()),
+            None,
+            true,
+            false,
+        );
+
+        match result {
+            Some((username, WsLoginMode::SystemPassword)) => {
+                assert_eq!(username, "local-user");
+            }
+            _ => panic!("expected system password mode"),
+        }
+    }
+
+    #[test]
+    fn login_mode_disabled_in_container_without_static_password() {
+        let result =
+            resolve_ws_login_mode_decision("local-user".to_string(), None, None, true, true);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn login_mode_disabled_when_local_system_auth_is_off() {
+        let result =
+            resolve_ws_login_mode_decision("local-user".to_string(), None, None, false, false);
+        assert!(result.is_none());
+    }
 }

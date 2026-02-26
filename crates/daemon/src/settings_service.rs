@@ -51,8 +51,8 @@ impl SettingsService for DaemonSettingsService {
             .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 
-    async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
-        config::generate_ws_jwt(subject)
+    async fn generate_ws_jwt(&self, _subject: Option<String>) -> Result<String, CoreError> {
+        config::generate_ws_jwt(Some(config::current_username()))
             .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 

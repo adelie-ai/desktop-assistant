@@ -2,12 +2,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use desktop_assistant_application::DefaultAssistantApiHandler;
-use desktop_assistant_ws::{WsAuthValidator, WsFrame, WsRequest, router};
+use desktop_assistant_ws::{
+    WsAuthValidator, WsFrame, WsLoginService, WsRequest, router, router_with_login,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tower::ServiceExt;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
@@ -36,6 +39,19 @@ impl WsAuthValidator for StaticJwtAuth {
     }
 }
 
+struct StaticLogin;
+
+#[async_trait::async_trait]
+impl WsLoginService for StaticLogin {
+    async fn authenticate_basic(&self, username: &str, password: &str) -> bool {
+        username == "alice" && password == "s3cr3t"
+    }
+
+    async fn issue_token_for_subject(&self, subject: &str) -> Result<String, String> {
+        Ok(format!("jwt-for-{subject}"))
+    }
+}
+
 fn ws_request(
     url: &str,
     bearer: Option<&str>,
@@ -48,6 +64,14 @@ fn ws_request(
         );
     }
     request
+}
+
+fn basic_auth_header(username: &str, password: &str) -> String {
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!("{username}:{password}").as_bytes(),
+    );
+    format!("Basic {encoded}")
 }
 
 struct FakeConversations;
@@ -462,6 +486,69 @@ async fn ws_rejects_invalid_bearer_token() {
     }
 
     server.abort();
+}
+
+#[tokio::test]
+async fn login_issues_token_for_basic_auth_username() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    let app = router_with_login(
+        handler,
+        Arc::new(StaticJwtAuth),
+        Some(Arc::new(StaticLogin)),
+    );
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("Authorization", basic_auth_header("alice", "s3cr3t"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["token"], "jwt-for-alice");
+    assert_eq!(value["token_type"], "bearer");
+    assert_eq!(value["subject"], "alice");
+}
+
+#[tokio::test]
+async fn login_rejects_invalid_basic_credentials() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    let app = router_with_login(
+        handler,
+        Arc::new(StaticJwtAuth),
+        Some(Arc::new(StaticLogin)),
+    );
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("Authorization", basic_auth_header("alice", "wrong"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

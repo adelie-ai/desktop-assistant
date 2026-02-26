@@ -128,3 +128,8 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - Added local JWT bootstrap via D-Bus `GenerateWsJwt` when WS token is not explicitly configured.
   - Updated widget UIs to select a named connection in per-widget config.
   - Added KCM Connections tab to manage named profiles + global default.
+- Added remote auth bootstrap endpoint:
+  - Added HTTP `POST /login` endpoint on the WS server.
+  - Uses Basic auth (`username:password`) and returns a bearer JWT with `sub=username`.
+  - Local Linux default authenticates against OS account password; container/remote uses daemon env credentials (`DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`, `DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD`).
+  - D-Bus `GenerateWsJwt` now issues tokens with the current OS username as subject.

@@ -20,9 +20,11 @@ tokio.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 
 uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
 
 [dev-dependencies]
 desktop-assistant-core = { path = "../core" }
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
 tokio.workspace = true
+tower = "0.5"
