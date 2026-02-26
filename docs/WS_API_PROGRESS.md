@@ -119,4 +119,5 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 - Updated TUI to prefer WS by default:
   - Added WS transport client using canonical WS protocol (`Command`/`WsFrame`).
   - Added transport config via env (`DESKTOP_ASSISTANT_TUI_TRANSPORT`, `DESKTOP_ASSISTANT_TUI_WS_URL`, `DESKTOP_ASSISTANT_TUI_WS_JWT`, `DESKTOP_ASSISTANT_TUI_WS_SUBJECT`).
+  - Added equivalent TUI CLI flags via `clap` (`--transport`, `--ws-url`, `--ws-jwt`, `--ws-subject`) with args taking precedence.
   - Added D-Bus settings JWT bootstrap when WS JWT is not provided.

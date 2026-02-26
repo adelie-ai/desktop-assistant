@@ -76,6 +76,11 @@ WebSocket auth uses bearer JWTs:
 TUI transport defaults to WebSocket and can be configured:
 
 ```bash
+# command-line flags (via clap)
+desktop-assistant-tui --transport ws --ws-url ws://127.0.0.1:11339/ws
+desktop-assistant-tui --transport dbus
+desktop-assistant-tui --ws-jwt eyJ... --ws-subject desktop-tui
+
 # default (if unset): ws
 export DESKTOP_ASSISTANT_TUI_TRANSPORT=ws
 

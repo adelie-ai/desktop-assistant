@@ -7,6 +7,7 @@ mod ws_client;
 use std::io;
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
@@ -21,7 +22,6 @@ use dbus_client::{DbusClient, SignalEvent, generate_ws_jwt};
 use keys::{Action, handle_key_event};
 use ws_client::WsClient;
 
-const DEFAULT_TRANSPORT: &str = "ws";
 const DEFAULT_WS_URL: &str = "ws://127.0.0.1:11339/ws";
 const DEFAULT_WS_SUBJECT: &str = "desktop-tui";
 
@@ -30,65 +30,103 @@ enum TransportClient {
     Ws(WsClient),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lower")]
 enum TransportMode {
     Ws,
     Dbus,
 }
 
-fn resolve_transport_mode() -> TransportMode {
-    match std::env::var("DESKTOP_ASSISTANT_TUI_TRANSPORT")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_TRANSPORT.to_string())
-        .as_str()
-    {
-        "dbus" => TransportMode::Dbus,
-        _ => TransportMode::Ws,
+#[derive(Debug, Parser)]
+#[command(name = "desktop-assistant-tui")]
+struct CliArgs {
+    #[arg(
+        long,
+        env = "DESKTOP_ASSISTANT_TUI_TRANSPORT",
+        value_enum,
+        default_value_t = TransportMode::Ws
+    )]
+    transport: TransportMode,
+    #[arg(
+        long = "ws-url",
+        env = "DESKTOP_ASSISTANT_TUI_WS_URL",
+        default_value = DEFAULT_WS_URL
+    )]
+    ws_url: String,
+    #[arg(long = "ws-jwt", env = "DESKTOP_ASSISTANT_TUI_WS_JWT")]
+    ws_jwt: Option<String>,
+    #[arg(
+        long = "ws-subject",
+        env = "DESKTOP_ASSISTANT_TUI_WS_SUBJECT",
+        default_value = DEFAULT_WS_SUBJECT
+    )]
+    ws_subject: String,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeOptions {
+    transport_mode: TransportMode,
+    ws_url: String,
+    ws_jwt: Option<String>,
+    ws_subject: String,
+}
+
+impl From<CliArgs> for RuntimeOptions {
+    fn from(cli: CliArgs) -> Self {
+        let ws_url = {
+            let trimmed = cli.ws_url.trim();
+            if trimmed.is_empty() {
+                DEFAULT_WS_URL.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+
+        let ws_jwt = cli
+            .ws_jwt
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let ws_subject = {
+            let trimmed = cli.ws_subject.trim();
+            if trimmed.is_empty() {
+                DEFAULT_WS_SUBJECT.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+
+        Self {
+            transport_mode: cli.transport,
+            ws_url,
+            ws_jwt,
+            ws_subject,
+        }
     }
 }
 
-fn resolve_ws_url() -> String {
-    std::env::var("DESKTOP_ASSISTANT_TUI_WS_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_WS_URL.to_string())
+fn transport_label(mode: TransportMode) -> &'static str {
+    match mode {
+        TransportMode::Dbus => "Connected via D-Bus",
+        TransportMode::Ws => "Connected via WebSocket",
+    }
 }
 
-fn resolve_ws_subject() -> String {
-    std::env::var("DESKTOP_ASSISTANT_TUI_WS_SUBJECT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_WS_SUBJECT.to_string())
-}
-
-fn resolve_ws_jwt_from_env() -> Option<String> {
-    std::env::var("DESKTOP_ASSISTANT_TUI_WS_JWT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-async fn connect_transport() -> Result<(TransportClient, mpsc::UnboundedReceiver<SignalEvent>)> {
-    match resolve_transport_mode() {
+async fn connect_transport(
+    options: &RuntimeOptions,
+) -> Result<(TransportClient, mpsc::UnboundedReceiver<SignalEvent>)> {
+    match options.transport_mode {
         TransportMode::Dbus => {
             let client = DbusClient::connect().await?;
             let signal_rx = client.subscribe_signals().await?;
             Ok((TransportClient::Dbus(client), signal_rx))
         }
         TransportMode::Ws => {
-            let ws_url = resolve_ws_url();
-            let token = match resolve_ws_jwt_from_env() {
+            let token = match options.ws_jwt.clone() {
                 Some(token) => token,
-                None => {
-                    let subject = resolve_ws_subject();
-                    generate_ws_jwt(&subject).await?
-                }
+                None => generate_ws_jwt(&options.ws_subject).await?,
             };
-            let (client, signal_rx) = WsClient::connect(&ws_url, &token).await?;
+            let (client, signal_rx) = WsClient::connect(&options.ws_url, &token).await?;
             Ok((TransportClient::Ws(client), signal_rx))
         }
     }
@@ -135,13 +173,15 @@ async fn client_send_prompt(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let options = RuntimeOptions::from(CliArgs::parse());
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, &options).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -155,20 +195,20 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    options: &RuntimeOptions,
+) -> Result<()> {
     let mut app = App::new();
 
     // Connect using configured transport (WS by default, D-Bus optional).
-    let (client, mut signal_rx) = match connect_transport().await {
+    let (client, mut signal_rx) = match connect_transport(options).await {
         Ok((transport_client, rx)) => {
             match client_list_conversations(&transport_client).await {
                 Ok(convs) => app.set_conversations(convs),
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
-            app.status_message = match resolve_transport_mode() {
-                TransportMode::Dbus => "Connected via D-Bus".to_string(),
-                TransportMode::Ws => "Connected via WebSocket".to_string(),
-            };
+            app.status_message = transport_label(options.transport_mode).to_string();
             (Some(transport_client), rx)
         }
         Err(e) => {
@@ -301,5 +341,56 @@ async fn handle_action(app: &mut App, client: &Option<TransportClient>, action: 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        let mut out = vec!["desktop-assistant-tui".to_string()];
+        out.extend(parts.iter().map(|value| value.to_string()));
+        out
+    }
+
+    #[test]
+    fn clap_parses_transport_flags() {
+        let parsed = CliArgs::try_parse_from(args(&[
+            "--transport",
+            "dbus",
+            "--ws-url",
+            "wss://example/ws",
+            "--ws-jwt",
+            "jwt123",
+            "--ws-subject",
+            "custom-client",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.transport, TransportMode::Dbus);
+        assert_eq!(parsed.ws_url, "wss://example/ws");
+        assert_eq!(parsed.ws_jwt.as_deref(), Some("jwt123"));
+        assert_eq!(parsed.ws_subject, "custom-client");
+    }
+
+    #[test]
+    fn clap_defaults_map_to_runtime_defaults() {
+        let cli = CliArgs::try_parse_from(args(&[])).unwrap();
+        let options = RuntimeOptions::from(cli);
+        assert_eq!(options.transport_mode, TransportMode::Ws);
+        assert_eq!(options.ws_url, DEFAULT_WS_URL);
+        assert_eq!(options.ws_subject, DEFAULT_WS_SUBJECT);
+        assert_eq!(options.ws_jwt, None);
+    }
+
+    #[test]
+    fn clap_rejects_invalid_transport_value() {
+        let error = CliArgs::try_parse_from(args(&["--transport", "http"]))
+            .err()
+            .expect("transport should be validated by clap");
+        let rendered = error.to_string();
+        assert!(rendered.contains("ws"));
+        assert!(rendered.contains("dbus"));
     }
 }
