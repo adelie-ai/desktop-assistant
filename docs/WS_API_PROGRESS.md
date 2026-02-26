@@ -65,7 +65,7 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 - [x] TUI defaults to WebSocket transport (`DESKTOP_ASSISTANT_TUI_TRANSPORT=ws`)
 - [x] TUI supports explicit D-Bus transport override (`DESKTOP_ASSISTANT_TUI_TRANSPORT=dbus`)
 - [x] TUI bootstraps WS JWT via D-Bus when token env is not provided
-- [ ] Move KDE widget transport to same defaulting model (follow-up)
+- [x] Move KDE widget transport to same defaulting model (ws/dbus, ws URL + subject config)
 
 ## Progress log
 
@@ -121,3 +121,8 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - Added transport config via env (`DESKTOP_ASSISTANT_TUI_TRANSPORT`, `DESKTOP_ASSISTANT_TUI_WS_URL`, `DESKTOP_ASSISTANT_TUI_WS_JWT`, `DESKTOP_ASSISTANT_TUI_WS_SUBJECT`).
   - Added equivalent TUI CLI flags via `clap` (`--transport`, `--ws-url`, `--ws-jwt`, `--ws-subject`) with args taking precedence.
   - Added D-Bus settings JWT bootstrap when WS JWT is not provided.
+- Updated KDE shared widget transport helper:
+  - Default transport is WebSocket (`ws://127.0.0.1:11339/ws`) with configurable D-Bus fallback.
+  - Added helper CLI/env/settings support for `transport`, `ws_url`, `ws_subject`, and optional `ws_jwt`.
+  - Added local JWT bootstrap via D-Bus `GenerateWsJwt` when WS token is not explicitly configured.
+  - Added per-widget transport/WS settings in plasmoid config UIs.

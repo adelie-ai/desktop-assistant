@@ -97,6 +97,21 @@ export DESKTOP_ASSISTANT_TUI_WS_SUBJECT=desktop-tui
 export DESKTOP_ASSISTANT_TUI_TRANSPORT=dbus
 ```
 
+KDE widget transport helper supports the same ws/dbus model:
+
+```bash
+# widget helper defaults to ws, but can be overridden globally
+export DESKTOP_ASSISTANT_WIDGET_TRANSPORT=ws
+export DESKTOP_ASSISTANT_WIDGET_WS_URL=ws://127.0.0.1:11339/ws
+export DESKTOP_ASSISTANT_WIDGET_WS_SUBJECT=desktop-widget
+
+# optional explicit token for remote clusters (skips local D-Bus JWT bootstrap)
+export DESKTOP_ASSISTANT_WIDGET_WS_JWT=eyJ...
+
+# force D-Bus transport
+export DESKTOP_ASSISTANT_WIDGET_TRANSPORT=dbus
+```
+
 For a desktop-agnostic setup, prefer systemd credentials via user-service drop-ins:
 
 ```bash

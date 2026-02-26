@@ -1,11 +1,11 @@
 # Adele AI Shared Chat Module
 
-This module contains shared chat UI and D-Bus helper logic intended for reuse across multiple shells/frontends.
+This module contains shared chat UI and transport helper logic intended for reuse across multiple shells/frontends.
 
 ## Layout
 
 - `ui/ChatView.qml` — reusable chat view
-- `code/dbus_client.py` — reusable D-Bus conversation helper
+- `code/dbus_client.py` — reusable widget transport helper (WebSocket + D-Bus fallback)
 - `images/` — shared avatar assets
 
 ## Install location

@@ -25,6 +25,21 @@ Item {
     property string helperPath: Qt.resolvedUrl("../code/dbus_client.py").toString().replace("file://", "")
     property string productionService: "org.desktopAssistant"
     property string developmentService: "org.desktopAssistant.Dev"
+    readonly property string defaultWsUrl: "ws://127.0.0.1:11339/ws"
+    readonly property string defaultWsSubject: "desktop-widget"
+    readonly property string activeTransportMode: {
+        const mode = String(Plasmoid.configuration.transportMode || "ws").trim().toLowerCase()
+        return mode === "dbus" ? "dbus" : "ws"
+    }
+    readonly property bool usingWsTransport: activeTransportMode === "ws"
+    readonly property string configuredWsUrl: {
+        const value = String(Plasmoid.configuration.wsUrl || "").trim()
+        return value.length > 0 ? value : defaultWsUrl
+    }
+    readonly property string configuredWsSubject: {
+        const value = String(Plasmoid.configuration.wsSubject || "").trim()
+        return value.length > 0 ? value : defaultWsSubject
+    }
     property string activeService: productionService
     property bool serviceInitialized: false
     property bool productionServiceRunning: false
@@ -226,12 +241,15 @@ Item {
     }
 
     function helperCommand(commandText) {
-        return "python3 "
-            + shellEscape(helperPath)
-            + " --service "
-            + shellEscape(activeService)
-            + " "
-            + commandText
+        let command = "python3 " + shellEscape(helperPath)
+        command += " --transport " + shellEscape(activeTransportMode)
+        if (usingWsTransport) {
+            command += " --ws-url " + shellEscape(configuredWsUrl)
+            command += " --ws-subject " + shellEscape(configuredWsSubject)
+        } else {
+            command += " --service " + shellEscape(activeService)
+        }
+        return command + " " + commandText
     }
 
     function zoomInUi() {
@@ -375,7 +393,7 @@ Item {
         }
         serviceStatusRequestInFlight = true
 
-        const command = "python3 " + shellEscape(helperPath) + " status"
+        const command = helperCommand("status")
         runCommand(
             command,
             function(stdout) {
@@ -1231,7 +1249,9 @@ Item {
             }
 
             QQC2.Label {
-                text: root.activeService === root.developmentService ? "Adele (Dev)" : "Adele"
+                text: root.usingWsTransport
+                    ? "Adele (WS)"
+                    : (root.activeService === root.developmentService ? "Adele (Dev)" : "Adele")
                 font.bold: true
                 color: root.themeTextColor
                 Layout.fillWidth: true
@@ -1586,7 +1606,7 @@ Item {
 
             QQC2.ComboBox {
                 id: servicePicker
-                visible: root.devServiceRunning && !root.ultraNarrow
+                visible: !root.usingWsTransport && root.devServiceRunning && !root.ultraNarrow
                 width: 170
                 model: root.serviceChoices
                 textRole: "label"

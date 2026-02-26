@@ -9,6 +9,18 @@
       <label>Selected D-Bus service for this widget instance</label>
       <default></default>
     </entry>
+    <entry name="transportMode" type="String">
+      <label>Transport mode for widget helper (ws or dbus)</label>
+      <default>ws</default>
+    </entry>
+    <entry name="wsUrl" type="String">
+      <label>WebSocket endpoint for widget helper</label>
+      <default>ws://127.0.0.1:11339/ws</default>
+    </entry>
+    <entry name="wsSubject" type="String">
+      <label>Subject used when bootstrapping WS JWT via D-Bus</label>
+      <default>desktop-widget</default>
+    </entry>
     <entry name="userAvatarPath" type="String">
       <label>Optional user avatar path or source URL</label>
       <default></default>

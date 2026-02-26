@@ -7,6 +7,9 @@ import org.kde.kirigami as Kirigami
 Kirigami.FormLayout {
     Kirigami.Theme.colorSet: Kirigami.Theme.View
     Kirigami.Theme.inherit: false
+    property string cfg_transportMode: "ws"
+    property alias cfg_wsUrl: wsUrlField.text
+    property alias cfg_wsSubject: wsSubjectField.text
     property alias cfg_userAvatarPath: userAvatarPathField.text
     property alias cfg_maxSessionAgeDays: maxSessionAgeSpinBox.value
     property alias cfg_maxRenderedMessages: maxRenderedMessagesSpinBox.value
@@ -55,6 +58,50 @@ Kirigami.FormLayout {
         placeholderText: i18n("/home/you/.face.icon or file:///…")
         ToolTip.visible: hovered
         ToolTip.text: i18n("Leave empty to use your system user avatar")
+    }
+
+    QQC2.ComboBox {
+        id: transportModeBox
+        Kirigami.FormData.label: i18n("Transport")
+        model: [
+            { text: i18n("WebSocket"), value: "ws" },
+            { text: i18n("D-Bus"), value: "dbus" }
+        ]
+        textRole: "text"
+        valueRole: "value"
+        currentIndex: 0
+        ToolTip.visible: hovered
+        ToolTip.text: i18n("Preferred transport for this widget instance")
+
+        Component.onCompleted: {
+            const current = String(cfg_transportMode || "ws").toLowerCase()
+            currentIndex = current === "dbus" ? 1 : 0
+        }
+
+        onCurrentValueChanged: {
+            const value = String(currentValue || "ws")
+            if (cfg_transportMode !== value) {
+                cfg_transportMode = value
+            }
+        }
+    }
+
+    QQC2.TextField {
+        id: wsUrlField
+        Kirigami.FormData.label: i18n("WebSocket URL")
+        placeholderText: i18n("ws://127.0.0.1:11339/ws")
+        enabled: transportModeBox.currentValue === "ws"
+        ToolTip.visible: hovered
+        ToolTip.text: i18n("Endpoint used when transport is WebSocket")
+    }
+
+    QQC2.TextField {
+        id: wsSubjectField
+        Kirigami.FormData.label: i18n("WebSocket subject")
+        placeholderText: i18n("desktop-widget")
+        enabled: transportModeBox.currentValue === "ws"
+        ToolTip.visible: hovered
+        ToolTip.text: i18n("Subject for D-Bus JWT bootstrap when no widget WS token is preconfigured")
     }
 
     QQC2.Label {
