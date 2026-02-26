@@ -1220,12 +1220,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "desktop-assistant-api-model",
+ "desktop-assistant-ws",
  "futures",
  "ratatui",
+ "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "tui-textarea",
+ "uuid",
  "zbus",
 ]
 

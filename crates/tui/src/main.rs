@@ -2,6 +2,7 @@ mod app;
 mod dbus_client;
 mod keys;
 mod ui;
+mod ws_client;
 
 use std::io;
 
@@ -15,9 +16,122 @@ use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use app::{App, InputMode};
-use dbus_client::{DbusClient, SignalEvent};
+use app::{App, ConversationDetail, ConversationSummary, InputMode};
+use dbus_client::{DbusClient, SignalEvent, generate_ws_jwt};
 use keys::{Action, handle_key_event};
+use ws_client::WsClient;
+
+const DEFAULT_TRANSPORT: &str = "ws";
+const DEFAULT_WS_URL: &str = "ws://127.0.0.1:11339/ws";
+const DEFAULT_WS_SUBJECT: &str = "desktop-tui";
+
+enum TransportClient {
+    Dbus(DbusClient),
+    Ws(WsClient),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportMode {
+    Ws,
+    Dbus,
+}
+
+fn resolve_transport_mode() -> TransportMode {
+    match std::env::var("DESKTOP_ASSISTANT_TUI_TRANSPORT")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_TRANSPORT.to_string())
+        .as_str()
+    {
+        "dbus" => TransportMode::Dbus,
+        _ => TransportMode::Ws,
+    }
+}
+
+fn resolve_ws_url() -> String {
+    std::env::var("DESKTOP_ASSISTANT_TUI_WS_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_WS_URL.to_string())
+}
+
+fn resolve_ws_subject() -> String {
+    std::env::var("DESKTOP_ASSISTANT_TUI_WS_SUBJECT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_WS_SUBJECT.to_string())
+}
+
+fn resolve_ws_jwt_from_env() -> Option<String> {
+    std::env::var("DESKTOP_ASSISTANT_TUI_WS_JWT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn connect_transport() -> Result<(TransportClient, mpsc::UnboundedReceiver<SignalEvent>)> {
+    match resolve_transport_mode() {
+        TransportMode::Dbus => {
+            let client = DbusClient::connect().await?;
+            let signal_rx = client.subscribe_signals().await?;
+            Ok((TransportClient::Dbus(client), signal_rx))
+        }
+        TransportMode::Ws => {
+            let ws_url = resolve_ws_url();
+            let token = match resolve_ws_jwt_from_env() {
+                Some(token) => token,
+                None => {
+                    let subject = resolve_ws_subject();
+                    generate_ws_jwt(&subject).await?
+                }
+            };
+            let (client, signal_rx) = WsClient::connect(&ws_url, &token).await?;
+            Ok((TransportClient::Ws(client), signal_rx))
+        }
+    }
+}
+
+async fn client_list_conversations(client: &TransportClient) -> Result<Vec<ConversationSummary>> {
+    match client {
+        TransportClient::Dbus(client) => client.list_conversations().await,
+        TransportClient::Ws(client) => client.list_conversations().await,
+    }
+}
+
+async fn client_get_conversation(client: &TransportClient, id: &str) -> Result<ConversationDetail> {
+    match client {
+        TransportClient::Dbus(client) => client.get_conversation(id).await,
+        TransportClient::Ws(client) => client.get_conversation(id).await,
+    }
+}
+
+async fn client_create_conversation(client: &TransportClient, title: &str) -> Result<String> {
+    match client {
+        TransportClient::Dbus(client) => client.create_conversation(title).await,
+        TransportClient::Ws(client) => client.create_conversation(title).await,
+    }
+}
+
+async fn client_delete_conversation(client: &TransportClient, id: &str) -> Result<()> {
+    match client {
+        TransportClient::Dbus(client) => client.delete_conversation(id).await,
+        TransportClient::Ws(client) => client.delete_conversation(id).await,
+    }
+}
+
+async fn client_send_prompt(
+    client: &TransportClient,
+    conversation_id: &str,
+    prompt: &str,
+) -> Result<String> {
+    match client {
+        TransportClient::Dbus(client) => client.send_prompt(conversation_id, prompt).await,
+        TransportClient::Ws(client) => client.send_prompt(conversation_id, prompt).await,
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,24 +158,21 @@ async fn main() -> Result<()> {
 async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
 
-    // Connect to D-Bus
-    let (client, mut signal_rx) = match DbusClient::connect().await {
-        Ok(c) => {
-            match c.list_conversations().await {
+    // Connect using configured transport (WS by default, D-Bus optional).
+    let (client, mut signal_rx) = match connect_transport().await {
+        Ok((transport_client, rx)) => {
+            match client_list_conversations(&transport_client).await {
                 Ok(convs) => app.set_conversations(convs),
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
-            let rx = match c.subscribe_signals().await {
-                Ok(rx) => rx,
-                Err(e) => {
-                    app.status_message = format!("Signal setup error: {e}");
-                    mpsc::unbounded_channel().1
-                }
+            app.status_message = match resolve_transport_mode() {
+                TransportMode::Dbus => "Connected via D-Bus".to_string(),
+                TransportMode::Ws => "Connected via WebSocket".to_string(),
             };
-            (Some(c), rx)
+            (Some(transport_client), rx)
         }
         Err(e) => {
-            app.status_message = format!("D-Bus connection failed: {e}");
+            app.status_message = format!("Connection failed: {e}");
             (None, mpsc::unbounded_channel().1)
         }
     };
@@ -108,7 +219,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()
     Ok(())
 }
 
-async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Action) {
+async fn handle_action(app: &mut App, client: &Option<TransportClient>, action: Action) {
     match action {
         Action::Quit => app.quit(),
         Action::NextConversation => app.next_conversation(),
@@ -116,7 +227,7 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
         Action::OpenConversation => {
             if let (Some(client), Some(id)) = (client.as_ref(), app.selected_conversation_id()) {
                 let id = id.to_string();
-                match client.get_conversation(&id).await {
+                match client_get_conversation(client, &id).await {
                     Ok(detail) => {
                         app.load_conversation(detail);
                         app.enter_editing_mode();
@@ -128,7 +239,7 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
         Action::DeleteConversation => {
             if let Some(id) = app.delete_selected_conversation()
                 && let Some(client) = client.as_ref()
-                && let Err(e) = client.delete_conversation(&id).await
+                && let Err(e) = client_delete_conversation(client, &id).await
             {
                 app.status_message = format!("Delete error: {e}");
             }
@@ -146,7 +257,10 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
             if let Some((conv_id, prompt)) = app.submit_prompt()
                 && let Some(client) = client.as_ref()
             {
-                match client.send_prompt(&conv_id, &prompt).await {
+                match client_send_prompt(client, &conv_id, &prompt).await {
+                    Ok(request_id) if request_id.is_empty() => {
+                        app.start_streaming_without_request_id()
+                    }
                     Ok(request_id) => app.start_streaming(request_id),
                     Err(e) => app.status_message = format!("Send error: {e}"),
                 }
@@ -162,10 +276,10 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
             if let Some(title) = app.submit_new_conversation_title()
                 && let Some(client) = client.as_ref()
             {
-                match client.create_conversation(&title).await {
+                match client_create_conversation(client, &title).await {
                     Ok(id) => {
                         // Refresh list and auto-open the new conversation
-                        match client.list_conversations().await {
+                        match client_list_conversations(client).await {
                             Ok(convs) => {
                                 let new_idx = convs.iter().position(|c| c.id == id);
                                 app.set_conversations(convs);
@@ -175,7 +289,7 @@ async fn handle_action(app: &mut App, client: &Option<DbusClient>, action: Actio
                             }
                             Err(e) => app.status_message = format!("Error refreshing: {e}"),
                         }
-                        match client.get_conversation(&id).await {
+                        match client_get_conversation(client, &id).await {
                             Ok(detail) => {
                                 app.load_conversation(detail);
                                 app.enter_editing_mode();

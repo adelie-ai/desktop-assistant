@@ -61,6 +61,12 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 - [x] Validate JWT in daemon before upgrading socket
 - [ ] Trusted external issuer support via config (follow-up)
 
+### 8) Client transport defaulting
+- [x] TUI defaults to WebSocket transport (`DESKTOP_ASSISTANT_TUI_TRANSPORT=ws`)
+- [x] TUI supports explicit D-Bus transport override (`DESKTOP_ASSISTANT_TUI_TRANSPORT=dbus`)
+- [x] TUI bootstraps WS JWT via D-Bus when token env is not provided
+- [ ] Move KDE widget transport to same defaulting model (follow-up)
+
 ## Progress log
 
 ### 2026-02-25
@@ -110,3 +116,7 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - Added daemon local JWT issuer/signing-key management.
   - Enforced `Authorization: Bearer <jwt>` on `/ws` handshake.
   - Added WS tests for missing/invalid token rejection.
+- Updated TUI to prefer WS by default:
+  - Added WS transport client using canonical WS protocol (`Command`/`WsFrame`).
+  - Added transport config via env (`DESKTOP_ASSISTANT_TUI_TRANSPORT`, `DESKTOP_ASSISTANT_TUI_WS_URL`, `DESKTOP_ASSISTANT_TUI_WS_JWT`, `DESKTOP_ASSISTANT_TUI_WS_SUBJECT`).
+  - Added D-Bus settings JWT bootstrap when WS JWT is not provided.

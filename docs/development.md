@@ -73,6 +73,25 @@ WebSocket auth uses bearer JWTs:
 - Connect to `/ws` with `Authorization: Bearer <token>`.
 - Tokens are locally signed by the daemon and multiple tokens can coexist until expiry.
 
+TUI transport defaults to WebSocket and can be configured:
+
+```bash
+# default (if unset): ws
+export DESKTOP_ASSISTANT_TUI_TRANSPORT=ws
+
+# override websocket endpoint (default: ws://127.0.0.1:11339/ws)
+export DESKTOP_ASSISTANT_TUI_WS_URL=ws://127.0.0.1:11339/ws
+
+# optional: provide JWT directly (skips D-Bus bootstrap)
+export DESKTOP_ASSISTANT_TUI_WS_JWT=eyJ...
+
+# optional: subject used when TUI asks D-Bus to mint a JWT
+export DESKTOP_ASSISTANT_TUI_WS_SUBJECT=desktop-tui
+
+# force legacy local D-Bus transport
+export DESKTOP_ASSISTANT_TUI_TRANSPORT=dbus
+```
+
 For a desktop-agnostic setup, prefer systemd credentials via user-service drop-ins:
 
 ```bash

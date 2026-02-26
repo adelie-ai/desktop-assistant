@@ -43,3 +43,4 @@ If settings later grow significantly, introduce `ListConfigSchema` and move to a
 - WebSocket is the remote-friendly transport; D-Bus remains best for local desktop integration.
 - Both adapters should be covered by integration tests that replay the same command/event scenarios.
 - WS auth (v1): Bearer JWT validated at handshake. Tokens are issued locally via D-Bus settings method.
+- First-party clients should default to WS transport (localhost by default, configurable), while D-Bus remains available for host integration and bootstrap flows.

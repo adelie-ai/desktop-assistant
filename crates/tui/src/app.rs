@@ -49,6 +49,8 @@ pub struct App {
 }
 
 impl App {
+    const PENDING_STREAM_REQUEST_ID: &str = "__pending_stream_request_id__";
+
     pub fn new() -> Self {
         Self {
             conversations: Vec::new(),
@@ -172,8 +174,23 @@ impl App {
         self.streaming_buffer.clear();
     }
 
+    pub fn start_streaming_without_request_id(&mut self) {
+        self.start_streaming(Self::PENDING_STREAM_REQUEST_ID.to_string());
+    }
+
+    fn stream_matches_or_claims_request_id(&mut self, request_id: &str) -> bool {
+        match self.pending_request_id.as_deref() {
+            Some(Self::PENDING_STREAM_REQUEST_ID) => {
+                self.pending_request_id = Some(request_id.to_string());
+                true
+            }
+            Some(current) => current == request_id,
+            None => false,
+        }
+    }
+
     pub fn receive_chunk(&mut self, request_id: &str, chunk: &str) {
-        if self.pending_request_id.as_deref() != Some(request_id) {
+        if !self.stream_matches_or_claims_request_id(request_id) {
             return;
         }
         self.streaming_buffer.push_str(chunk);
@@ -181,7 +198,7 @@ impl App {
     }
 
     pub fn complete_streaming(&mut self, request_id: &str, full_response: &str) {
-        if self.pending_request_id.as_deref() != Some(request_id) {
+        if !self.stream_matches_or_claims_request_id(request_id) {
             return;
         }
         if let Some(conv) = self.current_conversation.as_mut() {
@@ -195,7 +212,7 @@ impl App {
     }
 
     pub fn streaming_error(&mut self, request_id: &str, error: &str) {
-        if self.pending_request_id.as_deref() != Some(request_id) {
+        if !self.stream_matches_or_claims_request_id(request_id) {
             return;
         }
         self.status_message = format!("Error: {error}");
@@ -479,6 +496,38 @@ mod tests {
         assert_eq!(app.status_message, "Error: LLM timeout");
         assert_eq!(app.pending_request_id, None);
         assert_eq!(app.streaming_buffer, "");
+    }
+
+    #[test]
+    fn pending_stream_claims_first_request_id_from_chunk() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "Test".into(),
+            messages: vec![],
+        });
+
+        app.start_streaming_without_request_id();
+        app.receive_chunk("ws-req-1", "Hello ");
+        app.receive_chunk("ws-req-1", "world");
+        app.complete_streaming("ws-req-1", "Hello world");
+
+        assert_eq!(app.pending_request_id, None);
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello world");
+    }
+
+    #[test]
+    fn pending_stream_rejects_unrelated_request_after_claim() {
+        let mut app = App::new();
+        app.start_streaming_without_request_id();
+
+        app.receive_chunk("ws-req-1", "good");
+        app.receive_chunk("ws-req-2", "ignored");
+
+        assert_eq!(app.streaming_buffer, "good");
+        assert_eq!(app.pending_request_id, Some("ws-req-1".to_string()));
     }
 
     // --- Mode transition tests ---

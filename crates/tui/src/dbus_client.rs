@@ -7,6 +7,7 @@ use crate::app::{ChatMessage, ConversationDetail, ConversationSummary};
 
 const DEFAULT_DBUS_SERVICE: &str = "org.desktopAssistant";
 const DBUS_CONVERSATIONS_PATH: &str = "/org/desktopAssistant/Conversations";
+const DBUS_SETTINGS_PATH: &str = "/org/desktopAssistant/Settings";
 
 #[zbus::proxy(interface = "org.desktopAssistant.Conversations")]
 trait Conversations {
@@ -51,6 +52,11 @@ trait Conversations {
     ) -> zbus::fdo::Result<()>;
 }
 
+#[zbus::proxy(interface = "org.desktopAssistant.Settings")]
+trait Settings {
+    async fn generate_ws_jwt(&self, subject: &str) -> zbus::fdo::Result<String>;
+}
+
 /// Signal event received from D-Bus.
 #[derive(Debug)]
 pub enum SignalEvent {
@@ -72,14 +78,30 @@ pub struct DbusClient {
     proxy: ConversationsProxy<'static>,
 }
 
+fn resolve_dbus_service_name() -> String {
+    std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_DBUS_SERVICE.to_string())
+}
+
+pub async fn generate_ws_jwt(subject: &str) -> Result<String> {
+    let connection = Connection::session().await?;
+    let service_name = resolve_dbus_service_name();
+    let proxy = SettingsProxy::builder(&connection)
+        .destination(service_name)?
+        .path(DBUS_SETTINGS_PATH)?
+        .build()
+        .await?;
+
+    Ok(proxy.generate_ws_jwt(subject).await?)
+}
+
 impl DbusClient {
     pub async fn connect() -> Result<Self> {
         let connection = Connection::session().await?;
-        let service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_DBUS_SERVICE.to_string());
+        let service_name = resolve_dbus_service_name();
         let proxy = ConversationsProxy::builder(&connection)
             .destination(service_name)?
             .path(DBUS_CONVERSATIONS_PATH)?
