@@ -5,6 +5,7 @@ use std::{future::Future, future::pending};
 use axum::{
     Router,
     extract::{State, ws::Message, ws::WebSocket, ws::WebSocketUpgrade},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
 };
@@ -43,17 +44,55 @@ pub enum WsFrame {
 #[derive(Clone)]
 pub struct WsServerState {
     handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
 }
 
-pub fn router(handler: Arc<dyn AssistantApiHandler>) -> Router {
-    let state = WsServerState { handler };
+#[async_trait::async_trait]
+pub trait WsAuthValidator: Send + Sync {
+    async fn validate_bearer_token(&self, token: &str) -> bool;
+}
+
+pub fn router(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+) -> Router {
+    let state = WsServerState {
+        handler,
+        auth_validator,
+    };
 
     Router::new()
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsServerState>) -> impl IntoResponse {
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("authorization")?.to_str().ok()?.trim();
+    let (scheme, token) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<WsServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(token) = extract_bearer_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    };
+
+    if !state.auth_validator.validate_bearer_token(&token).await {
+        return (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response();
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -239,19 +278,24 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
     writer.abort();
 }
 
-pub async fn serve(handler: Arc<dyn AssistantApiHandler>, bind: SocketAddr) -> anyhow::Result<()> {
-    serve_with_shutdown(handler, bind, pending::<()>()).await
+pub async fn serve(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    bind: SocketAddr,
+) -> anyhow::Result<()> {
+    serve_with_shutdown(handler, auth_validator, bind, pending::<()>()).await
 }
 
 pub async fn serve_with_shutdown<F>(
     handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
     bind: SocketAddr,
     shutdown: F,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let app = router(handler);
+    let app = router(handler, auth_validator);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

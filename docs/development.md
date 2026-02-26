@@ -68,6 +68,11 @@ Secret backend default is `auto`:
 - `SetApiKey` writes to `$XDG_DATA_HOME/desktop-assistant/secrets/<connector>_api_key` (or `~/.local/share/desktop-assistant/secrets/...`).
 - Reads check that file first, then systemd credentials, then desktop keyrings, then environment variables.
 
+WebSocket auth uses bearer JWTs:
+- Generate a token over D-Bus with `GenerateWsJwt(subject)`.
+- Connect to `/ws` with `Authorization: Bearer <token>`.
+- Tokens are locally signed by the daemon and multiple tokens can coexist until expiry.
+
 For a desktop-agnostic setup, prefer systemd credentials via user-service drop-ins:
 
 ```bash

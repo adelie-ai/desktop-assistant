@@ -2,6 +2,10 @@
 
 Endpoint: `ws://<host>:<port>/ws`
 
+Handshake auth:
+- Require `Authorization: Bearer <jwt>` header.
+- JWT must be issued by the daemon's local issuer (v1).
+
 Client -> server:
 
 ```json

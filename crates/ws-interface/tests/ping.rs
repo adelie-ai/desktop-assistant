@@ -2,11 +2,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use desktop_assistant_application::DefaultAssistantApiHandler;
-use desktop_assistant_ws::{WsFrame, WsRequest, router};
+use desktop_assistant_ws::{WsAuthValidator, WsFrame, WsRequest, router};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{Duration, timeout};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
@@ -24,6 +25,29 @@ impl AssistantService for FakeAssistant {
     fn ping(&self) -> &str {
         "pong"
     }
+}
+
+struct StaticJwtAuth;
+
+#[async_trait::async_trait]
+impl WsAuthValidator for StaticJwtAuth {
+    async fn validate_bearer_token(&self, token: &str) -> bool {
+        token == "test-jwt"
+    }
+}
+
+fn ws_request(
+    url: &str,
+    bearer: Option<&str>,
+) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    let mut request = url.into_client_request().unwrap();
+    if let Some(token) = bearer {
+        request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+    }
+    request
 }
 
 struct FakeConversations;
@@ -117,6 +141,15 @@ impl SettingsService for FakeSettings {
     }
     async fn set_api_key(&self, _api_key: String) -> Result<(), CoreError> {
         Ok(())
+    }
+    async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+        Ok(format!(
+            "jwt-for-{}",
+            subject.unwrap_or_else(|| "desktop-client".to_string())
+        ))
+    }
+    async fn validate_ws_jwt(&self, token: String) -> Result<bool, CoreError> {
+        Ok(token.starts_with("jwt-for-"))
     }
     async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
         Ok(EmbeddingsSettingsView {
@@ -238,6 +271,17 @@ impl SettingsService for StatefulSettings {
         Ok(())
     }
 
+    async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+        Ok(format!(
+            "jwt-for-{}",
+            subject.unwrap_or_else(|| "desktop-client".to_string())
+        ))
+    }
+
+    async fn validate_ws_jwt(&self, token: String) -> Result<bool, CoreError> {
+        Ok(token.starts_with("jwt-for-"))
+    }
+
     async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
         Ok(self.state.lock().unwrap().embeddings.clone())
     }
@@ -307,7 +351,7 @@ async fn ws_ping_roundtrip() {
         Arc::new(FakeSettings),
     ));
 
-    let app = router(handler);
+    let app = router(handler, Arc::new(StaticJwtAuth));
 
     // bind ephemeral port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -318,7 +362,9 @@ async fn ws_ping_roundtrip() {
     });
 
     let url = format!("ws://{}/ws", addr);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
+        .await
+        .unwrap();
 
     let req = WsRequest {
         id: "1".into(),
@@ -351,14 +397,14 @@ async fn ws_ping_roundtrip() {
 }
 
 #[tokio::test]
-async fn ws_get_status_roundtrip() {
+async fn ws_rejects_missing_bearer_token() {
     let handler = Arc::new(DefaultAssistantApiHandler::new(
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
     ));
 
-    let app = router(handler);
+    let app = router(handler, Arc::new(StaticJwtAuth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
 
@@ -367,7 +413,77 @@ async fn ws_get_status_roundtrip() {
     });
 
     let url = format!("ws://{}/ws", addr);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let err = tokio_tungstenite::connect_async(ws_request(&url, None))
+        .await
+        .expect_err("expected unauthorized handshake");
+
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(
+                response.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_rejects_invalid_bearer_token() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    let app = router(handler, Arc::new(StaticJwtAuth));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let err = tokio_tungstenite::connect_async(ws_request(&url, Some("wrong-token")))
+        .await
+        .expect_err("expected unauthorized handshake");
+
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(
+                response.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_get_status_roundtrip() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    let app = router(handler, Arc::new(StaticJwtAuth));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
+        .await
+        .unwrap();
 
     let req = WsRequest {
         id: "2".into(),
@@ -409,7 +525,7 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         Arc::new(StatefulSettings::new()),
     ));
 
-    let app = router(handler);
+    let app = router(handler, Arc::new(StaticJwtAuth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
 
@@ -418,7 +534,9 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
     });
 
     let url = format!("ws://{}/ws", addr);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
+        .await
+        .unwrap();
 
     let req = WsRequest {
         id: "cfg-1".into(),
@@ -482,7 +600,7 @@ async fn ws_send_message_ack_then_streaming_events() {
         Arc::new(FakeSettings),
     ));
 
-    let app = router(handler);
+    let app = router(handler, Arc::new(StaticJwtAuth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
 
@@ -491,7 +609,9 @@ async fn ws_send_message_ack_then_streaming_events() {
     });
 
     let url = format!("ws://{}/ws", addr);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
+        .await
+        .unwrap();
 
     let req = WsRequest {
         id: "3".into(),
@@ -588,7 +708,7 @@ async fn ws_send_message_cancels_when_client_disconnects() {
         Arc::new(FakeSettings),
     ));
 
-    let app = router(handler);
+    let app = router(handler, Arc::new(StaticJwtAuth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
 
@@ -597,7 +717,9 @@ async fn ws_send_message_cancels_when_client_disconnects() {
     });
 
     let url = format!("ws://{}/ws", addr);
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
+        .await
+        .unwrap();
 
     let req = WsRequest {
         id: "4".into(),
@@ -648,6 +770,7 @@ async fn ws_serve_with_shutdown_exits() {
 
     let server = tokio::spawn(desktop_assistant_ws::serve_with_shutdown(
         handler,
+        Arc::new(StaticJwtAuth),
         addr,
         async {
             tokio::time::sleep(Duration::from_millis(20)).await;

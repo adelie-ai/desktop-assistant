@@ -597,6 +597,15 @@ mod tests {
         async fn set_api_key(&self, _api_key: String) -> Result<(), CoreError> {
             Ok(())
         }
+        async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+            Ok(format!(
+                "jwt-for-{}",
+                subject.unwrap_or_else(|| "desktop-client".to_string())
+            ))
+        }
+        async fn validate_ws_jwt(&self, token: String) -> Result<bool, CoreError> {
+            Ok(token.starts_with("jwt-for-"))
+        }
         async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
             Ok(EmbeddingsSettingsView {
                 connector: "x".into(),
@@ -719,6 +728,17 @@ mod tests {
             state.api_key_set = true;
             state.llm.has_api_key = true;
             Ok(())
+        }
+
+        async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+            Ok(format!(
+                "jwt-for-{}",
+                subject.unwrap_or_else(|| "desktop-client".to_string())
+            ))
+        }
+
+        async fn validate_ws_jwt(&self, token: String) -> Result<bool, CoreError> {
+            Ok(token.starts_with("jwt-for-"))
         }
 
         async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {

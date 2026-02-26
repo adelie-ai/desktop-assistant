@@ -24,6 +24,7 @@ Interface: `org.desktopAssistant.Settings`
 - `GetLlmSettings() -> (connector: s, model: s, base_url: s, has_api_key: b)`
 - `SetLlmSettings(connector: s, model: s, base_url: s) -> ()`
 - `SetApiKey(api_key: s) -> ()`
+- `GenerateWsJwt(subject: s) -> token: s`
 - `GetEmbeddingsSettings() -> (connector: s, model: s, base_url: s, has_api_key: b, available: b, is_default: b)`
 - `SetEmbeddingsSettings(connector: s, model: s, base_url: s) -> ()`
   - Empty `connector` clears the override and reverts to defaulting from the LLM connector
@@ -65,3 +66,6 @@ busctl --user call org.desktopAssistant \
   - API keys can be written with `SetApiKey`.
   - There is no method that returns secret values.
   - `GetLlmSettings` and `GetEmbeddingsSettings` only return non-sensitive fields plus `has_api_key`.
+- WebSocket auth uses bearer JWTs:
+  - Generate locally signed tokens with `GenerateWsJwt`.
+  - Multiple tokens can be valid at once until expiry.

@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
+use desktop_assistant_core::ports::inbound::SettingsService;
 use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
 use tracing_subscriber::EnvFilter;
 
@@ -22,6 +24,26 @@ use desktop_assistant_mcp_client::executor::{BuiltinPersistenceConfig, McpToolEx
 use desktop_assistant_ws as ws;
 use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
+
+struct WsSettingsAuth<S: SettingsService + 'static> {
+    settings: Arc<S>,
+}
+
+impl<S: SettingsService + 'static> WsSettingsAuth<S> {
+    fn new(settings: Arc<S>) -> Self {
+        Self { settings }
+    }
+}
+
+#[async_trait]
+impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
+    async fn validate_bearer_token(&self, token: &str) -> bool {
+        self.settings
+            .validate_ws_jwt(token.to_string())
+            .await
+            .unwrap_or(false)
+    }
+}
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -381,11 +403,12 @@ async fn main() -> Result<()> {
         Arc::clone(&conversation_service),
         Arc::clone(&settings_service),
     ));
+    let ws_auth = Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)));
 
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let ws_task = tokio::spawn(async move {
         tracing::info!("WebSocket listening on {ws_addr} (/ws)");
-        if let Err(e) = ws::serve_with_shutdown(api_handler, ws_addr, async {
+        if let Err(e) = ws::serve_with_shutdown(api_handler, ws_auth, ws_addr, async {
             let _ = ws_shutdown_rx.await;
         })
         .await

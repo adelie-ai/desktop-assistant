@@ -302,6 +302,22 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .map_err(to_fdo_error)
     }
 
+    /// Generate a signed WS JWT for connection authentication.
+    ///
+    /// Returns the token string. Subject defaults to `desktop-client` when blank.
+    async fn generate_ws_jwt(&self, subject: &str) -> fdo::Result<String> {
+        let subject = if subject.trim().is_empty() {
+            None
+        } else {
+            Some(subject.to_string())
+        };
+
+        self.service
+            .generate_ws_jwt(subject)
+            .await
+            .map_err(to_fdo_error)
+    }
+
     /// Return resolved embeddings settings.
     ///
     /// Returns: (connector, model, base_url, has_api_key, available, is_default)
@@ -625,6 +641,17 @@ mod tests {
             Ok(())
         }
 
+        async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+            Ok(format!(
+                "jwt-for-{}",
+                subject.unwrap_or_else(|| "desktop-client".to_string())
+            ))
+        }
+
+        async fn validate_ws_jwt(&self, token: String) -> Result<bool, CoreError> {
+            Ok(token.starts_with("jwt-for-"))
+        }
+
         async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
             Ok(self.state.lock().unwrap().embeddings.clone())
         }
@@ -733,5 +760,14 @@ mod tests {
         assert!(!updated.13);
 
         assert!(service.state.lock().unwrap().api_key_set);
+    }
+
+    #[tokio::test]
+    async fn generate_ws_jwt_delegates_to_settings_service() {
+        let service = Arc::new(StatefulSettingsService::new());
+        let adapter = DbusSettingsAdapter::new(service);
+
+        let token = adapter.generate_ws_jwt("tui").await.unwrap();
+        assert_eq!(token, "jwt-for-tui");
     }
 }

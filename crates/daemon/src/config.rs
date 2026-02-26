@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use desktop_assistant_llm_anthropic::AnthropicClient;
 use desktop_assistant_llm_bedrock::BedrockClient;
 use desktop_assistant_llm_ollama::OllamaClient;
 use desktop_assistant_llm_openai::OpenAiClient;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
@@ -936,9 +938,135 @@ fn read_kwallet_secret(secret: &SecretConfig, connector: &str) -> Option<String>
     sanitize_secret_value(value.as_ref())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WsJwtClaims {
+    iss: String,
+    sub: String,
+    aud: String,
+    exp: u64,
+    iat: u64,
+    nbf: u64,
+    jti: String,
+}
+
+fn ws_jwt_signing_key_account() -> &'static str {
+    "ws_jwt_hs256_signing_key"
+}
+
+fn default_ws_jwt_issuer() -> &'static str {
+    "org.desktopAssistant.local"
+}
+
+fn default_ws_jwt_audience() -> &'static str {
+    "desktop-assistant-ws"
+}
+
+fn default_ws_jwt_ttl_seconds() -> u64 {
+    60 * 60 * 24 * 30
+}
+
+fn normalize_ws_jwt_subject(subject: Option<String>) -> String {
+    subject
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "desktop-client".to_string())
+}
+
+fn unix_timestamp_seconds() -> anyhow::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| anyhow!("failed to read system clock: {error}"))
+}
+
+fn ensure_ws_jwt_signing_key() -> anyhow::Result<String> {
+    if let Some(existing) = read_common_file_secret(ws_jwt_signing_key_account()) {
+        return Ok(existing);
+    }
+
+    // 64 hex chars from two UUIDv4 values gives a sufficiently strong local HMAC secret.
+    let generated = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    write_common_file_secret(ws_jwt_signing_key_account(), &generated)?;
+    Ok(generated)
+}
+
+fn read_ws_jwt_signing_key() -> anyhow::Result<String> {
+    read_common_file_secret(ws_jwt_signing_key_account())
+        .ok_or_else(|| anyhow!("ws jwt signing key is not initialized"))
+}
+
+fn ws_jwt_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.set_issuer(&[default_ws_jwt_issuer()]);
+    validation.set_audience(&[default_ws_jwt_audience()]);
+    validation
+}
+
+fn encode_ws_jwt(claims: &WsJwtClaims) -> anyhow::Result<String> {
+    let signing_key = ensure_ws_jwt_signing_key()?;
+    jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        claims,
+        &EncodingKey::from_secret(signing_key.as_bytes()),
+    )
+    .map_err(|error| anyhow!("failed to encode ws jwt: {error}"))
+}
+
+fn decode_ws_jwt_claims(token: &str) -> anyhow::Result<WsJwtClaims> {
+    let signing_key = read_ws_jwt_signing_key()?;
+    let decoded = jsonwebtoken::decode::<WsJwtClaims>(
+        token,
+        &DecodingKey::from_secret(signing_key.as_bytes()),
+        &ws_jwt_validation(),
+    )
+    .map_err(|error| anyhow!("failed to decode ws jwt: {error}"))?;
+    Ok(decoded.claims)
+}
+
+pub fn generate_ws_jwt(subject: Option<String>) -> anyhow::Result<String> {
+    let now = unix_timestamp_seconds()?;
+    let claims = WsJwtClaims {
+        iss: default_ws_jwt_issuer().to_string(),
+        sub: normalize_ws_jwt_subject(subject),
+        aud: default_ws_jwt_audience().to_string(),
+        exp: now.saturating_add(default_ws_jwt_ttl_seconds()),
+        iat: now,
+        nbf: now.saturating_sub(1),
+        jti: uuid::Uuid::new_v4().to_string(),
+    };
+
+    encode_ws_jwt(&claims)
+}
+
+pub fn validate_ws_jwt(token: &str) -> anyhow::Result<bool> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(false);
+    }
+
+    match decode_ws_jwt_claims(token) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            tracing::debug!("invalid ws jwt: {error}");
+            Ok(false)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn ws_jwt_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn default_path_points_to_daemon_toml() {
@@ -1317,5 +1445,63 @@ mod tests {
         assert!(resolved.remote_url.is_none());
         assert_eq!(resolved.remote_name, "origin");
         assert!(!resolved.push_on_update);
+    }
+
+    #[test]
+    fn ws_jwt_generation_allows_multiple_valid_tokens() {
+        let _guard = ws_jwt_env_lock();
+        let test_dir =
+            std::env::temp_dir().join(format!("da-test-ws-jwt-{}", uuid::Uuid::new_v4()));
+        let data_home = test_dir.join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        // Tests are single-process here; setting env var scopes key storage to test temp dir.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        let token_1 = generate_ws_jwt(Some("tui".to_string())).expect("generate first jwt");
+        let token_2 = generate_ws_jwt(Some("plasmoid".to_string())).expect("generate second jwt");
+
+        assert_ne!(token_1, token_2);
+        assert!(validate_ws_jwt(&token_1).expect("validate first jwt"));
+        assert!(validate_ws_jwt(&token_2).expect("validate second jwt"));
+        assert!(!validate_ws_jwt("not-a-jwt").expect("validate invalid token"));
+
+        let claims_1 = decode_ws_jwt_claims(&token_1).expect("decode first jwt");
+        let claims_2 = decode_ws_jwt_claims(&token_2).expect("decode second jwt");
+        assert_eq!(claims_1.sub, "tui");
+        assert_eq!(claims_2.sub, "plasmoid");
+        assert_eq!(claims_1.iss, default_ws_jwt_issuer());
+        assert_eq!(claims_1.aud, default_ws_jwt_audience());
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(&test_dir).ok();
+    }
+
+    #[test]
+    fn ws_jwt_rejects_wrong_issuer() {
+        let _guard = ws_jwt_env_lock();
+        let test_dir =
+            std::env::temp_dir().join(format!("da-test-ws-jwt-iss-{}", uuid::Uuid::new_v4()));
+        let data_home = test_dir.join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        // Tests are single-process here; setting env var scopes key storage to test temp dir.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        let token = generate_ws_jwt(Some("tui".to_string())).expect("generate jwt");
+        let mut claims = decode_ws_jwt_claims(&token).expect("decode generated jwt");
+        claims.iss = "other-issuer".to_string();
+        let forged = encode_ws_jwt(&claims).expect("re-encode forged jwt");
+
+        assert!(!validate_ws_jwt(&forged).expect("validate forged token"));
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(&test_dir).ok();
     }
 }

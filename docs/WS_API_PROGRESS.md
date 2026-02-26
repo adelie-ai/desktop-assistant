@@ -55,6 +55,12 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 - [x] Implement `SendMessage` streaming (`AssistantDelta`, `AssistantCompleted`)
 - [x] Backpressure + cancellation
 
+### 7) WebSocket auth
+- [x] Require bearer token at WS handshake (`Authorization: Bearer <jwt>`)
+- [x] Add D-Bus JWT issuance method (`GenerateWsJwt`)
+- [x] Validate JWT in daemon before upgrading socket
+- [ ] Trusted external issuer support via config (follow-up)
+
 ## Progress log
 
 ### 2026-02-25
@@ -99,3 +105,8 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - `GetConfig` aggregate method
   - patch-based `SetConfig(changes)` method
   - `ConfigChanged` signal emission after successful update
+- Pivoted WS auth from opaque API keys to local JWTs:
+  - Added `GenerateWsJwt(subject)` on D-Bus settings interface.
+  - Added daemon local JWT issuer/signing-key management.
+  - Enforced `Authorization: Bearer <jwt>` on `/ws` handshake.
+  - Added WS tests for missing/invalid token rejection.

@@ -51,6 +51,15 @@ impl SettingsService for DaemonSettingsService {
             .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 
+    async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+        config::generate_ws_jwt(subject)
+            .map_err(|error| CoreError::SystemService(error.to_string()))
+    }
+
+    async fn validate_ws_jwt(&self, token: String) -> Result<bool, CoreError> {
+        config::validate_ws_jwt(&token).map_err(|error| CoreError::SystemService(error.to_string()))
+    }
+
     async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
         let view = config::get_embeddings_settings_view(&self.config_path)
             .map_err(|error| CoreError::SystemService(error.to_string()))?;

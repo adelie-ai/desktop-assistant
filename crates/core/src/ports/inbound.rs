@@ -103,6 +103,16 @@ pub trait SettingsService: Send + Sync {
         api_key: String,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
+    fn generate_ws_jwt(
+        &self,
+        subject: Option<String>,
+    ) -> impl std::future::Future<Output = Result<String, CoreError>> + Send;
+
+    fn validate_ws_jwt(
+        &self,
+        token: String,
+    ) -> impl std::future::Future<Output = Result<bool, CoreError>> + Send;
+
     fn get_embeddings_settings(
         &self,
     ) -> impl std::future::Future<Output = Result<EmbeddingsSettingsView, CoreError>> + Send;
