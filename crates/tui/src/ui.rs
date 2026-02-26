@@ -10,6 +10,35 @@ use crate::app::{App, InputMode};
 
 const INPUT_VISIBLE_LINES: u16 = 4;
 const INPUT_TOTAL_HEIGHT: u16 = INPUT_VISIBLE_LINES + 2; // +2 for borders
+const COLOR_PANEL_BORDER: Color = Color::Rgb(82, 104, 173);
+const COLOR_LIST_BORDER: Color = Color::Rgb(62, 125, 146);
+const COLOR_INPUT_BORDER_IDLE: Color = Color::Rgb(109, 122, 143);
+const COLOR_INPUT_BORDER_EDIT: Color = Color::Rgb(120, 183, 109);
+const COLOR_INPUT_BORDER_CREATE: Color = Color::Rgb(203, 152, 95);
+const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
+const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
+const COLOR_USER_PREFIX: Color = Color::Rgb(255, 189, 89);
+const COLOR_ASSISTANT_PREFIX: Color = Color::Rgb(92, 206, 154);
+const COLOR_ASSISTANT_STREAMING: Color = Color::Rgb(132, 218, 193);
+const COLOR_STATUS_DIM: Color = Color::Rgb(143, 153, 174);
+const COLOR_COUNT_DIM: Color = Color::Rgb(124, 132, 148);
+
+fn mode_chip_style(mode: &InputMode) -> Style {
+    match mode {
+        InputMode::Normal => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(122, 163, 255))
+            .add_modifier(Modifier::BOLD),
+        InputMode::Editing => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(120, 214, 118))
+            .add_modifier(Modifier::BOLD),
+        InputMode::CreatingConversation => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(238, 179, 107))
+            .add_modifier(Modifier::BOLD),
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -25,21 +54,36 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
     let items: Vec<ListItem> = app
         .conversations
         .iter()
-        .map(|c| ListItem::new(Line::from(format!("{} ({})", c.title, c.message_count))))
+        .map(|c| {
+            ListItem::new(Line::from(vec![
+                Span::styled(c.title.as_str(), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!(" ({})", c.message_count),
+                    Style::default().fg(COLOR_COUNT_DIM),
+                ),
+            ]))
+        })
         .collect();
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Conversations"),
+                .border_style(Style::default().fg(COLOR_LIST_BORDER))
+                .title(Line::from(Span::styled(
+                    "Conversations",
+                    Style::default()
+                        .fg(Color::Rgb(136, 214, 240))
+                        .add_modifier(Modifier::BOLD),
+                ))),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(COLOR_LIST_HIGHLIGHT)
+                .fg(COLOR_LIST_HIGHLIGHT_FG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("> ");
+        .highlight_symbol("▸ ");
 
     let mut state = ListState::default();
     state.select(app.selected_conversation);
@@ -67,8 +111,8 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if let Some(conv) = &app.current_conversation {
         for msg in &conv.messages {
             let (prefix, style) = match msg.role.as_str() {
-                "user" => ("You: ", Style::default().fg(Color::Cyan)),
-                "assistant" => ("AI: ", Style::default().fg(Color::Green)),
+                "user" => ("You: ", Style::default().fg(COLOR_USER_PREFIX)),
+                "assistant" => ("Adele: ", Style::default().fg(COLOR_ASSISTANT_PREFIX)),
                 _ => ("", Style::default()),
             };
             // Split content on newlines so ratatui renders them as separate lines
@@ -89,12 +133,12 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
         // Show streaming buffer as in-progress assistant message
         if !app.streaming_buffer.is_empty() {
-            let style = Style::default().fg(Color::Yellow);
+            let style = Style::default().fg(COLOR_ASSISTANT_STREAMING);
             let mut first = true;
             for text_line in app.streaming_buffer.split('\n') {
                 if first {
                     lines.push(Line::from(vec![
-                        Span::styled("AI: ", style.add_modifier(Modifier::BOLD)),
+                        Span::styled("Adele: ", style.add_modifier(Modifier::BOLD)),
                         Span::styled(text_line.to_string(), style),
                     ]));
                     first = false;
@@ -122,7 +166,15 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         chat_title.to_string()
     };
 
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_PANEL_BORDER))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Rgb(166, 182, 255))
+                .add_modifier(Modifier::BOLD),
+        )));
     let inner_width = block.inner(area).width;
     let visible_height = block.inner(area).height;
 
@@ -143,16 +195,27 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let wrap_width = usize::from(area.width.saturating_sub(2)).max(1);
     app.rewrap_textarea_to_width(wrap_width);
 
-    let title = match app.mode {
-        InputMode::Normal => "Input (press 'i' to edit)",
-        InputMode::Editing => "Input (Esc cancel, Enter send, Shift+Enter newline)",
-        InputMode::CreatingConversation => {
-            "New conversation title (Enter to create, Esc to cancel)"
-        }
+    let (title, border_color) = match app.mode {
+        InputMode::Normal => ("Input (press 'i' to edit)", COLOR_INPUT_BORDER_IDLE),
+        InputMode::Editing => (
+            "Input (Esc cancel, Enter send, Shift+Enter newline)",
+            COLOR_INPUT_BORDER_EDIT,
+        ),
+        InputMode::CreatingConversation => (
+            "New conversation title (Enter to create, Esc to cancel)",
+            COLOR_INPUT_BORDER_CREATE,
+        ),
     };
 
-    app.textarea
-        .set_block(Block::default().borders(Borders::ALL).title(title));
+    app.textarea.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(Line::from(Span::styled(
+                title,
+                Style::default().fg(Color::Rgb(216, 223, 236)),
+            ))),
+    );
 
     f.render_widget(&app.textarea, area);
 }
@@ -165,14 +228,12 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     };
 
     let status = Paragraph::new(Line::from(vec![
+        Span::styled(format!(" [{mode_str}] "), mode_chip_style(&app.mode)),
+        Span::styled(" • ", Style::default().fg(COLOR_STATUS_DIM)),
         Span::styled(
-            format!(" [{mode_str}] "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            app.status_message.as_str(),
+            Style::default().fg(Color::White),
         ),
-        Span::raw(format!(" {}", app.status_message)),
     ]));
 
     f.render_widget(status, area);
