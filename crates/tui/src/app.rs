@@ -1,10 +1,60 @@
 use ratatui::style::Style;
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_cursor_line_style(Style::default());
     ta
+}
+
+fn wrap_line_for_width(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+
+    while start < chars.len() {
+        let remaining = chars.len() - start;
+        if remaining <= width {
+            out.push(chars[start..].iter().collect());
+            break;
+        }
+
+        let hard_end = start + width;
+        let mut split_at = hard_end;
+        for i in (start..hard_end).rev() {
+            if chars[i].is_whitespace() {
+                split_at = i + 1;
+                break;
+            }
+        }
+        if split_at == start {
+            split_at = hard_end;
+        }
+
+        out.push(chars[start..split_at].iter().collect());
+        start = split_at;
+    }
+
+    out
+}
+
+fn map_cursor_col_to_wrapped_segments(segments: &[String], cursor_col: usize) -> (usize, usize) {
+    let mut remaining = cursor_col;
+    for (idx, segment) in segments.iter().enumerate() {
+        let seg_len = segment.chars().count();
+        if remaining <= seg_len {
+            return (idx, remaining);
+        }
+        remaining = remaining.saturating_sub(seg_len);
+    }
+
+    let last_idx = segments.len().saturating_sub(1);
+    let last_len = segments[last_idx].chars().count();
+    (last_idx, last_len)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +200,61 @@ impl App {
         self.textarea = new_textarea();
         self.mode = InputMode::Normal;
         Some(content)
+    }
+
+    /// Hard-wrap textarea lines to fit the available editor width.
+    ///
+    /// This gives the TUI composer word-wrap behavior even though the backing
+    /// textarea widget is single-line-scroll based.
+    pub fn rewrap_textarea_to_width(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+
+        let original_lines = self.textarea.lines().to_vec();
+        let (cursor_row, cursor_col) = self.textarea.cursor();
+        let mut wrapped_lines: Vec<String> = Vec::new();
+        let mut wrapped_cursor_row = 0usize;
+        let mut wrapped_cursor_col = 0usize;
+
+        for (row_idx, line) in original_lines.iter().enumerate() {
+            let segments = wrap_line_for_width(line, width);
+            if row_idx < cursor_row {
+                wrapped_cursor_row += segments.len();
+            } else if row_idx == cursor_row {
+                let (segment_idx, segment_col) =
+                    map_cursor_col_to_wrapped_segments(&segments, cursor_col);
+                wrapped_cursor_row += segment_idx;
+                wrapped_cursor_col = segment_col;
+            }
+            wrapped_lines.extend(segments);
+        }
+
+        if wrapped_lines.is_empty() {
+            wrapped_lines.push(String::new());
+        }
+
+        if wrapped_cursor_row >= wrapped_lines.len() {
+            wrapped_cursor_row = wrapped_lines.len().saturating_sub(1);
+            wrapped_cursor_col = wrapped_lines[wrapped_cursor_row].chars().count();
+        } else {
+            wrapped_cursor_col =
+                wrapped_cursor_col.min(wrapped_lines[wrapped_cursor_row].chars().count());
+        }
+
+        if wrapped_lines == original_lines
+            && (cursor_row, cursor_col) == (wrapped_cursor_row, wrapped_cursor_col)
+        {
+            return;
+        }
+
+        let mut textarea = TextArea::from(wrapped_lines);
+        textarea.set_cursor_line_style(Style::default());
+        textarea.move_cursor(CursorMove::Jump(
+            wrapped_cursor_row.min(u16::MAX as usize) as u16,
+            wrapped_cursor_col.min(u16::MAX as usize) as u16,
+        ));
+        self.textarea = textarea;
     }
 
     // --- Mode transitions ---
@@ -399,6 +504,26 @@ mod tests {
         assert_eq!(app.textarea_content(), "");
         app.textarea.delete_char(); // no panic on empty
         assert_eq!(app.textarea_content(), "");
+    }
+
+    #[test]
+    fn rewrap_textarea_to_width_wraps_long_lines_on_word_boundaries() {
+        let mut app = App::new();
+        app.textarea.insert_str("hello world again");
+
+        app.rewrap_textarea_to_width(8);
+
+        assert_eq!(app.textarea.lines(), ["hello ", "world ", "again"]);
+    }
+
+    #[test]
+    fn rewrap_textarea_to_width_preserves_explicit_newlines() {
+        let mut app = App::new();
+        app.textarea.insert_str("alpha beta\ngamma delta");
+
+        app.rewrap_textarea_to_width(7);
+
+        assert_eq!(app.textarea.lines(), ["alpha ", "beta", "gamma ", "delta"]);
     }
 
     #[test]

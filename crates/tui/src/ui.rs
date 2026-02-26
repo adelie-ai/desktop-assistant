@@ -8,6 +8,9 @@ use ratatui::{
 
 use crate::app::{App, InputMode};
 
+const INPUT_VISIBLE_LINES: u16 = 4;
+const INPUT_TOTAL_HEIGHT: u16 = INPUT_VISIBLE_LINES + 2; // +2 for borders
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -44,15 +47,11 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
 }
 
 fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    // Dynamic input height: line count + 2 for borders, min 3, max 10
-    let line_count = app.textarea.lines().len() as u16;
-    let input_height = (line_count + 2).clamp(3, 10);
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(input_height),
+            Constraint::Length(INPUT_TOTAL_HEIGHT),
             Constraint::Length(1),
         ])
         .split(area);
@@ -141,9 +140,12 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let wrap_width = usize::from(area.width.saturating_sub(2)).max(1);
+    app.rewrap_textarea_to_width(wrap_width);
+
     let title = match app.mode {
         InputMode::Normal => "Input (press 'i' to edit)",
-        InputMode::Editing => "Input (Esc cancel, Enter send, Alt+Enter newline)",
+        InputMode::Editing => "Input (Esc cancel, Enter send, Shift+Enter newline)",
         InputMode::CreatingConversation => {
             "New conversation title (Enter to create, Esc to cancel)"
         }

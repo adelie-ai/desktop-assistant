@@ -57,13 +57,14 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             }
         }
         InputMode::Editing => {
-            // Alt+Enter inserts a newline
-            if alt && key.code == KeyCode::Enter {
+            // Shift+Enter inserts a newline while plain Enter submits.
+            if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
                 return Some(Action::InsertNewline);
             }
             match key.code {
                 KeyCode::Esc => Some(Action::ExitEditMode),
-                KeyCode::Enter => Some(Action::SubmitPrompt),
+                KeyCode::Enter if key.modifiers.is_empty() => Some(Action::SubmitPrompt),
+                KeyCode::Enter => None,
                 KeyCode::PageUp => Some(Action::ScrollUp),
                 KeyCode::PageDown => Some(Action::ScrollDown),
                 KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -230,13 +231,24 @@ mod tests {
     }
 
     #[test]
-    fn editing_alt_enter_inserts_newline() {
+    fn editing_shift_enter_inserts_newline() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Enter, KeyModifiers::SHIFT),
+                &InputMode::Editing
+            ),
+            Some(Action::InsertNewline)
+        );
+    }
+
+    #[test]
+    fn editing_alt_enter_is_forwarded_to_textarea() {
         assert_eq!(
             handle_key_event(
                 key_with_mod(KeyCode::Enter, KeyModifiers::ALT),
                 &InputMode::Editing
             ),
-            Some(Action::InsertNewline)
+            None
         );
     }
 
