@@ -5,8 +5,20 @@ import org.kde.kcmutils as KCM
 import org.kde.kirigami as Kirigami
 
 KCM.SimpleKCM {
-    implicitWidth: 520
-    implicitHeight: 420
+    implicitWidth: 560
+    implicitHeight: 460
+
+    function indexForName(values, needle) {
+        if (!values || values.length === 0) {
+            return -1
+        }
+        for (let i = 0; i < values.length; i++) {
+            if (values[i] === needle) {
+                return i
+            }
+        }
+        return -1
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -19,7 +31,7 @@ KCM.SimpleKCM {
             QQC2.TabButton { text: "Chat LLM" }
             QQC2.TabButton { text: "Search" }
             QQC2.TabButton { text: "Data Sync" }
-            QQC2.TabButton { text: "Data Sync" }
+            QQC2.TabButton { text: "Connections" }
         }
 
         StackLayout {
@@ -245,6 +257,153 @@ KCM.SimpleKCM {
                     Item { Layout.fillHeight: true }
                 }
             }
+
+            QQC2.ScrollView {
+                clip: true
+
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 12
+
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: "Define Adelie connections once, set a global default, and let each widget pick a connection by name. 'local' is always a D-Bus connection; all other named connections use WebSocket."
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.Label {
+                            text: "Default"
+                            Layout.preferredWidth: 120
+                        }
+                        QQC2.ComboBox {
+                            id: defaultConnectionBox
+                            Layout.fillWidth: true
+                            model: kcm.connectionNames
+                            currentIndex: Math.max(0, indexForName(kcm.connectionNames, kcm.defaultConnectionName))
+                            onActivated: {
+                                if (currentIndex >= 0) {
+                                    kcm.defaultConnectionName = currentText
+                                }
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.Label {
+                            text: "Edit"
+                            Layout.preferredWidth: 120
+                        }
+                        QQC2.ComboBox {
+                            id: selectedConnectionBox
+                            Layout.fillWidth: true
+                            model: kcm.connectionNames
+                            currentIndex: Math.max(0, indexForName(kcm.connectionNames, kcm.selectedConnectionName))
+                            onActivated: {
+                                if (currentIndex >= 0) {
+                                    kcm.selectedConnectionName = currentText
+                                }
+                            }
+                        }
+                        QQC2.Button {
+                            text: "Remove"
+                            enabled: kcm.selectedConnectionRemovable
+                            onClicked: kcm.removeSelectedConnection()
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.Label {
+                            text: "Add remote"
+                            Layout.preferredWidth: 120
+                        }
+                        QQC2.TextField {
+                            id: newConnectionNameField
+                            Layout.fillWidth: true
+                            placeholderText: "my-cluster"
+                            onAccepted: addConnectionButton.clicked()
+                        }
+                        QQC2.Button {
+                            id: addConnectionButton
+                            text: "Add"
+                            onClicked: {
+                                const value = newConnectionNameField.text.trim()
+                                if (value.length === 0) {
+                                    return
+                                }
+                                kcm.addRemoteConnection(value)
+                                newConnectionNameField.text = ""
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.Label {
+                            text: "Transport"
+                            Layout.preferredWidth: 120
+                        }
+                        QQC2.TextField {
+                            Layout.fillWidth: true
+                            readOnly: true
+                            text: kcm.selectedConnectionTransport
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: kcm.selectedConnectionTransport === "dbus"
+                        QQC2.Label {
+                            text: "D-Bus service"
+                            Layout.preferredWidth: 120
+                        }
+                        QQC2.TextField {
+                            id: selectedConnectionDbusServiceField
+                            Layout.fillWidth: true
+                            placeholderText: "org.desktopAssistant"
+                            text: kcm.selectedConnectionDbusService
+                            onTextEdited: kcm.selectedConnectionDbusService = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: kcm.selectedConnectionTransport === "ws"
+                        QQC2.Label {
+                            text: "WebSocket URL"
+                            Layout.preferredWidth: 120
+                        }
+                        QQC2.TextField {
+                            id: selectedConnectionWsUrlField
+                            Layout.fillWidth: true
+                            placeholderText: "wss://cluster.example.com/ws"
+                            text: kcm.selectedConnectionWsUrl
+                            onTextEdited: kcm.selectedConnectionWsUrl = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: kcm.selectedConnectionTransport === "ws"
+                        QQC2.Label {
+                            text: "JWT subject"
+                            Layout.preferredWidth: 120
+                        }
+                        QQC2.TextField {
+                            id: selectedConnectionWsSubjectField
+                            Layout.fillWidth: true
+                            placeholderText: "desktop-widget"
+                            text: kcm.selectedConnectionWsSubject
+                            onTextEdited: kcm.selectedConnectionWsSubject = text
+                        }
+                    }
+
+                    Item { Layout.fillHeight: true }
+                }
+            }
         }
 
         RowLayout {
@@ -314,6 +473,24 @@ KCM.SimpleKCM {
             function onGitRemoteNameChanged() {
                 if (gitRemoteNameField.text !== kcm.gitRemoteName) {
                     gitRemoteNameField.text = kcm.gitRemoteName
+                }
+            }
+
+            function onSelectedConnectionDbusServiceChanged() {
+                if (selectedConnectionDbusServiceField.text !== kcm.selectedConnectionDbusService) {
+                    selectedConnectionDbusServiceField.text = kcm.selectedConnectionDbusService
+                }
+            }
+
+            function onSelectedConnectionWsUrlChanged() {
+                if (selectedConnectionWsUrlField.text !== kcm.selectedConnectionWsUrl) {
+                    selectedConnectionWsUrlField.text = kcm.selectedConnectionWsUrl
+                }
+            }
+
+            function onSelectedConnectionWsSubjectChanged() {
+                if (selectedConnectionWsSubjectField.text !== kcm.selectedConnectionWsSubject) {
+                    selectedConnectionWsSubjectField.text = kcm.selectedConnectionWsSubject
                 }
             }
         }

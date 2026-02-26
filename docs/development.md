@@ -25,6 +25,21 @@ cargo run -p desktop-assistant-daemon
 cargo run -p desktop-assistant-tui
 ```
 
+## Run Daemon in Docker
+
+```bash
+docker build -t desktop-assistant-daemon .
+
+# exposes ws://localhost:11339/ws from container
+docker run --rm -p 11339:11339 \
+  -e OPENAI_API_KEY=your_key_here \
+  desktop-assistant-daemon
+```
+
+Container defaults from `Dockerfile`:
+- `DESKTOP_ASSISTANT_WS_BIND=0.0.0.0:11339`
+- `DESKTOP_ASSISTANT_DBUS_REQUIRED=false` (daemon will continue if session D-Bus is unavailable)
+
 For systemd user service + D-Bus activation setup:
 
 ```bash
@@ -97,19 +112,23 @@ export DESKTOP_ASSISTANT_TUI_WS_SUBJECT=desktop-tui
 export DESKTOP_ASSISTANT_TUI_TRANSPORT=dbus
 ```
 
-KDE widget transport helper supports the same ws/dbus model:
+KDE widget helper now supports named connections (defaulting to `local` D-Bus unless changed in KCM):
 
 ```bash
-# widget helper defaults to ws, but can be overridden globally
-export DESKTOP_ASSISTANT_WIDGET_TRANSPORT=ws
-export DESKTOP_ASSISTANT_WIDGET_WS_URL=ws://127.0.0.1:11339/ws
-export DESKTOP_ASSISTANT_WIDGET_WS_SUBJECT=desktop-widget
+# optional: pin a widget or helper call to a named connection
+export DESKTOP_ASSISTANT_WIDGET_CONNECTION=my-cluster
 
 # optional explicit token for remote clusters (skips local D-Bus JWT bootstrap)
 export DESKTOP_ASSISTANT_WIDGET_WS_JWT=eyJ...
+```
 
-# force D-Bus transport
-export DESKTOP_ASSISTANT_WIDGET_TRANSPORT=dbus
+Legacy overrides are still available:
+
+```bash
+export DESKTOP_ASSISTANT_WIDGET_TRANSPORT=ws
+export DESKTOP_ASSISTANT_WIDGET_WS_URL=ws://127.0.0.1:11339/ws
+export DESKTOP_ASSISTANT_WIDGET_WS_SUBJECT=desktop-widget
+export DESKTOP_ASSISTANT_WIDGET_DBUS_SERVICE=org.desktopAssistant
 ```
 
 For a desktop-agnostic setup, prefer systemd credentials via user-service drop-ins:

@@ -19,7 +19,8 @@ from urllib.parse import urlparse
 DEFAULT_SERVICE = "org.desktopAssistant"
 DEV_SERVICE = "org.desktopAssistant.Dev"
 SETTINGS_PATH = Path.home() / ".config" / "desktop-assistant" / "widget_settings.json"
-DEFAULT_TRANSPORT = "ws"
+DEFAULT_CONNECTION_NAME = "local"
+DEFAULT_TRANSPORT = "dbus"
 DEFAULT_WS_URL = "ws://127.0.0.1:11339/ws"
 DEFAULT_WS_SUBJECT = "desktop-widget"
 SERVICE = DEFAULT_SERVICE
@@ -36,6 +37,8 @@ TRANSPORT = DEFAULT_TRANSPORT
 WS_URL = DEFAULT_WS_URL
 WS_SUBJECT = DEFAULT_WS_SUBJECT
 WS_JWT = ""
+CONNECTION_NAME = DEFAULT_CONNECTION_NAME
+DEFAULT_CONFIG_CONNECTION = DEFAULT_CONNECTION_NAME
 
 
 class DbusError(RuntimeError):
@@ -57,54 +60,96 @@ def _load_widget_settings_payload() -> dict[str, Any]:
     return payload
 
 
-def _load_widget_service() -> str:
-    env_service = os.environ.get("DESKTOP_ASSISTANT_WIDGET_DBUS_SERVICE", "").strip()
-    if env_service:
-        return env_service
-
-    payload = _load_widget_settings_payload()
-    value = str(payload.get("dbus_service", "")).strip()
-    return value or DEFAULT_SERVICE
+def _normalize_transport(value: str) -> str:
+    normalized = value.strip().lower()
+    return "ws" if normalized == "ws" else "dbus"
 
 
-def _load_widget_transport() -> str:
-    env_transport = os.environ.get("DESKTOP_ASSISTANT_WIDGET_TRANSPORT", "").strip().lower()
-    if env_transport:
-        return env_transport
+def _load_widget_connections(payload: dict[str, Any]) -> tuple[dict[str, dict[str, str]], str]:
+    raw_connections = payload.get("connections")
+    parsed: dict[str, dict[str, str]] = {}
+    local_service = str(payload.get("dbus_service", "")).strip() or DEFAULT_SERVICE
 
-    payload = _load_widget_settings_payload()
-    value = str(payload.get("transport", "")).strip().lower()
-    return value or DEFAULT_TRANSPORT
+    if isinstance(raw_connections, list):
+        for item in raw_connections:
+            if not isinstance(item, dict):
+                continue
+
+            name = str(item.get("name", "")).strip()
+            if not name or name in parsed:
+                continue
+
+            if name == DEFAULT_CONNECTION_NAME:
+                transport = "dbus"
+            else:
+                transport = _normalize_transport(str(item.get("transport", "ws")))
+                if transport != "ws":
+                    transport = "ws"
+
+            dbus_service = str(item.get("dbus_service", "")).strip() or local_service
+            ws_url = str(item.get("ws_url", "")).strip() or DEFAULT_WS_URL
+            ws_subject = str(item.get("ws_subject", "")).strip() or DEFAULT_WS_SUBJECT
+
+            parsed[name] = {
+                "name": name,
+                "transport": transport,
+                "dbus_service": dbus_service,
+                "ws_url": ws_url,
+                "ws_subject": ws_subject,
+            }
+
+    local = parsed.get(
+        DEFAULT_CONNECTION_NAME,
+        {
+            "name": DEFAULT_CONNECTION_NAME,
+            "transport": "dbus",
+            "dbus_service": local_service,
+            "ws_url": DEFAULT_WS_URL,
+            "ws_subject": DEFAULT_WS_SUBJECT,
+        },
+    )
+    local["transport"] = "dbus"
+    local["dbus_service"] = str(local.get("dbus_service", "")).strip() or local_service
+    local["ws_url"] = str(local.get("ws_url", "")).strip() or DEFAULT_WS_URL
+    local["ws_subject"] = str(local.get("ws_subject", "")).strip() or DEFAULT_WS_SUBJECT
+    parsed[DEFAULT_CONNECTION_NAME] = local
+    for connection in parsed.values():
+        if connection.get("transport") == "ws":
+            connection["dbus_service"] = local["dbus_service"]
+
+    default_connection = str(payload.get("default_connection", "")).strip()
+
+    if not isinstance(raw_connections, list) or not raw_connections:
+        legacy_transport = str(payload.get("transport", "")).strip().lower()
+        legacy_ws_url = str(payload.get("ws_url", "")).strip()
+        legacy_ws_subject = str(payload.get("ws_subject", "")).strip()
+        use_legacy_ws = legacy_transport == "ws" or bool(legacy_ws_url)
+        if use_legacy_ws:
+            legacy_name = "legacy-ws"
+            parsed[legacy_name] = {
+                "name": legacy_name,
+                "transport": "ws",
+                "dbus_service": local_service,
+                "ws_url": legacy_ws_url or DEFAULT_WS_URL,
+                "ws_subject": legacy_ws_subject or DEFAULT_WS_SUBJECT,
+            }
+            if not default_connection:
+                default_connection = legacy_name
+
+    if default_connection not in parsed:
+        default_connection = DEFAULT_CONNECTION_NAME
+
+    return parsed, default_connection
 
 
-def _load_widget_ws_url() -> str:
-    env_url = os.environ.get("DESKTOP_ASSISTANT_WIDGET_WS_URL", "").strip()
-    if env_url:
-        return env_url
-
-    payload = _load_widget_settings_payload()
-    value = str(payload.get("ws_url", "")).strip()
-    return value or DEFAULT_WS_URL
-
-
-def _load_widget_ws_subject() -> str:
-    env_subject = os.environ.get("DESKTOP_ASSISTANT_WIDGET_WS_SUBJECT", "").strip()
-    if env_subject:
-        return env_subject
-
-    payload = _load_widget_settings_payload()
-    value = str(payload.get("ws_subject", "")).strip()
-    return value or DEFAULT_WS_SUBJECT
-
-
-def _load_widget_ws_jwt() -> str:
-    env_jwt = os.environ.get("DESKTOP_ASSISTANT_WIDGET_WS_JWT", "").strip()
-    if env_jwt:
-        return env_jwt
-
-    payload = _load_widget_settings_payload()
-    value = str(payload.get("ws_jwt", "")).strip()
-    return value
+def _load_widget_connection_name(payload: dict[str, Any]) -> str:
+    env_name = os.environ.get("DESKTOP_ASSISTANT_WIDGET_CONNECTION", "").strip()
+    if env_name:
+        return env_name
+    value = str(payload.get("connection_name", "")).strip()
+    if value:
+        return value
+    return str(payload.get("connection", "")).strip()
 
 
 def _parse_gdbus_output(output: str) -> Any:
@@ -645,6 +690,8 @@ def ensure_conversation(title: str) -> str:
 
 def cmd_status() -> int:
     payload: dict[str, Any] = {
+        "selected_connection": CONNECTION_NAME,
+        "default_connection": DEFAULT_CONFIG_CONNECTION,
         "transport": TRANSPORT,
         "ws_url": WS_URL if TRANSPORT == "ws" else "",
         "selected_service": SERVICE,
@@ -678,9 +725,10 @@ def cmd_status() -> int:
 
 
 def main() -> int:
-    global SERVICE, TRANSPORT, WS_URL, WS_SUBJECT, WS_JWT
+    global CONNECTION_NAME, DEFAULT_CONFIG_CONNECTION, SERVICE, TRANSPORT, WS_JWT, WS_SUBJECT, WS_URL
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--connection-name", default="")
     parser.add_argument("--service", default="")
     parser.add_argument("--transport", default="")
     parser.add_argument("--ws-url", default="")
@@ -723,19 +771,48 @@ def main() -> int:
     await_cmd.add_argument("--timeout", type=float, default=60.0)
     await_cmd.add_argument("--interval", type=float, default=0.8)
 
+    subparsers.add_parser("connections")
     subparsers.add_parser("status")
 
     args = parser.parse_args()
-    SERVICE = args.service.strip() or _load_widget_service()
-    transport_value = (args.transport or _load_widget_transport()).strip().lower()
-    if transport_value not in {"ws", "dbus"}:
-        print(json.dumps({"error": f"invalid transport '{transport_value}'"}))
-        return 1
+    payload = _load_widget_settings_payload()
+    connections, default_connection = _load_widget_connections(payload)
+    DEFAULT_CONFIG_CONNECTION = default_connection
 
-    TRANSPORT = transport_value
-    WS_URL = args.ws_url.strip() or _load_widget_ws_url()
-    WS_SUBJECT = args.ws_subject.strip() or _load_widget_ws_subject()
-    WS_JWT = args.ws_jwt.strip() or _load_widget_ws_jwt()
+    requested_connection = args.connection_name.strip() or _load_widget_connection_name(payload) or default_connection
+    if requested_connection not in connections:
+        requested_connection = default_connection
+
+    resolved = connections.get(requested_connection, connections[DEFAULT_CONNECTION_NAME])
+    CONNECTION_NAME = requested_connection
+    TRANSPORT = _normalize_transport(str(resolved.get("transport", DEFAULT_TRANSPORT)))
+    SERVICE = str(resolved.get("dbus_service", "")).strip() or DEFAULT_SERVICE
+    WS_URL = str(resolved.get("ws_url", "")).strip() or DEFAULT_WS_URL
+    WS_SUBJECT = str(resolved.get("ws_subject", "")).strip() or DEFAULT_WS_SUBJECT
+    WS_JWT = str(payload.get("ws_jwt", "")).strip()
+
+    service_override = args.service.strip() or os.environ.get("DESKTOP_ASSISTANT_WIDGET_DBUS_SERVICE", "").strip()
+    if service_override:
+        SERVICE = service_override
+
+    transport_override = (args.transport.strip() or os.environ.get("DESKTOP_ASSISTANT_WIDGET_TRANSPORT", "").strip()).lower()
+    if transport_override:
+        if transport_override not in {"ws", "dbus"}:
+            print(json.dumps({"error": f"invalid transport '{transport_override}'"}))
+            return 1
+        TRANSPORT = transport_override
+
+    ws_url_override = args.ws_url.strip() or os.environ.get("DESKTOP_ASSISTANT_WIDGET_WS_URL", "").strip()
+    if ws_url_override:
+        WS_URL = ws_url_override
+
+    ws_subject_override = args.ws_subject.strip() or os.environ.get("DESKTOP_ASSISTANT_WIDGET_WS_SUBJECT", "").strip()
+    if ws_subject_override:
+        WS_SUBJECT = ws_subject_override
+
+    ws_jwt_override = args.ws_jwt.strip() or os.environ.get("DESKTOP_ASSISTANT_WIDGET_WS_JWT", "").strip()
+    if ws_jwt_override:
+        WS_JWT = ws_jwt_override
 
     try:
         if args.command == "ensure":
@@ -770,6 +847,28 @@ def main() -> int:
                 args.interval,
             )
             print(json.dumps({"assistant_reply": content}))
+            return 0
+        if args.command == "connections":
+            serialized_connections = []
+            for connection in connections.values():
+                serialized_connections.append(
+                    {
+                        "name": str(connection.get("name", "")),
+                        "transport": _normalize_transport(str(connection.get("transport", DEFAULT_TRANSPORT))),
+                        "dbus_service": str(connection.get("dbus_service", "")).strip(),
+                        "ws_url": str(connection.get("ws_url", "")).strip(),
+                        "ws_subject": str(connection.get("ws_subject", "")).strip(),
+                    }
+                )
+            print(
+                json.dumps(
+                    {
+                        "selected_connection": CONNECTION_NAME,
+                        "default_connection": default_connection,
+                        "connections": serialized_connections,
+                    }
+                )
+            )
             return 0
         if args.command == "status":
             return cmd_status()

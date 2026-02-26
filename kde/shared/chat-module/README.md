@@ -5,7 +5,7 @@ This module contains shared chat UI and transport helper logic intended for reus
 ## Layout
 
 - `ui/ChatView.qml` — reusable chat view
-- `code/dbus_client.py` — reusable widget transport helper (WebSocket + D-Bus fallback)
+- `code/dbus_client.py` — reusable widget helper with named connection support (`local` D-Bus + named WebSocket remotes)
 - `images/` — shared avatar assets
 
 ## Install location

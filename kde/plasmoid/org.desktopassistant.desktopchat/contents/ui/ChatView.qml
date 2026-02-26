@@ -25,21 +25,10 @@ Item {
     property string helperPath: Qt.resolvedUrl("../code/dbus_client.py").toString().replace("file://", "")
     property string productionService: "org.desktopAssistant"
     property string developmentService: "org.desktopAssistant.Dev"
-    readonly property string defaultWsUrl: "ws://127.0.0.1:11339/ws"
-    readonly property string defaultWsSubject: "desktop-widget"
-    readonly property string activeTransportMode: {
-        const mode = String(Plasmoid.configuration.transportMode || "ws").trim().toLowerCase()
-        return mode === "dbus" ? "dbus" : "ws"
-    }
-    readonly property bool usingWsTransport: activeTransportMode === "ws"
-    readonly property string configuredWsUrl: {
-        const value = String(Plasmoid.configuration.wsUrl || "").trim()
-        return value.length > 0 ? value : defaultWsUrl
-    }
-    readonly property string configuredWsSubject: {
-        const value = String(Plasmoid.configuration.wsSubject || "").trim()
-        return value.length > 0 ? value : defaultWsSubject
-    }
+    readonly property string configuredConnectionName: String(Plasmoid.configuration.connectionName || "").trim()
+    property string runtimeTransportMode: "dbus"
+    readonly property bool usingWsTransport: runtimeTransportMode === "ws"
+    property string activeConnectionName: configuredConnectionName
     property string activeService: productionService
     property bool serviceInitialized: false
     property bool productionServiceRunning: false
@@ -242,11 +231,10 @@ Item {
 
     function helperCommand(commandText) {
         let command = "python3 " + shellEscape(helperPath)
-        command += " --transport " + shellEscape(activeTransportMode)
-        if (usingWsTransport) {
-            command += " --ws-url " + shellEscape(configuredWsUrl)
-            command += " --ws-subject " + shellEscape(configuredWsSubject)
-        } else {
+        if (configuredConnectionName.length > 0) {
+            command += " --connection-name " + shellEscape(configuredConnectionName)
+        }
+        if (!usingWsTransport) {
             command += " --service " + shellEscape(activeService)
         }
         return command + " " + commandText
@@ -399,6 +387,8 @@ Item {
             function(stdout) {
                 try {
                     const payload = JSON.parse(stdout)
+                    runtimeTransportMode = String(payload.transport || "dbus").toLowerCase() === "ws" ? "ws" : "dbus"
+                    activeConnectionName = String(payload.selected_connection || configuredConnectionName || "").trim()
                     productionServiceRunning = !!payload.production_running
                     devServiceRunning = !!payload.dev_running
                     if (payload.default_service && payload.default_service.length > 0) {
@@ -428,15 +418,17 @@ Item {
                         serviceChoices = nextServiceChoices
                     }
 
-                    if (!serviceInitialized) {
+                    if (!serviceInitialized && runtimeTransportMode !== "ws") {
                         loadPersistedService()
                     }
 
-                    if (activeService !== productionService && activeService !== developmentService) {
+                    if (runtimeTransportMode === "ws") {
+                        activeService = productionService
+                    } else if (activeService !== productionService && activeService !== developmentService) {
                         activeService = String(payload.selected_service || productionService)
                     }
 
-                    if (!devServiceRunning && activeService === developmentService) {
+                    if (runtimeTransportMode !== "ws" && !devServiceRunning && activeService === developmentService) {
                         if (!silent) {
                             appendStatus("Development service stopped; switching to production")
                         }
@@ -1250,7 +1242,7 @@ Item {
 
             QQC2.Label {
                 text: root.usingWsTransport
-                    ? "Adele (WS)"
+                    ? (root.activeConnectionName.length > 0 ? "Adele (" + root.activeConnectionName + ")" : "Adele (WS)")
                     : (root.activeService === root.developmentService ? "Adele (Dev)" : "Adele")
                 font.bold: true
                 color: root.themeTextColor

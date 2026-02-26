@@ -45,6 +45,17 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
     }
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -366,26 +377,65 @@ async fn main() -> Result<()> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "org.desktopAssistant".to_string());
+    let dbus_required = env_bool("DESKTOP_ASSISTANT_DBUS_REQUIRED", true);
     tracing::info!("D-Bus well-known name={dbus_service_name}");
+    tracing::info!("D-Bus required={dbus_required}");
 
-    // Set up D-Bus connection
-    let connection = zbus::connection::Builder::session()?
-        .name(dbus_service_name.as_str())?
-        .serve_at(
-            "/org/desktopAssistant/Conversations",
-            DbusConversationAdapter::new(Arc::clone(&conversation_service)),
-        )?
-        .serve_at(
-            "/org/desktopAssistant/Settings",
-            DbusSettingsAdapter::new(Arc::clone(&settings_service)),
-        )?
-        .build()
-        .await?;
-
-    tracing::info!(
-        "D-Bus service registered at {}",
-        connection.unique_name().unwrap()
-    );
+    // Set up D-Bus connection (required by default; optional in headless/container mode).
+    let dbus_connection = match zbus::connection::Builder::session() {
+        Ok(builder) => match builder
+            .name(dbus_service_name.as_str())
+            .and_then(|b| {
+                b.serve_at(
+                    "/org/desktopAssistant/Conversations",
+                    DbusConversationAdapter::new(Arc::clone(&conversation_service)),
+                )
+            })
+            .and_then(|b| {
+                b.serve_at(
+                    "/org/desktopAssistant/Settings",
+                    DbusSettingsAdapter::new(Arc::clone(&settings_service)),
+                )
+            }) {
+            Ok(builder) => match builder.build().await {
+                Ok(connection) => {
+                    if let Some(unique_name) = connection.unique_name() {
+                        tracing::info!("D-Bus service registered at {}", unique_name);
+                    } else {
+                        tracing::info!("D-Bus service registered");
+                    }
+                    Some(connection)
+                }
+                Err(error) => {
+                    if dbus_required {
+                        return Err(error.into());
+                    }
+                    tracing::warn!(
+                        "D-Bus unavailable; continuing without D-Bus API (set DESKTOP_ASSISTANT_DBUS_REQUIRED=true to fail): {error}"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                if dbus_required {
+                    return Err(error.into());
+                }
+                tracing::warn!(
+                    "failed to configure D-Bus interface; continuing without D-Bus API (set DESKTOP_ASSISTANT_DBUS_REQUIRED=true to fail): {error}"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            if dbus_required {
+                return Err(error.into());
+            }
+            tracing::warn!(
+                "failed to connect to session D-Bus; continuing without D-Bus API (set DESKTOP_ASSISTANT_DBUS_REQUIRED=true to fail): {error}"
+            );
+            None
+        }
+    };
 
     // WebSocket API (remote-friendly). Defaults to localhost only.
     let ws_bind = std::env::var("DESKTOP_ASSISTANT_WS_BIND")
@@ -425,6 +475,8 @@ async fn main() -> Result<()> {
     if let Err(e) = ws_task.await {
         tracing::warn!("WebSocket task join error during shutdown: {e}");
     }
+
+    drop(dbus_connection);
 
     Ok(())
 }

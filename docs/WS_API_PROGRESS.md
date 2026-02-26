@@ -122,7 +122,9 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - Added equivalent TUI CLI flags via `clap` (`--transport`, `--ws-url`, `--ws-jwt`, `--ws-subject`) with args taking precedence.
   - Added D-Bus settings JWT bootstrap when WS JWT is not provided.
 - Updated KDE shared widget transport helper:
-  - Default transport is WebSocket (`ws://127.0.0.1:11339/ws`) with configurable D-Bus fallback.
-  - Added helper CLI/env/settings support for `transport`, `ws_url`, `ws_subject`, and optional `ws_jwt`.
+  - Added named connection profile support (`local` D-Bus + named WS remotes) with global default selection.
+  - Added helper CLI/env support for `--connection-name` / `DESKTOP_ASSISTANT_WIDGET_CONNECTION`.
+  - Kept legacy transport overrides (`transport`, `ws_url`, `ws_subject`) for backward compatibility.
   - Added local JWT bootstrap via D-Bus `GenerateWsJwt` when WS token is not explicitly configured.
-  - Added per-widget transport/WS settings in plasmoid config UIs.
+  - Updated widget UIs to select a named connection in per-widget config.
+  - Added KCM Connections tab to manage named profiles + global default.
