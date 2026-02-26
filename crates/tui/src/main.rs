@@ -5,6 +5,7 @@ mod ui;
 mod ws_client;
 
 use std::io;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
@@ -56,6 +57,16 @@ struct CliArgs {
     #[arg(long = "ws-jwt", env = "DESKTOP_ASSISTANT_TUI_WS_JWT")]
     ws_jwt: Option<String>,
     #[arg(
+        long = "ws-login-username",
+        env = "DESKTOP_ASSISTANT_TUI_WS_LOGIN_USERNAME"
+    )]
+    ws_login_username: Option<String>,
+    #[arg(
+        long = "ws-login-password",
+        env = "DESKTOP_ASSISTANT_TUI_WS_LOGIN_PASSWORD"
+    )]
+    ws_login_password: Option<String>,
+    #[arg(
         long = "ws-subject",
         env = "DESKTOP_ASSISTANT_TUI_WS_SUBJECT",
         default_value = DEFAULT_WS_SUBJECT
@@ -68,6 +79,8 @@ struct RuntimeOptions {
     transport_mode: TransportMode,
     ws_url: String,
     ws_jwt: Option<String>,
+    ws_login_username: Option<String>,
+    ws_login_password: Option<String>,
     ws_subject: String,
 }
 
@@ -87,6 +100,16 @@ impl From<CliArgs> for RuntimeOptions {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
+        let ws_login_username = cli
+            .ws_login_username
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let ws_login_password = cli
+            .ws_login_password
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
         let ws_subject = {
             let trimmed = cli.ws_subject.trim();
             if trimmed.is_empty() {
@@ -100,7 +123,100 @@ impl From<CliArgs> for RuntimeOptions {
             transport_mode: cli.transport,
             ws_url,
             ws_jwt,
+            ws_login_username,
+            ws_login_password,
             ws_subject,
+        }
+    }
+}
+
+fn derive_login_url_from_ws_url(ws_url: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(ws_url)
+        .map_err(|error| anyhow::anyhow!("invalid websocket URL '{ws_url}': {error}"))?;
+
+    let next_scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => {
+            return Err(anyhow::anyhow!(
+                "websocket URL must use ws:// or wss:// (got {other}://)"
+            ));
+        }
+    };
+
+    url.set_scheme(next_scheme).map_err(|_| {
+        anyhow::anyhow!("failed to rewrite websocket URL scheme for login endpoint")
+    })?;
+    url.set_path("/login");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+async fn request_ws_login_token(ws_url: &str, username: &str, password: &str) -> Result<String> {
+    let login_url = derive_login_url_from_ws_url(ws_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let response = client
+        .post(login_url)
+        .basic_auth(username, Some(password))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow::anyhow!("remote /login failed with HTTP {}", status));
+        }
+        return Err(anyhow::anyhow!(
+            "remote /login failed with HTTP {}: {}",
+            status,
+            trimmed
+        ));
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| anyhow::anyhow!("invalid /login JSON: {error}"))?;
+    let token = payload
+        .get("token")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if token.is_empty() {
+        return Err(anyhow::anyhow!("/login response did not include token"));
+    }
+    Ok(token.to_string())
+}
+
+async fn resolve_ws_bearer_token(options: &RuntimeOptions) -> Result<String> {
+    if let Some(token) = options.ws_jwt.clone() {
+        return Ok(token);
+    }
+
+    match generate_ws_jwt(&options.ws_subject).await {
+        Ok(token) => Ok(token),
+        Err(dbus_error) => {
+            if let (Some(username), Some(password)) = (
+                options.ws_login_username.as_deref(),
+                options.ws_login_password.as_deref(),
+            ) {
+                match request_ws_login_token(&options.ws_url, username, password).await {
+                    Ok(token) => Ok(token),
+                    Err(login_error) => Err(anyhow::anyhow!(
+                        "failed to obtain websocket token via D-Bus ({dbus_error}); \
+                         fallback /login on websocket host also failed ({login_error})"
+                    )),
+                }
+            } else {
+                Err(anyhow::anyhow!(
+                    "failed to obtain websocket token via D-Bus ({dbus_error}); \
+                     provide --ws-jwt or --ws-login-username/--ws-login-password for /login fallback"
+                ))
+            }
         }
     }
 }
@@ -122,10 +238,7 @@ async fn connect_transport(
             Ok((TransportClient::Dbus(client), signal_rx))
         }
         TransportMode::Ws => {
-            let token = match options.ws_jwt.clone() {
-                Some(token) => token,
-                None => generate_ws_jwt(&options.ws_subject).await?,
-            };
+            let token = resolve_ws_bearer_token(options).await?;
             let (client, signal_rx) = WsClient::connect(&options.ws_url, &token).await?;
             Ok((TransportClient::Ws(client), signal_rx))
         }
@@ -363,6 +476,10 @@ mod tests {
             "wss://example/ws",
             "--ws-jwt",
             "jwt123",
+            "--ws-login-username",
+            "alice",
+            "--ws-login-password",
+            "s3cr3t",
             "--ws-subject",
             "custom-client",
         ]))
@@ -371,6 +488,8 @@ mod tests {
         assert_eq!(parsed.transport, TransportMode::Dbus);
         assert_eq!(parsed.ws_url, "wss://example/ws");
         assert_eq!(parsed.ws_jwt.as_deref(), Some("jwt123"));
+        assert_eq!(parsed.ws_login_username.as_deref(), Some("alice"));
+        assert_eq!(parsed.ws_login_password.as_deref(), Some("s3cr3t"));
         assert_eq!(parsed.ws_subject, "custom-client");
     }
 
@@ -382,6 +501,8 @@ mod tests {
         assert_eq!(options.ws_url, DEFAULT_WS_URL);
         assert_eq!(options.ws_subject, DEFAULT_WS_SUBJECT);
         assert_eq!(options.ws_jwt, None);
+        assert_eq!(options.ws_login_username, None);
+        assert_eq!(options.ws_login_password, None);
     }
 
     #[test]
@@ -392,5 +513,22 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));
+    }
+
+    #[test]
+    fn derive_login_url_rewrites_ws_scheme_and_path() {
+        let url = derive_login_url_from_ws_url("ws://127.0.0.1:11339/ws?x=1#frag").unwrap();
+        assert_eq!(url, "http://127.0.0.1:11339/login");
+
+        let secure = derive_login_url_from_ws_url("wss://daemon.example.com/ws").unwrap();
+        assert_eq!(secure, "https://daemon.example.com/login");
+    }
+
+    #[test]
+    fn derive_login_url_rejects_non_ws_scheme() {
+        let error = derive_login_url_from_ws_url("http://example.com/ws")
+            .err()
+            .expect("non-ws scheme should fail");
+        assert!(error.to_string().contains("ws:// or wss://"));
     }
 }

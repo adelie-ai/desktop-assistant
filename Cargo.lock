@@ -1390,6 +1390,7 @@ dependencies = [
  "desktop-assistant-ws",
  "futures",
  "ratatui",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
