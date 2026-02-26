@@ -1085,6 +1085,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1130,6 +1131,7 @@ name = "desktop-assistant-dbus"
 version = "0.1.0"
 dependencies = [
  "desktop-assistant-core",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

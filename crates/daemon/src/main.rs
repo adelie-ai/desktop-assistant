@@ -23,6 +23,35 @@ use desktop_assistant_ws as ws;
 use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("failed to install Ctrl+C handler: {e}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                let _ = stream.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 /// Enum wrapper to dispatch between LLM backends at runtime.
 ///
 /// `LlmClient` uses `impl Future` returns, so it isn't dyn-compatible.
@@ -353,15 +382,26 @@ async fn main() -> Result<()> {
         Arc::clone(&settings_service),
     ));
 
-    tokio::spawn(async move {
+    let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let ws_task = tokio::spawn(async move {
         tracing::info!("WebSocket listening on {ws_addr} (/ws)");
-        if let Err(e) = ws::serve(api_handler, ws_addr).await {
+        if let Err(e) = ws::serve_with_shutdown(api_handler, ws_addr, async {
+            let _ = ws_shutdown_rx.await;
+        })
+        .await
+        {
             tracing::error!("WebSocket server error: {e}");
         }
     });
 
-    // Run until stopped
-    std::future::pending::<()>().await;
+    // Run until stopped.
+    shutdown_signal().await;
+    tracing::info!("shutdown signal received; stopping services");
+
+    let _ = ws_shutdown_tx.send(());
+    if let Err(e) = ws_task.await {
+        tracing::warn!("WebSocket task join error during shutdown: {e}");
+    }
 
     Ok(())
 }

@@ -15,6 +15,12 @@ pub enum Command {
 
     GetStatus,
 
+    // Canonical transport-level config API
+    GetConfig,
+    SetConfig {
+        changes: ConfigChanges,
+    },
+
     // Conversations
     CreateConversation {
         title: String,
@@ -75,6 +81,7 @@ pub enum CommandResult {
     Pong { value: String },
 
     Status(Status),
+    Config(Config),
 
     ConversationId { id: String },
     Conversations(Vec<ConversationSummary>),
@@ -93,6 +100,10 @@ pub enum CommandResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
+    ConfigChanged {
+        config: Config,
+    },
+
     /// Streaming chunk for a content response.
     AssistantDelta {
         conversation_id: String,
@@ -118,6 +129,39 @@ pub enum Event {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
     pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Config {
+    pub llm: LlmSettingsView,
+    pub embeddings: EmbeddingsSettingsView,
+    pub persistence: PersistenceSettingsView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ConfigChanges {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_connector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embeddings_connector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embeddings_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embeddings_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_remote_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_remote_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_push_on_update: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,5 +250,19 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn command_json_roundtrip_set_config() {
+        let cmd = Command::SetConfig {
+            changes: ConfigChanges {
+                llm_connector: Some("openai".into()),
+                persistence_enabled: Some(true),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
     }
 }

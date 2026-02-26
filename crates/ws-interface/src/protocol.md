@@ -27,3 +27,4 @@ Server -> client frames:
 
 Notes:
 - `SendMessage` returns an immediate `Ack` result and then emits `event` frames for streaming.
+- `SetConfig` returns a `Config` result and then emits `ConfigChanged { config }`.

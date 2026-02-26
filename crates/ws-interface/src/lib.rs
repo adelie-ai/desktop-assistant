@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::{future::Future, future::pending};
 
 use axum::{
     Router,
@@ -13,6 +14,8 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+const WS_OUTBOUND_BUFFER: usize = 64;
+
 /// WebSocket request envelope.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WsRequest {
@@ -21,7 +24,7 @@ pub struct WsRequest {
 }
 
 /// WebSocket frames sent from server to client.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WsFrame {
     Result {
@@ -55,13 +58,13 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsServerState>) ->
 }
 
 struct ChannelSink {
-    tx: mpsc::UnboundedSender<WsFrame>,
+    tx: mpsc::Sender<WsFrame>,
 }
 
 #[async_trait::async_trait]
 impl EventSink for ChannelSink {
-    async fn emit(&self, event: api::Event) {
-        let _ = self.tx.send(WsFrame::Event { event });
+    async fn emit(&self, event: api::Event) -> bool {
+        self.tx.send(WsFrame::Event { event }).await.is_ok()
     }
 }
 
@@ -69,7 +72,7 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Channel for outbound frames (results + events)
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsFrame>();
+    let (out_tx, mut out_rx) = mpsc::channel::<WsFrame>(WS_OUTBOUND_BUFFER);
 
     // Writer task: serialize WsFrame -> ws text message
     let writer = tokio::spawn(async move {
@@ -106,10 +109,16 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
                         let request_id = uuid::Uuid::new_v4().to_string();
                         let sink = Arc::new(ChannelSink { tx: out_tx.clone() });
 
-                        let _ = out_tx.send(WsFrame::Result {
-                            id: req.id.clone(),
-                            result: api::CommandResult::Ack,
-                        });
+                        if out_tx
+                            .send(WsFrame::Result {
+                                id: req.id.clone(),
+                                result: api::CommandResult::Ack,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
 
                         let handler = Arc::clone(&state.handler);
                         tokio::spawn(async move {
@@ -119,23 +128,104 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
                         });
                     }
 
+                    api::Command::SetConfig { changes } => {
+                        let res = state
+                            .handler
+                            .handle_command(api::Command::SetConfig { changes })
+                            .await;
+                        match res {
+                            Ok(api::CommandResult::Config(config)) => {
+                                if out_tx
+                                    .send(WsFrame::Result {
+                                        id: req.id.clone(),
+                                        result: api::CommandResult::Config(config.clone()),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if out_tx
+                                    .send(WsFrame::Event {
+                                        event: api::Event::ConfigChanged { config },
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(result) => {
+                                if out_tx
+                                    .send(WsFrame::Result { id: req.id, result })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(ApiError::Core(e)) => {
+                                if out_tx
+                                    .send(WsFrame::Error {
+                                        id: req.id,
+                                        error: e,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if out_tx
+                                    .send(WsFrame::Error {
+                                        id: req.id,
+                                        error: e.to_string(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     other => {
                         let res = state.handler.handle_command(other).await;
                         match res {
                             Ok(result) => {
-                                let _ = out_tx.send(WsFrame::Result { id: req.id, result });
+                                if out_tx
+                                    .send(WsFrame::Result { id: req.id, result })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(ApiError::Core(e)) => {
-                                let _ = out_tx.send(WsFrame::Error {
-                                    id: req.id,
-                                    error: e,
-                                });
+                                if out_tx
+                                    .send(WsFrame::Error {
+                                        id: req.id,
+                                        error: e,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(e) => {
-                                let _ = out_tx.send(WsFrame::Error {
-                                    id: req.id,
-                                    error: e.to_string(),
-                                });
+                                if out_tx
+                                    .send(WsFrame::Error {
+                                        id: req.id,
+                                        error: e.to_string(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -150,8 +240,21 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
 }
 
 pub async fn serve(handler: Arc<dyn AssistantApiHandler>, bind: SocketAddr) -> anyhow::Result<()> {
+    serve_with_shutdown(handler, bind, pending::<()>()).await
+}
+
+pub async fn serve_with_shutdown<F>(
+    handler: Arc<dyn AssistantApiHandler>,
+    bind: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let app = router(handler);
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }

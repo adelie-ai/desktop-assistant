@@ -38,21 +38,22 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
   - request/reply for non-streaming commands
   - `SendMessage` spawns streaming handler and forwards canonical events
 - [x] Integration tests for WS protocol (connect + ping)
-- [ ] Integration tests for WS protocol (get status)
+- [x] Integration tests for WS protocol (get status)
+- [x] Integration tests for WS protocol (`SendMessage` ACK + streaming events)
 
 ### 4) Wire into daemon
 - [x] Add env/config for WS bind address + port (default localhost): `DESKTOP_ASSISTANT_WS_BIND` (e.g. `127.0.0.1:11339`)
 - [x] Start WS server in daemon main (spawned task)
-- [ ] Ensure clean shutdown
+- [x] Ensure clean shutdown (SIGINT/SIGTERM -> WS graceful shutdown)
 
 ### 5) Config endpoints parity
-- [ ] Define typed config struct (~10 settings)
-- [ ] Implement `GetConfig`/`SetConfig`
-- [ ] Emit `ConfigChanged`
+- [x] Define typed config struct (~10 settings)
+- [x] Implement `GetConfig`/`SetConfig`
+- [x] Emit `ConfigChanged`
 
 ### 6) Chat streaming parity
-- [ ] Implement `SendMessage` streaming (`AssistantDelta`, `AssistantCompleted`)
-- [ ] Backpressure + cancellation
+- [x] Implement `SendMessage` streaming (`AssistantDelta`, `AssistantCompleted`)
+- [x] Backpressure + cancellation
 
 ## Progress log
 
@@ -67,3 +68,34 @@ Expose the same small API surface over **WebSocket** as currently exists/exists 
 - Created branch `feature/ws-api`.
 - Added docs: `docs/API_TRANSPORT.md`.
 - Created this progress tracker.
+
+### 2026-02-26
+- Added WS integration tests for:
+  - `GetStatus` roundtrip
+  - `SendMessage` ACK + `AssistantDelta` + `AssistantCompleted` event sequence
+- Added `serve_with_shutdown(...)` in `crates/ws-interface` using Axum graceful shutdown.
+- Updated daemon main loop to:
+  - wait for `SIGINT` / `SIGTERM`
+  - trigger WS shutdown via oneshot signal
+  - await WS task completion before exiting
+- Added bounded event buffering and disconnect-aware cancellation in WS streaming:
+  - bounded outbound WS frame queue in adapter
+  - bounded chunk queue in application handler
+  - stream callback aborts when queue is full or client sink disconnects
+- Added tests for cancellation:
+  - application unit test (`send_message_cancels_when_sink_disconnects`)
+  - WS integration test (`ws_send_message_cancels_when_client_disconnects`)
+- Added typed transport config model:
+  - `Command::{GetConfig, SetConfig}`
+  - `CommandResult::Config`
+  - `Event::ConfigChanged`
+- Implemented config parity in application handlers:
+  - aggregate `GetConfig` over existing settings ports
+  - apply `SetConfig` partial updates over existing settings ports
+- Added config parity tests:
+  - application tests for `GetConfig` and `SetConfig`
+  - WS integration test for `SetConfig` result + `ConfigChanged` event
+- Added D-Bus config parity follow-up on `org.desktopAssistant.Settings`:
+  - `GetConfig` aggregate method
+  - patch-based `SetConfig(changes)` method
+  - `ConfigChanged` signal emission after successful update

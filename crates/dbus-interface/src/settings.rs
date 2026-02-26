@@ -1,11 +1,86 @@
 use std::sync::Arc;
 
 use desktop_assistant_core::ports::inbound::SettingsService;
+use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
+
+type ConfigTuple = (
+    String,
+    String,
+    String,
+    bool,
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    bool,
+    bool,
+    String,
+    String,
+    bool,
+);
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
+pub struct ConfigPatchArgs {
+    pub set_llm_connector: bool,
+    pub llm_connector: String,
+    pub set_llm_model: bool,
+    pub llm_model: String,
+    pub set_llm_base_url: bool,
+    pub llm_base_url: String,
+    pub set_llm_api_key: bool,
+    pub llm_api_key: String,
+    pub set_embeddings_connector: bool,
+    pub embeddings_connector: String,
+    pub set_embeddings_model: bool,
+    pub embeddings_model: String,
+    pub set_embeddings_base_url: bool,
+    pub embeddings_base_url: String,
+    pub set_persistence_enabled: bool,
+    pub persistence_enabled: bool,
+    pub set_persistence_remote_url: bool,
+    pub persistence_remote_url: String,
+    pub set_persistence_remote_name: bool,
+    pub persistence_remote_name: String,
+    pub set_persistence_push_on_update: bool,
+    pub persistence_push_on_update: bool,
+}
+
+#[derive(Debug, Default)]
+struct ConfigPatch {
+    llm_connector: Option<String>,
+    llm_model: Option<String>,
+    llm_base_url: Option<String>,
+    llm_api_key: Option<String>,
+    embeddings_connector: Option<String>,
+    embeddings_model: Option<String>,
+    embeddings_base_url: Option<String>,
+    persistence_enabled: Option<bool>,
+    persistence_remote_url: Option<String>,
+    persistence_remote_name: Option<String>,
+    persistence_push_on_update: Option<bool>,
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn to_fdo_error<E: ToString>(error: E) -> fdo::Error {
+    fdo::Error::Failed(error.to_string())
+}
 
 /// D-Bus adapter for assistant settings.
 ///
-/// Exposes non-sensitive settings values and a write-only API key method.
+/// Exposes both granular settings methods and transport-level aggregate
+/// config methods (`GetConfig`/`SetConfig`) for API parity.
 pub struct DbusSettingsAdapter<S: SettingsService + 'static> {
     service: Arc<S>,
 }
@@ -13,6 +88,164 @@ pub struct DbusSettingsAdapter<S: SettingsService + 'static> {
 impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     pub fn new(service: Arc<S>) -> Self {
         Self { service }
+    }
+
+    async fn get_config_tuple(&self) -> fdo::Result<ConfigTuple> {
+        let llm = self
+            .service
+            .get_llm_settings()
+            .await
+            .map_err(to_fdo_error)?;
+        let embeddings = self
+            .service
+            .get_embeddings_settings()
+            .await
+            .map_err(to_fdo_error)?;
+        let persistence = self
+            .service
+            .get_persistence_settings()
+            .await
+            .map_err(to_fdo_error)?;
+
+        Ok((
+            llm.connector,
+            llm.model,
+            llm.base_url,
+            llm.has_api_key,
+            embeddings.connector,
+            embeddings.model,
+            embeddings.base_url,
+            embeddings.has_api_key,
+            embeddings.available,
+            embeddings.is_default,
+            persistence.enabled,
+            persistence.remote_url,
+            persistence.remote_name,
+            persistence.push_on_update,
+        ))
+    }
+
+    async fn apply_config_patch(&self, patch: ConfigPatch) -> fdo::Result<ConfigTuple> {
+        let ConfigPatch {
+            llm_connector,
+            llm_model,
+            llm_base_url,
+            llm_api_key,
+            embeddings_connector,
+            embeddings_model,
+            embeddings_base_url,
+            persistence_enabled,
+            persistence_remote_url,
+            persistence_remote_name,
+            persistence_push_on_update,
+        } = patch;
+
+        let llm_changed = llm_connector.is_some() || llm_model.is_some() || llm_base_url.is_some();
+        if llm_changed {
+            let current = self
+                .service
+                .get_llm_settings()
+                .await
+                .map_err(to_fdo_error)?;
+            let llm_model_set = llm_model.is_some();
+            let llm_base_url_set = llm_base_url.is_some();
+
+            let connector =
+                normalize_optional_string(llm_connector).unwrap_or_else(|| current.connector);
+            let model = if llm_model_set {
+                normalize_optional_string(llm_model)
+            } else {
+                Some(current.model)
+            };
+            let base_url = if llm_base_url_set {
+                normalize_optional_string(llm_base_url)
+            } else {
+                Some(current.base_url)
+            };
+
+            self.service
+                .set_llm_settings(connector, model, base_url)
+                .await
+                .map_err(to_fdo_error)?;
+        }
+
+        if let Some(api_key) = normalize_optional_string(llm_api_key) {
+            self.service
+                .set_api_key(api_key)
+                .await
+                .map_err(to_fdo_error)?;
+        }
+
+        let embeddings_changed = embeddings_connector.is_some()
+            || embeddings_model.is_some()
+            || embeddings_base_url.is_some();
+        if embeddings_changed {
+            let current = self
+                .service
+                .get_embeddings_settings()
+                .await
+                .map_err(to_fdo_error)?;
+            let embeddings_connector_set = embeddings_connector.is_some();
+            let embeddings_model_set = embeddings_model.is_some();
+            let embeddings_base_url_set = embeddings_base_url.is_some();
+
+            let connector = if embeddings_connector_set {
+                normalize_optional_string(embeddings_connector)
+            } else if current.is_default {
+                None
+            } else {
+                Some(current.connector)
+            };
+            let model = if embeddings_model_set {
+                normalize_optional_string(embeddings_model)
+            } else {
+                Some(current.model)
+            };
+            let base_url = if embeddings_base_url_set {
+                normalize_optional_string(embeddings_base_url)
+            } else {
+                Some(current.base_url)
+            };
+
+            self.service
+                .set_embeddings_settings(connector, model, base_url)
+                .await
+                .map_err(to_fdo_error)?;
+        }
+
+        let persistence_changed = persistence_enabled.is_some()
+            || persistence_remote_url.is_some()
+            || persistence_remote_name.is_some()
+            || persistence_push_on_update.is_some();
+        if persistence_changed {
+            let current = self
+                .service
+                .get_persistence_settings()
+                .await
+                .map_err(to_fdo_error)?;
+            let persistence_remote_url_set = persistence_remote_url.is_some();
+            let persistence_remote_name_set = persistence_remote_name.is_some();
+
+            let enabled = persistence_enabled.unwrap_or(current.enabled);
+            let remote_url = if persistence_remote_url_set {
+                normalize_optional_string(persistence_remote_url)
+            } else {
+                Some(current.remote_url)
+            };
+            let remote_name = if persistence_remote_name_set {
+                normalize_optional_string(persistence_remote_name)
+            } else {
+                Some(current.remote_name)
+            };
+            let push_on_update = persistence_push_on_update.unwrap_or(current.push_on_update);
+
+            self.service
+                .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
+                .await
+                .map_err(to_fdo_error)?;
+        }
+
+        self.get_config_tuple().await
     }
 }
 
@@ -24,7 +257,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .service
             .get_llm_settings()
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            .map_err(to_fdo_error)?;
 
         Ok((
             settings.connector,
@@ -56,7 +289,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         self.service
             .set_llm_settings(connector.to_string(), model, base_url)
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+            .map_err(to_fdo_error)
     }
 
     /// Write API key to configured secret backend.
@@ -66,7 +299,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         self.service
             .set_api_key(api_key.to_string())
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+            .map_err(to_fdo_error)
     }
 
     /// Return resolved embeddings settings.
@@ -79,7 +312,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .service
             .get_embeddings_settings()
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            .map_err(to_fdo_error)?;
 
         Ok((
             settings.connector,
@@ -119,7 +352,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         self.service
             .set_embeddings_settings(connector, model, base_url)
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+            .map_err(to_fdo_error)
     }
 
     /// Return connector defaults.
@@ -133,7 +366,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .service
             .get_connector_defaults(connector.to_string())
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            .map_err(to_fdo_error)?;
 
         Ok((
             defaults.llm_model,
@@ -152,7 +385,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .service
             .get_persistence_settings()
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            .map_err(to_fdo_error)?;
 
         Ok((
             settings.enabled,
@@ -185,8 +418,130 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         self.service
             .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
             .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+            .map_err(to_fdo_error)
     }
+
+    /// Return aggregate config tuple:
+    /// (llm_connector, llm_model, llm_base_url, llm_has_api_key,
+    ///  embeddings_connector, embeddings_model, embeddings_base_url, embeddings_has_api_key, embeddings_available, embeddings_is_default,
+    ///  persistence_enabled, persistence_remote_url, persistence_remote_name, persistence_push_on_update)
+    async fn get_config(&self) -> fdo::Result<ConfigTuple> {
+        self.get_config_tuple().await
+    }
+
+    /// Apply a partial aggregate config update and emit `ConfigChanged`.
+    ///
+    /// For each string field, set `changes.set_* = true` to apply the provided value.
+    /// Passing an empty string with `set_* = true` clears optional fields where supported.
+    async fn set_config(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        changes: ConfigPatchArgs,
+    ) -> fdo::Result<ConfigTuple> {
+        let ConfigPatchArgs {
+            set_llm_connector,
+            llm_connector,
+            set_llm_model,
+            llm_model,
+            set_llm_base_url,
+            llm_base_url,
+            set_llm_api_key,
+            llm_api_key,
+            set_embeddings_connector,
+            embeddings_connector,
+            set_embeddings_model,
+            embeddings_model,
+            set_embeddings_base_url,
+            embeddings_base_url,
+            set_persistence_enabled,
+            persistence_enabled,
+            set_persistence_remote_url,
+            persistence_remote_url,
+            set_persistence_remote_name,
+            persistence_remote_name,
+            set_persistence_push_on_update,
+            persistence_push_on_update,
+        } = changes;
+
+        let updated = self
+            .apply_config_patch(ConfigPatch {
+                llm_connector: set_llm_connector.then_some(llm_connector),
+                llm_model: set_llm_model.then_some(llm_model),
+                llm_base_url: set_llm_base_url.then_some(llm_base_url),
+                llm_api_key: set_llm_api_key.then_some(llm_api_key),
+                embeddings_connector: set_embeddings_connector.then_some(embeddings_connector),
+                embeddings_model: set_embeddings_model.then_some(embeddings_model),
+                embeddings_base_url: set_embeddings_base_url.then_some(embeddings_base_url),
+                persistence_enabled: set_persistence_enabled.then_some(persistence_enabled),
+                persistence_remote_url: set_persistence_remote_url
+                    .then_some(persistence_remote_url),
+                persistence_remote_name: set_persistence_remote_name
+                    .then_some(persistence_remote_name),
+                persistence_push_on_update: set_persistence_push_on_update
+                    .then_some(persistence_push_on_update),
+            })
+            .await?;
+
+        let emitter = emitter.to_owned();
+        let (
+            cfg_llm_connector,
+            cfg_llm_model,
+            cfg_llm_base_url,
+            cfg_llm_has_api_key,
+            cfg_embeddings_connector,
+            cfg_embeddings_model,
+            cfg_embeddings_base_url,
+            cfg_embeddings_has_api_key,
+            cfg_embeddings_available,
+            cfg_embeddings_is_default,
+            cfg_persistence_enabled,
+            cfg_persistence_remote_url,
+            cfg_persistence_remote_name,
+            cfg_persistence_push_on_update,
+        ) = updated.clone();
+
+        Self::config_changed(
+            &emitter,
+            &cfg_llm_connector,
+            &cfg_llm_model,
+            &cfg_llm_base_url,
+            cfg_llm_has_api_key,
+            &cfg_embeddings_connector,
+            &cfg_embeddings_model,
+            &cfg_embeddings_base_url,
+            cfg_embeddings_has_api_key,
+            cfg_embeddings_available,
+            cfg_embeddings_is_default,
+            cfg_persistence_enabled,
+            &cfg_persistence_remote_url,
+            &cfg_persistence_remote_name,
+            cfg_persistence_push_on_update,
+        )
+        .await
+        .map_err(to_fdo_error)?;
+
+        Ok(updated)
+    }
+
+    /// Signal emitted after a successful aggregate config update.
+    #[zbus(signal)]
+    async fn config_changed(
+        emitter: &SignalEmitter<'_>,
+        llm_connector: &str,
+        llm_model: &str,
+        llm_base_url: &str,
+        llm_has_api_key: bool,
+        embeddings_connector: &str,
+        embeddings_model: &str,
+        embeddings_base_url: &str,
+        embeddings_has_api_key: bool,
+        embeddings_available: bool,
+        embeddings_is_default: bool,
+        persistence_enabled: bool,
+        persistence_remote_url: &str,
+        persistence_remote_name: &str,
+        persistence_push_on_update: bool,
+    ) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -197,49 +552,102 @@ mod tests {
         ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
         SettingsService,
     };
+    use std::sync::Mutex;
 
-    struct FakeSettingsService;
+    #[derive(Clone)]
+    struct SettingsState {
+        llm: LlmSettingsView,
+        embeddings: EmbeddingsSettingsView,
+        persistence: PersistenceSettingsView,
+        api_key_set: bool,
+    }
 
-    impl SettingsService for FakeSettingsService {
+    struct StatefulSettingsService {
+        state: Mutex<SettingsState>,
+    }
+
+    impl StatefulSettingsService {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(SettingsState {
+                    llm: LlmSettingsView {
+                        connector: "openai".to_string(),
+                        model: "gpt-5.2".to_string(),
+                        base_url: "https://api.openai.com/v1".to_string(),
+                        has_api_key: false,
+                    },
+                    embeddings: EmbeddingsSettingsView {
+                        connector: "openai".to_string(),
+                        model: "text-embedding-3-small".to_string(),
+                        base_url: "https://api.openai.com/v1".to_string(),
+                        has_api_key: false,
+                        available: true,
+                        is_default: true,
+                    },
+                    persistence: PersistenceSettingsView {
+                        enabled: false,
+                        remote_url: String::new(),
+                        remote_name: "origin".to_string(),
+                        push_on_update: true,
+                    },
+                    api_key_set: false,
+                }),
+            }
+        }
+    }
+
+    impl SettingsService for StatefulSettingsService {
         async fn get_llm_settings(&self) -> Result<LlmSettingsView, CoreError> {
-            Ok(LlmSettingsView {
-                connector: "openai".to_string(),
-                model: "gpt-5.2".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                has_api_key: true,
-            })
+            Ok(self.state.lock().unwrap().llm.clone())
         }
 
         async fn set_llm_settings(
             &self,
-            _connector: String,
-            _model: Option<String>,
-            _base_url: Option<String>,
+            connector: String,
+            model: Option<String>,
+            base_url: Option<String>,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            state.llm.connector = connector;
+            if let Some(model) = model {
+                state.llm.model = model;
+            }
+            if let Some(base_url) = base_url {
+                state.llm.base_url = base_url;
+            }
             Ok(())
         }
 
         async fn set_api_key(&self, _api_key: String) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            state.api_key_set = true;
+            state.llm.has_api_key = true;
             Ok(())
         }
 
         async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
-            Ok(EmbeddingsSettingsView {
-                connector: "ollama".to_string(),
-                model: "nomic-embed-text".to_string(),
-                base_url: "http://localhost:11434".to_string(),
-                has_api_key: false,
-                available: true,
-                is_default: true,
-            })
+            Ok(self.state.lock().unwrap().embeddings.clone())
         }
 
         async fn set_embeddings_settings(
             &self,
-            _connector: Option<String>,
-            _model: Option<String>,
-            _base_url: Option<String>,
+            connector: Option<String>,
+            model: Option<String>,
+            base_url: Option<String>,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(connector) = connector {
+                state.embeddings.connector = connector;
+                state.embeddings.is_default = false;
+            } else {
+                state.embeddings.is_default = true;
+            }
+            if let Some(model) = model {
+                state.embeddings.model = model;
+            }
+            if let Some(base_url) = base_url {
+                state.embeddings.base_url = base_url;
+            }
             Ok(())
         }
 
@@ -257,28 +665,73 @@ mod tests {
         }
 
         async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-            Ok(PersistenceSettingsView {
-                enabled: false,
-                remote_url: String::new(),
-                remote_name: "origin".to_string(),
-                push_on_update: true,
-            })
+            Ok(self.state.lock().unwrap().persistence.clone())
         }
 
         async fn set_persistence_settings(
             &self,
-            _enabled: bool,
-            _remote_url: Option<String>,
-            _remote_name: Option<String>,
-            _push_on_update: bool,
+            enabled: bool,
+            remote_url: Option<String>,
+            remote_name: Option<String>,
+            push_on_update: bool,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            state.persistence.enabled = enabled;
+            if let Some(remote_url) = remote_url {
+                state.persistence.remote_url = remote_url;
+            }
+            if let Some(remote_name) = remote_name {
+                state.persistence.remote_name = remote_name;
+            }
+            state.persistence.push_on_update = push_on_update;
             Ok(())
         }
     }
 
     #[test]
     fn adapter_construction() {
-        let service = Arc::new(FakeSettingsService);
+        let service = Arc::new(StatefulSettingsService::new());
         let _adapter = DbusSettingsAdapter::new(service);
+    }
+
+    #[tokio::test]
+    async fn get_config_tuple_aggregates_settings() {
+        let service = Arc::new(StatefulSettingsService::new());
+        let adapter = DbusSettingsAdapter::new(service);
+        let config = adapter.get_config_tuple().await.unwrap();
+
+        assert_eq!(config.0, "openai");
+        assert_eq!(config.5, "text-embedding-3-small");
+        assert_eq!(config.12, "origin");
+    }
+
+    #[tokio::test]
+    async fn apply_config_patch_updates_config_and_api_key() {
+        let service = Arc::new(StatefulSettingsService::new());
+        let adapter = DbusSettingsAdapter::new(Arc::clone(&service));
+
+        let updated = adapter
+            .apply_config_patch(ConfigPatch {
+                llm_connector: Some("ollama".into()),
+                llm_model: Some("llama3.1:8b".into()),
+                llm_base_url: Some("http://localhost:11434".into()),
+                llm_api_key: Some("secret".into()),
+                persistence_enabled: Some(true),
+                persistence_remote_url: Some("git@example.com/repo.git".into()),
+                persistence_remote_name: Some("upstream".into()),
+                persistence_push_on_update: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(updated.0, "ollama");
+        assert_eq!(updated.1, "llama3.1:8b");
+        assert!(updated.3);
+        assert!(updated.10);
+        assert_eq!(updated.12, "upstream");
+        assert!(!updated.13);
+
+        assert!(service.state.lock().unwrap().api_key_set);
     }
 }

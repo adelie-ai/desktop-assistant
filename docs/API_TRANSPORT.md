@@ -21,12 +21,12 @@ This mirrors the Ports & Adapters approach in `AGENTS.md`.
 - `Ping`
 - `GetStatus`
 - `SendMessage { conversation_id?, content }` (streaming response)
-- `GetConfig { keys? }`
+- `GetConfig`
 - `SetConfig { changes }`
 
 ### Events
 - `StatusChanged(Status)`
-- `ConfigChanged { changes }`
+- `ConfigChanged { config }`
 - `MessageStarted { message_id, role }` (optional)
 - `AssistantDelta { request_id, chunk }`
 - `AssistantCompleted { request_id, full_response }`
@@ -35,7 +35,7 @@ This mirrors the Ports & Adapters approach in `AGENTS.md`.
 ## Config
 Settings are expected to be small in number (~10). Prefer a **typed config struct** for v1:
 - `GetConfig -> Config`
-- `SetConfig(PartialConfig) -> Config`
+- `SetConfig(ConfigChanges) -> Config`
 
 If settings later grow significantly, introduce `ListConfigSchema` and move to a registry-based key/value system.
 

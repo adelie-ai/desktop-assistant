@@ -29,12 +29,18 @@ Interface: `org.desktopAssistant.Settings`
   - Empty `connector` clears the override and reverts to defaulting from the LLM connector
 - `GetConnectorDefaults(connector: s) -> (llm_model: s, llm_base_url: s, embeddings_model: s, embeddings_base_url: s, embeddings_available: b)`
   - Returns provider defaults for the requested connector (empty `connector` resolves to the default connector)
+- `GetConfig() -> (llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b, persistence_enabled: b, persistence_remote_url: s, persistence_remote_name: s, persistence_push_on_update: b)`
+- `SetConfig(changes: ConfigPatchArgs) -> same tuple as GetConfig`
+  - `ConfigPatchArgs` is a struct of `(set_*, value)` pairs so callers can change only selected fields.
+  - String values are only applied when their corresponding `set_*` flag is `true`.
+  - For optional string fields, passing an empty string with `set_* = true` clears the field where supported.
 
 ## Signals
 
 - `ResponseChunk(conversation_id: s, request_id: s, chunk: s)`
 - `ResponseComplete(conversation_id: s, request_id: s, full_response: s)`
 - `ResponseError(conversation_id: s, request_id: s, error: s)`
+- `ConfigChanged(llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b, persistence_enabled: b, persistence_remote_url: s, persistence_remote_name: s, persistence_push_on_update: b)`
 
 ## Quick `busctl` examples
 
