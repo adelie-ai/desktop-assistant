@@ -221,7 +221,16 @@ kcm-install:
 
 # Install KDE System Settings KCM into system paths (requires sudo)
 kcm-install-system:
-    cmake -S {{kcm_dir}} -B build/kde-kcm-system -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DKDE_INSTALL_PLUGINDIR=/usr/lib64/qt6/plugins
+    plugin_dir="/usr/lib64/qt6/plugins"; \
+    if [ -f /etc/os-release ]; then \
+        . /etc/os-release; \
+        os_id="${ID:-}"; \
+        os_like="${ID_LIKE:-}"; \
+        if [ "$os_id" = "cachyos" ] || [ "$os_id" = "arch" ] || [[ "$os_like" == *"arch"* ]]; then \
+            plugin_dir="/usr/lib/qt6/plugins"; \
+        fi; \
+    fi; \
+    cmake -S {{kcm_dir}} -B build/kde-kcm-system -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DKDE_INSTALL_PLUGINDIR="$plugin_dir"
     cmake --build build/kde-kcm-system
     sudo cmake --install build/kde-kcm-system
     sudo rm -f /usr/share/kservices5/kcm_desktopassistant_service.desktop
