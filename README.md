@@ -74,8 +74,50 @@ Quick provider privacy + setup links: [docs/cloud-providers.md](docs/cloud-provi
 
 - Rust (stable, edition 2024)
 - Linux session D-Bus (`DBUS_SESSION_BUS_ADDRESS` available)
+- PostgreSQL with the `pgvector` extension (see below)
 - For cloud connectors, connector credentials (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or AWS credentials for Bedrock)
 - Optional MCP servers (for tools)
+
+### PostgreSQL setup
+
+The daemon requires a PostgreSQL database for knowledge base storage, tool registry, and conversation history. The `pgvector` extension is required for embedding-based search.
+
+1. Install PostgreSQL and pgvector:
+
+```bash
+# Debian/Ubuntu
+sudo apt install postgresql postgresql-contrib postgresql-16-pgvector
+
+# Fedora
+sudo dnf install postgresql-server postgresql-contrib pgvector_16
+
+# Arch
+sudo pacman -S postgresql postgresql-libs
+yay -S pgvector  # or install from AUR
+```
+
+2. Create a database and user:
+
+```sql
+CREATE USER desktop_assistant WITH PASSWORD 'your_password_here';
+CREATE DATABASE desktop_assistant OWNER desktop_assistant;
+```
+
+3. Enable the vector extension in the database:
+
+```sql
+\c desktop_assistant
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+4. Configure the connection in `daemon.toml`:
+
+```toml
+[database]
+url = "postgres://desktop_assistant:your_password_here@localhost/desktop_assistant"
+```
+
+The daemon runs migrations automatically on startup.
 
 ## Quick Start
 
@@ -170,27 +212,6 @@ args    = ["serve", "--mode", "stdio"]
 Each `[[servers]]` entry requires a `name` (used in logs) and a `command` (must be on `$PATH`). `args` is optional.
 
 See [docs/mcp-services.md](docs/mcp-services.md) for the full server list and configuration reference.
-
-### 3b) (Optional) Git persistence for memories/preferences
-
-To version built-in memory and preferences locally, enable git persistence:
-
-```toml
-[persistence.git]
-enabled = true
-```
-
-With this mode, updates are committed to a git repo in your assistant data directory (`$XDG_DATA_HOME/desktop-assistant`, or `~/.local/share/desktop-assistant`).
-
-To also push each update to a remote backup:
-
-```toml
-[persistence.git]
-enabled = true
-remote_url = "git@github.com:you/assistant-memory.git"
-remote_name = "origin"
-push_on_update = true
-```
 
 ### 4) Run daemon
 
@@ -465,28 +486,20 @@ require a working `snapd`/`core24` runtime that is not reliable inside Docker/Po
 - [Development Guide](docs/development.md)
 - [Cloud Providers](docs/cloud-providers.md)
 
-## Built-in Memory Tools
+## Built-in Tools
 
-The daemon now includes built-in in-process tools exposed through the MCP executor, even when no external MCP servers are configured:
+The daemon includes built-in tools that are always available, even without external MCP servers:
 
-- Preferences:
-	- `builtin_preferences_remember`
-	- `builtin_preferences_search`
-	- `builtin_preferences_retrieve`
-- Factual memory:
-	- `builtin_memory_remember`
-	- `builtin_memory_search`
-	- `builtin_memory_retrieve`
-	- `builtin_memory_update`
+- **Knowledge base** (unified storage for preferences, memories, and project context):
+	- `builtin_knowledge_base_write` — store or update an entry
+	- `builtin_knowledge_base_search` — hybrid vector + full-text search
+	- `builtin_knowledge_base_delete` — remove an entry by ID
+- **Tool discovery**:
+	- `builtin_tool_search` — search for additional tools by description; matched tools are automatically activated for the conversation
+- **System context**:
+	- `builtin_sys_props` — returns date/time, user, hostname, OS, and directory info
 
-Storage paths:
-
-- Preferences:
-	- `$XDG_DATA_HOME/desktop-assistant/preferences.json`, or
-	- `~/.local/share/desktop-assistant/preferences.json` when `XDG_DATA_HOME` is unset.
-- Factual memory:
-	- `$XDG_DATA_HOME/desktop-assistant/factual_memory.json`, or
-	- `~/.local/share/desktop-assistant/factual_memory.json` when `XDG_DATA_HOME` is unset.
+Knowledge base data is stored in PostgreSQL (requires database configuration, see [PostgreSQL setup](#postgresql-setup) above). Tool embeddings enable semantic search over both knowledge entries and registered tool descriptions.
 
 ## Notes
 
@@ -497,9 +510,7 @@ Storage paths:
 	- `~/.config/desktop-assistant/daemon.toml` if `XDG_CONFIG_HOME` is unset.
 - Secret backend default is `auto` (local file store first, then systemd credentials, then keyrings).
 - KDE Wallet remains supported via `llm.secret.backend = "kwallet"` in `daemon.toml`.
-- Conversations persist across daemon restarts in:
-	- `$XDG_DATA_HOME/desktop-assistant/conversations.json`, or
-	- `~/.local/share/desktop-assistant/conversations.json` if `XDG_DATA_HOME` is unset.
+- Conversations, knowledge base entries, and tool registry data persist in PostgreSQL across daemon restarts.
 
 ## License
 

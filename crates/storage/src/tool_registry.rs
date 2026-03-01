@@ -107,8 +107,8 @@ impl ToolRegistryStore for PgToolRegistryStore {
                 SELECT COALESCE(v.name, t.name) AS name,
                        COALESCE(v.description, t.description) AS description,
                        COALESCE(v.parameters, t.parameters) AS parameters,
-                       COALESCE(1.0 / (60 + v.rank_v), 0) +
-                       COALESCE(1.0 / (60 + t.rank_t), 0) AS rrf_score
+                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
+                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
                 FROM vector_ranked v
                 FULL OUTER JOIN text_ranked t ON v.name = t.name
             )

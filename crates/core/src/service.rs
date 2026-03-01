@@ -637,12 +637,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
             // Execute each tool call and append results
             for tool_call in &response.tool_calls {
-                tracing::info!("executing tool: {}", tool_call.name);
                 let arguments: serde_json::Value =
                     serde_json::from_str(&tool_call.arguments).unwrap_or_default();
+                tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
                 let result = match self.tools.execute_tool(&tool_call.name, arguments).await {
-                    Ok(output) => output,
-                    Err(e) => format!("Error: {e}"),
+                    Ok(output) => {
+                        tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
+                        output
+                    }
+                    Err(e) => {
+                        tracing::warn!(tool = %tool_call.name, error = %e, "tool execution failed");
+                        format!("Error: {e}")
+                    }
                 };
 
                 // Dynamic activation: if tool_search returned results,

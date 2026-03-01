@@ -283,6 +283,8 @@ impl BuiltinToolService {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(10) as usize;
 
+        tracing::info!(query = %query, ?tags, limit, "knowledge base search");
+
         let query_embedding = self.embed_text(&query).await.unwrap_or_default();
 
         let results = search_fn(query, query_embedding, tags, limit).await?;
@@ -299,6 +301,9 @@ impl BuiltinToolService {
                 })
             })
             .collect();
+
+        tracing::info!(result_count = items.len(), "knowledge base search results");
+        tracing::debug!(results = %serde_json::to_string(&items).unwrap_or_default(), "knowledge base search response");
 
         Ok(serde_json::json!({
             "ok": true,
@@ -328,6 +333,8 @@ impl BuiltinToolService {
         })?;
 
         let query = required_string(&arguments, "query")?;
+        tracing::info!(query = %query, "tool search");
+
         let query_embedding = self.embed_text(&query).await.unwrap_or_default();
 
         let results = search_fn(query, query_embedding, 10).await?;
@@ -341,6 +348,9 @@ impl BuiltinToolService {
                 })
             })
             .collect();
+
+        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        tracing::info!(result_count = tools.len(), ?tool_names, "tool search results");
 
         Ok(serde_json::json!({
             "ok": true,

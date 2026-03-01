@@ -85,8 +85,8 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                        COALESCE(v.metadata, t.metadata) AS metadata,
                        COALESCE(v.created_at, t.created_at) AS created_at,
                        COALESCE(v.updated_at, t.updated_at) AS updated_at,
-                       COALESCE(1.0 / (60 + v.rank_v), 0) +
-                       COALESCE(1.0 / (60 + t.rank_t), 0) AS rrf_score
+                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
+                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
                 FROM vector_ranked v
                 FULL OUTER JOIN text_ranked t ON v.id = t.id
             )
