@@ -1,5 +1,6 @@
 pub mod pool;
 pub mod conversation;
+pub mod embedding_backfill;
 pub mod knowledge;
 pub mod migrate_json;
 pub mod tool_registry;

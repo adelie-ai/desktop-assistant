@@ -15,6 +15,7 @@ pub trait ToolRegistryStore: Send + Sync {
         source: &str,
         is_core: bool,
         embeddings: Vec<Option<Vec<f32>>>,
+        embedding_model: Option<String>,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
     /// Remove all tool definitions registered by a given source.
@@ -76,6 +77,7 @@ mod tests {
             _source: &str,
             _is_core: bool,
             _embeddings: Vec<Option<Vec<f32>>>,
+            _embedding_model: Option<String>,
         ) -> Result<(), CoreError> {
             Ok(())
         }

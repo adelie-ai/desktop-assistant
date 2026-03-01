@@ -305,6 +305,14 @@ impl McpToolExecutor {
         entries
     }
 
+    /// Return all MCP (non-builtin) tool definitions.
+    pub async fn all_mcp_tools(&self) -> Vec<ToolDefinition> {
+        if let Err(e) = self.maybe_refresh_metadata().await {
+            tracing::warn!("failed to refresh MCP tools cache: {e}");
+        }
+        self.cached_tools.lock().await.clone()
+    }
+
     /// Shut down all connected MCP servers.
     pub async fn shutdown(self) {
         let mut clients = self.clients.lock().await;
@@ -318,19 +326,33 @@ impl McpToolExecutor {
 
 impl ToolExecutor for McpToolExecutor {
     async fn core_tools(&self) -> Vec<ToolDefinition> {
-        // For now, return all tools (builtin + MCP).
-        // Once tool_registry is wired, this will return only is_core=true tools.
+        // Only return builtin tools as core. MCP tools are discovered
+        // dynamically via builtin_tool_search to avoid bloating every
+        // request with dozens of tool definitions.
+        self.builtin_tools.tool_definitions()
+    }
+
+    async fn search_tools(&self, query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
         if let Err(e) = self.maybe_refresh_metadata().await {
             tracing::warn!("failed to refresh MCP tools cache: {e}");
         }
-        let mut tools = self.cached_tools.lock().await.clone();
-        tools.extend(self.builtin_tools.tool_definitions());
-        tools
-    }
+        let cached = self.cached_tools.lock().await;
+        let query_lower = query.to_lowercase();
+        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
 
-    async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
-        // Will be backed by PgToolRegistryStore once wired in Phase 6.
-        Ok(vec![])
+        let results: Vec<ToolDefinition> = cached
+            .iter()
+            .filter(|tool| {
+                let name = tool.name.to_lowercase();
+                let desc = tool.description.to_lowercase();
+                keywords
+                    .iter()
+                    .any(|kw| name.contains(kw) || desc.contains(kw))
+            })
+            .cloned()
+            .collect();
+
+        Ok(results)
     }
 
     async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {

@@ -21,6 +21,7 @@ impl ToolRegistryStore for PgToolRegistryStore {
         source: &str,
         is_core: bool,
         embeddings: Vec<Option<Vec<f32>>>,
+        embedding_model: Option<String>,
     ) -> Result<(), CoreError> {
         let mut tx = self.pool.begin().await.map_err(|e| CoreError::Storage(e.to_string()))?;
 
@@ -28,14 +29,15 @@ impl ToolRegistryStore for PgToolRegistryStore {
             let embedding_vec = embeddings.get(i).and_then(|e| e.clone()).map(Vector::from);
 
             sqlx::query(
-                "INSERT INTO tool_definitions (name, description, parameters, source, is_core, embedding)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                "INSERT INTO tool_definitions (name, description, parameters, source, is_core, embedding, embedding_model)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (name) DO UPDATE
                     SET description = EXCLUDED.description,
                         parameters = EXCLUDED.parameters,
                         source = EXCLUDED.source,
                         is_core = EXCLUDED.is_core,
                         embedding = EXCLUDED.embedding,
+                        embedding_model = EXCLUDED.embedding_model,
                         registered_at = NOW()"
             )
             .bind(&tool.name)
@@ -44,6 +46,7 @@ impl ToolRegistryStore for PgToolRegistryStore {
             .bind(source)
             .bind(is_core)
             .bind(embedding_vec)
+            .bind(&embedding_model)
             .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;

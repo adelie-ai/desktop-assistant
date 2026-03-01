@@ -160,7 +160,7 @@ pub async fn migrate_knowledge(
                 }
 
                 let entry = KnowledgeEntry::new(&id, &prose, tags);
-                if let Err(e) = kb_store.write(entry, pref.embedding).await {
+                if let Err(e) = kb_store.write(entry, pref.embedding, None).await {
                     tracing::warn!("failed to migrate preference '{}': {e}", pref.key);
                 } else {
                     count += 1;
@@ -210,7 +210,7 @@ pub async fn migrate_knowledge(
                 let mut entry = KnowledgeEntry::new(&mem.id, &mem.fact, tags);
                 entry.metadata = serde_json::Value::Object(metadata);
 
-                if let Err(e) = kb_store.write(entry, mem.embedding).await {
+                if let Err(e) = kb_store.write(entry, mem.embedding, None).await {
                     tracing::warn!("failed to migrate memory '{}': {e}", mem.id);
                 } else {
                     count += 1;

@@ -64,5 +64,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         tracing::warn!("could not create indexes: {e}");
     }
 
+    // Track which embedding model produced each vector.
+    if let Err(e) =
+        sqlx::raw_sql(include_str!("../migrations/004_embedding_model_tracking.sql"))
+            .execute(pool)
+            .await
+    {
+        tracing::warn!("could not apply embedding model tracking migration: {e}");
+    }
+
     Ok(())
 }

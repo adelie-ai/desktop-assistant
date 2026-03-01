@@ -12,6 +12,7 @@ pub trait KnowledgeBaseStore: Send + Sync {
         &self,
         entry: KnowledgeEntry,
         embedding: Option<Vec<f32>>,
+        embedding_model: Option<String>,
     ) -> impl Future<Output = Result<KnowledgeEntry, CoreError>> + Send;
 
     /// Hybrid search combining vector similarity and full-text search via RRF.
@@ -75,6 +76,7 @@ mod tests {
             &self,
             entry: KnowledgeEntry,
             _embedding: Option<Vec<f32>>,
+            _embedding_model: Option<String>,
         ) -> Result<KnowledgeEntry, CoreError> {
             Ok(entry)
         }
@@ -102,7 +104,7 @@ mod tests {
     async fn mock_knowledge_store_write_returns_entry() {
         let store = MockKnowledgeStore;
         let entry = KnowledgeEntry::new("kb-1", "test", vec![]);
-        let result = store.write(entry, None).await.unwrap();
+        let result = store.write(entry, None, None).await.unwrap();
         assert_eq!(result.id, "kb-1");
     }
 

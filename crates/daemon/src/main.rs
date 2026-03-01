@@ -537,11 +537,17 @@ async fn main() -> Result<()> {
         let kb_w = Arc::clone(kb);
         let kb_s = Arc::clone(kb);
         let kb_d = Arc::clone(kb);
+        let kb_emb_model = resolved_emb.model.clone();
         use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
         builtin_tools = builtin_tools.with_knowledge_base(
             Arc::new(move |entry, embedding| {
                 let store = Arc::clone(&kb_w);
-                Box::pin(async move { store.write(entry, embedding).await })
+                let model = if embedding.is_some() {
+                    Some(kb_emb_model.clone())
+                } else {
+                    None
+                };
+                Box::pin(async move { store.write(entry, embedding, model).await })
             }),
             Arc::new(move |query, embedding, tags, limit| {
                 let store = Arc::clone(&kb_s);
@@ -601,22 +607,70 @@ async fn main() -> Result<()> {
             .filter(|t| t.name.starts_with("builtin_"))
             .collect();
         let builtin_embeddings = vec![None; builtin_defs.len()];
-        if let Err(e) = tr.register_tools(builtin_defs, "builtin", true, builtin_embeddings).await {
+        if let Err(e) = tr.register_tools(builtin_defs, "builtin", true, builtin_embeddings, None).await {
             tracing::warn!("failed to register builtin tools in registry: {e}");
         }
 
         // Register MCP tools as non-core (discoverable via tool_search)
-        let mcp_defs: Vec<_> = tool_executor.core_tools().await
-            .into_iter()
-            .filter(|t| !t.name.starts_with("builtin_"))
-            .collect();
+        let mcp_defs: Vec<_> = tool_executor.all_mcp_tools().await;
         let mcp_embeddings = vec![None; mcp_defs.len()];
         if !mcp_defs.is_empty() {
-            if let Err(e) = tr.register_tools(mcp_defs, "mcp", false, mcp_embeddings).await {
+            if let Err(e) = tr.register_tools(mcp_defs, "mcp", false, mcp_embeddings, None).await {
                 tracing::warn!("failed to register MCP tools in registry: {e}");
             }
         }
     }
+
+    // Spawn background embedding backfill task
+    let (backfill_shutdown_tx, backfill_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let backfill_task = if let (Some(pool), true) = (&pg_pool, !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable)) {
+        let pool = pool.clone();
+        let client = Arc::clone(&embedding_client);
+        let model = resolved_emb.model.clone();
+        Some(tokio::spawn(async move {
+            // Let tool registration and MCP connections settle.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                _ = backfill_shutdown_rx => {
+                    tracing::info!("embedding backfill cancelled before start");
+                    return;
+                }
+            }
+
+            tracing::info!("starting embedding backfill (model={model})");
+
+            let embed_fn: desktop_assistant_storage::embedding_backfill::BackfillEmbedFn =
+                Box::new(move |texts| {
+                    let client = Arc::clone(&client);
+                    Box::pin(async move {
+                        client.embed(texts).await.map_err(|e| e.to_string())
+                    })
+                });
+
+            match desktop_assistant_storage::embedding_backfill::backfill_tool_embeddings(
+                &pool, &embed_fn, &model,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => tracing::info!("backfilled {n} tool embedding(s)"),
+                Ok(_) => tracing::debug!("no tool embeddings to backfill"),
+                Err(e) => tracing::warn!("tool embedding backfill failed: {e}"),
+            }
+
+            match desktop_assistant_storage::embedding_backfill::backfill_knowledge_embeddings(
+                &pool, &embed_fn, &model,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => tracing::info!("backfilled {n} knowledge embedding(s)"),
+                Ok(_) => tracing::debug!("no knowledge embeddings to backfill"),
+                Err(e) => tracing::warn!("knowledge embedding backfill failed: {e}"),
+            }
+        }))
+    } else {
+        drop(backfill_shutdown_rx);
+        None
+    };
 
     // Build the conversation service with tool support
     let conversation_store: AnyConversationStore = if let Some(pool) = &pg_pool {
@@ -768,6 +822,13 @@ async fn main() -> Result<()> {
     // Run until stopped.
     shutdown_signal().await;
     tracing::info!("shutdown signal received; stopping services");
+
+    let _ = backfill_shutdown_tx.send(());
+    if let Some(task) = backfill_task {
+        if let Err(e) = task.await {
+            tracing::warn!("backfill task join error during shutdown: {e}");
+        }
+    }
 
     let _ = ws_shutdown_tx.send(());
     if let Err(e) = ws_task.await {

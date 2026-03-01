@@ -19,17 +19,19 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         &self,
         entry: KnowledgeEntry,
         embedding: Option<Vec<f32>>,
+        embedding_model: Option<String>,
     ) -> Result<KnowledgeEntry, CoreError> {
         let embedding_vec = embedding.map(Vector::from);
 
         let row: KbRow = sqlx::query_as(
-            "INSERT INTO knowledge_base (id, content, tags, metadata, embedding)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO knowledge_base (id, content, tags, metadata, embedding, embedding_model)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE
                 SET content = EXCLUDED.content,
                     tags = EXCLUDED.tags,
                     metadata = EXCLUDED.metadata,
                     embedding = EXCLUDED.embedding,
+                    embedding_model = EXCLUDED.embedding_model,
                     updated_at = NOW()
              RETURNING id, content, tags, metadata, created_at, updated_at"
         )
@@ -38,6 +40,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(&entry.tags)
         .bind(&entry.metadata)
         .bind(embedding_vec)
+        .bind(&embedding_model)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
