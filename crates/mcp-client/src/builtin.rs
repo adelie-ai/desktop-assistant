@@ -88,22 +88,23 @@ impl BuiltinToolService {
             ToolDefinition::new(
                 TOOL_KB_WRITE,
                 "Write or update a knowledge base entry. Use for storing preferences, facts, \
-                 project context, or any durable information the user wants remembered.",
+                 instructions, project context, or any durable information the user wants remembered. \
+                 Content should be self-contained prose that describes both the context (when/why \
+                 this information is useful) and the information itself.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "Prose content to store"
+                            "description": "Self-contained prose describing the context and information. \
+                                            Write naturally, e.g. 'The user lives at 123 Main St, Springfield. \
+                                            Use this as their default location for weather, directions, and local searches.' \
+                                            Do not use key-value format."
                         },
                         "tags": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Tags for categorization (e.g. 'preference', 'memory', 'project:myapp')"
-                        },
-                        "metadata": {
-                            "type": "object",
-                            "description": "Optional structured metadata (key/value pairs)"
+                            "description": "Tags for categorization (e.g. 'preference', 'memory', 'instruction', 'project:myapp')"
                         },
                         "id": {
                             "type": "string",
