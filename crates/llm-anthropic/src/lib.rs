@@ -191,7 +191,22 @@ struct SseEvent {
     event_type: String,
     index: Option<usize>,
     content_block: Option<SseContentBlock>,
+    #[serde(default, deserialize_with = "deserialize_optional_delta")]
     delta: Option<SseDelta>,
+}
+
+/// Deserialize `delta` permissively: returns `None` when the object shape
+/// doesn't match `SseDelta` (e.g. `message_delta` events whose delta lacks a
+/// `type` tag).
+fn deserialize_optional_delta<'de, D>(deserializer: D) -> Result<Option<SseDelta>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        Some(v) => Ok(serde_json::from_value(v).ok()),
+        None => Ok(None),
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -278,6 +293,25 @@ impl LlmClient for AnthropicClient {
             stream: true,
             tools: api_tools,
         };
+
+        let request_json = serde_json::to_string(&request)
+            .unwrap_or_else(|_| "<serialization error>".into());
+        let request_bytes = request_json.len();
+        let msg_count = request.messages.len();
+        let tool_count = request.tools.len();
+        let system_chars: usize = request.system.as_deref().map_or(0, |s| s.len());
+        tracing::info!(
+            request_bytes,
+            msg_count,
+            tool_count,
+            system_chars,
+            model = %request.model,
+            "LLM request payload"
+        );
+        tracing::debug!(
+            "LLM request body (first 2000 chars): {}",
+            &request_json[..request_json.len().min(2000)]
+        );
 
         let url = format!("{}/v1/messages", self.base_url);
         let response = self
@@ -542,6 +576,14 @@ mod tests {
             SseDelta::InputJsonDelta { partial_json } => assert_eq!(partial_json, "{\"pa"),
             _ => panic!("expected input_json_delta"),
         }
+    }
+
+    #[test]
+    fn parse_message_delta_event_succeeds() {
+        let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":87,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":8}}"#;
+        let event: SseEvent = serde_json::from_str(data).unwrap();
+        assert_eq!(event.event_type, "message_delta");
+        assert!(event.delta.is_none()); // delta shape doesn't match SseDelta
     }
 
     #[test]

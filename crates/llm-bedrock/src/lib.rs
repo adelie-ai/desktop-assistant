@@ -73,6 +73,14 @@ impl BedrockClient {
             .await
     }
 
+    /// Return the model ID as the stable version identifier.
+    ///
+    /// Bedrock model IDs already include version info (e.g.
+    /// `amazon.titan-embed-text-v2:0`), so no server call is needed.
+    pub async fn model_identifier(&self) -> Result<String, CoreError> {
+        Ok(self.model.clone())
+    }
+
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
         let client = self.client().await?;
 
@@ -370,6 +378,19 @@ impl LlmClient for BedrockClient {
         let client = self.client().await?;
         let (system, api_messages) = convert_messages(&messages)?;
         let tool_config = convert_tools(tools)?;
+
+        let msg_count = api_messages.len();
+        let tool_count = tools.len();
+        let system_chars: usize = system.iter().map(|b| format!("{b:?}").len()).sum();
+        let msg_chars: usize = api_messages.iter().map(|m| format!("{m:?}").len()).sum();
+        tracing::info!(
+            msg_chars,
+            msg_count,
+            tool_count,
+            system_chars,
+            model = %self.model,
+            "LLM request payload"
+        );
 
         let mut request = client
             .converse_stream()

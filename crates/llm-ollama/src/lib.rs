@@ -121,6 +121,41 @@ impl OllamaClient {
         Ok(())
     }
 
+    /// Return the model name stamped with the server-side digest.
+    ///
+    /// Calls `POST {base_url}/api/show` and returns `"{model}@{digest}"`.
+    pub async fn model_identifier(&self) -> Result<String, CoreError> {
+        let url = format!("{}/api/show", self.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({ "model": self.model });
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CoreError::Llm(format!("model show HTTP request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(CoreError::Llm(format!(
+                "Ollama show API error (HTTP {status}): {text}"
+            )));
+        }
+
+        let parsed: OllamaShowResponse = response
+            .json()
+            .await
+            .map_err(|e| CoreError::Llm(format!("failed to parse show response: {e}")))?;
+
+        Ok(format!("{}@{}", self.model, parsed.digest))
+    }
+
     /// Generate embeddings for a batch of texts.
     ///
     /// Sends a `POST {base_url}/api/embed` request and returns one vector per input.
@@ -266,6 +301,11 @@ struct OllamaEmbedResponse {
 }
 
 #[derive(Deserialize)]
+struct OllamaShowResponse {
+    digest: String,
+}
+
+#[derive(Deserialize)]
 struct OllamaTagsResponse {
     #[serde(default)]
     models: Vec<OllamaModelTag>,
@@ -340,6 +380,23 @@ impl LlmClient for OllamaClient {
             stream: true,
             tools: chat_tools,
         };
+
+        let request_json = serde_json::to_string(&request)
+            .unwrap_or_else(|_| "<serialization error>".into());
+        let request_bytes = request_json.len();
+        let msg_count = request.messages.len();
+        let tool_count = request.tools.len();
+        tracing::info!(
+            request_bytes,
+            msg_count,
+            tool_count,
+            model = %request.model,
+            "LLM request payload"
+        );
+        tracing::debug!(
+            "LLM request body (first 2000 chars): {}",
+            &request_json[..request_json.len().min(2000)]
+        );
 
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
 
@@ -671,6 +728,22 @@ mod tests {
         tags_mock.assert_hits(1);
         pull_mock.assert_hits(1);
         chat_mock.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn model_identifier_returns_name_at_digest() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"digest":"sha256:abcdef1234567890"}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "nomic-embed-text");
+        let id = client.model_identifier().await.unwrap();
+        assert_eq!(id, "nomic-embed-text@sha256:abcdef1234567890");
     }
 
     #[tokio::test]

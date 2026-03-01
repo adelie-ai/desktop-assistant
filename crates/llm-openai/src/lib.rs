@@ -42,10 +42,14 @@ impl OpenAiClient {
         self
     }
 
-    /// Create from environment variables.
-    /// Reads `OPENAI_API_KEY` for the API key.
-    /// Optionally reads `OPENAI_MODEL` (defaults to gpt-5.2)
-    /// and `OPENAI_BASE_URL` (defaults to https://api.openai.com/v1).
+    /// Return the model name as the stable version identifier.
+    ///
+    /// OpenAI model names are already version-pinned, so no server call is
+    /// needed.
+    pub async fn model_identifier(&self) -> Result<String, CoreError> {
+        Ok(self.model.clone())
+    }
+
     /// Generate embeddings for a batch of texts.
     ///
     /// Sends a `POST {base_url}/embeddings` request and returns one vector per input.
@@ -313,6 +317,23 @@ impl LlmClient for OpenAiClient {
             stream: true,
             tools: chat_tools,
         };
+
+        let request_json = serde_json::to_string(&request)
+            .unwrap_or_else(|_| "<serialization error>".into());
+        let request_bytes = request_json.len();
+        let msg_count = request.messages.len();
+        let tool_count = request.tools.len();
+        tracing::info!(
+            request_bytes,
+            msg_count,
+            tool_count,
+            model = %request.model,
+            "LLM request payload"
+        );
+        tracing::debug!(
+            "LLM request body (first 2000 chars): {}",
+            &request_json[..request_json.len().min(2000)]
+        );
 
         let response = self
             .client

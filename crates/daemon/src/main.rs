@@ -278,6 +278,18 @@ impl EmbeddingClient for AnyEmbeddingClient {
             )),
         }
     }
+
+    async fn model_identifier(&self) -> Result<String, CoreError> {
+        match self {
+            Self::Bedrock(c) => c.model_identifier().await,
+            Self::OpenAi(c) => c.model_identifier().await,
+            Self::Ollama(c) => c.model_identifier().await,
+            Self::Unavailable => Err(CoreError::Llm(
+                "embeddings are not available: current connector does not support embeddings"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 impl LlmClient for AnyLlmClient {
@@ -443,6 +455,26 @@ async fn main() -> Result<()> {
     };
 
     let embedding_client = Arc::new(embedding_client);
+
+    // Resolve model identifier once at startup (includes digest for Ollama).
+    let embedding_model_id: String =
+        if matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
+            resolved_emb.model.clone()
+        } else {
+            match embedding_client.model_identifier().await {
+                Ok(id) => {
+                    tracing::info!("resolved embedding model identifier: {id}");
+                    id
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to resolve embedding model identifier, falling back to configured name: {e}"
+                    );
+                    resolved_emb.model.clone()
+                }
+            }
+        };
+
     let embedding_fn: Option<EmbedFn> =
         if matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
             None
@@ -525,7 +557,7 @@ async fn main() -> Result<()> {
     if let Some(embed_fn) = embedding_fn {
         tracing::info!(
             "enabling built-in vector search with model={}",
-            resolved_emb.model
+            embedding_model_id
         );
         builtin_tools = builtin_tools.with_embedding(embed_fn);
     } else {
@@ -537,7 +569,7 @@ async fn main() -> Result<()> {
         let kb_w = Arc::clone(kb);
         let kb_s = Arc::clone(kb);
         let kb_d = Arc::clone(kb);
-        let kb_emb_model = resolved_emb.model.clone();
+        let kb_emb_model = embedding_model_id.clone();
         use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
         builtin_tools = builtin_tools.with_knowledge_base(
             Arc::new(move |entry, embedding| {
@@ -626,7 +658,7 @@ async fn main() -> Result<()> {
     let backfill_task = if let (Some(pool), true) = (&pg_pool, !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable)) {
         let pool = pool.clone();
         let client = Arc::clone(&embedding_client);
-        let model = resolved_emb.model.clone();
+        let model = embedding_model_id.clone();
         Some(tokio::spawn(async move {
             // Let tool registration and MCP connections settle.
             tokio::select! {
