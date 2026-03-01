@@ -153,6 +153,9 @@ impl SettingsService for FakeSettings {
             model: "y".into(),
             base_url: "z".into(),
             has_api_key: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
         })
     }
     async fn set_llm_settings(
@@ -160,6 +163,9 @@ impl SettingsService for FakeSettings {
         _connector: String,
         _model: Option<String>,
         _base_url: Option<String>,
+        _temperature: Option<f64>,
+        _top_p: Option<f64>,
+        _max_tokens: Option<u32>,
     ) -> Result<(), CoreError> {
         Ok(())
     }
@@ -258,6 +264,9 @@ impl StatefulSettings {
                     model: "gpt-5".into(),
                     base_url: "https://api.openai.com/v1".into(),
                     has_api_key: false,
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
                 },
                 embeddings: EmbeddingsSettingsView {
                     connector: "openai".into(),
@@ -289,6 +298,9 @@ impl SettingsService for StatefulSettings {
         connector: String,
         model: Option<String>,
         base_url: Option<String>,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        max_tokens: Option<u32>,
     ) -> Result<(), CoreError> {
         let mut state = self.state.lock().unwrap();
         state.llm.connector = connector;
@@ -298,6 +310,9 @@ impl SettingsService for StatefulSettings {
         if let Some(base_url) = base_url {
             state.llm.base_url = base_url;
         }
+        state.llm.temperature = temperature;
+        state.llm.top_p = top_p;
+        state.llm.max_tokens = max_tokens;
         Ok(())
     }
 

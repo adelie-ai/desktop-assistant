@@ -264,6 +264,9 @@ mod tests {
                     model: "gpt-5.2".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
                     has_api_key: true,
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
                 },
                 embeddings: api::EmbeddingsSettingsView {
                     connector: "openai".to_string(),

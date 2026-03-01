@@ -88,6 +88,12 @@ pub struct LlmConfig {
     pub api_key_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<SecretConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 impl Default for LlmConfig {
@@ -98,6 +104,9 @@ impl Default for LlmConfig {
             base_url: None,
             api_key_env: None,
             secret: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
         }
     }
 }
@@ -137,6 +146,9 @@ pub struct ResolvedLlmConfig {
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +157,9 @@ pub struct LlmSettingsView {
     pub model: String,
     pub base_url: String,
     pub has_api_key: bool,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -342,6 +357,9 @@ pub fn get_llm_settings_view(path: &Path) -> anyhow::Result<LlmSettingsView> {
         model: resolved.model,
         base_url: resolved.base_url,
         has_api_key: !resolved.api_key.is_empty(),
+        temperature: resolved.temperature,
+        top_p: resolved.top_p,
+        max_tokens: resolved.max_tokens,
     })
 }
 
@@ -350,6 +368,9 @@ pub fn set_llm_settings(
     connector: &str,
     model: Option<&str>,
     base_url: Option<&str>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
 ) -> anyhow::Result<()> {
     let mut config = load_daemon_config(path)?.unwrap_or_default();
 
@@ -358,9 +379,28 @@ pub fn set_llm_settings(
         return Err(anyhow!("connector must not be empty"));
     }
 
+    if let Some(t) = temperature {
+        if !(0.0..=2.0).contains(&t) {
+            return Err(anyhow!("temperature must be between 0.0 and 2.0"));
+        }
+    }
+    if let Some(p) = top_p {
+        if !(0.0..=1.0).contains(&p) {
+            return Err(anyhow!("top_p must be between 0.0 and 1.0"));
+        }
+    }
+    if let Some(m) = max_tokens {
+        if m == 0 {
+            return Err(anyhow!("max_tokens must be greater than 0"));
+        }
+    }
+
     config.llm.connector = connector;
     config.llm.model = normalize_optional_value(model);
     config.llm.base_url = normalize_optional_value(base_url);
+    config.llm.temperature = temperature;
+    config.llm.top_p = top_p;
+    config.llm.max_tokens = max_tokens;
 
     save_daemon_config(path, &config)
 }
@@ -675,11 +715,18 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
             _ => "https://api.openai.com/v1".to_string(),
         });
 
+    let temperature = llm_config.and_then(|c| c.temperature);
+    let top_p = llm_config.and_then(|c| c.top_p);
+    let max_tokens = llm_config.and_then(|c| c.max_tokens);
+
     ResolvedLlmConfig {
         connector,
         model,
         base_url,
         api_key,
+        temperature,
+        top_p,
+        max_tokens,
     }
 }
 

@@ -13,6 +13,8 @@ pub struct AnthropicClient {
     model: String,
     base_url: String,
     max_tokens: u32,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 impl AnthropicClient {
@@ -31,6 +33,8 @@ impl AnthropicClient {
             model: Self::get_default_model().unwrap_or_default().to_string(),
             base_url: Self::get_default_base_url().unwrap_or_default().to_string(),
             max_tokens: 8192,
+            temperature: None,
+            top_p: None,
         }
     }
 
@@ -46,6 +50,23 @@ impl AnthropicClient {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_max_tokens_override(mut self, max_tokens: Option<u32>) -> Self {
+        if let Some(mt) = max_tokens {
+            self.max_tokens = mt;
+        }
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
+        self.top_p = top_p;
         self
     }
 
@@ -74,6 +95,10 @@ impl AnthropicClient {
 struct MessagesRequest {
     model: String,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     messages: Vec<AnthropicMessage>,
@@ -288,6 +313,8 @@ impl LlmClient for AnthropicClient {
         let request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
             system,
             messages: api_messages,
             stream: true,
@@ -622,6 +649,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".into(),
             max_tokens: 8192,
+            temperature: None,
+            top_p: None,
             system: None,
             messages: vec![],
             stream: true,
@@ -637,6 +666,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".into(),
             max_tokens: 8192,
+            temperature: None,
+            top_p: None,
             system: Some("system prompt".into()),
             messages: vec![],
             stream: true,
@@ -653,6 +684,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".into(),
             max_tokens: 8192,
+            temperature: None,
+            top_p: None,
             system: Some("be helpful".into()),
             messages: vec![],
             stream: true,
@@ -675,6 +708,8 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".into(),
             max_tokens: 8192,
+            temperature: None,
+            top_p: None,
             system: None,
             messages: vec![],
             stream: true,

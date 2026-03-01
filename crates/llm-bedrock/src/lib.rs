@@ -19,6 +19,9 @@ pub struct BedrockClient {
     base_url: String,
     api_key: String,
     client: OnceCell<Client>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
 }
 
 impl BedrockClient {
@@ -36,6 +39,9 @@ impl BedrockClient {
             base_url: Self::get_default_base_url().unwrap_or_default().to_string(),
             api_key,
             client: OnceCell::new(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
         }
     }
 
@@ -47,6 +53,21 @@ impl BedrockClient {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self.client = OnceCell::new();
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -396,6 +417,21 @@ impl LlmClient for BedrockClient {
             .converse_stream()
             .model_id(self.model.clone())
             .set_messages(Some(api_messages));
+
+        if self.temperature.is_some() || self.top_p.is_some() || self.max_tokens.is_some() {
+            let mut inference_cfg =
+                aws_sdk_bedrockruntime::types::InferenceConfiguration::builder();
+            if let Some(t) = self.temperature {
+                inference_cfg = inference_cfg.temperature(t as f32);
+            }
+            if let Some(p) = self.top_p {
+                inference_cfg = inference_cfg.top_p(p as f32);
+            }
+            if let Some(m) = self.max_tokens {
+                inference_cfg = inference_cfg.max_tokens(m as i32);
+            }
+            request = request.inference_config(inference_cfg.build());
+        }
 
         if !system.is_empty() {
             request = request.set_system(Some(system));

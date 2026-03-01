@@ -15,6 +15,9 @@ pub struct OllamaClient {
     model: String,
     base_url: String,
     model_ready: OnceCell<()>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
 }
 
 impl OllamaClient {
@@ -32,6 +35,9 @@ impl OllamaClient {
             model: model.into(),
             base_url: base_url.into(),
             model_ready: OnceCell::new(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
         }
     }
 
@@ -44,6 +50,21 @@ impl OllamaClient {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self.model_ready = OnceCell::new();
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -200,12 +221,24 @@ impl OllamaClient {
 // --- Request types ---
 
 #[derive(Serialize)]
+struct OllamaOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<u32>,
+}
+
+#[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
 }
 
 #[derive(Serialize)]
@@ -374,11 +407,22 @@ impl LlmClient for OllamaClient {
 
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
 
+        let options = if self.temperature.is_some() || self.top_p.is_some() || self.max_tokens.is_some() {
+            Some(OllamaOptions {
+                temperature: self.temperature,
+                top_p: self.top_p,
+                num_predict: self.max_tokens,
+            })
+        } else {
+            None
+        };
+
         let request = ChatRequest {
             model: self.model.clone(),
             messages: messages.iter().map(ChatMessage::from).collect(),
             stream: true,
             tools: chat_tools,
+            options,
         };
 
         let request_json = serde_json::to_string(&request)
@@ -632,6 +676,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            options: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("tools"));
@@ -645,6 +690,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![ChatTool::from(&def)],
+            options: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));

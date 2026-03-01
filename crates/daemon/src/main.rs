@@ -361,10 +361,15 @@ async fn main() -> Result<()> {
     let llm: AnyLlmClient = match resolved_llm.connector.as_str() {
         "ollama" => {
             tracing::info!("using Ollama LLM backend");
-            AnyLlmClient::Ollama(desktop_assistant_llm_ollama::OllamaClient::new(
-                resolved_llm.base_url,
-                resolved_llm.model,
-            ))
+            AnyLlmClient::Ollama(
+                desktop_assistant_llm_ollama::OllamaClient::new(
+                    resolved_llm.base_url,
+                    resolved_llm.model,
+                )
+                .with_temperature(resolved_llm.temperature)
+                .with_top_p(resolved_llm.top_p)
+                .with_max_tokens(resolved_llm.max_tokens),
+            )
         }
         "anthropic" => {
             if resolved_llm.api_key.is_empty() {
@@ -376,7 +381,10 @@ async fn main() -> Result<()> {
             AnyLlmClient::Anthropic(
                 desktop_assistant_llm_anthropic::AnthropicClient::new(resolved_llm.api_key)
                     .with_model(resolved_llm.model)
-                    .with_base_url(resolved_llm.base_url),
+                    .with_base_url(resolved_llm.base_url)
+                    .with_temperature(resolved_llm.temperature)
+                    .with_top_p(resolved_llm.top_p)
+                    .with_max_tokens_override(resolved_llm.max_tokens),
             )
         }
         "bedrock" | "aws-bedrock" => {
@@ -384,7 +392,10 @@ async fn main() -> Result<()> {
             AnyLlmClient::Bedrock(
                 desktop_assistant_llm_bedrock::BedrockClient::new(resolved_llm.api_key)
                     .with_model(resolved_llm.model)
-                    .with_base_url(resolved_llm.base_url),
+                    .with_base_url(resolved_llm.base_url)
+                    .with_temperature(resolved_llm.temperature)
+                    .with_top_p(resolved_llm.top_p)
+                    .with_max_tokens(resolved_llm.max_tokens),
             )
         }
         _ => {
@@ -396,7 +407,10 @@ async fn main() -> Result<()> {
             AnyLlmClient::OpenAi(
                 desktop_assistant_llm_openai::OpenAiClient::new(resolved_llm.api_key)
                     .with_model(resolved_llm.model)
-                    .with_base_url(resolved_llm.base_url),
+                    .with_base_url(resolved_llm.base_url)
+                    .with_temperature(resolved_llm.temperature)
+                    .with_top_p(resolved_llm.top_p)
+                    .with_max_tokens(resolved_llm.max_tokens),
             )
         }
     };

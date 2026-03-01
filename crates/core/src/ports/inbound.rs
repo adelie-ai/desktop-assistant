@@ -8,6 +8,9 @@ pub struct LlmSettingsView {
     pub model: String,
     pub base_url: String,
     pub has_api_key: bool,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +106,9 @@ pub trait SettingsService: Send + Sync {
         connector: String,
         model: Option<String>,
         base_url: Option<String>,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        max_tokens: Option<u32>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
     fn set_api_key(

@@ -28,6 +28,9 @@ impl SettingsService for DaemonSettingsService {
             model: view.model,
             base_url: view.base_url,
             has_api_key: view.has_api_key,
+            temperature: view.temperature,
+            top_p: view.top_p,
+            max_tokens: view.max_tokens,
         })
     }
 
@@ -36,12 +39,18 @@ impl SettingsService for DaemonSettingsService {
         connector: String,
         model: Option<String>,
         base_url: Option<String>,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        max_tokens: Option<u32>,
     ) -> Result<(), CoreError> {
         config::set_llm_settings(
             &self.config_path,
             &connector,
             model.as_deref(),
             base_url.as_deref(),
+            temperature,
+            top_p,
+            max_tokens,
         )
         .map_err(|error| CoreError::SystemService(error.to_string()))
     }

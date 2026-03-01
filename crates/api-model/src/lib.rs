@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
     Ping,
@@ -50,6 +50,12 @@ pub enum Command {
         connector: String,
         model: Option<String>,
         base_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        temperature: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        top_p: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u32>,
     },
     SetApiKey {
         api_key: String,
@@ -75,7 +81,7 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandResult {
     Pong { value: String },
@@ -97,7 +103,7 @@ pub enum CommandResult {
     Ack,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     ConfigChanged {
@@ -131,14 +137,14 @@ pub struct Status {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub llm: LlmSettingsView,
     pub embeddings: EmbeddingsSettingsView,
     pub persistence: PersistenceSettingsView,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConfigChanges {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_connector: Option<String>,
@@ -162,6 +168,12 @@ pub struct ConfigChanges {
     pub persistence_remote_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_push_on_update: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,12 +204,18 @@ pub struct MessagesView {
     pub messages: Vec<MessageView>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmSettingsView {
     pub connector: String,
     pub model: String,
     pub base_url: String,
     pub has_api_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

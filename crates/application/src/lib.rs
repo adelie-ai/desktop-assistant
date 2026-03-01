@@ -117,6 +117,9 @@ where
                 model: llm.model,
                 base_url: llm.base_url,
                 has_api_key: llm.has_api_key,
+                temperature: llm.temperature,
+                top_p: llm.top_p,
+                max_tokens: llm.max_tokens,
             },
             embeddings: api::EmbeddingsSettingsView {
                 connector: embeddings.connector,
@@ -149,9 +152,17 @@ where
             persistence_remote_url,
             persistence_remote_name,
             persistence_push_on_update,
+            llm_temperature,
+            llm_top_p,
+            llm_max_tokens,
         } = changes;
 
-        let llm_changed = llm_connector.is_some() || llm_model.is_some() || llm_base_url.is_some();
+        let llm_changed = llm_connector.is_some()
+            || llm_model.is_some()
+            || llm_base_url.is_some()
+            || llm_temperature.is_some()
+            || llm_top_p.is_some()
+            || llm_max_tokens.is_some();
         if llm_changed {
             let connector = Self::normalize_optional_string(llm_connector)
                 .unwrap_or_else(|| current.llm.connector.clone());
@@ -166,8 +177,24 @@ where
                 Some(current.llm.base_url.clone())
             };
 
+            let temperature = if llm_temperature.is_some() {
+                llm_temperature
+            } else {
+                current.llm.temperature
+            };
+            let top_p = if llm_top_p.is_some() {
+                llm_top_p
+            } else {
+                current.llm.top_p
+            };
+            let max_tokens = if llm_max_tokens.is_some() {
+                llm_max_tokens
+            } else {
+                current.llm.max_tokens
+            };
+
             self.settings
-                .set_llm_settings(connector, model, base_url)
+                .set_llm_settings(connector, model, base_url, temperature, top_p, max_tokens)
                 .await
                 .map_err(Self::map_core_err)?;
         }
@@ -346,6 +373,9 @@ where
                     model: s.model,
                     base_url: s.base_url,
                     has_api_key: s.has_api_key,
+                    temperature: s.temperature,
+                    top_p: s.top_p,
+                    max_tokens: s.max_tokens,
                 }))
             }
 
@@ -353,9 +383,12 @@ where
                 connector,
                 model,
                 base_url,
+                temperature,
+                top_p,
+                max_tokens,
             } => {
                 self.settings
-                    .set_llm_settings(connector, model, base_url)
+                    .set_llm_settings(connector, model, base_url, temperature, top_p, max_tokens)
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)
@@ -585,6 +618,9 @@ mod tests {
                 model: "y".into(),
                 base_url: "z".into(),
                 has_api_key: false,
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
             })
         }
         async fn set_llm_settings(
@@ -592,6 +628,9 @@ mod tests {
             _connector: String,
             _model: Option<String>,
             _base_url: Option<String>,
+            _temperature: Option<f64>,
+            _top_p: Option<f64>,
+            _max_tokens: Option<u32>,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -690,6 +729,9 @@ mod tests {
                         model: "gpt-5".into(),
                         base_url: "https://api.openai.com/v1".into(),
                         has_api_key: false,
+                        temperature: None,
+                        top_p: None,
+                        max_tokens: None,
                     },
                     embeddings: EmbeddingsSettingsView {
                         connector: "openai".into(),
@@ -725,6 +767,9 @@ mod tests {
             connector: String,
             model: Option<String>,
             base_url: Option<String>,
+            temperature: Option<f64>,
+            top_p: Option<f64>,
+            max_tokens: Option<u32>,
         ) -> Result<(), CoreError> {
             let mut state = self.state.lock().unwrap();
             state.llm.connector = connector;
@@ -734,6 +779,9 @@ mod tests {
             if let Some(base_url) = base_url {
                 state.llm.base_url = base_url;
             }
+            state.llm.temperature = temperature;
+            state.llm.top_p = top_p;
+            state.llm.max_tokens = max_tokens;
             Ok(())
         }
 

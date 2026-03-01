@@ -4,22 +4,26 @@ use desktop_assistant_core::ports::inbound::SettingsService;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
 
-type ConfigTuple = (
-    String,
-    String,
-    String,
-    bool,
-    String,
-    String,
-    String,
-    bool,
-    bool,
-    bool,
-    bool,
-    String,
-    String,
-    bool,
-);
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
+pub struct ConfigData {
+    pub llm_connector: String,
+    pub llm_model: String,
+    pub llm_base_url: String,
+    pub llm_has_api_key: bool,
+    pub embeddings_connector: String,
+    pub embeddings_model: String,
+    pub embeddings_base_url: String,
+    pub embeddings_has_api_key: bool,
+    pub embeddings_available: bool,
+    pub embeddings_is_default: bool,
+    pub persistence_enabled: bool,
+    pub persistence_remote_url: String,
+    pub persistence_remote_name: String,
+    pub persistence_push_on_update: bool,
+    pub llm_temperature: f64,
+    pub llm_top_p: f64,
+    pub llm_max_tokens: u32,
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
 pub struct ConfigPatchArgs {
@@ -45,6 +49,12 @@ pub struct ConfigPatchArgs {
     pub persistence_remote_name: String,
     pub set_persistence_push_on_update: bool,
     pub persistence_push_on_update: bool,
+    pub set_llm_temperature: bool,
+    pub llm_temperature: f64,
+    pub set_llm_top_p: bool,
+    pub llm_top_p: f64,
+    pub set_llm_max_tokens: bool,
+    pub llm_max_tokens: u32,
 }
 
 #[derive(Debug, Default)]
@@ -60,6 +70,9 @@ struct ConfigPatch {
     persistence_remote_url: Option<String>,
     persistence_remote_name: Option<String>,
     persistence_push_on_update: Option<bool>,
+    llm_temperature: Option<f64>,
+    llm_top_p: Option<f64>,
+    llm_max_tokens: Option<u32>,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -90,7 +103,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         Self { service }
     }
 
-    async fn get_config_tuple(&self) -> fdo::Result<ConfigTuple> {
+    async fn get_config_tuple(&self) -> fdo::Result<ConfigData> {
         let llm = self
             .service
             .get_llm_settings()
@@ -107,25 +120,28 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .await
             .map_err(to_fdo_error)?;
 
-        Ok((
-            llm.connector,
-            llm.model,
-            llm.base_url,
-            llm.has_api_key,
-            embeddings.connector,
-            embeddings.model,
-            embeddings.base_url,
-            embeddings.has_api_key,
-            embeddings.available,
-            embeddings.is_default,
-            persistence.enabled,
-            persistence.remote_url,
-            persistence.remote_name,
-            persistence.push_on_update,
-        ))
+        Ok(ConfigData {
+            llm_connector: llm.connector,
+            llm_model: llm.model,
+            llm_base_url: llm.base_url,
+            llm_has_api_key: llm.has_api_key,
+            embeddings_connector: embeddings.connector,
+            embeddings_model: embeddings.model,
+            embeddings_base_url: embeddings.base_url,
+            embeddings_has_api_key: embeddings.has_api_key,
+            embeddings_available: embeddings.available,
+            embeddings_is_default: embeddings.is_default,
+            persistence_enabled: persistence.enabled,
+            persistence_remote_url: persistence.remote_url,
+            persistence_remote_name: persistence.remote_name,
+            persistence_push_on_update: persistence.push_on_update,
+            llm_temperature: llm.temperature.unwrap_or(-1.0),
+            llm_top_p: llm.top_p.unwrap_or(-1.0),
+            llm_max_tokens: llm.max_tokens.unwrap_or(0),
+        })
     }
 
-    async fn apply_config_patch(&self, patch: ConfigPatch) -> fdo::Result<ConfigTuple> {
+    async fn apply_config_patch(&self, patch: ConfigPatch) -> fdo::Result<ConfigData> {
         let ConfigPatch {
             llm_connector,
             llm_model,
@@ -138,9 +154,17 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             persistence_remote_url,
             persistence_remote_name,
             persistence_push_on_update,
+            llm_temperature,
+            llm_top_p,
+            llm_max_tokens,
         } = patch;
 
-        let llm_changed = llm_connector.is_some() || llm_model.is_some() || llm_base_url.is_some();
+        let llm_changed = llm_connector.is_some()
+            || llm_model.is_some()
+            || llm_base_url.is_some()
+            || llm_temperature.is_some()
+            || llm_top_p.is_some()
+            || llm_max_tokens.is_some();
         if llm_changed {
             let current = self
                 .service
@@ -163,8 +187,24 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 Some(current.base_url)
             };
 
+            let temperature = if llm_temperature.is_some() {
+                llm_temperature
+            } else {
+                current.temperature
+            };
+            let top_p = if llm_top_p.is_some() {
+                llm_top_p
+            } else {
+                current.top_p
+            };
+            let max_tokens = if llm_max_tokens.is_some() {
+                llm_max_tokens
+            } else {
+                current.max_tokens
+            };
+
             self.service
-                .set_llm_settings(connector, model, base_url)
+                .set_llm_settings(connector, model, base_url, temperature, top_p, max_tokens)
                 .await
                 .map_err(to_fdo_error)?;
         }
@@ -252,7 +292,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
 #[interface(name = "org.desktopAssistant.Settings")]
 impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     /// Return non-sensitive LLM settings and whether an API key is available.
-    async fn get_llm_settings(&self) -> fdo::Result<(String, String, String, bool)> {
+    async fn get_llm_settings(&self) -> fdo::Result<(String, String, String, bool, f64, f64, u32)> {
         let settings = self
             .service
             .get_llm_settings()
@@ -264,6 +304,9 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             settings.model,
             settings.base_url,
             settings.has_api_key,
+            settings.temperature.unwrap_or(-1.0),
+            settings.top_p.unwrap_or(-1.0),
+            settings.max_tokens.unwrap_or(0),
         ))
     }
 
@@ -287,7 +330,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         };
 
         self.service
-            .set_llm_settings(connector.to_string(), model, base_url)
+            .set_llm_settings(connector.to_string(), model, base_url, None, None, None)
             .await
             .map_err(to_fdo_error)
     }
@@ -472,7 +515,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     /// (llm_connector, llm_model, llm_base_url, llm_has_api_key,
     ///  embeddings_connector, embeddings_model, embeddings_base_url, embeddings_has_api_key, embeddings_available, embeddings_is_default,
     ///  persistence_enabled, persistence_remote_url, persistence_remote_name, persistence_push_on_update)
-    async fn get_config(&self) -> fdo::Result<ConfigTuple> {
+    async fn get_config(&self) -> fdo::Result<ConfigData> {
         self.get_config_tuple().await
     }
 
@@ -484,7 +527,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         changes: ConfigPatchArgs,
-    ) -> fdo::Result<ConfigTuple> {
+    ) -> fdo::Result<ConfigData> {
         let ConfigPatchArgs {
             set_llm_connector,
             llm_connector,
@@ -508,6 +551,12 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             persistence_remote_name,
             set_persistence_push_on_update,
             persistence_push_on_update,
+            set_llm_temperature,
+            llm_temperature,
+            set_llm_top_p,
+            llm_top_p,
+            set_llm_max_tokens,
+            llm_max_tokens,
         } = changes;
 
         let updated = self
@@ -526,46 +575,16 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                     .then_some(persistence_remote_name),
                 persistence_push_on_update: set_persistence_push_on_update
                     .then_some(persistence_push_on_update),
+                llm_temperature: set_llm_temperature.then_some(llm_temperature),
+                llm_top_p: set_llm_top_p.then_some(llm_top_p),
+                llm_max_tokens: set_llm_max_tokens.then(|| llm_max_tokens),
             })
             .await?;
 
         let emitter = emitter.to_owned();
-        let (
-            cfg_llm_connector,
-            cfg_llm_model,
-            cfg_llm_base_url,
-            cfg_llm_has_api_key,
-            cfg_embeddings_connector,
-            cfg_embeddings_model,
-            cfg_embeddings_base_url,
-            cfg_embeddings_has_api_key,
-            cfg_embeddings_available,
-            cfg_embeddings_is_default,
-            cfg_persistence_enabled,
-            cfg_persistence_remote_url,
-            cfg_persistence_remote_name,
-            cfg_persistence_push_on_update,
-        ) = updated.clone();
-
-        Self::config_changed(
-            &emitter,
-            &cfg_llm_connector,
-            &cfg_llm_model,
-            &cfg_llm_base_url,
-            cfg_llm_has_api_key,
-            &cfg_embeddings_connector,
-            &cfg_embeddings_model,
-            &cfg_embeddings_base_url,
-            cfg_embeddings_has_api_key,
-            cfg_embeddings_available,
-            cfg_embeddings_is_default,
-            cfg_persistence_enabled,
-            &cfg_persistence_remote_url,
-            &cfg_persistence_remote_name,
-            cfg_persistence_push_on_update,
-        )
-        .await
-        .map_err(to_fdo_error)?;
+        Self::config_changed(&emitter, &updated)
+            .await
+            .map_err(to_fdo_error)?;
 
         Ok(updated)
     }
@@ -574,20 +593,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     #[zbus(signal)]
     async fn config_changed(
         emitter: &SignalEmitter<'_>,
-        llm_connector: &str,
-        llm_model: &str,
-        llm_base_url: &str,
-        llm_has_api_key: bool,
-        embeddings_connector: &str,
-        embeddings_model: &str,
-        embeddings_base_url: &str,
-        embeddings_has_api_key: bool,
-        embeddings_available: bool,
-        embeddings_is_default: bool,
-        persistence_enabled: bool,
-        persistence_remote_url: &str,
-        persistence_remote_name: &str,
-        persistence_push_on_update: bool,
+        config: &ConfigData,
     ) -> zbus::Result<()>;
 }
 
@@ -623,6 +629,9 @@ mod tests {
                         model: "gpt-5.2".to_string(),
                         base_url: "https://api.openai.com/v1".to_string(),
                         has_api_key: false,
+                        temperature: None,
+                        top_p: None,
+                        max_tokens: None,
                     },
                     embeddings: EmbeddingsSettingsView {
                         connector: "openai".to_string(),
@@ -658,6 +667,9 @@ mod tests {
             connector: String,
             model: Option<String>,
             base_url: Option<String>,
+            temperature: Option<f64>,
+            top_p: Option<f64>,
+            max_tokens: Option<u32>,
         ) -> Result<(), CoreError> {
             let mut state = self.state.lock().unwrap();
             state.llm.connector = connector;
@@ -667,6 +679,9 @@ mod tests {
             if let Some(base_url) = base_url {
                 state.llm.base_url = base_url;
             }
+            state.llm.temperature = temperature;
+            state.llm.top_p = top_p;
+            state.llm.max_tokens = max_tokens;
             Ok(())
         }
 
@@ -778,9 +793,9 @@ mod tests {
         let adapter = DbusSettingsAdapter::new(service);
         let config = adapter.get_config_tuple().await.unwrap();
 
-        assert_eq!(config.0, "openai");
-        assert_eq!(config.5, "text-embedding-3-small");
-        assert_eq!(config.12, "origin");
+        assert_eq!(config.llm_connector, "openai");
+        assert_eq!(config.embeddings_model, "text-embedding-3-small");
+        assert_eq!(config.persistence_remote_name, "origin");
     }
 
     #[tokio::test]
@@ -803,12 +818,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(updated.0, "ollama");
-        assert_eq!(updated.1, "llama3.1:8b");
-        assert!(updated.3);
-        assert!(updated.10);
-        assert_eq!(updated.12, "upstream");
-        assert!(!updated.13);
+        assert_eq!(updated.llm_connector, "ollama");
+        assert_eq!(updated.llm_model, "llama3.1:8b");
+        assert!(updated.llm_has_api_key);
+        assert!(updated.persistence_enabled);
+        assert_eq!(updated.persistence_remote_name, "upstream");
+        assert!(!updated.persistence_push_on_update);
 
         assert!(service.state.lock().unwrap().api_key_set);
     }
