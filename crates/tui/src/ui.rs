@@ -207,7 +207,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let (title, border_color) = match app.mode {
         InputMode::Normal => ("Input (press 'i' to edit)", COLOR_INPUT_BORDER_IDLE),
         InputMode::Editing => (
-            "Input (Esc cancel, Enter send, Shift+Enter newline)",
+            "Input (Esc cancel, Enter send, Shift+Enter/Ctrl+J newline)",
             COLOR_INPUT_BORDER_EDIT,
         ),
         InputMode::CreatingConversation => (

@@ -507,6 +507,40 @@ mod tests {
     }
 
     #[test]
+    fn textarea_input_newline_char_creates_new_line() {
+        let mut app = App::new();
+        app.textarea.insert_str("alpha");
+
+        app.textarea.input(crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Char('\n'),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+        app.textarea.insert_str("beta");
+
+        assert_eq!(app.textarea.lines(), ["alpha", "beta"]);
+        assert_eq!(app.textarea_content(), "alpha\nbeta");
+    }
+
+    #[test]
+    fn textarea_input_carriage_return_char_creates_new_line() {
+        let mut app = App::new();
+        app.textarea.insert_str("alpha");
+
+        app.textarea.input(crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Char('\r'),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+        app.textarea.insert_str("beta");
+
+        assert_eq!(app.textarea.lines(), ["alpha", "beta"]);
+        assert_eq!(app.textarea_content(), "alpha\nbeta");
+    }
+
+    #[test]
     fn rewrap_textarea_to_width_wraps_long_lines_on_word_boundaries() {
         let mut app = App::new();
         app.textarea.insert_str("hello world again");

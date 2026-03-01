@@ -20,13 +20,6 @@ pub enum Action {
     ScrollToBottom,
 }
 
-fn is_enter_key(code: &KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
-    )
-}
-
 /// Handle key events that we intercept before passing to textarea.
 /// Returns None for keys that should be forwarded to textarea.input().
 pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
@@ -35,6 +28,9 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
 
     // Ctrl+u / Ctrl+d / Ctrl+e for scrolling — works in all modes
     if ctrl {
+        if matches!(mode, InputMode::Editing) && matches!(key.code, KeyCode::Char('j')) {
+            return Some(Action::InsertNewline);
+        }
         return match key.code {
             KeyCode::Char('u') => Some(Action::ScrollUp),
             KeyCode::Char('d') => Some(Action::ScrollDown),
@@ -49,7 +45,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             if alt || key.modifiers.intersects(KeyModifiers::META) {
                 return None;
             }
-            if is_enter_key(&key.code) {
+            if key.code == KeyCode::Enter {
                 return Some(Action::OpenConversation);
             }
             match key.code {
@@ -67,16 +63,19 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
         }
         InputMode::Editing => {
             // Shift+Enter inserts a newline while plain Enter submits.
-            if key.modifiers.contains(KeyModifiers::SHIFT) && is_enter_key(&key.code) {
-                return Some(Action::InsertNewline);
-            }
-            if is_enter_key(&key.code) {
-                if key.modifiers.is_empty() {
-                    return Some(Action::SubmitPrompt);
-                }
-                return None;
-            }
             match key.code {
+                KeyCode::Enter => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        return Some(Action::InsertNewline);
+                    }
+                    if key.modifiers.is_empty() {
+                        return Some(Action::SubmitPrompt);
+                    }
+                    return None;
+                }
+                // Preserve terminal-provided newline chars by forwarding them
+                // to textarea.input(...), which keeps composer and payload in sync.
+                KeyCode::Char('\n') | KeyCode::Char('\r') => Some(Action::InsertNewline),
                 KeyCode::Esc => Some(Action::ExitEditMode),
                 KeyCode::PageUp => Some(Action::ScrollUp),
                 KeyCode::PageDown => Some(Action::ScrollDown),
@@ -88,7 +87,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             }
         }
         InputMode::CreatingConversation => {
-            if is_enter_key(&key.code) {
+            if key.code == KeyCode::Enter {
                 return Some(Action::SubmitTitle);
             }
             match key.code {
@@ -174,10 +173,10 @@ mod tests {
     }
 
     #[test]
-    fn normal_char_newline_opens() {
+    fn normal_char_newline_is_ignored() {
         assert_eq!(
             handle_key_event(key(KeyCode::Char('\n')), &InputMode::Normal),
-            Some(Action::OpenConversation)
+            None
         );
     }
 
@@ -265,10 +264,32 @@ mod tests {
     }
 
     #[test]
-    fn editing_shift_newline_char_inserts_newline() {
+    fn editing_newline_char_is_forwarded_to_textarea() {
         assert_eq!(
             handle_key_event(
-                key_with_mod(KeyCode::Char('\n'), KeyModifiers::SHIFT),
+                key_with_mod(KeyCode::Char('\n'), KeyModifiers::NONE),
+                &InputMode::Editing
+            ),
+            Some(Action::InsertNewline)
+        );
+    }
+
+    #[test]
+    fn editing_carriage_return_char_is_forwarded_to_textarea() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('\r'), KeyModifiers::NONE),
+                &InputMode::Editing
+            ),
+            Some(Action::InsertNewline)
+        );
+    }
+
+    #[test]
+    fn editing_ctrl_j_inserts_newline() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('j'), KeyModifiers::CONTROL),
                 &InputMode::Editing
             ),
             Some(Action::InsertNewline)

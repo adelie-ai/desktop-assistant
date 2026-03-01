@@ -355,7 +355,7 @@ async fn run(
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
                 if let Event::Key(key) = evt {
-                    if key.kind != KeyEventKind::Press {
+                    if key.kind == KeyEventKind::Release {
                         continue;
                     }
                     if let Some(action) = handle_key_event(key, &app.mode) {
