@@ -11,6 +11,15 @@ use chrono::{Duration, Local};
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
 
+/// Maximum number of conversation messages sent to the LLM per turn.
+/// When the conversation exceeds this limit, only the most recent messages
+/// are included, with the cut point snapped forward to a genuine `Role::User`
+/// message to avoid splitting tool-call/result pairs.
+const MAX_CONTEXT_MESSAGES: usize = 40;
+
+/// Minimum number of newly-dropped messages before re-compacting the summary.
+const COMPACTION_INTERVAL: usize = 20;
+
 fn now_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -27,6 +36,7 @@ const RUNTIME_SYSTEM_INSTRUCTION: &str = include_str!("prompts/runtime_system_in
 fn llm_messages_for_turn(
     conversation_messages: &[Message],
     tool_defs: &[ToolDefinition],
+    context_summary: &str,
 ) -> Vec<Message> {
     let tool_note = if tool_defs.is_empty() {
         "No tools are available in this turn.".to_string()
@@ -39,12 +49,28 @@ fn llm_messages_for_turn(
         format!("Available tools in this turn: {names}.")
     };
 
-    let mut messages = Vec::with_capacity(conversation_messages.len() + 1);
+    // Apply context windowing: if the conversation exceeds the limit, keep
+    // only the most recent messages, snapping the cut point forward to a
+    // genuine User message so we never split tool-call/result pairs.
+    let start = window_start(conversation_messages);
+    let windowed = &conversation_messages[start..];
+    let is_windowed = start > 0;
+
+    let mut messages = Vec::with_capacity(windowed.len() + 2);
     messages.push(Message::new(
         Role::System,
         format!("{RUNTIME_SYSTEM_INSTRUCTION}\n\n{tool_note}"),
     ));
-    messages.extend_from_slice(conversation_messages);
+
+    // Inject rolling context summary when windowing is active and summary exists.
+    if is_windowed && !context_summary.is_empty() {
+        messages.push(Message::new(
+            Role::System,
+            format!("[Summary of earlier conversation]\n{context_summary}"),
+        ));
+    }
+
+    messages.extend_from_slice(windowed);
     messages
 }
 
@@ -234,6 +260,106 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
     }
 }
 
+/// Compute the window-start index, snapped forward to a `Role::User` boundary.
+/// Returns 0 when the conversation fits within `MAX_CONTEXT_MESSAGES`.
+fn window_start(messages: &[Message]) -> usize {
+    if messages.len() <= MAX_CONTEXT_MESSAGES {
+        return 0;
+    }
+    let tentative = messages.len() - MAX_CONTEXT_MESSAGES;
+    messages[tentative..]
+        .iter()
+        .position(|m| m.role == Role::User)
+        .map_or(tentative, |offset| tentative + offset)
+}
+
+/// Determine which message range (if any) should be compacted into the
+/// rolling context summary. Returns `Some((from, to))` when there are
+/// enough newly-dropped messages, or `None` otherwise.
+fn compaction_range(conv: &Conversation) -> Option<(usize, usize)> {
+    let start = window_start(&conv.messages);
+    if start == 0 {
+        return None;
+    }
+    // First compaction: trigger immediately when crossing the threshold.
+    if conv.compacted_through == 0 {
+        return Some((0, start));
+    }
+    // Subsequent compactions: require COMPACTION_INTERVAL new messages.
+    if start >= conv.compacted_through + COMPACTION_INTERVAL {
+        return Some((conv.compacted_through, start))
+    }
+    None
+}
+
+/// Ask the LLM to produce a bullet-point summary of dropped messages, merged
+/// with any existing summary. Falls back to the existing summary on failure.
+async fn generate_context_summary<L: LlmClient>(
+    existing_summary: &str,
+    messages: &[Message],
+    llm: &L,
+) -> String {
+    // Build a transcript of User/Assistant messages only; skip Tool/System.
+    let mut transcript = String::new();
+    for msg in messages {
+        match msg.role {
+            Role::User => {
+                transcript.push_str("User: ");
+                transcript.push_str(&msg.content);
+                transcript.push('\n');
+            }
+            Role::Assistant if !msg.content.is_empty() => {
+                transcript.push_str("Assistant: ");
+                if msg.content.len() > 2000 {
+                    transcript.push_str(&msg.content[..2000]);
+                    transcript.push_str("...[truncated]");
+                } else {
+                    transcript.push_str(&msg.content);
+                }
+                transcript.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    if transcript.is_empty() {
+        return existing_summary.to_string();
+    }
+
+    let mut prompt = String::new();
+    if !existing_summary.is_empty() {
+        prompt.push_str("Existing summary of earlier messages:\n");
+        prompt.push_str(existing_summary);
+        prompt.push_str("\n\nNew messages to incorporate:\n");
+    } else {
+        prompt.push_str("Messages to summarize:\n");
+    }
+    prompt.push_str(&transcript);
+
+    let llm_messages = vec![
+        Message::new(
+            Role::System,
+            "You are a conversation summarizer. Produce a concise bullet-point summary of the \
+             key points, decisions, user preferences, and established facts from the conversation. \
+             Merge with any existing summary provided. Keep the summary under 500 words. \
+             Output ONLY the bullet-point summary, no preamble.",
+        ),
+        Message::new(Role::User, prompt),
+    ];
+
+    match llm.stream_completion(llm_messages, &[], Box::new(|_| true)).await {
+        Ok(response) if !response.text.trim().is_empty() => response.text.trim().to_string(),
+        Ok(_) => {
+            tracing::warn!("context summary generation returned empty");
+            existing_summary.to_string()
+        }
+        Err(e) => {
+            tracing::warn!("context summary generation failed: {e}");
+            existing_summary.to_string()
+        }
+    }
+}
+
 /// A no-op tool executor for use when no MCP servers are configured.
 pub struct NoopToolExecutor;
 
@@ -355,10 +481,22 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let is_first_message = conv.messages.is_empty();
         conv.messages.push(Message::new(Role::User, &prompt));
 
+        // Run compaction if enough messages have been dropped by windowing.
+        if let Some((from, to)) = compaction_range(&conv) {
+            let summary = generate_context_summary(
+                &conv.context_summary,
+                &conv.messages[from..to],
+                &self.llm,
+            )
+            .await;
+            conv.context_summary = summary;
+            conv.compacted_through = to;
+        }
+
         let tool_defs = self.tools.available_tools().await;
 
         for round in 0..MAX_TOOL_ROUNDS {
-            let llm_messages = llm_messages_for_turn(&conv.messages, &tool_defs);
+            let llm_messages = llm_messages_for_turn(&conv.messages, &tool_defs, &conv.context_summary);
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
             let mut visible_chunk_callback = on_chunk;
@@ -401,6 +539,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         MAX_TOOL_ROUNDS
                     );
                     let removed = trim_tool_pairs(&mut conv.messages);
+                    conv.compacted_through = conv.compacted_through.saturating_sub(removed);
                     tracing::info!("removed {removed} messages to reduce context");
                     conv.messages.push(Message::new(
                         Role::System,
@@ -1608,5 +1747,249 @@ mod tests {
                 .content
                 .contains("Available tools in this turn: terminal.")
         );
+    }
+
+    // --- Context windowing tests ---
+
+    #[test]
+    fn llm_messages_for_turn_returns_all_when_under_limit() {
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("assistant-{i}"))
+                }
+            })
+            .collect();
+
+        let result = llm_messages_for_turn(&msgs, &[], "");
+        // System message + all 10 conversation messages
+        assert_eq!(result.len(), 11);
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(result[1].content, "user-0");
+        assert_eq!(result[10].content, "assistant-9");
+    }
+
+    #[test]
+    fn llm_messages_for_turn_windows_when_over_limit() {
+        // Build a conversation larger than MAX_CONTEXT_MESSAGES, using
+        // simple User/Assistant alternation so the cut lands exactly.
+        let count = MAX_CONTEXT_MESSAGES + 20;
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("assistant-{i}"))
+                }
+            })
+            .collect();
+
+        let result = llm_messages_for_turn(&msgs, &[], "");
+        // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
+        // a User message (even index), so the window starts exactly there.
+        // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
+        assert_eq!(result.len(), MAX_CONTEXT_MESSAGES + 1);
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(result[1].role, Role::User);
+        assert_eq!(result[1].content, format!("user-20"));
+    }
+
+    #[test]
+    fn llm_messages_for_turn_snaps_to_user_boundary() {
+        // Simulate a conversation where the naive cut point would land in
+        // the middle of a tool-call/result group.
+        let mut msgs = Vec::new();
+        // Pad with enough User/Assistant pairs so the total exceeds the limit.
+        // We need the cut point to land on a non-User message.
+        let padding = MAX_CONTEXT_MESSAGES + 4;
+        for i in 0..padding {
+            if i % 2 == 0 {
+                msgs.push(Message::new(Role::User, format!("user-{i}")));
+            } else {
+                msgs.push(Message::new(Role::Assistant, format!("asst-{i}")));
+            }
+        }
+        // Now append a tool-call group at the end: assistant(tool_calls) + tool result + user
+        msgs.push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+            "c1",
+            "tool_a",
+            "{}",
+        )]));
+        msgs.push(Message::tool_result("c1", "result"));
+        msgs.push(Message::new(Role::User, "final-user"));
+        msgs.push(Message::new(Role::Assistant, "final-reply"));
+
+        let result = llm_messages_for_turn(&msgs, &[], "");
+
+        // The first conversation message (after System) must be a User message.
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(result[1].role, Role::User);
+
+        // The tail must be preserved intact.
+        let last = result.last().unwrap();
+        assert_eq!(last.content, "final-reply");
+    }
+
+    // --- Compaction tests ---
+
+    #[test]
+    fn compaction_range_returns_none_under_limit() {
+        let mut conv = Conversation::new("c1", "Test");
+        for i in 0..10 {
+            conv.messages.push(Message::new(Role::User, format!("msg-{i}")));
+        }
+        assert!(compaction_range(&conv).is_none());
+    }
+
+    #[test]
+    fn compaction_range_returns_some_on_first_overflow() {
+        let mut conv = Conversation::new("c1", "Test");
+        let count = MAX_CONTEXT_MESSAGES + 10;
+        for i in 0..count {
+            if i % 2 == 0 {
+                conv.messages.push(Message::new(Role::User, format!("user-{i}")));
+            } else {
+                conv.messages.push(Message::new(Role::Assistant, format!("asst-{i}")));
+            }
+        }
+        let range = compaction_range(&conv);
+        assert!(range.is_some());
+        let (from, to) = range.unwrap();
+        assert_eq!(from, 0);
+        assert!(to > 0);
+        assert!(to <= count);
+    }
+
+    #[test]
+    fn compaction_range_respects_interval() {
+        let mut conv = Conversation::new("c1", "Test");
+        let count = MAX_CONTEXT_MESSAGES + 10;
+        for i in 0..count {
+            if i % 2 == 0 {
+                conv.messages.push(Message::new(Role::User, format!("user-{i}")));
+            } else {
+                conv.messages.push(Message::new(Role::Assistant, format!("asst-{i}")));
+            }
+        }
+        // Simulate first compaction already done
+        let start = window_start(&conv.messages);
+        conv.compacted_through = start;
+
+        // No new messages dropped beyond compacted_through → None
+        assert!(compaction_range(&conv).is_none());
+
+        // Add COMPACTION_INTERVAL more messages so window slides
+        for i in 0..COMPACTION_INTERVAL {
+            conv.messages.push(Message::new(Role::User, format!("extra-user-{i}")));
+            conv.messages.push(Message::new(Role::Assistant, format!("extra-asst-{i}")));
+        }
+        let range = compaction_range(&conv);
+        assert!(range.is_some());
+        let (from, to) = range.unwrap();
+        assert_eq!(from, start);
+        assert!(to > start);
+    }
+
+    #[test]
+    fn llm_messages_for_turn_injects_summary_when_windowing() {
+        let count = MAX_CONTEXT_MESSAGES + 20;
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("assistant-{i}"))
+                }
+            })
+            .collect();
+
+        let result = llm_messages_for_turn(&msgs, &[], "- User prefers dark mode");
+
+        // System prompt, then summary system message, then windowed messages
+        assert_eq!(result[0].role, Role::System);
+        assert!(result[0].content.contains("Adele"));
+
+        assert_eq!(result[1].role, Role::System);
+        assert!(result[1].content.contains("[Summary of earlier conversation]"));
+        assert!(result[1].content.contains("User prefers dark mode"));
+
+        assert_eq!(result[2].role, Role::User);
+    }
+
+    #[test]
+    fn llm_messages_for_turn_omits_summary_when_under_limit() {
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("asst-{i}"))
+                }
+            })
+            .collect();
+
+        let result = llm_messages_for_turn(&msgs, &[], "- Some summary");
+
+        // No summary injected when under limit
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(result[1].role, Role::User);
+        assert!(!result[0].content.contains("Summary of earlier conversation"));
+    }
+
+    #[test]
+    fn llm_messages_for_turn_omits_empty_summary_when_windowing() {
+        let count = MAX_CONTEXT_MESSAGES + 20;
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("asst-{i}"))
+                }
+            })
+            .collect();
+
+        let result = llm_messages_for_turn(&msgs, &[], "");
+
+        // System prompt directly followed by windowed messages — no summary
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(result[1].role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn generate_context_summary_produces_summary() {
+        let messages = vec![
+            Message::new(Role::User, "What is Rust?"),
+            Message::new(Role::Assistant, "Rust is a systems programming language."),
+            Message::new(Role::User, "What about lifetimes?"),
+            Message::new(Role::Assistant, "Lifetimes ensure references are valid."),
+        ];
+        let llm = MockLlm::new(vec!["- Discussed Rust and lifetimes"]);
+        let result = generate_context_summary("", &messages, &llm).await;
+        assert_eq!(result, "- Discussed Rust and lifetimes");
+    }
+
+    #[tokio::test]
+    async fn generate_context_summary_falls_back_on_failure() {
+        let messages = vec![
+            Message::new(Role::User, "Hello"),
+            Message::new(Role::Assistant, "Hi"),
+        ];
+        let llm = FailingLlm::new(vec![], 0);
+        let result = generate_context_summary("existing summary", &messages, &llm).await;
+        assert_eq!(result, "existing summary");
+    }
+
+    #[tokio::test]
+    async fn generate_context_summary_returns_existing_for_tool_only_messages() {
+        let messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
+            Message::tool_result("c1", "result"),
+        ];
+        let llm = MockLlm::new(vec!["should not be called"]);
+        let result = generate_context_summary("old summary", &messages, &llm).await;
+        assert_eq!(result, "old summary");
     }
 }

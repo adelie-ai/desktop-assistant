@@ -34,6 +34,12 @@ pub struct Conversation {
     #[serde(default)]
     pub updated_at: String,
     pub messages: Vec<Message>,
+    /// Rolling summary of messages dropped by context windowing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_summary: String,
+    /// Message index up to which compaction has been performed.
+    #[serde(default)]
+    pub compacted_through: usize,
 }
 
 impl Conversation {
@@ -44,6 +50,8 @@ impl Conversation {
             created_at: String::new(),
             updated_at: String::new(),
             messages: Vec::new(),
+            context_summary: String::new(),
+            compacted_through: 0,
         }
     }
 }
@@ -146,5 +154,33 @@ mod tests {
         let conv: Conversation = serde_json::from_str(json).unwrap();
         assert_eq!(conv.created_at, "");
         assert_eq!(conv.updated_at, "");
+    }
+
+    #[test]
+    fn conversation_deserializes_without_compaction_fields() {
+        let json = r#"{"id":"id-1","title":"Chat","messages":[]}"#;
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert_eq!(conv.context_summary, "");
+        assert_eq!(conv.compacted_through, 0);
+    }
+
+    #[test]
+    fn conversation_serialization_roundtrip_with_compaction() {
+        let mut conv = Conversation::new("id-1", "Chat");
+        conv.context_summary = "User asked about Rust lifetimes.".to_string();
+        conv.compacted_through = 25;
+        conv.messages.push(Message::new(Role::User, "test"));
+
+        let json = serde_json::to_string(&conv).unwrap();
+        let deserialized: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.context_summary, "User asked about Rust lifetimes.");
+        assert_eq!(deserialized.compacted_through, 25);
+    }
+
+    #[test]
+    fn conversation_skips_empty_context_summary_in_serialization() {
+        let conv = Conversation::new("id-1", "Chat");
+        let json = serde_json::to_string(&conv).unwrap();
+        assert!(!json.contains("context_summary"));
     }
 }
