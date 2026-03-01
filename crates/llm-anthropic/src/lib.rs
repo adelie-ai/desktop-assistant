@@ -279,9 +279,10 @@ impl LlmClient for AnthropicClient {
             tools: api_tools,
         };
 
+        let url = format!("{}/v1/messages", self.base_url);
         let response = self
             .client
-            .post(format!("{}/v1/messages", self.base_url))
+            .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
@@ -290,8 +291,8 @@ impl LlmClient for AnthropicClient {
             .await
             .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if !status.is_success() {
             let body = response
                 .text()
                 .await

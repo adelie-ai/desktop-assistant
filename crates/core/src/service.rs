@@ -104,9 +104,21 @@ fn sanitize_assistant_text(text: &str) -> String {
     sanitized
 }
 
+use crate::ports::llm::is_retryable_error;
+
 fn user_visible_llm_error_message(error: &CoreError) -> String {
     let raw = error.to_string();
     let normalized = raw.to_ascii_lowercase();
+
+    if normalized.contains("429")
+        || normalized.contains("rate_limit")
+        || normalized.contains("529")
+        || normalized.contains("overloaded")
+    {
+        return format!(
+            "The API rate limit was exceeded. Please wait a moment and try again. Details: {raw}"
+        );
+    }
 
     if normalized.contains("does not support tools") {
         return format!(
@@ -529,7 +541,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .await
             {
                 Ok(r) => r,
-                Err(e) if round > 0 => {
+                Err(e) if round > 0 && !is_retryable_error(&e) => {
                     // Mid-loop LLM error (e.g. context too long) — trim old
                     // tool call/result pairs and tell the LLM what happened
                     // so it can adjust its approach.
@@ -1239,6 +1251,7 @@ mod tests {
         responses: Mutex<Vec<LlmResponse>>,
         fail_on_call: usize,
         call_count: Mutex<usize>,
+        error_message: String,
     }
 
     impl FailingLlm {
@@ -1247,7 +1260,13 @@ mod tests {
                 responses: Mutex::new(responses),
                 fail_on_call,
                 call_count: Mutex::new(0),
+                error_message: "context_length_exceeded".into(),
             }
+        }
+
+        fn with_error(mut self, msg: &str) -> Self {
+            self.error_message = msg.into();
+            self
         }
     }
 
@@ -1266,7 +1285,7 @@ mod tests {
             };
 
             if call_idx == self.fail_on_call {
-                return Err(CoreError::Llm("context_length_exceeded".into()));
+                return Err(CoreError::Llm(self.error_message.clone()));
             }
 
             let response = {
@@ -1390,6 +1409,75 @@ mod tests {
         );
         let msg = user_visible_llm_error_message(&err);
         assert!(msg.contains("still downloading or loading"));
+    }
+
+    #[test]
+    fn user_visible_error_for_rate_limit_429() {
+        let err = CoreError::Llm(
+            r#"Anthropic API error (HTTP 429 Too Many Requests): {"error":{"type":"rate_limit_error","message":"Rate limited"}}"#
+                .to_string(),
+        );
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("rate limit was exceeded"));
+    }
+
+    #[test]
+    fn user_visible_error_for_overloaded_529() {
+        let err = CoreError::Llm(
+            "Anthropic API error (HTTP 529): overloaded".to_string(),
+        );
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("rate limit was exceeded"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_error_mid_loop_does_not_trim_context() {
+        let tools = vec![ToolDefinition::new(
+            "my_tool",
+            "A tool",
+            serde_json::json!({}),
+        )];
+
+        let responses = vec![
+            // Round 0: LLM requests tool call
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "my_tool", "{}")]),
+            // Round 1: fails with 429 (simulated by FailingLlm, call index 1)
+            // — should NOT trim, should surface as user-visible error
+        ];
+
+        let mut tool_results = HashMap::new();
+        tool_results.insert("my_tool".to_string(), "result".to_string());
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            FailingLlm::new(responses, 1)
+                .with_error("Anthropic API error (HTTP 429 Too Many Requests): rate_limit_error"),
+            MockToolExecutor::new(tools, tool_results),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "Use my tool".into(), noop_callback())
+            .await
+            .unwrap();
+
+        // Should get a rate-limit user-visible message, not "adjusted my approach"
+        assert!(result.contains("rate limit was exceeded"));
+
+        // Verify NO system message about trimming was added
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let has_trim_msg = updated
+            .messages
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("context became too long"));
+        assert!(!has_trim_msg, "rate limit error should not trigger context trimming");
     }
 
     #[tokio::test]

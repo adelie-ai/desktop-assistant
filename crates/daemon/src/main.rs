@@ -6,7 +6,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, RetryingLlmClient};
 use tracing_subscriber::EnvFilter;
 
 mod app;
@@ -466,6 +466,7 @@ async fn main() -> Result<()> {
         store::default_conversation_store_path().display()
     );
 
+    let llm = RetryingLlmClient::new(llm, 3);
     let conversation_service = Arc::new(ConversationHandler::with_tools(
         conversation_store,
         llm,
