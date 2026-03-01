@@ -2,11 +2,10 @@ use std::collections::HashMap;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
-use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::Mutex;
 
-use crate::builtin::{BuiltinToolService, PersistenceConfig};
+pub use crate::builtin::BuiltinToolService;
 use crate::{McpClient, McpError};
 
 /// Configuration for an MCP server.
@@ -20,39 +19,6 @@ pub struct McpServerConfig {
     /// exposed as `{namespace}__{tool_name}`. When absent, tool names are
     /// passed through unchanged.
     pub namespace: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BuiltinPersistenceConfig {
-    pub enabled: bool,
-    pub remote_url: Option<String>,
-    pub remote_name: String,
-    pub push_on_update: bool,
-}
-
-impl Default for BuiltinPersistenceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            remote_url: None,
-            remote_name: "origin".to_string(),
-            push_on_update: true,
-        }
-    }
-}
-
-impl BuiltinPersistenceConfig {
-    fn into_builtin(self) -> Option<PersistenceConfig> {
-        if !self.enabled {
-            return None;
-        }
-
-        Some(PersistenceConfig {
-            remote_url: self.remote_url,
-            remote_name: self.remote_name,
-            push_on_update: self.push_on_update,
-        })
-    }
 }
 
 /// Adapter implementing `ToolExecutor` by managing multiple MCP server connections.
@@ -69,53 +35,16 @@ pub struct McpToolExecutor {
     cached_resources: Mutex<Vec<serde_json::Value>>,
     /// Cached metadata for MCP prompts across all connected servers.
     cached_prompts: Mutex<Vec<serde_json::Value>>,
-    /// Built-in in-process tools (preferences + factual memory).
+    /// Built-in in-process tools (knowledge base + tool search + sys props).
     builtin_tools: BuiltinToolService,
 }
 
 impl McpToolExecutor {
     pub fn new(configs: Vec<McpServerConfig>) -> Self {
-        Self::new_with_persistence(configs, None)
+        Self::with_builtin_tools(configs, BuiltinToolService::new())
     }
 
-    pub fn new_with_persistence(
-        configs: Vec<McpServerConfig>,
-        persistence: Option<BuiltinPersistenceConfig>,
-    ) -> Self {
-        let builtin_tools = match persistence {
-            Some(config) => {
-                BuiltinToolService::from_default_paths_with_persistence(config.into_builtin())
-            }
-            None => BuiltinToolService::from_default_paths(),
-        };
-        Self::with_builtin_tools(configs, builtin_tools)
-    }
-
-    pub fn new_with_embedding(
-        configs: Vec<McpServerConfig>,
-        embed_fn: EmbedFn,
-        embedding_model: String,
-    ) -> Self {
-        Self::new_with_embedding_and_persistence(configs, embed_fn, embedding_model, None)
-    }
-
-    pub fn new_with_embedding_and_persistence(
-        configs: Vec<McpServerConfig>,
-        embed_fn: EmbedFn,
-        embedding_model: String,
-        persistence: Option<BuiltinPersistenceConfig>,
-    ) -> Self {
-        let builtin_tools = match persistence {
-            Some(config) => {
-                BuiltinToolService::from_default_paths_with_persistence(config.into_builtin())
-            }
-            None => BuiltinToolService::from_default_paths(),
-        }
-        .with_embedding(embed_fn, embedding_model);
-        Self::with_builtin_tools(configs, builtin_tools)
-    }
-
-    fn with_builtin_tools(
+    pub fn with_builtin_tools(
         configs: Vec<McpServerConfig>,
         builtin_tools: BuiltinToolService,
     ) -> Self {
@@ -388,13 +317,35 @@ impl McpToolExecutor {
 }
 
 impl ToolExecutor for McpToolExecutor {
-    async fn available_tools(&self) -> Vec<ToolDefinition> {
+    async fn core_tools(&self) -> Vec<ToolDefinition> {
+        // For now, return all tools (builtin + MCP).
+        // Once tool_registry is wired, this will return only is_core=true tools.
         if let Err(e) = self.maybe_refresh_metadata().await {
             tracing::warn!("failed to refresh MCP tools cache: {e}");
         }
         let mut tools = self.cached_tools.lock().await.clone();
         tools.extend(self.builtin_tools.tool_definitions());
         tools
+    }
+
+    async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+        // Will be backed by PgToolRegistryStore once wired in Phase 6.
+        Ok(vec![])
+    }
+
+    async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+        // Check builtins first
+        if BuiltinToolService::supports_tool(name) {
+            return Ok(self
+                .builtin_tools
+                .tool_definitions()
+                .into_iter()
+                .find(|t| t.name == name));
+        }
+
+        // Check cached MCP tools
+        let cached = self.cached_tools.lock().await;
+        Ok(cached.iter().find(|t| t.name == name).cloned())
     }
 
     async fn execute_tool(
@@ -481,14 +432,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_no_configs_returns_empty_tools() {
+    async fn executor_no_configs_returns_builtin_tools() {
         let executor = McpToolExecutor::new(vec![]);
-        let tools = executor.available_tools().await;
+        let tools = executor.core_tools().await;
         assert!(!tools.is_empty());
         assert!(
             tools
                 .iter()
-                .any(|tool| tool.name == "builtin_preferences_remember")
+                .any(|tool| tool.name == "builtin_knowledge_base_write")
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "builtin_tool_search")
         );
     }
 
@@ -513,22 +469,22 @@ mod tests {
     #[tokio::test]
     async fn executor_includes_builtin_tools() {
         let executor = McpToolExecutor::new(vec![]);
-        let tools = executor.available_tools().await;
+        let tools = executor.core_tools().await;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"builtin_preferences_remember"));
-        assert!(names.contains(&"builtin_memory_update"));
+        assert!(names.contains(&"builtin_knowledge_base_write"));
+        assert!(names.contains(&"builtin_knowledge_base_search"));
+        assert!(names.contains(&"builtin_knowledge_base_delete"));
+        assert!(names.contains(&"builtin_tool_search"));
+        assert!(names.contains(&"builtin_sys_props"));
     }
 
     #[tokio::test]
-    async fn executor_executes_builtin_tool() {
+    async fn executor_executes_builtin_sys_props() {
         let executor = McpToolExecutor::new(vec![]);
         let result = executor
             .execute_tool(
-                "builtin_preferences_remember",
-                serde_json::json!({
-                    "key": "editor",
-                    "value": "vscode"
-                }),
+                "builtin_sys_props",
+                serde_json::json!({}),
             )
             .await
             .unwrap();

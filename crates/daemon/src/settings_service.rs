@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
-    ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
-    SettingsService,
+    ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
+    PersistenceSettingsView, SettingsService,
 };
 
 use crate::config;
@@ -129,6 +129,24 @@ impl SettingsService for DaemonSettingsService {
             push_on_update,
         )
         .map_err(|e| CoreError::SystemService(e.to_string()))
+    }
+
+    async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+        let (url, max_connections) = config::get_database_settings_view(&self.config_path)
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        Ok(DatabaseSettingsView {
+            url,
+            max_connections,
+        })
+    }
+
+    async fn set_database_settings(
+        &self,
+        url: Option<String>,
+        max_connections: u32,
+    ) -> Result<(), CoreError> {
+        config::set_database_settings(&self.config_path, url.as_deref(), max_connections)
+            .map_err(|e| CoreError::SystemService(e.to_string()))
     }
 }
 

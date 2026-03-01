@@ -16,6 +16,12 @@ pub mod store;
 /// Tool executor port — outbound trait for executing tools via MCP or other providers.
 pub mod tools;
 
+/// Knowledge base store port — outbound trait for unified knowledge persistence.
+pub mod knowledge;
+
+/// Tool registry store port — outbound trait for tool definition persistence and search.
+pub mod tool_registry;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -28,5 +34,7 @@ mod tests {
         fn _assert_system_exists<T: super::outbound::SystemServiceClient>() {}
         fn _assert_tools_exists<T: super::tools::ToolExecutor>() {}
         fn _assert_embedding_exists<T: super::embedding::EmbeddingClient>() {}
+        fn _assert_knowledge_exists<T: super::knowledge::KnowledgeBaseStore>() {}
+        fn _assert_tool_registry_exists<T: super::tool_registry::ToolRegistryStore>() {}
     }
 }

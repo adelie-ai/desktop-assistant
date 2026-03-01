@@ -111,7 +111,7 @@ async fn executor_with_real_mcp_server() {
     executor.start().await.expect("failed to start executor");
 
     // Verify tools are available
-    let tools = executor.available_tools().await;
+    let tools = executor.core_tools().await;
     assert!(
         !tools.is_empty(),
         "executor should have tools from fileio-mcp"

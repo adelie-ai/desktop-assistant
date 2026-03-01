@@ -19,6 +19,32 @@ pub struct DaemonConfig {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DatabaseConfig {
+    /// PostgreSQL connection URL (e.g. "postgres://user:pass@localhost/desktop_assistant").
+    /// Falls back to `DESKTOP_ASSISTANT_DATABASE_URL` env var.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Maximum number of connections in the pool.
+    #[serde(default = "default_database_max_connections")]
+    pub max_connections: u32,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            max_connections: default_database_max_connections(),
+        }
+    }
+}
+
+fn default_database_max_connections() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -436,6 +462,25 @@ pub fn set_persistence_settings(
     save_daemon_config(path, &config)
 }
 
+pub fn get_database_settings_view(path: &Path) -> anyhow::Result<(String, u32)> {
+    let config = load_daemon_config(path)?;
+    let (url, max_connections) = resolve_database_config(config.as_ref());
+    Ok((url.unwrap_or_default(), max_connections))
+}
+
+pub fn set_database_settings(
+    path: &Path,
+    url: Option<&str>,
+    max_connections: u32,
+) -> anyhow::Result<()> {
+    let mut config = load_daemon_config(path)?.unwrap_or_default();
+
+    config.database.url = normalize_optional_value(url);
+    config.database.max_connections = max_connections;
+
+    save_daemon_config(path, &config)
+}
+
 pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
     let connector = connector.trim().to_lowercase();
     let connector = if connector.is_empty() {
@@ -534,6 +579,21 @@ pub fn resolve_persistence_config(config: Option<&DaemonConfig>) -> ResolvedPers
         remote_name,
         push_on_update,
     }
+}
+
+/// Resolve the database URL from config, then env var fallback.
+/// Returns `None` if no database URL is configured anywhere.
+pub fn resolve_database_config(config: Option<&DaemonConfig>) -> (Option<String>, u32) {
+    let db = config.map(|c| &c.database);
+    let url = db
+        .and_then(|d| d.url.clone())
+        .or_else(|| std::env::var("DESKTOP_ASSISTANT_DATABASE_URL").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let max_conns = db
+        .map(|d| d.max_connections)
+        .unwrap_or_else(default_database_max_connections);
+    (url, max_conns)
 }
 
 fn default_embedding_model(connector: &str) -> String {

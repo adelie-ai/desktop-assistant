@@ -2,9 +2,25 @@ use crate::CoreError;
 use crate::domain::ToolDefinition;
 
 /// Outbound port for executing tools (e.g., via MCP servers).
+///
+/// Supports dynamic tool discovery: `core_tools()` returns the small set
+/// always sent to the LLM, while `search_tools()` and `tool_definition()`
+/// allow on-demand lookup of additional tools.
 pub trait ToolExecutor: Send + Sync {
-    /// Returns all available tools from all connected tool providers.
-    fn available_tools(&self) -> impl std::future::Future<Output = Vec<ToolDefinition>> + Send;
+    /// Returns the core tools that should always be included in LLM requests.
+    fn core_tools(&self) -> impl std::future::Future<Output = Vec<ToolDefinition>> + Send;
+
+    /// Search for tools matching a query. Used by the `builtin_tool_search` tool.
+    fn search_tools(
+        &self,
+        query: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<ToolDefinition>, CoreError>> + Send;
+
+    /// Look up a single tool definition by name.
+    fn tool_definition(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<ToolDefinition>, CoreError>> + Send;
 
     /// Execute a tool by name with the given arguments.
     /// Returns the tool's text output.
@@ -24,8 +40,19 @@ mod tests {
     }
 
     impl ToolExecutor for MockToolExecutor {
-        async fn available_tools(&self) -> Vec<ToolDefinition> {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
             self.tools.clone()
+        }
+
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+
+        async fn tool_definition(
+            &self,
+            name: &str,
+        ) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
         }
 
         async fn execute_tool(
@@ -50,7 +77,7 @@ mod tests {
                 serde_json::json!({"type": "object"}),
             )],
         };
-        let tools = executor.available_tools().await;
+        let tools = executor.core_tools().await;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "test_tool");
     }
@@ -78,5 +105,25 @@ mod tests {
             .execute_tool("nonexistent", serde_json::json!({}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    #[tokio::test]
+    async fn mock_executor_searches_tools() {
+        let executor = MockToolExecutor { tools: vec![] };
+        let results = executor.search_tools("test").await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_executor_looks_up_tool_definition() {
+        let executor = MockToolExecutor {
+            tools: vec![ToolDefinition::new("my_tool", "desc", serde_json::json!({}))],
+        };
+        let def = executor.tool_definition("my_tool").await.unwrap();
+        assert!(def.is_some());
+        assert_eq!(def.unwrap().name, "my_tool");
+
+        let missing = executor.tool_definition("missing").await.unwrap();
+        assert!(missing.is_none());
     }
 }

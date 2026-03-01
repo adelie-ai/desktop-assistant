@@ -15,8 +15,8 @@ use tower::ServiceExt;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
 use desktop_assistant_core::ports::inbound::{
-    AssistantService, ConnectorDefaultsView, ConversationService, EmbeddingsSettingsView,
-    LlmSettingsView, PersistenceSettingsView, SettingsService,
+    AssistantService, ConnectorDefaultsView, ConversationService, DatabaseSettingsView,
+    EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView, SettingsService,
 };
 use desktop_assistant_core::ports::llm::ChunkCallback;
 
@@ -222,6 +222,19 @@ impl SettingsService for FakeSettings {
     ) -> Result<(), CoreError> {
         Ok(())
     }
+    async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+        Ok(DatabaseSettingsView {
+            url: String::new(),
+            max_connections: 5,
+        })
+    }
+    async fn set_database_settings(
+        &self,
+        _url: Option<String>,
+        _max_connections: u32,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -363,6 +376,21 @@ impl SettingsService for StatefulSettings {
             state.persistence.remote_name = remote_name;
         }
         state.persistence.push_on_update = push_on_update;
+        Ok(())
+    }
+
+    async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+        Ok(DatabaseSettingsView {
+            url: String::new(),
+            max_connections: 5,
+        })
+    }
+
+    async fn set_database_settings(
+        &self,
+        _url: Option<String>,
+        _max_connections: u32,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
 }

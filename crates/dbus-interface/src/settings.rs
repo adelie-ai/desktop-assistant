@@ -437,6 +437,37 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .map_err(to_fdo_error)
     }
 
+    /// Return database settings.
+    ///
+    /// Returns: (url, max_connections)
+    async fn get_database_settings(&self) -> fdo::Result<(String, u32)> {
+        let settings = self
+            .service
+            .get_database_settings()
+            .await
+            .map_err(to_fdo_error)?;
+
+        Ok((settings.url, settings.max_connections))
+    }
+
+    /// Update database settings. Empty url clears it.
+    async fn set_database_settings(
+        &self,
+        url: &str,
+        max_connections: u32,
+    ) -> fdo::Result<()> {
+        let url = if url.trim().is_empty() {
+            None
+        } else {
+            Some(url.to_string())
+        };
+
+        self.service
+            .set_database_settings(url, max_connections)
+            .await
+            .map_err(to_fdo_error)
+    }
+
     /// Return aggregate config tuple:
     /// (llm_connector, llm_model, llm_base_url, llm_has_api_key,
     ///  embeddings_connector, embeddings_model, embeddings_base_url, embeddings_has_api_key, embeddings_available, embeddings_is_default,
@@ -565,8 +596,8 @@ mod tests {
     use super::*;
     use desktop_assistant_core::CoreError;
     use desktop_assistant_core::ports::inbound::{
-        ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
-        SettingsService,
+        ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
+        PersistenceSettingsView, SettingsService,
     };
     use std::sync::Mutex;
 
@@ -575,6 +606,7 @@ mod tests {
         llm: LlmSettingsView,
         embeddings: EmbeddingsSettingsView,
         persistence: PersistenceSettingsView,
+        database: DatabaseSettingsView,
         api_key_set: bool,
     }
 
@@ -605,6 +637,10 @@ mod tests {
                         remote_url: String::new(),
                         remote_name: "origin".to_string(),
                         push_on_update: true,
+                    },
+                    database: DatabaseSettingsView {
+                        url: String::new(),
+                        max_connections: 5,
                     },
                     api_key_set: false,
                 }),
@@ -711,6 +747,21 @@ mod tests {
                 state.persistence.remote_name = remote_name;
             }
             state.persistence.push_on_update = push_on_update;
+            Ok(())
+        }
+
+        async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+            Ok(self.state.lock().unwrap().database.clone())
+        }
+
+        async fn set_database_settings(
+            &self,
+            url: Option<String>,
+            max_connections: u32,
+        ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            state.database.url = url.unwrap_or_default();
+            state.database.max_connections = max_connections;
             Ok(())
         }
     }

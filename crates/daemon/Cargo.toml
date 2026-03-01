@@ -14,6 +14,7 @@ desktop-assistant-llm-openai.workspace = true
 desktop-assistant-llm-ollama.workspace = true
 desktop-assistant-llm-bedrock.workspace = true
 desktop-assistant-mcp-client.workspace = true
+desktop-assistant-storage.workspace = true
 tokio.workspace = true
 zbus.workspace = true
 anyhow.workspace = true

@@ -207,6 +207,50 @@ KCM.SimpleKCM {
                     width: parent.width
                     spacing: 12
 
+                    Kirigami.Separator { Layout.fillWidth: true }
+
+                    QQC2.Label {
+                        font.bold: true
+                        text: "Database"
+                    }
+
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: "Optional PostgreSQL database for structured storage. Leave the URL empty to use the built-in SQLite default."
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.Label { text: "URL" }
+                        QQC2.TextField {
+                            id: dbUrlField
+                            Layout.fillWidth: true
+                            placeholderText: "postgres://user:pass@localhost/dbname"
+                            text: kcm.dbUrl
+                            onTextEdited: kcm.dbUrl = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        QQC2.Label { text: "Max Connections" }
+                        QQC2.SpinBox {
+                            id: dbMaxConnectionsBox
+                            from: 1
+                            to: 100
+                            value: kcm.dbMaxConnections
+                            onValueModified: kcm.dbMaxConnections = value
+                        }
+                    }
+
+                    Kirigami.Separator { Layout.fillWidth: true }
+
+                    QQC2.Label {
+                        font.bold: true
+                        text: "Git Versioning"
+                    }
+
                     QQC2.Label {
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap
@@ -461,6 +505,18 @@ KCM.SimpleKCM {
             function onEmbBaseUrlChanged() {
                 if (embBaseUrlField.text !== kcm.embBaseUrl) {
                     embBaseUrlField.text = kcm.embBaseUrl
+                }
+            }
+
+            function onDbUrlChanged() {
+                if (dbUrlField.text !== kcm.dbUrl) {
+                    dbUrlField.text = kcm.dbUrl
+                }
+            }
+
+            function onDbMaxConnectionsChanged() {
+                if (dbMaxConnectionsBox.value !== kcm.dbMaxConnections) {
+                    dbMaxConnectionsBox.value = kcm.dbMaxConnections
                 }
             }
 

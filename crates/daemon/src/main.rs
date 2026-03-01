@@ -20,7 +20,7 @@ use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
 use desktop_assistant_dbus::settings::DbusSettingsAdapter;
 use desktop_assistant_mcp_client::config as mcp_config;
-use desktop_assistant_mcp_client::executor::{BuiltinPersistenceConfig, McpToolExecutor};
+use desktop_assistant_mcp_client::executor::{BuiltinToolService, McpToolExecutor};
 use desktop_assistant_ws as ws;
 use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
@@ -183,6 +183,63 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+/// Enum wrapper to dispatch between conversation store backends at runtime.
+enum AnyConversationStore {
+    Json(PersistentConversationStore),
+    Postgres(desktop_assistant_storage::PgConversationStore),
+}
+
+impl desktop_assistant_core::ports::store::ConversationStore for AnyConversationStore {
+    async fn create(
+        &self,
+        conv: desktop_assistant_core::domain::Conversation,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Json(s) => s.create(conv).await,
+            Self::Postgres(s) => s.create(conv).await,
+        }
+    }
+
+    async fn get(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<desktop_assistant_core::domain::Conversation, CoreError> {
+        match self {
+            Self::Json(s) => s.get(id).await,
+            Self::Postgres(s) => s.get(id).await,
+        }
+    }
+
+    async fn list(
+        &self,
+    ) -> Result<Vec<desktop_assistant_core::domain::Conversation>, CoreError> {
+        match self {
+            Self::Json(s) => s.list().await,
+            Self::Postgres(s) => s.list().await,
+        }
+    }
+
+    async fn update(
+        &self,
+        conv: desktop_assistant_core::domain::Conversation,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Json(s) => s.update(conv).await,
+            Self::Postgres(s) => s.update(conv).await,
+        }
+    }
+
+    async fn delete(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Json(s) => s.delete(id).await,
+            Self::Postgres(s) => s.delete(id).await,
+        }
     }
 }
 
@@ -397,6 +454,65 @@ async fn main() -> Result<()> {
             }))
         };
 
+    // --- Database (optional) ---
+    let (db_url, db_max_conns) = config::resolve_database_config(daemon_config.as_ref());
+    let pg_pool = if let Some(url) = db_url {
+        tracing::info!("connecting to PostgreSQL (max_connections={})", db_max_conns);
+        match desktop_assistant_storage::create_pool(&url, db_max_conns).await {
+            Ok(pool) => {
+                if let Err(e) = desktop_assistant_storage::run_migrations(&pool).await {
+                    tracing::error!("failed to run database migrations: {e}");
+                    return Err(e.into());
+                }
+                tracing::info!("database migrations applied successfully");
+
+                // One-time JSON → Postgres migration (runs if JSON files exist)
+                let conv_json = store::default_conversation_store_path();
+                let data_home = conv_json.parent().unwrap_or(std::path::Path::new("."));
+                let prefs_json = data_home.join("preferences.json");
+                let memory_json = data_home.join("factual_memory.json");
+
+                if conv_json.exists() || prefs_json.exists() || memory_json.exists() {
+                    // Only migrate if tables are empty (first startup with Postgres)
+                    if conv_json.exists()
+                        && desktop_assistant_storage::is_conversations_table_empty(&pool).await
+                    {
+                        match desktop_assistant_storage::migrate_conversations(&conv_json, &pool).await {
+                            Ok(n) => tracing::info!("migrated {n} conversations from JSON"),
+                            Err(e) => tracing::warn!("conversation migration failed: {e}"),
+                        }
+                    }
+                    if (prefs_json.exists() || memory_json.exists())
+                        && desktop_assistant_storage::is_knowledge_base_table_empty(&pool).await
+                    {
+                        match desktop_assistant_storage::migrate_knowledge(&prefs_json, &memory_json, &pool).await {
+                            Ok(n) => tracing::info!("migrated {n} knowledge entries from JSON"),
+                            Err(e) => tracing::warn!("knowledge migration failed: {e}"),
+                        }
+                    }
+                }
+
+                Some(pool)
+            }
+            Err(e) => {
+                tracing::error!("failed to connect to PostgreSQL: {e}");
+                return Err(e.into());
+            }
+        }
+    } else {
+        tracing::info!("no database URL configured; Postgres features disabled");
+        None
+    };
+
+    // --- Knowledge base & tool registry stores ---
+    let kb_store = pg_pool
+        .as_ref()
+        .map(|pool| Arc::new(desktop_assistant_storage::PgKnowledgeBaseStore::new(pool.clone())));
+
+    let tool_registry_store = pg_pool
+        .as_ref()
+        .map(|pool| Arc::new(desktop_assistant_storage::PgToolRegistryStore::new(pool.clone())));
+
     // Load MCP server configuration
     let mcp_config_path = mcp_config::default_config_path();
     let mcp_configs = mcp_config::load_mcp_configs(&mcp_config_path).unwrap_or_else(|e| {
@@ -404,48 +520,65 @@ async fn main() -> Result<()> {
         Vec::new()
     });
 
-    // Build the MCP tool executor
-    let resolved_persistence = config::resolve_persistence_config(daemon_config.as_ref());
-    let builtin_persistence = if resolved_persistence.enabled {
-        Some(BuiltinPersistenceConfig {
-            enabled: true,
-            remote_url: resolved_persistence.remote_url.clone(),
-            remote_name: resolved_persistence.remote_name.clone(),
-            push_on_update: resolved_persistence.push_on_update,
-        })
-    } else {
-        None
-    };
-
-    if let Some(persistence) = &builtin_persistence {
+    // Build the MCP tool executor with builtin tools
+    let mut builtin_tools = BuiltinToolService::new();
+    if let Some(embed_fn) = embedding_fn {
         tracing::info!(
-            remote_name = persistence.remote_name,
-            push_on_update = persistence.push_on_update,
-            has_remote = persistence.remote_url.is_some(),
-            "built-in memory/preferences git persistence enabled"
+            "enabling built-in vector search with model={}",
+            resolved_emb.model
+        );
+        builtin_tools = builtin_tools.with_embedding(embed_fn);
+    } else {
+        tracing::info!("built-in vector search disabled (no embedding backend available)");
+    }
+
+    if let Some(kb) = &kb_store {
+        tracing::info!("wiring knowledge base store into builtin tools");
+        let kb_w = Arc::clone(kb);
+        let kb_s = Arc::clone(kb);
+        let kb_d = Arc::clone(kb);
+        use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+        builtin_tools = builtin_tools.with_knowledge_base(
+            Arc::new(move |entry, embedding| {
+                let store = Arc::clone(&kb_w);
+                Box::pin(async move { store.write(entry, embedding).await })
+            }),
+            Arc::new(move |query, embedding, tags, limit| {
+                let store = Arc::clone(&kb_s);
+                Box::pin(async move { store.search(&query, embedding, tags, limit).await })
+            }),
+            Arc::new(move |id| {
+                let store = Arc::clone(&kb_d);
+                Box::pin(async move { store.delete(&id).await })
+            }),
         );
     }
 
-    let tool_executor = if let Some(embed_fn) = embedding_fn {
-        tracing::info!(
-            "enabling built-in vector search for preferences/memory with model={}",
-            resolved_emb.model
+    if let Some(tr) = &tool_registry_store {
+        tracing::info!("wiring tool registry store into builtin tools");
+        let tr_s = Arc::clone(tr);
+        let tr_d = Arc::clone(tr);
+        use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
+        builtin_tools = builtin_tools.with_tool_registry(
+            Arc::new(move |query, embedding, limit| {
+                let store = Arc::clone(&tr_s);
+                Box::pin(async move { store.search_tools(&query, embedding, limit).await })
+            }),
+            Arc::new(move |name| {
+                let store = Arc::clone(&tr_d);
+                Box::pin(async move { store.tool_definition(&name).await })
+            }),
         );
-        McpToolExecutor::new_with_embedding_and_persistence(
-            mcp_configs,
-            embed_fn,
-            resolved_emb.model.clone(),
-            builtin_persistence,
-        )
-    } else {
-        tracing::info!("built-in vector search disabled (no embedding backend available)");
-        McpToolExecutor::new_with_persistence(mcp_configs, builtin_persistence)
-    };
+    }
+
+    let tool_executor =
+        McpToolExecutor::with_builtin_tools(mcp_configs, builtin_tools);
     if let Err(e) = tool_executor.start().await {
         tracing::warn!("failed to start MCP servers: {e}");
     }
 
-    let registered_tools = tool_executor.tools_by_service().await;
+    // Register discovered MCP tools in the tool registry (with embeddings)
+    let registered_tools: Vec<(String, String)> = tool_executor.tools_by_service().await;
     if registered_tools.is_empty() {
         tracing::info!("MCP startup complete: no tools registered");
     } else {
@@ -458,13 +591,46 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(tr) = &tool_registry_store {
+        use desktop_assistant_core::ports::tools::ToolExecutor;
+        use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
+
+        // Register builtin tools as core (always sent to LLM)
+        let builtin_defs: Vec<_> = tool_executor.core_tools().await
+            .into_iter()
+            .filter(|t| t.name.starts_with("builtin_"))
+            .collect();
+        let builtin_embeddings = vec![None; builtin_defs.len()];
+        if let Err(e) = tr.register_tools(builtin_defs, "builtin", true, builtin_embeddings).await {
+            tracing::warn!("failed to register builtin tools in registry: {e}");
+        }
+
+        // Register MCP tools as non-core (discoverable via tool_search)
+        let mcp_defs: Vec<_> = tool_executor.core_tools().await
+            .into_iter()
+            .filter(|t| !t.name.starts_with("builtin_"))
+            .collect();
+        let mcp_embeddings = vec![None; mcp_defs.len()];
+        if !mcp_defs.is_empty() {
+            if let Err(e) = tr.register_tools(mcp_defs, "mcp", false, mcp_embeddings).await {
+                tracing::warn!("failed to register MCP tools in registry: {e}");
+            }
+        }
+    }
+
     // Build the conversation service with tool support
-    let conversation_store = PersistentConversationStore::from_default_path()
-        .map_err(|e| anyhow::anyhow!("failed to initialize persistent conversation store: {e}"))?;
-    tracing::info!(
-        "conversation persistence enabled at {}",
-        store::default_conversation_store_path().display()
-    );
+    let conversation_store: AnyConversationStore = if let Some(pool) = &pg_pool {
+        tracing::info!("using PostgreSQL conversation store");
+        AnyConversationStore::Postgres(desktop_assistant_storage::PgConversationStore::new(pool.clone()))
+    } else {
+        let store = PersistentConversationStore::from_default_path()
+            .map_err(|e| anyhow::anyhow!("failed to initialize persistent conversation store: {e}"))?;
+        tracing::info!(
+            "using JSON conversation store at {}",
+            store::default_conversation_store_path().display()
+        );
+        AnyConversationStore::Json(store)
+    };
 
     let llm = RetryingLlmClient::new(llm, 3);
     let conversation_service = Arc::new(ConversationHandler::with_tools(

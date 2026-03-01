@@ -24,6 +24,8 @@ class DesktopAssistantKcm : public KQuickConfigModule {
     Q_PROPERTY(QString gitRemoteUrl READ gitRemoteUrl WRITE setGitRemoteUrl NOTIFY gitRemoteUrlChanged)
     Q_PROPERTY(QString gitRemoteName READ gitRemoteName WRITE setGitRemoteName NOTIFY gitRemoteNameChanged)
     Q_PROPERTY(bool gitPushOnUpdate READ gitPushOnUpdate WRITE setGitPushOnUpdate NOTIFY gitPushOnUpdateChanged)
+    Q_PROPERTY(QString dbUrl READ dbUrl WRITE setDbUrl NOTIFY dbUrlChanged)
+    Q_PROPERTY(int dbMaxConnections READ dbMaxConnections WRITE setDbMaxConnections NOTIFY dbMaxConnectionsChanged)
     Q_PROPERTY(QStringList connectionNames READ connectionNames NOTIFY connectionNamesChanged)
     Q_PROPERTY(QString defaultConnectionName READ defaultConnectionName WRITE setDefaultConnectionName NOTIFY defaultConnectionNameChanged)
     Q_PROPERTY(QString selectedConnectionName READ selectedConnectionName WRITE setSelectedConnectionName NOTIFY selectedConnectionNameChanged)
@@ -76,6 +78,12 @@ public:
     bool gitPushOnUpdate() const;
     void setGitPushOnUpdate(bool value);
 
+    QString dbUrl() const;
+    void setDbUrl(const QString &value);
+
+    int dbMaxConnections() const;
+    void setDbMaxConnections(int value);
+
     QStringList connectionNames() const;
 
     QString defaultConnectionName() const;
@@ -123,6 +131,8 @@ Q_SIGNALS:
     void gitRemoteUrlChanged();
     void gitRemoteNameChanged();
     void gitPushOnUpdateChanged();
+    void dbUrlChanged();
+    void dbMaxConnectionsChanged();
     void connectionNamesChanged();
     void defaultConnectionNameChanged();
     void selectedConnectionNameChanged();
@@ -165,6 +175,8 @@ private:
     QString m_gitRemoteUrl;
     QString m_gitRemoteName = QStringLiteral("origin");
     bool m_gitPushOnUpdate = true;
+    QString m_dbUrl;
+    int m_dbMaxConnections = 5;
     QVector<ConnectionProfile> m_connections;
     QString m_defaultConnectionName = QStringLiteral("local");
     QString m_selectedConnectionName = QStringLiteral("local");

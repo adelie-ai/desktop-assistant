@@ -38,6 +38,13 @@ pub struct PersistenceSettingsView {
     pub push_on_update: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct DatabaseSettingsView {
+    /// Empty string means no URL is configured.
+    pub url: String,
+    pub max_connections: u32,
+}
+
 /// Inbound port for health/status queries.
 ///
 /// Any adapter that wants to expose assistant status (D-Bus, HTTP, etc.)
@@ -139,6 +146,16 @@ pub trait SettingsService: Send + Sync {
         remote_url: Option<String>,
         remote_name: Option<String>,
         push_on_update: bool,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn get_database_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<DatabaseSettingsView, CoreError>> + Send;
+
+    fn set_database_settings(
+        &self,
+        url: Option<String>,
+        max_connections: u32,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 

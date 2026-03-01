@@ -292,6 +292,36 @@ void DesktopAssistantKcm::setGitPushOnUpdate(bool value)
     setNeedsSave(true);
 }
 
+QString DesktopAssistantKcm::dbUrl() const
+{
+    return m_dbUrl;
+}
+
+void DesktopAssistantKcm::setDbUrl(const QString &value)
+{
+    if (m_dbUrl == value) {
+        return;
+    }
+    m_dbUrl = value;
+    Q_EMIT dbUrlChanged();
+    setNeedsSave(true);
+}
+
+int DesktopAssistantKcm::dbMaxConnections() const
+{
+    return m_dbMaxConnections;
+}
+
+void DesktopAssistantKcm::setDbMaxConnections(int value)
+{
+    if (m_dbMaxConnections == value) {
+        return;
+    }
+    m_dbMaxConnections = value;
+    Q_EMIT dbMaxConnectionsChanged();
+    setNeedsSave(true);
+}
+
 QStringList DesktopAssistantKcm::connectionNames() const
 {
     QStringList names;
@@ -488,6 +518,21 @@ void DesktopAssistantKcm::load()
     m_gitRemoteName = gitArgs[2].toString();
     m_gitPushOnUpdate = gitArgs[3].toBool();
 
+    QDBusMessage dbReply = iface.call("GetDatabaseSettings");
+    if (setStatusFromDbusError(dbReply)) {
+        return;
+    }
+
+    const auto dbArgs = dbReply.arguments();
+    if (dbArgs.size() < 2) {
+        m_statusText = QStringLiteral("Unexpected GetDatabaseSettings reply");
+        Q_EMIT statusTextChanged();
+        return;
+    }
+
+    m_dbUrl = dbArgs[0].toString();
+    m_dbMaxConnections = dbArgs[1].toInt();
+
     loadWidgetConnectionSettings();
 
     Q_EMIT connectorChanged();
@@ -505,6 +550,8 @@ void DesktopAssistantKcm::load()
     Q_EMIT gitRemoteUrlChanged();
     Q_EMIT gitRemoteNameChanged();
     Q_EMIT gitPushOnUpdateChanged();
+    Q_EMIT dbUrlChanged();
+    Q_EMIT dbMaxConnectionsChanged();
     Q_EMIT connectionNamesChanged();
     Q_EMIT defaultConnectionNameChanged();
     emitConnectionSelectionChanged();
@@ -536,6 +583,15 @@ void DesktopAssistantKcm::save()
         m_gitPushOnUpdate
     );
     if (setStatusFromDbusError(gitSaveReply)) {
+        return;
+    }
+
+    QDBusMessage dbSaveReply = iface.call(
+        "SetDatabaseSettings",
+        m_dbUrl,
+        static_cast<uint>(m_dbMaxConnections)
+    );
+    if (setStatusFromDbusError(dbSaveReply)) {
         return;
     }
 

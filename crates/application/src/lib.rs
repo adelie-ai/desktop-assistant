@@ -526,7 +526,8 @@ mod tests {
         Conversation, ConversationId, ConversationSummary, Message, Role,
     };
     use desktop_assistant_core::ports::inbound::{
-        ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
+        ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
+        PersistenceSettingsView,
     };
     use desktop_assistant_core::ports::llm::ChunkCallback;
     use std::sync::Mutex;
@@ -650,6 +651,19 @@ mod tests {
             _remote_url: Option<String>,
             _remote_name: Option<String>,
             _push_on_update: bool,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+            Ok(DatabaseSettingsView {
+                url: String::new(),
+                max_connections: 5,
+            })
+        }
+        async fn set_database_settings(
+            &self,
+            _url: Option<String>,
+            _max_connections: u32,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -798,6 +812,21 @@ mod tests {
                 state.persistence.remote_name = remote_name;
             }
             state.persistence.push_on_update = push_on_update;
+            Ok(())
+        }
+
+        async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+            Ok(DatabaseSettingsView {
+                url: String::new(),
+                max_connections: 5,
+            })
+        }
+
+        async fn set_database_settings(
+            &self,
+            _url: Option<String>,
+            _max_connections: u32,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
     }

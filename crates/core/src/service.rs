@@ -38,6 +38,7 @@ fn llm_messages_for_turn(
     tool_defs: &[ToolDefinition],
     context_summary: &str,
 ) -> Vec<Message> {
+    let has_tool_search = tool_defs.iter().any(|t| t.name == "builtin_tool_search");
     let tool_note = if tool_defs.is_empty() {
         "No tools are available in this turn.".to_string()
     } else {
@@ -46,7 +47,15 @@ fn llm_messages_for_turn(
             .map(|t| t.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("Available tools in this turn: {names}.")
+        if has_tool_search {
+            format!(
+                "Available tools in this turn: {names}. \
+                 Additional tools may be available — use builtin_tool_search to discover \
+                 tools for tasks not covered by the tools listed above."
+            )
+        } else {
+            format!("Available tools in this turn: {names}.")
+        }
     };
 
     // Apply context windowing: if the conversation exceeds the limit, keep
@@ -376,8 +385,22 @@ async fn generate_context_summary<L: LlmClient>(
 pub struct NoopToolExecutor;
 
 impl ToolExecutor for NoopToolExecutor {
-    async fn available_tools(&self) -> Vec<crate::domain::ToolDefinition> {
+    async fn core_tools(&self) -> Vec<crate::domain::ToolDefinition> {
         Vec::new()
+    }
+
+    async fn search_tools(
+        &self,
+        _query: &str,
+    ) -> Result<Vec<crate::domain::ToolDefinition>, CoreError> {
+        Ok(vec![])
+    }
+
+    async fn tool_definition(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::domain::ToolDefinition>, CoreError> {
+        Ok(None)
     }
 
     async fn execute_tool(
@@ -505,9 +528,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             conv.compacted_through = to;
         }
 
-        let tool_defs = self.tools.available_tools().await;
+        // Dynamic tool discovery: start with core tools, activate more via tool_search.
+        let core_tools = self.tools.core_tools().await;
+        let mut activated_tools: std::collections::HashMap<String, ToolDefinition> =
+            std::collections::HashMap::new();
 
         for round in 0..MAX_TOOL_ROUNDS {
+            // Build the tool set: core + dynamically activated
+            let mut tool_defs: Vec<ToolDefinition> = core_tools.clone();
+            tool_defs.extend(activated_tools.values().cloned());
+
             let llm_messages = llm_messages_for_turn(&conv.messages, &tool_defs, &conv.context_summary);
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
@@ -614,6 +644,35 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     Ok(output) => output,
                     Err(e) => format!("Error: {e}"),
                 };
+
+                // Dynamic activation: if tool_search returned results,
+                // activate the discovered tools for subsequent rounds.
+                if tool_call.name == "builtin_tool_search" {
+                    if let Ok(found) = serde_json::from_str::<serde_json::Value>(&result) {
+                        if let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array()) {
+                            for tool_entry in tools_arr {
+                                if let Some(name) = tool_entry.get("name").and_then(|v| v.as_str())
+                                {
+                                    if !activated_tools.contains_key(name)
+                                        && !core_tools.iter().any(|t| t.name == name)
+                                    {
+                                        if let Ok(Some(def)) =
+                                            self.tools.tool_definition(name).await
+                                        {
+                                            tracing::info!(
+                                                "dynamically activated tool: {}",
+                                                def.name
+                                            );
+                                            activated_tools
+                                                .insert(def.name.clone(), def);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 conv.messages
                     .push(Message::tool_result(&tool_call.id, &result));
             }
@@ -1016,8 +1075,19 @@ mod tests {
     }
 
     impl ToolExecutor for MockToolExecutor {
-        async fn available_tools(&self) -> Vec<ToolDefinition> {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
             self.tools.clone()
+        }
+
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+
+        async fn tool_definition(
+            &self,
+            name: &str,
+        ) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
         }
 
         async fn execute_tool(
@@ -1483,7 +1553,7 @@ mod tests {
     #[tokio::test]
     async fn noop_executor_returns_empty_tools() {
         let executor = NoopToolExecutor;
-        assert!(executor.available_tools().await.is_empty());
+        assert!(executor.core_tools().await.is_empty());
     }
 
     #[tokio::test]
@@ -1557,7 +1627,7 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("search preferences and memory first (project scope first, then global) before non-memory tools")
+                .contains("search the knowledge base first (project scope first, then global) before non-memory tools")
         );
         assert!(
             messages[0]
@@ -1585,52 +1655,41 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("builtin_preferences_remember/search/retrieve/delete")
-        );
-        assert!(
-            messages[0]
-                .content
-                .contains("builtin_memory_remember/search/retrieve/update/delete")
+                .contains("builtin_knowledge_base_write/search/delete")
         );
         assert!(messages[0].content.contains("builtin_sys_props"));
-        assert!(messages[0].content.contains(
-            "Store memory/preferences judiciously: only durable, reusable, high-confidence information"
-        ));
-        assert!(messages[0].content.contains("Memory is prose context"));
         assert!(
             messages[0]
                 .content
-                .contains("Preferences are key/value datapoints")
+                .contains("builtin_tool_search")
         );
         assert!(messages[0].content.contains("Never fabricate tool outputs"));
     }
 
     #[test]
-    fn runtime_instruction_enforces_memory_first_for_user_specific_requests() {
+    fn runtime_instruction_enforces_kb_first_for_user_specific_requests() {
         let priority_rule = "Current-turn user instructions override all stored data.";
-        let memory_first = "If a request is user-specific/project-specific or a reference is unclear, search preferences and memory first (project scope first, then global) before non-memory tools.";
+        let kb_first = "If a request is user-specific/project-specific or a reference is unclear, search the knowledge base first (project scope first, then global) before non-memory tools.";
         let ambiguous_reference =
             "If still unclear, ask one brief clarifying question and do not assume.";
         let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming limitation, after rule 7 when applicable.";
         let no_guessing = "Do not guess user-specific details (project path, run command, package manager, editor, service name, account, or host).";
         let verify_relevant_facts = "Validate facts that are relevant to the request before relying on them, especially user circumstances and temporally variable details (machine settings, personal preferences, and current date/time); use tools when required.";
-        let preference_kv_split = "Preferences are key/value datapoints (defaults, paths, IDs, names, commands, hostnames, and other concrete settings).";
-        let memory_prose_split = "Memory is prose context (background, rationale, corrections, procedural notes, and explanatory details).";
         let no_fabrication =
             "Never fabricate tool outputs or claim a tool succeeded when it did not.";
+        let tool_search_discovery = "Use builtin_tool_search when the user's request requires capabilities not covered by your current tools.";
 
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(priority_rule));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(memory_first));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(kb_first));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(ambiguous_reference));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(no_guessing));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(verify_relevant_facts));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(tool_fallback));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(preference_kv_split));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(memory_prose_split));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(no_fabrication));
+        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(tool_search_discovery));
 
         let priority_rule_pos = RUNTIME_SYSTEM_INSTRUCTION.find(priority_rule).unwrap();
-        let memory_first_pos = RUNTIME_SYSTEM_INSTRUCTION.find(memory_first).unwrap();
+        let kb_first_pos = RUNTIME_SYSTEM_INSTRUCTION.find(kb_first).unwrap();
         let ambiguous_reference_pos = RUNTIME_SYSTEM_INSTRUCTION
             .find(ambiguous_reference)
             .unwrap();
@@ -1641,12 +1700,12 @@ mod tests {
         let tool_fallback_pos = RUNTIME_SYSTEM_INSTRUCTION.find(tool_fallback).unwrap();
 
         assert!(
-            priority_rule_pos < memory_first_pos,
-            "priority rule must remain before memory/tool decision rules"
+            priority_rule_pos < kb_first_pos,
+            "priority rule must remain before knowledge base decision rules"
         );
         assert!(
-            memory_first_pos < tool_fallback_pos,
-            "memory-first rule must remain before non-memory tool fallback rule"
+            kb_first_pos < tool_fallback_pos,
+            "kb-first rule must remain before non-memory tool fallback rule"
         );
         assert!(
             ambiguous_reference_pos < tool_fallback_pos,

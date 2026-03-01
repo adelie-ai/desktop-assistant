@@ -12,6 +12,7 @@ members = [
     "crates/llm-anthropic",
     "crates/llm-ollama",
     "crates/mcp-client",
+    "crates/storage",
     "crates/tui",
 ]
 
@@ -31,6 +32,7 @@ desktop-assistant-llm-openai = { path = "crates/llm-openai" }
 desktop-assistant-llm-ollama = { path = "crates/llm-ollama" }
 desktop-assistant-llm-bedrock = { path = "crates/llm-bedrock" }
 desktop-assistant-mcp-client = { path = "crates/mcp-client" }
+desktop-assistant-storage = { path = "crates/storage" }
 serde_json = "1"
 toml = "1"
 chrono = { version = "0.4", features = ["clock"] }
