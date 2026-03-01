@@ -48,6 +48,24 @@ impl AnthropicClient {
         self.max_tokens = max_tokens;
         self
     }
+
+    /// Create from environment variables.
+    /// Reads `ANTHROPIC_API_KEY` for the API key.
+    /// Optionally reads `ANTHROPIC_MODEL` (defaults to claude-sonnet-4-5-20250929)
+    /// and `ANTHROPIC_BASE_URL` (defaults to https://api.anthropic.com).
+    pub fn from_env() -> Result<Self, CoreError> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+            CoreError::Llm("ANTHROPIC_API_KEY environment variable not set".into())
+        })?;
+        let mut client = Self::new(api_key);
+        if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            client.model = model;
+        }
+        if let Ok(url) = std::env::var("ANTHROPIC_BASE_URL") {
+            client.base_url = url;
+        }
+        Ok(client)
+    }
 }
 
 // --- Request types ---
@@ -599,6 +617,14 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"system\":\"be helpful\""));
+    }
+
+    #[test]
+    fn from_env_missing_key() {
+        // Ensure the env var is not set for this test
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        let result = AnthropicClient::from_env();
+        assert!(matches!(result, Err(CoreError::Llm(_))));
     }
 
     #[test]
