@@ -252,27 +252,22 @@ impl BuiltinToolService {
         };
 
         // Generate embedding for the content.
-        // If embeddings are configured but the call fails, return an error
-        // so the caller knows the write is incomplete rather than silently
-        // storing a NULL embedding that won't appear in vector searches.
-        let embedding = if self.embed_fn.is_some() {
-            match self.embed_text(&content).await {
-                Some(vec) => Some(vec),
-                None => {
-                    return Err(CoreError::ToolExecution(
-                        "failed to generate embedding for knowledge entry; the entry was NOT saved — check that the embedding service is reachable".to_string(),
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+        // If embedding fails, save the entry anyway with a NULL embedding so
+        // the background backfill/dreaming cycle re-embeds it later.
+        let embedding = self.embed_text(&content).await;
+        let embedded = embedding.is_some();
+        if self.embed_fn.is_some() && !embedded {
+            tracing::warn!(
+                "embedding failed for knowledge entry; saving without embedding (backfill will retry)"
+            );
+        }
 
         let saved = write_fn(entry, embedding).await?;
 
         Ok(serde_json::json!({
             "ok": true,
             "id": saved.id,
+            "embedded": embedded,
             "created_at": saved.created_at,
             "updated_at": saved.updated_at,
         })
