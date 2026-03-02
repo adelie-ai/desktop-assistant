@@ -8,10 +8,11 @@ use crate::domain::KnowledgeEntry;
 /// Outbound port for the unified knowledge base (replaces preferences + memory).
 pub trait KnowledgeBaseStore: Send + Sync {
     /// Write (upsert) a knowledge entry. If an entry with the same id exists, it is replaced.
+    /// Embedding is a list of chunk vectors (one per chunk of the entry's content).
     fn write(
         &self,
         entry: KnowledgeEntry,
-        embedding: Option<Vec<f32>>,
+        embedding: Option<Vec<Vec<f32>>>,
         embedding_model: Option<String>,
     ) -> impl Future<Output = Result<KnowledgeEntry, CoreError>> + Send;
 
@@ -39,10 +40,11 @@ pub trait KnowledgeBaseStore: Send + Sync {
 }
 
 /// Boxed async closure for writing knowledge entries through non-generic boundaries.
+/// Embedding is a list of chunk vectors (one per chunk of the entry's content).
 pub type KnowledgeWriteFn = Arc<
     dyn Fn(
             KnowledgeEntry,
-            Option<Vec<f32>>,
+            Option<Vec<Vec<f32>>>,
         ) -> Pin<Box<dyn Future<Output = Result<KnowledgeEntry, CoreError>> + Send>>
         + Send
         + Sync,
@@ -75,7 +77,7 @@ mod tests {
         async fn write(
             &self,
             entry: KnowledgeEntry,
-            _embedding: Option<Vec<f32>>,
+            _embedding: Option<Vec<Vec<f32>>>,
             _embedding_model: Option<String>,
         ) -> Result<KnowledgeEntry, CoreError> {
             Ok(entry)

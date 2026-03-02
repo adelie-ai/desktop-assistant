@@ -606,7 +606,7 @@ async fn main() -> Result<()> {
         let kb_emb_model = embedding_model_id.clone();
         use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
         builtin_tools = builtin_tools.with_knowledge_base(
-            Arc::new(move |entry, embedding| {
+            Arc::new(move |entry, embedding: Option<Vec<Vec<f32>>>| {
                 let store = Arc::clone(&kb_w);
                 let model = if embedding.is_some() {
                     Some(kb_emb_model.clone())

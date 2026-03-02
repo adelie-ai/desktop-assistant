@@ -11,6 +11,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use desktop_assistant_core::chunking::{chunk_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP};
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -361,22 +362,22 @@ async fn apply_update(
     new_content: &str,
     new_tags: &[String],
 ) -> Result<(), String> {
-    // Re-embed the updated content
-    let embeddings = embed_fn(vec![new_content.to_string()]).await?;
-    let embedding = embeddings
-        .into_iter()
-        .next()
-        .ok_or_else(|| "dreaming: embedding returned no vectors".to_string())?;
-    let embedding_vec = Vector::from(embedding);
+    // Chunk and re-embed the updated content
+    let chunks = chunk_text(new_content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+    let embeddings = embed_fn(chunks).await?;
+    if embeddings.is_empty() {
+        return Err("dreaming: embedding returned no vectors".to_string());
+    }
+    let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
 
     sqlx::query(
         "UPDATE knowledge_base
-         SET content = $1, tags = $2, embedding = $3, embedding_model = $4, updated_at = NOW()
+         SET content = $1, tags = $2, embedding = $3::vector[], embedding_model = $4, updated_at = NOW()
          WHERE id = $5",
     )
     .bind(new_content)
     .bind(new_tags)
-    .bind(embedding_vec)
+    .bind(&embedding_vecs)
     .bind(embedding_model)
     .bind(id)
     .execute(pool)
@@ -620,22 +621,21 @@ async fn dedup_and_write_fact(
     content: &str,
     tags: &[String],
 ) -> Result<bool, String> {
-    // Generate embedding for the new fact
-    let embeddings = embed_fn(vec![content.to_string()]).await?;
-    let embedding = embeddings
-        .into_iter()
-        .next()
-        .ok_or_else(|| "dreaming: embedding returned no vectors".to_string())?;
+    // Chunk and embed the new fact
+    let chunks = chunk_text(content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+    let embeddings = embed_fn(chunks).await?;
+    if embeddings.is_empty() {
+        return Err("dreaming: embedding returned no vectors".to_string());
+    }
 
-    let query_vec = Vector::from(embedding.clone());
+    // Use the first chunk's embedding for dedup (representative of the fact)
+    let query_vec = Vector::from(embeddings[0].clone());
 
-    // Check for close matches in the knowledge base
+    // Check for close matches — unnest existing vector arrays
     let closest_distance: Option<(f64,)> = sqlx::query_as(
-        "SELECT embedding <=> $1 AS distance
-         FROM knowledge_base
-         WHERE embedding IS NOT NULL
-         ORDER BY embedding <=> $1
-         LIMIT 1",
+        "SELECT MIN(chunk <=> $1) AS distance
+         FROM knowledge_base, unnest(embedding) AS chunk
+         WHERE embedding IS NOT NULL",
     )
     .bind(&query_vec)
     .fetch_optional(pool)
@@ -652,22 +652,22 @@ async fn dedup_and_write_fact(
         }
     }
 
-    // Write the new fact
+    // Write the new fact with chunked embeddings
     let id = uuid::Uuid::now_v7().to_string();
     let mut all_tags: Vec<String> = vec!["source:dreaming".to_string()];
     all_tags.extend(tags.iter().cloned());
     let metadata = serde_json::json!({});
-    let embedding_vec = Vector::from(embedding);
+    let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
 
     sqlx::query(
         "INSERT INTO knowledge_base (id, content, tags, metadata, embedding, embedding_model)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         VALUES ($1, $2, $3, $4, $5::vector[], $6)",
     )
     .bind(&id)
     .bind(content)
     .bind(&all_tags)
     .bind(&metadata)
-    .bind(embedding_vec)
+    .bind(&embedding_vecs)
     .bind(embedding_model)
     .execute(pool)
     .await

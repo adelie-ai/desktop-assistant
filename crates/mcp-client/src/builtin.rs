@@ -295,10 +295,10 @@ impl BuiltinToolService {
             updated_at: String::new(),
         };
 
-        // Generate embedding for the content.
+        // Generate chunked embeddings for the content.
         // If embedding fails, save the entry anyway with a NULL embedding so
         // the background backfill/dreaming cycle re-embeds it later.
-        let embedding = self.embed_text(&content).await;
+        let embedding = self.embed_chunks(&content).await;
         let embedded = embedding.is_some();
         if self.embed_fn.is_some() && !embedded {
             tracing::warn!(
@@ -430,12 +430,30 @@ impl BuiltinToolService {
     }
 
     /// Embed a single text string, returning None if embeddings are unavailable.
+    /// Used for search queries which are always short and don't need chunking.
     async fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
         let embed_fn = self.embed_fn.as_ref()?;
         match embed_fn(vec![text.to_string()]).await {
             Ok(mut vecs) => vecs.pop(),
             Err(e) => {
                 tracing::warn!("failed to embed text: {e}");
+                None
+            }
+        }
+    }
+
+    /// Chunk text and embed each chunk, returning None if embeddings are unavailable.
+    /// Used for KB writes where content may exceed the model's context window.
+    async fn embed_chunks(&self, text: &str) -> Option<Vec<Vec<f32>>> {
+        use desktop_assistant_core::chunking::{chunk_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP};
+
+        let embed_fn = self.embed_fn.as_ref()?;
+        let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+        match embed_fn(chunks).await {
+            Ok(vecs) if !vecs.is_empty() => Some(vecs),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("failed to embed chunks: {e}");
                 None
             }
         }
@@ -744,7 +762,7 @@ mod tests {
         let store: Arc<Mutex<Vec<KnowledgeEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
         let write_store = Arc::clone(&store);
-        let write_fn: KnowledgeWriteFn = Arc::new(move |mut entry, _embedding| {
+        let write_fn: KnowledgeWriteFn = Arc::new(move |mut entry, _embedding: Option<Vec<Vec<f32>>>| {
             let s = Arc::clone(&write_store);
             Box::pin(async move {
                 entry.created_at = "2024-01-01".to_string();

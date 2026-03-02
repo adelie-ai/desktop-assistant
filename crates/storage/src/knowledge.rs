@@ -18,14 +18,15 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
     async fn write(
         &self,
         entry: KnowledgeEntry,
-        embedding: Option<Vec<f32>>,
+        embedding: Option<Vec<Vec<f32>>>,
         embedding_model: Option<String>,
     ) -> Result<KnowledgeEntry, CoreError> {
-        let embedding_vec = embedding.map(Vector::from);
+        let embedding_vecs: Option<Vec<Vector>> =
+            embedding.map(|chunks| chunks.into_iter().map(Vector::from).collect());
 
         let row: KbRow = sqlx::query_as(
             "INSERT INTO knowledge_base (id, content, tags, metadata, embedding, embedding_model)
-             VALUES ($1, $2, $3, $4, $5, $6)
+             VALUES ($1, $2, $3, $4, $5::vector[], $6)
              ON CONFLICT (id) DO UPDATE
                 SET content = EXCLUDED.content,
                     tags = EXCLUDED.tags,
@@ -39,7 +40,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(&entry.content)
         .bind(&entry.tags)
         .bind(&entry.metadata)
-        .bind(embedding_vec)
+        .bind(&embedding_vecs)
         .bind(&embedding_model)
         .fetch_one(&self.pool)
         .await
@@ -60,13 +61,18 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         let result_limit = limit as i64;
 
         let rows: Vec<KbSearchRow> = sqlx::query_as(
-            "WITH vector_ranked AS (
+            "WITH chunk_distances AS (
                 SELECT id, content, tags, metadata, created_at, updated_at,
-                       ROW_NUMBER() OVER (ORDER BY embedding <=> $1) AS rank_v
-                FROM knowledge_base
+                       MIN(chunk <=> $1) AS min_distance
+                FROM knowledge_base, unnest(embedding) AS chunk
                 WHERE ($2::text[] IS NULL OR tags && $2)
                   AND embedding IS NOT NULL
-                ORDER BY embedding <=> $1
+                GROUP BY id, content, tags, metadata, created_at, updated_at
+            ),
+            vector_ranked AS (
+                SELECT id, content, tags, metadata, created_at, updated_at,
+                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
+                FROM chunk_distances
                 LIMIT $3
             ),
             text_ranked AS (

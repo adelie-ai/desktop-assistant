@@ -8,6 +8,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use desktop_assistant_core::chunking::{chunk_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP};
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -88,6 +89,9 @@ pub async fn invalidate_stale_embeddings(
 
 /// Backfill embeddings for `knowledge_base` rows that are missing or stale.
 ///
+/// Each entry's content is split into chunks, all chunks are batch-embedded,
+/// and the resulting vectors are stored as a `vector[]` array on the row.
+///
 /// Continues past batch failures so that a single bad batch does not block the
 /// entire backfill.  Returns the total number of rows successfully updated.
 pub async fn backfill_knowledge_embeddings(
@@ -119,18 +123,31 @@ pub async fn backfill_knowledge_embeddings(
             break;
         }
 
-        let texts: Vec<String> = rows.iter().map(|(_, content)| content.clone()).collect();
+        // Chunk all rows and track which chunks belong to which row.
+        let mut all_chunks: Vec<(usize, String)> = Vec::new();
+        for (i, (_, content)) in rows.iter().enumerate() {
+            for chunk in chunk_text(content, CHUNK_MAX_CHARS, CHUNK_OVERLAP) {
+                all_chunks.push((i, chunk));
+            }
+        }
+
+        let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
         match embed_fn(texts).await {
             Ok(embeddings) => {
                 consecutive_failures = 0;
-                for ((id, _), embedding) in rows.iter().zip(embeddings.into_iter()) {
-                    let vec = Vector::from(embedding);
+                // Group embeddings back by row index.
+                let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
+                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings.into_iter()) {
+                    row_embeddings[*row_idx].push(Vector::from(emb));
+                }
+
+                for ((id, _), vecs) in rows.iter().zip(row_embeddings.into_iter()) {
                     sqlx::query(
                         "UPDATE knowledge_base
-                         SET embedding = $1, embedding_model = $2
+                         SET embedding = $1::vector[], embedding_model = $2
                          WHERE id = $3",
                     )
-                    .bind(vec)
+                    .bind(&vecs)
                     .bind(current_model)
                     .bind(id)
                     .execute(pool)
@@ -141,28 +158,27 @@ pub async fn backfill_knowledge_embeddings(
             }
             Err(e) => {
                 tracing::warn!("knowledge embedding batch failed, retrying individually: {e}");
-                // Batch failed (e.g. one entry exceeds context length).
-                // Retry each entry individually so good entries still get embedded.
+                // Batch failed — retry each entry individually so good entries still get embedded.
                 let mut any_succeeded = false;
                 for (id, content) in &rows {
-                    match embed_fn(vec![content.clone()]).await {
+                    let chunks = chunk_text(content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    match embed_fn(chunks).await {
                         Ok(embeddings) => {
-                            if let Some(embedding) = embeddings.into_iter().next() {
-                                let vec = Vector::from(embedding);
-                                sqlx::query(
-                                    "UPDATE knowledge_base
-                                     SET embedding = $1, embedding_model = $2
-                                     WHERE id = $3",
-                                )
-                                .bind(vec)
-                                .bind(current_model)
-                                .bind(id)
-                                .execute(pool)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                                total += 1;
-                                any_succeeded = true;
-                            }
+                            let vecs: Vec<Vector> =
+                                embeddings.into_iter().map(Vector::from).collect();
+                            sqlx::query(
+                                "UPDATE knowledge_base
+                                 SET embedding = $1::vector[], embedding_model = $2
+                                 WHERE id = $3",
+                            )
+                            .bind(&vecs)
+                            .bind(current_model)
+                            .bind(id)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            total += 1;
+                            any_succeeded = true;
                         }
                         Err(e2) => {
                             tracing::warn!("skipping knowledge entry {id}: {e2}");

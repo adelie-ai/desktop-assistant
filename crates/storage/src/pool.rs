@@ -87,5 +87,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         tracing::warn!("could not apply dreaming watermarks migration: {e}");
     }
 
+    // Chunked embeddings — knowledge_base.embedding becomes vector[].
+    if let Err(e) =
+        sqlx::raw_sql(include_str!("../migrations/007_chunked_embeddings.sql"))
+            .execute(pool)
+            .await
+    {
+        tracing::warn!("could not apply chunked embeddings migration: {e}");
+    }
+
     Ok(())
 }
