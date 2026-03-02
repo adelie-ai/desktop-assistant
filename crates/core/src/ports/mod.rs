@@ -22,6 +22,9 @@ pub mod knowledge;
 /// Tool registry store port — outbound trait for tool definition persistence and search.
 pub mod tool_registry;
 
+/// Database query port — closure type for read-only SQL queries.
+pub mod database;
+
 #[cfg(test)]
 mod tests {
     #[test]

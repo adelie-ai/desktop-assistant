@@ -7,6 +7,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{KnowledgeDeleteFn, KnowledgeSearchFn, KnowledgeWriteFn};
+use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
 
 const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
@@ -14,6 +15,7 @@ const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
+const TOOL_DB_QUERY: &str = "builtin_db_query";
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -30,6 +32,7 @@ pub struct BuiltinToolService {
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
+    db_query_fn: Option<DbQueryFn>,
 }
 
 impl BuiltinToolService {
@@ -43,6 +46,7 @@ impl BuiltinToolService {
             kb_delete_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
+            db_query_fn: None,
         }
     }
 
@@ -73,6 +77,12 @@ impl BuiltinToolService {
     ) -> Self {
         self.tool_search_fn = Some(search_fn);
         self.tool_definition_fn = Some(definition_fn);
+        self
+    }
+
+    /// Configure database query closure for read-only SQL access.
+    pub fn with_database(mut self, query_fn: DbQueryFn) -> Self {
+        self.db_query_fn = Some(query_fn);
         self
     }
 
@@ -171,6 +181,30 @@ impl BuiltinToolService {
                     "additionalProperties": false
                 }),
             ),
+            ToolDefinition::new(
+                TOOL_DB_QUERY,
+                "Execute a read-only SQL query against the assistant's PostgreSQL database. \
+                 Use this to inspect conversations, messages, knowledge base entries, tool \
+                 definitions, and other stored data. Only SELECT/WITH/TABLE/VALUES/EXPLAIN \
+                 queries are allowed. The database enforces read-only access at the \
+                 transaction level.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "SQL query to execute (read-only)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "description": "Maximum number of rows to return (default 100)"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            ),
         ]
     }
 
@@ -182,6 +216,7 @@ impl BuiltinToolService {
                 | TOOL_KB_DELETE
                 | TOOL_SEARCH
                 | TOOL_SYS_PROPS
+                | TOOL_DB_QUERY
         )
     }
 
@@ -196,6 +231,7 @@ impl BuiltinToolService {
             TOOL_KB_DELETE => self.kb_delete(arguments).await,
             TOOL_SEARCH => self.tool_search(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
+            TOOL_DB_QUERY => self.db_query(arguments).await,
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
@@ -358,6 +394,29 @@ impl BuiltinToolService {
         Ok(serde_json::json!({
             "ok": true,
             "tools": tools,
+        })
+        .to_string())
+    }
+
+    async fn db_query(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let query_fn = self.db_query_fn.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution("database query not configured".to_string())
+        })?;
+
+        let query = required_string(&arguments, "query")?;
+        let limit = arguments
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(100) as usize;
+
+        tracing::info!(limit, "executing db query");
+        tracing::debug!(sql = %query, "db query SQL");
+
+        let result = query_fn(query, limit).await?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "result": result,
         })
         .to_string())
     }
@@ -556,6 +615,7 @@ mod tests {
         assert!(names.contains(&TOOL_KB_DELETE.to_string()));
         assert!(names.contains(&TOOL_SEARCH.to_string()));
         assert!(names.contains(&TOOL_SYS_PROPS.to_string()));
+        assert!(names.contains(&TOOL_DB_QUERY.to_string()));
     }
 
     #[tokio::test]
@@ -612,6 +672,48 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    #[tokio::test]
+    async fn db_query_without_database_returns_error() {
+        let service = BuiltinToolService::new();
+        let result = service
+            .execute_tool(
+                TOOL_DB_QUERY,
+                serde_json::json!({"query": "SELECT 1"}),
+            )
+            .await;
+        assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    #[tokio::test]
+    async fn db_query_with_closure() {
+        use std::sync::Arc;
+        use desktop_assistant_core::ports::database::DbQueryFn;
+
+        let query_fn: DbQueryFn = Arc::new(|_sql, _limit| {
+            Box::pin(async {
+                Ok(serde_json::json!({
+                    "columns": ["count"],
+                    "rows": [[42]],
+                    "row_count": 1
+                }))
+            })
+        });
+
+        let service = BuiltinToolService::new().with_database(query_fn);
+
+        let result = service
+            .execute_tool(
+                TOOL_DB_QUERY,
+                serde_json::json!({"query": "SELECT count(*) FROM conversations"}),
+            )
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["result"]["row_count"], 1);
+        assert_eq!(json["result"]["rows"][0][0], 42);
     }
 
     #[tokio::test]

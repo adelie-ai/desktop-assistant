@@ -6,7 +6,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 desktop-assistant-core.workspace = true
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "json", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "json", "chrono", "uuid"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 serde.workspace = true
 serde_json = "1"

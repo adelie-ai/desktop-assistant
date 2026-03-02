@@ -626,6 +626,17 @@ async fn main() -> Result<()> {
         );
     }
 
+    if let Some(pool) = &pg_pool {
+        tracing::info!("wiring database query into builtin tools");
+        let pool_for_db = pool.clone();
+        builtin_tools = builtin_tools.with_database(Arc::new(move |sql, limit| {
+            let pool = pool_for_db.clone();
+            Box::pin(async move {
+                desktop_assistant_storage::execute_readonly_query(&pool, &sql, limit).await
+            })
+        }));
+    }
+
     if let Some(tr) = &tool_registry_store {
         tracing::info!("wiring tool registry store into builtin tools");
         let tr_s = Arc::clone(tr);
