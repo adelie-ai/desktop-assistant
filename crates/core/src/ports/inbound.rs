@@ -96,6 +96,12 @@ pub trait ConversationService: Send + Sync {
         id: &ConversationId,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
+    fn rename_conversation(
+        &self,
+        id: &ConversationId,
+        title: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
     fn clear_all_history(&self)
     -> impl std::future::Future<Output = Result<u32, CoreError>> + Send;
 

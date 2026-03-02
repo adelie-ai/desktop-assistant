@@ -1,6 +1,7 @@
 use crate::CoreError;
 use crate::domain::{
-    Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition,
+    Conversation, ConversationId, ConversationSummary, Message, MessageSummary, Role,
+    ToolDefinition,
 };
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{ChunkCallback, LlmClient};
@@ -35,6 +36,7 @@ const RUNTIME_SYSTEM_INSTRUCTION: &str = include_str!("prompts/runtime_system_in
 
 fn llm_messages_for_turn(
     conversation_messages: &[Message],
+    summaries: &[MessageSummary],
     tool_defs: &[ToolDefinition],
     context_summary: &str,
 ) -> Vec<Message> {
@@ -65,6 +67,18 @@ fn llm_messages_for_turn(
     let windowed = &conversation_messages[start..];
     let is_windowed = start > 0;
 
+    // Build a map from start_ordinal -> summary for active summaries in the window.
+    let summary_map: std::collections::HashMap<usize, &MessageSummary> = summaries
+        .iter()
+        .map(|s| (s.start_ordinal, s))
+        .collect();
+
+    // Track which summary IDs are active so we know to skip their messages.
+    let active_summary_ids: std::collections::HashSet<&str> = summaries
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect();
+
     let mut messages = Vec::with_capacity(windowed.len() + 2);
     messages.push(Message::new(
         Role::System,
@@ -79,7 +93,41 @@ fn llm_messages_for_turn(
         ));
     }
 
-    messages.extend_from_slice(windowed);
+    // Track which summaries have already been injected.
+    let mut injected_summaries: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+
+    for (i, msg) in windowed.iter().enumerate() {
+        let ordinal = start + i;
+
+        if let Some(sid) = &msg.summary_id {
+            if active_summary_ids.contains(sid.as_str()) {
+                // This message is collapsed. Inject the summary at the first
+                // collapsed message we encounter for this summary.
+                if !injected_summaries.contains(sid.as_str()) {
+                    injected_summaries.insert(sid);
+                    // Look up by ordinal first, then fall back to finding by ID
+                    // (the window may not start at the summary's start_ordinal).
+                    let found = summary_map.get(&ordinal).copied().or_else(|| {
+                        summaries.iter().find(|s| s.id == *sid)
+                    });
+                    if let Some(s) = found {
+                        messages.push(Message::new(
+                            Role::System,
+                            format!(
+                                "[Summary of messages {}\u{2013}{}] {}",
+                                s.start_ordinal, s.end_ordinal, s.summary
+                            ),
+                        ));
+                    }
+                }
+                continue;
+            }
+        }
+
+        messages.push(msg.clone());
+    }
+
     messages
 }
 
@@ -494,6 +542,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         self.store.delete(id).await
     }
 
+    async fn rename_conversation(
+        &self,
+        id: &ConversationId,
+        title: String,
+    ) -> Result<(), CoreError> {
+        let mut conv = self.store.get(id).await?;
+        conv.title = title;
+        conv.updated_at = now_timestamp();
+        self.store.update(conv).await
+    }
+
     async fn clear_all_history(&self) -> Result<u32, CoreError> {
         let conversations = self.store.list().await?;
         let mut deleted = 0u32;
@@ -538,7 +597,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             let mut tool_defs: Vec<ToolDefinition> = core_tools.clone();
             tool_defs.extend(activated_tools.values().cloned());
 
-            let llm_messages = llm_messages_for_turn(&conv.messages, &tool_defs, &conv.context_summary);
+            let llm_messages = llm_messages_for_turn(&conv.messages, &conv.summaries, &tool_defs, &conv.context_summary);
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
             let mut visible_chunk_callback = on_chunk;
@@ -753,6 +812,20 @@ mod tests {
                 .map(|_| ())
                 .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
         }
+
+        async fn create_summary(
+            &self,
+            _conversation_id: &ConversationId,
+            _summary: String,
+            _start_ordinal: usize,
+            _end_ordinal: usize,
+        ) -> Result<String, CoreError> {
+            Ok("mock-summary".to_string())
+        }
+
+        async fn expand_summary(&self, _summary_id: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
     }
 
     // --- Mock LLM ---
@@ -825,6 +898,20 @@ mod tests {
         }
 
         async fn delete(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn create_summary(
+            &self,
+            _conversation_id: &ConversationId,
+            _summary: String,
+            _start_ordinal: usize,
+            _end_ordinal: usize,
+        ) -> Result<String, CoreError> {
+            Ok("mock-summary".to_string())
+        }
+
+        async fn expand_summary(&self, _summary_id: &str) -> Result<(), CoreError> {
             Ok(())
         }
     }
@@ -1916,7 +2003,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], "");
         // System message + all 10 conversation messages
         assert_eq!(result.len(), 11);
         assert_eq!(result[0].role, Role::System);
@@ -1939,7 +2026,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], "");
         // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
         // a User message (even index), so the window starts exactly there.
         // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
@@ -1974,7 +2061,7 @@ mod tests {
         msgs.push(Message::new(Role::User, "final-user"));
         msgs.push(Message::new(Role::Assistant, "final-reply"));
 
-        let result = llm_messages_for_turn(&msgs, &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], "");
 
         // The first conversation message (after System) must be a User message.
         assert_eq!(result[0].role, Role::System);
@@ -2058,7 +2145,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], "- User prefers dark mode");
+        let result = llm_messages_for_turn(&msgs, &[], &[], "- User prefers dark mode");
 
         // System prompt, then summary system message, then windowed messages
         assert_eq!(result[0].role, Role::System);
@@ -2083,7 +2170,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], "- Some summary");
+        let result = llm_messages_for_turn(&msgs, &[], &[], "- Some summary");
 
         // No summary injected when under limit
         assert_eq!(result[0].role, Role::System);
@@ -2104,11 +2191,102 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], "");
 
         // System prompt directly followed by windowed messages — no summary
         assert_eq!(result[0].role, Role::System);
         assert_eq!(result[1].role, Role::User);
+    }
+
+    // --- Message summary (collapsing) tests ---
+
+    #[test]
+    fn llm_messages_for_turn_collapses_summarized_range() {
+        let mut msgs = vec![
+            Message::new(Role::User, "start"),
+            Message::new(Role::Assistant, "step 1"),
+            Message::new(Role::Assistant, "step 2"),
+            Message::new(Role::Assistant, "step 3"),
+            Message::new(Role::User, "follow up"),
+            Message::new(Role::Assistant, "final"),
+        ];
+        // Mark messages 1..=3 as collapsed behind summary "s1"
+        msgs[1].summary_id = Some("s1".to_string());
+        msgs[2].summary_id = Some("s1".to_string());
+        msgs[3].summary_id = Some("s1".to_string());
+
+        let summaries = vec![MessageSummary {
+            id: "s1".to_string(),
+            summary: "Assistant performed steps 1-3.".to_string(),
+            start_ordinal: 1,
+            end_ordinal: 3,
+        }];
+
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], "");
+
+        // System + "start" + summary injection + "follow up" + "final" = 5
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(result[1].content, "start");
+        assert_eq!(result[2].role, Role::System);
+        assert!(result[2].content.contains("Summary of messages 1\u{2013}3"));
+        assert!(result[2].content.contains("Assistant performed steps 1-3."));
+        assert_eq!(result[3].content, "follow up");
+        assert_eq!(result[4].content, "final");
+    }
+
+    #[test]
+    fn llm_messages_for_turn_no_summaries_passes_through() {
+        let msgs = vec![
+            Message::new(Role::User, "hi"),
+            Message::new(Role::Assistant, "hello"),
+        ];
+
+        let result = llm_messages_for_turn(&msgs, &[], &[], "");
+        // System + 2 messages
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[1].content, "hi");
+        assert_eq!(result[2].content, "hello");
+    }
+
+    #[test]
+    fn llm_messages_for_turn_multiple_summaries() {
+        let mut msgs = vec![
+            Message::new(Role::User, "start"),
+            Message::new(Role::Assistant, "a1"),
+            Message::new(Role::Assistant, "a2"),
+            Message::new(Role::User, "middle"),
+            Message::new(Role::Assistant, "b1"),
+            Message::new(Role::Assistant, "b2"),
+            Message::new(Role::User, "end"),
+        ];
+        msgs[1].summary_id = Some("s1".to_string());
+        msgs[2].summary_id = Some("s1".to_string());
+        msgs[4].summary_id = Some("s2".to_string());
+        msgs[5].summary_id = Some("s2".to_string());
+
+        let summaries = vec![
+            MessageSummary {
+                id: "s1".to_string(),
+                summary: "First batch.".to_string(),
+                start_ordinal: 1,
+                end_ordinal: 2,
+            },
+            MessageSummary {
+                id: "s2".to_string(),
+                summary: "Second batch.".to_string(),
+                start_ordinal: 4,
+                end_ordinal: 5,
+            },
+        ];
+
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], "");
+        // System + "start" + summary1 + "middle" + summary2 + "end" = 6
+        assert_eq!(result.len(), 6);
+        assert!(result[2].content.contains("First batch."));
+        assert_eq!(result[3].content, "middle");
+        assert!(result[4].content.contains("Second batch."));
+        assert_eq!(result[5].content, "end");
     }
 
     #[tokio::test]

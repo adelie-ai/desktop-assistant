@@ -352,6 +352,17 @@ where
                 Ok(api::CommandResult::Ack)
             }
 
+            api::Command::RenameConversation { id, title } => {
+                self.conversations
+                    .rename_conversation(
+                        &desktop_assistant_core::domain::ConversationId::from(id.as_str()),
+                        title,
+                    )
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
             api::Command::ClearAllHistory => {
                 let n = self
                     .conversations
@@ -530,11 +541,31 @@ where
             Ok(full_response) => {
                 let _ = sink
                     .emit(api::Event::AssistantCompleted {
-                        conversation_id,
+                        conversation_id: conversation_id.clone(),
                         request_id,
                         full_response,
                     })
                     .await;
+
+                // Emit title change event so clients can update their UI
+                // (the core service may generate a title after the first message).
+                if let Ok(conv) = self
+                    .conversations
+                    .get_conversation(
+                        &desktop_assistant_core::domain::ConversationId::from(
+                            conversation_id.as_str(),
+                        ),
+                    )
+                    .await
+                {
+                    let _ = sink
+                        .emit(api::Event::ConversationTitleChanged {
+                            conversation_id,
+                            title: conv.title,
+                        })
+                        .await;
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -593,6 +624,13 @@ mod tests {
             Ok(c)
         }
         async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
         async fn clear_all_history(&self) -> Result<u32, CoreError> {
@@ -953,6 +991,13 @@ mod tests {
             Ok(Conversation::new(id.as_str(), "t"))
         }
         async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
         async fn clear_all_history(&self) -> Result<u32, CoreError> {

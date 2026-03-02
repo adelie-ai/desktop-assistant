@@ -14,7 +14,6 @@ const COLOR_PANEL_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_LIST_BORDER: Color = Color::Rgb(62, 125, 146);
 const COLOR_INPUT_BORDER_IDLE: Color = Color::Rgb(109, 122, 143);
 const COLOR_INPUT_BORDER_EDIT: Color = Color::Rgb(120, 183, 109);
-const COLOR_INPUT_BORDER_CREATE: Color = Color::Rgb(203, 152, 95);
 const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
 const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
 const COLOR_USER_PREFIX: Color = Color::Rgb(255, 189, 89);
@@ -32,10 +31,6 @@ fn mode_chip_style(mode: &InputMode) -> Style {
         InputMode::Editing => Style::default()
             .fg(Color::Black)
             .bg(Color::Rgb(120, 214, 118))
-            .add_modifier(Modifier::BOLD),
-        InputMode::CreatingConversation => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(238, 179, 107))
             .add_modifier(Modifier::BOLD),
     }
 }
@@ -121,8 +116,11 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         for msg in &conv.messages {
             let (prefix, style) = match msg.role.as_str() {
                 "user" => ("You: ", Style::default().fg(COLOR_USER_PREFIX)),
-                "assistant" => ("Adele: ", Style::default().fg(COLOR_ASSISTANT_PREFIX)),
-                _ => ("", Style::default()),
+                "assistant" if !msg.content.trim().is_empty() => {
+                    ("Adele: ", Style::default().fg(COLOR_ASSISTANT_PREFIX))
+                }
+                // Skip tool, system, and empty assistant messages
+                _ => continue,
             };
             // Split content on newlines so ratatui renders them as separate lines
             let mut first = true;
@@ -210,10 +208,6 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             "Input (Esc cancel, Enter send, Shift+Enter/Ctrl+J newline)",
             COLOR_INPUT_BORDER_EDIT,
         ),
-        InputMode::CreatingConversation => (
-            "New conversation title (Enter to create, Esc to cancel)",
-            COLOR_INPUT_BORDER_CREATE,
-        ),
     };
 
     app.textarea.set_block(
@@ -233,7 +227,6 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mode_str = match app.mode {
         InputMode::Normal => "NORMAL",
         InputMode::Editing => "EDITING",
-        InputMode::CreatingConversation => "CREATING",
     };
 
     let status = Paragraph::new(Line::from(vec![
@@ -327,16 +320,6 @@ mod tests {
         let mut app = App::new();
         app.enter_editing_mode();
         app.textarea.insert_str("typing something");
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-    }
-
-    #[test]
-    fn draw_in_creating_mode_does_not_panic() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::new();
-        app.enter_creating_conversation_mode();
-        app.textarea.insert_str("New Chat");
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 

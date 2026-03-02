@@ -34,6 +34,10 @@ pub enum Command {
     DeleteConversation {
         id: String,
     },
+    RenameConversation {
+        id: String,
+        title: String,
+    },
     ClearAllHistory,
 
     /// Send a content to an existing conversation.
@@ -129,6 +133,12 @@ pub enum Event {
         conversation_id: String,
         request_id: String,
         error: String,
+    },
+
+    /// The title of a conversation was changed (e.g. LLM-generated after first message).
+    ConversationTitleChanged {
+        conversation_id: String,
+        title: String,
     },
 }
 

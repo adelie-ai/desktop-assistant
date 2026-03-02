@@ -92,6 +92,13 @@ impl ConversationService for FakeConversations {
     async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
         Ok(())
     }
+    async fn rename_conversation(
+        &self,
+        _id: &ConversationId,
+        _title: String,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
     async fn clear_all_history(&self) -> Result<u32, CoreError> {
         Ok(0)
     }
@@ -124,6 +131,13 @@ impl ConversationService for CancelAwareConversations {
         Ok(Conversation::new(id.as_str(), "t"))
     }
     async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn rename_conversation(
+        &self,
+        _id: &ConversationId,
+        _title: String,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
     async fn clear_all_history(&self) -> Result<u32, CoreError> {
