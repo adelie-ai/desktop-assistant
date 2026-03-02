@@ -459,6 +459,86 @@ bool DesktopAssistantKcm::selectedConnectionRemovable() const
     return m_connections.size() > 1;
 }
 
+bool DesktopAssistantKcm::dreamingEnabled() const
+{
+    return m_dreamingEnabled;
+}
+
+void DesktopAssistantKcm::setDreamingEnabled(bool value)
+{
+    if (m_dreamingEnabled == value) {
+        return;
+    }
+    m_dreamingEnabled = value;
+    Q_EMIT dreamingEnabledChanged();
+    setNeedsSave(true);
+}
+
+int DesktopAssistantKcm::dreamingIntervalSecs() const
+{
+    return m_dreamingIntervalSecs;
+}
+
+void DesktopAssistantKcm::setDreamingIntervalSecs(int value)
+{
+    if (m_dreamingIntervalSecs == value) {
+        return;
+    }
+    m_dreamingIntervalSecs = value;
+    Q_EMIT dreamingIntervalSecsChanged();
+    setNeedsSave(true);
+}
+
+bool DesktopAssistantKcm::dreamingHasSeparateLlm() const
+{
+    return m_dreamingHasSeparateLlm;
+}
+
+QString DesktopAssistantKcm::dreamingLlmConnector() const
+{
+    return m_dreamingLlmConnector;
+}
+
+void DesktopAssistantKcm::setDreamingLlmConnector(const QString &value)
+{
+    if (m_dreamingLlmConnector == value) {
+        return;
+    }
+    m_dreamingLlmConnector = value;
+    Q_EMIT dreamingLlmConnectorChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::dreamingLlmModel() const
+{
+    return m_dreamingLlmModel;
+}
+
+void DesktopAssistantKcm::setDreamingLlmModel(const QString &value)
+{
+    if (m_dreamingLlmModel == value) {
+        return;
+    }
+    m_dreamingLlmModel = value;
+    Q_EMIT dreamingLlmModelChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::dreamingLlmBaseUrl() const
+{
+    return m_dreamingLlmBaseUrl;
+}
+
+void DesktopAssistantKcm::setDreamingLlmBaseUrl(const QString &value)
+{
+    if (m_dreamingLlmBaseUrl == value) {
+        return;
+    }
+    m_dreamingLlmBaseUrl = value;
+    Q_EMIT dreamingLlmBaseUrlChanged();
+    setNeedsSave(true);
+}
+
 void DesktopAssistantKcm::load()
 {
     QDBusInterface iface(SERVICE, PATH, IFACE, QDBusConnection::sessionBus());
@@ -533,6 +613,25 @@ void DesktopAssistantKcm::load()
     m_dbUrl = dbArgs[0].toString();
     m_dbMaxConnections = dbArgs[1].toInt();
 
+    QDBusMessage dreamReply = iface.call("GetDreamingSettings");
+    if (setStatusFromDbusError(dreamReply)) {
+        return;
+    }
+
+    const auto dreamArgs = dreamReply.arguments();
+    if (dreamArgs.size() < 6) {
+        m_statusText = QStringLiteral("Unexpected GetDreamingSettings reply");
+        Q_EMIT statusTextChanged();
+        return;
+    }
+
+    m_dreamingEnabled = dreamArgs[0].toBool();
+    m_dreamingIntervalSecs = static_cast<int>(dreamArgs[1].toULongLong());
+    m_dreamingHasSeparateLlm = dreamArgs[2].toBool();
+    m_dreamingLlmConnector = dreamArgs[3].toString();
+    m_dreamingLlmModel = dreamArgs[4].toString();
+    m_dreamingLlmBaseUrl = dreamArgs[5].toString();
+
     loadWidgetConnectionSettings();
 
     Q_EMIT connectorChanged();
@@ -555,6 +654,12 @@ void DesktopAssistantKcm::load()
     Q_EMIT connectionNamesChanged();
     Q_EMIT defaultConnectionNameChanged();
     emitConnectionSelectionChanged();
+    Q_EMIT dreamingEnabledChanged();
+    Q_EMIT dreamingIntervalSecsChanged();
+    Q_EMIT dreamingHasSeparateLlmChanged();
+    Q_EMIT dreamingLlmConnectorChanged();
+    Q_EMIT dreamingLlmModelChanged();
+    Q_EMIT dreamingLlmBaseUrlChanged();
 
     m_statusText = QStringLiteral("Loaded settings from desktop-assistant daemon");
     Q_EMIT statusTextChanged();
@@ -592,6 +697,18 @@ void DesktopAssistantKcm::save()
         static_cast<uint>(m_dbMaxConnections)
     );
     if (setStatusFromDbusError(dbSaveReply)) {
+        return;
+    }
+
+    QDBusMessage dreamSaveReply = iface.call(
+        "SetDreamingSettings",
+        m_dreamingEnabled,
+        static_cast<qulonglong>(m_dreamingIntervalSecs),
+        m_dreamingLlmConnector,
+        m_dreamingLlmModel,
+        m_dreamingLlmBaseUrl
+    );
+    if (setStatusFromDbusError(dreamSaveReply)) {
         return;
     }
 

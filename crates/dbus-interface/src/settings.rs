@@ -480,6 +480,59 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .map_err(to_fdo_error)
     }
 
+    /// Return dreaming (periodic fact extraction) settings.
+    ///
+    /// Returns: (enabled, interval_secs, has_separate_llm, llm_connector, llm_model, llm_base_url)
+    async fn get_dreaming_settings(&self) -> fdo::Result<(bool, u64, bool, String, String, String)> {
+        let settings = self
+            .service
+            .get_dreaming_settings()
+            .await
+            .map_err(to_fdo_error)?;
+
+        Ok((
+            settings.enabled,
+            settings.interval_secs,
+            settings.has_separate_llm,
+            settings.llm_connector,
+            settings.llm_model,
+            settings.llm_base_url,
+        ))
+    }
+
+    /// Update dreaming settings. Empty llm_connector clears the LLM override.
+    async fn set_dreaming_settings(
+        &self,
+        enabled: bool,
+        interval_secs: u64,
+        llm_connector: &str,
+        llm_model: &str,
+        llm_base_url: &str,
+    ) -> fdo::Result<()> {
+        let llm_connector = if llm_connector.trim().is_empty() {
+            None
+        } else {
+            Some(llm_connector.to_string())
+        };
+
+        let llm_model = if llm_model.trim().is_empty() {
+            None
+        } else {
+            Some(llm_model.to_string())
+        };
+
+        let llm_base_url = if llm_base_url.trim().is_empty() {
+            None
+        } else {
+            Some(llm_base_url.to_string())
+        };
+
+        self.service
+            .set_dreaming_settings(enabled, interval_secs, llm_connector, llm_model, llm_base_url)
+            .await
+            .map_err(to_fdo_error)
+    }
+
     /// Return database settings.
     ///
     /// Returns: (url, max_connections)
@@ -602,8 +655,8 @@ mod tests {
     use super::*;
     use desktop_assistant_core::CoreError;
     use desktop_assistant_core::ports::inbound::{
-        ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
-        PersistenceSettingsView, SettingsService,
+        ConnectorDefaultsView, DatabaseSettingsView, DreamingSettingsView, EmbeddingsSettingsView,
+        LlmSettingsView, PersistenceSettingsView, SettingsService,
     };
     use std::sync::Mutex;
 
@@ -613,6 +666,7 @@ mod tests {
         embeddings: EmbeddingsSettingsView,
         persistence: PersistenceSettingsView,
         database: DatabaseSettingsView,
+        dreaming: DreamingSettingsView,
         api_key_set: bool,
     }
 
@@ -650,6 +704,14 @@ mod tests {
                     database: DatabaseSettingsView {
                         url: String::new(),
                         max_connections: 5,
+                    },
+                    dreaming: DreamingSettingsView {
+                        enabled: false,
+                        interval_secs: 3600,
+                        has_separate_llm: false,
+                        llm_connector: "openai".to_string(),
+                        llm_model: "gpt-5.2".to_string(),
+                        llm_base_url: "https://api.openai.com/v1".to_string(),
                     },
                     api_key_set: false,
                 }),
@@ -777,6 +839,34 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.database.url = url.unwrap_or_default();
             state.database.max_connections = max_connections;
+            Ok(())
+        }
+
+        async fn get_dreaming_settings(&self) -> Result<DreamingSettingsView, CoreError> {
+            Ok(self.state.lock().unwrap().dreaming.clone())
+        }
+
+        async fn set_dreaming_settings(
+            &self,
+            enabled: bool,
+            interval_secs: u64,
+            llm_connector: Option<String>,
+            llm_model: Option<String>,
+            llm_base_url: Option<String>,
+        ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            state.dreaming.enabled = enabled;
+            state.dreaming.interval_secs = interval_secs;
+            state.dreaming.has_separate_llm = llm_connector.is_some();
+            if let Some(connector) = llm_connector {
+                state.dreaming.llm_connector = connector;
+            }
+            if let Some(model) = llm_model {
+                state.dreaming.llm_model = model;
+            }
+            if let Some(base_url) = llm_base_url {
+                state.dreaming.llm_base_url = base_url;
+            }
             Ok(())
         }
     }

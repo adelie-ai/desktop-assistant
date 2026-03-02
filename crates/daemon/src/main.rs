@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, ToolDefinition};
+use desktop_assistant_core::domain::{Message, Role, ToolDefinition};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
 use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, RetryingLlmClient};
@@ -326,6 +326,56 @@ impl LlmClient for AnyLlmClient {
     }
 }
 
+/// Build an `AnyLlmClient` from a resolved LLM configuration.
+fn build_llm_client(resolved: config::ResolvedLlmConfig) -> AnyLlmClient {
+    match resolved.connector.as_str() {
+        "ollama" => AnyLlmClient::Ollama(
+            desktop_assistant_llm_ollama::OllamaClient::new(resolved.base_url, resolved.model)
+                .with_temperature(resolved.temperature)
+                .with_top_p(resolved.top_p)
+                .with_max_tokens(resolved.max_tokens),
+        ),
+        "anthropic" => {
+            if resolved.api_key.is_empty() {
+                tracing::warn!(
+                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
+                );
+            }
+            AnyLlmClient::Anthropic(
+                desktop_assistant_llm_anthropic::AnthropicClient::new(resolved.api_key)
+                    .with_model(resolved.model)
+                    .with_base_url(resolved.base_url)
+                    .with_temperature(resolved.temperature)
+                    .with_top_p(resolved.top_p)
+                    .with_max_tokens_override(resolved.max_tokens),
+            )
+        }
+        "bedrock" | "aws-bedrock" => AnyLlmClient::Bedrock(
+            desktop_assistant_llm_bedrock::BedrockClient::new(resolved.api_key)
+                .with_model(resolved.model)
+                .with_base_url(resolved.base_url)
+                .with_temperature(resolved.temperature)
+                .with_top_p(resolved.top_p)
+                .with_max_tokens(resolved.max_tokens),
+        ),
+        _ => {
+            if resolved.api_key.is_empty() {
+                tracing::warn!(
+                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
+                );
+            }
+            AnyLlmClient::OpenAi(
+                desktop_assistant_llm_openai::OpenAiClient::new(resolved.api_key)
+                    .with_model(resolved.model)
+                    .with_base_url(resolved.base_url)
+                    .with_temperature(resolved.temperature)
+                    .with_top_p(resolved.top_p)
+                    .with_max_tokens(resolved.max_tokens),
+            )
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -358,62 +408,8 @@ async fn main() -> Result<()> {
     let llm_connector = resolved_llm.connector.clone();
     let llm_api_key = resolved_llm.api_key.clone();
 
-    let llm: AnyLlmClient = match resolved_llm.connector.as_str() {
-        "ollama" => {
-            tracing::info!("using Ollama LLM backend");
-            AnyLlmClient::Ollama(
-                desktop_assistant_llm_ollama::OllamaClient::new(
-                    resolved_llm.base_url,
-                    resolved_llm.model,
-                )
-                .with_temperature(resolved_llm.temperature)
-                .with_top_p(resolved_llm.top_p)
-                .with_max_tokens(resolved_llm.max_tokens),
-            )
-        }
-        "anthropic" => {
-            if resolved_llm.api_key.is_empty() {
-                tracing::warn!(
-                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
-                );
-            }
-            tracing::info!("using Anthropic LLM backend");
-            AnyLlmClient::Anthropic(
-                desktop_assistant_llm_anthropic::AnthropicClient::new(resolved_llm.api_key)
-                    .with_model(resolved_llm.model)
-                    .with_base_url(resolved_llm.base_url)
-                    .with_temperature(resolved_llm.temperature)
-                    .with_top_p(resolved_llm.top_p)
-                    .with_max_tokens_override(resolved_llm.max_tokens),
-            )
-        }
-        "bedrock" | "aws-bedrock" => {
-            tracing::info!("using AWS Bedrock LLM backend");
-            AnyLlmClient::Bedrock(
-                desktop_assistant_llm_bedrock::BedrockClient::new(resolved_llm.api_key)
-                    .with_model(resolved_llm.model)
-                    .with_base_url(resolved_llm.base_url)
-                    .with_temperature(resolved_llm.temperature)
-                    .with_top_p(resolved_llm.top_p)
-                    .with_max_tokens(resolved_llm.max_tokens),
-            )
-        }
-        _ => {
-            if resolved_llm.api_key.is_empty() {
-                tracing::warn!(
-                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
-                );
-            }
-            AnyLlmClient::OpenAi(
-                desktop_assistant_llm_openai::OpenAiClient::new(resolved_llm.api_key)
-                    .with_model(resolved_llm.model)
-                    .with_base_url(resolved_llm.base_url)
-                    .with_temperature(resolved_llm.temperature)
-                    .with_top_p(resolved_llm.top_p)
-                    .with_max_tokens(resolved_llm.max_tokens),
-            )
-        }
-    };
+    tracing::info!("using {} LLM backend", llm_connector);
+    let llm: AnyLlmClient = build_llm_client(resolved_llm);
 
     // Build the embedding client from resolved config
     let resolved_emb = config::resolve_embeddings_config(daemon_config.as_ref());
@@ -549,6 +545,30 @@ async fn main() -> Result<()> {
         tracing::info!("no database URL configured; Postgres features disabled");
         None
     };
+
+    // Invalidate embeddings from a different model so that vector-dimension
+    // mismatches cannot cause search errors while the backfill is running.
+    if let Some(pool) = &pg_pool {
+        if !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
+            match desktop_assistant_storage::embedding_backfill::invalidate_stale_embeddings(
+                pool,
+                &embedding_model_id,
+            )
+            .await
+            {
+                Ok((kb, tools)) if kb > 0 || tools > 0 => {
+                    tracing::warn!(
+                        "embedding model changed to {}: invalidated {kb} knowledge + {tools} tool embeddings (will re-embed in background)",
+                        embedding_model_id
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("failed to invalidate stale embeddings: {e}");
+                }
+            }
+        }
+    }
 
     // --- Knowledge base & tool registry stores ---
     let kb_store = pg_pool
@@ -718,6 +738,114 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Spawn background dreaming (periodic fact extraction) task
+    let dreaming_enabled = daemon_config
+        .as_ref()
+        .map(|c| c.dreaming.enabled)
+        .unwrap_or(false);
+    let dreaming_interval_secs = daemon_config
+        .as_ref()
+        .map(|c| c.dreaming.interval_secs)
+        .unwrap_or(3600);
+
+    let (dreaming_shutdown_tx, dreaming_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let dreaming_task = if dreaming_enabled {
+        if let (Some(pool), true) = (
+            &pg_pool,
+            !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
+        ) {
+            let resolved_dreaming_llm =
+                config::resolve_dreaming_llm_config(daemon_config.as_ref());
+            tracing::info!(
+                "dreaming LLM connector={}, model={}",
+                resolved_dreaming_llm.connector,
+                resolved_dreaming_llm.model
+            );
+
+            let dreaming_llm = build_llm_client(resolved_dreaming_llm);
+            let dreaming_llm = RetryingLlmClient::new(dreaming_llm, 3);
+            let dreaming_llm = Arc::new(dreaming_llm);
+
+            let pool = pool.clone();
+            let emb_client = Arc::clone(&embedding_client);
+            let emb_model = embedding_model_id.clone();
+
+            Some(tokio::spawn(async move {
+                let mut shutdown_rx = dreaming_shutdown_rx;
+
+                // Initial delay — let startup settle.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                    _ = &mut shutdown_rx => {
+                        tracing::info!("dreaming cancelled before first scan");
+                        return;
+                    }
+                }
+
+                let llm_fn: desktop_assistant_storage::dreaming::DreamingLlmFn =
+                    Box::new(move |system_prompt, user_prompt| {
+                        let llm = Arc::clone(&dreaming_llm);
+                        Box::pin(async move {
+                            let messages = vec![
+                                Message::new(Role::System, system_prompt),
+                                Message::new(Role::User, user_prompt),
+                            ];
+                            let response = llm
+                                .stream_completion(messages, &[], Box::new(|_| true))
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            Ok(response.text)
+                        })
+                    });
+
+                let embed_fn: desktop_assistant_storage::dreaming::BackfillEmbedFn =
+                    Box::new(move |texts| {
+                        let client = Arc::clone(&emb_client);
+                        Box::pin(async move {
+                            client.embed(texts).await.map_err(|e| e.to_string())
+                        })
+                    });
+
+                loop {
+                    tracing::info!("dreaming: starting scan cycle");
+                    match desktop_assistant_storage::dreaming::run_dreaming_scan(
+                        &pool, &llm_fn, &embed_fn, &emb_model,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => tracing::info!("dreaming: wrote {n} new fact(s)"),
+                        Ok(_) => tracing::debug!("dreaming: no new facts extracted"),
+                        Err(e) => tracing::warn!("dreaming: scan failed: {e}"),
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(dreaming_interval_secs)) => {}
+                        _ = &mut shutdown_rx => {
+                            tracing::info!("dreaming: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            if pg_pool.is_none() {
+                tracing::warn!(
+                    "dreaming enabled but no database configured; dreaming disabled"
+                );
+            } else {
+                tracing::warn!(
+                    "dreaming enabled but embeddings unavailable; dreaming disabled"
+                );
+            }
+            drop(dreaming_shutdown_rx);
+            None
+        }
+    } else {
+        tracing::debug!("dreaming disabled");
+        drop(dreaming_shutdown_rx);
+        None
+    };
+
     // Build the conversation service with tool support
     let conversation_store: AnyConversationStore = if let Some(pool) = &pg_pool {
         tracing::info!("using PostgreSQL conversation store");
@@ -873,6 +1001,13 @@ async fn main() -> Result<()> {
     if let Some(task) = backfill_task {
         if let Err(e) = task.await {
             tracing::warn!("backfill task join error during shutdown: {e}");
+        }
+    }
+
+    let _ = dreaming_shutdown_tx.send(());
+    if let Some(task) = dreaming_task {
+        if let Err(e) = task.await {
+            tracing::warn!("dreaming task join error during shutdown: {e}");
         }
     }
 

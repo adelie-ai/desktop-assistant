@@ -48,6 +48,20 @@ pub struct DatabaseSettingsView {
     pub max_connections: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct DreamingSettingsView {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    /// Whether `[dreaming.llm]` is explicitly configured (vs. falling back to primary LLM).
+    pub has_separate_llm: bool,
+    /// Resolved connector (from dreaming.llm or fallback).
+    pub llm_connector: String,
+    /// Resolved model (from dreaming.llm or fallback).
+    pub llm_model: String,
+    /// Resolved base URL (from dreaming.llm or fallback).
+    pub llm_base_url: String,
+}
+
 /// Inbound port for health/status queries.
 ///
 /// Any adapter that wants to expose assistant status (D-Bus, HTTP, etc.)
@@ -162,6 +176,22 @@ pub trait SettingsService: Send + Sync {
         &self,
         url: Option<String>,
         max_connections: u32,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn get_dreaming_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<DreamingSettingsView, CoreError>> + Send;
+
+    /// Update dreaming settings.
+    ///
+    /// Pass `llm_connector = None` to clear the separate LLM override (revert to primary).
+    fn set_dreaming_settings(
+        &self,
+        enabled: bool,
+        interval_secs: u64,
+        llm_connector: Option<String>,
+        llm_model: Option<String>,
+        llm_base_url: Option<String>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 

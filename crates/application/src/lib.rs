@@ -559,8 +559,8 @@ mod tests {
         Conversation, ConversationId, ConversationSummary, Message, Role,
     };
     use desktop_assistant_core::ports::inbound::{
-        ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
-        PersistenceSettingsView,
+        ConnectorDefaultsView, DatabaseSettingsView, DreamingSettingsView,
+        EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
     };
     use desktop_assistant_core::ports::llm::ChunkCallback;
     use std::sync::Mutex;
@@ -703,6 +703,26 @@ mod tests {
             &self,
             _url: Option<String>,
             _max_connections: u32,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_dreaming_settings(&self) -> Result<DreamingSettingsView, CoreError> {
+            Ok(DreamingSettingsView {
+                enabled: false,
+                interval_secs: 3600,
+                has_separate_llm: false,
+                llm_connector: "openai".into(),
+                llm_model: "gpt-5".into(),
+                llm_base_url: "https://api.openai.com/v1".into(),
+            })
+        }
+        async fn set_dreaming_settings(
+            &self,
+            _enabled: bool,
+            _interval_secs: u64,
+            _llm_connector: Option<String>,
+            _llm_model: Option<String>,
+            _llm_base_url: Option<String>,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -874,6 +894,26 @@ mod tests {
             &self,
             _url: Option<String>,
             _max_connections: u32,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_dreaming_settings(&self) -> Result<DreamingSettingsView, CoreError> {
+            Ok(DreamingSettingsView {
+                enabled: false,
+                interval_secs: 3600,
+                has_separate_llm: false,
+                llm_connector: "openai".into(),
+                llm_model: "gpt-5".into(),
+                llm_base_url: "https://api.openai.com/v1".into(),
+            })
+        }
+        async fn set_dreaming_settings(
+            &self,
+            _enabled: bool,
+            _interval_secs: u64,
+            _llm_connector: Option<String>,
+            _llm_model: Option<String>,
+            _llm_base_url: Option<String>,
         ) -> Result<(), CoreError> {
             Ok(())
         }

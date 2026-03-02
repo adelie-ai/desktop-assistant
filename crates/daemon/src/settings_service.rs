@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
-    ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
-    PersistenceSettingsView, SettingsService,
+    ConnectorDefaultsView, DatabaseSettingsView, DreamingSettingsView, EmbeddingsSettingsView,
+    LlmSettingsView, PersistenceSettingsView, SettingsService,
 };
 
 use crate::config;
@@ -156,6 +156,38 @@ impl SettingsService for DaemonSettingsService {
     ) -> Result<(), CoreError> {
         config::set_database_settings(&self.config_path, url.as_deref(), max_connections)
             .map_err(|e| CoreError::SystemService(e.to_string()))
+    }
+
+    async fn get_dreaming_settings(&self) -> Result<DreamingSettingsView, CoreError> {
+        let view = config::get_dreaming_settings_view(&self.config_path)
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        Ok(DreamingSettingsView {
+            enabled: view.enabled,
+            interval_secs: view.interval_secs,
+            has_separate_llm: view.has_separate_llm,
+            llm_connector: view.llm_connector,
+            llm_model: view.llm_model,
+            llm_base_url: view.llm_base_url,
+        })
+    }
+
+    async fn set_dreaming_settings(
+        &self,
+        enabled: bool,
+        interval_secs: u64,
+        llm_connector: Option<String>,
+        llm_model: Option<String>,
+        llm_base_url: Option<String>,
+    ) -> Result<(), CoreError> {
+        config::set_dreaming_settings(
+            &self.config_path,
+            enabled,
+            interval_secs,
+            llm_connector.as_deref(),
+            llm_model.as_deref(),
+            llm_base_url.as_deref(),
+        )
+        .map_err(|e| CoreError::SystemService(e.to_string()))
     }
 }
 

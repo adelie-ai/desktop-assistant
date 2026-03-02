@@ -1624,7 +1624,7 @@ mod tests {
             "You are Adele, a desktop assistant named in reference to the Adélie penguin"
         ));
         assert!(messages[0].content.contains("Your name is Adele"));
-        assert!(messages[0].content.contains("Follow this priority order"));
+        assert!(messages[0].content.contains("Follow these rules in priority order"));
         assert!(
             messages[0]
                 .content
@@ -1633,7 +1633,7 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("search the knowledge base first (project scope first, then global) before non-memory tools")
+                .contains("search the knowledge base first (project scope, then global) before using other tools")
         );
         assert!(
             messages[0]
@@ -1643,12 +1643,12 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("make a short internal preflight")
+                .contains("do a short internal preflight")
         );
         assert!(
             messages[0]
                 .content
-                .contains("Validate facts that are relevant to the request before relying on them")
+                .contains("Validate facts relevant to the request before relying on them")
         );
         assert!(
             messages[0]
@@ -1675,15 +1675,15 @@ mod tests {
     #[test]
     fn runtime_instruction_enforces_kb_first_for_user_specific_requests() {
         let priority_rule = "Current-turn user instructions override all stored data.";
-        let kb_first = "If a request is user-specific/project-specific or a reference is unclear, search the knowledge base first (project scope first, then global) before non-memory tools.";
+        let kb_first = "If a request is user-specific, project-specific, or a reference is unclear, search the knowledge base first (project scope, then global) before using other tools.";
         let ambiguous_reference =
             "If still unclear, ask one brief clarifying question and do not assume.";
-        let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), attempt one best-fit available tool before claiming limitation, after rule 7 when applicable.";
+        let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), use the best-fit available tool.";
         let no_guessing = "Do not guess user-specific details (project path, run command, package manager, editor, service name, account, or host).";
-        let verify_relevant_facts = "Validate facts that are relevant to the request before relying on them, especially user circumstances and temporally variable details (machine settings, personal preferences, and current date/time); use tools when required.";
+        let verify_relevant_facts = "Validate facts relevant to the request before relying on them, especially temporally variable details (machine settings, current date/time).";
         let no_fabrication =
             "Never fabricate tool outputs or claim a tool succeeded when it did not.";
-        let tool_search_discovery = "Use builtin_tool_search when the user's request requires capabilities not covered by your current tools.";
+        let tool_search_discovery = "Use builtin_tool_search to discover additional tools when the user's request might need capabilities beyond your current set.";
 
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(priority_rule));
         assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(kb_first));
@@ -1711,19 +1711,19 @@ mod tests {
         );
         assert!(
             kb_first_pos < tool_fallback_pos,
-            "kb-first rule must remain before non-memory tool fallback rule"
+            "kb-first rule must remain before tool fallback rule"
         );
         assert!(
-            ambiguous_reference_pos < tool_fallback_pos,
-            "ambiguity guardrail must remain before non-memory tool fallback rule"
+            tool_fallback_pos < no_guessing_pos,
+            "tool usage rules must come before discovery/verification guardrails"
         );
         assert!(
-            no_guessing_pos < tool_fallback_pos,
-            "no-guessing guardrail must remain before non-memory tool fallback rule"
+            no_guessing_pos < ambiguous_reference_pos,
+            "no-guessing guardrail must come before ambiguity guardrail"
         );
         assert!(
-            verify_relevant_facts_pos < tool_fallback_pos,
-            "fact-validation guardrail must remain before non-memory tool fallback rule"
+            ambiguous_reference_pos < verify_relevant_facts_pos,
+            "ambiguity guardrail must come before fact-validation guardrail"
         );
     }
 

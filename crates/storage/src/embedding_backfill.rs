@@ -20,6 +20,45 @@ pub type BackfillEmbedFn = Box<
 
 const BATCH_SIZE: i64 = 32;
 
+/// Invalidate (NULL-out) embeddings whose model stamp doesn't match the current model.
+///
+/// This prevents pgvector dimension-mismatch errors when the embedding model
+/// changes (e.g. switching from a 1536-dim to 768-dim model).  Rows with
+/// NULL embeddings are silently skipped by vector search and will be re-embedded
+/// by the backfill loop.
+///
+/// Returns `(knowledge_count, tool_count)` of invalidated rows.
+pub async fn invalidate_stale_embeddings(
+    pool: &PgPool,
+    current_model: &str,
+) -> Result<(u64, u64), String> {
+    let kb_result = sqlx::query(
+        "UPDATE knowledge_base
+         SET embedding = NULL
+         WHERE embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND embedding_model != $1",
+    )
+    .bind(current_model)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let tool_result = sqlx::query(
+        "UPDATE tool_definitions
+         SET embedding = NULL
+         WHERE embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND embedding_model != $1",
+    )
+    .bind(current_model)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok((kb_result.rows_affected(), tool_result.rows_affected()))
+}
+
 /// Backfill embeddings for `knowledge_base` rows that are missing or stale.
 ///
 /// Returns the total number of rows updated.

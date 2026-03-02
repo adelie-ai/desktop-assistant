@@ -30,6 +30,7 @@ KCM.SimpleKCM {
 
             QQC2.TabButton { text: "Chat LLM" }
             QQC2.TabButton { text: "Search" }
+            QQC2.TabButton { text: "Dreaming" }
             QQC2.TabButton { text: "Data Sync" }
             QQC2.TabButton { text: "Connections" }
         }
@@ -194,6 +195,107 @@ KCM.SimpleKCM {
                         visible: !kcm.embAvailable
                         color: Kirigami.Theme.neutralTextColor
                         text: "The current choice cannot power Search right now. Pick another Search provider, or switch the Chat LLM connector."
+                    }
+
+                    Item { Layout.fillHeight: true }
+                }
+            }
+
+            QQC2.ScrollView {
+                clip: true
+
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 12
+
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: "Dreaming periodically reviews conversations and extracts long-term facts into the knowledge base. It also consolidates and corrects existing memories."
+                    }
+
+                    QQC2.CheckBox {
+                        id: dreamingEnabledCheck
+                        text: "Enable dreaming"
+                        checked: kcm.dreamingEnabled
+                        onToggled: kcm.dreamingEnabled = checked
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: dreamingEnabledCheck.checked
+                        QQC2.Label { text: "Interval (seconds)" }
+                        QQC2.SpinBox {
+                            id: dreamingIntervalBox
+                            from: 60
+                            to: 86400
+                            stepSize: 300
+                            value: kcm.dreamingIntervalSecs
+                            onValueModified: kcm.dreamingIntervalSecs = value
+                        }
+                    }
+
+                    Kirigami.Separator { Layout.fillWidth: true }
+
+                    QQC2.CheckBox {
+                        id: dreamingSeparateLlmCheck
+                        enabled: dreamingEnabledCheck.checked
+                        text: "Use a separate LLM for dreaming"
+                        checked: kcm.dreamingLlmConnector !== ""
+                        onToggled: {
+                            if (!checked) {
+                                kcm.dreamingLlmConnector = ""
+                                kcm.dreamingLlmModel = ""
+                                kcm.dreamingLlmBaseUrl = ""
+                            } else {
+                                kcm.dreamingLlmConnector = "ollama"
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: dreamingEnabledCheck.checked && dreamingSeparateLlmCheck.checked
+                        QQC2.Label { text: "Connector" }
+                        QQC2.ComboBox {
+                            id: dreamingConnectorBox
+                            Layout.fillWidth: true
+                            model: ["ollama", "openai", "anthropic", "aws-bedrock"]
+                            currentIndex: {
+                                if (kcm.dreamingLlmConnector === "ollama") return 0
+                                if (kcm.dreamingLlmConnector === "openai") return 1
+                                if (kcm.dreamingLlmConnector === "anthropic") return 2
+                                if (kcm.dreamingLlmConnector === "bedrock" || kcm.dreamingLlmConnector === "aws-bedrock") return 3
+                                return 0
+                            }
+                            onActivated: kcm.dreamingLlmConnector = currentText
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: dreamingEnabledCheck.checked && dreamingSeparateLlmCheck.checked
+                        QQC2.Label { text: "Model" }
+                        QQC2.TextField {
+                            id: dreamingModelField
+                            Layout.fillWidth: true
+                            placeholderText: "llama3.2:3b / gpt-4o-mini / ..."
+                            text: kcm.dreamingLlmModel
+                            onTextEdited: kcm.dreamingLlmModel = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: dreamingEnabledCheck.checked && dreamingSeparateLlmCheck.checked
+                        QQC2.Label { text: "Base URL" }
+                        QQC2.TextField {
+                            id: dreamingBaseUrlField
+                            Layout.fillWidth: true
+                            placeholderText: "http://localhost:11434"
+                            text: kcm.dreamingLlmBaseUrl
+                            onTextEdited: kcm.dreamingLlmBaseUrl = text
+                        }
                     }
 
                     Item { Layout.fillHeight: true }
@@ -547,6 +649,24 @@ KCM.SimpleKCM {
             function onSelectedConnectionWsSubjectChanged() {
                 if (selectedConnectionWsSubjectField.text !== kcm.selectedConnectionWsSubject) {
                     selectedConnectionWsSubjectField.text = kcm.selectedConnectionWsSubject
+                }
+            }
+
+            function onDreamingIntervalSecsChanged() {
+                if (dreamingIntervalBox.value !== kcm.dreamingIntervalSecs) {
+                    dreamingIntervalBox.value = kcm.dreamingIntervalSecs
+                }
+            }
+
+            function onDreamingLlmModelChanged() {
+                if (dreamingModelField.text !== kcm.dreamingLlmModel) {
+                    dreamingModelField.text = kcm.dreamingLlmModel
+                }
+            }
+
+            function onDreamingLlmBaseUrlChanged() {
+                if (dreamingBaseUrlField.text !== kcm.dreamingLlmBaseUrl) {
+                    dreamingBaseUrlField.text = kcm.dreamingLlmBaseUrl
                 }
             }
         }

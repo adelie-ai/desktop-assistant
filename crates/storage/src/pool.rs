@@ -78,5 +78,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Dreaming watermarks — tracks per-conversation extraction progress.
+    if let Err(e) =
+        sqlx::raw_sql(include_str!("../migrations/006_dreaming_watermarks.sql"))
+            .execute(pool)
+            .await
+    {
+        tracing::warn!("could not apply dreaming watermarks migration: {e}");
+    }
+
     Ok(())
 }

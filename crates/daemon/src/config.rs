@@ -21,6 +21,34 @@ pub struct DaemonConfig {
     pub persistence: PersistenceConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub dreaming: DreamingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DreamingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_dreaming_interval_secs")]
+    pub interval_secs: u64,
+    /// Optional separate LLM config for dreaming extraction.
+    /// Falls back to the top-level `[llm]` if omitted.
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
+}
+
+impl Default for DreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_dreaming_interval_secs(),
+            llm: None,
+        }
+    }
+}
+
+fn default_dreaming_interval_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -521,6 +549,69 @@ pub fn set_database_settings(
     save_daemon_config(path, &config)
 }
 
+pub struct DreamingSettingsViewConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub has_separate_llm: bool,
+    pub llm_connector: String,
+    pub llm_model: String,
+    pub llm_base_url: String,
+}
+
+pub fn get_dreaming_settings_view(path: &Path) -> anyhow::Result<DreamingSettingsViewConfig> {
+    let config = load_daemon_config(path)?;
+    let dreaming = config.as_ref().map(|c| &c.dreaming);
+
+    let enabled = dreaming.map(|d| d.enabled).unwrap_or(false);
+    let interval_secs = dreaming
+        .map(|d| d.interval_secs)
+        .unwrap_or_else(default_dreaming_interval_secs);
+    let has_separate_llm = dreaming.is_some_and(|d| d.llm.is_some());
+
+    let resolved = resolve_dreaming_llm_config(config.as_ref());
+
+    Ok(DreamingSettingsViewConfig {
+        enabled,
+        interval_secs,
+        has_separate_llm,
+        llm_connector: resolved.connector,
+        llm_model: resolved.model,
+        llm_base_url: resolved.base_url,
+    })
+}
+
+pub fn set_dreaming_settings(
+    path: &Path,
+    enabled: bool,
+    interval_secs: u64,
+    llm_connector: Option<&str>,
+    llm_model: Option<&str>,
+    llm_base_url: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut config = load_daemon_config(path)?.unwrap_or_default();
+
+    config.dreaming.enabled = enabled;
+    config.dreaming.interval_secs = interval_secs;
+
+    // If connector is provided, configure a separate dreaming LLM.
+    // If connector is None/empty, clear the override (fall back to primary).
+    let connector = llm_connector
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if let Some(connector) = connector {
+        let mut llm = config.dreaming.llm.unwrap_or_default();
+        llm.connector = connector.to_lowercase();
+        llm.model = normalize_optional_value(llm_model);
+        llm.base_url = normalize_optional_value(llm_base_url);
+        config.dreaming.llm = Some(llm);
+    } else {
+        config.dreaming.llm = None;
+    }
+
+    save_daemon_config(path, &config)
+}
+
 pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
     let connector = connector.trim().to_lowercase();
     let connector = if connector.is_empty() {
@@ -674,8 +765,23 @@ fn normalize_optional_value(value: Option<&str>) -> Option<String> {
 }
 
 pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
-    let llm_config = config.map(|c| &c.llm);
+    resolve_llm_config_from(config.map(|c| &c.llm))
+}
 
+/// Resolve dreaming LLM config: uses `[dreaming.llm]` if set, otherwise falls
+/// back to the top-level `[llm]`.
+pub fn resolve_dreaming_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
+    let dreaming_llm = config.and_then(|c| c.dreaming.llm.as_ref());
+    if dreaming_llm.is_some() {
+        resolve_llm_config_from(dreaming_llm)
+    } else {
+        resolve_llm_config(config)
+    }
+}
+
+/// Shared resolution logic: takes an optional `LlmConfig` reference and
+/// resolves connector, model, base_url, api_key with env-var fallbacks.
+fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig {
     let connector = llm_config
         .map(|c| c.connector.trim().to_lowercase())
         .filter(|c| !c.is_empty())
