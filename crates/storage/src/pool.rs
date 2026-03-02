@@ -73,5 +73,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         tracing::warn!("could not apply embedding model tracking migration: {e}");
     }
 
+    // Convert messages.id from BIGSERIAL to TEXT (UUIDv7).
+    sqlx::raw_sql(include_str!("../migrations/005_uuidv7_ids.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }

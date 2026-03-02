@@ -122,6 +122,10 @@ desktop-assistant/
 │       └── Cargo.toml
 ```
 
+### 8. Database ID Columns
+
+All `id` columns must use **UUIDv7** (`TEXT` type, generated via `uuid::Uuid::now_v7().to_string()`). UUIDv7 embeds a millisecond timestamp, giving chronological sortability like auto-incrementing integers while avoiding races across multiple instances. Never use `BIGSERIAL`, `SERIAL`, or UUIDv4 for new `id` columns.
+
 ## Rust Conventions
 
 - Edition: 2024

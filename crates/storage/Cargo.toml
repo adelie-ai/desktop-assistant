@@ -13,6 +13,7 @@ serde_json = "1"
 tracing.workspace = true
 chrono.workspace = true
 tokio.workspace = true
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

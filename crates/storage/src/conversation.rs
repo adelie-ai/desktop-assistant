@@ -211,9 +211,10 @@ async fn insert_message(
     };
 
     sqlx::query(
-        "INSERT INTO messages (conversation_id, ordinal, role, content, tool_calls, tool_call_id)
-         VALUES ($1, $2, $3, $4, $5, $6)"
+        "INSERT INTO messages (id, conversation_id, ordinal, role, content, tool_calls, tool_call_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
     )
+    .bind(uuid::Uuid::now_v7().to_string())
     .bind(conversation_id)
     .bind(ordinal as i32)
     .bind(role_to_str(&msg.role))

@@ -737,7 +737,7 @@ async fn main() -> Result<()> {
         conversation_store,
         llm,
         tool_executor,
-        Box::new(|| uuid::Uuid::new_v4().to_string()),
+        Box::new(|| uuid::Uuid::now_v7().to_string()),
     ));
     let settings_service = Arc::new(DaemonSettingsService::new(config_path.clone()));
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
