@@ -64,8 +64,12 @@ pub trait LlmClient: Send + Sync {
 }
 
 /// Check whether a `CoreError` represents a retryable API error (429/529/rate-limit/overloaded).
+/// Excludes permanent errors like `insufficient_quota` that happen to use HTTP 429.
 pub fn is_retryable_error(e: &CoreError) -> bool {
     let normalized = e.to_string().to_ascii_lowercase();
+    if normalized.contains("insufficient_quota") || normalized.contains("rate_limit_error") {
+        return false;
+    }
     normalized.contains("429")
         || normalized.contains("rate_limit")
         || normalized.contains("529")
@@ -264,6 +268,24 @@ mod tests {
     #[test]
     fn non_retryable_error() {
         let e = CoreError::Llm("invalid API key".into());
+        assert!(!is_retryable_error(&e));
+    }
+
+    #[test]
+    fn non_retryable_insufficient_quota_429() {
+        let e = CoreError::Llm(
+            "OpenAI API error (HTTP 429 Too Many Requests): {\"error\":{\"type\":\"insufficient_quota\",\"message\":\"You exceeded your current quota\"}}"
+                .into(),
+        );
+        assert!(!is_retryable_error(&e));
+    }
+
+    #[test]
+    fn non_retryable_anthropic_rate_limit_error_429() {
+        let e = CoreError::Llm(
+            "Anthropic API error (HTTP 429 Too Many Requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit\"}}"
+                .into(),
+        );
         assert!(!is_retryable_error(&e));
     }
 
