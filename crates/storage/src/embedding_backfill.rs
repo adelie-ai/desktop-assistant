@@ -99,10 +99,13 @@ pub async fn backfill_knowledge_embeddings(
     let mut consecutive_failures = 0u32;
 
     loop {
+        // Select rows needing embedding.  Rows where embedding_model already
+        // matches the current model are either already done (embedding present)
+        // or failed individually on a prior iteration (embedding NULL, model
+        // stamped) — skip both to avoid an infinite retry loop.
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, content FROM knowledge_base
-             WHERE embedding IS NULL
-                OR embedding_model IS NULL
+             WHERE embedding_model IS NULL
                 OR embedding_model != $1
              LIMIT $2",
         )
@@ -137,17 +140,56 @@ pub async fn backfill_knowledge_embeddings(
                 total += rows.len();
             }
             Err(e) => {
-                consecutive_failures += 1;
-                tracing::warn!(
-                    "knowledge embedding backfill batch failed ({consecutive_failures}): {e}"
-                );
-                // After 3 consecutive failures the embedding service is likely
-                // down — stop retrying to avoid a hot loop.
-                if consecutive_failures >= 3 {
-                    tracing::error!(
-                        "knowledge embedding backfill aborting after {consecutive_failures} consecutive failures"
-                    );
-                    break;
+                tracing::warn!("knowledge embedding batch failed, retrying individually: {e}");
+                // Batch failed (e.g. one entry exceeds context length).
+                // Retry each entry individually so good entries still get embedded.
+                let mut any_succeeded = false;
+                for (id, content) in &rows {
+                    match embed_fn(vec![content.clone()]).await {
+                        Ok(embeddings) => {
+                            if let Some(embedding) = embeddings.into_iter().next() {
+                                let vec = Vector::from(embedding);
+                                sqlx::query(
+                                    "UPDATE knowledge_base
+                                     SET embedding = $1, embedding_model = $2
+                                     WHERE id = $3",
+                                )
+                                .bind(vec)
+                                .bind(current_model)
+                                .bind(id)
+                                .execute(pool)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                                total += 1;
+                                any_succeeded = true;
+                            }
+                        }
+                        Err(e2) => {
+                            tracing::warn!("skipping knowledge entry {id}: {e2}");
+                            // Mark it so we don't retry it every startup.
+                            sqlx::query(
+                                "UPDATE knowledge_base
+                                 SET embedding_model = $1
+                                 WHERE id = $2",
+                            )
+                            .bind(current_model)
+                            .bind(id)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+                if any_succeeded {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        tracing::error!(
+                            "knowledge embedding backfill aborting after {consecutive_failures} consecutive failures"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -174,8 +216,7 @@ pub async fn backfill_tool_embeddings(
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT name, name || ' ' || description AS text
              FROM tool_definitions
-             WHERE embedding IS NULL
-                OR embedding_model IS NULL
+             WHERE embedding_model IS NULL
                 OR embedding_model != $1
              LIMIT $2",
         )
@@ -210,15 +251,53 @@ pub async fn backfill_tool_embeddings(
                 total += rows.len();
             }
             Err(e) => {
-                consecutive_failures += 1;
-                tracing::warn!(
-                    "tool embedding backfill batch failed ({consecutive_failures}): {e}"
-                );
-                if consecutive_failures >= 3 {
-                    tracing::error!(
-                        "tool embedding backfill aborting after {consecutive_failures} consecutive failures"
-                    );
-                    break;
+                tracing::warn!("tool embedding batch failed, retrying individually: {e}");
+                let mut any_succeeded = false;
+                for (name, text) in &rows {
+                    match embed_fn(vec![text.clone()]).await {
+                        Ok(embeddings) => {
+                            if let Some(embedding) = embeddings.into_iter().next() {
+                                let vec = Vector::from(embedding);
+                                sqlx::query(
+                                    "UPDATE tool_definitions
+                                     SET embedding = $1, embedding_model = $2
+                                     WHERE name = $3",
+                                )
+                                .bind(vec)
+                                .bind(current_model)
+                                .bind(name)
+                                .execute(pool)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                                total += 1;
+                                any_succeeded = true;
+                            }
+                        }
+                        Err(e2) => {
+                            tracing::warn!("skipping tool {name}: {e2}");
+                            sqlx::query(
+                                "UPDATE tool_definitions
+                                 SET embedding_model = $1
+                                 WHERE name = $2",
+                            )
+                            .bind(current_model)
+                            .bind(name)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+                if any_succeeded {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        tracing::error!(
+                            "tool embedding backfill aborting after {consecutive_failures} consecutive failures"
+                        );
+                        break;
+                    }
                 }
             }
         }

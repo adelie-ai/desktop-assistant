@@ -445,7 +445,8 @@ async fn load_new_transcript(
     let mut transcript = String::new();
     for (role, content) in rows {
         let truncated = if content.len() > MAX_MESSAGE_CHARS {
-            format!("{}…", &content[..MAX_MESSAGE_CHARS])
+            let end = content.floor_char_boundary(MAX_MESSAGE_CHARS);
+            format!("{}…", &content[..end])
         } else {
             content
         };
