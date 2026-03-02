@@ -251,8 +251,22 @@ impl BuiltinToolService {
             updated_at: String::new(),
         };
 
-        // Generate embedding for the content
-        let embedding = self.embed_text(&content).await;
+        // Generate embedding for the content.
+        // If embeddings are configured but the call fails, return an error
+        // so the caller knows the write is incomplete rather than silently
+        // storing a NULL embedding that won't appear in vector searches.
+        let embedding = if self.embed_fn.is_some() {
+            match self.embed_text(&content).await {
+                Some(vec) => Some(vec),
+                None => {
+                    return Err(CoreError::ToolExecution(
+                        "failed to generate embedding for knowledge entry; the entry was NOT saved — check that the embedding service is reachable".to_string(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         let saved = write_fn(entry, embedding).await?;
 
