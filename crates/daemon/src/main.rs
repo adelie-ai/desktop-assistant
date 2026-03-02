@@ -632,7 +632,7 @@ async fn main() -> Result<()> {
         builtin_tools = builtin_tools.with_database(Arc::new(move |sql, limit| {
             let pool = pool_for_db.clone();
             Box::pin(async move {
-                desktop_assistant_storage::execute_readonly_query(&pool, &sql, limit).await
+                desktop_assistant_storage::execute_database_query(&pool, &sql, limit).await
             })
         }));
     }

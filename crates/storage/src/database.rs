@@ -2,38 +2,53 @@ use desktop_assistant_core::CoreError;
 use sqlx::postgres::PgRow;
 use sqlx::{Column, PgPool, Row, TypeInfo};
 
-/// Execute a read-only SQL query and return results as JSON.
+/// Execute a SQL query and return results as JSON.
 ///
-/// The query is wrapped in a READ ONLY transaction (PostgreSQL enforces no writes).
-/// A LIMIT clause is appended if one is not already present.
-/// The transaction is always rolled back (read-only, nothing to commit).
+/// **Read queries** (SELECT / WITH / TABLE / VALUES / EXPLAIN) run inside a
+/// READ ONLY transaction with an automatic LIMIT appended when absent.
 ///
-/// Returns `{ "columns": [...], "rows": [[...], ...], "row_count": N }`.
-pub async fn execute_readonly_query(
+/// **Write queries** (CREATE / INSERT / UPDATE / DELETE / DROP / ALTER / …)
+/// run in a normal transaction that is committed on success.  The transaction's
+/// `search_path` is set to `scratch, public` so that unqualified table
+/// references in DDL/DML resolve to the `scratch` schema while all public
+/// tables remain readable.  The `scratch` schema is created lazily if it does
+/// not yet exist.
+///
+/// Returns:
+/// - Row-returning queries: `{ "columns": [...], "rows": [[...], ...], "row_count": N }`
+/// - Non-row-returning writes: `{ "rows_affected": N }`
+pub async fn execute_database_query(
     pool: &PgPool,
     sql: &str,
     limit: usize,
 ) -> Result<serde_json::Value, CoreError> {
     let sql_trimmed = sql.trim().trim_end_matches(';');
-
-    // Reject obviously non-read queries at the application level as an extra guard.
     let upper = sql_trimmed.to_uppercase();
     let first_keyword = upper.split_whitespace().next().unwrap_or("");
-    if !matches!(
+
+    let is_read = matches!(
         first_keyword,
         "SELECT" | "WITH" | "TABLE" | "VALUES" | "EXPLAIN"
-    ) {
-        return Err(CoreError::ToolExecution(format!(
-            "only SELECT/WITH/TABLE/VALUES/EXPLAIN queries are allowed, got: {first_keyword}"
-        )));
-    }
+    );
 
-    // Append LIMIT if not already present.
-    let has_limit = upper.contains(" LIMIT ");
-    let query = if has_limit {
-        sql_trimmed.to_string()
+    if is_read {
+        execute_read(pool, sql_trimmed, &upper, limit).await
     } else {
-        format!("{sql_trimmed} LIMIT {limit}")
+        execute_write(pool, sql_trimmed, &upper).await
+    }
+}
+
+/// Read path — READ ONLY transaction, auto-LIMIT, always rolled back.
+async fn execute_read(
+    pool: &PgPool,
+    sql: &str,
+    upper: &str,
+    limit: usize,
+) -> Result<serde_json::Value, CoreError> {
+    let query = if upper.contains(" LIMIT ") {
+        sql.to_string()
+    } else {
+        format!("{sql} LIMIT {limit}")
     };
 
     let mut tx = pool
@@ -41,7 +56,6 @@ pub async fn execute_readonly_query(
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-    // Set the transaction to READ ONLY so PostgreSQL rejects any writes.
     sqlx::query("SET TRANSACTION READ ONLY")
         .execute(&mut *tx)
         .await
@@ -52,12 +66,69 @@ pub async fn execute_readonly_query(
         .await
         .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?;
 
-    // Always rollback — read-only transaction has nothing to commit.
     tx.rollback()
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-    // Extract column names from the first row (or return empty if no rows).
+    rows_to_json(&rows)
+}
+
+/// Write path — ensures `scratch` schema exists, sets search_path to
+/// `scratch, public`, executes the statement, and commits.
+async fn execute_write(
+    pool: &PgPool,
+    sql: &str,
+    upper: &str,
+) -> Result<serde_json::Value, CoreError> {
+    // Ensure the scratch schema exists (idempotent).
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS scratch")
+        .execute(pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+    // Unqualified writes go to scratch; public tables are still readable.
+    sqlx::query("SET LOCAL search_path TO scratch, public")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+    // If the statement contains RETURNING it will produce rows.
+    let has_returning = upper.contains("RETURNING");
+
+    if has_returning {
+        let rows: Vec<PgRow> = sqlx::query(sql)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        rows_to_json(&rows)
+    } else {
+        let result = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(serde_json::json!({
+            "rows_affected": result.rows_affected()
+        }))
+    }
+}
+
+/// Convert a slice of `PgRow` into the standard JSON result envelope.
+fn rows_to_json(rows: &[PgRow]) -> Result<serde_json::Value, CoreError> {
     let columns: Vec<String> = if let Some(first) = rows.first() {
         first
             .columns()
@@ -74,12 +145,11 @@ pub async fn execute_readonly_query(
 
     let mut json_rows: Vec<Vec<serde_json::Value>> = Vec::with_capacity(rows.len());
 
-    for row in &rows {
+    for row in rows {
         let mut json_row = Vec::with_capacity(columns.len());
         for (i, col) in row.columns().iter().enumerate() {
             let type_name = col.type_info().name();
-            let value = pg_value_to_json(row, i, type_name);
-            json_row.push(value);
+            json_row.push(pg_value_to_json(row, i, type_name));
         }
         json_rows.push(json_row);
     }
@@ -94,9 +164,6 @@ pub async fn execute_readonly_query(
 
 /// Convert a single column value from a PgRow into a serde_json::Value.
 fn pg_value_to_json(row: &PgRow, index: usize, type_name: &str) -> serde_json::Value {
-    // Check for NULL first — works for any type.
-    // We try the most common type (String) and if it's null, return null.
-    // This is a workaround because sqlx doesn't expose a generic is_null check.
     match type_name {
         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" => match row.try_get::<Option<String>, _>(index) {
             Ok(Some(v)) => serde_json::Value::String(v),
@@ -143,7 +210,6 @@ fn pg_value_to_json(row: &PgRow, index: usize, type_name: &str) -> serde_json::V
                 Ok(Some(v)) => serde_json::Value::String(v.to_rfc3339()),
                 Ok(None) => serde_json::Value::Null,
                 Err(_) => {
-                    // Fallback: try as NaiveDateTime
                     match row.try_get::<Option<chrono::NaiveDateTime>, _>(index) {
                         Ok(Some(v)) => serde_json::Value::String(v.to_string()),
                         _ => serde_json::Value::Null,
@@ -168,7 +234,6 @@ fn pg_value_to_json(row: &PgRow, index: usize, type_name: &str) -> serde_json::V
                 Err(_) => serde_json::Value::Null,
             }
         }
-        // Fallback: try to get as String
         _ => match row.try_get::<Option<String>, _>(index) {
             Ok(Some(v)) => serde_json::Value::String(v),
             Ok(None) => serde_json::Value::Null,

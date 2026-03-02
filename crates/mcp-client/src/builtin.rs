@@ -183,23 +183,31 @@ impl BuiltinToolService {
             ),
             ToolDefinition::new(
                 TOOL_DB_QUERY,
-                "Execute a read-only SQL query against the assistant's PostgreSQL database. \
-                 Use this to inspect conversations, messages, knowledge base entries, tool \
-                 definitions, and other stored data. Only SELECT/WITH/TABLE/VALUES/EXPLAIN \
-                 queries are allowed. The database enforces read-only access at the \
-                 transaction level.",
+                "Execute a SQL query against the assistant's PostgreSQL database. \
+                 Use this to inspect your own conversations, messages, knowledge base \
+                 entries, tool definitions, and other stored data. You can also modify \
+                 data directly — use this to debug issues, fix inconsistencies, or \
+                 rework entries that lack a dedicated tool.\n\n\
+                 A `scratch` schema is available for temporary relational work (staging \
+                 tables, intermediate joins, materialized views, etc.). Write queries \
+                 default to the scratch schema via search_path; the main data in the \
+                 `public` schema is always readable. To modify public tables directly, \
+                 use fully-qualified names (e.g. `UPDATE public.knowledge_base ...`).\n\n\
+                 SELECT/WITH/TABLE/VALUES/EXPLAIN run in a read-only transaction. \
+                 Other statements (CREATE, INSERT, UPDATE, DELETE, etc.) run in a \
+                 normal transaction and are committed.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "SQL query to execute (read-only)"
+                            "description": "SQL query to execute"
                         },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 500,
-                            "description": "Maximum number of rows to return (default 100)"
+                            "description": "Maximum rows to return for SELECT queries (default 100). Ignored for write queries."
                         }
                     },
                     "required": ["query"]

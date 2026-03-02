@@ -8,7 +8,7 @@ pub mod migrate_json;
 pub mod tool_registry;
 
 pub use conversation::PgConversationStore;
-pub use database::execute_readonly_query;
+pub use database::execute_database_query;
 pub use knowledge::PgKnowledgeBaseStore;
 pub use migrate_json::{
     is_conversations_table_empty, is_knowledge_base_table_empty, migrate_conversations,
