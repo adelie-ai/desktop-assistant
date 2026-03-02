@@ -9,12 +9,13 @@ use crate::domain::ToolDefinition;
 /// Stores tool definitions with embeddings for hybrid search.
 pub trait ToolRegistryStore: Send + Sync {
     /// Register (upsert) tool definitions from a source (e.g. an MCP server name or "builtin").
+    /// Embeddings are chunk arrays (one Vec<f32> per chunk) to match the vector[] column.
     fn register_tools(
         &self,
         tools: Vec<ToolDefinition>,
         source: &str,
         is_core: bool,
-        embeddings: Vec<Option<Vec<f32>>>,
+        embeddings: Vec<Option<Vec<Vec<f32>>>>,
         embedding_model: Option<String>,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
@@ -76,7 +77,7 @@ mod tests {
             _tools: Vec<ToolDefinition>,
             _source: &str,
             _is_core: bool,
-            _embeddings: Vec<Option<Vec<f32>>>,
+            _embeddings: Vec<Option<Vec<Vec<f32>>>>,
             _embedding_model: Option<String>,
         ) -> Result<(), CoreError> {
             Ok(())

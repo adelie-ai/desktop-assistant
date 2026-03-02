@@ -217,6 +217,8 @@ pub async fn backfill_knowledge_embeddings(
 /// Backfill embeddings for `tool_definitions` rows that are missing or stale.
 ///
 /// The text embedded is `name || ' ' || description` to match the tsvector.
+/// Each tool's text is chunked (though most will be a single chunk) and stored
+/// as a `vector[]` array.
 ///
 /// Continues past batch failures so that a single bad batch does not block the
 /// entire backfill.  Returns the total number of rows successfully updated.
@@ -246,18 +248,31 @@ pub async fn backfill_tool_embeddings(
             break;
         }
 
-        let texts: Vec<String> = rows.iter().map(|(_, text)| text.clone()).collect();
+        // Chunk all rows and track which chunks belong to which row.
+        let mut all_chunks: Vec<(usize, String)> = Vec::new();
+        for (i, (_, text)) in rows.iter().enumerate() {
+            for chunk in chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP) {
+                all_chunks.push((i, chunk));
+            }
+        }
+
+        let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
         match embed_fn(texts).await {
             Ok(embeddings) => {
                 consecutive_failures = 0;
-                for ((name, _), embedding) in rows.iter().zip(embeddings.into_iter()) {
-                    let vec = Vector::from(embedding);
+                // Group embeddings back by row index.
+                let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
+                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings.into_iter()) {
+                    row_embeddings[*row_idx].push(Vector::from(emb));
+                }
+
+                for ((name, _), vecs) in rows.iter().zip(row_embeddings.into_iter()) {
                     sqlx::query(
                         "UPDATE tool_definitions
-                         SET embedding = $1, embedding_model = $2
+                         SET embedding = $1::vector[], embedding_model = $2
                          WHERE name = $3",
                     )
-                    .bind(vec)
+                    .bind(&vecs)
                     .bind(current_model)
                     .bind(name)
                     .execute(pool)
@@ -270,24 +285,24 @@ pub async fn backfill_tool_embeddings(
                 tracing::warn!("tool embedding batch failed, retrying individually: {e}");
                 let mut any_succeeded = false;
                 for (name, text) in &rows {
-                    match embed_fn(vec![text.clone()]).await {
+                    let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    match embed_fn(chunks).await {
                         Ok(embeddings) => {
-                            if let Some(embedding) = embeddings.into_iter().next() {
-                                let vec = Vector::from(embedding);
-                                sqlx::query(
-                                    "UPDATE tool_definitions
-                                     SET embedding = $1, embedding_model = $2
-                                     WHERE name = $3",
-                                )
-                                .bind(vec)
-                                .bind(current_model)
-                                .bind(name)
-                                .execute(pool)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                                total += 1;
-                                any_succeeded = true;
-                            }
+                            let vecs: Vec<Vector> =
+                                embeddings.into_iter().map(Vector::from).collect();
+                            sqlx::query(
+                                "UPDATE tool_definitions
+                                 SET embedding = $1::vector[], embedding_model = $2
+                                 WHERE name = $3",
+                            )
+                            .bind(&vecs)
+                            .bind(current_model)
+                            .bind(name)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            total += 1;
+                            any_succeeded = true;
                         }
                         Err(e2) => {
                             tracing::warn!("skipping tool {name}: {e2}");

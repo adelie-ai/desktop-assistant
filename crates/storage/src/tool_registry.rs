@@ -20,17 +20,20 @@ impl ToolRegistryStore for PgToolRegistryStore {
         tools: Vec<ToolDefinition>,
         source: &str,
         is_core: bool,
-        embeddings: Vec<Option<Vec<f32>>>,
+        embeddings: Vec<Option<Vec<Vec<f32>>>>,
         embedding_model: Option<String>,
     ) -> Result<(), CoreError> {
         let mut tx = self.pool.begin().await.map_err(|e| CoreError::Storage(e.to_string()))?;
 
         for (i, tool) in tools.iter().enumerate() {
-            let embedding_vec = embeddings.get(i).and_then(|e| e.clone()).map(Vector::from);
+            let embedding_vecs: Option<Vec<Vector>> = embeddings
+                .get(i)
+                .and_then(|e| e.clone())
+                .map(|chunks| chunks.into_iter().map(Vector::from).collect());
 
             sqlx::query(
                 "INSERT INTO tool_definitions (name, description, parameters, source, is_core, embedding, embedding_model)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 VALUES ($1, $2, $3, $4, $5, $6::vector[], $7)
                  ON CONFLICT (name) DO UPDATE
                     SET description = EXCLUDED.description,
                         parameters = EXCLUDED.parameters,
@@ -45,7 +48,7 @@ impl ToolRegistryStore for PgToolRegistryStore {
             .bind(&tool.parameters)
             .bind(source)
             .bind(is_core)
-            .bind(embedding_vec)
+            .bind(&embedding_vecs)
             .bind(&embedding_model)
             .execute(&mut *tx)
             .await
@@ -87,12 +90,17 @@ impl ToolRegistryStore for PgToolRegistryStore {
         let result_limit = limit as i64;
 
         let rows: Vec<ToolSearchRow> = sqlx::query_as(
-            "WITH vector_ranked AS (
+            "WITH chunk_distances AS (
                 SELECT name, description, parameters,
-                       ROW_NUMBER() OVER (ORDER BY embedding <=> $1) AS rank_v
-                FROM tool_definitions
+                       MIN(chunk <=> $1) AS min_distance
+                FROM tool_definitions, unnest(embedding) AS chunk
                 WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> $1
+                GROUP BY name, description, parameters
+            ),
+            vector_ranked AS (
+                SELECT name, description, parameters,
+                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
+                FROM chunk_distances
                 LIMIT $2
             ),
             text_ranked AS (
