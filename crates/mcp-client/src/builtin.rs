@@ -22,13 +22,6 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-fn now_ts_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
 pub struct BuiltinToolService {
     embed_fn: Option<EmbedFn>,
     kb_write_fn: Option<KnowledgeWriteFn>,
@@ -247,7 +240,7 @@ impl BuiltinToolService {
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
         let id = optional_string(&arguments, "id")
-            .unwrap_or_else(|| format!("kb-{}", now_ts_nanos()));
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
         let entry = desktop_assistant_core::domain::KnowledgeEntry {
             id,

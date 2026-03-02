@@ -13,6 +13,7 @@ tracing.workspace = true
 thiserror.workspace = true
 toml = "1"
 chrono.workspace = true
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
