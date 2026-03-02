@@ -144,19 +144,17 @@ impl OllamaClient {
 
     /// Return the model name stamped with the server-side digest.
     ///
-    /// Calls `POST {base_url}/api/show` and returns `"{model}@{digest}"`.
+    /// Calls `GET {base_url}/api/tags` and finds the matching model's digest,
+    /// returning `"{model}@{digest}"`.
     pub async fn model_identifier(&self) -> Result<String, CoreError> {
-        let url = format!("{}/api/show", self.base_url.trim_end_matches('/'));
-        let body = serde_json::json!({ "model": self.model });
+        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
 
         let response = self
             .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
+            .get(&url)
             .send()
             .await
-            .map_err(|e| CoreError::Llm(format!("model show HTTP request failed: {e}")))?;
+            .map_err(|e| CoreError::Llm(format!("model tags HTTP request failed: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -165,16 +163,28 @@ impl OllamaClient {
                 .await
                 .unwrap_or_else(|_| "unable to read body".into());
             return Err(CoreError::Llm(format!(
-                "Ollama show API error (HTTP {status}): {text}"
+                "Ollama tags API error (HTTP {status}): {text}"
             )));
         }
 
-        let parsed: OllamaShowResponse = response
+        let tags: OllamaTagsResponse = response
             .json()
             .await
-            .map_err(|e| CoreError::Llm(format!("failed to parse show response: {e}")))?;
+            .map_err(|e| CoreError::Llm(format!("failed to parse tags response: {e}")))?;
 
-        Ok(format!("{}@{}", self.model, parsed.digest))
+        let digest = tags
+            .models
+            .iter()
+            .find(|m| model_matches(&self.model, m))
+            .and_then(|m| m.digest.as_deref())
+            .ok_or_else(|| {
+                CoreError::Llm(format!(
+                    "model '{}' not found in Ollama tags response",
+                    self.model
+                ))
+            })?;
+
+        Ok(format!("{}@{}", self.model, digest))
     }
 
     /// Generate embeddings for a batch of texts.
@@ -187,6 +197,7 @@ impl OllamaClient {
         let body = serde_json::json!({
             "model": self.model,
             "input": texts,
+            "truncate": true,
         });
 
         let response = self
@@ -334,11 +345,6 @@ struct OllamaEmbedResponse {
 }
 
 #[derive(Deserialize)]
-struct OllamaShowResponse {
-    digest: String,
-}
-
-#[derive(Deserialize)]
 struct OllamaTagsResponse {
     #[serde(default)]
     models: Vec<OllamaModelTag>,
@@ -348,6 +354,7 @@ struct OllamaTagsResponse {
 struct OllamaModelTag {
     name: String,
     model: Option<String>,
+    digest: Option<String>,
 }
 
 fn model_matches(configured: &str, installed: &OllamaModelTag) -> bool {
@@ -781,10 +788,10 @@ mod tests {
         let server = MockServer::start();
 
         server.mock(|when, then| {
-            when.method(POST).path("/api/show");
+            when.method(GET).path("/api/tags");
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"digest":"sha256:abcdef1234567890"}"#);
+                .body(r#"{"models":[{"name":"nomic-embed-text:latest","model":"nomic-embed-text:latest","digest":"sha256:abcdef1234567890"}]}"#);
         });
 
         let client = OllamaClient::new(server.url(""), "nomic-embed-text");
