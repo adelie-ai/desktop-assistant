@@ -1,11 +1,8 @@
 mod app;
-mod dbus_client;
 mod keys;
 mod ui;
-mod ws_client;
 
 use std::io;
-use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
@@ -17,26 +14,22 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use desktop_assistant_client_common::{
+    AssistantClient, ConnectionConfig, SignalEvent, TransportMode, connect_transport,
+    transport::transport_label,
+};
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use tokio::sync::mpsc;
 
-use app::{App, ConversationDetail, ConversationSummary, InputMode};
-use dbus_client::{DbusClient, SignalEvent, generate_ws_jwt};
+use app::{App, InputMode};
 use keys::{Action, handle_key_event};
-use ws_client::WsClient;
 
-const DEFAULT_WS_URL: &str = "ws://127.0.0.1:11339/ws";
-const DEFAULT_WS_SUBJECT: &str = "desktop-tui";
-
-enum TransportClient {
-    Dbus(DbusClient),
-    Ws(WsClient),
-}
+const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
+const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
-enum TransportMode {
+enum CliTransportMode {
     Ws,
     Dbus,
 }
@@ -48,9 +41,9 @@ struct CliArgs {
         long,
         env = "DESKTOP_ASSISTANT_TUI_TRANSPORT",
         value_enum,
-        default_value_t = TransportMode::Ws
+        default_value_t = CliTransportMode::Ws
     )]
-    transport: TransportMode,
+    transport: CliTransportMode,
     #[arg(
         long = "ws-url",
         env = "DESKTOP_ASSISTANT_TUI_WS_URL",
@@ -77,17 +70,7 @@ struct CliArgs {
     ws_subject: String,
 }
 
-#[derive(Debug, Clone)]
-struct RuntimeOptions {
-    transport_mode: TransportMode,
-    ws_url: String,
-    ws_jwt: Option<String>,
-    ws_login_username: Option<String>,
-    ws_login_password: Option<String>,
-    ws_subject: String,
-}
-
-impl From<CliArgs> for RuntimeOptions {
+impl From<CliArgs> for ConnectionConfig {
     fn from(cli: CliArgs) -> Self {
         let ws_url = {
             let trimmed = cli.ws_url.trim();
@@ -122,8 +105,13 @@ impl From<CliArgs> for RuntimeOptions {
             }
         };
 
+        let transport_mode = match cli.transport {
+            CliTransportMode::Ws => TransportMode::Ws,
+            CliTransportMode::Dbus => TransportMode::Dbus,
+        };
+
         Self {
-            transport_mode: cli.transport,
+            transport_mode,
             ws_url,
             ws_jwt,
             ws_login_username,
@@ -133,163 +121,9 @@ impl From<CliArgs> for RuntimeOptions {
     }
 }
 
-fn derive_login_url_from_ws_url(ws_url: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(ws_url)
-        .map_err(|error| anyhow::anyhow!("invalid websocket URL '{ws_url}': {error}"))?;
-
-    let next_scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        other => {
-            return Err(anyhow::anyhow!(
-                "websocket URL must use ws:// or wss:// (got {other}://)"
-            ));
-        }
-    };
-
-    url.set_scheme(next_scheme).map_err(|_| {
-        anyhow::anyhow!("failed to rewrite websocket URL scheme for login endpoint")
-    })?;
-    url.set_path("/login");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
-}
-
-async fn request_ws_login_token(ws_url: &str, username: &str, password: &str) -> Result<String> {
-    let login_url = derive_login_url_from_ws_url(ws_url)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let response = client
-        .post(login_url)
-        .basic_auth(username, Some(password))
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await?;
-
-    if !status.is_success() {
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow::anyhow!("remote /login failed with HTTP {}", status));
-        }
-        return Err(anyhow::anyhow!(
-            "remote /login failed with HTTP {}: {}",
-            status,
-            trimmed
-        ));
-    }
-
-    let payload: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|error| anyhow::anyhow!("invalid /login JSON: {error}"))?;
-    let token = payload
-        .get("token")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    if token.is_empty() {
-        return Err(anyhow::anyhow!("/login response did not include token"));
-    }
-    Ok(token.to_string())
-}
-
-async fn resolve_ws_bearer_token(options: &RuntimeOptions) -> Result<String> {
-    if let Some(token) = options.ws_jwt.clone() {
-        return Ok(token);
-    }
-
-    match generate_ws_jwt(&options.ws_subject).await {
-        Ok(token) => Ok(token),
-        Err(dbus_error) => {
-            if let (Some(username), Some(password)) = (
-                options.ws_login_username.as_deref(),
-                options.ws_login_password.as_deref(),
-            ) {
-                match request_ws_login_token(&options.ws_url, username, password).await {
-                    Ok(token) => Ok(token),
-                    Err(login_error) => Err(anyhow::anyhow!(
-                        "failed to obtain websocket token via D-Bus ({dbus_error}); \
-                         fallback /login on websocket host also failed ({login_error})"
-                    )),
-                }
-            } else {
-                Err(anyhow::anyhow!(
-                    "failed to obtain websocket token via D-Bus ({dbus_error}); \
-                     provide --ws-jwt or --ws-login-username/--ws-login-password for /login fallback"
-                ))
-            }
-        }
-    }
-}
-
-fn transport_label(mode: TransportMode) -> &'static str {
-    match mode {
-        TransportMode::Dbus => "Connected via D-Bus",
-        TransportMode::Ws => "Connected via WebSocket",
-    }
-}
-
-async fn connect_transport(
-    options: &RuntimeOptions,
-) -> Result<(TransportClient, mpsc::UnboundedReceiver<SignalEvent>)> {
-    match options.transport_mode {
-        TransportMode::Dbus => {
-            let client = DbusClient::connect().await?;
-            let signal_rx = client.subscribe_signals().await?;
-            Ok((TransportClient::Dbus(client), signal_rx))
-        }
-        TransportMode::Ws => {
-            let token = resolve_ws_bearer_token(options).await?;
-            let (client, signal_rx) = WsClient::connect(&options.ws_url, &token).await?;
-            Ok((TransportClient::Ws(client), signal_rx))
-        }
-    }
-}
-
-async fn client_list_conversations(client: &TransportClient) -> Result<Vec<ConversationSummary>> {
-    match client {
-        TransportClient::Dbus(client) => client.list_conversations().await,
-        TransportClient::Ws(client) => client.list_conversations().await,
-    }
-}
-
-async fn client_get_conversation(client: &TransportClient, id: &str) -> Result<ConversationDetail> {
-    match client {
-        TransportClient::Dbus(client) => client.get_conversation(id).await,
-        TransportClient::Ws(client) => client.get_conversation(id).await,
-    }
-}
-
-async fn client_create_conversation(client: &TransportClient, title: &str) -> Result<String> {
-    match client {
-        TransportClient::Dbus(client) => client.create_conversation(title).await,
-        TransportClient::Ws(client) => client.create_conversation(title).await,
-    }
-}
-
-async fn client_delete_conversation(client: &TransportClient, id: &str) -> Result<()> {
-    match client {
-        TransportClient::Dbus(client) => client.delete_conversation(id).await,
-        TransportClient::Ws(client) => client.delete_conversation(id).await,
-    }
-}
-
-async fn client_send_prompt(
-    client: &TransportClient,
-    conversation_id: &str,
-    prompt: &str,
-) -> Result<String> {
-    match client {
-        TransportClient::Dbus(client) => client.send_prompt(conversation_id, prompt).await,
-        TransportClient::Ws(client) => client.send_prompt(conversation_id, prompt).await,
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let options = RuntimeOptions::from(CliArgs::parse());
+    let config = ConnectionConfig::from(CliArgs::parse());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -306,7 +140,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &options).await;
+    let result = run(&mut terminal, &config).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -323,23 +157,23 @@ async fn main() -> Result<()> {
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    options: &RuntimeOptions,
+    config: &ConnectionConfig,
 ) -> Result<()> {
     let mut app = App::new();
 
     // Connect using configured transport (WS by default, D-Bus optional).
-    let (client, mut signal_rx) = match connect_transport(options).await {
+    let (client, mut signal_rx) = match connect_transport(config).await {
         Ok((transport_client, rx)) => {
-            match client_list_conversations(&transport_client).await {
+            match transport_client.list_conversations().await {
                 Ok(convs) => app.set_conversations(convs),
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
-            app.status_message = transport_label(options.transport_mode).to_string();
+            app.status_message = transport_label(config.transport_mode).to_string();
             (Some(transport_client), rx)
         }
         Err(e) => {
             app.status_message = format!("Connection failed: {e}");
-            (None, mpsc::unbounded_channel().1)
+            (None, tokio::sync::mpsc::unbounded_channel().1)
         }
     };
 
@@ -360,7 +194,7 @@ async fn run(
                     }
                     if let Some(action) = handle_key_event(key, &app.mode) {
                         handle_action(&mut app, &client, action).await;
-                    } else if matches!(app.mode, InputMode::Editing | InputMode::CreatingConversation) {
+                    } else if matches!(app.mode, InputMode::Editing) {
                         // Forward unhandled keys to textarea
                         app.textarea.input(key);
                     }
@@ -377,6 +211,12 @@ async fn run(
                     SignalEvent::Error { request_id, error } => {
                         app.streaming_error(&request_id, &error);
                     }
+                    SignalEvent::TitleChanged { conversation_id, title } => {
+                        app.update_conversation_title(&conversation_id, &title);
+                    }
+                    SignalEvent::Disconnected { reason } => {
+                        app.status_message = format!("Disconnected: {reason}");
+                    }
                 }
             }
         }
@@ -385,7 +225,11 @@ async fn run(
     Ok(())
 }
 
-async fn handle_action(app: &mut App, client: &Option<TransportClient>, action: Action) {
+async fn handle_action(
+    app: &mut App,
+    client: &Option<desktop_assistant_client_common::TransportClient>,
+    action: Action,
+) {
     match action {
         Action::Quit => app.quit(),
         Action::NextConversation => app.next_conversation(),
@@ -393,7 +237,7 @@ async fn handle_action(app: &mut App, client: &Option<TransportClient>, action: 
         Action::OpenConversation => {
             if let (Some(client), Some(id)) = (client.as_ref(), app.selected_conversation_id()) {
                 let id = id.to_string();
-                match client_get_conversation(client, &id).await {
+                match client.get_conversation(&id).await {
                     Ok(detail) => {
                         app.load_conversation(detail);
                         app.enter_editing_mode();
@@ -405,12 +249,37 @@ async fn handle_action(app: &mut App, client: &Option<TransportClient>, action: 
         Action::DeleteConversation => {
             if let Some(id) = app.delete_selected_conversation()
                 && let Some(client) = client.as_ref()
-                && let Err(e) = client_delete_conversation(client, &id).await
+                && let Err(e) = client.delete_conversation(&id).await
             {
                 app.status_message = format!("Delete error: {e}");
             }
         }
-        Action::NewConversation => app.enter_creating_conversation_mode(),
+        Action::NewConversation => {
+            if let Some(client) = client.as_ref() {
+                match client.create_conversation("New Conversation").await {
+                    Ok(id) => {
+                        match client.list_conversations().await {
+                            Ok(convs) => {
+                                let new_idx = convs.iter().position(|c| c.id == id);
+                                app.set_conversations(convs);
+                                if let Some(idx) = new_idx {
+                                    app.selected_conversation = Some(idx);
+                                }
+                            }
+                            Err(e) => app.status_message = format!("Error refreshing: {e}"),
+                        }
+                        match client.get_conversation(&id).await {
+                            Ok(detail) => {
+                                app.load_conversation(detail);
+                                app.enter_editing_mode();
+                            }
+                            Err(e) => app.status_message = format!("Error opening: {e}"),
+                        }
+                    }
+                    Err(e) => app.status_message = format!("Create error: {e}"),
+                }
+            }
+        }
         Action::EnterEditMode => {
             if app.current_conversation.is_some() {
                 app.enter_editing_mode();
@@ -423,7 +292,7 @@ async fn handle_action(app: &mut App, client: &Option<TransportClient>, action: 
             if let Some((conv_id, prompt)) = app.submit_prompt()
                 && let Some(client) = client.as_ref()
             {
-                match client_send_prompt(client, &conv_id, &prompt).await {
+                match client.send_prompt(&conv_id, &prompt).await {
                     Ok(request_id) if request_id.is_empty() => {
                         app.start_streaming_without_request_id()
                     }
@@ -438,35 +307,6 @@ async fn handle_action(app: &mut App, client: &Option<TransportClient>, action: 
         Action::ScrollUp => app.scroll_up(5),
         Action::ScrollDown => app.scroll_down(5),
         Action::ScrollToBottom => app.scroll_to_bottom(),
-        Action::SubmitTitle => {
-            if let Some(title) = app.submit_new_conversation_title()
-                && let Some(client) = client.as_ref()
-            {
-                match client_create_conversation(client, &title).await {
-                    Ok(id) => {
-                        // Refresh list and auto-open the new conversation
-                        match client_list_conversations(client).await {
-                            Ok(convs) => {
-                                let new_idx = convs.iter().position(|c| c.id == id);
-                                app.set_conversations(convs);
-                                if let Some(idx) = new_idx {
-                                    app.selected_conversation = Some(idx);
-                                }
-                            }
-                            Err(e) => app.status_message = format!("Error refreshing: {e}"),
-                        }
-                        match client_get_conversation(client, &id).await {
-                            Ok(detail) => {
-                                app.load_conversation(detail);
-                                app.enter_editing_mode();
-                            }
-                            Err(e) => app.status_message = format!("Error opening: {e}"),
-                        }
-                    }
-                    Err(e) => app.status_message = format!("Create error: {e}"),
-                }
-            }
-        }
     }
 }
 
@@ -498,7 +338,7 @@ mod tests {
         ]))
         .unwrap();
 
-        assert_eq!(parsed.transport, TransportMode::Dbus);
+        assert_eq!(parsed.transport, CliTransportMode::Dbus);
         assert_eq!(parsed.ws_url, "wss://example/ws");
         assert_eq!(parsed.ws_jwt.as_deref(), Some("jwt123"));
         assert_eq!(parsed.ws_login_username.as_deref(), Some("alice"));
@@ -509,13 +349,13 @@ mod tests {
     #[test]
     fn clap_defaults_map_to_runtime_defaults() {
         let cli = CliArgs::try_parse_from(args(&[])).unwrap();
-        let options = RuntimeOptions::from(cli);
-        assert_eq!(options.transport_mode, TransportMode::Ws);
-        assert_eq!(options.ws_url, DEFAULT_WS_URL);
-        assert_eq!(options.ws_subject, DEFAULT_WS_SUBJECT);
-        assert_eq!(options.ws_jwt, None);
-        assert_eq!(options.ws_login_username, None);
-        assert_eq!(options.ws_login_password, None);
+        let config = ConnectionConfig::from(cli);
+        assert_eq!(config.transport_mode, TransportMode::Ws);
+        assert_eq!(config.ws_url, DEFAULT_WS_URL);
+        assert_eq!(config.ws_subject, DEFAULT_WS_SUBJECT);
+        assert_eq!(config.ws_jwt, None);
+        assert_eq!(config.ws_login_username, None);
+        assert_eq!(config.ws_login_password, None);
     }
 
     #[test]
@@ -526,22 +366,5 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));
-    }
-
-    #[test]
-    fn derive_login_url_rewrites_ws_scheme_and_path() {
-        let url = derive_login_url_from_ws_url("ws://127.0.0.1:11339/ws?x=1#frag").unwrap();
-        assert_eq!(url, "http://127.0.0.1:11339/login");
-
-        let secure = derive_login_url_from_ws_url("wss://daemon.example.com/ws").unwrap();
-        assert_eq!(secure, "https://daemon.example.com/login");
-    }
-
-    #[test]
-    fn derive_login_url_rejects_non_ws_scheme() {
-        let error = derive_login_url_from_ws_url("http://example.com/ws")
-            .err()
-            .expect("non-ws scheme should fail");
-        assert!(error.to_string().contains("ws:// or wss://"));
     }
 }

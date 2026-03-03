@@ -76,6 +76,10 @@ impl WsClient {
                 }
             }
 
+            let _ = signal_tx.send(SignalEvent::Disconnected {
+                reason: "WebSocket connection closed".to_string(),
+            });
+
             let mut pending = pending_for_reader.lock().await;
             for (_id, tx) in pending.drain() {
                 let _ = tx.send(Err("websocket disconnected".to_string()));

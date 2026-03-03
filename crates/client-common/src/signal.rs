@@ -16,4 +16,7 @@ pub enum SignalEvent {
         conversation_id: String,
         title: String,
     },
+    Disconnected {
+        reason: String,
+    },
 }
