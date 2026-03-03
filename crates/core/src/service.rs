@@ -647,7 +647,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .await
             {
                 Ok(r) => r,
-                Err(e) if round > 0 && !is_retryable_error(&e) => {
+                Err(e) if round > 0 && !is_retryable_error(&e) && !user_visible_llm_error_message(&e).contains("rate limit was exceeded") => {
                     // Mid-loop LLM error (e.g. context too long) — trim old
                     // tool call/result pairs and tell the LLM what happened
                     // so it can adjust its approach.
