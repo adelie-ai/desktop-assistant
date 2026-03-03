@@ -1295,6 +1295,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-client-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "desktop-assistant-api-model",
+ "desktop-assistant-ws",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+ "zbus",
+]
+
+[[package]]
 name = "desktop-assistant-core"
 version = "0.1.0"
 dependencies = [
@@ -1445,19 +1463,14 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
- "desktop-assistant-api-model",
- "desktop-assistant-ws",
+ "desktop-assistant-client-common",
  "futures",
  "ratatui",
- "reqwest",
  "serde_json",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "tui-textarea",
- "uuid",
- "zbus",
 ]
 
 [[package]]

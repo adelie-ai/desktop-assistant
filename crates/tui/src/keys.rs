@@ -13,7 +13,6 @@ pub enum Action {
     EnterEditMode,
     ExitEditMode,
     SubmitPrompt,
-    SubmitTitle,
     InsertNewline,
     ScrollUp,
     ScrollDown,
@@ -82,16 +81,6 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     Some(Action::ScrollToBottom)
                 }
-                // All other keys: return None so they get forwarded to textarea
-                _ => None,
-            }
-        }
-        InputMode::CreatingConversation => {
-            if key.code == KeyCode::Enter {
-                return Some(Action::SubmitTitle);
-            }
-            match key.code {
-                KeyCode::Esc => Some(Action::ExitEditMode),
                 // All other keys: return None so they get forwarded to textarea
                 _ => None,
             }
@@ -344,40 +333,6 @@ mod tests {
         );
     }
 
-    // --- CreatingConversation mode tests ---
-
-    #[test]
-    fn creating_escape_exits() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Esc), &InputMode::CreatingConversation),
-            Some(Action::ExitEditMode)
-        );
-    }
-
-    #[test]
-    fn creating_enter_submits_title() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Enter), &InputMode::CreatingConversation),
-            Some(Action::SubmitTitle)
-        );
-    }
-
-    #[test]
-    fn creating_char_forwarded_to_textarea() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char('Z')), &InputMode::CreatingConversation),
-            None
-        );
-    }
-
-    #[test]
-    fn creating_unknown_key_forwarded_to_textarea() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::F(1)), &InputMode::CreatingConversation),
-            None
-        );
-    }
-
     // --- Scroll tests (Ctrl+u/d/e work in all modes) ---
 
     #[test]
@@ -432,17 +387,6 @@ mod tests {
                 &InputMode::Editing
             ),
             Some(Action::ScrollDown)
-        );
-    }
-
-    #[test]
-    fn ctrl_u_works_in_creating_mode() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
-                &InputMode::CreatingConversation
-            ),
-            Some(Action::ScrollUp)
         );
     }
 

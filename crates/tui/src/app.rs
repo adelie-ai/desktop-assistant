@@ -1,3 +1,4 @@
+pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use ratatui::style::Style;
 use tui_textarea::{CursorMove, TextArea};
 
@@ -61,27 +62,6 @@ fn map_cursor_col_to_wrapped_segments(segments: &[String], cursor_col: usize) ->
 pub enum InputMode {
     Normal,
     Editing,
-    CreatingConversation,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConversationSummary {
-    pub id: String,
-    pub title: String,
-    pub message_count: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConversationDetail {
-    pub id: String,
-    pub title: String,
-    pub messages: Vec<ChatMessage>,
 }
 
 pub struct App {
@@ -191,17 +171,6 @@ impl App {
         Some((conv.id.clone(), content))
     }
 
-    /// Returns the title for the new conversation, or None if empty.
-    pub fn submit_new_conversation_title(&mut self) -> Option<String> {
-        let content = self.textarea_content();
-        if content.is_empty() {
-            return None;
-        }
-        self.textarea = new_textarea();
-        self.mode = InputMode::Normal;
-        Some(content)
-    }
-
     /// Hard-wrap textarea lines to fit the available editor width.
     ///
     /// This gives the TUI composer word-wrap behavior even though the backing
@@ -265,11 +234,6 @@ impl App {
 
     pub fn enter_normal_mode(&mut self) {
         self.mode = InputMode::Normal;
-    }
-
-    pub fn enter_creating_conversation_mode(&mut self) {
-        self.mode = InputMode::CreatingConversation;
-        self.textarea = new_textarea();
     }
 
     // --- Streaming ---
@@ -343,6 +307,19 @@ impl App {
 
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
         self.current_conversation = Some(detail);
+    }
+
+    pub fn update_conversation_title(&mut self, conversation_id: &str, title: &str) {
+        for conv in &mut self.conversations {
+            if conv.id == conversation_id {
+                conv.title = title.to_string();
+            }
+        }
+        if let Some(current) = self.current_conversation.as_mut() {
+            if current.id == conversation_id {
+                current.title = title.to_string();
+            }
+        }
     }
 
     pub fn selected_conversation_id(&self) -> Option<&str> {
@@ -701,33 +678,6 @@ mod tests {
 
         app.enter_normal_mode();
         assert_eq!(app.mode, InputMode::Normal);
-
-        app.enter_creating_conversation_mode();
-        assert_eq!(app.mode, InputMode::CreatingConversation);
-        assert_eq!(app.textarea_content(), ""); // input cleared
-
-        app.textarea.insert_str("leftover");
-        app.enter_creating_conversation_mode();
-        assert_eq!(app.textarea_content(), ""); // cleared again
-    }
-
-    #[test]
-    fn submit_new_conversation_title() {
-        let mut app = App::new();
-        app.enter_creating_conversation_mode();
-        app.textarea.insert_str("My Chat");
-
-        let title = app.submit_new_conversation_title();
-        assert_eq!(title, Some("My Chat".to_string()));
-        assert_eq!(app.textarea_content(), "");
-        assert_eq!(app.mode, InputMode::Normal);
-    }
-
-    #[test]
-    fn submit_empty_conversation_title_returns_none() {
-        let mut app = App::new();
-        app.enter_creating_conversation_mode();
-        assert!(app.submit_new_conversation_title().is_none());
     }
 
     // --- Conversation management tests ---
