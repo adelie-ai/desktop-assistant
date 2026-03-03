@@ -459,83 +459,83 @@ bool DesktopAssistantKcm::selectedConnectionRemovable() const
     return m_connections.size() > 1;
 }
 
-bool DesktopAssistantKcm::dreamingEnabled() const
+bool DesktopAssistantKcm::btDreamingEnabled() const
 {
-    return m_dreamingEnabled;
+    return m_btDreamingEnabled;
 }
 
-void DesktopAssistantKcm::setDreamingEnabled(bool value)
+void DesktopAssistantKcm::setBtDreamingEnabled(bool value)
 {
-    if (m_dreamingEnabled == value) {
+    if (m_btDreamingEnabled == value) {
         return;
     }
-    m_dreamingEnabled = value;
-    Q_EMIT dreamingEnabledChanged();
+    m_btDreamingEnabled = value;
+    Q_EMIT btDreamingEnabledChanged();
     setNeedsSave(true);
 }
 
-int DesktopAssistantKcm::dreamingIntervalSecs() const
+int DesktopAssistantKcm::btDreamingIntervalSecs() const
 {
-    return m_dreamingIntervalSecs;
+    return m_btDreamingIntervalSecs;
 }
 
-void DesktopAssistantKcm::setDreamingIntervalSecs(int value)
+void DesktopAssistantKcm::setBtDreamingIntervalSecs(int value)
 {
-    if (m_dreamingIntervalSecs == value) {
+    if (m_btDreamingIntervalSecs == value) {
         return;
     }
-    m_dreamingIntervalSecs = value;
-    Q_EMIT dreamingIntervalSecsChanged();
+    m_btDreamingIntervalSecs = value;
+    Q_EMIT btDreamingIntervalSecsChanged();
     setNeedsSave(true);
 }
 
-bool DesktopAssistantKcm::dreamingHasSeparateLlm() const
+bool DesktopAssistantKcm::btHasSeparateLlm() const
 {
-    return m_dreamingHasSeparateLlm;
+    return m_btHasSeparateLlm;
 }
 
-QString DesktopAssistantKcm::dreamingLlmConnector() const
+QString DesktopAssistantKcm::btLlmConnector() const
 {
-    return m_dreamingLlmConnector;
+    return m_btLlmConnector;
 }
 
-void DesktopAssistantKcm::setDreamingLlmConnector(const QString &value)
+void DesktopAssistantKcm::setBtLlmConnector(const QString &value)
 {
-    if (m_dreamingLlmConnector == value) {
+    if (m_btLlmConnector == value) {
         return;
     }
-    m_dreamingLlmConnector = value;
-    Q_EMIT dreamingLlmConnectorChanged();
+    m_btLlmConnector = value;
+    Q_EMIT btLlmConnectorChanged();
     setNeedsSave(true);
 }
 
-QString DesktopAssistantKcm::dreamingLlmModel() const
+QString DesktopAssistantKcm::btLlmModel() const
 {
-    return m_dreamingLlmModel;
+    return m_btLlmModel;
 }
 
-void DesktopAssistantKcm::setDreamingLlmModel(const QString &value)
+void DesktopAssistantKcm::setBtLlmModel(const QString &value)
 {
-    if (m_dreamingLlmModel == value) {
+    if (m_btLlmModel == value) {
         return;
     }
-    m_dreamingLlmModel = value;
-    Q_EMIT dreamingLlmModelChanged();
+    m_btLlmModel = value;
+    Q_EMIT btLlmModelChanged();
     setNeedsSave(true);
 }
 
-QString DesktopAssistantKcm::dreamingLlmBaseUrl() const
+QString DesktopAssistantKcm::btLlmBaseUrl() const
 {
-    return m_dreamingLlmBaseUrl;
+    return m_btLlmBaseUrl;
 }
 
-void DesktopAssistantKcm::setDreamingLlmBaseUrl(const QString &value)
+void DesktopAssistantKcm::setBtLlmBaseUrl(const QString &value)
 {
-    if (m_dreamingLlmBaseUrl == value) {
+    if (m_btLlmBaseUrl == value) {
         return;
     }
-    m_dreamingLlmBaseUrl = value;
-    Q_EMIT dreamingLlmBaseUrlChanged();
+    m_btLlmBaseUrl = value;
+    Q_EMIT btLlmBaseUrlChanged();
     setNeedsSave(true);
 }
 
@@ -613,24 +613,24 @@ void DesktopAssistantKcm::load()
     m_dbUrl = dbArgs[0].toString();
     m_dbMaxConnections = dbArgs[1].toInt();
 
-    QDBusMessage dreamReply = iface.call("GetDreamingSettings");
-    if (setStatusFromDbusError(dreamReply)) {
+    QDBusMessage btReply = iface.call("GetBackendTasksSettings");
+    if (setStatusFromDbusError(btReply)) {
         return;
     }
 
-    const auto dreamArgs = dreamReply.arguments();
-    if (dreamArgs.size() < 6) {
-        m_statusText = QStringLiteral("Unexpected GetDreamingSettings reply");
+    const auto btArgs = btReply.arguments();
+    if (btArgs.size() < 6) {
+        m_statusText = QStringLiteral("Unexpected GetBackendTasksSettings reply");
         Q_EMIT statusTextChanged();
         return;
     }
 
-    m_dreamingEnabled = dreamArgs[0].toBool();
-    m_dreamingIntervalSecs = static_cast<int>(dreamArgs[1].toULongLong());
-    m_dreamingHasSeparateLlm = dreamArgs[2].toBool();
-    m_dreamingLlmConnector = dreamArgs[3].toString();
-    m_dreamingLlmModel = dreamArgs[4].toString();
-    m_dreamingLlmBaseUrl = dreamArgs[5].toString();
+    m_btHasSeparateLlm = btArgs[0].toBool();
+    m_btLlmConnector = btArgs[1].toString();
+    m_btLlmModel = btArgs[2].toString();
+    m_btLlmBaseUrl = btArgs[3].toString();
+    m_btDreamingEnabled = btArgs[4].toBool();
+    m_btDreamingIntervalSecs = static_cast<int>(btArgs[5].toULongLong());
 
     loadWidgetConnectionSettings();
 
@@ -654,12 +654,12 @@ void DesktopAssistantKcm::load()
     Q_EMIT connectionNamesChanged();
     Q_EMIT defaultConnectionNameChanged();
     emitConnectionSelectionChanged();
-    Q_EMIT dreamingEnabledChanged();
-    Q_EMIT dreamingIntervalSecsChanged();
-    Q_EMIT dreamingHasSeparateLlmChanged();
-    Q_EMIT dreamingLlmConnectorChanged();
-    Q_EMIT dreamingLlmModelChanged();
-    Q_EMIT dreamingLlmBaseUrlChanged();
+    Q_EMIT btDreamingEnabledChanged();
+    Q_EMIT btDreamingIntervalSecsChanged();
+    Q_EMIT btHasSeparateLlmChanged();
+    Q_EMIT btLlmConnectorChanged();
+    Q_EMIT btLlmModelChanged();
+    Q_EMIT btLlmBaseUrlChanged();
 
     m_statusText = QStringLiteral("Loaded settings from desktop-assistant daemon");
     Q_EMIT statusTextChanged();
@@ -700,15 +700,15 @@ void DesktopAssistantKcm::save()
         return;
     }
 
-    QDBusMessage dreamSaveReply = iface.call(
-        "SetDreamingSettings",
-        m_dreamingEnabled,
-        static_cast<qulonglong>(m_dreamingIntervalSecs),
-        m_dreamingLlmConnector,
-        m_dreamingLlmModel,
-        m_dreamingLlmBaseUrl
+    QDBusMessage btSaveReply = iface.call(
+        "SetBackendTasksSettings",
+        m_btLlmConnector,
+        m_btLlmModel,
+        m_btLlmBaseUrl,
+        m_btDreamingEnabled,
+        static_cast<qulonglong>(m_btDreamingIntervalSecs)
     );
-    if (setStatusFromDbusError(dreamSaveReply)) {
+    if (setStatusFromDbusError(btSaveReply)) {
         return;
     }
 

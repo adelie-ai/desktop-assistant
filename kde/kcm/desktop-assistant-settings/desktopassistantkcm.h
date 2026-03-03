@@ -34,12 +34,12 @@ class DesktopAssistantKcm : public KQuickConfigModule {
     Q_PROPERTY(QString selectedConnectionWsUrl READ selectedConnectionWsUrl WRITE setSelectedConnectionWsUrl NOTIFY selectedConnectionWsUrlChanged)
     Q_PROPERTY(QString selectedConnectionWsSubject READ selectedConnectionWsSubject WRITE setSelectedConnectionWsSubject NOTIFY selectedConnectionWsSubjectChanged)
     Q_PROPERTY(bool selectedConnectionRemovable READ selectedConnectionRemovable NOTIFY selectedConnectionRemovableChanged)
-    Q_PROPERTY(bool dreamingEnabled READ dreamingEnabled WRITE setDreamingEnabled NOTIFY dreamingEnabledChanged)
-    Q_PROPERTY(int dreamingIntervalSecs READ dreamingIntervalSecs WRITE setDreamingIntervalSecs NOTIFY dreamingIntervalSecsChanged)
-    Q_PROPERTY(bool dreamingHasSeparateLlm READ dreamingHasSeparateLlm NOTIFY dreamingHasSeparateLlmChanged)
-    Q_PROPERTY(QString dreamingLlmConnector READ dreamingLlmConnector WRITE setDreamingLlmConnector NOTIFY dreamingLlmConnectorChanged)
-    Q_PROPERTY(QString dreamingLlmModel READ dreamingLlmModel WRITE setDreamingLlmModel NOTIFY dreamingLlmModelChanged)
-    Q_PROPERTY(QString dreamingLlmBaseUrl READ dreamingLlmBaseUrl WRITE setDreamingLlmBaseUrl NOTIFY dreamingLlmBaseUrlChanged)
+    Q_PROPERTY(bool btDreamingEnabled READ btDreamingEnabled WRITE setDreamingEnabled NOTIFY btDreamingEnabledChanged)
+    Q_PROPERTY(int btDreamingIntervalSecs READ btDreamingIntervalSecs WRITE setDreamingIntervalSecs NOTIFY btDreamingIntervalSecsChanged)
+    Q_PROPERTY(bool btHasSeparateLlm READ btHasSeparateLlm NOTIFY btHasSeparateLlmChanged)
+    Q_PROPERTY(QString btLlmConnector READ btLlmConnector WRITE setDreamingLlmConnector NOTIFY btLlmConnectorChanged)
+    Q_PROPERTY(QString btLlmModel READ btLlmModel WRITE setDreamingLlmModel NOTIFY btLlmModelChanged)
+    Q_PROPERTY(QString btLlmBaseUrl READ btLlmBaseUrl WRITE setDreamingLlmBaseUrl NOTIFY btLlmBaseUrlChanged)
 
 public:
     DesktopAssistantKcm(QObject *parent, const KPluginMetaData &metaData, const QVariantList &args);
@@ -111,21 +111,21 @@ public:
 
     bool selectedConnectionRemovable() const;
 
-    bool dreamingEnabled() const;
+    bool btDreamingEnabled() const;
     void setDreamingEnabled(bool value);
 
-    int dreamingIntervalSecs() const;
+    int btDreamingIntervalSecs() const;
     void setDreamingIntervalSecs(int value);
 
-    bool dreamingHasSeparateLlm() const;
+    bool btHasSeparateLlm() const;
 
-    QString dreamingLlmConnector() const;
+    QString btLlmConnector() const;
     void setDreamingLlmConnector(const QString &value);
 
-    QString dreamingLlmModel() const;
+    QString btLlmModel() const;
     void setDreamingLlmModel(const QString &value);
 
-    QString dreamingLlmBaseUrl() const;
+    QString btLlmBaseUrl() const;
     void setDreamingLlmBaseUrl(const QString &value);
 
     Q_INVOKABLE void load() override;
@@ -164,12 +164,12 @@ Q_SIGNALS:
     void selectedConnectionWsUrlChanged();
     void selectedConnectionWsSubjectChanged();
     void selectedConnectionRemovableChanged();
-    void dreamingEnabledChanged();
-    void dreamingIntervalSecsChanged();
-    void dreamingHasSeparateLlmChanged();
-    void dreamingLlmConnectorChanged();
-    void dreamingLlmModelChanged();
-    void dreamingLlmBaseUrlChanged();
+    void btDreamingEnabledChanged();
+    void btDreamingIntervalSecsChanged();
+    void btHasSeparateLlmChanged();
+    void btLlmConnectorChanged();
+    void btLlmModelChanged();
+    void btLlmBaseUrlChanged();
 
 private:
     struct ConnectionProfile {
@@ -209,10 +209,10 @@ private:
     QVector<ConnectionProfile> m_connections;
     QString m_defaultConnectionName = QStringLiteral("local");
     QString m_selectedConnectionName = QStringLiteral("local");
-    bool m_dreamingEnabled = false;
-    int m_dreamingIntervalSecs = 3600;
-    bool m_dreamingHasSeparateLlm = false;
-    QString m_dreamingLlmConnector;
-    QString m_dreamingLlmModel;
-    QString m_dreamingLlmBaseUrl;
+    bool m_btDreamingEnabled = false;
+    int m_btDreamingIntervalSecs = 3600;
+    bool m_btHasSeparateLlm = false;
+    QString m_btLlmConnector;
+    QString m_btLlmModel;
+    QString m_btLlmBaseUrl;
 };

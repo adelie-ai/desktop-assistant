@@ -49,17 +49,19 @@ pub struct DatabaseSettingsView {
 }
 
 #[derive(Debug, Clone)]
-pub struct DreamingSettingsView {
-    pub enabled: bool,
-    pub interval_secs: u64,
-    /// Whether `[dreaming.llm]` is explicitly configured (vs. falling back to primary LLM).
+pub struct BackendTasksSettingsView {
+    /// Whether `[backend_tasks.llm]` is explicitly configured (vs. falling back to primary LLM).
     pub has_separate_llm: bool,
-    /// Resolved connector (from dreaming.llm or fallback).
+    /// Resolved connector (from backend_tasks.llm or fallback).
     pub llm_connector: String,
-    /// Resolved model (from dreaming.llm or fallback).
+    /// Resolved model (from backend_tasks.llm or fallback).
     pub llm_model: String,
-    /// Resolved base URL (from dreaming.llm or fallback).
+    /// Resolved base URL (from backend_tasks.llm or fallback).
     pub llm_base_url: String,
+    /// Whether periodic fact extraction ("dreaming") is enabled.
+    pub dreaming_enabled: bool,
+    /// Interval in seconds between dreaming cycles.
+    pub dreaming_interval_secs: u64,
 }
 
 /// Inbound port for health/status queries.
@@ -184,20 +186,20 @@ pub trait SettingsService: Send + Sync {
         max_connections: u32,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
-    fn get_dreaming_settings(
+    fn get_backend_tasks_settings(
         &self,
-    ) -> impl std::future::Future<Output = Result<DreamingSettingsView, CoreError>> + Send;
+    ) -> impl std::future::Future<Output = Result<BackendTasksSettingsView, CoreError>> + Send;
 
-    /// Update dreaming settings.
+    /// Update backend-tasks settings (LLM override + dreaming config).
     ///
     /// Pass `llm_connector = None` to clear the separate LLM override (revert to primary).
-    fn set_dreaming_settings(
+    fn set_backend_tasks_settings(
         &self,
-        enabled: bool,
-        interval_secs: u64,
         llm_connector: Option<String>,
         llm_model: Option<String>,
         llm_base_url: Option<String>,
+        dreaming_enabled: bool,
+        dreaming_interval_secs: u64,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 

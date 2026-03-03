@@ -590,7 +590,7 @@ mod tests {
         Conversation, ConversationId, ConversationSummary, Message, Role,
     };
     use desktop_assistant_core::ports::inbound::{
-        ConnectorDefaultsView, DatabaseSettingsView, DreamingSettingsView,
+        BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
         EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
     };
     use desktop_assistant_core::ports::llm::ChunkCallback;
@@ -744,23 +744,25 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn get_dreaming_settings(&self) -> Result<DreamingSettingsView, CoreError> {
-            Ok(DreamingSettingsView {
-                enabled: false,
-                interval_secs: 3600,
+        async fn get_backend_tasks_settings(
+            &self,
+        ) -> Result<BackendTasksSettingsView, CoreError> {
+            Ok(BackendTasksSettingsView {
                 has_separate_llm: false,
                 llm_connector: "openai".into(),
                 llm_model: "gpt-5".into(),
                 llm_base_url: "https://api.openai.com/v1".into(),
+                dreaming_enabled: false,
+                dreaming_interval_secs: 3600,
             })
         }
-        async fn set_dreaming_settings(
+        async fn set_backend_tasks_settings(
             &self,
-            _enabled: bool,
-            _interval_secs: u64,
             _llm_connector: Option<String>,
             _llm_model: Option<String>,
             _llm_base_url: Option<String>,
+            _dreaming_enabled: bool,
+            _dreaming_interval_secs: u64,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -935,23 +937,25 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn get_dreaming_settings(&self) -> Result<DreamingSettingsView, CoreError> {
-            Ok(DreamingSettingsView {
-                enabled: false,
-                interval_secs: 3600,
+        async fn get_backend_tasks_settings(
+            &self,
+        ) -> Result<BackendTasksSettingsView, CoreError> {
+            Ok(BackendTasksSettingsView {
                 has_separate_llm: false,
                 llm_connector: "openai".into(),
                 llm_model: "gpt-5".into(),
                 llm_base_url: "https://api.openai.com/v1".into(),
+                dreaming_enabled: false,
+                dreaming_interval_secs: 3600,
             })
         }
-        async fn set_dreaming_settings(
+        async fn set_backend_tasks_settings(
             &self,
-            _enabled: bool,
-            _interval_secs: u64,
             _llm_connector: Option<String>,
             _llm_model: Option<String>,
             _llm_base_url: Option<String>,
+            _dreaming_enabled: bool,
+            _dreaming_interval_secs: u64,
         ) -> Result<(), CoreError> {
             Ok(())
         }

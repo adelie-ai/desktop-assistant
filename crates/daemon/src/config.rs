@@ -22,27 +22,29 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
-    pub dreaming: DreamingConfig,
+    pub backend_tasks: BackendTasksConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DreamingConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_dreaming_interval_secs")]
-    pub interval_secs: u64,
-    /// Optional separate LLM config for dreaming extraction.
+pub struct BackendTasksConfig {
+    /// Optional separate LLM config for backend tasks (title generation,
+    /// context summary, dreaming extraction).
     /// Falls back to the top-level `[llm]` if omitted.
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+    /// Enable periodic fact extraction from conversations ("dreaming").
+    #[serde(default)]
+    pub dreaming_enabled: bool,
+    #[serde(default = "default_dreaming_interval_secs")]
+    pub dreaming_interval_secs: u64,
 }
 
-impl Default for DreamingConfig {
+impl Default for BackendTasksConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            interval_secs: default_dreaming_interval_secs(),
             llm: None,
+            dreaming_enabled: false,
+            dreaming_interval_secs: default_dreaming_interval_secs(),
         }
     }
 }
@@ -549,64 +551,63 @@ pub fn set_database_settings(
     save_daemon_config(path, &config)
 }
 
-pub struct DreamingSettingsViewConfig {
-    pub enabled: bool,
-    pub interval_secs: u64,
+pub struct BackendTasksSettingsViewConfig {
     pub has_separate_llm: bool,
     pub llm_connector: String,
     pub llm_model: String,
     pub llm_base_url: String,
+    pub dreaming_enabled: bool,
+    pub dreaming_interval_secs: u64,
 }
 
-pub fn get_dreaming_settings_view(path: &Path) -> anyhow::Result<DreamingSettingsViewConfig> {
+pub fn get_backend_tasks_settings_view(
+    path: &Path,
+) -> anyhow::Result<BackendTasksSettingsViewConfig> {
     let config = load_daemon_config(path)?;
-    let dreaming = config.as_ref().map(|c| &c.dreaming);
-
-    let enabled = dreaming.map(|d| d.enabled).unwrap_or(false);
-    let interval_secs = dreaming
-        .map(|d| d.interval_secs)
+    let bt = config.as_ref().map(|c| &c.backend_tasks);
+    let has_separate_llm = bt.is_some_and(|b| b.llm.is_some());
+    let dreaming_enabled = bt.map(|b| b.dreaming_enabled).unwrap_or(false);
+    let dreaming_interval_secs = bt
+        .map(|b| b.dreaming_interval_secs)
         .unwrap_or_else(default_dreaming_interval_secs);
-    let has_separate_llm = dreaming.is_some_and(|d| d.llm.is_some());
 
-    let resolved = resolve_dreaming_llm_config(config.as_ref());
+    let resolved = resolve_backend_tasks_llm_config(config.as_ref());
 
-    Ok(DreamingSettingsViewConfig {
-        enabled,
-        interval_secs,
+    Ok(BackendTasksSettingsViewConfig {
         has_separate_llm,
         llm_connector: resolved.connector,
         llm_model: resolved.model,
         llm_base_url: resolved.base_url,
+        dreaming_enabled,
+        dreaming_interval_secs,
     })
 }
 
-pub fn set_dreaming_settings(
+pub fn set_backend_tasks_settings(
     path: &Path,
-    enabled: bool,
-    interval_secs: u64,
     llm_connector: Option<&str>,
     llm_model: Option<&str>,
     llm_base_url: Option<&str>,
+    dreaming_enabled: bool,
+    dreaming_interval_secs: u64,
 ) -> anyhow::Result<()> {
     let mut config = load_daemon_config(path)?.unwrap_or_default();
 
-    config.dreaming.enabled = enabled;
-    config.dreaming.interval_secs = interval_secs;
+    config.backend_tasks.dreaming_enabled = dreaming_enabled;
+    config.backend_tasks.dreaming_interval_secs = dreaming_interval_secs;
 
-    // If connector is provided, configure a separate dreaming LLM.
+    // If connector is provided, configure a separate backend-tasks LLM.
     // If connector is None/empty, clear the override (fall back to primary).
-    let connector = llm_connector
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let connector = llm_connector.map(str::trim).filter(|v| !v.is_empty());
 
     if let Some(connector) = connector {
-        let mut llm = config.dreaming.llm.unwrap_or_default();
+        let mut llm = config.backend_tasks.llm.unwrap_or_default();
         llm.connector = connector.to_lowercase();
         llm.model = normalize_optional_value(llm_model);
         llm.base_url = normalize_optional_value(llm_base_url);
-        config.dreaming.llm = Some(llm);
+        config.backend_tasks.llm = Some(llm);
     } else {
-        config.dreaming.llm = None;
+        config.backend_tasks.llm = None;
     }
 
     save_daemon_config(path, &config)
@@ -768,12 +769,12 @@ pub fn resolve_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
     resolve_llm_config_from(config.map(|c| &c.llm))
 }
 
-/// Resolve dreaming LLM config: uses `[dreaming.llm]` if set, otherwise falls
-/// back to the top-level `[llm]`.
-pub fn resolve_dreaming_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
-    let dreaming_llm = config.and_then(|c| c.dreaming.llm.as_ref());
-    if dreaming_llm.is_some() {
-        resolve_llm_config_from(dreaming_llm)
+/// Resolve backend-tasks LLM config: uses `[backend_tasks.llm]` if set,
+/// otherwise falls back to the top-level `[llm]`.
+pub fn resolve_backend_tasks_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
+    let bt_llm = config.and_then(|c| c.backend_tasks.llm.as_ref());
+    if bt_llm.is_some() {
+        resolve_llm_config_from(bt_llm)
     } else {
         resolve_llm_config(config)
     }

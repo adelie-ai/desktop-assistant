@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
-    ConnectorDefaultsView, DatabaseSettingsView, DreamingSettingsView, EmbeddingsSettingsView,
-    LlmSettingsView, PersistenceSettingsView, SettingsService,
+    BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
+    EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView, SettingsService,
 };
 
 use crate::config;
@@ -158,34 +158,34 @@ impl SettingsService for DaemonSettingsService {
             .map_err(|e| CoreError::SystemService(e.to_string()))
     }
 
-    async fn get_dreaming_settings(&self) -> Result<DreamingSettingsView, CoreError> {
-        let view = config::get_dreaming_settings_view(&self.config_path)
+    async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {
+        let view = config::get_backend_tasks_settings_view(&self.config_path)
             .map_err(|e| CoreError::SystemService(e.to_string()))?;
-        Ok(DreamingSettingsView {
-            enabled: view.enabled,
-            interval_secs: view.interval_secs,
+        Ok(BackendTasksSettingsView {
             has_separate_llm: view.has_separate_llm,
             llm_connector: view.llm_connector,
             llm_model: view.llm_model,
             llm_base_url: view.llm_base_url,
+            dreaming_enabled: view.dreaming_enabled,
+            dreaming_interval_secs: view.dreaming_interval_secs,
         })
     }
 
-    async fn set_dreaming_settings(
+    async fn set_backend_tasks_settings(
         &self,
-        enabled: bool,
-        interval_secs: u64,
         llm_connector: Option<String>,
         llm_model: Option<String>,
         llm_base_url: Option<String>,
+        dreaming_enabled: bool,
+        dreaming_interval_secs: u64,
     ) -> Result<(), CoreError> {
-        config::set_dreaming_settings(
+        config::set_backend_tasks_settings(
             &self.config_path,
-            enabled,
-            interval_secs,
             llm_connector.as_deref(),
             llm_model.as_deref(),
             llm_base_url.as_deref(),
+            dreaming_enabled,
+            dreaming_interval_secs,
         )
         .map_err(|e| CoreError::SystemService(e.to_string()))
     }

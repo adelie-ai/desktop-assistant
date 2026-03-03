@@ -30,7 +30,7 @@ KCM.SimpleKCM {
 
             QQC2.TabButton { text: "Chat LLM" }
             QQC2.TabButton { text: "Search" }
-            QQC2.TabButton { text: "Dreaming" }
+            QQC2.TabButton { text: "Backend Tasks" }
             QQC2.TabButton { text: "Data Sync" }
             QQC2.TabButton { text: "Connections" }
         }
@@ -211,90 +211,100 @@ KCM.SimpleKCM {
                     QQC2.Label {
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap
-                        text: "Dreaming periodically reviews conversations and extracts long-term facts into the knowledge base. It also consolidates and corrects existing memories."
+                        text: "Backend tasks use a cheaper LLM for title generation, context summary compaction, and dreaming (periodic fact extraction). When no separate LLM is configured, the primary Chat LLM is used."
                     }
 
                     QQC2.CheckBox {
-                        id: dreamingEnabledCheck
-                        text: "Enable dreaming"
-                        checked: kcm.dreamingEnabled
-                        onToggled: kcm.dreamingEnabled = checked
+                        id: btSeparateLlmCheck
+                        text: "Use a separate LLM for backend tasks"
+                        checked: kcm.btLlmConnector !== ""
+                        onToggled: {
+                            if (!checked) {
+                                kcm.btLlmConnector = ""
+                                kcm.btLlmModel = ""
+                                kcm.btLlmBaseUrl = ""
+                            } else {
+                                kcm.btLlmConnector = "ollama"
+                            }
+                        }
                     }
 
                     RowLayout {
                         Layout.fillWidth: true
-                        enabled: dreamingEnabledCheck.checked
-                        QQC2.Label { text: "Interval (seconds)" }
-                        QQC2.SpinBox {
-                            id: dreamingIntervalBox
-                            from: 60
-                            to: 86400
-                            stepSize: 300
-                            value: kcm.dreamingIntervalSecs
-                            onValueModified: kcm.dreamingIntervalSecs = value
+                        enabled: btSeparateLlmCheck.checked
+                        QQC2.Label { text: "Connector" }
+                        QQC2.ComboBox {
+                            id: btConnectorBox
+                            Layout.fillWidth: true
+                            model: ["ollama", "openai", "anthropic", "aws-bedrock"]
+                            currentIndex: {
+                                if (kcm.btLlmConnector === "ollama") return 0
+                                if (kcm.btLlmConnector === "openai") return 1
+                                if (kcm.btLlmConnector === "anthropic") return 2
+                                if (kcm.btLlmConnector === "bedrock" || kcm.btLlmConnector === "aws-bedrock") return 3
+                                return 0
+                            }
+                            onActivated: kcm.btLlmConnector = currentText
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: btSeparateLlmCheck.checked
+                        QQC2.Label { text: "Model" }
+                        QQC2.TextField {
+                            id: btModelField
+                            Layout.fillWidth: true
+                            placeholderText: "llama3.2:3b / gpt-4o-mini / ..."
+                            text: kcm.btLlmModel
+                            onTextEdited: kcm.btLlmModel = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: btSeparateLlmCheck.checked
+                        QQC2.Label { text: "Base URL" }
+                        QQC2.TextField {
+                            id: btBaseUrlField
+                            Layout.fillWidth: true
+                            placeholderText: "http://localhost:11434"
+                            text: kcm.btLlmBaseUrl
+                            onTextEdited: kcm.btLlmBaseUrl = text
                         }
                     }
 
                     Kirigami.Separator { Layout.fillWidth: true }
 
+                    QQC2.Label {
+                        font.bold: true
+                        text: "Dreaming"
+                    }
+
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: "Dreaming periodically reviews conversations and extracts long-term facts into the knowledge base."
+                    }
+
                     QQC2.CheckBox {
-                        id: dreamingSeparateLlmCheck
-                        enabled: dreamingEnabledCheck.checked
-                        text: "Use a separate LLM for dreaming"
-                        checked: kcm.dreamingLlmConnector !== ""
-                        onToggled: {
-                            if (!checked) {
-                                kcm.dreamingLlmConnector = ""
-                                kcm.dreamingLlmModel = ""
-                                kcm.dreamingLlmBaseUrl = ""
-                            } else {
-                                kcm.dreamingLlmConnector = "ollama"
-                            }
-                        }
+                        id: btDreamingEnabledCheck
+                        text: "Enable dreaming"
+                        checked: kcm.btDreamingEnabled
+                        onToggled: kcm.btDreamingEnabled = checked
                     }
 
                     RowLayout {
                         Layout.fillWidth: true
-                        enabled: dreamingEnabledCheck.checked && dreamingSeparateLlmCheck.checked
-                        QQC2.Label { text: "Connector" }
-                        QQC2.ComboBox {
-                            id: dreamingConnectorBox
-                            Layout.fillWidth: true
-                            model: ["ollama", "openai", "anthropic", "aws-bedrock"]
-                            currentIndex: {
-                                if (kcm.dreamingLlmConnector === "ollama") return 0
-                                if (kcm.dreamingLlmConnector === "openai") return 1
-                                if (kcm.dreamingLlmConnector === "anthropic") return 2
-                                if (kcm.dreamingLlmConnector === "bedrock" || kcm.dreamingLlmConnector === "aws-bedrock") return 3
-                                return 0
-                            }
-                            onActivated: kcm.dreamingLlmConnector = currentText
-                        }
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        enabled: dreamingEnabledCheck.checked && dreamingSeparateLlmCheck.checked
-                        QQC2.Label { text: "Model" }
-                        QQC2.TextField {
-                            id: dreamingModelField
-                            Layout.fillWidth: true
-                            placeholderText: "llama3.2:3b / gpt-4o-mini / ..."
-                            text: kcm.dreamingLlmModel
-                            onTextEdited: kcm.dreamingLlmModel = text
-                        }
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        enabled: dreamingEnabledCheck.checked && dreamingSeparateLlmCheck.checked
-                        QQC2.Label { text: "Base URL" }
-                        QQC2.TextField {
-                            id: dreamingBaseUrlField
-                            Layout.fillWidth: true
-                            placeholderText: "http://localhost:11434"
-                            text: kcm.dreamingLlmBaseUrl
-                            onTextEdited: kcm.dreamingLlmBaseUrl = text
+                        enabled: btDreamingEnabledCheck.checked
+                        QQC2.Label { text: "Interval (seconds)" }
+                        QQC2.SpinBox {
+                            id: btDreamingIntervalBox
+                            from: 60
+                            to: 86400
+                            stepSize: 300
+                            value: kcm.btDreamingIntervalSecs
+                            onValueModified: kcm.btDreamingIntervalSecs = value
                         }
                     }
 
@@ -652,21 +662,21 @@ KCM.SimpleKCM {
                 }
             }
 
-            function onDreamingIntervalSecsChanged() {
-                if (dreamingIntervalBox.value !== kcm.dreamingIntervalSecs) {
-                    dreamingIntervalBox.value = kcm.dreamingIntervalSecs
+            function onBtDreamingIntervalSecsChanged() {
+                if (btDreamingIntervalBox.value !== kcm.btDreamingIntervalSecs) {
+                    btDreamingIntervalBox.value = kcm.btDreamingIntervalSecs
                 }
             }
 
-            function onDreamingLlmModelChanged() {
-                if (dreamingModelField.text !== kcm.dreamingLlmModel) {
-                    dreamingModelField.text = kcm.dreamingLlmModel
+            function onBtLlmModelChanged() {
+                if (btModelField.text !== kcm.btLlmModel) {
+                    btModelField.text = kcm.btLlmModel
                 }
             }
 
-            function onDreamingLlmBaseUrlChanged() {
-                if (dreamingBaseUrlField.text !== kcm.dreamingLlmBaseUrl) {
-                    dreamingBaseUrlField.text = kcm.dreamingLlmBaseUrl
+            function onBtLlmBaseUrlChanged() {
+                if (btBaseUrlField.text !== kcm.btLlmBaseUrl) {
+                    btBaseUrlField.text = kcm.btLlmBaseUrl
                 }
             }
         }
