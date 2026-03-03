@@ -96,5 +96,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         tracing::warn!("could not apply chunked embeddings migration: {e}");
     }
 
+    // Collapsible message summaries — reversible range summaries.
+    sqlx::raw_sql(include_str!("../migrations/008_message_summaries.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }

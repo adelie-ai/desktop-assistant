@@ -1,6 +1,6 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
-    Conversation, ConversationId, Message, Role, ToolCall,
+    Conversation, ConversationId, Message, MessageSummary, Role, ToolCall,
 };
 use desktop_assistant_core::ports::store::ConversationStore;
 use sqlx::PgPool;
@@ -73,7 +73,7 @@ impl ConversationStore for PgConversationStore {
         let row = row.ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
 
         let msg_rows: Vec<MsgRow> = sqlx::query_as(
-            "SELECT ordinal, role, content, tool_calls, tool_call_id
+            "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id
              FROM messages WHERE conversation_id = $1 ORDER BY ordinal"
         )
         .bind(&id.0)
@@ -81,15 +81,22 @@ impl ConversationStore for PgConversationStore {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        let messages = msg_rows.into_iter().map(|r| {
-            let mut msg = Message::new(str_to_role(&r.role), &r.content);
-            if let Some(tc_json) = r.tool_calls {
-                if let Ok(tool_calls) = serde_json::from_value::<Vec<ToolCall>>(tc_json) {
-                    msg.tool_calls = tool_calls;
-                }
-            }
-            msg.tool_call_id = r.tool_call_id;
-            msg
+        let messages = msg_rows.into_iter().map(msg_from_row).collect();
+
+        let summary_rows: Vec<SummaryRow> = sqlx::query_as(
+            "SELECT id, summary, start_ordinal, end_ordinal
+             FROM message_summaries WHERE conversation_id = $1 ORDER BY start_ordinal"
+        )
+        .bind(&id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        let summaries = summary_rows.into_iter().map(|r| MessageSummary {
+            id: r.id,
+            summary: r.summary,
+            start_ordinal: r.start_ordinal as usize,
+            end_ordinal: r.end_ordinal as usize,
         }).collect();
 
         Ok(Conversation {
@@ -100,6 +107,7 @@ impl ConversationStore for PgConversationStore {
             messages,
             context_summary: row.context_summary,
             compacted_through: row.compacted_through as usize,
+            summaries,
         })
     }
 
@@ -115,7 +123,7 @@ impl ConversationStore for PgConversationStore {
         let mut conversations = Vec::with_capacity(rows.len());
         for row in rows {
             let msg_rows: Vec<MsgRow> = sqlx::query_as(
-                "SELECT ordinal, role, content, tool_calls, tool_call_id
+                "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id
                  FROM messages WHERE conversation_id = $1 ORDER BY ordinal"
             )
             .bind(&row.id)
@@ -123,15 +131,22 @@ impl ConversationStore for PgConversationStore {
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-            let messages = msg_rows.into_iter().map(|r| {
-                let mut msg = Message::new(str_to_role(&r.role), &r.content);
-                if let Some(tc_json) = r.tool_calls {
-                    if let Ok(tool_calls) = serde_json::from_value::<Vec<ToolCall>>(tc_json) {
-                        msg.tool_calls = tool_calls;
-                    }
-                }
-                msg.tool_call_id = r.tool_call_id;
-                msg
+            let messages = msg_rows.into_iter().map(msg_from_row).collect();
+
+            let summary_rows: Vec<SummaryRow> = sqlx::query_as(
+                "SELECT id, summary, start_ordinal, end_ordinal
+                 FROM message_summaries WHERE conversation_id = $1 ORDER BY start_ordinal"
+            )
+            .bind(&row.id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+            let summaries = summary_rows.into_iter().map(|r| MessageSummary {
+                id: r.id,
+                summary: r.summary,
+                start_ordinal: r.start_ordinal as usize,
+                end_ordinal: r.end_ordinal as usize,
             }).collect();
 
             conversations.push(Conversation {
@@ -142,6 +157,7 @@ impl ConversationStore for PgConversationStore {
                 messages,
                 context_summary: row.context_summary,
                 compacted_through: row.compacted_through as usize,
+                summaries,
             });
         }
 
@@ -196,6 +212,55 @@ impl ConversationStore for PgConversationStore {
         }
         Ok(())
     }
+
+    async fn create_summary(
+        &self,
+        conversation_id: &ConversationId,
+        summary: String,
+        start_ordinal: usize,
+        end_ordinal: usize,
+    ) -> Result<String, CoreError> {
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut tx = self.pool.begin().await.map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO message_summaries (id, conversation_id, summary, start_ordinal, end_ordinal)
+             VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(&id)
+        .bind(&conversation_id.0)
+        .bind(&summary)
+        .bind(start_ordinal as i32)
+        .bind(end_ordinal as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        sqlx::query(
+            "UPDATE messages SET summary_id = $1
+             WHERE conversation_id = $2 AND ordinal BETWEEN $3 AND $4"
+        )
+        .bind(&id)
+        .bind(&conversation_id.0)
+        .bind(start_ordinal as i32)
+        .bind(end_ordinal as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(id)
+    }
+
+    async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+        // ON DELETE SET NULL on messages.summary_id handles clearing the references.
+        sqlx::query("DELETE FROM message_summaries WHERE id = $1")
+            .bind(summary_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
 }
 
 async fn insert_message(
@@ -211,8 +276,8 @@ async fn insert_message(
     };
 
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, ordinal, role, content, tool_calls, tool_call_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        "INSERT INTO messages (id, conversation_id, ordinal, role, content, tool_calls, tool_call_id, summary_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
     )
     .bind(uuid::Uuid::now_v7().to_string())
     .bind(conversation_id)
@@ -221,11 +286,24 @@ async fn insert_message(
     .bind(&msg.content)
     .bind(tool_calls_json)
     .bind(&msg.tool_call_id)
+    .bind(&msg.summary_id)
     .execute(&mut **tx)
     .await
     .map_err(|e| CoreError::Storage(e.to_string()))?;
 
     Ok(())
+}
+
+fn msg_from_row(r: MsgRow) -> Message {
+    let mut msg = Message::new(str_to_role(&r.role), &r.content);
+    if let Some(tc_json) = r.tool_calls {
+        if let Ok(tool_calls) = serde_json::from_value::<Vec<ToolCall>>(tc_json) {
+            msg.tool_calls = tool_calls;
+        }
+    }
+    msg.tool_call_id = r.tool_call_id;
+    msg.summary_id = r.summary_id;
+    msg
 }
 
 fn parse_timestamp(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -257,4 +335,13 @@ struct MsgRow {
     content: String,
     tool_calls: Option<serde_json::Value>,
     tool_call_id: Option<String>,
+    summary_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SummaryRow {
+    id: String,
+    summary: String,
+    start_ordinal: i32,
+    end_ordinal: i32,
 }

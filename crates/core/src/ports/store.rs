@@ -26,12 +26,28 @@ pub trait ConversationStore: Send + Sync {
         &self,
         id: &ConversationId,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// Collapse a range of messages behind a summary. Returns the new summary ID.
+    fn create_summary(
+        &self,
+        conversation_id: &ConversationId,
+        summary: String,
+        start_ordinal: usize,
+        end_ordinal: usize,
+    ) -> impl std::future::Future<Output = Result<String, CoreError>> + Send;
+
+    /// Expand (undo) a summary — deletes the summary row; ON DELETE SET NULL
+    /// clears summary_id on all linked messages.
+    fn expand_summary(
+        &self,
+        summary_id: &str,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Message, Role};
+    use crate::domain::{Message, MessageSummary, Role};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -83,6 +99,48 @@ mod tests {
                 .remove(&id.0)
                 .map(|_| ())
                 .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+        }
+
+        async fn create_summary(
+            &self,
+            conversation_id: &ConversationId,
+            summary: String,
+            start_ordinal: usize,
+            end_ordinal: usize,
+        ) -> Result<String, CoreError> {
+            let mut data = self.data.lock().unwrap();
+            let conv = data
+                .get_mut(&conversation_id.0)
+                .ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
+            let id = format!("summary-{}", conv.summaries.len() + 1);
+            for (i, msg) in conv.messages.iter_mut().enumerate() {
+                if i >= start_ordinal && i <= end_ordinal {
+                    msg.summary_id = Some(id.clone());
+                }
+            }
+            conv.summaries.push(MessageSummary {
+                id: id.clone(),
+                summary,
+                start_ordinal,
+                end_ordinal,
+            });
+            Ok(id)
+        }
+
+        async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+            let mut data = self.data.lock().unwrap();
+            for conv in data.values_mut() {
+                if let Some(pos) = conv.summaries.iter().position(|s| s.id == summary_id) {
+                    conv.summaries.remove(pos);
+                    for msg in conv.messages.iter_mut() {
+                        if msg.summary_id.as_deref() == Some(summary_id) {
+                            msg.summary_id = None;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            Ok(())
         }
     }
 

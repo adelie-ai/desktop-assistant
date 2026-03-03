@@ -467,6 +467,7 @@ impl ToolExecutor for NoopToolExecutor {
 pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     store: S,
     llm: L,
+    backend_llm: Option<L>,
     tools: T,
     id_generator: Box<dyn Fn() -> String + Send + Sync>,
 }
@@ -476,6 +477,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
         Self {
             store,
             llm,
+            backend_llm: None,
             tools: NoopToolExecutor,
             id_generator,
         }
@@ -492,9 +494,24 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         Self {
             store,
             llm,
+            backend_llm: None,
             tools,
             id_generator,
         }
+    }
+
+    /// Set a separate LLM for backend tasks (title generation, context summary).
+    /// Falls back to the primary LLM when not set.
+    pub fn with_backend_llm(mut self, llm: L) -> Self {
+        self.backend_llm = Some(llm);
+        self
+    }
+}
+
+impl<S, L: LlmClient, T> ConversationHandler<S, L, T> {
+    /// Returns the backend-tasks LLM if configured, otherwise the primary LLM.
+    fn task_llm(&self) -> &L {
+        self.backend_llm.as_ref().unwrap_or(&self.llm)
     }
 }
 
@@ -580,7 +597,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             let summary = generate_context_summary(
                 &conv.context_summary,
                 &conv.messages[from..to],
-                &self.llm,
+                self.task_llm(),
             )
             .await;
             conv.context_summary = summary;
@@ -673,7 +690,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // so the conversation list shows meaningful names rather than
                 // timestamp-based placeholders.
                 if is_first_message {
-                    let generated = generate_conversation_title(&prompt, &self.llm).await;
+                    let generated = generate_conversation_title(&prompt, self.task_llm()).await;
                     if !generated.is_empty() {
                         conv.title = generated;
                     }

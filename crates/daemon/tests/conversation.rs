@@ -73,6 +73,20 @@ impl ConversationStore for TestStore {
             .map(|_| ())
             .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
     }
+
+    async fn create_summary(
+        &self,
+        _conversation_id: &ConversationId,
+        _summary: String,
+        _start_ordinal: usize,
+        _end_ordinal: usize,
+    ) -> Result<String, CoreError> {
+        Ok("test-summary".to_string())
+    }
+
+    async fn expand_summary(&self, _summary_id: &str) -> Result<(), CoreError> {
+        Ok(())
+    }
 }
 
 // --- Mock LLM for integration tests ---

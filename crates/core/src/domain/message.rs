@@ -23,6 +23,9 @@ pub struct Message {
     /// The tool call ID this message is a response to (only set for Role::Tool).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// If set, this message is collapsed behind a `MessageSummary` with this ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
 }
 
 impl Message {
@@ -32,6 +35,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            summary_id: None,
         }
     }
 
@@ -42,6 +46,7 @@ impl Message {
             content: String::new(),
             tool_calls,
             tool_call_id: None,
+            summary_id: None,
         }
     }
 
@@ -52,6 +57,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            summary_id: None,
         }
     }
 }

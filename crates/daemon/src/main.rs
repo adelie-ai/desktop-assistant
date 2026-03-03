@@ -241,6 +241,26 @@ impl desktop_assistant_core::ports::store::ConversationStore for AnyConversation
             Self::Postgres(s) => s.delete(id).await,
         }
     }
+
+    async fn create_summary(
+        &self,
+        conversation_id: &desktop_assistant_core::domain::ConversationId,
+        summary: String,
+        start_ordinal: usize,
+        end_ordinal: usize,
+    ) -> Result<String, CoreError> {
+        match self {
+            Self::Json(s) => s.create_summary(conversation_id, summary, start_ordinal, end_ordinal).await,
+            Self::Postgres(s) => s.create_summary(conversation_id, summary, start_ordinal, end_ordinal).await,
+        }
+    }
+
+    async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+        match self {
+            Self::Json(s) => s.expand_summary(summary_id).await,
+            Self::Postgres(s) => s.expand_summary(summary_id).await,
+        }
+    }
 }
 
 /// Enum wrapper to dispatch between LLM backends at runtime.
@@ -752,11 +772,11 @@ async fn main() -> Result<()> {
     // Spawn background dreaming (periodic fact extraction) task
     let dreaming_enabled = daemon_config
         .as_ref()
-        .map(|c| c.dreaming.enabled)
+        .map(|c| c.backend_tasks.dreaming_enabled)
         .unwrap_or(false);
     let dreaming_interval_secs = daemon_config
         .as_ref()
-        .map(|c| c.dreaming.interval_secs)
+        .map(|c| c.backend_tasks.dreaming_interval_secs)
         .unwrap_or(3600);
 
     let (dreaming_shutdown_tx, dreaming_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -765,15 +785,15 @@ async fn main() -> Result<()> {
             &pg_pool,
             !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
         ) {
-            let resolved_dreaming_llm =
-                config::resolve_dreaming_llm_config(daemon_config.as_ref());
+            let resolved_bt_llm =
+                config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
             tracing::info!(
                 "dreaming LLM connector={}, model={}",
-                resolved_dreaming_llm.connector,
-                resolved_dreaming_llm.model
+                resolved_bt_llm.connector,
+                resolved_bt_llm.model
             );
 
-            let dreaming_llm = build_llm_client(resolved_dreaming_llm);
+            let dreaming_llm = build_llm_client(resolved_bt_llm);
             let dreaming_llm = RetryingLlmClient::new(dreaming_llm, 3);
             let dreaming_llm = Arc::new(dreaming_llm);
 
@@ -872,12 +892,31 @@ async fn main() -> Result<()> {
     };
 
     let llm = RetryingLlmClient::new(llm, 3);
-    let conversation_service = Arc::new(ConversationHandler::with_tools(
+    let mut handler = ConversationHandler::with_tools(
         conversation_store,
         llm,
         tool_executor,
         Box::new(|| uuid::Uuid::now_v7().to_string()),
-    ));
+    );
+
+    // Build a separate LLM for backend tasks (title generation, context summary)
+    // if [backend_tasks.llm] is configured and differs from the primary.
+    let resolved_bt = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
+    let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
+    if resolved_bt.connector != resolved_primary.connector
+        || resolved_bt.model != resolved_primary.model
+    {
+        tracing::info!(
+            "backend-tasks LLM connector={}, model={}",
+            resolved_bt.connector,
+            resolved_bt.model
+        );
+        let bt_llm = build_llm_client(resolved_bt);
+        let bt_llm = RetryingLlmClient::new(bt_llm, 3);
+        handler = handler.with_backend_llm(bt_llm);
+    }
+
+    let conversation_service = Arc::new(handler);
     let settings_service = Arc::new(DaemonSettingsService::new(config_path.clone()));
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()

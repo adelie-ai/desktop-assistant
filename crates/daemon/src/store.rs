@@ -174,6 +174,50 @@ impl ConversationStore for PersistentConversationStore {
             Err(CoreError::ConversationNotFound(id.0.clone()))
         }
     }
+
+    async fn create_summary(
+        &self,
+        conversation_id: &ConversationId,
+        summary: String,
+        start_ordinal: usize,
+        end_ordinal: usize,
+    ) -> Result<String, CoreError> {
+        use desktop_assistant_core::domain::MessageSummary;
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&conversation_id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
+        let id = uuid::Uuid::now_v7().to_string();
+        for (i, msg) in conv.messages.iter_mut().enumerate() {
+            if i >= start_ordinal && i <= end_ordinal {
+                msg.summary_id = Some(id.clone());
+            }
+        }
+        conv.summaries.push(MessageSummary {
+            id: id.clone(),
+            summary,
+            start_ordinal,
+            end_ordinal,
+        });
+        self.persist(&data)?;
+        Ok(id)
+    }
+
+    async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        for conv in data.values_mut() {
+            if let Some(pos) = conv.summaries.iter().position(|s| s.id == summary_id) {
+                conv.summaries.remove(pos);
+                for msg in conv.messages.iter_mut() {
+                    if msg.summary_id.as_deref() == Some(summary_id) {
+                        msg.summary_id = None;
+                    }
+                }
+                return self.persist(&data);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// In-memory conversation store backed by a `Mutex<HashMap>`.
@@ -228,6 +272,49 @@ impl ConversationStore for InMemoryConversationStore {
             .remove(&id.0)
             .map(|_| ())
             .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+    }
+
+    async fn create_summary(
+        &self,
+        conversation_id: &ConversationId,
+        summary: String,
+        start_ordinal: usize,
+        end_ordinal: usize,
+    ) -> Result<String, CoreError> {
+        use desktop_assistant_core::domain::MessageSummary;
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&conversation_id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
+        let id = uuid::Uuid::now_v7().to_string();
+        for (i, msg) in conv.messages.iter_mut().enumerate() {
+            if i >= start_ordinal && i <= end_ordinal {
+                msg.summary_id = Some(id.clone());
+            }
+        }
+        conv.summaries.push(MessageSummary {
+            id: id.clone(),
+            summary,
+            start_ordinal,
+            end_ordinal,
+        });
+        Ok(id)
+    }
+
+    async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        for conv in data.values_mut() {
+            if let Some(pos) = conv.summaries.iter().position(|s| s.id == summary_id) {
+                conv.summaries.remove(pos);
+                for msg in conv.messages.iter_mut() {
+                    if msg.summary_id.as_deref() == Some(summary_id) {
+                        msg.summary_id = None;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 }
 

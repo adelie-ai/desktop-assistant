@@ -24,6 +24,15 @@ impl From<&str> for ConversationId {
     }
 }
 
+/// A collapsed range of messages replaced by a summary text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSummary {
+    pub id: String,
+    pub summary: String,
+    pub start_ordinal: usize,
+    pub end_ordinal: usize,
+}
+
 /// A conversation aggregate containing its messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -40,6 +49,9 @@ pub struct Conversation {
     /// Message index up to which compaction has been performed.
     #[serde(default)]
     pub compacted_through: usize,
+    /// Collapsed message ranges with their summary text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summaries: Vec<MessageSummary>,
 }
 
 impl Conversation {
@@ -52,6 +64,7 @@ impl Conversation {
             messages: Vec::new(),
             context_summary: String::new(),
             compacted_through: 0,
+            summaries: Vec::new(),
         }
     }
 }
