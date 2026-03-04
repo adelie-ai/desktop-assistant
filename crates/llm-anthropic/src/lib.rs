@@ -75,9 +75,8 @@ impl AnthropicClient {
     /// Optionally reads `ANTHROPIC_MODEL` (defaults to claude-sonnet-4-5-20250929)
     /// and `ANTHROPIC_BASE_URL` (defaults to https://api.anthropic.com).
     pub fn from_env() -> Result<Self, CoreError> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-            CoreError::Llm("ANTHROPIC_API_KEY environment variable not set".into())
-        })?;
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .map_err(|_| CoreError::Llm("ANTHROPIC_API_KEY environment variable not set".into()))?;
         let mut client = Self::new(api_key);
         if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
             client.model = model;
@@ -91,6 +90,28 @@ impl AnthropicClient {
 
 // --- Request types ---
 
+#[derive(Serialize, Clone)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
+}
+
+impl CacheControl {
+    fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    cache_control: CacheControl,
+}
+
 #[derive(Serialize)]
 struct MessagesRequest {
     model: String,
@@ -99,8 +120,8 @@ struct MessagesRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    system: Vec<SystemBlock>,
     messages: Vec<AnthropicMessage>,
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -149,14 +170,17 @@ impl From<&ToolDefinition> for AnthropicTool {
 }
 
 /// Convert domain messages into Anthropic API messages, extracting the system prompt.
-fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessage>) {
-    let mut system = None;
+///
+/// The system prompt is returned as a `Vec<SystemBlock>` with an ephemeral cache
+/// breakpoint so the Anthropic API caches it across turns.
+fn convert_messages(messages: &[Message]) -> (Vec<SystemBlock>, Vec<AnthropicMessage>) {
+    let mut system_text = None;
     let mut api_messages: Vec<AnthropicMessage> = Vec::new();
 
     for msg in messages {
         match msg.role {
             Role::System => {
-                system = Some(msg.content.clone());
+                system_text = Some(msg.content.clone());
             }
             Role::User => {
                 api_messages.push(AnthropicMessage {
@@ -204,6 +228,16 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessa
             }
         }
     }
+
+    let system = system_text
+        .map(|text| {
+            vec![SystemBlock {
+                block_type: "text",
+                text,
+                cache_control: CacheControl::ephemeral(),
+            }]
+        })
+        .unwrap_or_default();
 
     (system, api_messages)
 }
@@ -321,12 +355,12 @@ impl LlmClient for AnthropicClient {
             tools: api_tools,
         };
 
-        let request_json = serde_json::to_string(&request)
-            .unwrap_or_else(|_| "<serialization error>".into());
+        let request_json =
+            serde_json::to_string(&request).unwrap_or_else(|_| "<serialization error>".into());
         let request_bytes = request_json.len();
         let msg_count = request.messages.len();
         let tool_count = request.tools.len();
-        let system_chars: usize = request.system.as_deref().map_or(0, |s| s.len());
+        let system_chars: usize = request.system.first().map_or(0, |block| block.text.len());
         tracing::info!(
             request_bytes,
             msg_count,
@@ -481,7 +515,7 @@ mod tests {
     fn convert_user_message() {
         let messages = vec![Message::new(Role::User, "hello")];
         let (system, api_msgs) = convert_messages(&messages);
-        assert!(system.is_none());
+        assert!(system.is_empty());
         assert_eq!(api_msgs.len(), 1);
         assert_eq!(api_msgs[0].role, "user");
         match &api_msgs[0].content[0] {
@@ -497,7 +531,9 @@ mod tests {
             Message::new(Role::User, "hi"),
         ];
         let (system, api_msgs) = convert_messages(&messages);
-        assert_eq!(system.as_deref(), Some("you are helpful"));
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].text, "you are helpful");
+        assert_eq!(system[0].cache_control.cache_type, "ephemeral");
         assert_eq!(api_msgs.len(), 1); // system not in messages array
         assert_eq!(api_msgs[0].role, "user");
     }
@@ -651,7 +687,7 @@ mod tests {
             max_tokens: 8192,
             temperature: None,
             top_p: None,
-            system: None,
+            system: vec![],
             messages: vec![],
             stream: true,
             tools: vec![],
@@ -668,7 +704,11 @@ mod tests {
             max_tokens: 8192,
             temperature: None,
             top_p: None,
-            system: Some("system prompt".into()),
+            system: vec![SystemBlock {
+                block_type: "text",
+                text: "system prompt".into(),
+                cache_control: CacheControl::ephemeral(),
+            }],
             messages: vec![],
             stream: true,
             tools: vec![AnthropicTool::from(&def)],
@@ -686,13 +726,20 @@ mod tests {
             max_tokens: 8192,
             temperature: None,
             top_p: None,
-            system: Some("be helpful".into()),
+            system: vec![SystemBlock {
+                block_type: "text",
+                text: "be helpful".into(),
+                cache_control: CacheControl::ephemeral(),
+            }],
             messages: vec![],
             stream: true,
             tools: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"system\":\"be helpful\""));
+        assert!(json.contains("\"system\""));
+        assert!(json.contains("\"be helpful\""));
+        assert!(json.contains("\"cache_control\""));
+        assert!(json.contains("\"ephemeral\""));
     }
 
     #[test]
@@ -710,7 +757,7 @@ mod tests {
             max_tokens: 8192,
             temperature: None,
             top_p: None,
-            system: None,
+            system: vec![],
             messages: vec![],
             stream: true,
             tools: vec![],
