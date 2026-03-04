@@ -329,14 +329,28 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
 
 /// Compute the window-start index, snapped forward to a `Role::User` boundary.
 /// Returns 0 when the conversation fits within `MAX_CONTEXT_MESSAGES`.
+/// Find the start index for the context window.
+///
+/// The returned index must never land on a `Role::Tool` message, because that
+/// would orphan tool results from their preceding assistant `tool_calls`
+/// message — which the OpenAI API rejects with HTTP 400.  We prefer snapping
+/// to a `Role::User` boundary; when none exists (common in long agentic
+/// tool-calling loops) we skip past any leading Tool messages instead.
 fn window_start(messages: &[Message]) -> usize {
     if messages.len() <= MAX_CONTEXT_MESSAGES {
         return 0;
     }
     let tentative = messages.len() - MAX_CONTEXT_MESSAGES;
-    messages[tentative..]
+    let search = &messages[tentative..];
+    // Prefer starting on a User message to keep tool groups intact.
+    if let Some(offset) = search.iter().position(|m| m.role == Role::User) {
+        return tentative + offset;
+    }
+    // No User message found; at minimum skip past any Tool messages so we
+    // never start with orphaned tool results.
+    search
         .iter()
-        .position(|m| m.role == Role::User)
+        .position(|m| m.role != Role::Tool)
         .map_or(tentative, |offset| tentative + offset)
 }
 
@@ -2075,6 +2089,31 @@ mod tests {
         // The tail must be preserved intact.
         let last = result.last().unwrap();
         assert_eq!(last.content, "final-reply");
+    }
+
+    #[test]
+    fn window_start_skips_orphaned_tool_messages() {
+        // When the tentative cut point lands on a Tool message and there are
+        // no User messages after it, the window must skip past Tool messages
+        // to avoid orphaning tool results from their assistant tool_calls.
+        let mut msgs = Vec::new();
+        msgs.push(Message::new(Role::User, "initial"));
+        // Fill with tool-call groups (assistant + tool_result each = 2 msgs)
+        // so the entire tail is tool groups with no User messages.
+        let num_groups = MAX_CONTEXT_MESSAGES + 2;
+        for i in 0..num_groups {
+            msgs.push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                format!("c{i}"),
+                "tool_a",
+                "{}",
+            )]));
+            msgs.push(Message::tool_result(format!("c{i}"), format!("result-{i}")));
+        }
+        // Total = 1 + num_groups*2.  tentative = total - MAX_CONTEXT_MESSAGES.
+        // The tentative index lands inside the tool groups.  If it happens to
+        // land on a tool_result, the old code would start there (orphaned).
+        let start = window_start(&msgs);
+        assert_ne!(msgs[start].role, Role::Tool, "window must not start on a Tool message");
     }
 
     // --- Compaction tests ---
