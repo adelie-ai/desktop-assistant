@@ -78,26 +78,22 @@ pub async fn resolve_ws_bearer_token(config: &ConnectionConfig) -> Result<String
     #[cfg(feature = "dbus")]
     {
         match crate::dbus_client::generate_ws_jwt(&config.ws_subject).await {
-            Ok(token) => return Ok(token),
+            Ok(token) => Ok(token),
             Err(dbus_error) => {
                 if let (Some(username), Some(password)) = (
                     config.ws_login_username.as_deref(),
                     config.ws_login_password.as_deref(),
                 ) {
-                    match request_ws_login_token(&config.ws_url, username, password).await {
-                        Ok(token) => return Ok(token),
-                        Err(login_error) => {
-                            return Err(anyhow::anyhow!(
-                                "failed to obtain websocket token via D-Bus ({dbus_error}); \
-                                 fallback /login on websocket host also failed ({login_error})"
-                            ));
-                        }
-                    }
+                    request_ws_login_token(&config.ws_url, username, password).await
+                        .map_err(|login_error| anyhow::anyhow!(
+                            "failed to obtain websocket token via D-Bus ({dbus_error}); \
+                             fallback /login on websocket host also failed ({login_error})"
+                        ))
                 } else {
-                    return Err(anyhow::anyhow!(
+                    Err(anyhow::anyhow!(
                         "failed to obtain websocket token via D-Bus ({dbus_error}); \
                          provide --ws-jwt or --ws-login-username/--ws-login-password for /login fallback"
-                    ));
+                    ))
                 }
             }
         }

@@ -296,10 +296,8 @@ async fn insert_message(
 
 fn msg_from_row(r: MsgRow) -> Message {
     let mut msg = Message::new(str_to_role(&r.role), &r.content);
-    if let Some(tc_json) = r.tool_calls {
-        if let Ok(tool_calls) = serde_json::from_value::<Vec<ToolCall>>(tc_json) {
-            msg.tool_calls = tool_calls;
-        }
+    if let Some(tc_json) = r.tool_calls && let Ok(tool_calls) = serde_json::from_value::<Vec<ToolCall>>(tc_json) {
+        msg.tool_calls = tool_calls;
     }
     msg.tool_call_id = r.tool_call_id;
     msg.summary_id = r.summary_id;

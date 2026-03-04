@@ -49,6 +49,18 @@ pub struct DatabaseSettingsView {
 }
 
 #[derive(Debug, Clone)]
+pub struct McpServerView {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub namespace: Option<String>,
+    pub enabled: bool,
+    /// "running" | "stopped" | "disabled"
+    pub status: String,
+    pub tool_count: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct BackendTasksSettingsView {
     /// Whether `[backend_tasks.llm]` is explicitly configured (vs. falling back to primary LLM).
     pub has_separate_llm: bool,
@@ -201,6 +213,38 @@ pub trait SettingsService: Send + Sync {
         dreaming_enabled: bool,
         dreaming_interval_secs: u64,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    // MCP server management
+
+    fn list_mcp_servers(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<McpServerView>, CoreError>> + Send;
+
+    fn add_mcp_server(
+        &self,
+        name: String,
+        command: String,
+        args: Vec<String>,
+        namespace: Option<String>,
+        enabled: bool,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn remove_mcp_server(
+        &self,
+        name: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn set_mcp_server_enabled(
+        &self,
+        name: String,
+        enabled: bool,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn mcp_server_action(
+        &self,
+        action: String,
+        server: Option<String>,
+    ) -> impl std::future::Future<Output = Result<Vec<McpServerView>, CoreError>> + Send;
 }
 
 #[cfg(test)]

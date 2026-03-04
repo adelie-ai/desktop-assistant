@@ -100,29 +100,27 @@ fn llm_messages_for_turn(
     for (i, msg) in windowed.iter().enumerate() {
         let ordinal = start + i;
 
-        if let Some(sid) = &msg.summary_id {
-            if active_summary_ids.contains(sid.as_str()) {
-                // This message is collapsed. Inject the summary at the first
-                // collapsed message we encounter for this summary.
-                if !injected_summaries.contains(sid.as_str()) {
-                    injected_summaries.insert(sid);
-                    // Look up by ordinal first, then fall back to finding by ID
-                    // (the window may not start at the summary's start_ordinal).
-                    let found = summary_map.get(&ordinal).copied().or_else(|| {
-                        summaries.iter().find(|s| s.id == *sid)
-                    });
-                    if let Some(s) = found {
-                        messages.push(Message::new(
-                            Role::System,
-                            format!(
-                                "[Summary of messages {}\u{2013}{}] {}",
-                                s.start_ordinal, s.end_ordinal, s.summary
-                            ),
-                        ));
-                    }
+        if let Some(sid) = &msg.summary_id && active_summary_ids.contains(sid.as_str()) {
+            // This message is collapsed. Inject the summary at the first
+            // collapsed message we encounter for this summary.
+            if !injected_summaries.contains(sid.as_str()) {
+                injected_summaries.insert(sid);
+                // Look up by ordinal first, then fall back to finding by ID
+                // (the window may not start at the summary's start_ordinal).
+                let found = summary_map.get(&ordinal).copied().or_else(|| {
+                    summaries.iter().find(|s| s.id == *sid)
+                });
+                if let Some(s) = found {
+                    messages.push(Message::new(
+                        Role::System,
+                        format!(
+                            "[Summary of messages {}\u{2013}{}] {}",
+                            s.start_ordinal, s.end_ordinal, s.summary
+                        ),
+                    ));
                 }
-                continue;
             }
+            continue;
         }
 
         messages.push(msg.clone());
@@ -729,28 +727,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
                 // Dynamic activation: if tool_search returned results,
                 // activate the discovered tools for subsequent rounds.
-                if tool_call.name == "builtin_tool_search" {
-                    if let Ok(found) = serde_json::from_str::<serde_json::Value>(&result) {
-                        if let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array()) {
-                            for tool_entry in tools_arr {
-                                if let Some(name) = tool_entry.get("name").and_then(|v| v.as_str())
-                                {
-                                    if !activated_tools.contains_key(name)
-                                        && !core_tools.iter().any(|t| t.name == name)
-                                    {
-                                        if let Ok(Some(def)) =
-                                            self.tools.tool_definition(name).await
-                                        {
-                                            tracing::info!(
-                                                "dynamically activated tool: {}",
-                                                def.name
-                                            );
-                                            activated_tools
-                                                .insert(def.name.clone(), def);
-                                        }
-                                    }
-                                }
-                            }
+                if tool_call.name == "builtin_tool_search"
+                    && let Ok(found) = serde_json::from_str::<serde_json::Value>(&result)
+                    && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
+                {
+                    for tool_entry in tools_arr {
+                        if let Some(name) = tool_entry.get("name").and_then(|v| v.as_str())
+                            && !activated_tools.contains_key(name)
+                            && !core_tools.iter().any(|t| t.name == name)
+                            && let Ok(Some(def)) = self.tools.tool_definition(name).await
+                        {
+                            tracing::info!("dynamically activated tool: {}", def.name);
+                            activated_tools.insert(def.name.clone(), def);
                         }
                     }
                 }

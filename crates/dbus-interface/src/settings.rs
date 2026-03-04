@@ -175,7 +175,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             let llm_base_url_set = llm_base_url.is_some();
 
             let connector =
-                normalize_optional_string(llm_connector).unwrap_or_else(|| current.connector);
+                normalize_optional_string(llm_connector).unwrap_or(current.connector);
             let model = if llm_model_set {
                 normalize_optional_string(llm_model)
             } else {
@@ -577,7 +577,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                     .then_some(persistence_push_on_update),
                 llm_temperature: set_llm_temperature.then_some(llm_temperature),
                 llm_top_p: set_llm_top_p.then_some(llm_top_p),
-                llm_max_tokens: set_llm_max_tokens.then(|| llm_max_tokens),
+                llm_max_tokens: set_llm_max_tokens.then_some(llm_max_tokens),
             })
             .await?;
 
@@ -648,6 +648,93 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             )
             .await
             .map_err(to_fdo_error)
+    }
+
+    /// List configured MCP servers with status.
+    ///
+    /// Returns: Vec<(name, command, enabled, status, tool_count)>
+    async fn list_mcp_servers(
+        &self,
+    ) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
+        let servers = self
+            .service
+            .list_mcp_servers()
+            .await
+            .map_err(to_fdo_error)?;
+
+        Ok(servers
+            .into_iter()
+            .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
+            .collect())
+    }
+
+    /// Add a new MCP server.
+    async fn add_mcp_server(
+        &self,
+        name: &str,
+        command: &str,
+        args: &str,
+        namespace: &str,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let args: Vec<String> = if args.trim().is_empty() {
+            vec![]
+        } else {
+            args.split_whitespace().map(|s| s.to_string()).collect()
+        };
+
+        let namespace = if namespace.trim().is_empty() {
+            None
+        } else {
+            Some(namespace.to_string())
+        };
+
+        self.service
+            .add_mcp_server(name.to_string(), command.to_string(), args, namespace, enabled)
+            .await
+            .map_err(to_fdo_error)
+    }
+
+    /// Remove an MCP server by name.
+    async fn remove_mcp_server(&self, name: &str) -> fdo::Result<()> {
+        self.service
+            .remove_mcp_server(name.to_string())
+            .await
+            .map_err(to_fdo_error)
+    }
+
+    /// Enable or disable an MCP server.
+    async fn set_mcp_server_enabled(&self, name: &str, enabled: bool) -> fdo::Result<()> {
+        self.service
+            .set_mcp_server_enabled(name.to_string(), enabled)
+            .await
+            .map_err(to_fdo_error)
+    }
+
+    /// Perform an action (status/start/stop/restart) on MCP server(s).
+    ///
+    /// Returns: Vec<(name, command, enabled, status, tool_count)>
+    async fn mcp_server_action(
+        &self,
+        action: &str,
+        server: &str,
+    ) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
+        let server = if server.trim().is_empty() {
+            None
+        } else {
+            Some(server.to_string())
+        };
+
+        let servers = self
+            .service
+            .mcp_server_action(action.to_string(), server)
+            .await
+            .map_err(to_fdo_error)?;
+
+        Ok(servers
+            .into_iter()
+            .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
+            .collect())
     }
 
     /// Signal emitted after a successful aggregate config update.
@@ -878,6 +965,22 @@ mod tests {
             state.backend_tasks.dreaming_enabled = dreaming_enabled;
             state.backend_tasks.dreaming_interval_secs = dreaming_interval_secs;
             Ok(())
+        }
+
+        async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+            Ok(vec![])
+        }
+        async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+            Ok(vec![])
         }
     }
 

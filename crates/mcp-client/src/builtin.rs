@@ -10,12 +10,15 @@ use desktop_assistant_core::ports::knowledge::{KnowledgeDeleteFn, KnowledgeSearc
 use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
 
+use crate::executor::McpControlHandle;
+
 const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
 const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
 const TOOL_DB_QUERY: &str = "builtin_db_query";
+const TOOL_MCP_CONTROL: &str = "builtin_mcp_control";
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -33,6 +36,13 @@ pub struct BuiltinToolService {
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
     db_query_fn: Option<DbQueryFn>,
+    mcp_handle: Option<McpControlHandle>,
+}
+
+impl Default for BuiltinToolService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BuiltinToolService {
@@ -47,6 +57,7 @@ impl BuiltinToolService {
             tool_search_fn: None,
             tool_definition_fn: None,
             db_query_fn: None,
+            mcp_handle: None,
         }
     }
 
@@ -84,6 +95,11 @@ impl BuiltinToolService {
     pub fn with_database(mut self, query_fn: DbQueryFn) -> Self {
         self.db_query_fn = Some(query_fn);
         self
+    }
+
+    /// Set the MCP control handle (used by builtin_mcp_control tool).
+    pub fn set_mcp_control(&mut self, handle: McpControlHandle) {
+        self.mcp_handle = Some(handle);
     }
 
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -213,6 +229,27 @@ impl BuiltinToolService {
                     "required": ["query"]
                 }),
             ),
+            ToolDefinition::new(
+                TOOL_MCP_CONTROL,
+                "Check status, start, stop, or restart MCP (Model Context Protocol) \
+                 servers. Use this when a tool call fails because an MCP server is \
+                 disconnected, or to inspect what servers are available.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["status", "start", "stop", "restart"],
+                            "description": "Action to perform"
+                        },
+                        "server": {
+                            "type": "string",
+                            "description": "Server name (omit for all servers)"
+                        }
+                    },
+                    "required": ["action"]
+                }),
+            ),
         ]
     }
 
@@ -225,6 +262,7 @@ impl BuiltinToolService {
                 | TOOL_SEARCH
                 | TOOL_SYS_PROPS
                 | TOOL_DB_QUERY
+                | TOOL_MCP_CONTROL
         )
     }
 
@@ -240,6 +278,7 @@ impl BuiltinToolService {
             TOOL_SEARCH => self.tool_search(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
             TOOL_DB_QUERY => self.db_query(arguments).await,
+            TOOL_MCP_CONTROL => self.mcp_control(arguments).await,
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
@@ -427,6 +466,69 @@ impl BuiltinToolService {
             "result": result,
         })
         .to_string())
+    }
+
+    async fn mcp_control(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let handle = self.mcp_handle.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution("MCP control not configured".to_string())
+        })?;
+
+        let action = required_string(&arguments, "action")?;
+        let server = optional_string(&arguments, "server");
+        let server_ref = server.as_deref();
+
+        match action.as_str() {
+            "status" => {
+                let statuses = handle.status(server_ref).await;
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "servers": statuses,
+                })
+                .to_string())
+            }
+            "start" => {
+                let result = handle
+                    .start_server(server_ref)
+                    .await
+                    .map_err(|e| CoreError::ToolExecution(format!("start failed: {e}")))?;
+                let statuses = handle.status(server_ref).await;
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "message": result,
+                    "servers": statuses,
+                })
+                .to_string())
+            }
+            "stop" => {
+                let result = handle
+                    .stop_server(server_ref)
+                    .await
+                    .map_err(|e| CoreError::ToolExecution(format!("stop failed: {e}")))?;
+                let statuses = handle.status(server_ref).await;
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "message": result,
+                    "servers": statuses,
+                })
+                .to_string())
+            }
+            "restart" => {
+                let result = handle
+                    .restart_server(server_ref)
+                    .await
+                    .map_err(|e| CoreError::ToolExecution(format!("restart failed: {e}")))?;
+                let statuses = handle.status(server_ref).await;
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "message": result,
+                    "servers": statuses,
+                })
+                .to_string())
+            }
+            _ => Err(CoreError::ToolExecution(format!(
+                "unknown MCP control action: {action}"
+            ))),
+        }
     }
 
     /// Embed a single text string, returning None if embeddings are unavailable.
@@ -642,6 +744,7 @@ mod tests {
         assert!(names.contains(&TOOL_SEARCH.to_string()));
         assert!(names.contains(&TOOL_SYS_PROPS.to_string()));
         assert!(names.contains(&TOOL_DB_QUERY.to_string()));
+        assert!(names.contains(&TOOL_MCP_CONTROL.to_string()));
     }
 
     #[tokio::test]

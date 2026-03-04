@@ -409,20 +409,14 @@ pub fn set_llm_settings(
         return Err(anyhow!("connector must not be empty"));
     }
 
-    if let Some(t) = temperature {
-        if !(0.0..=2.0).contains(&t) {
-            return Err(anyhow!("temperature must be between 0.0 and 2.0"));
-        }
+    if let Some(t) = temperature && !(0.0..=2.0).contains(&t) {
+        return Err(anyhow!("temperature must be between 0.0 and 2.0"));
     }
-    if let Some(p) = top_p {
-        if !(0.0..=1.0).contains(&p) {
-            return Err(anyhow!("top_p must be between 0.0 and 1.0"));
-        }
+    if let Some(p) = top_p && !(0.0..=1.0).contains(&p) {
+        return Err(anyhow!("top_p must be between 0.0 and 1.0"));
     }
-    if let Some(m) = max_tokens {
-        if m == 0 {
-            return Err(anyhow!("max_tokens must be greater than 0"));
-        }
+    if let Some(m) = max_tokens && m == 0 {
+        return Err(anyhow!("max_tokens must be greater than 0"));
     }
 
     config.llm.connector = connector;
@@ -1284,7 +1278,7 @@ pub fn validate_ws_jwt(token: &str) -> anyhow::Result<bool> {
 pub fn authenticate_os_user_password(username: &str, password: &str) -> anyhow::Result<bool> {
     #[cfg(target_os = "linux")]
     {
-        return pam_auth::authenticate(username, password);
+        pam_auth::authenticate(username, password)
     }
 
     #[cfg(not(target_os = "linux"))]

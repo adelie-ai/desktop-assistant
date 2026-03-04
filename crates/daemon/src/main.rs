@@ -568,24 +568,22 @@ async fn main() -> Result<()> {
 
     // Invalidate embeddings from a different model so that vector-dimension
     // mismatches cannot cause search errors while the backfill is running.
-    if let Some(pool) = &pg_pool {
-        if !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
-            match desktop_assistant_storage::embedding_backfill::invalidate_stale_embeddings(
-                pool,
-                &embedding_model_id,
-            )
-            .await
-            {
-                Ok((kb, tools)) if kb > 0 || tools > 0 => {
-                    tracing::warn!(
-                        "embedding model changed to {}: invalidated {kb} knowledge + {tools} tool embeddings (will re-embed in background)",
-                        embedding_model_id
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("failed to invalidate stale embeddings: {e}");
-                }
+    if let Some(pool) = &pg_pool && !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
+        match desktop_assistant_storage::embedding_backfill::invalidate_stale_embeddings(
+            pool,
+            &embedding_model_id,
+        )
+        .await
+        {
+            Ok((kb, tools)) if kb > 0 || tools > 0 => {
+                tracing::warn!(
+                    "embedding model changed to {}: invalidated {kb} knowledge + {tools} tool embeddings (will re-embed in background)",
+                    embedding_model_id
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("failed to invalidate stale embeddings: {e}");
             }
         }
     }
@@ -674,8 +672,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    let tool_executor =
-        McpToolExecutor::with_builtin_tools(mcp_configs, builtin_tools);
+    let mut tool_executor =
+        McpToolExecutor::with_builtin_tools_and_config_path(mcp_configs, builtin_tools, mcp_config_path);
+    let mcp_handle = tool_executor.control_handle();
+    tool_executor.builtin_tools_mut().set_mcp_control(mcp_handle.clone());
     if let Err(e) = tool_executor.start().await {
         tracing::warn!("failed to start MCP servers: {e}");
     }
@@ -711,10 +711,8 @@ async fn main() -> Result<()> {
         // Register MCP tools as non-core (discoverable via tool_search)
         let mcp_defs: Vec<_> = tool_executor.all_mcp_tools().await;
         let mcp_embeddings = vec![None; mcp_defs.len()];
-        if !mcp_defs.is_empty() {
-            if let Err(e) = tr.register_tools(mcp_defs, "mcp", false, mcp_embeddings, None).await {
-                tracing::warn!("failed to register MCP tools in registry: {e}");
-            }
+        if !mcp_defs.is_empty() && let Err(e) = tr.register_tools(mcp_defs, "mcp", false, mcp_embeddings, None).await {
+            tracing::warn!("failed to register MCP tools in registry: {e}");
         }
     }
 
@@ -917,7 +915,9 @@ async fn main() -> Result<()> {
     }
 
     let conversation_service = Arc::new(handler);
-    let settings_service = Arc::new(DaemonSettingsService::new(config_path.clone()));
+    let settings_service = Arc::new(
+        DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle),
+    );
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
         .map(|v| v.trim().to_string())
@@ -1048,17 +1048,13 @@ async fn main() -> Result<()> {
     tracing::info!("shutdown signal received; stopping services");
 
     let _ = backfill_shutdown_tx.send(());
-    if let Some(task) = backfill_task {
-        if let Err(e) = task.await {
-            tracing::warn!("backfill task join error during shutdown: {e}");
-        }
+    if let Some(task) = backfill_task && let Err(e) = task.await {
+        tracing::warn!("backfill task join error during shutdown: {e}");
     }
 
     let _ = dreaming_shutdown_tx.send(());
-    if let Some(task) = dreaming_task {
-        if let Err(e) = task.await {
-            tracing::warn!("dreaming task join error during shutdown: {e}");
-        }
+    if let Some(task) = dreaming_task && let Err(e) = task.await {
+        tracing::warn!("dreaming task join error during shutdown: {e}");
     }
 
     let _ = ws_shutdown_tx.send(());

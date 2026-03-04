@@ -70,7 +70,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
                     if key.modifiers.is_empty() {
                         return Some(Action::SubmitPrompt);
                     }
-                    return None;
+                    None
                 }
                 // Preserve terminal-provided newline chars by forwarding them
                 // to textarea.input(...), which keeps composer and payload in sync.

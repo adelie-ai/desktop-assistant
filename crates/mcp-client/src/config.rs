@@ -4,7 +4,7 @@ use crate::McpError;
 use crate::executor::McpServerConfig;
 
 /// Top-level MCP configuration file structure.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct McpConfig {
     #[serde(default)]
     servers: Vec<McpServerConfig>,
@@ -52,6 +52,37 @@ pub fn load_mcp_configs(path: &std::path::Path) -> Result<Vec<McpServerConfig>, 
     Ok(config.servers)
 }
 
+/// Save MCP server configurations to a TOML file.
+pub fn save_mcp_configs(
+    path: &std::path::Path,
+    configs: &[McpServerConfig],
+) -> Result<(), McpError> {
+    let config = McpConfig {
+        servers: configs.to_vec(),
+    };
+
+    let contents = toml::to_string_pretty(&config).map_err(|e| {
+        McpError::UnexpectedResponse(format!("failed to serialize MCP config: {e}"))
+    })?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            McpError::UnexpectedResponse(format!("failed to create config directory: {e}"))
+        })?;
+    }
+
+    std::fs::write(path, contents).map_err(|e| {
+        McpError::UnexpectedResponse(format!("failed to write MCP config file: {e}"))
+    })?;
+
+    tracing::info!(
+        "saved {} MCP server config(s) to {}",
+        configs.len(),
+        path.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +126,42 @@ args = ["--config", "/path/to/config.toml"]
         let path = default_config_path();
         assert!(path.to_str().unwrap().contains("mcp_servers.toml"));
         assert!(path.to_str().unwrap().contains("desktop-assistant"));
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = std::env::temp_dir().join("mcp_config_roundtrip_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let configs = vec![
+            McpServerConfig {
+                name: "fileio".into(),
+                command: "fileio-mcp".into(),
+                args: vec![],
+                namespace: None,
+                enabled: true,
+            },
+            McpServerConfig {
+                name: "jira".into(),
+                command: "jira-mcp".into(),
+                args: vec!["--host".into(), "jira.example.com".into()],
+                namespace: Some("jira".into()),
+                enabled: false,
+            },
+        ];
+
+        save_mcp_configs(&path, &configs).unwrap();
+        let loaded = load_mcp_configs(&path).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "fileio");
+        assert!(loaded[0].enabled);
+        assert_eq!(loaded[1].name, "jira");
+        assert!(!loaded[1].enabled);
+        assert_eq!(loaded[1].namespace.as_deref(), Some("jira"));
+        assert_eq!(loaded[1].args.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

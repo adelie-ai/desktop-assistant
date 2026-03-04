@@ -148,6 +148,7 @@ async fn executor_refreshes_resources_and_prompts_after_live_list_changed() {
         command: "python3".into(),
         args: vec!["-u".into(), "-c".into(), script],
         namespace: None,
+        enabled: true,
     }];
 
     let executor = McpToolExecutor::new(configs);

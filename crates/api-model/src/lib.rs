@@ -83,6 +83,35 @@ pub enum Command {
         remote_name: Option<String>,
         push_on_update: bool,
     },
+
+    // MCP server management
+    ListMcpServers,
+    AddMcpServer {
+        name: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    },
+    RemoveMcpServer {
+        name: String,
+    },
+    SetMcpServerEnabled {
+        name: String,
+        enabled: bool,
+    },
+    McpServerAction {
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,6 +132,8 @@ pub enum CommandResult {
     EmbeddingsSettings(EmbeddingsSettingsView),
     ConnectorDefaults(ConnectorDefaultsView),
     PersistenceSettings(PersistenceSettingsView),
+
+    McpServers(Vec<McpServerView>),
 
     Ack,
 }
@@ -254,6 +285,19 @@ pub struct PersistenceSettingsView {
     pub remote_url: String,
     pub remote_name: String,
     pub push_on_update: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerView {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub enabled: bool,
+    /// "running" | "stopped" | "disabled"
+    pub status: String,
+    pub tool_count: u32,
 }
 
 #[cfg(test)]

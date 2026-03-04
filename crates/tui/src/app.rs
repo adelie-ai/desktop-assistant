@@ -315,10 +315,8 @@ impl App {
                 conv.title = title.to_string();
             }
         }
-        if let Some(current) = self.current_conversation.as_mut() {
-            if current.id == conversation_id {
-                current.title = title.to_string();
-            }
+        if let Some(current) = self.current_conversation.as_mut() && current.id == conversation_id {
+            current.title = title.to_string();
         }
     }
 

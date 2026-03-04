@@ -3,18 +3,35 @@ use std::path::PathBuf;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
     BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
-    EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView, SettingsService,
+    EmbeddingsSettingsView, LlmSettingsView, McpServerView, PersistenceSettingsView,
+    SettingsService,
 };
+use desktop_assistant_mcp_client::executor::McpControlHandle;
 
 use crate::config;
 
 pub struct DaemonSettingsService {
     config_path: PathBuf,
+    mcp_handle: Option<McpControlHandle>,
 }
 
 impl DaemonSettingsService {
     pub fn new(config_path: PathBuf) -> Self {
-        Self { config_path }
+        Self {
+            config_path,
+            mcp_handle: None,
+        }
+    }
+
+    pub fn with_mcp_control(mut self, handle: McpControlHandle) -> Self {
+        self.mcp_handle = Some(handle);
+        self
+    }
+
+    fn mcp_handle(&self) -> Result<&McpControlHandle, CoreError> {
+        self.mcp_handle
+            .as_ref()
+            .ok_or_else(|| CoreError::SystemService("MCP control not configured".to_string()))
     }
 }
 
@@ -188,6 +205,122 @@ impl SettingsService for DaemonSettingsService {
             dreaming_interval_secs,
         )
         .map_err(|e| CoreError::SystemService(e.to_string()))
+    }
+
+    async fn list_mcp_servers(&self) -> Result<Vec<McpServerView>, CoreError> {
+        let handle = self.mcp_handle()?;
+        let statuses = handle.status(None).await;
+        Ok(statuses
+            .into_iter()
+            .map(|s| McpServerView {
+                name: s.name,
+                command: s.command,
+                args: vec![],
+                namespace: None,
+                enabled: s.enabled,
+                status: s.status,
+                tool_count: s.tool_count,
+            })
+            .collect())
+    }
+
+    async fn add_mcp_server(
+        &self,
+        name: String,
+        command: String,
+        args: Vec<String>,
+        namespace: Option<String>,
+        enabled: bool,
+    ) -> Result<(), CoreError> {
+        let handle = self.mcp_handle()?;
+        let config = desktop_assistant_mcp_client::executor::McpServerConfig {
+            name,
+            command,
+            args,
+            namespace,
+            enabled,
+        };
+        handle
+            .add_server(config)
+            .await
+            .map_err(|e| CoreError::SystemService(e.to_string()))
+    }
+
+    async fn remove_mcp_server(&self, name: String) -> Result<(), CoreError> {
+        let handle = self.mcp_handle()?;
+        handle
+            .remove_server(&name)
+            .await
+            .map_err(|e| CoreError::SystemService(e.to_string()))
+    }
+
+    async fn set_mcp_server_enabled(
+        &self,
+        name: String,
+        enabled: bool,
+    ) -> Result<(), CoreError> {
+        let handle = self.mcp_handle()?;
+        if enabled {
+            handle
+                .enable_server(&name)
+                .await
+                .map_err(|e| CoreError::SystemService(e.to_string()))
+        } else {
+            handle
+                .disable_server(&name)
+                .await
+                .map_err(|e| CoreError::SystemService(e.to_string()))
+        }
+    }
+
+    async fn mcp_server_action(
+        &self,
+        action: String,
+        server: Option<String>,
+    ) -> Result<Vec<McpServerView>, CoreError> {
+        let handle = self.mcp_handle()?;
+        let server_ref = server.as_deref();
+
+        match action.as_str() {
+            "status" => {}
+            "start" => {
+                handle
+                    .start_server(server_ref)
+                    .await
+                    .map_err(|e| CoreError::SystemService(e.to_string()))?;
+            }
+            "stop" => {
+                handle
+                    .stop_server(server_ref)
+                    .await
+                    .map_err(|e| CoreError::SystemService(e.to_string()))?;
+            }
+            "restart" => {
+                handle
+                    .restart_server(server_ref)
+                    .await
+                    .map_err(|e| CoreError::SystemService(e.to_string()))?;
+            }
+            _ => {
+                return Err(CoreError::SystemService(format!(
+                    "unknown MCP action: {action}"
+                )));
+            }
+        }
+
+        let statuses = handle.status(server_ref).await;
+        Ok(statuses
+            .into_iter()
+            .map(|s| McpServerView {
+                name: s.name,
+                command: s.command,
+                args: vec![],
+                namespace: None,
+                enabled: s.enabled,
+                status: s.status,
+                tool_count: s.tool_count,
+            })
+            .collect())
     }
 }
 

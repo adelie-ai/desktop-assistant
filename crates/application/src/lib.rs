@@ -489,6 +489,81 @@ where
                 Ok(api::CommandResult::Ack)
             }
 
+            // MCP server management
+            api::Command::ListMcpServers => {
+                let servers = self
+                    .settings
+                    .list_mcp_servers()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::McpServers(
+                    servers
+                        .into_iter()
+                        .map(|s| api::McpServerView {
+                            name: s.name,
+                            command: s.command,
+                            args: s.args,
+                            namespace: s.namespace,
+                            enabled: s.enabled,
+                            status: s.status,
+                            tool_count: s.tool_count,
+                        })
+                        .collect(),
+                ))
+            }
+
+            api::Command::AddMcpServer {
+                name,
+                command,
+                args,
+                namespace,
+                enabled,
+            } => {
+                self.settings
+                    .add_mcp_server(name, command, args, namespace, enabled)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::RemoveMcpServer { name } => {
+                self.settings
+                    .remove_mcp_server(name)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::SetMcpServerEnabled { name, enabled } => {
+                self.settings
+                    .set_mcp_server_enabled(name, enabled)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::McpServerAction { action, server } => {
+                let servers = self
+                    .settings
+                    .mcp_server_action(action, server)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::McpServers(
+                    servers
+                        .into_iter()
+                        .map(|s| api::McpServerView {
+                            name: s.name,
+                            command: s.command,
+                            args: s.args,
+                            namespace: s.namespace,
+                            enabled: s.enabled,
+                            status: s.status,
+                            tool_count: s.tool_count,
+                        })
+                        .collect(),
+                ))
+            }
+
             // Streamed commands are handled elsewhere.
             api::Command::SendMessage { .. } => Err(ApiError::Unsupported),
         }
@@ -766,6 +841,21 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
+        async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+            Ok(vec![])
+        }
+        async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+            Ok(vec![])
+        }
     }
 
     #[derive(Clone)]
@@ -958,6 +1048,21 @@ mod tests {
             _dreaming_interval_secs: u64,
         ) -> Result<(), CoreError> {
             Ok(())
+        }
+        async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+            Ok(vec![])
+        }
+        async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+            Ok(vec![])
         }
     }
 

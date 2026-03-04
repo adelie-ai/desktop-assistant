@@ -105,6 +105,7 @@ async fn executor_with_real_mcp_server() {
         command: "fileio-mcp".into(),
         args: vec!["serve".into(), "--mode".into(), "stdio".into()],
         namespace: None,
+        enabled: true,
     }];
 
     let executor = McpToolExecutor::new(configs);

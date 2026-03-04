@@ -93,10 +93,8 @@ fn find_split_point(text: &str, max_pos: usize) -> usize {
     }
 
     // Try word boundary.
-    if let Some(pos) = region.rfind(' ') {
-        if pos > max_pos / 2 {
-            return pos;
-        }
+    if let Some(pos) = region.rfind(' ') && pos > max_pos / 2 {
+        return pos;
     }
 
     // Hard split at max_pos (or nearest char boundary).

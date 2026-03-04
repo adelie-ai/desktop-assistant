@@ -601,12 +601,8 @@ fn extract_json_array(text: &str) -> String {
     }
 
     // Try to find bare [ ... ] in the text
-    if let Some(start) = text.find('[') {
-        if let Some(end) = text.rfind(']') {
-            if end > start {
-                return text[start..=end].to_string();
-            }
-        }
+    if let Some(start) = text.find('[') && let Some(end) = text.rfind(']') && end > start {
+        return text[start..=end].to_string();
     }
 
     text.to_string()
@@ -642,14 +638,12 @@ async fn dedup_and_write_fact(
     .await
     .map_err(|e| format!("dreaming: dedup search failed: {e}"))?;
 
-    if let Some((distance,)) = closest_distance {
-        if distance < DEDUP_DISTANCE_THRESHOLD {
-            tracing::debug!(
-                "dreaming: skipping duplicate fact (distance={distance:.4}): {}",
-                &content[..content.len().min(80)]
-            );
-            return Ok(false);
-        }
+    if let Some((distance,)) = closest_distance && distance < DEDUP_DISTANCE_THRESHOLD {
+        tracing::debug!(
+            "dreaming: skipping duplicate fact (distance={distance:.4}): {}",
+            &content[..content.len().min(80)]
+        );
+        return Ok(false);
     }
 
     // Write the new fact with chunked embeddings
