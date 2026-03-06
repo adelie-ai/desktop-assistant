@@ -9,7 +9,7 @@ use aws_sdk_bedrockruntime::types::{
 use aws_smithy_types::{Document, Number};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
 use std::collections::BTreeMap;
 use tokio::sync::OnceCell;
 
@@ -344,6 +344,7 @@ fn apply_stream_event(
     text: &mut String,
     tool_acc: &mut ToolCallAccumulator,
     on_chunk: &mut ChunkCallback,
+    token_usage: &mut Option<TokenUsage>,
 ) -> bool {
     match event {
         aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStart(start) => {
@@ -373,6 +374,15 @@ fn apply_stream_event(
                     }
                     _ => {}
                 }
+            }
+        }
+        aws_sdk_bedrockruntime::types::ConverseStreamOutput::Metadata(meta) => {
+            if let Some(usage) = meta.usage() {
+                *token_usage = Some(TokenUsage {
+                    input_tokens: Some(usage.input_tokens() as u64),
+                    output_tokens: Some(usage.output_tokens() as u64),
+                    ..Default::default()
+                });
             }
         }
         _ => {}
@@ -449,24 +459,35 @@ impl LlmClient for BedrockClient {
 
         let mut text = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
+        let mut token_usage: Option<TokenUsage> = None;
 
         while let Some(event) = stream
             .recv()
             .await
             .map_err(|e| CoreError::Llm(format!("Bedrock stream receive failed: {e}")))?
         {
-            if !apply_stream_event(event, &mut text, &mut tool_acc, &mut on_chunk) {
+            if !apply_stream_event(
+                event,
+                &mut text,
+                &mut tool_acc,
+                &mut on_chunk,
+                &mut token_usage,
+            ) {
                 break;
             }
         }
 
         let tool_calls = tool_acc.into_tool_calls();
 
-        if tool_calls.is_empty() {
-            Ok(LlmResponse::text(text))
+        let mut response = if tool_calls.is_empty() {
+            LlmResponse::text(text)
         } else {
-            Ok(LlmResponse::with_tool_calls(text, tool_calls))
+            LlmResponse::with_tool_calls(text, tool_calls)
+        };
+        if let Some(usage) = token_usage {
+            response = response.with_usage(usage);
         }
+        Ok(response)
     }
 }
 
@@ -579,6 +600,7 @@ mod tests {
     fn stream_event_processing_handles_mixed_text_and_tool_calls() {
         let mut text = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
+        let mut token_usage: Option<TokenUsage> = None;
         let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let chunks_clone = Arc::clone(&chunks);
 
@@ -632,24 +654,28 @@ mod tests {
             &mut text,
             &mut tool_acc,
             &mut on_chunk,
+            &mut token_usage,
         ));
         assert!(apply_stream_event(
             ConverseStreamOutput::ContentBlockDelta(text_delta),
             &mut text,
             &mut tool_acc,
             &mut on_chunk,
+            &mut token_usage,
         ));
         assert!(apply_stream_event(
             ConverseStreamOutput::ContentBlockDelta(tool_delta_1),
             &mut text,
             &mut tool_acc,
             &mut on_chunk,
+            &mut token_usage,
         ));
         assert!(apply_stream_event(
             ConverseStreamOutput::ContentBlockDelta(tool_delta_2),
             &mut text,
             &mut tool_acc,
             &mut on_chunk,
+            &mut token_usage,
         ));
 
         assert_eq!(text, "Hello");
@@ -666,6 +692,7 @@ mod tests {
     fn stream_event_processing_stops_on_callback_abort() {
         let mut text = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
+        let mut token_usage: Option<TokenUsage> = None;
         let mut seen = 0usize;
 
         let mut on_chunk: ChunkCallback = Box::new(move |_chunk| {
@@ -689,12 +716,14 @@ mod tests {
             &mut text,
             &mut tool_acc,
             &mut on_chunk,
+            &mut token_usage,
         ));
         assert!(!apply_stream_event(
             ConverseStreamOutput::ContentBlockDelta(second),
             &mut text,
             &mut tool_acc,
             &mut on_chunk,
+            &mut token_usage,
         ));
         assert_eq!(text, "AB");
     }

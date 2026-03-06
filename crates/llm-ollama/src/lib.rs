@@ -1,6 +1,6 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -376,6 +376,10 @@ fn model_name_matches(configured: &str, candidate: &str) -> bool {
 struct ChatChunk {
     message: Option<ChunkMessage>,
     done: bool,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -414,15 +418,16 @@ impl LlmClient for OllamaClient {
 
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
 
-        let options = if self.temperature.is_some() || self.top_p.is_some() || self.max_tokens.is_some() {
-            Some(OllamaOptions {
-                temperature: self.temperature,
-                top_p: self.top_p,
-                num_predict: self.max_tokens,
-            })
-        } else {
-            None
-        };
+        let options =
+            if self.temperature.is_some() || self.top_p.is_some() || self.max_tokens.is_some() {
+                Some(OllamaOptions {
+                    temperature: self.temperature,
+                    top_p: self.top_p,
+                    num_predict: self.max_tokens,
+                })
+            } else {
+                None
+            };
 
         let request = ChatRequest {
             model: self.model.clone(),
@@ -432,8 +437,8 @@ impl LlmClient for OllamaClient {
             options,
         };
 
-        let request_json = serde_json::to_string(&request)
-            .unwrap_or_else(|_| "<serialization error>".into());
+        let request_json =
+            serde_json::to_string(&request).unwrap_or_else(|_| "<serialization error>".into());
         let request_bytes = request_json.len();
         let msg_count = request.messages.len();
         let tool_count = request.tools.len();
@@ -475,6 +480,7 @@ impl LlmClient for OllamaClient {
         let mut stream = response.bytes_stream();
         let mut full_response = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut token_usage: Option<TokenUsage> = None;
         let mut buffer = String::new();
 
         while let Some(chunk) = stream.next().await {
@@ -499,7 +505,11 @@ impl LlmClient for OllamaClient {
                                 full_response.push_str(content);
                                 if !on_chunk(content.clone()) {
                                     tracing::debug!("streaming aborted by callback");
-                                    return Ok(build_response(full_response, tool_calls));
+                                    return Ok(build_response(
+                                        full_response,
+                                        tool_calls,
+                                        token_usage,
+                                    ));
                                 }
                             }
 
@@ -518,7 +528,14 @@ impl LlmClient for OllamaClient {
                         }
 
                         if chunk.done {
-                            return Ok(build_response(full_response, tool_calls));
+                            if chunk.prompt_eval_count.is_some() || chunk.eval_count.is_some() {
+                                token_usage = Some(TokenUsage {
+                                    input_tokens: chunk.prompt_eval_count,
+                                    output_tokens: chunk.eval_count,
+                                    ..Default::default()
+                                });
+                            }
+                            return Ok(build_response(full_response, tool_calls, token_usage));
                         }
                     }
                     Err(e) => {
@@ -532,34 +549,51 @@ impl LlmClient for OllamaClient {
         let remaining = buffer.trim().to_string();
         if !remaining.is_empty()
             && let Ok(chunk) = serde_json::from_str::<ChatChunk>(&remaining)
-            && let Some(message) = &chunk.message
         {
-            if let Some(content) = &message.content
-                && !content.is_empty()
-            {
-                full_response.push_str(content);
-                let _ = on_chunk(content.clone());
+            if let Some(message) = &chunk.message {
+                if let Some(content) = &message.content
+                    && !content.is_empty()
+                {
+                    full_response.push_str(content);
+                    let _ = on_chunk(content.clone());
+                }
+
+                if let Some(tcs) = &message.tool_calls {
+                    for (i, tc) in tcs.iter().enumerate() {
+                        let id = format!("ollama_call_{}", tool_calls.len() + i);
+                        let arguments = serde_json::to_string(&tc.function.arguments)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        tool_calls.push(ToolCall::new(id, tc.function.name.clone(), arguments));
+                    }
+                }
             }
 
-            if let Some(tcs) = &message.tool_calls {
-                for (i, tc) in tcs.iter().enumerate() {
-                    let id = format!("ollama_call_{}", tool_calls.len() + i);
-                    let arguments = serde_json::to_string(&tc.function.arguments)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    tool_calls.push(ToolCall::new(id, tc.function.name.clone(), arguments));
-                }
+            if chunk.done && (chunk.prompt_eval_count.is_some() || chunk.eval_count.is_some()) {
+                token_usage = Some(TokenUsage {
+                    input_tokens: chunk.prompt_eval_count,
+                    output_tokens: chunk.eval_count,
+                    ..Default::default()
+                });
             }
         }
 
-        Ok(build_response(full_response, tool_calls))
+        Ok(build_response(full_response, tool_calls, token_usage))
     }
 }
 
-fn build_response(text: String, tool_calls: Vec<ToolCall>) -> LlmResponse {
-    if tool_calls.is_empty() {
+fn build_response(
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    usage: Option<TokenUsage>,
+) -> LlmResponse {
+    let response = if tool_calls.is_empty() {
         LlmResponse::text(text)
     } else {
         LlmResponse::with_tool_calls(text, tool_calls)
+    };
+    match usage {
+        Some(u) => response.with_usage(u),
+        None => response,
     }
 }
 
@@ -707,17 +741,27 @@ mod tests {
 
     #[test]
     fn build_response_text_only() {
-        let resp = build_response("hello".into(), vec![]);
+        let resp = build_response("hello".into(), vec![], None);
         assert_eq!(resp.text, "hello");
         assert!(!resp.has_tool_calls());
+        assert!(resp.usage.is_none());
     }
 
     #[test]
     fn build_response_with_tool_calls() {
         let calls = vec![ToolCall::new("c1", "test", "{}")];
-        let resp = build_response("".into(), calls);
+        let resp = build_response("".into(), calls, None);
         assert!(resp.has_tool_calls());
         assert_eq!(resp.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_done_chunk_with_eval_counts() {
+        let data = r#"{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":42,"eval_count":17}"#;
+        let chunk: ChatChunk = serde_json::from_str(data).unwrap();
+        assert!(chunk.done);
+        assert_eq!(chunk.prompt_eval_count, Some(42));
+        assert_eq!(chunk.eval_count, Some(17));
     }
 
     #[test]

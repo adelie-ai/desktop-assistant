@@ -1,11 +1,22 @@
 use std::sync::{Arc, Mutex};
 
 use crate::CoreError;
-use crate::domain::{Message, ToolCall, ToolDefinition};
+use crate::domain::{Message, ToolCall, ToolDefinition, ToolNamespace};
 
 /// Callback invoked for each chunk of a streaming LLM response.
 /// Return `true` to continue, `false` to abort the stream.
 pub type ChunkCallback = Box<dyn FnMut(String) -> bool + Send>;
+
+/// Token usage statistics from an LLM call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+}
 
 /// Response from the LLM, which may contain text, tool calls, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +25,8 @@ pub struct LlmResponse {
     pub text: String,
     /// Tool calls requested by the LLM (empty if text-only response).
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage statistics, if provided by the connector.
+    pub usage: Option<TokenUsage>,
 }
 
 impl LlmResponse {
@@ -22,6 +35,7 @@ impl LlmResponse {
         Self {
             text: text.into(),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
 
@@ -30,7 +44,14 @@ impl LlmResponse {
         Self {
             text: text.into(),
             tool_calls,
+            usage: None,
         }
+    }
+
+    /// Attach token usage statistics.
+    pub fn with_usage(mut self, usage: TokenUsage) -> Self {
+        self.usage = Some(usage);
+        self
     }
 
     /// Whether this response requests tool calls.
@@ -61,6 +82,33 @@ pub trait LlmClient: Send + Sync {
         tools: &[ToolDefinition],
         on_chunk: ChunkCallback,
     ) -> impl std::future::Future<Output = Result<LlmResponse, CoreError>> + Send;
+
+    /// Whether this connector supports server-side hosted tool search
+    /// (e.g. OpenAI namespaces with deferred loading).
+    fn supports_hosted_tool_search(&self) -> bool {
+        false
+    }
+
+    /// Stream a completion with namespaced tool definitions.
+    ///
+    /// Connectors that support hosted tool search (e.g. OpenAI) serialize
+    /// namespaces with `defer_loading: true` and append a `tool_search` entry.
+    /// The default implementation flattens everything into `stream_completion`.
+    fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        on_chunk: ChunkCallback,
+    ) -> impl std::future::Future<Output = Result<LlmResponse, CoreError>> + Send {
+        async move {
+            let mut all: Vec<ToolDefinition> = core_tools.to_vec();
+            for ns in namespaces {
+                all.extend(ns.tools.iter().cloned());
+            }
+            self.stream_completion(messages, &all, on_chunk).await
+        }
+    }
 }
 
 /// Check whether a `CoreError` represents a retryable API error (429/529/rate-limit/overloaded).
@@ -121,6 +169,53 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
 
             let msgs = messages.clone();
             match self.inner.stream_completion(msgs, tools, proxy_cb).await {
+                Ok(response) => return Ok(response),
+                Err(e) if attempt < self.max_retries && is_retryable_error(&e) => {
+                    let delay_secs = 1u64 << attempt;
+                    tracing::warn!(
+                        "retryable LLM error, retrying in {delay_secs}s (attempt {}/{}): {e}",
+                        attempt + 1,
+                        self.max_retries
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        unreachable!("loop always returns")
+    }
+
+    fn supports_hosted_tool_search(&self) -> bool {
+        self.inner.supports_hosted_tool_search()
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let shared_cb: Arc<Mutex<Option<ChunkCallback>>> = Arc::new(Mutex::new(Some(on_chunk)));
+
+        for attempt in 0..=self.max_retries {
+            let cb_ref = Arc::clone(&shared_cb);
+            let proxy_cb: ChunkCallback = Box::new(move |chunk: String| -> bool {
+                let mut guard = cb_ref.lock().unwrap();
+                if let Some(ref mut cb) = *guard {
+                    cb(chunk)
+                } else {
+                    false
+                }
+            });
+
+            let msgs = messages.clone();
+            match self
+                .inner
+                .stream_completion_with_namespaces(msgs, core_tools, namespaces, proxy_cb)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(e) if attempt < self.max_retries && is_retryable_error(&e) => {
                     let delay_secs = 1u64 << attempt;
@@ -367,6 +462,39 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid API key"));
+    }
+
+    #[test]
+    fn llm_response_usage_defaults_to_none() {
+        let resp = LlmResponse::text("hello");
+        assert!(resp.usage.is_none());
+    }
+
+    #[test]
+    fn llm_response_with_usage() {
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cache_creation_input_tokens: Some(10),
+            cache_read_input_tokens: Some(20),
+        };
+        let resp = LlmResponse::text("hello").with_usage(usage.clone());
+        assert_eq!(resp.usage, Some(usage));
+    }
+
+    #[test]
+    fn token_usage_serde_round_trip() {
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(20),
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let parsed: TokenUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(usage, parsed);
+        // cache_creation_input_tokens is None so should be skipped
+        assert!(!json.contains("cache_creation_input_tokens"));
     }
 
     #[tokio::test]
