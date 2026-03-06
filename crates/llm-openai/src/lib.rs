@@ -554,13 +554,18 @@ impl OpenAiClient {
                         break;
                     }
                     other => {
-                        tracing::trace!("ignoring SSE event: {:?}", other);
+                        tracing::debug!("ignoring SSE event: {:?}", other);
                     }
                 }
             }
         }
 
         let tool_calls = tool_acc.into_tool_calls();
+        tracing::debug!(
+            text_len = full_response.len(),
+            tool_call_count = tool_calls.len(),
+            "OpenAI response parsed"
+        );
         let mut resp = if tool_calls.is_empty() {
             LlmResponse::text(full_response)
         } else {

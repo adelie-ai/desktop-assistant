@@ -856,7 +856,21 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
             if !response.has_tool_calls() {
                 // Text-only response — we're done
-                let visible_text = sanitize_assistant_text(&response.text);
+                let mut visible_text = sanitize_assistant_text(&response.text);
+                if visible_text.is_empty() {
+                    tracing::warn!(
+                        raw_len = response.text.len(),
+                        raw_first_100 = %response.text.chars().take(100).collect::<String>(),
+                        round,
+                        "LLM returned empty visible text after sanitization"
+                    );
+                    if round > 0 {
+                        visible_text =
+                            "I wasn't able to complete this request — the tools I tried \
+                             returned errors. Please check the conversation log or try again."
+                                .to_string();
+                    }
+                }
                 conv.messages
                     .push(Message::new(Role::Assistant, &visible_text));
                 // On the first message, generate a descriptive title via the LLM
