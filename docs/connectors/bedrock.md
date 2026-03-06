@@ -50,9 +50,35 @@ This was rejected because:
 - The maintenance burden would outweigh the caching savings
 - Users who want Anthropic caching can use the direct Anthropic connector instead
 
-### Future considerations
+## Hosted Tool Search
 
-If AWS adds cache control support to the Converse API, we should adopt it.  The
-same dynamic tool list constraints documented in `anthropic.md` would apply —
-system prompt caching would be the safe choice; tool list caching would depend on
-how Bedrock handles prefix invalidation.
+### Current status: not supported
+
+The Converse API does not support hosted tool search.  Both Anthropic and OpenAI
+offer server-side tool search (deferred loading + model-driven discovery), but
+the Converse API's `ToolConfiguration` type has no `defer_loading` field or tool
+search sentinel equivalent.
+
+Anthropic's tool search *is* available on Bedrock through the raw `InvokeModel`
+API (same native JSON format as the direct Anthropic API), but using it has the
+same trade-offs as prompt caching — see above.
+
+### Future options
+
+1. **AWS adds tool search to Converse API** — adopt it directly, no refactoring
+   needed.
+
+2. **Separate Bedrock Invoke connector** — rather than duplicating serialization
+   logic, refactor the existing Anthropic (or OpenAI) connector so its request
+   serialization is reusable, then create a thin Bedrock Invoke adapter that
+   takes the serialized request and sends it via `invoke_model_with_response_stream`
+   instead of the provider's HTTP endpoint.  This would unlock both prompt caching
+   and tool search on Bedrock without code duplication.  The Converse-based
+   connector would remain for non-Anthropic models.
+
+## Future considerations
+
+If AWS adds cache control or tool search support to the Converse API, we should
+adopt it.  The same dynamic tool list constraints documented in `anthropic.md`
+would apply — system prompt caching would be the safe choice; tool list caching
+would depend on how Bedrock handles prefix invalidation.

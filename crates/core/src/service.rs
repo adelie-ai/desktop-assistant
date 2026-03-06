@@ -1,7 +1,7 @@
 use crate::CoreError;
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, MessageSummary, Role,
-    ToolDefinition,
+    ToolDefinition, ToolNamespace,
 };
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{ChunkCallback, LlmClient};
@@ -68,16 +68,12 @@ fn llm_messages_for_turn(
     let is_windowed = start > 0;
 
     // Build a map from start_ordinal -> summary for active summaries in the window.
-    let summary_map: std::collections::HashMap<usize, &MessageSummary> = summaries
-        .iter()
-        .map(|s| (s.start_ordinal, s))
-        .collect();
+    let summary_map: std::collections::HashMap<usize, &MessageSummary> =
+        summaries.iter().map(|s| (s.start_ordinal, s)).collect();
 
     // Track which summary IDs are active so we know to skip their messages.
-    let active_summary_ids: std::collections::HashSet<&str> = summaries
-        .iter()
-        .map(|s| s.id.as_str())
-        .collect();
+    let active_summary_ids: std::collections::HashSet<&str> =
+        summaries.iter().map(|s| s.id.as_str()).collect();
 
     let mut messages = Vec::with_capacity(windowed.len() + 2);
     messages.push(Message::new(
@@ -94,22 +90,24 @@ fn llm_messages_for_turn(
     }
 
     // Track which summaries have already been injected.
-    let mut injected_summaries: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
+    let mut injected_summaries: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for (i, msg) in windowed.iter().enumerate() {
         let ordinal = start + i;
 
-        if let Some(sid) = &msg.summary_id && active_summary_ids.contains(sid.as_str()) {
+        if let Some(sid) = &msg.summary_id
+            && active_summary_ids.contains(sid.as_str())
+        {
             // This message is collapsed. Inject the summary at the first
             // collapsed message we encounter for this summary.
             if !injected_summaries.contains(sid.as_str()) {
                 injected_summaries.insert(sid);
                 // Look up by ordinal first, then fall back to finding by ID
                 // (the window may not start at the summary's start_ordinal).
-                let found = summary_map.get(&ordinal).copied().or_else(|| {
-                    summaries.iter().find(|s| s.id == *sid)
-                });
+                let found = summary_map
+                    .get(&ordinal)
+                    .copied()
+                    .or_else(|| summaries.iter().find(|s| s.id == *sid));
                 if let Some(s) = found {
                     messages.push(Message::new(
                         Role::System,
@@ -368,7 +366,7 @@ fn compaction_range(conv: &Conversation) -> Option<(usize, usize)> {
     }
     // Subsequent compactions: require COMPACTION_INTERVAL new messages.
     if start >= conv.compacted_through + COMPACTION_INTERVAL {
-        return Some((conv.compacted_through, start))
+        return Some((conv.compacted_through, start));
     }
     None
 }
@@ -428,7 +426,10 @@ async fn generate_context_summary<L: LlmClient>(
         Message::new(Role::User, prompt),
     ];
 
-    match llm.stream_completion(llm_messages, &[], Box::new(|_| true)).await {
+    match llm
+        .stream_completion(llm_messages, &[], Box::new(|_| true))
+        .await
+    {
         Ok(response) if !response.text.trim().is_empty() => response.text.trim().to_string(),
         Ok(_) => {
             tracing::warn!("context summary generation returned empty");
@@ -439,6 +440,118 @@ async fn generate_context_summary<L: LlmClient>(
             existing_summary.to_string()
         }
     }
+}
+
+/// Use the LLM to semantically categorize tools into descriptive namespaces.
+///
+/// Takes the raw tool namespaces (typically grouped by MCP server) and asks
+/// the LLM to reorganize them into ≤10-tool categories with descriptive names.
+/// Falls back to the original namespaces on failure.
+async fn categorize_tool_namespaces<L: LlmClient>(
+    namespaces: Vec<ToolNamespace>,
+    llm: &L,
+) -> Vec<ToolNamespace> {
+    // Collect all tools across namespaces. If there are very few, skip categorization.
+    let all_tools: Vec<&ToolDefinition> = namespaces.iter().flat_map(|ns| &ns.tools).collect();
+    if all_tools.len() <= 10 {
+        return namespaces;
+    }
+
+    // Build a tool manifest for the LLM
+    let tool_list: String = all_tools
+        .iter()
+        .map(|t| format!("- {} : {}", t.name, t.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let messages = vec![
+        Message::new(
+            Role::System,
+            "You organize tools into semantic categories for an AI assistant's tool search system. \
+             Each category should have at most 10 tools. Give each category a short snake_case name \
+             and a one-sentence description that helps the AI find the right tools.\n\n\
+             Respond with ONLY valid JSON: an array of objects with \"name\" (snake_case), \
+             \"description\" (string), and \"tools\" (array of tool name strings).\n\
+             Every tool must appear in exactly one category. Do not add or remove tools.",
+        ),
+        Message::new(
+            Role::User,
+            format!("Organize these tools into categories (max 10 tools each):\n\n{tool_list}"),
+        ),
+    ];
+
+    let response = match llm
+        .stream_completion(messages, &[], Box::new(|_| true))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("tool namespace categorization failed: {e}");
+            return namespaces;
+        }
+    };
+
+    // Parse the LLM's JSON response
+    let text = response.text.trim();
+    // Strip markdown code fences if present
+    let json_str = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .unwrap_or(text)
+        .trim();
+
+    let categories: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("failed to parse tool categorization response: {e}");
+            return namespaces;
+        }
+    };
+
+    // Build a lookup from tool name to tool definition
+    let tool_map: std::collections::HashMap<&str, &ToolDefinition> =
+        all_tools.iter().map(|t| (t.name.as_str(), *t)).collect();
+
+    let mut result = Vec::new();
+    for cat in &categories {
+        let Some(name) = cat.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(description) = cat.get("description").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(tool_names) = cat.get("tools").and_then(|v| v.as_array()) else {
+            continue;
+        };
+
+        let tools: Vec<ToolDefinition> = tool_names
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|name| tool_map.get(name).map(|t| (*t).clone()))
+            .collect();
+
+        if !tools.is_empty() {
+            result.push(ToolNamespace::new(name, description, tools));
+        }
+    }
+
+    // Sanity check: if the LLM dropped tools, fall back to original
+    let result_tool_count: usize = result.iter().map(|ns| ns.tools.len()).sum();
+    if result_tool_count < all_tools.len() {
+        tracing::warn!(
+            "LLM categorization lost tools ({result_tool_count} vs {}), using original namespaces",
+            all_tools.len()
+        );
+        return namespaces;
+    }
+
+    tracing::info!(
+        "LLM categorized {} tools into {} namespaces",
+        result_tool_count,
+        result.len()
+    );
+    result
 }
 
 /// A no-op tool executor for use when no MCP servers are configured.
@@ -617,16 +730,46 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         }
 
         // Dynamic tool discovery: start with core tools, activate more via tool_search.
+        let use_hosted_search = self.llm.supports_hosted_tool_search();
+        let namespaces: Vec<ToolNamespace> = if use_hosted_search {
+            let raw_namespaces = self.tools.tool_namespaces().await;
+            if raw_namespaces.is_empty() {
+                vec![]
+            } else {
+                categorize_tool_namespaces(raw_namespaces, self.task_llm()).await
+            }
+        } else {
+            vec![]
+        };
+
         let core_tools = self.tools.core_tools().await;
+        // When hosted search is active and we have namespaces, remove
+        // builtin_tool_search from core tools — the provider handles discovery.
+        let core_tools_for_llm: Vec<ToolDefinition> = if use_hosted_search && !namespaces.is_empty()
+        {
+            core_tools
+                .iter()
+                .filter(|t| t.name != "builtin_tool_search")
+                .cloned()
+                .collect()
+        } else {
+            core_tools.clone()
+        };
+
         let mut activated_tools: std::collections::HashMap<String, ToolDefinition> =
             std::collections::HashMap::new();
 
         for round in 0..MAX_TOOL_ROUNDS {
             // Build the tool set: core + dynamically activated
-            let mut tool_defs: Vec<ToolDefinition> = core_tools.clone();
+            let mut tool_defs: Vec<ToolDefinition> = core_tools_for_llm.clone();
             tool_defs.extend(activated_tools.values().cloned());
 
-            let llm_messages = llm_messages_for_turn(&conv.messages, &conv.summaries, &tool_defs, &conv.context_summary);
+            let llm_messages = llm_messages_for_turn(
+                &conv.messages,
+                &conv.summaries,
+                &tool_defs,
+                &conv.context_summary,
+            );
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
             let mut visible_chunk_callback = on_chunk;
@@ -653,13 +796,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 }
             });
 
-            let response = match self
-                .llm
-                .stream_completion(llm_messages, &tool_defs, filtered_chunk_callback)
-                .await
-            {
+            let response = match if use_hosted_search && !namespaces.is_empty() {
+                self.llm
+                    .stream_completion_with_namespaces(
+                        llm_messages,
+                        &tool_defs,
+                        &namespaces,
+                        filtered_chunk_callback,
+                    )
+                    .await
+            } else {
+                self.llm
+                    .stream_completion(llm_messages, &tool_defs, filtered_chunk_callback)
+                    .await
+            } {
                 Ok(r) => r,
-                Err(e) if round > 0 && !is_retryable_error(&e) && !user_visible_llm_error_message(&e).contains("rate limit was exceeded") => {
+                Err(e)
+                    if round > 0
+                        && !is_retryable_error(&e)
+                        && !user_visible_llm_error_message(&e)
+                            .contains("rate limit was exceeded") =>
+                {
                     // Mid-loop LLM error (e.g. context too long) — trim old
                     // tool call/result pairs and tell the LLM what happened
                     // so it can adjust its approach.
@@ -741,7 +898,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
                 // Dynamic activation: if tool_search returned results,
                 // activate the discovered tools for subsequent rounds.
-                if tool_call.name == "builtin_tool_search"
+                // Skip when hosted search is active — the provider handles discovery.
+                if !use_hosted_search
+                    && tool_call.name == "builtin_tool_search"
                     && let Ok(found) = serde_json::from_str::<serde_json::Value>(&result)
                     && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
                 {
@@ -1195,10 +1354,7 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn tool_definition(
-            &self,
-            name: &str,
-        ) -> Result<Option<ToolDefinition>, CoreError> {
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
             Ok(self.tools.iter().find(|t| t.name == name).cloned())
         }
 
@@ -1605,9 +1761,7 @@ mod tests {
 
     #[test]
     fn user_visible_error_for_overloaded_529() {
-        let err = CoreError::Llm(
-            "Anthropic API error (HTTP 529): overloaded".to_string(),
-        );
+        let err = CoreError::Llm("Anthropic API error (HTTP 529): overloaded".to_string());
         let msg = user_visible_llm_error_message(&err);
         assert!(msg.contains("rate limit was exceeded"));
     }
@@ -1659,7 +1813,10 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.role == Role::System && m.content.contains("context became too long"));
-        assert!(!has_trim_msg, "rate limit error should not trigger context trimming");
+        assert!(
+            !has_trim_msg,
+            "rate limit error should not trigger context trimming"
+        );
     }
 
     #[tokio::test]
@@ -1730,17 +1887,19 @@ mod tests {
             "You are Adele, a desktop assistant named in reference to the Adélie penguin"
         ));
         assert!(messages[0].content.contains("Your name is Adele"));
-        assert!(messages[0].content.contains("Follow these rules in priority order"));
+        assert!(
+            messages[0]
+                .content
+                .contains("Follow these rules in priority order")
+        );
         assert!(
             messages[0]
                 .content
                 .contains("Current-turn user instructions override all stored data")
         );
-        assert!(
-            messages[0]
-                .content
-                .contains("search the knowledge base first (project scope, then global) before using other tools")
-        );
+        assert!(messages[0].content.contains(
+            "search the knowledge base first (project scope, then global) before using other tools"
+        ));
         assert!(
             messages[0]
                 .content
@@ -1770,11 +1929,7 @@ mod tests {
                 .contains("builtin_knowledge_base_write/search/delete")
         );
         assert!(messages[0].content.contains("builtin_sys_props"));
-        assert!(
-            messages[0]
-                .content
-                .contains("builtin_tool_search")
-        );
+        assert!(messages[0].content.contains("builtin_tool_search"));
         assert!(messages[0].content.contains("Never fabricate tool outputs"));
     }
 
@@ -2072,9 +2227,7 @@ mod tests {
         }
         // Now append a tool-call group at the end: assistant(tool_calls) + tool result + user
         msgs.push(Message::assistant_with_tool_calls(vec![ToolCall::new(
-            "c1",
-            "tool_a",
-            "{}",
+            "c1", "tool_a", "{}",
         )]));
         msgs.push(Message::tool_result("c1", "result"));
         msgs.push(Message::new(Role::User, "final-user"));
@@ -2113,7 +2266,11 @@ mod tests {
         // The tentative index lands inside the tool groups.  If it happens to
         // land on a tool_result, the old code would start there (orphaned).
         let start = window_start(&msgs);
-        assert_ne!(msgs[start].role, Role::Tool, "window must not start on a Tool message");
+        assert_ne!(
+            msgs[start].role,
+            Role::Tool,
+            "window must not start on a Tool message"
+        );
     }
 
     // --- Compaction tests ---
@@ -2122,7 +2279,8 @@ mod tests {
     fn compaction_range_returns_none_under_limit() {
         let mut conv = Conversation::new("c1", "Test");
         for i in 0..10 {
-            conv.messages.push(Message::new(Role::User, format!("msg-{i}")));
+            conv.messages
+                .push(Message::new(Role::User, format!("msg-{i}")));
         }
         assert!(compaction_range(&conv).is_none());
     }
@@ -2133,9 +2291,11 @@ mod tests {
         let count = MAX_CONTEXT_MESSAGES + 10;
         for i in 0..count {
             if i % 2 == 0 {
-                conv.messages.push(Message::new(Role::User, format!("user-{i}")));
+                conv.messages
+                    .push(Message::new(Role::User, format!("user-{i}")));
             } else {
-                conv.messages.push(Message::new(Role::Assistant, format!("asst-{i}")));
+                conv.messages
+                    .push(Message::new(Role::Assistant, format!("asst-{i}")));
             }
         }
         let range = compaction_range(&conv);
@@ -2152,9 +2312,11 @@ mod tests {
         let count = MAX_CONTEXT_MESSAGES + 10;
         for i in 0..count {
             if i % 2 == 0 {
-                conv.messages.push(Message::new(Role::User, format!("user-{i}")));
+                conv.messages
+                    .push(Message::new(Role::User, format!("user-{i}")));
             } else {
-                conv.messages.push(Message::new(Role::Assistant, format!("asst-{i}")));
+                conv.messages
+                    .push(Message::new(Role::Assistant, format!("asst-{i}")));
             }
         }
         // Simulate first compaction already done
@@ -2166,8 +2328,10 @@ mod tests {
 
         // Add COMPACTION_INTERVAL more messages so window slides
         for i in 0..COMPACTION_INTERVAL {
-            conv.messages.push(Message::new(Role::User, format!("extra-user-{i}")));
-            conv.messages.push(Message::new(Role::Assistant, format!("extra-asst-{i}")));
+            conv.messages
+                .push(Message::new(Role::User, format!("extra-user-{i}")));
+            conv.messages
+                .push(Message::new(Role::Assistant, format!("extra-asst-{i}")));
         }
         let range = compaction_range(&conv);
         assert!(range.is_some());
@@ -2196,7 +2360,11 @@ mod tests {
         assert!(result[0].content.contains("Adele"));
 
         assert_eq!(result[1].role, Role::System);
-        assert!(result[1].content.contains("[Summary of earlier conversation]"));
+        assert!(
+            result[1]
+                .content
+                .contains("[Summary of earlier conversation]")
+        );
         assert!(result[1].content.contains("User prefers dark mode"));
 
         assert_eq!(result[2].role, Role::User);
@@ -2219,7 +2387,11 @@ mod tests {
         // No summary injected when under limit
         assert_eq!(result[0].role, Role::System);
         assert_eq!(result[1].role, Role::User);
-        assert!(!result[0].content.contains("Summary of earlier conversation"));
+        assert!(
+            !result[0]
+                .content
+                .contains("Summary of earlier conversation")
+        );
     }
 
     #[test]

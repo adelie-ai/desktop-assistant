@@ -1,6 +1,6 @@
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
@@ -169,6 +169,59 @@ impl From<&ToolDefinition> for AnthropicTool {
     }
 }
 
+/// A tool with `defer_loading: true` for Anthropic's hosted tool search.
+#[derive(Serialize)]
+struct AnthropicDeferredTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+    defer_loading: bool,
+}
+
+impl AnthropicDeferredTool {
+    fn from_definition(def: &ToolDefinition) -> Self {
+        Self {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            input_schema: def.parameters.clone(),
+            defer_loading: true,
+        }
+    }
+}
+
+/// The Anthropic tool search sentinel tool.
+#[derive(Serialize)]
+struct AnthropicToolSearchTool {
+    r#type: String,
+    name: String,
+}
+
+/// Untagged enum for the tools array with hosted tool search.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AnthropicToolEntry {
+    Regular(AnthropicTool),
+    Deferred(AnthropicDeferredTool),
+    ToolSearch(AnthropicToolSearchTool),
+}
+
+/// Request variant using `AnthropicToolEntry` for tool search support.
+#[derive(Serialize)]
+struct MessagesRequestWithToolSearch {
+    model: String,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    system: Vec<SystemBlock>,
+    messages: Vec<AnthropicMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<AnthropicToolEntry>,
+}
+
 /// Convert domain messages into Anthropic API messages, extracting the system prompt.
 ///
 /// The system prompt is returned as a `Vec<SystemBlock>` with an ephemeral cache
@@ -244,6 +297,18 @@ fn convert_messages(messages: &[Message]) -> (Vec<SystemBlock>, Vec<AnthropicMes
 
 // --- SSE response types ---
 
+#[derive(Deserialize, Debug, Default)]
+struct SseUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
 #[derive(Deserialize, Debug)]
 struct SseEvent {
     #[serde(rename = "type")]
@@ -252,6 +317,8 @@ struct SseEvent {
     content_block: Option<SseContentBlock>,
     #[serde(default, deserialize_with = "deserialize_optional_delta")]
     delta: Option<SseDelta>,
+    #[serde(default)]
+    usage: Option<SseUsage>,
 }
 
 /// Deserialize `delta` permissively: returns `None` when the object shape
@@ -326,47 +393,18 @@ impl ToolCallAccumulator {
     }
 }
 
-impl LlmClient for AnthropicClient {
-    fn get_default_model(&self) -> Option<&str> {
-        Self::get_default_model()
-    }
-
-    fn get_default_base_url(&self) -> Option<&str> {
-        Self::get_default_base_url()
-    }
-
-    async fn stream_completion(
+impl AnthropicClient {
+    /// Send a request and parse the SSE stream into an LlmResponse.
+    async fn send_and_stream(
         &self,
-        messages: Vec<Message>,
-        tools: &[ToolDefinition],
+        request_json: &str,
+        request_body: &impl Serialize,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let api_tools: Vec<AnthropicTool> = tools.iter().map(AnthropicTool::from).collect();
-        let (system, api_messages) = convert_messages(&messages);
-
-        let request = MessagesRequest {
-            model: self.model.clone(),
-            max_tokens: self.max_tokens,
-            temperature: self.temperature,
-            top_p: self.top_p,
-            system,
-            messages: api_messages,
-            stream: true,
-            tools: api_tools,
-        };
-
-        let request_json =
-            serde_json::to_string(&request).unwrap_or_else(|_| "<serialization error>".into());
         let request_bytes = request_json.len();
-        let msg_count = request.messages.len();
-        let tool_count = request.tools.len();
-        let system_chars: usize = request.system.first().map_or(0, |block| block.text.len());
         tracing::info!(
             request_bytes,
-            msg_count,
-            tool_count,
-            system_chars,
-            model = %request.model,
+            model = %self.model,
             "LLM request payload"
         );
         tracing::debug!(
@@ -381,7 +419,7 @@ impl LlmClient for AnthropicClient {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&request)
+            .json(request_body)
             .send()
             .await
             .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
@@ -406,10 +444,8 @@ impl LlmClient for AnthropicClient {
 
         let mut full_response = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
-        // Track the current content block index for mapping tool_use blocks
-        // to accumulator indices (only counting tool_use blocks).
+        let mut accumulated_usage = SseUsage::default();
         let mut tool_block_count: usize = 0;
-        // Map from SSE content block index to tool accumulator index.
         let mut block_to_tool: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
 
@@ -467,8 +503,13 @@ impl LlmClient for AnthropicClient {
                         "message_stop" => {
                             break;
                         }
+                        "message_start" | "message_delta" => {
+                            if let Some(u) = &event.usage {
+                                accumulate_usage(&mut accumulated_usage, u);
+                            }
+                        }
                         _ => {
-                            // message_start, content_block_stop, message_delta, ping — ignore
+                            // content_block_stop, ping — ignore
                         }
                     },
                     Err(e) => {
@@ -479,11 +520,135 @@ impl LlmClient for AnthropicClient {
         }
 
         let tool_calls = tool_acc.into_tool_calls();
-        if tool_calls.is_empty() {
-            Ok(LlmResponse::text(full_response))
+        let usage = to_token_usage(&accumulated_usage);
+        let resp = if tool_calls.is_empty() {
+            LlmResponse::text(full_response)
         } else {
-            Ok(LlmResponse::with_tool_calls(full_response, tool_calls))
+            LlmResponse::with_tool_calls(full_response, tool_calls)
+        };
+        Ok(resp.with_usage(usage))
+    }
+}
+
+impl LlmClient for AnthropicClient {
+    fn get_default_model(&self) -> Option<&str> {
+        Self::get_default_model()
+    }
+
+    fn get_default_base_url(&self) -> Option<&str> {
+        Self::get_default_base_url()
+    }
+
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let api_tools: Vec<AnthropicTool> = tools.iter().map(AnthropicTool::from).collect();
+        let (system, api_messages) = convert_messages(&messages);
+
+        let request = MessagesRequest {
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            system,
+            messages: api_messages,
+            stream: true,
+            tools: api_tools,
+        };
+
+        let request_json =
+            serde_json::to_string(&request).unwrap_or_else(|_| "<serialization error>".into());
+
+        self.send_and_stream(&request_json, &request, on_chunk)
+            .await
+    }
+
+    fn supports_hosted_tool_search(&self) -> bool {
+        true
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let (system, api_messages) = convert_messages(&messages);
+
+        // Core tools are sent as regular (non-deferred) tools
+        let mut tool_entries: Vec<AnthropicToolEntry> = core_tools
+            .iter()
+            .map(|t| AnthropicToolEntry::Regular(AnthropicTool::from(t)))
+            .collect();
+
+        // Namespace tools are sent as deferred
+        for ns in namespaces {
+            for tool in &ns.tools {
+                tool_entries.push(AnthropicToolEntry::Deferred(
+                    AnthropicDeferredTool::from_definition(tool),
+                ));
+            }
         }
+
+        // Add the tool search sentinel
+        tool_entries.push(AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
+            r#type: "tool_search_tool_regex_20251119".to_string(),
+            name: "tool_search_tool_regex".to_string(),
+        }));
+
+        let request = MessagesRequestWithToolSearch {
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            system,
+            messages: api_messages,
+            stream: true,
+            tools: tool_entries,
+        };
+
+        let request_json =
+            serde_json::to_string(&request).unwrap_or_else(|_| "<serialization error>".into());
+
+        tracing::info!(
+            namespace_count = namespaces.len(),
+            core_tool_count = core_tools.len(),
+            "using Anthropic hosted tool search with deferred tools"
+        );
+
+        self.send_and_stream(&request_json, &request, on_chunk)
+            .await
+    }
+}
+
+fn accumulate_usage(acc: &mut SseUsage, new: &SseUsage) {
+    fn add(a: &mut Option<u64>, b: Option<u64>) {
+        if let Some(v) = b {
+            *a = Some(a.unwrap_or(0) + v);
+        }
+    }
+    add(&mut acc.input_tokens, new.input_tokens);
+    add(&mut acc.output_tokens, new.output_tokens);
+    add(
+        &mut acc.cache_creation_input_tokens,
+        new.cache_creation_input_tokens,
+    );
+    add(
+        &mut acc.cache_read_input_tokens,
+        new.cache_read_input_tokens,
+    );
+}
+
+fn to_token_usage(sse: &SseUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: sse.input_tokens,
+        output_tokens: sse.output_tokens,
+        cache_creation_input_tokens: sse.cache_creation_input_tokens,
+        cache_read_input_tokens: sse.cache_read_input_tokens,
     }
 }
 
@@ -647,6 +812,35 @@ mod tests {
         let event: SseEvent = serde_json::from_str(data).unwrap();
         assert_eq!(event.event_type, "message_delta");
         assert!(event.delta.is_none()); // delta shape doesn't match SseDelta
+        let usage = event.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(87));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.cache_creation_input_tokens, Some(0));
+        assert_eq!(usage.cache_read_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn accumulate_usage_sums_values() {
+        let mut acc = SseUsage::default();
+        let start = SseUsage {
+            input_tokens: Some(100),
+            output_tokens: None,
+            cache_creation_input_tokens: Some(10),
+            cache_read_input_tokens: None,
+        };
+        let delta = SseUsage {
+            input_tokens: None,
+            output_tokens: Some(50),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(20),
+        };
+        accumulate_usage(&mut acc, &start);
+        accumulate_usage(&mut acc, &delta);
+        let usage = to_token_usage(&acc);
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(50));
+        assert_eq!(usage.cache_creation_input_tokens, Some(10));
+        assert_eq!(usage.cache_read_input_tokens, Some(20));
     }
 
     #[test]
@@ -748,6 +942,62 @@ mod tests {
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let result = AnthropicClient::from_env();
         assert!(matches!(result, Err(CoreError::Llm(_))));
+    }
+
+    #[test]
+    fn anthropic_deferred_tool_serialization() {
+        let def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let deferred = AnthropicDeferredTool::from_definition(&def);
+        let json: serde_json::Value = serde_json::to_value(&deferred).unwrap();
+        assert_eq!(json["name"], "read_file");
+        assert_eq!(json["description"], "Read a file");
+        assert!(json["defer_loading"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn anthropic_tool_search_sentinel_serialization() {
+        let sentinel = AnthropicToolSearchTool {
+            r#type: "tool_search_tool_regex_20251119".to_string(),
+            name: "tool_search_tool_regex".to_string(),
+        };
+        let json: serde_json::Value = serde_json::to_value(&sentinel).unwrap();
+        assert_eq!(json["type"], "tool_search_tool_regex_20251119");
+        assert_eq!(json["name"], "tool_search_tool_regex");
+    }
+
+    #[test]
+    fn anthropic_tool_entry_mixed_serialization() {
+        let core = AnthropicToolEntry::Regular(AnthropicTool {
+            name: "mcp_control".into(),
+            description: "Control MCP".into(),
+            input_schema: serde_json::json!({}),
+        });
+        let deferred = AnthropicToolEntry::Deferred(AnthropicDeferredTool {
+            name: "jira__create".into(),
+            description: "Create Jira issue".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: true,
+        });
+        let sentinel = AnthropicToolEntry::ToolSearch(AnthropicToolSearchTool {
+            r#type: "tool_search_tool_regex_20251119".into(),
+            name: "tool_search_tool_regex".into(),
+        });
+
+        let entries = vec![core, deferred, sentinel];
+        let json: serde_json::Value = serde_json::to_value(&entries).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        // Core tool: no defer_loading
+        assert!(arr[0].get("defer_loading").is_none());
+        assert_eq!(arr[0]["name"], "mcp_control");
+        // Deferred tool: has defer_loading
+        assert!(arr[1]["defer_loading"].as_bool().unwrap());
+        // Sentinel: has type field
+        assert_eq!(arr[2]["type"], "tool_search_tool_regex_20251119");
     }
 
     #[test]

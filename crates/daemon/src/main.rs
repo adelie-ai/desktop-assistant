@@ -3,10 +3,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, Role, ToolDefinition};
+use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, RetryingLlmClient};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, RetryingLlmClient,
+};
+use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tracing_subscriber::EnvFilter;
 
 mod app;
@@ -213,9 +216,7 @@ impl desktop_assistant_core::ports::store::ConversationStore for AnyConversation
         }
     }
 
-    async fn list(
-        &self,
-    ) -> Result<Vec<desktop_assistant_core::domain::Conversation>, CoreError> {
+    async fn list(&self) -> Result<Vec<desktop_assistant_core::domain::Conversation>, CoreError> {
         match self {
             Self::Json(s) => s.list().await,
             Self::Postgres(s) => s.list().await,
@@ -250,8 +251,14 @@ impl desktop_assistant_core::ports::store::ConversationStore for AnyConversation
         end_ordinal: usize,
     ) -> Result<String, CoreError> {
         match self {
-            Self::Json(s) => s.create_summary(conversation_id, summary, start_ordinal, end_ordinal).await,
-            Self::Postgres(s) => s.create_summary(conversation_id, summary, start_ordinal, end_ordinal).await,
+            Self::Json(s) => {
+                s.create_summary(conversation_id, summary, start_ordinal, end_ordinal)
+                    .await
+            }
+            Self::Postgres(s) => {
+                s.create_summary(conversation_id, summary, start_ordinal, end_ordinal)
+                    .await
+            }
         }
     }
 
@@ -342,6 +349,41 @@ impl LlmClient for AnyLlmClient {
             Self::Bedrock(c) => c.stream_completion(messages, tools, on_chunk).await,
             Self::OpenAi(c) => c.stream_completion(messages, tools, on_chunk).await,
             Self::Ollama(c) => c.stream_completion(messages, tools, on_chunk).await,
+        }
+    }
+
+    fn supports_hosted_tool_search(&self) -> bool {
+        match self {
+            Self::Anthropic(c) => c.supports_hosted_tool_search(),
+            Self::OpenAi(c) => c.supports_hosted_tool_search(),
+            _ => false,
+        }
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        match self {
+            Self::Anthropic(c) => {
+                c.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
+                    .await
+            }
+            Self::OpenAi(c) => {
+                c.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
+                    .await
+            }
+            // Bedrock/Ollama: use default flattening behavior
+            _ => {
+                let mut all: Vec<ToolDefinition> = core_tools.to_vec();
+                for ns in namespaces {
+                    all.extend(ns.tools.iter().cloned());
+                }
+                self.stream_completion(messages, &all, on_chunk).await
+            }
         }
     }
 }
@@ -487,23 +529,25 @@ async fn main() -> Result<()> {
     let embedding_client = Arc::new(embedding_client);
 
     // Resolve model identifier once at startup (includes digest for Ollama).
-    let embedding_model_id: String =
-        if matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
-            resolved_emb.model.clone()
-        } else {
-            match embedding_client.model_identifier().await {
-                Ok(id) => {
-                    tracing::info!("resolved embedding model identifier: {id}");
-                    id
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to resolve embedding model identifier, falling back to configured name: {e}"
-                    );
-                    resolved_emb.model.clone()
-                }
+    let embedding_model_id: String = if matches!(
+        embedding_client.as_ref(),
+        AnyEmbeddingClient::Unavailable
+    ) {
+        resolved_emb.model.clone()
+    } else {
+        match embedding_client.model_identifier().await {
+            Ok(id) => {
+                tracing::info!("resolved embedding model identifier: {id}");
+                id
             }
-        };
+            Err(e) => {
+                tracing::warn!(
+                    "failed to resolve embedding model identifier, falling back to configured name: {e}"
+                );
+                resolved_emb.model.clone()
+            }
+        }
+    };
 
     let embedding_fn: Option<EmbedFn> =
         if matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
@@ -519,7 +563,10 @@ async fn main() -> Result<()> {
     // --- Database (optional) ---
     let (db_url, db_max_conns) = config::resolve_database_config(daemon_config.as_ref());
     let pg_pool = if let Some(url) = db_url {
-        tracing::info!("connecting to PostgreSQL (max_connections={})", db_max_conns);
+        tracing::info!(
+            "connecting to PostgreSQL (max_connections={})",
+            db_max_conns
+        );
         match desktop_assistant_storage::create_pool(&url, db_max_conns).await {
             Ok(pool) => {
                 if let Err(e) = desktop_assistant_storage::run_migrations(&pool).await {
@@ -539,7 +586,9 @@ async fn main() -> Result<()> {
                     if conv_json.exists()
                         && desktop_assistant_storage::is_conversations_table_empty(&pool).await
                     {
-                        match desktop_assistant_storage::migrate_conversations(&conv_json, &pool).await {
+                        match desktop_assistant_storage::migrate_conversations(&conv_json, &pool)
+                            .await
+                        {
                             Ok(n) => tracing::info!("migrated {n} conversations from JSON"),
                             Err(e) => tracing::warn!("conversation migration failed: {e}"),
                         }
@@ -547,7 +596,13 @@ async fn main() -> Result<()> {
                     if (prefs_json.exists() || memory_json.exists())
                         && desktop_assistant_storage::is_knowledge_base_table_empty(&pool).await
                     {
-                        match desktop_assistant_storage::migrate_knowledge(&prefs_json, &memory_json, &pool).await {
+                        match desktop_assistant_storage::migrate_knowledge(
+                            &prefs_json,
+                            &memory_json,
+                            &pool,
+                        )
+                        .await
+                        {
                             Ok(n) => tracing::info!("migrated {n} knowledge entries from JSON"),
                             Err(e) => tracing::warn!("knowledge migration failed: {e}"),
                         }
@@ -568,7 +623,9 @@ async fn main() -> Result<()> {
 
     // Invalidate embeddings from a different model so that vector-dimension
     // mismatches cannot cause search errors while the backfill is running.
-    if let Some(pool) = &pg_pool && !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
+    if let Some(pool) = &pg_pool
+        && !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable)
+    {
         match desktop_assistant_storage::embedding_backfill::invalidate_stale_embeddings(
             pool,
             &embedding_model_id,
@@ -589,13 +646,17 @@ async fn main() -> Result<()> {
     }
 
     // --- Knowledge base & tool registry stores ---
-    let kb_store = pg_pool
-        .as_ref()
-        .map(|pool| Arc::new(desktop_assistant_storage::PgKnowledgeBaseStore::new(pool.clone())));
+    let kb_store = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgKnowledgeBaseStore::new(
+            pool.clone(),
+        ))
+    });
 
-    let tool_registry_store = pg_pool
-        .as_ref()
-        .map(|pool| Arc::new(desktop_assistant_storage::PgToolRegistryStore::new(pool.clone())));
+    let tool_registry_store = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgToolRegistryStore::new(
+            pool.clone(),
+        ))
+    });
 
     // Load MCP server configuration
     let mcp_config_path = mcp_config::default_config_path();
@@ -672,10 +733,15 @@ async fn main() -> Result<()> {
         );
     }
 
-    let mut tool_executor =
-        McpToolExecutor::with_builtin_tools_and_config_path(mcp_configs, builtin_tools, mcp_config_path);
+    let mut tool_executor = McpToolExecutor::with_builtin_tools_and_config_path(
+        mcp_configs,
+        builtin_tools,
+        mcp_config_path,
+    );
     let mcp_handle = tool_executor.control_handle();
-    tool_executor.builtin_tools_mut().set_mcp_control(mcp_handle.clone());
+    tool_executor
+        .builtin_tools_mut()
+        .set_mcp_control(mcp_handle.clone());
     if let Err(e) = tool_executor.start().await {
         tracing::warn!("failed to start MCP servers: {e}");
     }
@@ -695,30 +761,42 @@ async fn main() -> Result<()> {
     }
 
     if let Some(tr) = &tool_registry_store {
-        use desktop_assistant_core::ports::tools::ToolExecutor;
         use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
+        use desktop_assistant_core::ports::tools::ToolExecutor;
 
         // Register builtin tools as core (always sent to LLM)
-        let builtin_defs: Vec<_> = tool_executor.core_tools().await
+        let builtin_defs: Vec<_> = tool_executor
+            .core_tools()
+            .await
             .into_iter()
             .filter(|t| t.name.starts_with("builtin_"))
             .collect();
         let builtin_embeddings = vec![None; builtin_defs.len()];
-        if let Err(e) = tr.register_tools(builtin_defs, "builtin", true, builtin_embeddings, None).await {
+        if let Err(e) = tr
+            .register_tools(builtin_defs, "builtin", true, builtin_embeddings, None)
+            .await
+        {
             tracing::warn!("failed to register builtin tools in registry: {e}");
         }
 
         // Register MCP tools as non-core (discoverable via tool_search)
         let mcp_defs: Vec<_> = tool_executor.all_mcp_tools().await;
         let mcp_embeddings = vec![None; mcp_defs.len()];
-        if !mcp_defs.is_empty() && let Err(e) = tr.register_tools(mcp_defs, "mcp", false, mcp_embeddings, None).await {
+        if !mcp_defs.is_empty()
+            && let Err(e) = tr
+                .register_tools(mcp_defs, "mcp", false, mcp_embeddings, None)
+                .await
+        {
             tracing::warn!("failed to register MCP tools in registry: {e}");
         }
     }
 
     // Spawn background embedding backfill task
     let (backfill_shutdown_tx, backfill_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let backfill_task = if let (Some(pool), true) = (&pg_pool, !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable)) {
+    let backfill_task = if let (Some(pool), true) = (
+        &pg_pool,
+        !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
+    ) {
         let pool = pool.clone();
         let client = Arc::clone(&embedding_client);
         let model = embedding_model_id.clone();
@@ -737,9 +815,7 @@ async fn main() -> Result<()> {
             let embed_fn: desktop_assistant_storage::embedding_backfill::BackfillEmbedFn =
                 Box::new(move |texts| {
                     let client = Arc::clone(&client);
-                    Box::pin(async move {
-                        client.embed(texts).await.map_err(|e| e.to_string())
-                    })
+                    Box::pin(async move { client.embed(texts).await.map_err(|e| e.to_string()) })
                 });
 
             match desktop_assistant_storage::embedding_backfill::backfill_tool_embeddings(
@@ -783,8 +859,7 @@ async fn main() -> Result<()> {
             &pg_pool,
             !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
         ) {
-            let resolved_bt_llm =
-                config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
+            let resolved_bt_llm = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
             tracing::info!(
                 "dreaming LLM connector={}, model={}",
                 resolved_bt_llm.connector,
@@ -793,6 +868,7 @@ async fn main() -> Result<()> {
 
             let dreaming_llm = build_llm_client(resolved_bt_llm);
             let dreaming_llm = RetryingLlmClient::new(dreaming_llm, 3);
+            let dreaming_llm = MaybeProfiled::from_env(dreaming_llm);
             let dreaming_llm = Arc::new(dreaming_llm);
 
             let pool = pool.clone();
@@ -830,9 +906,9 @@ async fn main() -> Result<()> {
                 let embed_fn: desktop_assistant_storage::dreaming::BackfillEmbedFn =
                     Box::new(move |texts| {
                         let client = Arc::clone(&emb_client);
-                        Box::pin(async move {
-                            client.embed(texts).await.map_err(|e| e.to_string())
-                        })
+                        Box::pin(
+                            async move { client.embed(texts).await.map_err(|e| e.to_string()) },
+                        )
                     });
 
                 loop {
@@ -858,13 +934,9 @@ async fn main() -> Result<()> {
             }))
         } else {
             if pg_pool.is_none() {
-                tracing::warn!(
-                    "dreaming enabled but no database configured; dreaming disabled"
-                );
+                tracing::warn!("dreaming enabled but no database configured; dreaming disabled");
             } else {
-                tracing::warn!(
-                    "dreaming enabled but embeddings unavailable; dreaming disabled"
-                );
+                tracing::warn!("dreaming enabled but embeddings unavailable; dreaming disabled");
             }
             drop(dreaming_shutdown_rx);
             None
@@ -878,10 +950,13 @@ async fn main() -> Result<()> {
     // Build the conversation service with tool support
     let conversation_store: AnyConversationStore = if let Some(pool) = &pg_pool {
         tracing::info!("using PostgreSQL conversation store");
-        AnyConversationStore::Postgres(desktop_assistant_storage::PgConversationStore::new(pool.clone()))
+        AnyConversationStore::Postgres(desktop_assistant_storage::PgConversationStore::new(
+            pool.clone(),
+        ))
     } else {
-        let store = PersistentConversationStore::from_default_path()
-            .map_err(|e| anyhow::anyhow!("failed to initialize persistent conversation store: {e}"))?;
+        let store = PersistentConversationStore::from_default_path().map_err(|e| {
+            anyhow::anyhow!("failed to initialize persistent conversation store: {e}")
+        })?;
         tracing::info!(
             "using JSON conversation store at {}",
             store::default_conversation_store_path().display()
@@ -890,6 +965,7 @@ async fn main() -> Result<()> {
     };
 
     let llm = RetryingLlmClient::new(llm, 3);
+    let llm = MaybeProfiled::from_env(llm);
     let mut handler = ConversationHandler::with_tools(
         conversation_store,
         llm,
@@ -911,13 +987,13 @@ async fn main() -> Result<()> {
         );
         let bt_llm = build_llm_client(resolved_bt);
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
+        let bt_llm = MaybeProfiled::from_env(bt_llm);
         handler = handler.with_backend_llm(bt_llm);
     }
 
     let conversation_service = Arc::new(handler);
-    let settings_service = Arc::new(
-        DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle),
-    );
+    let settings_service =
+        Arc::new(DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle));
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
         .map(|v| v.trim().to_string())
@@ -1048,12 +1124,16 @@ async fn main() -> Result<()> {
     tracing::info!("shutdown signal received; stopping services");
 
     let _ = backfill_shutdown_tx.send(());
-    if let Some(task) = backfill_task && let Err(e) = task.await {
+    if let Some(task) = backfill_task
+        && let Err(e) = task.await
+    {
         tracing::warn!("backfill task join error during shutdown: {e}");
     }
 
     let _ = dreaming_shutdown_tx.send(());
-    if let Some(task) = dreaming_task && let Err(e) = task.await {
+    if let Some(task) = dreaming_task
+        && let Err(e) = task.await
+    {
         tracing::warn!("dreaming task join error during shutdown: {e}");
     }
 

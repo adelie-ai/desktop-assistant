@@ -45,6 +45,32 @@ impl ToolCall {
     }
 }
 
+/// A named group of tools for deferred loading via hosted tool search.
+///
+/// When using OpenAI's hosted tool search, tools within a namespace are
+/// sent with `defer_loading: true` so the model can discover them on demand
+/// instead of having them all in the active context window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolNamespace {
+    pub name: String,
+    pub description: String,
+    pub tools: Vec<ToolDefinition>,
+}
+
+impl ToolNamespace {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            tools,
+        }
+    }
+}
+
 /// The result of executing a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -135,5 +161,30 @@ mod tests {
         let call = ToolCall::new("id", "name", "args");
         let cloned = call.clone();
         assert_eq!(call, cloned);
+    }
+
+    #[test]
+    fn tool_namespace_creation() {
+        let tools = vec![ToolDefinition::new("t1", "desc1", serde_json::json!({}))];
+        let ns = ToolNamespace::new("my_ns", "A namespace", tools.clone());
+        assert_eq!(ns.name, "my_ns");
+        assert_eq!(ns.description, "A namespace");
+        assert_eq!(ns.tools, tools);
+    }
+
+    #[test]
+    fn tool_namespace_serialization_roundtrip() {
+        let ns = ToolNamespace::new(
+            "test_ns",
+            "Test namespace",
+            vec![ToolDefinition::new(
+                "t1",
+                "desc",
+                serde_json::json!({"type": "object"}),
+            )],
+        );
+        let json = serde_json::to_string(&ns).unwrap();
+        let deserialized: ToolNamespace = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, ns);
     }
 }

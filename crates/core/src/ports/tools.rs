@@ -1,5 +1,5 @@
 use crate::CoreError;
-use crate::domain::ToolDefinition;
+use crate::domain::{ToolDefinition, ToolNamespace};
 
 /// Outbound port for executing tools (e.g., via MCP servers).
 ///
@@ -21,6 +21,15 @@ pub trait ToolExecutor: Send + Sync {
         &self,
         name: &str,
     ) -> impl std::future::Future<Output = Result<Option<ToolDefinition>, CoreError>> + Send;
+
+    /// Returns tools grouped into namespaces for hosted tool search.
+    ///
+    /// Default returns empty — connectors that don't support hosted tool search
+    /// ignore this entirely. When non-empty, the service layer can pass these
+    /// to `LlmClient::stream_completion_with_namespaces()`.
+    fn tool_namespaces(&self) -> impl std::future::Future<Output = Vec<ToolNamespace>> + Send {
+        async { vec![] }
+    }
 
     /// Execute a tool by name with the given arguments.
     /// Returns the tool's text output.
@@ -48,10 +57,7 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn tool_definition(
-            &self,
-            name: &str,
-        ) -> Result<Option<ToolDefinition>, CoreError> {
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
             Ok(self.tools.iter().find(|t| t.name == name).cloned())
         }
 
@@ -117,7 +123,11 @@ mod tests {
     #[tokio::test]
     async fn mock_executor_looks_up_tool_definition() {
         let executor = MockToolExecutor {
-            tools: vec![ToolDefinition::new("my_tool", "desc", serde_json::json!({}))],
+            tools: vec![ToolDefinition::new(
+                "my_tool",
+                "desc",
+                serde_json::json!({}),
+            )],
         };
         let def = executor.tool_definition("my_tool").await.unwrap();
         assert!(def.is_some());

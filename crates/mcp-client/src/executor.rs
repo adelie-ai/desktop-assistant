@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::ToolDefinition;
+use desktop_assistant_core::domain::{ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::{Mutex, RwLock};
 
 pub use crate::builtin::BuiltinToolService;
-use crate::{McpClient, McpError};
 use crate::config::save_mcp_configs;
+use crate::{McpClient, McpError};
 
 fn default_enabled() -> bool {
     true
@@ -240,9 +240,9 @@ impl McpExecutorState {
     /// Connect a single server by index.
     async fn connect_server(&self, idx: usize) -> Result<(), McpError> {
         let configs = self.configs.read().await;
-        let config = configs
-            .get(idx)
-            .ok_or_else(|| McpError::UnexpectedResponse(format!("server index {idx} out of range")))?;
+        let config = configs.get(idx).ok_or_else(|| {
+            McpError::UnexpectedResponse(format!("server index {idx} out of range"))
+        })?;
 
         tracing::info!(
             "connecting to MCP server '{}': {}",
@@ -443,11 +443,10 @@ impl McpControlHandle {
 
     /// Remove a server by name: auto-stop, remove config, persist.
     pub async fn remove_server(&self, name: &str) -> Result<(), McpError> {
-        let idx = self
-            .state
-            .find_server_index(name)
-            .await
-            .ok_or_else(|| McpError::UnexpectedResponse(format!("server '{name}' not found")))?;
+        let idx =
+            self.state.find_server_index(name).await.ok_or_else(|| {
+                McpError::UnexpectedResponse(format!("server '{name}' not found"))
+            })?;
 
         // Stop if connected
         self.state.disconnect_server(idx).await;
@@ -470,11 +469,10 @@ impl McpControlHandle {
 
     /// Enable a server: set enabled=true, auto-start, persist.
     pub async fn enable_server(&self, name: &str) -> Result<(), McpError> {
-        let idx = self
-            .state
-            .find_server_index(name)
-            .await
-            .ok_or_else(|| McpError::UnexpectedResponse(format!("server '{name}' not found")))?;
+        let idx =
+            self.state.find_server_index(name).await.ok_or_else(|| {
+                McpError::UnexpectedResponse(format!("server '{name}' not found"))
+            })?;
 
         {
             let mut configs = self.state.configs.write().await;
@@ -490,11 +488,10 @@ impl McpControlHandle {
 
     /// Disable a server: auto-stop, set enabled=false, persist.
     pub async fn disable_server(&self, name: &str) -> Result<(), McpError> {
-        let idx = self
-            .state
-            .find_server_index(name)
-            .await
-            .ok_or_else(|| McpError::UnexpectedResponse(format!("server '{name}' not found")))?;
+        let idx =
+            self.state.find_server_index(name).await.ok_or_else(|| {
+                McpError::UnexpectedResponse(format!("server '{name}' not found"))
+            })?;
 
         self.state.disconnect_server(idx).await;
 
@@ -518,12 +515,9 @@ impl McpControlHandle {
     async fn resolve_indices(&self, server: Option<&str>) -> Result<Vec<usize>, McpError> {
         let configs = self.state.configs.read().await;
         if let Some(name) = server {
-            let idx = configs
-                .iter()
-                .position(|c| c.name == name)
-                .ok_or_else(|| {
-                    McpError::UnexpectedResponse(format!("server '{name}' not found"))
-                })?;
+            let idx = configs.iter().position(|c| c.name == name).ok_or_else(|| {
+                McpError::UnexpectedResponse(format!("server '{name}' not found"))
+            })?;
             Ok(vec![idx])
         } else {
             Ok((0..configs.len()).collect())
@@ -701,6 +695,49 @@ impl ToolExecutor for McpToolExecutor {
         self.builtin_tools.tool_definitions()
     }
 
+    async fn tool_namespaces(&self) -> Vec<ToolNamespace> {
+        if let Err(e) = self.state.maybe_refresh_metadata().await {
+            tracing::warn!("failed to refresh MCP tools cache: {e}");
+        }
+
+        let mut namespaces = Vec::new();
+
+        // Builtins are always sent as core tools, so skip them here.
+        // Only MCP server tools go into deferred namespaces.
+
+        // MCP server tool namespaces — grouped by server
+        let configs = self.state.configs.read().await;
+        let cached = self.state.cached_tools.lock().await;
+        let routing = self.state.tool_routing.lock().await;
+
+        for (idx, config) in configs.iter().enumerate() {
+            let server_tools: Vec<ToolDefinition> = cached
+                .iter()
+                .filter(|tool| {
+                    routing
+                        .get(&tool.name)
+                        .is_some_and(|(server_idx, _)| *server_idx == idx)
+                })
+                .cloned()
+                .collect();
+
+            if !server_tools.is_empty() {
+                let ns_name = config
+                    .namespace
+                    .as_deref()
+                    .unwrap_or(&config.name)
+                    .to_string();
+                namespaces.push(ToolNamespace::new(
+                    &ns_name,
+                    format!("Tools from the {} MCP server", config.name),
+                    server_tools,
+                ));
+            }
+        }
+
+        namespaces
+    }
+
     async fn search_tools(&self, query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
         if let Err(e) = self.state.maybe_refresh_metadata().await {
             tracing::warn!("failed to refresh MCP tools cache: {e}");
@@ -838,11 +875,7 @@ mod tests {
                 .iter()
                 .any(|tool| tool.name == "builtin_knowledge_base_write")
         );
-        assert!(
-            tools
-                .iter()
-                .any(|tool| tool.name == "builtin_tool_search")
-        );
+        assert!(tools.iter().any(|tool| tool.name == "builtin_tool_search"));
     }
 
     #[tokio::test]
@@ -879,10 +912,7 @@ mod tests {
     async fn executor_executes_builtin_sys_props() {
         let executor = McpToolExecutor::new(vec![]);
         let result = executor
-            .execute_tool(
-                "builtin_sys_props",
-                serde_json::json!({}),
-            )
+            .execute_tool("builtin_sys_props", serde_json::json!({}))
             .await
             .unwrap();
         assert!(result.contains("\"ok\":true"));
@@ -943,6 +973,16 @@ mod tests {
 
         let empty = handle.status(Some("nonexistent")).await;
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_namespaces_excludes_builtins() {
+        let executor = McpToolExecutor::new(vec![]);
+        let namespaces = executor.tool_namespaces().await;
+
+        // With no MCP servers, namespaces should be empty —
+        // builtins are always core tools, not deferred.
+        assert!(namespaces.is_empty());
     }
 
     #[tokio::test]
