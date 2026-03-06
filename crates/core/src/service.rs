@@ -31,15 +31,14 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
         .to_string()
 }
 
-/// Per-turn runtime instruction injected for the LLM.
-const RUNTIME_SYSTEM_INSTRUCTION: &str = include_str!("prompts/runtime_system_instruction.txt");
-
 fn llm_messages_for_turn(
     conversation_messages: &[Message],
     summaries: &[MessageSummary],
     tool_defs: &[ToolDefinition],
     context_summary: &str,
 ) -> Vec<Message> {
+    use crate::prompts::{self, PromptSection, PromptSectionKind};
+
     let has_tool_search = tool_defs.iter().any(|t| t.name == "builtin_tool_search");
     let tool_note = if tool_defs.is_empty() {
         "No tools are available in this turn.".to_string()
@@ -60,6 +59,14 @@ fn llm_messages_for_turn(
         }
     };
 
+    // Assemble system prompt from static sections + dynamic tool availability.
+    let mut sections = prompts::static_sections();
+    sections.push(PromptSection::new(
+        PromptSectionKind::ToolAvailability,
+        tool_note,
+    ));
+    let system_instruction = prompts::assemble(&sections);
+
     // Apply context windowing: if the conversation exceeds the limit, keep
     // only the most recent messages, snapping the cut point forward to a
     // genuine User message so we never split tool-call/result pairs.
@@ -76,10 +83,7 @@ fn llm_messages_for_turn(
         summaries.iter().map(|s| s.id.as_str()).collect();
 
     let mut messages = Vec::with_capacity(windowed.len() + 2);
-    messages.push(Message::new(
-        Role::System,
-        format!("{RUNTIME_SYSTEM_INSTRUCTION}\n\n{tool_note}"),
-    ));
+    messages.push(Message::new(Role::System, system_instruction));
 
     // Inject rolling context summary when windowing is active and summary exists.
     if is_windowed && !context_summary.is_empty() {
@@ -1935,6 +1939,10 @@ mod tests {
 
     #[test]
     fn runtime_instruction_enforces_kb_first_for_user_specific_requests() {
+        use crate::prompts;
+
+        let instruction = prompts::assemble(&prompts::static_sections());
+
         let priority_rule = "Current-turn user instructions override all stored data.";
         let kb_first = "If a request is user-specific, project-specific, or a reference is unclear, search the knowledge base first (project scope, then global) before using other tools.";
         let ambiguous_reference =
@@ -1946,25 +1954,21 @@ mod tests {
             "Never fabricate tool outputs or claim a tool succeeded when it did not.";
         let tool_search_discovery = "Use builtin_tool_search to discover additional tools when the user's request might need capabilities beyond your current set.";
 
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(priority_rule));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(kb_first));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(ambiguous_reference));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(no_guessing));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(verify_relevant_facts));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(tool_fallback));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(no_fabrication));
-        assert!(RUNTIME_SYSTEM_INSTRUCTION.contains(tool_search_discovery));
+        assert!(instruction.contains(priority_rule));
+        assert!(instruction.contains(kb_first));
+        assert!(instruction.contains(ambiguous_reference));
+        assert!(instruction.contains(no_guessing));
+        assert!(instruction.contains(verify_relevant_facts));
+        assert!(instruction.contains(tool_fallback));
+        assert!(instruction.contains(no_fabrication));
+        assert!(instruction.contains(tool_search_discovery));
 
-        let priority_rule_pos = RUNTIME_SYSTEM_INSTRUCTION.find(priority_rule).unwrap();
-        let kb_first_pos = RUNTIME_SYSTEM_INSTRUCTION.find(kb_first).unwrap();
-        let ambiguous_reference_pos = RUNTIME_SYSTEM_INSTRUCTION
-            .find(ambiguous_reference)
-            .unwrap();
-        let no_guessing_pos = RUNTIME_SYSTEM_INSTRUCTION.find(no_guessing).unwrap();
-        let verify_relevant_facts_pos = RUNTIME_SYSTEM_INSTRUCTION
-            .find(verify_relevant_facts)
-            .unwrap();
-        let tool_fallback_pos = RUNTIME_SYSTEM_INSTRUCTION.find(tool_fallback).unwrap();
+        let priority_rule_pos = instruction.find(priority_rule).unwrap();
+        let kb_first_pos = instruction.find(kb_first).unwrap();
+        let ambiguous_reference_pos = instruction.find(ambiguous_reference).unwrap();
+        let no_guessing_pos = instruction.find(no_guessing).unwrap();
+        let verify_relevant_facts_pos = instruction.find(verify_relevant_facts).unwrap();
+        let tool_fallback_pos = instruction.find(tool_fallback).unwrap();
 
         assert!(
             priority_rule_pos < kb_first_pos,

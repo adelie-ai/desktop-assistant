@@ -1,6 +1,7 @@
 pub mod chunking;
 pub mod domain;
 pub mod ports;
+pub mod prompts;
 pub mod service;
 
 use thiserror::Error;
