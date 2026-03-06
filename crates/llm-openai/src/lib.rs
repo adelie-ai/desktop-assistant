@@ -541,6 +541,15 @@ impl OpenAiClient {
                             tool_acc.finalize_arguments(d.output_index, &d.arguments);
                         }
                     }
+                    Some("response.tool_search_call.searching") => {
+                        tracing::info!("tool search initiated");
+                    }
+                    Some("response.tool_search_call.in_progress") => {
+                        // Tool search still running — nothing to do.
+                    }
+                    Some("response.tool_search_call.completed") => {
+                        tracing::info!(data, "tool search completed");
+                    }
                     Some("response.completed") => {
                         if let Ok(rc) = serde_json::from_str::<ResponseCompleted>(data) {
                             if let Some(u) = rc.response.usage {

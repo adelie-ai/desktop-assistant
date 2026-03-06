@@ -8,7 +8,7 @@ BusName=org.desktopAssistant
 ExecStart=%h/.cargo/bin/desktop-assistant-daemon
 Restart=on-failure
 RestartSec=2
-Environment=RUST_LOG=info,desktop_assistant_core::service=debug,desktop_assistant_mcp_client=debug
+Environment=RUST_LOG=info,desktop_assistant_core::service=debug,desktop_assistant_mcp_client=debug,desktop_assistant_llm_openai=debug
 
 [Install]
 WantedBy=default.target
