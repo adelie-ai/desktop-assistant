@@ -471,12 +471,20 @@ async fn categorize_tool_namespaces<L: LlmClient>(
     let messages = vec![
         Message::new(
             Role::System,
-            "You organize tools into semantic categories for an AI assistant's tool search system. \
-             Each category should have at most 10 tools. Give each category a short snake_case name \
-             and a one-sentence description that helps the AI find the right tools.\n\n\
+            "You organize tools into semantic categories for an AI assistant's hosted tool search. \
+             The search system matches a natural-language query against category descriptions to \
+             decide which tools to surface, so descriptions are critical.\n\n\
+             Rules:\n\
+             - Each category: max 10 tools.\n\
+             - \"name\": short snake_case identifier.\n\
+             - \"description\": one or two sentences listing the KEY ACTIONS and VERBS a user \
+               would search for. Include synonyms and related terms. \
+               Example: \"Start, stop, and manage time-tracking sessions — clock in, clock out, \
+               log hours, backdate entries, query timesheets, and correct recorded time.\"\n\
+             - Every tool must appear in exactly one category. Do not add or remove tools.\n\
+             - Keep related read AND write operations together in the same category.\n\n\
              Respond with ONLY valid JSON: an array of objects with \"name\" (snake_case), \
-             \"description\" (string), and \"tools\" (array of tool name strings).\n\
-             Every tool must appear in exactly one category. Do not add or remove tools.",
+             \"description\" (string), and \"tools\" (array of tool name strings).",
         ),
         Message::new(
             Role::User,
@@ -555,6 +563,14 @@ async fn categorize_tool_namespaces<L: LlmClient>(
         result_tool_count,
         result.len()
     );
+    for ns in &result {
+        tracing::debug!(
+            "namespace {:?}: {:?} (tools: {})",
+            ns.name,
+            ns.description,
+            ns.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
     result
 }
 
@@ -591,6 +607,20 @@ impl ToolExecutor for NoopToolExecutor {
     }
 }
 
+/// Compute a stable hash over the sorted tool names in a set of namespaces.
+fn tool_set_hash(namespaces: &[ToolNamespace]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut names: Vec<&str> = namespaces
+        .iter()
+        .flat_map(|ns| &ns.tools)
+        .map(|t| t.name.as_str())
+        .collect();
+    names.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    names.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Core service implementing conversation management.
 /// Generic over store, LLM, and tool executor backends for testability.
 pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
@@ -599,6 +629,7 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     backend_llm: Option<L>,
     tools: T,
     id_generator: Box<dyn Fn() -> String + Send + Sync>,
+    namespace_cache: std::sync::Mutex<Option<(u64, Vec<ToolNamespace>)>>,
 }
 
 impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
@@ -609,6 +640,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             backend_llm: None,
             tools: NoopToolExecutor,
             id_generator,
+            namespace_cache: std::sync::Mutex::new(None),
         }
     }
 }
@@ -626,6 +658,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             backend_llm: None,
             tools,
             id_generator,
+            namespace_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -740,7 +773,25 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             if raw_namespaces.is_empty() {
                 vec![]
             } else {
-                categorize_tool_namespaces(raw_namespaces, self.task_llm()).await
+                let hash = tool_set_hash(&raw_namespaces);
+                let cached_hit = {
+                    let cached = self.namespace_cache.lock().unwrap();
+                    cached
+                        .as_ref()
+                        .filter(|(h, _)| *h == hash)
+                        .map(|(_, ns)| ns.clone())
+                };
+                if let Some(ns) = cached_hit {
+                    tracing::debug!(
+                        "reusing cached namespace categorization (hash={hash:#x})"
+                    );
+                    ns
+                } else {
+                    let result =
+                        categorize_tool_namespaces(raw_namespaces, self.task_llm()).await;
+                    *self.namespace_cache.lock().unwrap() = Some((hash, result.clone()));
+                    result
+                }
             }
         } else {
             vec![]
