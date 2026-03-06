@@ -1,12 +1,14 @@
+use std::collections::HashMap;
+
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 
-/// OpenAI-compatible LLM client that streams completions via SSE.
+/// OpenAI-compatible LLM client that streams completions via the Responses API.
 pub struct OpenAiClient {
     client: Client,
     api_key: String,
@@ -19,7 +21,7 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn get_default_model() -> Option<&'static str> {
-        Some("gpt-5.2")
+        Some("gpt-5.4")
     }
 
     pub fn get_default_base_url() -> Option<&'static str> {
@@ -64,16 +66,11 @@ impl OpenAiClient {
     }
 
     /// Return the model name as the stable version identifier.
-    ///
-    /// OpenAI model names are already version-pinned, so no server call is
-    /// needed.
     pub async fn model_identifier(&self) -> Result<String, CoreError> {
         Ok(self.model.clone())
     }
 
     /// Generate embeddings for a batch of texts.
-    ///
-    /// Sends a `POST {base_url}/embeddings` request and returns one vector per input.
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
         let body = serde_json::json!({
             "model": self.model,
@@ -123,116 +120,138 @@ impl OpenAiClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Responses API – request serialization types
+// ---------------------------------------------------------------------------
+
+/// Unified request body for the Responses API (`POST /v1/responses`).
 #[derive(Serialize)]
-struct ChatRequest {
+struct ResponsesRequest {
     model: String,
-    messages: Vec<ChatMessage>,
+    input: Vec<InputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ChatTool>,
+    tools: Vec<ToolEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
 }
 
-/// OpenAI tool definition wrapper.
-#[derive(Serialize)]
-struct ChatTool {
-    r#type: String,
-    function: ChatFunction,
+/// Heterogeneous input items for the Responses API.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+enum InputItem {
+    Message(InputMessage),
+    FunctionCall(InputFunctionCall),
+    FunctionCallOutput(InputFunctionCallOutput),
 }
 
-#[derive(Serialize)]
-struct ChatFunction {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-
-impl From<&ToolDefinition> for ChatTool {
-    fn from(def: &ToolDefinition) -> Self {
-        ChatTool {
-            r#type: "function".to_string(),
-            function: ChatFunction {
-                name: def.name.clone(),
-                description: def.description.clone(),
-                parameters: def.parameters.clone(),
-            },
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ChatMessage {
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct InputMessage {
     role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ChatMessageToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    content: String,
 }
 
-/// Tool call as included in an assistant message being sent to the API.
-#[derive(Serialize)]
-struct ChatMessageToolCall {
-    id: String,
+/// A tool call from a previous assistant turn, replayed as input.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct InputFunctionCall {
     r#type: String,
-    function: ChatMessageFunction,
-}
-
-#[derive(Serialize)]
-struct ChatMessageFunction {
+    /// Synthetic ID for the input item (not the correlation key).
+    id: String,
+    /// The real correlation key matching `function_call_output`.
+    call_id: String,
     name: String,
     arguments: String,
 }
 
-impl From<&Message> for ChatMessage {
-    fn from(msg: &Message) -> Self {
-        let role = match msg.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::System => "system",
-            Role::Tool => "tool",
-        };
+/// A tool result replayed as input.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct InputFunctionCallOutput {
+    r#type: String,
+    call_id: String,
+    output: String,
+}
 
-        let tool_calls = if msg.tool_calls.is_empty() {
-            None
-        } else {
-            Some(
-                msg.tool_calls
-                    .iter()
-                    .map(|tc| ChatMessageToolCall {
-                        id: tc.id.clone(),
-                        r#type: "function".to_string(),
-                        function: ChatMessageFunction {
-                            name: tc.name.clone(),
-                            arguments: tc.arguments.clone(),
-                        },
-                    })
-                    .collect(),
-            )
-        };
+/// Tool entry in the `tools` array – can be a function, namespace, or tool_search.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+enum ToolEntry {
+    Function(FunctionTool),
+    Namespace(NamespaceTool),
+    ToolSearch(ToolSearchSentinel),
+}
 
-        let content = if msg.content.is_empty() && tool_calls.is_some() {
-            None
-        } else {
-            Some(msg.content.clone())
-        };
+/// Flat function tool (name at top level, not nested under `function`).
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FunctionTool {
+    r#type: String,
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defer_loading: Option<bool>,
+}
 
-        ChatMessage {
-            role: role.to_string(),
-            content,
-            tool_calls,
-            tool_call_id: msg.tool_call_id.clone(),
+impl FunctionTool {
+    fn from_definition(def: &ToolDefinition) -> Self {
+        Self {
+            r#type: "function".to_string(),
+            name: def.name.clone(),
+            description: def.description.clone(),
+            parameters: def.parameters.clone(),
+            defer_loading: None,
+        }
+    }
+
+    fn from_definition_deferred(def: &ToolDefinition) -> Self {
+        Self {
+            r#type: "function".to_string(),
+            name: def.name.clone(),
+            description: def.description.clone(),
+            parameters: def.parameters.clone(),
+            defer_loading: Some(true),
         }
     }
 }
 
-// --- Embedding response types ---
+/// A tool namespace entry for hosted tool search.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct NamespaceTool {
+    r#type: String,
+    name: String,
+    description: String,
+    tools: Vec<FunctionTool>,
+}
+
+impl NamespaceTool {
+    fn from_namespace(ns: &ToolNamespace) -> Self {
+        Self {
+            r#type: "namespace".to_string(),
+            name: ns.name.clone(),
+            description: ns.description.clone(),
+            tools: ns
+                .tools
+                .iter()
+                .map(FunctionTool::from_definition_deferred)
+                .collect(),
+        }
+    }
+}
+
+/// The `tool_search` sentinel that enables OpenAI's hosted tool discovery.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct ToolSearchSentinel {
+    r#type: String,
+}
+
+// ---------------------------------------------------------------------------
+// Embedding response types
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct EmbeddingResponse {
@@ -244,120 +263,187 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
-// --- Response deserialization types ---
+// ---------------------------------------------------------------------------
+// Responses API – streaming response types
+// ---------------------------------------------------------------------------
 
+/// `response.output_text.delta` event payload.
 #[derive(Deserialize)]
-struct ChatChunk {
-    choices: Vec<ChunkChoice>,
+struct TextDelta {
+    delta: String,
 }
 
+/// `response.output_item.added` event payload.
 #[derive(Deserialize)]
-struct ChunkChoice {
-    delta: Delta,
+struct OutputItemAdded {
+    output_index: usize,
+    item: OutputItem,
+}
+
+/// An output item (we only care about `function_call` items).
+#[derive(Deserialize)]
+struct OutputItem {
+    r#type: String,
     #[allow(dead_code)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Delta {
-    content: Option<String>,
-    tool_calls: Option<Vec<DeltaToolCall>>,
-}
-
-/// A tool call delta from the streaming response.
-#[derive(Deserialize)]
-struct DeltaToolCall {
-    index: usize,
+    #[serde(default)]
     id: Option<String>,
-    function: Option<DeltaFunction>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `response.function_call_arguments.delta` event payload.
+#[derive(Deserialize)]
+struct FunctionArgsDelta {
+    output_index: usize,
+    delta: String,
+}
+
+/// `response.function_call_arguments.done` event payload.
+#[derive(Deserialize)]
+struct FunctionArgsDone {
+    output_index: usize,
+    arguments: String,
+}
+
+/// `response.completed` event payload.
+#[derive(Deserialize)]
+struct ResponseCompleted {
+    response: ResponseCompletedInner,
 }
 
 #[derive(Deserialize)]
-struct DeltaFunction {
-    name: Option<String>,
-    arguments: Option<String>,
+struct ResponseCompletedInner {
+    #[serde(default)]
+    usage: Option<ResponseUsage>,
 }
 
-/// Accumulator for building tool calls from streaming deltas.
-#[derive(Default)]
-struct ToolCallAccumulator {
-    entries: Vec<ToolCallEntry>,
+#[derive(Deserialize)]
+struct ResponseUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 }
 
-#[derive(Default)]
-struct ToolCallEntry {
-    id: String,
+/// Entry in the tool call accumulator, keyed by `output_index`.
+#[derive(Debug, Default)]
+struct ResponseToolEntry {
+    call_id: String,
     name: String,
     arguments: String,
 }
 
-impl ToolCallAccumulator {
-    fn apply_delta(&mut self, delta: &DeltaToolCall) {
-        // Grow entries vector if needed
-        while self.entries.len() <= delta.index {
-            self.entries.push(ToolCallEntry::default());
-        }
+/// Accumulator for building tool calls from Responses API streaming events.
+#[derive(Debug, Default)]
+struct ResponseToolAccumulator {
+    entries: HashMap<usize, ResponseToolEntry>,
+}
 
-        let entry = &mut self.entries[delta.index];
+impl ResponseToolAccumulator {
+    fn register(&mut self, output_index: usize, call_id: String, name: String) {
+        self.entries.insert(
+            output_index,
+            ResponseToolEntry {
+                call_id,
+                name,
+                arguments: String::new(),
+            },
+        );
+    }
 
-        if let Some(id) = &delta.id {
-            entry.id = id.clone();
+    fn append_arguments(&mut self, output_index: usize, delta: &str) {
+        if let Some(entry) = self.entries.get_mut(&output_index) {
+            entry.arguments.push_str(delta);
         }
-        if let Some(func) = &delta.function {
-            if let Some(name) = &func.name {
-                entry.name = name.clone();
-            }
-            if let Some(args) = &func.arguments {
-                entry.arguments.push_str(args);
-            }
+    }
+
+    fn finalize_arguments(&mut self, output_index: usize, arguments: &str) {
+        if let Some(entry) = self.entries.get_mut(&output_index) {
+            entry.arguments = arguments.to_string();
         }
     }
 
     fn into_tool_calls(self) -> Vec<ToolCall> {
-        self.entries
+        let mut pairs: Vec<(usize, ResponseToolEntry)> = self.entries.into_iter().collect();
+        pairs.sort_by_key(|(idx, _)| *idx);
+        pairs
             .into_iter()
-            .map(|e| ToolCall::new(e.id, e.name, e.arguments))
+            .map(|(_, e)| ToolCall::new(e.call_id, e.name, e.arguments))
             .collect()
     }
 }
 
-impl LlmClient for OpenAiClient {
-    fn get_default_model(&self) -> Option<&str> {
-        Self::get_default_model()
+// ---------------------------------------------------------------------------
+// Message conversion: domain Messages → Responses API InputItems
+// ---------------------------------------------------------------------------
+
+/// Convert domain messages to Responses API input items plus an optional
+/// `instructions` string (extracted from system messages; last one wins).
+fn convert_messages(messages: &[Message]) -> (Vec<InputItem>, Option<String>) {
+    let mut items = Vec::new();
+    let mut instructions: Option<String> = None;
+
+    for msg in messages {
+        match msg.role {
+            Role::System => {
+                instructions = Some(msg.content.clone());
+            }
+            Role::User => {
+                items.push(InputItem::Message(InputMessage {
+                    role: "user".to_string(),
+                    content: msg.content.clone(),
+                }));
+            }
+            Role::Assistant => {
+                // Emit text content as a message if non-empty
+                if !msg.content.is_empty() {
+                    items.push(InputItem::Message(InputMessage {
+                        role: "assistant".to_string(),
+                        content: msg.content.clone(),
+                    }));
+                }
+                // Emit each tool call as a separate FunctionCall item
+                for tc in &msg.tool_calls {
+                    items.push(InputItem::FunctionCall(InputFunctionCall {
+                        r#type: "function_call".to_string(),
+                        id: format!("fc_{}", tc.id),
+                        call_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    }));
+                }
+            }
+            Role::Tool => {
+                if let Some(call_id) = &msg.tool_call_id {
+                    items.push(InputItem::FunctionCallOutput(InputFunctionCallOutput {
+                        r#type: "function_call_output".to_string(),
+                        call_id: call_id.clone(),
+                        output: msg.content.clone(),
+                    }));
+                }
+            }
+        }
     }
 
-    fn get_default_base_url(&self) -> Option<&str> {
-        Self::get_default_base_url()
-    }
+    (items, instructions)
+}
 
-    async fn stream_completion(
+// ---------------------------------------------------------------------------
+// Streaming implementation
+// ---------------------------------------------------------------------------
+
+impl OpenAiClient {
+    /// Send a Responses API request and parse the SSE stream into an LlmResponse.
+    async fn send_and_stream(
         &self,
-        messages: Vec<Message>,
-        tools: &[ToolDefinition],
+        request_json: &str,
+        request_body: &impl Serialize,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
-
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: messages.iter().map(ChatMessage::from).collect(),
-            stream: true,
-            tools: chat_tools,
-            temperature: self.temperature,
-            top_p: self.top_p,
-            max_tokens: self.max_tokens,
-        };
-
-        let request_json = serde_json::to_string(&request)
-            .unwrap_or_else(|_| "<serialization error>".into());
         let request_bytes = request_json.len();
-        let msg_count = request.messages.len();
-        let tool_count = request.tools.len();
         tracing::info!(
             request_bytes,
-            msg_count,
-            tool_count,
-            model = %request.model,
+            model = %self.model,
             "LLM request payload"
         );
         tracing::debug!(
@@ -367,10 +453,10 @@ impl LlmClient for OpenAiClient {
 
         let response = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(format!("{}/responses", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&request)
+            .json(request_body)
             .send()
             .await
             .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
@@ -394,56 +480,179 @@ impl LlmClient for OpenAiClient {
         let mut lines = tokio::io::BufReader::new(stream_reader).lines();
 
         let mut full_response = String::new();
-        let mut tool_acc = ToolCallAccumulator::default();
+        let mut tool_acc = ResponseToolAccumulator::default();
+        let mut token_usage: Option<TokenUsage> = None;
+        let mut current_event: Option<String> = None;
 
         while let Some(line) = lines
             .next_line()
             .await
             .map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?
         {
-            let line: String = line.trim().to_string();
-            if line.is_empty() || line.starts_with(':') {
+            let line = line.trim().to_string();
+            if line.is_empty() {
                 continue;
             }
 
+            // SSE: `event: <type>` sets the current event type
+            if let Some(event_type) = line.strip_prefix("event: ") {
+                current_event = Some(event_type.to_string());
+                continue;
+            }
+
+            // SSE: `data: <json>` dispatches on current event type
             if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    break;
-                }
-
-                match serde_json::from_str::<ChatChunk>(data) {
-                    Ok(chunk) => {
-                        if let Some(choice) = chunk.choices.first() {
-                            // Handle text content
-                            if let Some(content) = &choice.delta.content {
-                                full_response.push_str(content);
-                                if !on_chunk(content.clone()) {
-                                    tracing::debug!("streaming aborted by callback");
-                                    break;
-                                }
-                            }
-
-                            // Handle tool call deltas
-                            if let Some(tool_calls) = &choice.delta.tool_calls {
-                                for tc_delta in tool_calls {
-                                    tool_acc.apply_delta(tc_delta);
-                                }
+                let event = current_event.take();
+                match event.as_deref() {
+                    Some("response.output_text.delta") => {
+                        if let Ok(td) = serde_json::from_str::<TextDelta>(data) {
+                            full_response.push_str(&td.delta);
+                            if !on_chunk(td.delta) {
+                                tracing::debug!("streaming aborted by callback");
+                                break;
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("failed to parse SSE chunk: {e}, data: {data}");
+                    Some("response.output_item.added") => {
+                        if let Ok(added) = serde_json::from_str::<OutputItemAdded>(data) {
+                            if added.item.r#type == "function_call" {
+                                tool_acc.register(
+                                    added.output_index,
+                                    added.item.call_id.unwrap_or_default(),
+                                    added.item.name.unwrap_or_default(),
+                                );
+                            }
+                        }
+                    }
+                    Some("response.function_call_arguments.delta") => {
+                        if let Ok(d) = serde_json::from_str::<FunctionArgsDelta>(data) {
+                            tool_acc.append_arguments(d.output_index, &d.delta);
+                        }
+                    }
+                    Some("response.function_call_arguments.done") => {
+                        if let Ok(d) = serde_json::from_str::<FunctionArgsDone>(data) {
+                            tool_acc.finalize_arguments(d.output_index, &d.arguments);
+                        }
+                    }
+                    Some("response.completed") => {
+                        if let Ok(rc) = serde_json::from_str::<ResponseCompleted>(data) {
+                            if let Some(u) = rc.response.usage {
+                                token_usage = Some(TokenUsage {
+                                    input_tokens: u.input_tokens,
+                                    output_tokens: u.output_tokens,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        break;
+                    }
+                    other => {
+                        tracing::trace!("ignoring SSE event: {:?}", other);
                     }
                 }
             }
         }
 
         let tool_calls = tool_acc.into_tool_calls();
-        if tool_calls.is_empty() {
-            Ok(LlmResponse::text(full_response))
+        let mut resp = if tool_calls.is_empty() {
+            LlmResponse::text(full_response)
         } else {
-            Ok(LlmResponse::with_tool_calls(full_response, tool_calls))
+            LlmResponse::with_tool_calls(full_response, tool_calls)
+        };
+        if let Some(usage) = token_usage {
+            resp = resp.with_usage(usage);
         }
+        Ok(resp)
+    }
+}
+
+impl LlmClient for OpenAiClient {
+    fn get_default_model(&self) -> Option<&str> {
+        Self::get_default_model()
+    }
+
+    fn get_default_base_url(&self) -> Option<&str> {
+        Self::get_default_base_url()
+    }
+
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let (input, instructions) = convert_messages(&messages);
+        let tool_entries: Vec<ToolEntry> = tools
+            .iter()
+            .map(|t| ToolEntry::Function(FunctionTool::from_definition(t)))
+            .collect();
+
+        let request = ResponsesRequest {
+            model: self.model.clone(),
+            input,
+            instructions,
+            stream: true,
+            tools: tool_entries,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_output_tokens: self.max_tokens,
+        };
+
+        let request_json =
+            serde_json::to_string(&request).unwrap_or_else(|_| "<serialization error>".into());
+
+        self.send_and_stream(&request_json, &request, on_chunk)
+            .await
+    }
+
+    fn supports_hosted_tool_search(&self) -> bool {
+        true
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let (input, instructions) = convert_messages(&messages);
+
+        let mut tool_entries: Vec<ToolEntry> = core_tools
+            .iter()
+            .map(|t| ToolEntry::Function(FunctionTool::from_definition(t)))
+            .collect();
+
+        for ns in namespaces {
+            tool_entries.push(ToolEntry::Namespace(NamespaceTool::from_namespace(ns)));
+        }
+
+        tool_entries.push(ToolEntry::ToolSearch(ToolSearchSentinel {
+            r#type: "tool_search".to_string(),
+        }));
+
+        let request = ResponsesRequest {
+            model: self.model.clone(),
+            input,
+            instructions,
+            stream: true,
+            tools: tool_entries,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_output_tokens: self.max_tokens,
+        };
+
+        let request_json =
+            serde_json::to_string(&request).unwrap_or_else(|_| "<serialization error>".into());
+
+        tracing::info!(
+            namespace_count = namespaces.len(),
+            core_tool_count = core_tools.len(),
+            "using hosted tool search with namespaces"
+        );
+
+        self.send_and_stream(&request_json, &request, on_chunk)
+            .await
     }
 }
 
@@ -451,121 +660,283 @@ impl LlmClient for OpenAiClient {
 mod tests {
     use super::*;
 
-    #[test]
-    fn chat_message_from_domain_message() {
-        let msg = Message::new(Role::User, "hello");
-        let chat_msg = ChatMessage::from(&msg);
-        assert_eq!(chat_msg.role, "user");
-        assert_eq!(chat_msg.content.as_deref(), Some("hello"));
-        assert!(chat_msg.tool_calls.is_none());
-        assert!(chat_msg.tool_call_id.is_none());
-    }
+    // --- convert_messages tests ---
 
     #[test]
-    fn chat_message_from_assistant() {
-        let msg = Message::new(Role::Assistant, "hi");
-        let chat_msg = ChatMessage::from(&msg);
-        assert_eq!(chat_msg.role, "assistant");
-    }
-
-    #[test]
-    fn chat_message_from_system() {
-        let msg = Message::new(Role::System, "instructions");
-        let chat_msg = ChatMessage::from(&msg);
-        assert_eq!(chat_msg.role, "system");
-    }
-
-    #[test]
-    fn chat_message_from_tool_result() {
-        let msg = Message::tool_result("call-1", "file contents");
-        let chat_msg = ChatMessage::from(&msg);
-        assert_eq!(chat_msg.role, "tool");
-        assert_eq!(chat_msg.content.as_deref(), Some("file contents"));
-        assert_eq!(chat_msg.tool_call_id.as_deref(), Some("call-1"));
-    }
-
-    #[test]
-    fn chat_message_from_assistant_with_tool_calls() {
-        let calls = vec![ToolCall::new("c1", "read_file", r#"{"path": "/tmp/a"}"#)];
-        let msg = Message::assistant_with_tool_calls(calls);
-        let chat_msg = ChatMessage::from(&msg);
-        assert_eq!(chat_msg.role, "assistant");
-        assert!(chat_msg.content.is_none()); // empty content omitted
-        let tc = chat_msg.tool_calls.unwrap();
-        assert_eq!(tc.len(), 1);
-        assert_eq!(tc[0].id, "c1");
-        assert_eq!(tc[0].function.name, "read_file");
-    }
-
-    #[test]
-    fn chat_tool_from_tool_definition() {
-        let def = ToolDefinition::new("test", "A test tool", serde_json::json!({"type": "object"}));
-        let chat_tool = ChatTool::from(&def);
-        assert_eq!(chat_tool.r#type, "function");
-        assert_eq!(chat_tool.function.name, "test");
-        assert_eq!(chat_tool.function.description, "A test tool");
-    }
-
-    #[test]
-    fn client_builder() {
-        let client = OpenAiClient::new("test-key".into())
-            .with_model("gpt-3.5-turbo")
-            .with_base_url("http://localhost:8080");
-        assert_eq!(client.model, "gpt-3.5-turbo");
-        assert_eq!(client.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn parse_sse_chunk() {
-        let data = r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let chunk: ChatChunk = serde_json::from_str(data).unwrap();
-        assert_eq!(chunk.choices[0].delta.content.as_ref().unwrap(), "Hello");
-    }
-
-    #[test]
-    fn parse_sse_chunk_no_content() {
-        let data = r#"{"choices":[{"delta":{},"finish_reason":null}]}"#;
-        let chunk: ChatChunk = serde_json::from_str(data).unwrap();
-        assert!(chunk.choices[0].delta.content.is_none());
-    }
-
-    #[test]
-    fn parse_sse_chunk_with_tool_calls() {
-        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"read_file","arguments":"{\"pa"}}]},"finish_reason":null}]}"#;
-        let chunk: ChatChunk = serde_json::from_str(data).unwrap();
-        let tc = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
-        assert_eq!(tc.len(), 1);
-        assert_eq!(tc[0].index, 0);
-        assert_eq!(tc[0].id.as_deref(), Some("call_abc"));
+    fn convert_messages_user_only() {
+        let msgs = vec![Message::new(Role::User, "hello")];
+        let (items, instructions) = convert_messages(&msgs);
+        assert!(instructions.is_none());
+        assert_eq!(items.len(), 1);
         assert_eq!(
-            tc[0].function.as_ref().unwrap().name.as_deref(),
-            Some("read_file")
+            items[0],
+            InputItem::Message(InputMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            })
         );
     }
 
     #[test]
-    fn tool_call_accumulator_builds_from_deltas() {
-        let mut acc = ToolCallAccumulator::default();
+    fn convert_messages_system_becomes_instructions() {
+        let msgs = vec![
+            Message::new(Role::System, "You are helpful."),
+            Message::new(Role::User, "hi"),
+        ];
+        let (items, instructions) = convert_messages(&msgs);
+        assert_eq!(instructions.as_deref(), Some("You are helpful."));
+        // System message should NOT appear in items
+        assert_eq!(items.len(), 1);
+    }
 
-        // First delta: id and name
-        acc.apply_delta(&DeltaToolCall {
-            index: 0,
-            id: Some("call_1".into()),
-            function: Some(DeltaFunction {
-                name: Some("read_file".into()),
-                arguments: Some("{\"pa".into()),
-            }),
-        });
+    #[test]
+    fn convert_messages_last_system_wins() {
+        let msgs = vec![
+            Message::new(Role::System, "first"),
+            Message::new(Role::System, "second"),
+            Message::new(Role::User, "hi"),
+        ];
+        let (_, instructions) = convert_messages(&msgs);
+        assert_eq!(instructions.as_deref(), Some("second"));
+    }
 
-        // Second delta: more arguments
-        acc.apply_delta(&DeltaToolCall {
-            index: 0,
-            id: None,
-            function: Some(DeltaFunction {
-                name: None,
-                arguments: Some("th\": \"/tmp\"}".into()),
-            }),
+    #[test]
+    fn convert_messages_assistant_text() {
+        let msgs = vec![Message::new(Role::Assistant, "I can help")];
+        let (items, _) = convert_messages(&msgs);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0],
+            InputItem::Message(InputMessage {
+                role: "assistant".to_string(),
+                content: "I can help".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn convert_messages_assistant_with_tool_calls() {
+        let calls = vec![ToolCall::new("c1", "read_file", r#"{"path": "/tmp/a"}"#)];
+        let msg = Message::assistant_with_tool_calls(calls);
+        let (items, _) = convert_messages(&[msg]);
+        // Empty content → no InputMessage, just the FunctionCall
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            InputItem::FunctionCall(fc) => {
+                assert_eq!(fc.r#type, "function_call");
+                assert_eq!(fc.call_id, "c1");
+                assert_eq!(fc.id, "fc_c1");
+                assert_eq!(fc.name, "read_file");
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_tool_result() {
+        let msg = Message::tool_result("c1", "file contents");
+        let (items, _) = convert_messages(&[msg]);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            InputItem::FunctionCallOutput(out) => {
+                assert_eq!(out.r#type, "function_call_output");
+                assert_eq!(out.call_id, "c1");
+                assert_eq!(out.output, "file contents");
+            }
+            other => panic!("expected FunctionCallOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_mixed_history() {
+        let msgs = vec![
+            Message::new(Role::System, "Be concise."),
+            Message::new(Role::User, "Read /tmp/a"),
+            Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c1",
+                "read_file",
+                r#"{"path":"/tmp/a"}"#,
+            )]),
+            Message::tool_result("c1", "contents of a"),
+            Message::new(Role::Assistant, "Here are the contents."),
+        ];
+        let (items, instructions) = convert_messages(&msgs);
+        assert_eq!(instructions.as_deref(), Some("Be concise."));
+        assert_eq!(items.len(), 4); // user, function_call, function_call_output, assistant text
+    }
+
+    // --- Tool serialization tests ---
+
+    #[test]
+    fn function_tool_serialization_flat_name() {
+        let def = ToolDefinition::new("test", "A test tool", serde_json::json!({"type": "object"}));
+        let tool = FunctionTool::from_definition(&def);
+        let json: serde_json::Value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["type"], "function");
+        assert_eq!(json["name"], "test");
+        assert_eq!(json["description"], "A test tool");
+        // Name is at top level, NOT nested under "function"
+        assert!(json.get("function").is_none());
+    }
+
+    #[test]
+    fn function_tool_deferred_has_defer_loading() {
+        let def = ToolDefinition::new("t", "d", serde_json::json!({}));
+        let tool = FunctionTool::from_definition_deferred(&def);
+        let json: serde_json::Value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["defer_loading"], true);
+    }
+
+    #[test]
+    fn namespace_tool_serialization() {
+        let ns = ToolNamespace::new(
+            "jira",
+            "Jira project tools",
+            vec![
+                ToolDefinition::new("jira__list", "List issues", serde_json::json!({})),
+                ToolDefinition::new("jira__create", "Create issue", serde_json::json!({})),
+            ],
+        );
+        let entry = ToolEntry::Namespace(NamespaceTool::from_namespace(&ns));
+        let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["type"], "namespace");
+        assert_eq!(json["name"], "jira");
+        assert_eq!(json["description"], "Jira project tools");
+        let tools = json["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert!(tools[0]["defer_loading"].as_bool().unwrap());
+        assert_eq!(tools[0]["name"], "jira__list");
+        // Flat format: no "function" wrapper
+        assert!(tools[0].get("function").is_none());
+    }
+
+    #[test]
+    fn tool_search_sentinel_serialization() {
+        let entry = ToolEntry::ToolSearch(ToolSearchSentinel {
+            r#type: "tool_search".to_string(),
         });
+        let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["type"], "tool_search");
+    }
+
+    // --- Request serialization tests ---
+
+    #[test]
+    fn response_request_uses_max_output_tokens() {
+        let req = ResponsesRequest {
+            model: "gpt-5.4".into(),
+            input: vec![],
+            instructions: None,
+            stream: true,
+            tools: vec![],
+            temperature: None,
+            top_p: None,
+            max_output_tokens: Some(1024),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("max_output_tokens"));
+        assert!(!json.contains("\"max_tokens\""));
+    }
+
+    #[test]
+    fn response_request_uses_instructions() {
+        let req = ResponsesRequest {
+            model: "gpt-5.4".into(),
+            input: vec![],
+            instructions: Some("Be helpful.".into()),
+            stream: true,
+            tools: vec![],
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["instructions"], "Be helpful.");
+    }
+
+    #[test]
+    fn response_request_omits_empty_tools() {
+        let req = ResponsesRequest {
+            model: "gpt-5.4".into(),
+            input: vec![],
+            instructions: None,
+            stream: true,
+            tools: vec![],
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("tools"));
+    }
+
+    #[test]
+    fn response_request_with_tools() {
+        let def = ToolDefinition::new("test", "desc", serde_json::json!({"type": "object"}));
+        let req = ResponsesRequest {
+            model: "gpt-5.4".into(),
+            input: vec![],
+            instructions: None,
+            stream: true,
+            tools: vec![ToolEntry::Function(FunctionTool::from_definition(&def))],
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"tools\""));
+        assert!(json.contains("\"test\""));
+    }
+
+    #[test]
+    fn request_with_namespaces_serialization() {
+        let core_tool = ToolDefinition::new("mcp_control", "Control MCP", serde_json::json!({}));
+        let ns = ToolNamespace::new(
+            "kb",
+            "Knowledge base tools",
+            vec![ToolDefinition::new(
+                "kb_write",
+                "Write to KB",
+                serde_json::json!({}),
+            )],
+        );
+
+        let mut entries: Vec<ToolEntry> = vec![ToolEntry::Function(FunctionTool::from_definition(
+            &core_tool,
+        ))];
+        entries.push(ToolEntry::Namespace(NamespaceTool::from_namespace(&ns)));
+        entries.push(ToolEntry::ToolSearch(ToolSearchSentinel {
+            r#type: "tool_search".to_string(),
+        }));
+
+        let req = ResponsesRequest {
+            model: "gpt-5.4".into(),
+            input: vec![],
+            instructions: None,
+            stream: true,
+            tools: entries,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&req).unwrap();
+        let tools = json["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[1]["type"], "namespace");
+        assert_eq!(tools[2]["type"], "tool_search");
+    }
+
+    // --- Tool accumulator tests ---
+
+    #[test]
+    fn response_tool_accumulator_register_and_finalize() {
+        let mut acc = ResponseToolAccumulator::default();
+        acc.register(0, "call_1".into(), "read_file".into());
+        acc.append_arguments(0, r#"{"pa"#);
+        acc.append_arguments(0, r#"th": "/tmp"}"#);
 
         let calls = acc.into_tool_calls();
         assert_eq!(calls.len(), 1);
@@ -575,26 +946,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_accumulator_multiple_tools() {
-        let mut acc = ToolCallAccumulator::default();
+    fn response_tool_accumulator_finalize_replaces_partial() {
+        let mut acc = ResponseToolAccumulator::default();
+        acc.register(0, "c1".into(), "tool_a".into());
+        acc.append_arguments(0, "partial");
+        acc.finalize_arguments(0, r#"{"complete": true}"#);
 
-        acc.apply_delta(&DeltaToolCall {
-            index: 0,
-            id: Some("c1".into()),
-            function: Some(DeltaFunction {
-                name: Some("tool_a".into()),
-                arguments: Some("{}".into()),
-            }),
-        });
+        let calls = acc.into_tool_calls();
+        assert_eq!(calls[0].arguments, r#"{"complete": true}"#);
+    }
 
-        acc.apply_delta(&DeltaToolCall {
-            index: 1,
-            id: Some("c2".into()),
-            function: Some(DeltaFunction {
-                name: Some("tool_b".into()),
-                arguments: Some("{}".into()),
-            }),
-        });
+    #[test]
+    fn response_tool_accumulator_multiple_tools() {
+        let mut acc = ResponseToolAccumulator::default();
+        acc.register(0, "c1".into(), "tool_a".into());
+        acc.register(1, "c2".into(), "tool_b".into());
+        acc.finalize_arguments(0, "{}");
+        acc.finalize_arguments(1, "{}");
 
         let calls = acc.into_tool_calls();
         assert_eq!(calls.len(), 2);
@@ -603,36 +971,31 @@ mod tests {
     }
 
     #[test]
-    fn request_without_tools_omits_field() {
-        let req = ChatRequest {
-            model: "gpt-5.2".into(),
-            messages: vec![],
-            stream: true,
-            tools: vec![],
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("tools"));
+    fn response_tool_accumulator_sorted_by_index() {
+        let mut acc = ResponseToolAccumulator::default();
+        // Insert out of order
+        acc.register(2, "c3".into(), "tool_c".into());
+        acc.register(0, "c1".into(), "tool_a".into());
+        acc.register(1, "c2".into(), "tool_b".into());
+        acc.finalize_arguments(0, "{}");
+        acc.finalize_arguments(1, "{}");
+        acc.finalize_arguments(2, "{}");
+
+        let calls = acc.into_tool_calls();
+        assert_eq!(calls[0].name, "tool_a");
+        assert_eq!(calls[1].name, "tool_b");
+        assert_eq!(calls[2].name, "tool_c");
     }
 
+    // --- Client builder test ---
+
     #[test]
-    fn request_with_tools_includes_field() {
-        let def = ToolDefinition::new("test", "desc", serde_json::json!({"type": "object"}));
-        let req = ChatRequest {
-            model: "gpt-5.2".into(),
-            messages: vec![],
-            stream: true,
-            tools: vec![ChatTool::from(&def)],
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"tools\""));
-        assert!(json.contains("\"function\""));
-        assert!(json.contains("\"test\""));
+    fn client_builder() {
+        let client = OpenAiClient::new("test-key".into())
+            .with_model("gpt-3.5-turbo")
+            .with_base_url("http://localhost:8080");
+        assert_eq!(client.model, "gpt-3.5-turbo");
+        assert_eq!(client.base_url, "http://localhost:8080");
     }
 
     #[test]
