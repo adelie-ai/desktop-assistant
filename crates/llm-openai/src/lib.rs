@@ -378,16 +378,23 @@ impl ResponseToolAccumulator {
 // ---------------------------------------------------------------------------
 
 /// Convert domain messages to Responses API input items plus an optional
-/// `instructions` string (extracted from system messages; last one wins).
+/// `instructions` string (extracted from system messages; multiple system
+/// messages are concatenated since the Responses API accepts a single string).
 fn convert_messages(messages: &[Message]) -> (Vec<InputItem>, Option<String>) {
     let mut items = Vec::new();
     let mut instructions: Option<String> = None;
 
     for msg in messages {
         match msg.role {
-            Role::System => {
-                instructions = Some(msg.content.clone());
-            }
+            Role::System => match &mut instructions {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&msg.content);
+                }
+                None => {
+                    instructions = Some(msg.content.clone());
+                }
+            },
             Role::User => {
                 items.push(InputItem::Message(InputMessage {
                     role: "user".to_string(),
@@ -690,14 +697,14 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_last_system_wins() {
+    fn convert_messages_concatenates_system_messages() {
         let msgs = vec![
             Message::new(Role::System, "first"),
             Message::new(Role::System, "second"),
             Message::new(Role::User, "hi"),
         ];
         let (_, instructions) = convert_messages(&msgs);
-        assert_eq!(instructions.as_deref(), Some("second"));
+        assert_eq!(instructions.as_deref(), Some("first\n\nsecond"));
     }
 
     #[test]

@@ -227,13 +227,17 @@ struct MessagesRequestWithToolSearch {
 /// The system prompt is returned as a `Vec<SystemBlock>` with an ephemeral cache
 /// breakpoint so the Anthropic API caches it across turns.
 fn convert_messages(messages: &[Message]) -> (Vec<SystemBlock>, Vec<AnthropicMessage>) {
-    let mut system_text = None;
+    let mut system_blocks: Vec<SystemBlock> = Vec::new();
     let mut api_messages: Vec<AnthropicMessage> = Vec::new();
 
     for msg in messages {
         match msg.role {
             Role::System => {
-                system_text = Some(msg.content.clone());
+                system_blocks.push(SystemBlock {
+                    block_type: "text",
+                    text: msg.content.clone(),
+                    cache_control: CacheControl::ephemeral(),
+                });
             }
             Role::User => {
                 api_messages.push(AnthropicMessage {
@@ -282,17 +286,7 @@ fn convert_messages(messages: &[Message]) -> (Vec<SystemBlock>, Vec<AnthropicMes
         }
     }
 
-    let system = system_text
-        .map(|text| {
-            vec![SystemBlock {
-                block_type: "text",
-                text,
-                cache_control: CacheControl::ephemeral(),
-            }]
-        })
-        .unwrap_or_default();
-
-    (system, api_messages)
+    (system_blocks, api_messages)
 }
 
 // --- SSE response types ---
@@ -998,6 +992,26 @@ mod tests {
         assert!(arr[1]["defer_loading"].as_bool().unwrap());
         // Sentinel: has type field
         assert_eq!(arr[2]["type"], "tool_search_tool_regex_20251119");
+    }
+
+    #[test]
+    fn convert_multiple_system_messages_all_preserved() {
+        let messages = vec![
+            Message::new(Role::System, "main instruction"),
+            Message::new(Role::User, "hi"),
+            Message::new(Role::System, "context summary"),
+            Message::new(Role::System, "message summary"),
+        ];
+        let (system, api_msgs) = convert_messages(&messages);
+        assert_eq!(system.len(), 3);
+        assert_eq!(system[0].text, "main instruction");
+        assert_eq!(system[1].text, "context summary");
+        assert_eq!(system[2].text, "message summary");
+        for block in &system {
+            assert_eq!(block.cache_control.cache_type, "ephemeral");
+        }
+        assert_eq!(api_msgs.len(), 1);
+        assert_eq!(api_msgs[0].role, "user");
     }
 
     #[test]
