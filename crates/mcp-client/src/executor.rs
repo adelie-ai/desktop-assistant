@@ -793,7 +793,23 @@ impl ToolExecutor for McpToolExecutor {
         let routing = self.state.tool_routing.lock().await;
         let (idx, original_name) = routing
             .get(name)
-            .ok_or_else(|| CoreError::ToolExecution(format!("unknown tool: {name}")))?
+            .ok_or_else(|| {
+                // Find tools with a similar prefix to help the model self-correct.
+                let prefix = name.find('_').map(|i| &name[..i]).unwrap_or(name);
+                let similar: Vec<&str> = routing
+                    .keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .map(|k| k.as_str())
+                    .collect();
+                if similar.is_empty() {
+                    CoreError::ToolExecution(format!("unknown tool: {name}"))
+                } else {
+                    CoreError::ToolExecution(format!(
+                        "unknown tool: {name}. Similar tools available: {}",
+                        similar.join(", ")
+                    ))
+                }
+            })?
             .clone();
         drop(routing);
 
