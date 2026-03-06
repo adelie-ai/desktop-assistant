@@ -2,9 +2,8 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
-    BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
-    EmbeddingsSettingsView, LlmSettingsView, McpServerView, PersistenceSettingsView,
-    SettingsService,
+    BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView,
+    LlmSettingsView, McpServerView, PersistenceSettingsView, SettingsService,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
@@ -254,11 +253,7 @@ impl SettingsService for DaemonSettingsService {
             .map_err(|e| CoreError::SystemService(e.to_string()))
     }
 
-    async fn set_mcp_server_enabled(
-        &self,
-        name: String,
-        enabled: bool,
-    ) -> Result<(), CoreError> {
+    async fn set_mcp_server_enabled(&self, name: String, enabled: bool) -> Result<(), CoreError> {
         let handle = self.mcp_handle()?;
         if enabled {
             handle

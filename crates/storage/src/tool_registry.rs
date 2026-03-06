@@ -23,7 +23,11 @@ impl ToolRegistryStore for PgToolRegistryStore {
         embeddings: Vec<Option<Vec<Vec<f32>>>>,
         embedding_model: Option<String>,
     ) -> Result<(), CoreError> {
-        let mut tx = self.pool.begin().await.map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         for (i, tool) in tools.iter().enumerate() {
             let embedding_vecs: Option<Vec<Vector>> = embeddings
@@ -55,7 +59,9 @@ impl ToolRegistryStore for PgToolRegistryStore {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
         }
 
-        tx.commit().await.map_err(|e| CoreError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -70,7 +76,7 @@ impl ToolRegistryStore for PgToolRegistryStore {
 
     async fn core_tools(&self) -> Result<Vec<ToolDefinition>, CoreError> {
         let rows: Vec<ToolRow> = sqlx::query_as(
-            "SELECT name, description, parameters FROM tool_definitions WHERE is_core = TRUE"
+            "SELECT name, description, parameters FROM tool_definitions WHERE is_core = TRUE",
         )
         .fetch_all(&self.pool)
         .await
@@ -121,7 +127,7 @@ impl ToolRegistryStore for PgToolRegistryStore {
                 FULL OUTER JOIN text_ranked t ON v.name = t.name
             )
             SELECT name, description, parameters, rrf_score
-            FROM fused ORDER BY rrf_score DESC LIMIT $4"
+            FROM fused ORDER BY rrf_score DESC LIMIT $4",
         )
         .bind(embedding_vec)
         .bind(fetch_limit)
@@ -136,7 +142,7 @@ impl ToolRegistryStore for PgToolRegistryStore {
 
     async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
         let row: Option<ToolRow> = sqlx::query_as(
-            "SELECT name, description, parameters FROM tool_definitions WHERE name = $1"
+            "SELECT name, description, parameters FROM tool_definitions WHERE name = $1",
         )
         .bind(name)
         .fetch_optional(&self.pool)

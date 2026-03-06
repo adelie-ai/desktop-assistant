@@ -1,10 +1,10 @@
-pub mod pool;
 pub mod conversation;
 pub mod database;
 pub mod dreaming;
 pub mod embedding_backfill;
 pub mod knowledge;
 pub mod migrate_json;
+pub mod pool;
 pub mod tool_registry;
 
 pub use conversation::PgConversationStore;

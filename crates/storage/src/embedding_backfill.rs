@@ -8,7 +8,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use desktop_assistant_core::chunking::{chunk_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP};
+use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use pgvector::Vector;
 use sqlx::PgPool;
 

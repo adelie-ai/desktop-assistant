@@ -84,11 +84,14 @@ pub async fn resolve_ws_bearer_token(config: &ConnectionConfig) -> Result<String
                     config.ws_login_username.as_deref(),
                     config.ws_login_password.as_deref(),
                 ) {
-                    request_ws_login_token(&config.ws_url, username, password).await
-                        .map_err(|login_error| anyhow::anyhow!(
-                            "failed to obtain websocket token via D-Bus ({dbus_error}); \
+                    request_ws_login_token(&config.ws_url, username, password)
+                        .await
+                        .map_err(|login_error| {
+                            anyhow::anyhow!(
+                                "failed to obtain websocket token via D-Bus ({dbus_error}); \
                              fallback /login on websocket host also failed ({login_error})"
-                        ))
+                            )
+                        })
                 } else {
                     Err(anyhow::anyhow!(
                         "failed to obtain websocket token via D-Bus ({dbus_error}); \

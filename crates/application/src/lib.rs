@@ -626,11 +626,9 @@ where
                 // (the core service may generate a title after the first message).
                 if let Ok(conv) = self
                     .conversations
-                    .get_conversation(
-                        &desktop_assistant_core::domain::ConversationId::from(
-                            conversation_id.as_str(),
-                        ),
-                    )
+                    .get_conversation(&desktop_assistant_core::domain::ConversationId::from(
+                        conversation_id.as_str(),
+                    ))
                     .await
                 {
                     let _ = sink
@@ -819,9 +817,7 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn get_backend_tasks_settings(
-            &self,
-        ) -> Result<BackendTasksSettingsView, CoreError> {
+        async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {
             Ok(BackendTasksSettingsView {
                 has_separate_llm: false,
                 llm_connector: "openai".into(),
@@ -841,19 +837,36 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+        async fn list_mcp_servers(
+            &self,
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
         }
-        async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+        async fn add_mcp_server(
+            &self,
+            _name: String,
+            _command: String,
+            _args: Vec<String>,
+            _namespace: Option<String>,
+            _enabled: bool,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
         async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
+        async fn set_mcp_server_enabled(
+            &self,
+            _name: String,
+            _enabled: bool,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+        async fn mcp_server_action(
+            &self,
+            _action: String,
+            _server: Option<String>,
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
         }
     }
@@ -1027,9 +1040,7 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn get_backend_tasks_settings(
-            &self,
-        ) -> Result<BackendTasksSettingsView, CoreError> {
+        async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {
             Ok(BackendTasksSettingsView {
                 has_separate_llm: false,
                 llm_connector: "openai".into(),
@@ -1049,19 +1060,36 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+        async fn list_mcp_servers(
+            &self,
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
         }
-        async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+        async fn add_mcp_server(
+            &self,
+            _name: String,
+            _command: String,
+            _args: Vec<String>,
+            _namespace: Option<String>,
+            _enabled: bool,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
         async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
+        async fn set_mcp_server_enabled(
+            &self,
+            _name: String,
+            _enabled: bool,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+        async fn mcp_server_action(
+            &self,
+            _action: String,
+            _server: Option<String>,
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
         }
     }

@@ -186,7 +186,10 @@ mod tests {
 
         let json = serde_json::to_string(&conv).unwrap();
         let deserialized: Conversation = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.context_summary, "User asked about Rust lifetimes.");
+        assert_eq!(
+            deserialized.context_summary,
+            "User asked about Rust lifetimes."
+        );
         assert_eq!(deserialized.compacted_through, 25);
     }
 

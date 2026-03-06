@@ -165,11 +165,13 @@ fn rows_to_json(rows: &[PgRow]) -> Result<serde_json::Value, CoreError> {
 /// Convert a single column value from a PgRow into a serde_json::Value.
 fn pg_value_to_json(row: &PgRow, index: usize, type_name: &str) -> serde_json::Value {
     match type_name {
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" => match row.try_get::<Option<String>, _>(index) {
-            Ok(Some(v)) => serde_json::Value::String(v),
-            Ok(None) => serde_json::Value::Null,
-            Err(_) => serde_json::Value::Null,
-        },
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" => {
+            match row.try_get::<Option<String>, _>(index) {
+                Ok(Some(v)) => serde_json::Value::String(v),
+                Ok(None) => serde_json::Value::Null,
+                Err(_) => serde_json::Value::Null,
+            }
+        }
         "UUID" => match row.try_get::<Option<uuid::Uuid>, _>(index) {
             Ok(Some(v)) => serde_json::Value::String(v.to_string()),
             Ok(None) => serde_json::Value::Null,
@@ -209,12 +211,10 @@ fn pg_value_to_json(row: &PgRow, index: usize, type_name: &str) -> serde_json::V
             match row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(index) {
                 Ok(Some(v)) => serde_json::Value::String(v.to_rfc3339()),
                 Ok(None) => serde_json::Value::Null,
-                Err(_) => {
-                    match row.try_get::<Option<chrono::NaiveDateTime>, _>(index) {
-                        Ok(Some(v)) => serde_json::Value::String(v.to_string()),
-                        _ => serde_json::Value::Null,
-                    }
-                }
+                Err(_) => match row.try_get::<Option<chrono::NaiveDateTime>, _>(index) {
+                    Ok(Some(v)) => serde_json::Value::String(v.to_string()),
+                    _ => serde_json::Value::Null,
+                },
             }
         }
         "DATE" => match row.try_get::<Option<chrono::NaiveDate>, _>(index) {

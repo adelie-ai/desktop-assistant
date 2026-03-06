@@ -34,7 +34,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                     embedding = EXCLUDED.embedding,
                     embedding_model = EXCLUDED.embedding_model,
                     updated_at = NOW()
-             RETURNING id, content, tags, metadata, created_at, updated_at"
+             RETURNING id, content, tags, metadata, created_at, updated_at",
         )
         .bind(&entry.id)
         .bind(&entry.content)
@@ -97,7 +97,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                 FULL OUTER JOIN text_ranked t ON v.id = t.id
             )
             SELECT id, content, tags, metadata, created_at, updated_at, rrf_score
-            FROM fused ORDER BY rrf_score DESC LIMIT $5"
+            FROM fused ORDER BY rrf_score DESC LIMIT $5",
         )
         .bind(embedding_vec)
         .bind(&tags)
@@ -123,7 +123,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
     async fn get(&self, id: &str) -> Result<Option<KnowledgeEntry>, CoreError> {
         let row: Option<KbRow> = sqlx::query_as(
             "SELECT id, content, tags, metadata, created_at, updated_at
-             FROM knowledge_base WHERE id = $1"
+             FROM knowledge_base WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)

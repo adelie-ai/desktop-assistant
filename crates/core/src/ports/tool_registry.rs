@@ -20,15 +20,11 @@ pub trait ToolRegistryStore: Send + Sync {
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
     /// Remove all tool definitions registered by a given source.
-    fn unregister_source(
-        &self,
-        source: &str,
-    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+    fn unregister_source(&self, source: &str)
+    -> impl Future<Output = Result<(), CoreError>> + Send;
 
     /// Return tool definitions marked as core (always sent to LLM).
-    fn core_tools(
-        &self,
-    ) -> impl Future<Output = Result<Vec<ToolDefinition>, CoreError>> + Send;
+    fn core_tools(&self) -> impl Future<Output = Result<Vec<ToolDefinition>, CoreError>> + Send;
 
     /// Hybrid search for tool definitions using vector similarity + full-text search via RRF.
     fn search_tools(
@@ -60,7 +56,8 @@ pub type ToolSearchFn = Arc<
 pub type ToolDefinitionFn = Arc<
     dyn Fn(
             String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<ToolDefinition>, CoreError>> + Send>>
+        )
+            -> Pin<Box<dyn Future<Output = Result<Option<ToolDefinition>, CoreError>> + Send>>
         + Send
         + Sync,
 >;
@@ -100,10 +97,7 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn tool_definition(
-            &self,
-            _name: &str,
-        ) -> Result<Option<ToolDefinition>, CoreError> {
+        async fn tool_definition(&self, _name: &str) -> Result<Option<ToolDefinition>, CoreError> {
             Ok(None)
         }
     }

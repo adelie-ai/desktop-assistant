@@ -276,10 +276,19 @@ impl SettingsService for FakeSettings {
     ) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+    async fn list_mcp_servers(
+        &self,
+    ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
         Ok(vec![])
     }
-    async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+    async fn add_mcp_server(
+        &self,
+        _name: String,
+        _command: String,
+        _args: Vec<String>,
+        _namespace: Option<String>,
+        _enabled: bool,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
     async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
@@ -288,7 +297,11 @@ impl SettingsService for FakeSettings {
     async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+    async fn mcp_server_action(
+        &self,
+        _action: String,
+        _server: Option<String>,
+    ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
         Ok(vec![])
     }
 }
@@ -478,10 +491,19 @@ impl SettingsService for StatefulSettings {
     ) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+    async fn list_mcp_servers(
+        &self,
+    ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
         Ok(vec![])
     }
-    async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+    async fn add_mcp_server(
+        &self,
+        _name: String,
+        _command: String,
+        _args: Vec<String>,
+        _namespace: Option<String>,
+        _enabled: bool,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
     async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
@@ -490,7 +512,11 @@ impl SettingsService for StatefulSettings {
     async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+    async fn mcp_server_action(
+        &self,
+        _action: String,
+        _server: Option<String>,
+    ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
         Ok(vec![])
     }
 }

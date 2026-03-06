@@ -93,7 +93,9 @@ fn find_split_point(text: &str, max_pos: usize) -> usize {
     }
 
     // Try word boundary.
-    if let Some(pos) = region.rfind(' ') && pos > max_pos / 2 {
+    if let Some(pos) = region.rfind(' ')
+        && pos > max_pos / 2
+    {
         return pos;
     }
 
@@ -140,7 +142,11 @@ mod tests {
     fn long_text_gets_chunked() {
         let text = "word ".repeat(500); // ~2500 chars
         let chunks = chunk_text(&text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        assert!(chunks.len() > 1, "expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
         for chunk in &chunks {
             // Each chunk should be at most max_chars + some tolerance for overlap tail
             assert!(
@@ -157,7 +163,11 @@ mod tests {
         let para2 = "b".repeat(800);
         let text = format!("{para1}\n\n{para2}");
         let chunks = chunk_text(&text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        assert!(chunks.len() >= 2, "expected >= 2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected >= 2 chunks, got {}",
+            chunks.len()
+        );
         assert!(chunks[0].contains(&"a".repeat(100)));
         assert!(chunks.last().unwrap().contains(&"b".repeat(100)));
     }

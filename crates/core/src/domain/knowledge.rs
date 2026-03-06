@@ -13,11 +13,7 @@ pub struct KnowledgeEntry {
 }
 
 impl KnowledgeEntry {
-    pub fn new(
-        id: impl Into<String>,
-        content: impl Into<String>,
-        tags: Vec<String>,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, content: impl Into<String>, tags: Vec<String>) -> Self {
         Self {
             id: id.into(),
             content: content.into(),

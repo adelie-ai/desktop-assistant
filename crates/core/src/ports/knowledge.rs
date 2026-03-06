@@ -27,10 +27,7 @@ pub trait KnowledgeBaseStore: Send + Sync {
     ) -> impl Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
 
     /// Delete a knowledge entry by id.
-    fn delete(
-        &self,
-        id: &str,
-    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+    fn delete(&self, id: &str) -> impl Future<Output = Result<(), CoreError>> + Send;
 
     /// Get a single knowledge entry by id.
     fn get(

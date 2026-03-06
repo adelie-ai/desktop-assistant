@@ -11,7 +11,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use desktop_assistant_core::chunking::{chunk_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP};
+use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -58,7 +58,11 @@ pub async fn run_dreaming_scan(
                     "dreaming: consolidation updated {} and deleted {} memor{}",
                     stats.updated,
                     stats.deleted,
-                    if stats.updated + stats.deleted == 1 { "y" } else { "ies" }
+                    if stats.updated + stats.deleted == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
                 );
             } else {
                 tracing::debug!("dreaming: consolidation found no changes needed");
@@ -119,14 +123,8 @@ async fn run_extraction_phase(
         let facts = parse_extracted_facts(&response);
 
         for fact in &facts {
-            match dedup_and_write_fact(
-                pool,
-                embed_fn,
-                embedding_model,
-                &fact.content,
-                &fact.tags,
-            )
-            .await
+            match dedup_and_write_fact(pool, embed_fn, embedding_model, &fact.content, &fact.tags)
+                .await
             {
                 Ok(true) => total_facts += 1,
                 Ok(false) => {} // duplicate, skipped
@@ -194,8 +192,15 @@ async fn run_consolidation_phase(
                 new_content,
                 new_tags,
             } => {
-                match apply_update(pool, embed_fn, embedding_model, &id, &new_content, &new_tags)
-                    .await
+                match apply_update(
+                    pool,
+                    embed_fn,
+                    embedding_model,
+                    &id,
+                    &new_content,
+                    &new_tags,
+                )
+                .await
                 {
                     Ok(()) => {
                         tracing::info!(
@@ -207,15 +212,13 @@ async fn run_consolidation_phase(
                     Err(e) => tracing::warn!("dreaming: failed to update memory {id}: {e}"),
                 }
             }
-            ConsolidationOp::Delete { id, reason } => {
-                match apply_delete(pool, &id).await {
-                    Ok(()) => {
-                        tracing::info!("dreaming: removed memory {id}: {reason}");
-                        deleted += 1;
-                    }
-                    Err(e) => tracing::warn!("dreaming: failed to delete memory {id}: {e}"),
+            ConsolidationOp::Delete { id, reason } => match apply_delete(pool, &id).await {
+                Ok(()) => {
+                    tracing::info!("dreaming: removed memory {id}: {reason}");
+                    deleted += 1;
                 }
-            }
+                Err(e) => tracing::warn!("dreaming: failed to delete memory {id}: {e}"),
+            },
         }
     }
 
@@ -224,7 +227,9 @@ async fn run_consolidation_phase(
 
 /// Load KB entries for consolidation review.
 /// Returns `(id, content, tags)` tuples.
-async fn load_kb_entries_for_review(pool: &PgPool) -> Result<Vec<(String, String, Vec<String>)>, String> {
+async fn load_kb_entries_for_review(
+    pool: &PgPool,
+) -> Result<Vec<(String, String, Vec<String>)>, String> {
     let rows: Vec<(String, String, Vec<String>)> = sqlx::query_as(
         "SELECT id, content, tags FROM knowledge_base
          ORDER BY updated_at DESC
@@ -459,13 +464,12 @@ async fn load_new_transcript(
 
 /// Get the maximum message ordinal for a conversation.
 async fn get_max_ordinal(pool: &PgPool, conversation_id: &str) -> Result<i32, String> {
-    let row: (Option<i32>,) = sqlx::query_as(
-        "SELECT MAX(ordinal) FROM messages WHERE conversation_id = $1",
-    )
-    .bind(conversation_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("dreaming: failed to get max ordinal: {e}"))?;
+    let row: (Option<i32>,) =
+        sqlx::query_as("SELECT MAX(ordinal) FROM messages WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("dreaming: failed to get max ordinal: {e}"))?;
 
     Ok(row.0.unwrap_or(0))
 }
@@ -528,7 +532,9 @@ fn build_extraction_user_prompt(context_summary: &str, transcript: &str) -> Stri
 
     prompt.push_str("## Recent messages\n\n");
     prompt.push_str(transcript);
-    prompt.push_str("\n\nExtract any important long-term facts from the above transcript. Return a JSON array.");
+    prompt.push_str(
+        "\n\nExtract any important long-term facts from the above transcript. Return a JSON array.",
+    );
 
     prompt
 }
@@ -601,7 +607,10 @@ fn extract_json_array(text: &str) -> String {
     }
 
     // Try to find bare [ ... ] in the text
-    if let Some(start) = text.find('[') && let Some(end) = text.rfind(']') && end > start {
+    if let Some(start) = text.find('[')
+        && let Some(end) = text.rfind(']')
+        && end > start
+    {
         return text[start..=end].to_string();
     }
 
@@ -638,7 +647,9 @@ async fn dedup_and_write_fact(
     .await
     .map_err(|e| format!("dreaming: dedup search failed: {e}"))?;
 
-    if let Some((distance,)) = closest_distance && distance < DEDUP_DISTANCE_THRESHOLD {
+    if let Some((distance,)) = closest_distance
+        && distance < DEDUP_DISTANCE_THRESHOLD
+    {
         tracing::debug!(
             "dreaming: skipping duplicate fact (distance={distance:.4}): {}",
             &content[..content.len().min(80)]
@@ -804,7 +815,8 @@ That's all I found."#;
 
     #[test]
     fn parse_consolidation_delete_op() {
-        let response = r#"[{"op": "delete", "id": "old-entry", "reason": "Superseded by newer entry"}]"#;
+        let response =
+            r#"[{"op": "delete", "id": "old-entry", "reason": "Superseded by newer entry"}]"#;
 
         let ops = parse_consolidation_operations(response);
         assert_eq!(ops.len(), 1);
@@ -866,7 +878,11 @@ That's all I found."#;
     #[test]
     fn consolidation_prompt_lists_entries() {
         let entries = vec![
-            ("id-1".to_string(), "Fact one".to_string(), vec!["tag1".to_string()]),
+            (
+                "id-1".to_string(),
+                "Fact one".to_string(),
+                vec!["tag1".to_string()],
+            ),
             ("id-2".to_string(), "Fact two".to_string(), vec![]),
         ];
         let prompt = build_consolidation_user_prompt(&entries);

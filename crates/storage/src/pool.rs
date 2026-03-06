@@ -35,21 +35,27 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     // Vector tables — each run independently so one failure doesn't block the other.
     for (table, sql) in [
-        ("knowledge_base", include_str!("../migrations/002_vector_tables.sql")),
-        ("tool_definitions", concat!(
-            "CREATE TABLE IF NOT EXISTS tool_definitions (",
-            "    name        TEXT PRIMARY KEY,",
-            "    description TEXT NOT NULL,",
-            "    parameters  JSONB NOT NULL,",
-            "    source      TEXT NOT NULL,",
-            "    is_core     BOOLEAN NOT NULL DEFAULT FALSE,",
-            "    embedding   vector,",
-            "    tsv         tsvector GENERATED ALWAYS AS (",
-            "                    to_tsvector('english', name || ' ' || description)",
-            "                ) STORED,",
-            "    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-            ");"
-        )),
+        (
+            "knowledge_base",
+            include_str!("../migrations/002_vector_tables.sql"),
+        ),
+        (
+            "tool_definitions",
+            concat!(
+                "CREATE TABLE IF NOT EXISTS tool_definitions (",
+                "    name        TEXT PRIMARY KEY,",
+                "    description TEXT NOT NULL,",
+                "    parameters  JSONB NOT NULL,",
+                "    source      TEXT NOT NULL,",
+                "    is_core     BOOLEAN NOT NULL DEFAULT FALSE,",
+                "    embedding   vector,",
+                "    tsv         tsvector GENERATED ALWAYS AS (",
+                "                    to_tsvector('english', name || ' ' || description)",
+                "                ) STORED,",
+                "    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+                ");"
+            ),
+        ),
     ] {
         if let Err(e) = sqlx::raw_sql(sql).execute(pool).await {
             tracing::warn!("could not create {table} table (pgvector may be missing): {e}");
@@ -65,10 +71,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     }
 
     // Track which embedding model produced each vector.
-    if let Err(e) =
-        sqlx::raw_sql(include_str!("../migrations/004_embedding_model_tracking.sql"))
-            .execute(pool)
-            .await
+    if let Err(e) = sqlx::raw_sql(include_str!(
+        "../migrations/004_embedding_model_tracking.sql"
+    ))
+    .execute(pool)
+    .await
     {
         tracing::warn!("could not apply embedding model tracking migration: {e}");
     }
@@ -79,19 +86,17 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .await?;
 
     // Dreaming watermarks — tracks per-conversation extraction progress.
-    if let Err(e) =
-        sqlx::raw_sql(include_str!("../migrations/006_dreaming_watermarks.sql"))
-            .execute(pool)
-            .await
+    if let Err(e) = sqlx::raw_sql(include_str!("../migrations/006_dreaming_watermarks.sql"))
+        .execute(pool)
+        .await
     {
         tracing::warn!("could not apply dreaming watermarks migration: {e}");
     }
 
     // Chunked embeddings — knowledge_base.embedding becomes vector[].
-    if let Err(e) =
-        sqlx::raw_sql(include_str!("../migrations/007_chunked_embeddings.sql"))
-            .execute(pool)
-            .await
+    if let Err(e) = sqlx::raw_sql(include_str!("../migrations/007_chunked_embeddings.sql"))
+        .execute(pool)
+        .await
     {
         tracing::warn!("could not apply chunked embeddings migration: {e}");
     }

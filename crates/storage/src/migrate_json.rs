@@ -65,10 +65,7 @@ struct LegacyMemoryStore {
 /// `PgConversationStore::create`. Skips conversations with no messages.
 ///
 /// Returns the number of conversations migrated.
-pub async fn migrate_conversations(
-    json_path: &Path,
-    pool: &PgPool,
-) -> Result<usize, CoreError> {
+pub async fn migrate_conversations(json_path: &Path, pool: &PgPool) -> Result<usize, CoreError> {
     if !json_path.exists() {
         tracing::info!(
             "no conversations JSON file at {}; skipping migration",
@@ -138,13 +135,12 @@ pub async fn migrate_knowledge(
         })?;
 
         if !content.trim().is_empty() {
-            let prefs: LegacyPreferenceStore =
-                serde_json::from_str(&content).map_err(|e| {
-                    CoreError::Storage(format!(
-                        "failed parsing preferences file {}: {e}",
-                        preferences_path.display()
-                    ))
-                })?;
+            let prefs: LegacyPreferenceStore = serde_json::from_str(&content).map_err(|e| {
+                CoreError::Storage(format!(
+                    "failed parsing preferences file {}: {e}",
+                    preferences_path.display()
+                ))
+            })?;
 
             for pref in prefs.items {
                 let id = format!("pref_{}", slug(&pref.key));
@@ -185,13 +181,12 @@ pub async fn migrate_knowledge(
         })?;
 
         if !content.trim().is_empty() {
-            let memories: LegacyMemoryStore =
-                serde_json::from_str(&content).map_err(|e| {
-                    CoreError::Storage(format!(
-                        "failed parsing memory file {}: {e}",
-                        memory_path.display()
-                    ))
-                })?;
+            let memories: LegacyMemoryStore = serde_json::from_str(&content).map_err(|e| {
+                CoreError::Storage(format!(
+                    "failed parsing memory file {}: {e}",
+                    memory_path.display()
+                ))
+            })?;
 
             for mem in memories.items {
                 let mut tags: Vec<String> = vec!["memory".to_string()];
@@ -229,26 +224,30 @@ pub async fn migrate_knowledge(
 
 /// Check if the conversations table is empty.
 pub async fn is_conversations_table_empty(pool: &PgPool) -> bool {
-    let result: Result<(i64,), _> =
-        sqlx::query_as("SELECT COUNT(*) FROM conversations")
-            .fetch_one(pool)
-            .await;
+    let result: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM conversations")
+        .fetch_one(pool)
+        .await;
     matches!(result, Ok((0,)))
 }
 
 /// Check if the knowledge_base table is empty.
 pub async fn is_knowledge_base_table_empty(pool: &PgPool) -> bool {
-    let result: Result<(i64,), _> =
-        sqlx::query_as("SELECT COUNT(*) FROM knowledge_base")
-            .fetch_one(pool)
-            .await;
+    let result: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM knowledge_base")
+        .fetch_one(pool)
+        .await;
     matches!(result, Ok((0,)))
 }
 
 /// Create a simple slug from a key string for use as an ID.
 fn slug(key: &str) -> String {
     key.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim_matches('_')
         .to_string()

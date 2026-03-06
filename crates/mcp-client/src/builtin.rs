@@ -5,9 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{Local, SecondsFormat, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
-use desktop_assistant_core::ports::embedding::EmbedFn;
-use desktop_assistant_core::ports::knowledge::{KnowledgeDeleteFn, KnowledgeSearchFn, KnowledgeWriteFn};
 use desktop_assistant_core::ports::database::DbQueryFn;
+use desktop_assistant_core::ports::embedding::EmbedFn;
+use desktop_assistant_core::ports::knowledge::{
+    KnowledgeDeleteFn, KnowledgeSearchFn, KnowledgeWriteFn,
+};
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
 
 use crate::executor::McpControlHandle;
@@ -312,9 +314,10 @@ impl BuiltinToolService {
     }
 
     async fn kb_write(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let write_fn = self.kb_write_fn.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("knowledge base not configured".to_string())
-        })?;
+        let write_fn = self
+            .kb_write_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
 
         let content = required_string(&arguments, "content")?;
         let tags = optional_string_array(&arguments, "tags");
@@ -322,8 +325,8 @@ impl BuiltinToolService {
             .get("metadata")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let id = optional_string(&arguments, "id")
-            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let id =
+            optional_string(&arguments, "id").unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
         let entry = desktop_assistant_core::domain::KnowledgeEntry {
             id,
@@ -358,9 +361,10 @@ impl BuiltinToolService {
     }
 
     async fn kb_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let search_fn = self.kb_search_fn.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("knowledge base not configured".to_string())
-        })?;
+        let search_fn = self
+            .kb_search_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
 
         let query = required_string(&arguments, "query")?;
         let tags = optional_string_array_nonempty(&arguments, "tags");
@@ -399,9 +403,10 @@ impl BuiltinToolService {
     }
 
     async fn kb_delete(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let delete_fn = self.kb_delete_fn.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("knowledge base not configured".to_string())
-        })?;
+        let delete_fn = self
+            .kb_delete_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
 
         let id = required_string(&arguments, "id")?;
         delete_fn(id.clone()).await?;
@@ -414,9 +419,10 @@ impl BuiltinToolService {
     }
 
     async fn tool_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let search_fn = self.tool_search_fn.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("tool registry not configured".to_string())
-        })?;
+        let search_fn = self
+            .tool_search_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("tool registry not configured".to_string()))?;
 
         let query = required_string(&arguments, "query")?;
         tracing::info!(query = %query, "tool search");
@@ -436,7 +442,11 @@ impl BuiltinToolService {
             .collect();
 
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        tracing::info!(result_count = tools.len(), ?tool_names, "tool search results");
+        tracing::info!(
+            result_count = tools.len(),
+            ?tool_names,
+            "tool search results"
+        );
 
         Ok(serde_json::json!({
             "ok": true,
@@ -446,9 +456,10 @@ impl BuiltinToolService {
     }
 
     async fn db_query(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let query_fn = self.db_query_fn.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("database query not configured".to_string())
-        })?;
+        let query_fn = self
+            .db_query_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("database query not configured".to_string()))?;
 
         let query = required_string(&arguments, "query")?;
         let limit = arguments
@@ -469,9 +480,10 @@ impl BuiltinToolService {
     }
 
     async fn mcp_control(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let handle = self.mcp_handle.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("MCP control not configured".to_string())
-        })?;
+        let handle = self
+            .mcp_handle
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("MCP control not configured".to_string()))?;
 
         let action = required_string(&arguments, "action")?;
         let server = optional_string(&arguments, "server");
@@ -547,7 +559,7 @@ impl BuiltinToolService {
     /// Chunk text and embed each chunk, returning None if embeddings are unavailable.
     /// Used for KB writes where content may exceed the model's context window.
     async fn embed_chunks(&self, text: &str) -> Option<Vec<Vec<f32>>> {
-        use desktop_assistant_core::chunking::{chunk_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP};
+        use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 
         let embed_fn = self.embed_fn.as_ref()?;
         let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
@@ -783,10 +795,7 @@ mod tests {
     async fn kb_write_without_store_returns_error() {
         let service = BuiltinToolService::new();
         let result = service
-            .execute_tool(
-                TOOL_KB_WRITE,
-                serde_json::json!({"content": "test"}),
-            )
+            .execute_tool(TOOL_KB_WRITE, serde_json::json!({"content": "test"}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
     }
@@ -795,10 +804,7 @@ mod tests {
     async fn kb_search_without_store_returns_error() {
         let service = BuiltinToolService::new();
         let result = service
-            .execute_tool(
-                TOOL_KB_SEARCH,
-                serde_json::json!({"query": "test"}),
-            )
+            .execute_tool(TOOL_KB_SEARCH, serde_json::json!({"query": "test"}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
     }
@@ -807,18 +813,15 @@ mod tests {
     async fn db_query_without_database_returns_error() {
         let service = BuiltinToolService::new();
         let result = service
-            .execute_tool(
-                TOOL_DB_QUERY,
-                serde_json::json!({"query": "SELECT 1"}),
-            )
+            .execute_tool(TOOL_DB_QUERY, serde_json::json!({"query": "SELECT 1"}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
     }
 
     #[tokio::test]
     async fn db_query_with_closure() {
-        use std::sync::Arc;
         use desktop_assistant_core::ports::database::DbQueryFn;
+        use std::sync::Arc;
 
         let query_fn: DbQueryFn = Arc::new(|_sql, _limit| {
             Box::pin(async {
@@ -849,31 +852,29 @@ mod tests {
     async fn tool_search_without_registry_returns_error() {
         let service = BuiltinToolService::new();
         let result = service
-            .execute_tool(
-                TOOL_SEARCH,
-                serde_json::json!({"query": "file operations"}),
-            )
+            .execute_tool(TOOL_SEARCH, serde_json::json!({"query": "file operations"}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
     }
 
     #[tokio::test]
     async fn kb_write_and_search_with_closures() {
-        use std::sync::{Arc, Mutex};
         use desktop_assistant_core::domain::KnowledgeEntry;
+        use std::sync::{Arc, Mutex};
 
         let store: Arc<Mutex<Vec<KnowledgeEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
         let write_store = Arc::clone(&store);
-        let write_fn: KnowledgeWriteFn = Arc::new(move |mut entry, _embedding: Option<Vec<Vec<f32>>>| {
-            let s = Arc::clone(&write_store);
-            Box::pin(async move {
-                entry.created_at = "2024-01-01".to_string();
-                entry.updated_at = "2024-01-01".to_string();
-                s.lock().unwrap().push(entry.clone());
-                Ok(entry)
-            })
-        });
+        let write_fn: KnowledgeWriteFn =
+            Arc::new(move |mut entry, _embedding: Option<Vec<Vec<f32>>>| {
+                let s = Arc::clone(&write_store);
+                Box::pin(async move {
+                    entry.created_at = "2024-01-01".to_string();
+                    entry.updated_at = "2024-01-01".to_string();
+                    s.lock().unwrap().push(entry.clone());
+                    Ok(entry)
+                })
+            });
 
         let search_store = Arc::clone(&store);
         let search_fn: KnowledgeSearchFn = Arc::new(move |_query, _emb, _tags, limit| {
@@ -884,12 +885,9 @@ mod tests {
             })
         });
 
-        let delete_fn: KnowledgeDeleteFn = Arc::new(|_id| {
-            Box::pin(async { Ok(()) })
-        });
+        let delete_fn: KnowledgeDeleteFn = Arc::new(|_id| Box::pin(async { Ok(()) }));
 
-        let service = BuiltinToolService::new()
-            .with_knowledge_base(write_fn, search_fn, delete_fn);
+        let service = BuiltinToolService::new().with_knowledge_base(write_fn, search_fn, delete_fn);
 
         // Write
         let write_result = service
@@ -908,43 +906,42 @@ mod tests {
 
         // Search
         let search_result = service
-            .execute_tool(
-                TOOL_KB_SEARCH,
-                serde_json::json!({"query": "dark mode"}),
-            )
+            .execute_tool(TOOL_KB_SEARCH, serde_json::json!({"query": "dark mode"}))
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&search_result).unwrap();
         assert_eq!(json["ok"], true);
         let results = json["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0]["content"].as_str().unwrap().contains("dark mode"));
+        assert!(
+            results[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("dark mode")
+        );
     }
 
     #[tokio::test]
     async fn tool_search_with_closure() {
-        use std::sync::Arc;
         use desktop_assistant_core::domain::ToolDefinition;
+        use std::sync::Arc;
 
         let search_fn: ToolSearchFn = Arc::new(|_query, _emb, _limit| {
             Box::pin(async {
-                Ok(vec![
-                    ToolDefinition::new("jira__create_issue", "Create a Jira issue", serde_json::json!({})),
-                ])
+                Ok(vec![ToolDefinition::new(
+                    "jira__create_issue",
+                    "Create a Jira issue",
+                    serde_json::json!({}),
+                )])
             })
         });
 
-        let def_fn: ToolDefinitionFn = Arc::new(|_name| {
-            Box::pin(async { Ok(None) })
-        });
+        let def_fn: ToolDefinitionFn = Arc::new(|_name| Box::pin(async { Ok(None) }));
 
         let service = BuiltinToolService::new().with_tool_registry(search_fn, def_fn);
 
         let result = service
-            .execute_tool(
-                TOOL_SEARCH,
-                serde_json::json!({"query": "create ticket"}),
-            )
+            .execute_tool(TOOL_SEARCH, serde_json::json!({"query": "create ticket"}))
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();

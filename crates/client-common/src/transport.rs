@@ -93,11 +93,9 @@ pub async fn connect_transport(
             Ok((TransportClient::Dbus(client), signal_rx))
         }
         #[cfg(not(feature = "dbus"))]
-        TransportMode::Dbus => {
-            Err(anyhow::anyhow!(
-                "D-Bus transport is not available (compiled without dbus feature)"
-            ))
-        }
+        TransportMode::Dbus => Err(anyhow::anyhow!(
+            "D-Bus transport is not available (compiled without dbus feature)"
+        )),
         TransportMode::Ws => {
             let token = resolve_ws_bearer_token(config).await?;
             let (client, signal_rx) = WsClient::connect(&config.ws_url, &token).await?;
