@@ -459,6 +459,11 @@ async fn main() -> Result<()> {
         }
     };
 
+    let profiling = daemon_config
+        .as_ref()
+        .map(|c| c.profiling.clone())
+        .unwrap_or_default();
+
     let resolved_llm = config::resolve_llm_config(daemon_config.as_ref());
     tracing::info!(
         "LLM connector={}, model={}, base_url={}",
@@ -868,7 +873,12 @@ async fn main() -> Result<()> {
 
             let dreaming_llm = build_llm_client(resolved_bt_llm);
             let dreaming_llm = RetryingLlmClient::new(dreaming_llm, 3);
-            let dreaming_llm = MaybeProfiled::from_env(dreaming_llm);
+            let dreaming_llm = MaybeProfiled::from_config(
+                dreaming_llm,
+                profiling.enabled,
+                profiling.log_path.as_deref(),
+                profiling.full_content,
+            );
             let dreaming_llm = Arc::new(dreaming_llm);
 
             let pool = pool.clone();
@@ -965,7 +975,12 @@ async fn main() -> Result<()> {
     };
 
     let llm = RetryingLlmClient::new(llm, 3);
-    let llm = MaybeProfiled::from_env(llm);
+    let llm = MaybeProfiled::from_config(
+        llm,
+        profiling.enabled,
+        profiling.log_path.as_deref(),
+        profiling.full_content,
+    );
     let mut handler = ConversationHandler::with_tools(
         conversation_store,
         llm,
@@ -987,7 +1002,12 @@ async fn main() -> Result<()> {
         );
         let bt_llm = build_llm_client(resolved_bt);
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
-        let bt_llm = MaybeProfiled::from_env(bt_llm);
+        let bt_llm = MaybeProfiled::from_config(
+            bt_llm,
+            profiling.enabled,
+            profiling.log_path.as_deref(),
+            profiling.full_content,
+        );
         handler = handler.with_backend_llm(bt_llm);
     }
 

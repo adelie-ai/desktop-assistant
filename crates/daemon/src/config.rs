@@ -23,6 +23,8 @@ pub struct DaemonConfig {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub backend_tasks: BackendTasksConfig,
+    #[serde(default)]
+    pub profiling: ProfilingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +53,20 @@ impl Default for BackendTasksConfig {
 
 fn default_dreaming_interval_secs() -> u64 {
     3600
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ProfilingConfig {
+    /// Enable LLM call profiling. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path for the JSONL profile log.
+    /// Defaults to `~/.local/share/desktop-assistant/llm-profile.jsonl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    /// Log full message/response content instead of previews. Default: false.
+    #[serde(default)]
+    pub full_content: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

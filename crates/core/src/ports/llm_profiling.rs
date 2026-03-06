@@ -281,6 +281,57 @@ impl<L> MaybeProfiled<L> {
             _ => Self::Plain(inner),
         }
     }
+
+    /// Build from config values with env var override.
+    ///
+    /// Precedence: `LLM_PROFILE_LOG` env var → config `enabled` → off.
+    pub fn from_config(
+        inner: L,
+        enabled: bool,
+        log_path: Option<&str>,
+        full_content: bool,
+    ) -> Self {
+        // Env var overrides config entirely (backwards compat).
+        if let Ok(env_path) = std::env::var("LLM_PROFILE_LOG") {
+            if !env_path.is_empty() {
+                let env_full = std::env::var("LLM_PROFILE_FULL")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                tracing::info!("LLM profiling enabled (env) → {env_path}");
+                return Self::Profiled(ProfilingLlmClient::new(
+                    inner,
+                    PathBuf::from(env_path),
+                    env_full,
+                ));
+            }
+        }
+
+        if !enabled {
+            return Self::Plain(inner);
+        }
+
+        let resolve_tilde = |p: &str| -> PathBuf {
+            if p.starts_with("~/") {
+                if let Ok(home) = std::env::var("HOME") {
+                    return PathBuf::from(home).join(&p[2..]);
+                }
+            }
+            PathBuf::from(p)
+        };
+
+        let path = log_path.map(|p| resolve_tilde(p)).unwrap_or_else(|| {
+            let data_dir = std::env::var("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                    PathBuf::from(home).join(".local/share")
+                });
+            data_dir.join("desktop-assistant/llm-profile.jsonl")
+        });
+
+        tracing::info!("LLM profiling enabled (config) → {}", path.display());
+        Self::Profiled(ProfilingLlmClient::new(inner, path, full_content))
+    }
 }
 
 impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
