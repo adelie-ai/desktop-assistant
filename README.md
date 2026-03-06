@@ -130,7 +130,7 @@ cargo build --workspace
 ### 2) Configure connector
 
 Default connector is `openai`.
-Default OpenAI model is `gpt-5.2`.
+Default OpenAI model is `gpt-5.4`.
 
 To opt into local Ollama instead, set `llm.connector = "ollama"` in your daemon config (`$XDG_CONFIG_HOME/desktop-assistant/daemon.toml`, or `~/.config/desktop-assistant/daemon.toml`).
 
@@ -142,7 +142,7 @@ export ANTHROPIC_API_KEY=your_key_here
 export AWS_REGION=us-east-1
 
 # optional connector overrides:
-export OPENAI_MODEL=gpt-5.2
+export OPENAI_MODEL=gpt-5.4
 export OPENAI_BASE_URL=https://api.openai.com/v1
 
 # optional Bedrock API key field format accepted by this daemon:

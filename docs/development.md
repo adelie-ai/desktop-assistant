@@ -163,12 +163,12 @@ systemctl --user restart desktop-assistant-daemon
 Optional:
 
 ```bash
-export OPENAI_MODEL=gpt-5.2
+export OPENAI_MODEL=gpt-5.4
 export OPENAI_BASE_URL=https://api.openai.com/v1
 export RUST_LOG=info
 ```
 
-If `OPENAI_MODEL` is not set, the daemon defaults OpenAI to `gpt-5.2`.
+If `OPENAI_MODEL` is not set, the daemon defaults OpenAI to `gpt-5.4`.
 
 To enable local git versioning for built-in memory/preferences:
 

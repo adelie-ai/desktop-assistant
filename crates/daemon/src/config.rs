@@ -409,13 +409,19 @@ pub fn set_llm_settings(
         return Err(anyhow!("connector must not be empty"));
     }
 
-    if let Some(t) = temperature && !(0.0..=2.0).contains(&t) {
+    if let Some(t) = temperature
+        && !(0.0..=2.0).contains(&t)
+    {
         return Err(anyhow!("temperature must be between 0.0 and 2.0"));
     }
-    if let Some(p) = top_p && !(0.0..=1.0).contains(&p) {
+    if let Some(p) = top_p
+        && !(0.0..=1.0).contains(&p)
+    {
         return Err(anyhow!("top_p must be between 0.0 and 1.0"));
     }
-    if let Some(m) = max_tokens && m == 0 {
+    if let Some(m) = max_tokens
+        && m == 0
+    {
         return Err(anyhow!("max_tokens must be greater than 0"));
     }
 
@@ -1505,13 +1511,13 @@ mod tests {
             r#"
             [llm]
             connector = "openai"
-            model = "gpt-5.2"
+            model = "gpt-5.4"
             "#,
         )
         .unwrap();
 
         assert_eq!(parsed.llm.connector, "openai");
-        assert_eq!(parsed.llm.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(parsed.llm.model.as_deref(), Some("gpt-5.4"));
     }
 
     #[test]
@@ -1737,7 +1743,7 @@ mod tests {
     #[test]
     fn connector_defaults_openai() {
         let defaults = get_connector_defaults("openai");
-        assert_eq!(defaults.llm_model, "gpt-5.2");
+        assert_eq!(defaults.llm_model, "gpt-5.4");
         assert_eq!(defaults.llm_base_url, "https://api.openai.com/v1");
         assert_eq!(defaults.embeddings_model, "text-embedding-3-small");
         assert_eq!(defaults.embeddings_base_url, "https://api.openai.com/v1");

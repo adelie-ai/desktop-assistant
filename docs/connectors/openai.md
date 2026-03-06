@@ -6,7 +6,7 @@ Crate: `desktop-assistant-llm-openai`
 
 - Endpoint: `{base_url}/chat/completions` (POST, streaming SSE)
 - Auth: `Authorization: Bearer {api_key}`
-- Default model: `gpt-5.2`
+- Default model: `gpt-5.4`
 - Default base URL: `https://api.openai.com/v1`
 
 ## Configuration

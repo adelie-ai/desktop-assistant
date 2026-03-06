@@ -174,8 +174,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             let llm_model_set = llm_model.is_some();
             let llm_base_url_set = llm_base_url.is_some();
 
-            let connector =
-                normalize_optional_string(llm_connector).unwrap_or(current.connector);
+            let connector = normalize_optional_string(llm_connector).unwrap_or(current.connector);
             let model = if llm_model_set {
                 normalize_optional_string(llm_model)
             } else {
@@ -494,11 +493,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     }
 
     /// Update database settings. Empty url clears it.
-    async fn set_database_settings(
-        &self,
-        url: &str,
-        max_connections: u32,
-    ) -> fdo::Result<()> {
+    async fn set_database_settings(&self, url: &str, max_connections: u32) -> fdo::Result<()> {
         let url = if url.trim().is_empty() {
             None
         } else {
@@ -653,9 +648,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     /// List configured MCP servers with status.
     ///
     /// Returns: Vec<(name, command, enabled, status, tool_count)>
-    async fn list_mcp_servers(
-        &self,
-    ) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
+    async fn list_mcp_servers(&self) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
         let servers = self
             .service
             .list_mcp_servers()
@@ -690,7 +683,13 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         };
 
         self.service
-            .add_mcp_server(name.to_string(), command.to_string(), args, namespace, enabled)
+            .add_mcp_server(
+                name.to_string(),
+                command.to_string(),
+                args,
+                namespace,
+                enabled,
+            )
             .await
             .map_err(to_fdo_error)
     }
@@ -739,10 +738,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
 
     /// Signal emitted after a successful aggregate config update.
     #[zbus(signal)]
-    async fn config_changed(
-        emitter: &SignalEmitter<'_>,
-        config: &ConfigData,
-    ) -> zbus::Result<()>;
+    async fn config_changed(emitter: &SignalEmitter<'_>, config: &ConfigData) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -775,7 +771,7 @@ mod tests {
                 state: Mutex::new(SettingsState {
                     llm: LlmSettingsView {
                         connector: "openai".to_string(),
-                        model: "gpt-5.2".to_string(),
+                        model: "gpt-5.4".to_string(),
                         base_url: "https://api.openai.com/v1".to_string(),
                         has_api_key: false,
                         temperature: None,
@@ -803,7 +799,7 @@ mod tests {
                     backend_tasks: BackendTasksSettingsView {
                         has_separate_llm: false,
                         llm_connector: "openai".to_string(),
-                        llm_model: "gpt-5.2".to_string(),
+                        llm_model: "gpt-5.4".to_string(),
                         llm_base_url: "https://api.openai.com/v1".to_string(),
                         dreaming_enabled: false,
                         dreaming_interval_secs: 3600,
@@ -891,7 +887,7 @@ mod tests {
             _connector: String,
         ) -> Result<ConnectorDefaultsView, CoreError> {
             Ok(ConnectorDefaultsView {
-                llm_model: "gpt-5.2".to_string(),
+                llm_model: "gpt-5.4".to_string(),
                 llm_base_url: "https://api.openai.com/v1".to_string(),
                 embeddings_model: "text-embedding-3-small".to_string(),
                 embeddings_base_url: "https://api.openai.com/v1".to_string(),
@@ -937,9 +933,7 @@ mod tests {
             Ok(())
         }
 
-        async fn get_backend_tasks_settings(
-            &self,
-        ) -> Result<BackendTasksSettingsView, CoreError> {
+        async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {
             Ok(self.state.lock().unwrap().backend_tasks.clone())
         }
 
@@ -967,19 +961,36 @@ mod tests {
             Ok(())
         }
 
-        async fn list_mcp_servers(&self) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+        async fn list_mcp_servers(
+            &self,
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
         }
-        async fn add_mcp_server(&self, _name: String, _command: String, _args: Vec<String>, _namespace: Option<String>, _enabled: bool) -> Result<(), CoreError> {
+        async fn add_mcp_server(
+            &self,
+            _name: String,
+            _command: String,
+            _args: Vec<String>,
+            _namespace: Option<String>,
+            _enabled: bool,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
         async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn set_mcp_server_enabled(&self, _name: String, _enabled: bool) -> Result<(), CoreError> {
+        async fn set_mcp_server_enabled(
+            &self,
+            _name: String,
+            _enabled: bool,
+        ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn mcp_server_action(&self, _action: String, _server: Option<String>) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
+        async fn mcp_server_action(
+            &self,
+            _action: String,
+            _server: Option<String>,
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
         }
     }

@@ -84,7 +84,7 @@ KCM.SimpleKCM {
                         QQC2.TextField {
                             id: llmModelField
                             Layout.fillWidth: true
-                            placeholderText: "gpt-5.2 / llama3.1 / ..."
+                            placeholderText: "gpt-5.4 / llama3.1 / ..."
                             text: kcm.model
                             onTextEdited: kcm.model = text
                         }

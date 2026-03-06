@@ -278,7 +278,7 @@ mod tests {
             config: api::Config {
                 llm: api::LlmSettingsView {
                     connector: "openai".to_string(),
-                    model: "gpt-5.2".to_string(),
+                    model: "gpt-5.4".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
                     has_api_key: true,
                     temperature: None,
