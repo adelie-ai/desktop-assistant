@@ -34,12 +34,12 @@ class DesktopAssistantKcm : public KQuickConfigModule {
     Q_PROPERTY(QString selectedConnectionWsUrl READ selectedConnectionWsUrl WRITE setSelectedConnectionWsUrl NOTIFY selectedConnectionWsUrlChanged)
     Q_PROPERTY(QString selectedConnectionWsSubject READ selectedConnectionWsSubject WRITE setSelectedConnectionWsSubject NOTIFY selectedConnectionWsSubjectChanged)
     Q_PROPERTY(bool selectedConnectionRemovable READ selectedConnectionRemovable NOTIFY selectedConnectionRemovableChanged)
-    Q_PROPERTY(bool btDreamingEnabled READ btDreamingEnabled WRITE setDreamingEnabled NOTIFY btDreamingEnabledChanged)
-    Q_PROPERTY(int btDreamingIntervalSecs READ btDreamingIntervalSecs WRITE setDreamingIntervalSecs NOTIFY btDreamingIntervalSecsChanged)
+    Q_PROPERTY(bool btDreamingEnabled READ btDreamingEnabled WRITE setBtDreamingEnabled NOTIFY btDreamingEnabledChanged)
+    Q_PROPERTY(int btDreamingIntervalSecs READ btDreamingIntervalSecs WRITE setBtDreamingIntervalSecs NOTIFY btDreamingIntervalSecsChanged)
     Q_PROPERTY(bool btHasSeparateLlm READ btHasSeparateLlm NOTIFY btHasSeparateLlmChanged)
-    Q_PROPERTY(QString btLlmConnector READ btLlmConnector WRITE setDreamingLlmConnector NOTIFY btLlmConnectorChanged)
-    Q_PROPERTY(QString btLlmModel READ btLlmModel WRITE setDreamingLlmModel NOTIFY btLlmModelChanged)
-    Q_PROPERTY(QString btLlmBaseUrl READ btLlmBaseUrl WRITE setDreamingLlmBaseUrl NOTIFY btLlmBaseUrlChanged)
+    Q_PROPERTY(QString btLlmConnector READ btLlmConnector WRITE setBtLlmConnector NOTIFY btLlmConnectorChanged)
+    Q_PROPERTY(QString btLlmModel READ btLlmModel WRITE setBtLlmModel NOTIFY btLlmModelChanged)
+    Q_PROPERTY(QString btLlmBaseUrl READ btLlmBaseUrl WRITE setBtLlmBaseUrl NOTIFY btLlmBaseUrlChanged)
     Q_PROPERTY(int hostedToolSearch READ hostedToolSearch WRITE setHostedToolSearch NOTIFY hostedToolSearchChanged)
     Q_PROPERTY(bool hostedToolSearchAvailable READ hostedToolSearchAvailable NOTIFY hostedToolSearchAvailableChanged)
 
@@ -114,21 +114,21 @@ public:
     bool selectedConnectionRemovable() const;
 
     bool btDreamingEnabled() const;
-    void setDreamingEnabled(bool value);
+    void setBtDreamingEnabled(bool value);
 
     int btDreamingIntervalSecs() const;
-    void setDreamingIntervalSecs(int value);
+    void setBtDreamingIntervalSecs(int value);
 
     bool btHasSeparateLlm() const;
 
     QString btLlmConnector() const;
-    void setDreamingLlmConnector(const QString &value);
+    void setBtLlmConnector(const QString &value);
 
     QString btLlmModel() const;
-    void setDreamingLlmModel(const QString &value);
+    void setBtLlmModel(const QString &value);
 
     QString btLlmBaseUrl() const;
-    void setDreamingLlmBaseUrl(const QString &value);
+    void setBtLlmBaseUrl(const QString &value);
 
     int hostedToolSearch() const;
     void setHostedToolSearch(int value);
