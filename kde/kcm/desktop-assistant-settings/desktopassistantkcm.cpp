@@ -48,6 +48,7 @@ struct ConnectorDefaults {
     QString embeddingsModel;
     QString embeddingsBaseUrl;
     bool embeddingsAvailable = true;
+    bool hostedToolSearchAvailable = true;
 };
 
 bool fetchConnectorDefaults(
@@ -79,6 +80,7 @@ bool fetchConnectorDefaults(
         out->embeddingsModel = args[2].toString();
         out->embeddingsBaseUrl = args[3].toString();
         out->embeddingsAvailable = args[4].toBool();
+        out->hostedToolSearchAvailable = args.size() > 5 ? args[5].toBool() : true;
     }
 
     return true;
@@ -539,6 +541,26 @@ void DesktopAssistantKcm::setBtLlmBaseUrl(const QString &value)
     setNeedsSave(true);
 }
 
+int DesktopAssistantKcm::hostedToolSearch() const
+{
+    return m_hostedToolSearch;
+}
+
+void DesktopAssistantKcm::setHostedToolSearch(int value)
+{
+    if (m_hostedToolSearch == value) {
+        return;
+    }
+    m_hostedToolSearch = value;
+    Q_EMIT hostedToolSearchChanged();
+    setNeedsSave(true);
+}
+
+bool DesktopAssistantKcm::hostedToolSearchAvailable() const
+{
+    return m_hostedToolSearchAvailable;
+}
+
 void DesktopAssistantKcm::load()
 {
     QDBusInterface iface(SERVICE, PATH, IFACE, QDBusConnection::sessionBus());
@@ -559,6 +581,8 @@ void DesktopAssistantKcm::load()
     m_model = args[1].toString();
     m_baseUrl = args[2].toString();
     m_hasApiKey = args[3].toBool();
+    // hosted_tool_search: -1 = connector default, 0 = off, 1 = on (8th arg)
+    m_hostedToolSearch = args.size() > 7 ? args[7].toInt() : -1;
 
     QDBusMessage embReply = iface.call("GetEmbeddingsSettings");
     if (setStatusFromDbusError(embReply)) {
@@ -660,6 +684,8 @@ void DesktopAssistantKcm::load()
     Q_EMIT btLlmConnectorChanged();
     Q_EMIT btLlmModelChanged();
     Q_EMIT btLlmBaseUrlChanged();
+    Q_EMIT hostedToolSearchChanged();
+    Q_EMIT hostedToolSearchAvailableChanged();
 
     m_statusText = QStringLiteral("Loaded settings from desktop-assistant daemon");
     Q_EMIT statusTextChanged();
@@ -758,6 +784,10 @@ void DesktopAssistantKcm::applyChatDefaults()
 
     setModel(defaults.llmModel);
     setBaseUrl(defaults.llmBaseUrl);
+    if (m_hostedToolSearchAvailable != defaults.hostedToolSearchAvailable) {
+        m_hostedToolSearchAvailable = defaults.hostedToolSearchAvailable;
+        Q_EMIT hostedToolSearchAvailableChanged();
+    }
 }
 
 void DesktopAssistantKcm::applySearchDefaults()

@@ -47,6 +47,7 @@ impl SettingsService for DaemonSettingsService {
             temperature: view.temperature,
             top_p: view.top_p,
             max_tokens: view.max_tokens,
+            hosted_tool_search: view.hosted_tool_search,
         })
     }
 
@@ -58,6 +59,7 @@ impl SettingsService for DaemonSettingsService {
         temperature: Option<f64>,
         top_p: Option<f64>,
         max_tokens: Option<u32>,
+        hosted_tool_search: Option<bool>,
     ) -> Result<(), CoreError> {
         config::set_llm_settings(
             &self.config_path,
@@ -67,6 +69,7 @@ impl SettingsService for DaemonSettingsService {
             temperature,
             top_p,
             max_tokens,
+            hosted_tool_search,
         )
         .map_err(|error| CoreError::SystemService(error.to_string()))
     }
@@ -125,6 +128,7 @@ impl SettingsService for DaemonSettingsService {
             embeddings_model: defaults.embeddings_model,
             embeddings_base_url: defaults.embeddings_base_url,
             embeddings_available: defaults.embeddings_available,
+            hosted_tool_search_available: defaults.hosted_tool_search_available,
         })
     }
 

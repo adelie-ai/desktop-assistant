@@ -23,6 +23,7 @@ pub struct ConfigData {
     pub llm_temperature: f64,
     pub llm_top_p: f64,
     pub llm_max_tokens: u32,
+    pub llm_hosted_tool_search: i32,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
@@ -55,6 +56,8 @@ pub struct ConfigPatchArgs {
     pub llm_top_p: f64,
     pub set_llm_max_tokens: bool,
     pub llm_max_tokens: u32,
+    pub set_llm_hosted_tool_search: bool,
+    pub llm_hosted_tool_search: i32,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +76,7 @@ struct ConfigPatch {
     llm_temperature: Option<f64>,
     llm_top_p: Option<f64>,
     llm_max_tokens: Option<u32>,
+    llm_hosted_tool_search: Option<bool>,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -138,6 +142,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             llm_temperature: llm.temperature.unwrap_or(-1.0),
             llm_top_p: llm.top_p.unwrap_or(-1.0),
             llm_max_tokens: llm.max_tokens.unwrap_or(0),
+            llm_hosted_tool_search: llm.hosted_tool_search.map(|v| v as i32).unwrap_or(-1),
         })
     }
 
@@ -157,6 +162,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             llm_temperature,
             llm_top_p,
             llm_max_tokens,
+            llm_hosted_tool_search,
         } = patch;
 
         let llm_changed = llm_connector.is_some()
@@ -164,7 +170,8 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             || llm_base_url.is_some()
             || llm_temperature.is_some()
             || llm_top_p.is_some()
-            || llm_max_tokens.is_some();
+            || llm_max_tokens.is_some()
+            || llm_hosted_tool_search.is_some();
         if llm_changed {
             let current = self
                 .service
@@ -202,8 +209,22 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 current.max_tokens
             };
 
+            let hosted_tool_search = if llm_hosted_tool_search.is_some() {
+                llm_hosted_tool_search
+            } else {
+                current.hosted_tool_search
+            };
+
             self.service
-                .set_llm_settings(connector, model, base_url, temperature, top_p, max_tokens)
+                .set_llm_settings(
+                    connector,
+                    model,
+                    base_url,
+                    temperature,
+                    top_p,
+                    max_tokens,
+                    hosted_tool_search,
+                )
                 .await
                 .map_err(to_fdo_error)?;
         }
@@ -291,7 +312,9 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
 #[interface(name = "org.desktopAssistant.Settings")]
 impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     /// Return non-sensitive LLM settings and whether an API key is available.
-    async fn get_llm_settings(&self) -> fdo::Result<(String, String, String, bool, f64, f64, u32)> {
+    async fn get_llm_settings(
+        &self,
+    ) -> fdo::Result<(String, String, String, bool, f64, f64, u32, i32)> {
         let settings = self
             .service
             .get_llm_settings()
@@ -306,6 +329,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             settings.temperature.unwrap_or(-1.0),
             settings.top_p.unwrap_or(-1.0),
             settings.max_tokens.unwrap_or(0),
+            settings.hosted_tool_search.map(|v| v as i32).unwrap_or(-1),
         ))
     }
 
@@ -329,7 +353,15 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         };
 
         self.service
-            .set_llm_settings(connector.to_string(), model, base_url, None, None, None)
+            .set_llm_settings(
+                connector.to_string(),
+                model,
+                base_url,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .map_err(to_fdo_error)
     }
@@ -419,7 +451,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     async fn get_connector_defaults(
         &self,
         connector: &str,
-    ) -> fdo::Result<(String, String, String, String, bool)> {
+    ) -> fdo::Result<(String, String, String, String, bool, bool)> {
         let defaults = self
             .service
             .get_connector_defaults(connector.to_string())
@@ -432,6 +464,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             defaults.embeddings_model,
             defaults.embeddings_base_url,
             defaults.embeddings_available,
+            defaults.hosted_tool_search_available,
         ))
     }
 
@@ -552,6 +585,8 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             llm_top_p,
             set_llm_max_tokens,
             llm_max_tokens,
+            set_llm_hosted_tool_search,
+            llm_hosted_tool_search,
         } = changes;
 
         let updated = self
@@ -573,6 +608,8 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 llm_temperature: set_llm_temperature.then_some(llm_temperature),
                 llm_top_p: set_llm_top_p.then_some(llm_top_p),
                 llm_max_tokens: set_llm_max_tokens.then_some(llm_max_tokens),
+                llm_hosted_tool_search: set_llm_hosted_tool_search
+                    .then_some(llm_hosted_tool_search == 1),
             })
             .await?;
 
@@ -777,6 +814,7 @@ mod tests {
                         temperature: None,
                         top_p: None,
                         max_tokens: None,
+                        hosted_tool_search: None,
                     },
                     embeddings: EmbeddingsSettingsView {
                         connector: "openai".to_string(),
@@ -823,6 +861,7 @@ mod tests {
             temperature: Option<f64>,
             top_p: Option<f64>,
             max_tokens: Option<u32>,
+            hosted_tool_search: Option<bool>,
         ) -> Result<(), CoreError> {
             let mut state = self.state.lock().unwrap();
             state.llm.connector = connector;
@@ -835,6 +874,7 @@ mod tests {
             state.llm.temperature = temperature;
             state.llm.top_p = top_p;
             state.llm.max_tokens = max_tokens;
+            state.llm.hosted_tool_search = hosted_tool_search;
             Ok(())
         }
 
@@ -892,6 +932,7 @@ mod tests {
                 embeddings_model: "text-embedding-3-small".to_string(),
                 embeddings_base_url: "https://api.openai.com/v1".to_string(),
                 embeddings_available: true,
+                hosted_tool_search_available: true,
             })
         }
 

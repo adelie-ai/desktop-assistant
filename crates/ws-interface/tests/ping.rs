@@ -171,6 +171,7 @@ impl SettingsService for FakeSettings {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            hosted_tool_search: None,
         })
     }
     async fn set_llm_settings(
@@ -181,6 +182,7 @@ impl SettingsService for FakeSettings {
         _temperature: Option<f64>,
         _top_p: Option<f64>,
         _max_tokens: Option<u32>,
+        _hosted_tool_search: Option<bool>,
     ) -> Result<(), CoreError> {
         Ok(())
     }
@@ -224,6 +226,7 @@ impl SettingsService for FakeSettings {
             embeddings_model: "em".into(),
             embeddings_base_url: "eu".into(),
             embeddings_available: false,
+            hosted_tool_search_available: false,
         })
     }
     async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
@@ -330,6 +333,7 @@ impl StatefulSettings {
                     temperature: None,
                     top_p: None,
                     max_tokens: None,
+                    hosted_tool_search: None,
                 },
                 embeddings: EmbeddingsSettingsView {
                     connector: "openai".into(),
@@ -364,6 +368,7 @@ impl SettingsService for StatefulSettings {
         temperature: Option<f64>,
         top_p: Option<f64>,
         max_tokens: Option<u32>,
+        hosted_tool_search: Option<bool>,
     ) -> Result<(), CoreError> {
         let mut state = self.state.lock().unwrap();
         state.llm.connector = connector;
@@ -376,6 +381,7 @@ impl SettingsService for StatefulSettings {
         state.llm.temperature = temperature;
         state.llm.top_p = top_p;
         state.llm.max_tokens = max_tokens;
+        state.llm.hosted_tool_search = hosted_tool_search;
         Ok(())
     }
 
@@ -431,6 +437,7 @@ impl SettingsService for StatefulSettings {
             embeddings_model: "em".into(),
             embeddings_base_url: "eu".into(),
             embeddings_available: false,
+            hosted_tool_search_available: false,
         })
     }
 

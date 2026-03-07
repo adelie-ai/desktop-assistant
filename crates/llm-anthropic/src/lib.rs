@@ -15,6 +15,7 @@ pub struct AnthropicClient {
     max_tokens: u32,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    hosted_tool_search: bool,
 }
 
 impl AnthropicClient {
@@ -35,6 +36,7 @@ impl AnthropicClient {
             max_tokens: 8192,
             temperature: None,
             top_p: None,
+            hosted_tool_search: true,
         }
     }
 
@@ -67,6 +69,11 @@ impl AnthropicClient {
 
     pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
         self.top_p = top_p;
+        self
+    }
+
+    pub fn with_hosted_tool_search(mut self, enabled: bool) -> Self {
+        self.hosted_tool_search = enabled;
         self
     }
 
@@ -172,6 +179,7 @@ impl From<&ToolDefinition> for AnthropicTool {
 /// A tool with `defer_loading: true` for Anthropic's hosted tool search.
 #[derive(Serialize)]
 struct AnthropicDeferredTool {
+    r#type: String,
     name: String,
     description: String,
     input_schema: serde_json::Value,
@@ -181,6 +189,7 @@ struct AnthropicDeferredTool {
 impl AnthropicDeferredTool {
     fn from_definition(def: &ToolDefinition) -> Self {
         Self {
+            r#type: "custom".to_string(),
             name: def.name.clone(),
             description: def.description.clone(),
             input_schema: def.parameters.clone(),
@@ -413,6 +422,10 @@ impl AnthropicClient {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
+            .header(
+                "anthropic-beta",
+                "interleaved-thinking-2025-05-14,tool-search-2025-04-15",
+            )
             .json(request_body)
             .send()
             .await
@@ -561,7 +574,7 @@ impl LlmClient for AnthropicClient {
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
-        true
+        self.hosted_tool_search
     }
 
     async fn stream_completion_with_namespaces(
@@ -950,6 +963,7 @@ mod tests {
         assert_eq!(json["name"], "read_file");
         assert_eq!(json["description"], "Read a file");
         assert!(json["defer_loading"].as_bool().unwrap());
+        assert_eq!(json["type"], "custom");
     }
 
     #[test]
@@ -971,6 +985,7 @@ mod tests {
             input_schema: serde_json::json!({}),
         });
         let deferred = AnthropicToolEntry::Deferred(AnthropicDeferredTool {
+            r#type: "custom".into(),
             name: "jira__create".into(),
             description: "Create Jira issue".into(),
             input_schema: serde_json::json!({}),

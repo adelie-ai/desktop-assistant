@@ -403,14 +403,17 @@ fn build_llm_client(resolved: config::ResolvedLlmConfig) -> AnyLlmClient {
                     "No API key resolved from configured secret backend or environment; LLM calls may fail"
                 );
             }
-            AnyLlmClient::Anthropic(
+            let mut client =
                 desktop_assistant_llm_anthropic::AnthropicClient::new(resolved.api_key)
                     .with_model(resolved.model)
                     .with_base_url(resolved.base_url)
                     .with_temperature(resolved.temperature)
                     .with_top_p(resolved.top_p)
-                    .with_max_tokens_override(resolved.max_tokens),
-            )
+                    .with_max_tokens_override(resolved.max_tokens);
+            if let Some(hts) = resolved.hosted_tool_search {
+                client = client.with_hosted_tool_search(hts);
+            }
+            AnyLlmClient::Anthropic(client)
         }
         "bedrock" | "aws-bedrock" => AnyLlmClient::Bedrock(
             desktop_assistant_llm_bedrock::BedrockClient::new(resolved.api_key)
@@ -426,14 +429,16 @@ fn build_llm_client(resolved: config::ResolvedLlmConfig) -> AnyLlmClient {
                     "No API key resolved from configured secret backend or environment; LLM calls may fail"
                 );
             }
-            AnyLlmClient::OpenAi(
-                desktop_assistant_llm_openai::OpenAiClient::new(resolved.api_key)
-                    .with_model(resolved.model)
-                    .with_base_url(resolved.base_url)
-                    .with_temperature(resolved.temperature)
-                    .with_top_p(resolved.top_p)
-                    .with_max_tokens(resolved.max_tokens),
-            )
+            let mut client = desktop_assistant_llm_openai::OpenAiClient::new(resolved.api_key)
+                .with_model(resolved.model)
+                .with_base_url(resolved.base_url)
+                .with_temperature(resolved.temperature)
+                .with_top_p(resolved.top_p)
+                .with_max_tokens(resolved.max_tokens);
+            if let Some(hts) = resolved.hosted_tool_search {
+                client = client.with_hosted_tool_search(hts);
+            }
+            AnyLlmClient::OpenAi(client)
         }
     }
 }

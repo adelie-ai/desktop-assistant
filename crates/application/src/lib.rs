@@ -120,6 +120,7 @@ where
                 temperature: llm.temperature,
                 top_p: llm.top_p,
                 max_tokens: llm.max_tokens,
+                hosted_tool_search: llm.hosted_tool_search,
             },
             embeddings: api::EmbeddingsSettingsView {
                 connector: embeddings.connector,
@@ -155,6 +156,7 @@ where
             llm_temperature,
             llm_top_p,
             llm_max_tokens,
+            llm_hosted_tool_search,
         } = changes;
 
         let llm_changed = llm_connector.is_some()
@@ -162,7 +164,8 @@ where
             || llm_base_url.is_some()
             || llm_temperature.is_some()
             || llm_top_p.is_some()
-            || llm_max_tokens.is_some();
+            || llm_max_tokens.is_some()
+            || llm_hosted_tool_search.is_some();
         if llm_changed {
             let connector = Self::normalize_optional_string(llm_connector)
                 .unwrap_or_else(|| current.llm.connector.clone());
@@ -192,9 +195,22 @@ where
             } else {
                 current.llm.max_tokens
             };
+            let hosted_tool_search = if llm_hosted_tool_search.is_some() {
+                llm_hosted_tool_search
+            } else {
+                current.llm.hosted_tool_search
+            };
 
             self.settings
-                .set_llm_settings(connector, model, base_url, temperature, top_p, max_tokens)
+                .set_llm_settings(
+                    connector,
+                    model,
+                    base_url,
+                    temperature,
+                    top_p,
+                    max_tokens,
+                    hosted_tool_search,
+                )
                 .await
                 .map_err(Self::map_core_err)?;
         }
@@ -387,6 +403,7 @@ where
                     temperature: s.temperature,
                     top_p: s.top_p,
                     max_tokens: s.max_tokens,
+                    hosted_tool_search: s.hosted_tool_search,
                 }))
             }
 
@@ -399,7 +416,15 @@ where
                 max_tokens,
             } => {
                 self.settings
-                    .set_llm_settings(connector, model, base_url, temperature, top_p, max_tokens)
+                    .set_llm_settings(
+                        connector,
+                        model,
+                        base_url,
+                        temperature,
+                        top_p,
+                        max_tokens,
+                        None,
+                    )
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)
@@ -456,6 +481,7 @@ where
                         embeddings_model: d.embeddings_model,
                         embeddings_base_url: d.embeddings_base_url,
                         embeddings_available: d.embeddings_available,
+                        hosted_tool_search_available: d.hosted_tool_search_available,
                     },
                 ))
             }
@@ -732,6 +758,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 max_tokens: None,
+                hosted_tool_search: None,
             })
         }
         async fn set_llm_settings(
@@ -742,6 +769,7 @@ mod tests {
             _temperature: Option<f64>,
             _top_p: Option<f64>,
             _max_tokens: Option<u32>,
+            _hosted_tool_search: Option<bool>,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -785,6 +813,7 @@ mod tests {
                 embeddings_model: "em".into(),
                 embeddings_base_url: "eu".into(),
                 embeddings_available: false,
+                hosted_tool_search_available: false,
             })
         }
         async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
@@ -895,6 +924,7 @@ mod tests {
                         temperature: None,
                         top_p: None,
                         max_tokens: None,
+                        hosted_tool_search: None,
                     },
                     embeddings: EmbeddingsSettingsView {
                         connector: "openai".into(),
@@ -933,6 +963,7 @@ mod tests {
             temperature: Option<f64>,
             top_p: Option<f64>,
             max_tokens: Option<u32>,
+            hosted_tool_search: Option<bool>,
         ) -> Result<(), CoreError> {
             let mut state = self.state.lock().unwrap();
             state.llm.connector = connector;
@@ -945,6 +976,7 @@ mod tests {
             state.llm.temperature = temperature;
             state.llm.top_p = top_p;
             state.llm.max_tokens = max_tokens;
+            state.llm.hosted_tool_search = hosted_tool_search;
             Ok(())
         }
 
@@ -1000,6 +1032,7 @@ mod tests {
                 embeddings_model: "em".into(),
                 embeddings_base_url: "eu".into(),
                 embeddings_available: false,
+                hosted_tool_search_available: false,
             })
         }
 

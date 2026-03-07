@@ -284,6 +284,7 @@ mod tests {
                     temperature: None,
                     top_p: None,
                     max_tokens: None,
+                    hosted_tool_search: None,
                 },
                 embeddings: api::EmbeddingsSettingsView {
                     connector: "openai".to_string(),

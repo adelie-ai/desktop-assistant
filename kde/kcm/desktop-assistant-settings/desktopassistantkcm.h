@@ -40,6 +40,8 @@ class DesktopAssistantKcm : public KQuickConfigModule {
     Q_PROPERTY(QString btLlmConnector READ btLlmConnector WRITE setDreamingLlmConnector NOTIFY btLlmConnectorChanged)
     Q_PROPERTY(QString btLlmModel READ btLlmModel WRITE setDreamingLlmModel NOTIFY btLlmModelChanged)
     Q_PROPERTY(QString btLlmBaseUrl READ btLlmBaseUrl WRITE setDreamingLlmBaseUrl NOTIFY btLlmBaseUrlChanged)
+    Q_PROPERTY(int hostedToolSearch READ hostedToolSearch WRITE setHostedToolSearch NOTIFY hostedToolSearchChanged)
+    Q_PROPERTY(bool hostedToolSearchAvailable READ hostedToolSearchAvailable NOTIFY hostedToolSearchAvailableChanged)
 
 public:
     DesktopAssistantKcm(QObject *parent, const KPluginMetaData &metaData, const QVariantList &args);
@@ -128,6 +130,10 @@ public:
     QString btLlmBaseUrl() const;
     void setDreamingLlmBaseUrl(const QString &value);
 
+    int hostedToolSearch() const;
+    void setHostedToolSearch(int value);
+    bool hostedToolSearchAvailable() const;
+
     Q_INVOKABLE void load() override;
     Q_INVOKABLE void save() override;
     Q_INVOKABLE void defaults() override;
@@ -170,6 +176,8 @@ Q_SIGNALS:
     void btLlmConnectorChanged();
     void btLlmModelChanged();
     void btLlmBaseUrlChanged();
+    void hostedToolSearchChanged();
+    void hostedToolSearchAvailableChanged();
 
 private:
     struct ConnectionProfile {
@@ -215,4 +223,6 @@ private:
     QString m_btLlmConnector;
     QString m_btLlmModel;
     QString m_btLlmBaseUrl;
+    int m_hostedToolSearch = -1; // -1 = connector default, 0 = off, 1 = on
+    bool m_hostedToolSearchAvailable = true;
 };

@@ -11,6 +11,7 @@ pub struct LlmSettingsView {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    pub hosted_tool_search: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct ConnectorDefaultsView {
     pub embeddings_model: String,
     pub embeddings_base_url: String,
     pub embeddings_available: bool,
+    pub hosted_tool_search_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +145,7 @@ pub trait SettingsService: Send + Sync {
         temperature: Option<f64>,
         top_p: Option<f64>,
         max_tokens: Option<u32>,
+        hosted_tool_search: Option<bool>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
     fn set_api_key(

@@ -35,28 +35,51 @@ fn llm_messages_for_turn(
     conversation_messages: &[Message],
     summaries: &[MessageSummary],
     tool_defs: &[ToolDefinition],
+    deferred_namespaces: &[ToolNamespace],
     context_summary: &str,
 ) -> Vec<Message> {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
 
     let has_tool_search = tool_defs.iter().any(|t| t.name == "builtin_tool_search");
-    let tool_note = if tool_defs.is_empty() {
+    let tool_note = if tool_defs.is_empty() && deferred_namespaces.is_empty() {
         "No tools are available in this turn.".to_string()
     } else {
-        let names = tool_defs
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if has_tool_search {
-            format!(
-                "Available tools in this turn: {names}. \
-                 Additional tools may be available — use builtin_tool_search to discover \
-                 tools for tasks not covered by the tools listed above."
-            )
-        } else {
-            format!("Available tools in this turn: {names}.")
+        let mut note = String::new();
+
+        if !tool_defs.is_empty() {
+            let names = tool_defs
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if has_tool_search {
+                note = format!(
+                    "Available tools in this turn: {names}. \
+                     Additional tools may be available — use builtin_tool_search to discover \
+                     tools for tasks not covered by the tools listed above."
+                );
+            } else {
+                note = format!("Available tools in this turn: {names}.");
+            }
         }
+
+        // When deferred namespaces exist (hosted or not), append a compact
+        // name-only index so the model knows what tools are reachable.
+        if !deferred_namespaces.is_empty() {
+            if !note.is_empty() {
+                note.push('\n');
+            }
+            for ns in deferred_namespaces {
+                let tool_names: Vec<&str> = ns.tools.iter().map(|t| t.name.as_str()).collect();
+                note.push_str(&format!("{}=[{}]\n", ns.name, tool_names.join(", ")));
+            }
+            note.push_str(
+                "These tools are available via search or deferred loading. \
+                 Use builtin_tool_search if you cannot call one directly.",
+            );
+        }
+
+        note
     };
 
     // Assemble system prompt from static sections + dynamic tool availability.
@@ -568,7 +591,11 @@ async fn categorize_tool_namespaces<L: LlmClient>(
             "namespace {:?}: {:?} (tools: {})",
             ns.name,
             ns.description,
-            ns.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+            ns.tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     result
@@ -782,13 +809,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         .map(|(_, ns)| ns.clone())
                 };
                 if let Some(ns) = cached_hit {
-                    tracing::debug!(
-                        "reusing cached namespace categorization (hash={hash:#x})"
-                    );
+                    tracing::debug!("reusing cached namespace categorization (hash={hash:#x})");
                     ns
                 } else {
-                    let result =
-                        categorize_tool_namespaces(raw_namespaces, self.task_llm()).await;
+                    let result = categorize_tool_namespaces(raw_namespaces, self.task_llm()).await;
                     *self.namespace_cache.lock().unwrap() = Some((hash, result.clone()));
                     result
                 }
@@ -813,16 +837,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
         let mut activated_tools: std::collections::HashMap<String, ToolDefinition> =
             std::collections::HashMap::new();
+        // Track whether hosted search has been demoted to local fallback.
+        let mut hosted_search_demoted = false;
 
         for round in 0..MAX_TOOL_ROUNDS {
-            // Build the tool set: core + dynamically activated
-            let mut tool_defs: Vec<ToolDefinition> = core_tools_for_llm.clone();
+            // Build the tool set: core + dynamically activated.
+            // When hosted search has been demoted, use the full core set
+            // (which includes builtin_tool_search) instead of the filtered one.
+            let mut tool_defs: Vec<ToolDefinition> = if hosted_search_demoted {
+                core_tools.clone()
+            } else {
+                core_tools_for_llm.clone()
+            };
             tool_defs.extend(activated_tools.values().cloned());
 
+            let deferred_ns: &[ToolNamespace] =
+                if !hosted_search_demoted { &namespaces } else { &[] };
             let llm_messages = llm_messages_for_turn(
                 &conv.messages,
                 &conv.summaries,
                 &tool_defs,
+                deferred_ns,
                 &conv.context_summary,
             );
             let mut raw_stream = String::new();
@@ -851,61 +886,93 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 }
             });
 
-            let response = match if use_hosted_search && !namespaces.is_empty() {
-                self.llm
-                    .stream_completion_with_namespaces(
-                        llm_messages,
-                        &tool_defs,
-                        &namespaces,
-                        filtered_chunk_callback,
-                    )
-                    .await
-            } else {
-                self.llm
-                    .stream_completion(llm_messages, &tool_defs, filtered_chunk_callback)
-                    .await
-            } {
-                Ok(r) => r,
-                Err(e)
-                    if round > 0
-                        && !is_retryable_error(&e)
-                        && !user_visible_llm_error_message(&e)
-                            .contains("rate limit was exceeded") =>
-                {
-                    // Mid-loop LLM error (e.g. context too long) — trim old
-                    // tool call/result pairs and tell the LLM what happened
-                    // so it can adjust its approach.
-                    tracing::warn!(
-                        "LLM call failed on round {}/{}, trimming context: {e}",
-                        round + 1,
-                        MAX_TOOL_ROUNDS
-                    );
-                    let removed = trim_tool_pairs(&mut conv.messages);
-                    conv.compacted_through = conv.compacted_through.saturating_sub(removed);
-                    tracing::info!("removed {removed} messages to reduce context");
-                    conv.messages.push(Message::new(
-                        Role::System,
-                        format!(
-                            "Your previous tool call could not be processed because \
+            let response =
+                match if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
+                    self.llm
+                        .stream_completion_with_namespaces(
+                            llm_messages,
+                            &tool_defs,
+                            &namespaces,
+                            filtered_chunk_callback,
+                        )
+                        .await
+                } else {
+                    self.llm
+                        .stream_completion(llm_messages, &tool_defs, filtered_chunk_callback)
+                        .await
+                } {
+                    Ok(r) => r,
+                    Err(e)
+                        if round > 0
+                            && !is_retryable_error(&e)
+                            && !user_visible_llm_error_message(&e)
+                                .contains("rate limit was exceeded") =>
+                    {
+                        // Mid-loop LLM error (e.g. context too long) — trim old
+                        // tool call/result pairs and tell the LLM what happened
+                        // so it can adjust its approach.
+                        tracing::warn!(
+                            "LLM call failed on round {}/{}, trimming context: {e}",
+                            round + 1,
+                            MAX_TOOL_ROUNDS
+                        );
+                        let removed = trim_tool_pairs(&mut conv.messages);
+                        conv.compacted_through = conv.compacted_through.saturating_sub(removed);
+                        tracing::info!("removed {removed} messages to reduce context");
+                        conv.messages.push(Message::new(
+                            Role::System,
+                            format!(
+                                "Your previous tool call could not be processed because \
                              the context became too long. {removed} older messages were \
                              trimmed. The original error was: {e}\n\
                              Please adjust your approach — for example, request less \
                              output or take a different path."
-                        ),
+                            ),
+                        ));
+                        on_chunk = Box::new(|_| true);
+                        continue;
+                    }
+                    Err(e) => {
+                        let friendly = user_visible_llm_error_message(&e);
+                        conv.messages.push(Message::new(Role::Assistant, &friendly));
+                        conv.updated_at = now_timestamp();
+                        self.store.update(conv).await?;
+                        return Ok(friendly);
+                    }
+                };
+
+            if !response.has_tool_calls() {
+                // Hosted-search fallback: if the model returned text-only
+                // while hosted search was active, it likely couldn't invoke
+                // deferred tools.  Demote to local builtin_tool_search and
+                // let the model try again with the classic tool-discovery path.
+                if use_hosted_search
+                    && !namespaces.is_empty()
+                    && !hosted_search_demoted
+                    && round < 2
+                {
+                    tracing::warn!(
+                        round,
+                        "hosted tool search produced no tool calls — \
+                         falling back to builtin_tool_search"
+                    );
+                    hosted_search_demoted = true;
+                    // Keep the assistant text so the model has context,
+                    // then inject a system nudge to use builtin_tool_search.
+                    if !response.text.is_empty() {
+                        conv.messages
+                            .push(Message::new(Role::Assistant, &response.text));
+                    }
+                    conv.messages.push(Message::new(
+                        Role::System,
+                        "The server-side tool search was unable to surface the \
+                         tools you need. You now have access to `builtin_tool_search` \
+                         — call it with a query describing what you need.",
                     ));
                     on_chunk = Box::new(|_| true);
                     continue;
                 }
-                Err(e) => {
-                    let friendly = user_visible_llm_error_message(&e);
-                    conv.messages.push(Message::new(Role::Assistant, &friendly));
-                    conv.updated_at = now_timestamp();
-                    self.store.update(conv).await?;
-                    return Ok(friendly);
-                }
-            };
 
-            if !response.has_tool_calls() {
                 // Text-only response — we're done
                 let mut visible_text = sanitize_assistant_text(&response.text);
                 if visible_text.is_empty() {
@@ -967,8 +1034,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
                 // Dynamic activation: if tool_search returned results,
                 // activate the discovered tools for subsequent rounds.
-                // Skip when hosted search is active — the provider handles discovery.
-                if !use_hosted_search
+                // Skip when hosted search is active (unless demoted to local fallback).
+                if (!use_hosted_search || hosted_search_demoted)
                     && tool_call.name == "builtin_tool_search"
                     && let Ok(found) = serde_json::from_str::<serde_json::Value>(&result)
                     && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
@@ -2246,7 +2313,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
         // System message + all 10 conversation messages
         assert_eq!(result.len(), 11);
         assert_eq!(result[0].role, Role::System);
@@ -2269,7 +2336,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
         // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
         // a User message (even index), so the window starts exactly there.
         // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
@@ -2302,7 +2369,7 @@ mod tests {
         msgs.push(Message::new(Role::User, "final-user"));
         msgs.push(Message::new(Role::Assistant, "final-reply"));
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
 
         // The first conversation message (after System) must be a User message.
         assert_eq!(result[0].role, Role::System);
@@ -2422,7 +2489,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], "- User prefers dark mode");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "- User prefers dark mode");
 
         // System prompt, then summary system message, then windowed messages
         assert_eq!(result[0].role, Role::System);
@@ -2451,7 +2518,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], "- Some summary");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "- Some summary");
 
         // No summary injected when under limit
         assert_eq!(result[0].role, Role::System);
@@ -2476,7 +2543,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
 
         // System prompt directly followed by windowed messages — no summary
         assert_eq!(result[0].role, Role::System);
@@ -2507,7 +2574,7 @@ mod tests {
             end_ordinal: 3,
         }];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], "");
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "");
 
         // System + "start" + summary injection + "follow up" + "final" = 5
         assert_eq!(result.len(), 5);
@@ -2527,7 +2594,7 @@ mod tests {
             Message::new(Role::Assistant, "hello"),
         ];
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
         // System + 2 messages
         assert_eq!(result.len(), 3);
         assert_eq!(result[1].content, "hi");
@@ -2565,7 +2632,7 @@ mod tests {
             },
         ];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], "");
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "");
         // System + "start" + summary1 + "middle" + summary2 + "end" = 6
         assert_eq!(result.len(), 6);
         assert!(result[2].content.contains("First batch."));

@@ -215,6 +215,8 @@ pub struct ConfigChanges {
     pub llm_top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_hosted_tool_search: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,6 +259,8 @@ pub struct LlmSettingsView {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted_tool_search: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -276,6 +280,7 @@ pub struct ConnectorDefaultsView {
     pub embeddings_model: String,
     pub embeddings_base_url: String,
     pub embeddings_available: bool,
+    pub hosted_tool_search_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

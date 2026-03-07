@@ -140,6 +140,10 @@ pub struct LlmConfig {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Enable provider-side hosted tool search (deferred loading / namespaces).
+    /// When `None`, defaults to the connector's built-in capability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted_tool_search: Option<bool>,
 }
 
 impl Default for LlmConfig {
@@ -153,6 +157,7 @@ impl Default for LlmConfig {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            hosted_tool_search: None,
         }
     }
 }
@@ -195,6 +200,8 @@ pub struct ResolvedLlmConfig {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Explicit hosted-tool-search override from config, or `None` for connector default.
+    pub hosted_tool_search: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +213,7 @@ pub struct LlmSettingsView {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    pub hosted_tool_search: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -235,6 +243,7 @@ pub struct ConnectorDefaultsView {
     pub embeddings_model: String,
     pub embeddings_base_url: String,
     pub embeddings_available: bool,
+    pub hosted_tool_search_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +415,7 @@ pub fn get_llm_settings_view(path: &Path) -> anyhow::Result<LlmSettingsView> {
         temperature: resolved.temperature,
         top_p: resolved.top_p,
         max_tokens: resolved.max_tokens,
+        hosted_tool_search: resolved.hosted_tool_search,
     })
 }
 
@@ -417,6 +427,7 @@ pub fn set_llm_settings(
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
+    hosted_tool_search: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut config = load_daemon_config(path)?.unwrap_or_default();
 
@@ -447,6 +458,7 @@ pub fn set_llm_settings(
     config.llm.temperature = temperature;
     config.llm.top_p = top_p;
     config.llm.max_tokens = max_tokens;
+    config.llm.hosted_tool_search = hosted_tool_search;
 
     save_daemon_config(path, &config)
 }
@@ -647,12 +659,15 @@ pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
         "openai"
     };
 
+    let hosted_tool_search_available = connector == "openai" || connector == "anthropic";
+
     ConnectorDefaultsView {
         llm_model,
         llm_base_url,
         embeddings_model: default_embedding_model(embeddings_connector),
         embeddings_base_url: default_base_url(embeddings_connector),
         embeddings_available,
+        hosted_tool_search_available,
     }
 }
 
@@ -841,6 +856,7 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
     let temperature = llm_config.and_then(|c| c.temperature);
     let top_p = llm_config.and_then(|c| c.top_p);
     let max_tokens = llm_config.and_then(|c| c.max_tokens);
+    let hosted_tool_search = llm_config.and_then(|c| c.hosted_tool_search);
 
     ResolvedLlmConfig {
         connector,
@@ -850,6 +866,7 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
         temperature,
         top_p,
         max_tokens,
+        hosted_tool_search,
     }
 }
 
