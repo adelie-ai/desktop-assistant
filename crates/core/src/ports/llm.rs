@@ -111,7 +111,8 @@ pub trait LlmClient: Send + Sync {
     }
 }
 
-/// Check whether a `CoreError` represents a retryable API error (429/529/rate-limit/overloaded).
+/// Check whether a `CoreError` represents a retryable API error
+/// (429/529/rate-limit/overloaded/server_error).
 /// Excludes permanent errors like `insufficient_quota` that happen to use HTTP 429.
 pub fn is_retryable_error(e: &CoreError) -> bool {
     let normalized = e.to_string().to_ascii_lowercase();
@@ -122,6 +123,7 @@ pub fn is_retryable_error(e: &CoreError) -> bool {
         || normalized.contains("rate_limit")
         || normalized.contains("529")
         || normalized.contains("overloaded")
+        || normalized.contains("server_error")
 }
 
 /// Decorator that wraps any `LlmClient` and retries on transient rate-limit errors
@@ -382,6 +384,12 @@ mod tests {
                 .into(),
         );
         assert!(!is_retryable_error(&e));
+    }
+
+    #[test]
+    fn retryable_error_server_error() {
+        let e = CoreError::Llm("OpenAI server_error: An error occurred while processing your request.".into());
+        assert!(is_retryable_error(&e));
     }
 
     // --- RetryingLlmClient tests ---

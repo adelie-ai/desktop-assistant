@@ -17,6 +17,7 @@ pub struct OpenAiClient {
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
+    hosted_tool_search: bool,
 }
 
 impl OpenAiClient {
@@ -37,6 +38,7 @@ impl OpenAiClient {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            hosted_tool_search: true,
         }
     }
 
@@ -62,6 +64,11 @@ impl OpenAiClient {
 
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_hosted_tool_search(mut self, enabled: bool) -> Self {
+        self.hosted_tool_search = enabled;
         self
     }
 
@@ -550,6 +557,26 @@ impl OpenAiClient {
                     Some("response.tool_search_call.completed") => {
                         tracing::info!(data, "tool search completed");
                     }
+                    Some("response.failed") => {
+                        tracing::warn!("OpenAI response failed: {data}");
+                        // Extract a concise error message if possible.
+                        let msg = serde_json::from_str::<serde_json::Value>(data)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("response")
+                                    .and_then(|r| r.get("error"))
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(|m| m.as_str())
+                                    .map(String::from)
+                            })
+                            .unwrap_or_else(|| "response.failed".into());
+                        return Err(CoreError::Llm(format!(
+                            "OpenAI server_error: {msg}"
+                        )));
+                    }
+                    Some("error") => {
+                        tracing::warn!("OpenAI stream error: {data}");
+                    }
                     Some("response.completed") => {
                         if let Ok(rc) = serde_json::from_str::<ResponseCompleted>(data) {
                             if let Some(u) = rc.response.usage {
@@ -627,7 +654,7 @@ impl LlmClient for OpenAiClient {
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
-        true
+        self.hosted_tool_search
     }
 
     async fn stream_completion_with_namespaces(
