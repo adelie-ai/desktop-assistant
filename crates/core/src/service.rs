@@ -498,14 +498,18 @@ async fn categorize_tool_namespaces<L: LlmClient>(
              The search system matches a natural-language query against category descriptions to \
              decide which tools to surface, so descriptions are critical.\n\n\
              Rules:\n\
-             - Each category: max 10 tools.\n\
+             - Each category: around 10 tools. A few more is fine if splitting \
+               would break a natural workflow grouping.\n\
              - \"name\": short snake_case identifier.\n\
              - \"description\": one or two sentences listing the KEY ACTIONS and VERBS a user \
                would search for. Include synonyms and related terms. \
                Example: \"Start, stop, and manage time-tracking sessions — clock in, clock out, \
                log hours, backdate entries, query timesheets, and correct recorded time.\"\n\
              - Every tool must appear in exactly one category. Do not add or remove tools.\n\
-             - Keep related read AND write operations together in the same category.\n\n\
+             - Keep related read AND write operations together in the same category.\n\
+             - Group tools by WORKFLOW, not by abstract type. Tools that are typically \
+               used together in the same task belong in the same category — a user \
+               performing a workflow should find everything they need in one namespace.\n\n\
              Respond with ONLY valid JSON: an array of objects with \"name\" (snake_case), \
              \"description\" (string), and \"tools\" (array of tool name strings).",
         ),
@@ -1048,6 +1052,33 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         {
                             tracing::info!("dynamically activated tool: {}", def.name);
                             activated_tools.insert(def.name.clone(), def);
+                        }
+                    }
+                }
+
+                // When hosted search is active and the model calls a
+                // deferred namespace tool, activate the entire namespace
+                // so full schemas are available in subsequent rounds.
+                if use_hosted_search
+                    && !hosted_search_demoted
+                    && !activated_tools.contains_key(&tool_call.name)
+                    && !core_tools.iter().any(|t| t.name == tool_call.name)
+                {
+                    for ns in &namespaces {
+                        if ns.tools.iter().any(|t| t.name == tool_call.name) {
+                            for t in &ns.tools {
+                                if !activated_tools.contains_key(&t.name)
+                                    && !core_tools.iter().any(|ct| ct.name == t.name)
+                                {
+                                    tracing::info!(
+                                        "activated deferred tool from namespace {:?}: {}",
+                                        ns.name,
+                                        t.name
+                                    );
+                                    activated_tools.insert(t.name.clone(), t.clone());
+                                }
+                            }
+                            break;
                         }
                     }
                 }
