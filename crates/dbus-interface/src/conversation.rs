@@ -197,11 +197,15 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
             let callback: desktop_assistant_core::ports::llm::ChunkCallback =
                 Box::new(move |chunk| tx_chunk.send(StreamEvent::Chunk(chunk)).is_ok());
 
+            let on_status: desktop_assistant_core::ports::llm::StatusCallback =
+                Box::new(|_| {});
+
             match service
                 .send_prompt(
                     &ConversationId::from(llm_conv_id.as_str()),
                     prompt,
                     callback,
+                    on_status,
                 )
                 .await
             {
@@ -295,7 +299,7 @@ mod tests {
     use super::*;
     use desktop_assistant_core::CoreError;
     use desktop_assistant_core::domain::{Conversation, ConversationSummary, Message, Role};
-    use desktop_assistant_core::ports::llm::ChunkCallback;
+    use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 
     struct FakeConversationService;
 
@@ -344,6 +348,7 @@ mod tests {
             _conversation_id: &ConversationId,
             _prompt: String,
             mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
         ) -> Result<String, CoreError> {
             on_chunk("hello ".to_string());
             on_chunk("world".to_string());
@@ -452,6 +457,7 @@ mod tests {
                 _: &ConversationId,
                 _: String,
                 _: ChunkCallback,
+                _: StatusCallback,
             ) -> Result<String, CoreError> {
                 Ok(String::new())
             }
@@ -535,6 +541,7 @@ mod tests {
                 _: &ConversationId,
                 _: String,
                 _: ChunkCallback,
+                _: StatusCallback,
             ) -> Result<String, CoreError> {
                 Ok(String::new())
             }

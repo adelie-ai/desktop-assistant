@@ -231,6 +231,14 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             conversation_id,
             title,
         }),
+        api::Event::AssistantStatus {
+            request_id,
+            message,
+            ..
+        } => Some(SignalEvent::Status {
+            request_id,
+            message,
+        }),
         api::Event::ConfigChanged { .. } => None,
     }
 }

@@ -4,7 +4,7 @@ use crate::domain::{
     ToolDefinition, ToolNamespace,
 };
 use crate::ports::inbound::ConversationService;
-use crate::ports::llm::{ChunkCallback, LlmClient};
+use crate::ports::llm::{ChunkCallback, LlmClient, StatusCallback};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 use chrono::{Duration, Local};
@@ -185,6 +185,38 @@ fn sanitize_assistant_text(text: &str) -> String {
 }
 
 use crate::ports::llm::is_retryable_error;
+
+/// Generate a short, human-readable status message for a tool call.
+fn tool_status_message(tool_name: &str, arguments: &serde_json::Value) -> String {
+    match tool_name {
+        "builtin_knowledge_base_search" => {
+            if let Some(q) = arguments.get("query").and_then(|v| v.as_str()) {
+                let truncated: String = q.chars().take(60).collect();
+                format!("Searching knowledge base: {truncated}")
+            } else {
+                "Searching knowledge base".into()
+            }
+        }
+        "builtin_knowledge_base_write" => "Saving to knowledge base".into(),
+        "builtin_knowledge_base_delete" => "Removing knowledge base entry".into(),
+        "builtin_sys_props" => "Checking system properties".into(),
+        "builtin_db_query" => "Querying database".into(),
+        "builtin_tool_search" => {
+            if let Some(q) = arguments.get("query").and_then(|v| v.as_str()) {
+                let truncated: String = q.chars().take(60).collect();
+                format!("Searching for tools: {truncated}")
+            } else {
+                "Searching for tools".into()
+            }
+        }
+        "builtin_mcp_control" => "Managing tool servers".into(),
+        name => {
+            // For MCP/dynamic tools, humanize the snake_case name.
+            let friendly = name.replace('_', " ");
+            format!("Running {friendly}")
+        }
+    }
+}
 
 fn user_visible_llm_error_message(error: &CoreError) -> String {
     let raw = error.to_string();
@@ -780,6 +812,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         conversation_id: &ConversationId,
         prompt: String,
         mut on_chunk: ChunkCallback,
+        mut on_status: StatusCallback,
     ) -> Result<String, CoreError> {
         let mut conv = self.store.get(conversation_id).await?;
         let is_first_message = conv.messages.is_empty();
@@ -1024,6 +1057,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             for tool_call in &response.tool_calls {
                 let arguments: serde_json::Value =
                     serde_json::from_str(&tool_call.arguments).unwrap_or_default();
+                on_status(tool_status_message(&tool_call.name, &arguments));
                 tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
                 let result = match self.tools.execute_tool(&tool_call.name, arguments).await {
                     Ok(output) => {
@@ -1221,6 +1255,10 @@ mod tests {
         Box::new(|_| true)
     }
 
+    fn noop_status() -> StatusCallback {
+        Box::new(|_| {})
+    }
+
     struct ListOnlyStore {
         conversations: Vec<Conversation>,
     }
@@ -1368,7 +1406,7 @@ mod tests {
         let conv = handler.create_conversation("Chat".into()).await.unwrap();
 
         let response = handler
-            .send_prompt(&conv.id, "Hi".into(), noop_callback())
+            .send_prompt(&conv.id, "Hi".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert_eq!(response, "Hello there");
@@ -1396,6 +1434,7 @@ mod tests {
                     chunks_clone.lock().unwrap().push(chunk);
                     true
                 }),
+                noop_status(),
             )
             .await
             .unwrap();
@@ -1409,7 +1448,7 @@ mod tests {
         let conv = handler.create_conversation("Chat".into()).await.unwrap();
 
         let response = handler
-            .send_prompt(&conv.id, "Hi".into(), noop_callback())
+            .send_prompt(&conv.id, "Hi".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert_eq!(response, "Visible answer");
@@ -1434,6 +1473,7 @@ mod tests {
                     chunks_clone.lock().unwrap().push(chunk);
                     true
                 }),
+                noop_status(),
             )
             .await
             .unwrap();
@@ -1453,7 +1493,7 @@ mod tests {
     async fn send_prompt_nonexistent_conversation_fails() {
         let handler = make_handler(vec![]);
         let result = handler
-            .send_prompt(&ConversationId::from("nope"), "hi".into(), noop_callback())
+            .send_prompt(&ConversationId::from("nope"), "hi".into(), noop_callback(), noop_status())
             .await;
         assert!(matches!(result, Err(CoreError::ConversationNotFound(_))));
     }
@@ -1580,7 +1620,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Read /tmp/test".into(), noop_callback())
+            .send_prompt(&conv.id, "Read /tmp/test".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert_eq!(result, "The file contains: hello world");
@@ -1626,7 +1666,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Do both".into(), noop_callback())
+            .send_prompt(&conv.id, "Do both".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert_eq!(result, "Done with both tools");
@@ -1654,7 +1694,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Try bad tool".into(), noop_callback())
+            .send_prompt(&conv.id, "Try bad tool".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert_eq!(result, "Tool failed, but I can continue");
@@ -1690,7 +1730,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Loop forever".into(), noop_callback())
+            .send_prompt(&conv.id, "Loop forever".into(), noop_callback(), noop_status())
             .await;
         assert!(matches!(result, Err(CoreError::Llm(_))));
     }
@@ -1841,7 +1881,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Use big tool".into(), noop_callback())
+            .send_prompt(&conv.id, "Use big tool".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert_eq!(result, "I adjusted my approach");
@@ -1875,7 +1915,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "hello".into(), noop_callback())
+            .send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert!(result.contains("LLM backend error"));
@@ -1967,7 +2007,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Use my tool".into(), noop_callback())
+            .send_prompt(&conv.id, "Use my tool".into(), noop_callback(), noop_status())
             .await
             .unwrap();
 
@@ -2043,7 +2083,7 @@ mod tests {
 
         let conv = handler.create_conversation("Test".into()).await.unwrap();
         let _ = handler
-            .send_prompt(&conv.id, "hello".into(), noop_callback())
+            .send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status())
             .await
             .unwrap();
 
@@ -2216,7 +2256,7 @@ mod tests {
         assert_eq!(conv.title, "New Chat");
 
         handler
-            .send_prompt(&conv.id, "Let's plan a trip!".into(), noop_callback())
+            .send_prompt(&conv.id, "Let's plan a trip!".into(), noop_callback(), noop_status())
             .await
             .unwrap();
 
@@ -2247,7 +2287,7 @@ mod tests {
 
         // First prompt — sets the title
         handler
-            .send_prompt(&conv.id, "Hello".into(), noop_callback())
+            .send_prompt(&conv.id, "Hello".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         let after_first = handler.get_conversation(&conv.id).await.unwrap();
@@ -2255,7 +2295,7 @@ mod tests {
 
         // Second prompt — title must remain unchanged
         handler
-            .send_prompt(&conv.id, "Follow-up question".into(), noop_callback())
+            .send_prompt(&conv.id, "Follow-up question".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         let after_second = handler.get_conversation(&conv.id).await.unwrap();
@@ -2280,7 +2320,7 @@ mod tests {
         let conv = handler.create_conversation("My Chat".into()).await.unwrap();
 
         handler
-            .send_prompt(&conv.id, "Hi".into(), noop_callback())
+            .send_prompt(&conv.id, "Hi".into(), noop_callback(), noop_status())
             .await
             .unwrap();
 
@@ -2316,7 +2356,7 @@ mod tests {
 
         let conv = handler.create_conversation("Test".into()).await.unwrap();
         let _ = handler
-            .send_prompt(&conv.id, "hello".into(), noop_callback())
+            .send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status())
             .await
             .unwrap();
 

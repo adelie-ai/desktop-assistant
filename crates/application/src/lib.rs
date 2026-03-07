@@ -625,12 +625,33 @@ where
             .is_ok()
         });
 
+        // Bridge status updates from core callback -> canonical events.
+        let status_tx = sink.clone();
+        let conv_id_for_status = conversation_id.clone();
+        let req_id_for_status = request_id.clone();
+        let on_status: desktop_assistant_core::ports::llm::StatusCallback =
+            Box::new(move |message| {
+                let sink = Arc::clone(&status_tx);
+                let conv_id = conv_id_for_status.clone();
+                let req_id = req_id_for_status.clone();
+                // Fire-and-forget: status messages are best-effort.
+                tokio::spawn(async move {
+                    sink.emit(api::Event::AssistantStatus {
+                        conversation_id: conv_id,
+                        request_id: req_id,
+                        message,
+                    })
+                    .await;
+                });
+            });
+
         let full = self
             .conversations
             .send_prompt(
                 &desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str()),
                 content,
                 callback,
+                on_status,
             )
             .await;
 
@@ -692,7 +713,7 @@ mod tests {
         BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
         EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
     };
-    use desktop_assistant_core::ports::llm::ChunkCallback;
+    use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -740,6 +761,7 @@ mod tests {
             _conversation_id: &ConversationId,
             _prompt: String,
             mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
         ) -> Result<String, CoreError> {
             on_chunk("a".into());
             on_chunk("b".into());
@@ -1178,6 +1200,7 @@ mod tests {
             _conversation_id: &ConversationId,
             _prompt: String,
             mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
         ) -> Result<String, CoreError> {
             for _ in 0..10_000 {
                 if !on_chunk("x".to_string()) {

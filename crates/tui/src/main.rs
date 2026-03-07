@@ -211,6 +211,9 @@ async fn run(
                     SignalEvent::Error { request_id, error } => {
                         app.streaming_error(&request_id, &error);
                     }
+                    SignalEvent::Status { request_id: _, message } => {
+                        app.status_message = message;
+                    }
                     SignalEvent::TitleChanged { conversation_id, title } => {
                         app.update_conversation_title(&conversation_id, &title);
                     }

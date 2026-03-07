@@ -7,6 +7,10 @@ use crate::domain::{Message, ToolCall, ToolDefinition, ToolNamespace};
 /// Return `true` to continue, `false` to abort the stream.
 pub type ChunkCallback = Box<dyn FnMut(String) -> bool + Send>;
 
+/// Callback invoked to report progress while the assistant is working
+/// (e.g. "Searching knowledge base...", "Querying timeclock sessions...").
+pub type StatusCallback = Box<dyn FnMut(String) + Send>;
+
 /// Token usage statistics from an LLM call.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {

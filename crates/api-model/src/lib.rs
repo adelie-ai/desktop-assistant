@@ -145,6 +145,14 @@ pub enum Event {
         config: Config,
     },
 
+    /// Progress status while the assistant is working (tool calls, searches, etc.).
+    /// Displayed as transient "working..." indicators, not as chat messages.
+    AssistantStatus {
+        conversation_id: String,
+        request_id: String,
+        message: String,
+    },
+
     /// Streaming chunk for a content response.
     AssistantDelta {
         conversation_id: String,

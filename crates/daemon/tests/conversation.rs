@@ -160,6 +160,7 @@ async fn full_conversation_lifecycle() {
                 chunks_clone.lock().unwrap().push(chunk);
                 true
             }),
+            Box::new(|_| {}),
         )
         .await
         .unwrap();
@@ -204,7 +205,7 @@ async fn multiple_conversations() {
 
     // Send prompt only to c1
     service
-        .send_prompt(&c1.id, "hello".into(), Box::new(|_| true))
+        .send_prompt(&c1.id, "hello".into(), Box::new(|_| true), Box::new(|_| {}))
         .await
         .unwrap();
 
@@ -234,6 +235,7 @@ async fn streaming_callback_abort() {
                 *count += 1;
                 *count < 2 // abort after 2nd chunk
             }),
+            Box::new(|_| {}),
         )
         .await
         .unwrap();

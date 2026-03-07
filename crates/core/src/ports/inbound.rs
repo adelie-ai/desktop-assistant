@@ -1,6 +1,6 @@
 use crate::CoreError;
 use crate::domain::{Conversation, ConversationId, ConversationSummary};
-use crate::ports::llm::ChunkCallback;
+use crate::ports::llm::{ChunkCallback, StatusCallback};
 
 #[derive(Debug, Clone)]
 pub struct LlmSettingsView {
@@ -126,6 +126,7 @@ pub trait ConversationService: Send + Sync {
         conversation_id: &ConversationId,
         prompt: String,
         on_chunk: ChunkCallback,
+        on_status: StatusCallback,
     ) -> impl std::future::Future<Output = Result<String, CoreError>> + Send;
 }
 

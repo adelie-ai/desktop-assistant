@@ -19,7 +19,7 @@ use desktop_assistant_core::ports::inbound::{
     DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
     SettingsService,
 };
-use desktop_assistant_core::ports::llm::ChunkCallback;
+use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 
 struct FakeAssistant;
 impl AssistantService for FakeAssistant {
@@ -107,6 +107,7 @@ impl ConversationService for FakeConversations {
         _conversation_id: &ConversationId,
         _prompt: String,
         mut on_chunk: ChunkCallback,
+        _on_status: StatusCallback,
     ) -> Result<String, CoreError> {
         on_chunk("he".into());
         on_chunk("llo".into());
@@ -148,6 +149,7 @@ impl ConversationService for CancelAwareConversations {
         _conversation_id: &ConversationId,
         _prompt: String,
         mut on_chunk: ChunkCallback,
+        _on_status: StatusCallback,
     ) -> Result<String, CoreError> {
         for _ in 0..10_000 {
             if !on_chunk("x".repeat(512)) {

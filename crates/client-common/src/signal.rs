@@ -12,6 +12,10 @@ pub enum SignalEvent {
         request_id: String,
         error: String,
     },
+    Status {
+        request_id: String,
+        message: String,
+    },
     TitleChanged {
         conversation_id: String,
         title: String,
