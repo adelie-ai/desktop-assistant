@@ -27,7 +27,7 @@ pub struct BedrockClient {
 
 impl BedrockClient {
     pub fn get_default_model() -> Option<&'static str> {
-        Some("anthropic.claude-3-5-sonnet-20241022-v2:0")
+        Some("us.anthropic.claude-sonnet-4-6")
     }
 
     pub fn get_default_base_url() -> Option<&'static str> {

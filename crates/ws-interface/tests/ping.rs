@@ -225,6 +225,7 @@ impl SettingsService for FakeSettings {
         Ok(ConnectorDefaultsView {
             llm_model: "m".into(),
             llm_base_url: "u".into(),
+            backend_llm_model: "bm".into(),
             embeddings_model: "em".into(),
             embeddings_base_url: "eu".into(),
             embeddings_available: false,
@@ -436,6 +437,7 @@ impl SettingsService for StatefulSettings {
         Ok(ConnectorDefaultsView {
             llm_model: "m".into(),
             llm_base_url: "u".into(),
+            backend_llm_model: "bm".into(),
             embeddings_model: "em".into(),
             embeddings_base_url: "eu".into(),
             embeddings_available: false,

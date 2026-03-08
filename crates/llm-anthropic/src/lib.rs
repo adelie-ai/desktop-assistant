@@ -20,7 +20,7 @@ pub struct AnthropicClient {
 
 impl AnthropicClient {
     pub fn get_default_model() -> Option<&'static str> {
-        Some("claude-sonnet-4-5-20250929")
+        Some("claude-sonnet-4-6-20260227")
     }
 
     pub fn get_default_base_url() -> Option<&'static str> {
@@ -79,7 +79,7 @@ impl AnthropicClient {
 
     /// Create from environment variables.
     /// Reads `ANTHROPIC_API_KEY` for the API key.
-    /// Optionally reads `ANTHROPIC_MODEL` (defaults to claude-sonnet-4-5-20250929)
+    /// Optionally reads `ANTHROPIC_MODEL` (defaults to claude-sonnet-4-6-20260227)
     /// and `ANTHROPIC_BASE_URL` (defaults to https://api.anthropic.com).
     pub fn from_env() -> Result<Self, CoreError> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn client_defaults() {
         let client = AnthropicClient::new("key".into());
-        assert_eq!(client.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(client.model, "claude-sonnet-4-6-20260227");
         assert_eq!(client.base_url, "https://api.anthropic.com");
         assert_eq!(client.max_tokens, 8192);
     }
@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn request_without_tools_omits_field() {
         let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".into(),
+            model: "claude-sonnet-4-6-20260227".into(),
             max_tokens: 8192,
             temperature: None,
             top_p: None,
@@ -901,7 +901,7 @@ mod tests {
     fn request_with_tools_includes_field() {
         let def = ToolDefinition::new("test", "desc", serde_json::json!({"type": "object"}));
         let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".into(),
+            model: "claude-sonnet-4-6-20260227".into(),
             max_tokens: 8192,
             temperature: None,
             top_p: None,
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn request_with_system_includes_field() {
         let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".into(),
+            model: "claude-sonnet-4-6-20260227".into(),
             max_tokens: 8192,
             temperature: None,
             top_p: None,
@@ -1032,7 +1032,7 @@ mod tests {
     #[test]
     fn request_without_system_omits_field() {
         let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".into(),
+            model: "claude-sonnet-4-6-20260227".into(),
             max_tokens: 8192,
             temperature: None,
             top_p: None,

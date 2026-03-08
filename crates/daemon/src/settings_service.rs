@@ -125,6 +125,7 @@ impl SettingsService for DaemonSettingsService {
         Ok(ConnectorDefaultsView {
             llm_model: defaults.llm_model,
             llm_base_url: defaults.llm_base_url,
+            backend_llm_model: defaults.backend_llm_model,
             embeddings_model: defaults.embeddings_model,
             embeddings_base_url: defaults.embeddings_base_url,
             embeddings_available: defaults.embeddings_available,

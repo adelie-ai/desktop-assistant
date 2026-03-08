@@ -285,6 +285,7 @@ pub struct EmbeddingsSettingsView {
 pub struct ConnectorDefaultsView {
     pub llm_model: String,
     pub llm_base_url: String,
+    pub backend_llm_model: String,
     pub embeddings_model: String,
     pub embeddings_base_url: String,
     pub embeddings_available: bool,

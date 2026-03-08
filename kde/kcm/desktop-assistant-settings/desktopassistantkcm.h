@@ -139,6 +139,7 @@ public:
     Q_INVOKABLE void defaults() override;
     Q_INVOKABLE void applyChatDefaults();
     Q_INVOKABLE void applySearchDefaults();
+    Q_INVOKABLE void applyBackendDefaults();
     Q_INVOKABLE void restartDaemon();
     Q_INVOKABLE void addRemoteConnection(const QString &name);
     Q_INVOKABLE void removeSelectedConnection();

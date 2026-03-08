@@ -6,7 +6,7 @@ Crate: `desktop-assistant-llm-bedrock`
 
 - API: AWS Bedrock Converse Stream (SDK, not raw HTTP)
 - Auth: AWS credential chain (IAM, env vars, profiles, SSO)
-- Default model: `anthropic.claude-3-5-sonnet-20241022-v2:0`
+- Default model: `us.anthropic.claude-sonnet-4-6`
 - Default region: `us-east-1`
 
 Supports static credentials via `AWS_BEDROCK_API_KEY=ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`

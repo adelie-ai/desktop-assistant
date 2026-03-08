@@ -451,7 +451,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     async fn get_connector_defaults(
         &self,
         connector: &str,
-    ) -> fdo::Result<(String, String, String, String, bool, bool)> {
+    ) -> fdo::Result<(String, String, String, String, bool, bool, String)> {
         let defaults = self
             .service
             .get_connector_defaults(connector.to_string())
@@ -465,6 +465,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             defaults.embeddings_base_url,
             defaults.embeddings_available,
             defaults.hosted_tool_search_available,
+            defaults.backend_llm_model,
         ))
     }
 
@@ -929,6 +930,7 @@ mod tests {
             Ok(ConnectorDefaultsView {
                 llm_model: "gpt-5.4".to_string(),
                 llm_base_url: "https://api.openai.com/v1".to_string(),
+                backend_llm_model: "gpt-4o-mini".to_string(),
                 embeddings_model: "text-embedding-3-small".to_string(),
                 embeddings_base_url: "https://api.openai.com/v1".to_string(),
                 embeddings_available: true,

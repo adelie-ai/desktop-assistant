@@ -6,7 +6,7 @@ Crate: `desktop-assistant-llm-anthropic`
 
 - Endpoint: `{base_url}/v1/messages` (POST, streaming SSE)
 - API version header: `2023-06-01`
-- Default model: `claude-sonnet-4-5-20250929`
+- Default model: `claude-sonnet-4-6-20260227`
 - Default base URL: `https://api.anthropic.com`
 - Default max tokens: `8192`
 

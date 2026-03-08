@@ -248,6 +248,12 @@ KCM.SimpleKCM {
                         }
                     }
 
+                    QQC2.Button {
+                        text: "Set Defaults"
+                        enabled: btSeparateLlmCheck.checked
+                        onClicked: kcm.applyBackendDefaults()
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
                         enabled: btSeparateLlmCheck.checked

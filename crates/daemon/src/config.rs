@@ -247,6 +247,7 @@ pub struct EmbeddingsSettingsView {
 pub struct ConnectorDefaultsView {
     pub llm_model: String,
     pub llm_base_url: String,
+    pub backend_llm_model: String,
     pub embeddings_model: String,
     pub embeddings_base_url: String,
     pub embeddings_available: bool,
@@ -668,9 +669,12 @@ pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
 
     let hosted_tool_search_available = connector == "openai" || connector == "anthropic";
 
+    let backend_llm_model = default_backend_llm_model(&connector);
+
     ConnectorDefaultsView {
         llm_model,
         llm_base_url,
+        backend_llm_model,
         embeddings_model: default_embedding_model(embeddings_connector),
         embeddings_base_url: default_base_url(embeddings_connector),
         embeddings_available,
@@ -794,6 +798,15 @@ fn default_llm_model(connector: &str) -> String {
     }
     .unwrap_or_default()
     .to_string()
+}
+
+fn default_backend_llm_model(connector: &str) -> String {
+    match connector {
+        "ollama" => OllamaClient::get_default_model().unwrap_or_default().to_string(),
+        "anthropic" => "claude-haiku-4-5-20251001".to_string(),
+        "bedrock" | "aws-bedrock" => "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
+        _ => "gpt-4o-mini".to_string(),
+    }
 }
 
 fn normalize_optional_value(value: Option<&str>) -> Option<String> {
@@ -1761,7 +1774,7 @@ mod tests {
 
         let resolved = resolve_llm_config(Some(&config));
         assert_eq!(resolved.connector, "bedrock");
-        assert_eq!(resolved.model, "anthropic.claude-3-5-sonnet-20241022-v2:0");
+        assert_eq!(resolved.model, "us.anthropic.claude-sonnet-4-6");
         assert_eq!(resolved.base_url, "us-east-1");
     }
 
@@ -1795,7 +1808,7 @@ mod tests {
     #[test]
     fn connector_defaults_anthropic_embeddings_fallback_to_openai() {
         let defaults = get_connector_defaults("anthropic");
-        assert_eq!(defaults.llm_model, "claude-sonnet-4-5-20250929");
+        assert_eq!(defaults.llm_model, "claude-sonnet-4-6-20260227");
         assert_eq!(defaults.llm_base_url, "https://api.anthropic.com");
         assert_eq!(defaults.embeddings_model, "text-embedding-3-small");
         assert_eq!(defaults.embeddings_base_url, "https://api.openai.com/v1");
@@ -1808,7 +1821,7 @@ mod tests {
             r#"
             [llm]
             connector = "anthropic"
-            model = "claude-sonnet-4-5-20250929"
+            model = "claude-sonnet-4-6-20260227"
 
             [embeddings]
             connector = "ollama"

@@ -49,6 +49,7 @@ struct ConnectorDefaults {
     QString embeddingsBaseUrl;
     bool embeddingsAvailable = true;
     bool hostedToolSearchAvailable = true;
+    QString backendLlmModel;
 };
 
 bool fetchConnectorDefaults(
@@ -81,6 +82,7 @@ bool fetchConnectorDefaults(
         out->embeddingsBaseUrl = args[3].toString();
         out->embeddingsAvailable = args[4].toBool();
         out->hostedToolSearchAvailable = args.size() > 5 ? args[5].toBool() : true;
+        out->backendLlmModel = args.size() > 6 ? args[6].toString() : out->llmModel;
     }
 
     return true;
@@ -764,6 +766,7 @@ void DesktopAssistantKcm::defaults()
 {
     applyChatDefaults();
     applySearchDefaults();
+    applyBackendDefaults();
     setApiKeyInput(QString());
     m_statusText = QStringLiteral("Applied connector defaults; click Apply to save");
     Q_EMIT statusTextChanged();
@@ -818,6 +821,26 @@ void DesktopAssistantKcm::applySearchDefaults()
 
     setEmbModel(defaults.embeddingsModel);
     setEmbBaseUrl(defaults.embeddingsBaseUrl);
+}
+
+void DesktopAssistantKcm::applyBackendDefaults()
+{
+    QDBusInterface iface(SERVICE, PATH, IFACE, QDBusConnection::sessionBus());
+    const auto btConnector = normalizeConnector(m_btLlmConnector.isEmpty() ? m_connector : m_btLlmConnector);
+
+    ConnectorDefaults defaults;
+    QString errorText;
+    if (!fetchConnectorDefaults(iface, btConnector, &defaults, &errorText)) {
+        m_statusText = errorText;
+        Q_EMIT statusTextChanged();
+        return;
+    }
+
+    if (m_btLlmConnector.isEmpty()) {
+        setBtLlmConnector(btConnector);
+    }
+    setBtLlmModel(defaults.backendLlmModel);
+    setBtLlmBaseUrl(defaults.llmBaseUrl);
 }
 
 void DesktopAssistantKcm::restartDaemon()
