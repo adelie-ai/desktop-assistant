@@ -144,6 +144,10 @@ pub struct LlmConfig {
     /// When `None`, defaults to the connector's built-in capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_tool_search: Option<bool>,
+    /// AWS profile name for Bedrock connector (e.g. "my-work-profile").
+    /// When `None`, uses the default AWS credential chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_profile: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -158,6 +162,7 @@ impl Default for LlmConfig {
             top_p: None,
             max_tokens: None,
             hosted_tool_search: None,
+            aws_profile: None,
         }
     }
 }
@@ -202,6 +207,8 @@ pub struct ResolvedLlmConfig {
     pub max_tokens: Option<u32>,
     /// Explicit hosted-tool-search override from config, or `None` for connector default.
     pub hosted_tool_search: Option<bool>,
+    /// AWS profile name for Bedrock connector.
+    pub aws_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -857,6 +864,7 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
     let top_p = llm_config.and_then(|c| c.top_p);
     let max_tokens = llm_config.and_then(|c| c.max_tokens);
     let hosted_tool_search = llm_config.and_then(|c| c.hosted_tool_search);
+    let aws_profile = llm_config.and_then(|c| c.aws_profile.clone());
 
     ResolvedLlmConfig {
         connector,
@@ -867,6 +875,7 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
         top_p,
         max_tokens,
         hosted_tool_search,
+        aws_profile,
     }
 }
 

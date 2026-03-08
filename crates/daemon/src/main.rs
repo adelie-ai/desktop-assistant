@@ -421,7 +421,8 @@ fn build_llm_client(resolved: config::ResolvedLlmConfig) -> AnyLlmClient {
                 .with_base_url(resolved.base_url)
                 .with_temperature(resolved.temperature)
                 .with_top_p(resolved.top_p)
-                .with_max_tokens(resolved.max_tokens),
+                .with_max_tokens(resolved.max_tokens)
+                .with_aws_profile(resolved.aws_profile),
         ),
         _ => {
             if resolved.api_key.is_empty() {

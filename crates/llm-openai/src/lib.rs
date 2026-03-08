@@ -237,9 +237,12 @@ struct NamespaceTool {
 
 impl NamespaceTool {
     fn from_namespace(ns: &ToolNamespace) -> Self {
+        // Prefix namespace names to avoid collisions with OpenAI reserved
+        // namespaces (e.g. "terminal", "browser").
+        let name = format!("adele_{}", ns.name);
         Self {
             r#type: "namespace".to_string(),
-            name: ns.name.clone(),
+            name,
             description: ns.description.clone(),
             tools: ns
                 .tools
@@ -848,7 +851,7 @@ mod tests {
         let entry = ToolEntry::Namespace(NamespaceTool::from_namespace(&ns));
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["type"], "namespace");
-        assert_eq!(json["name"], "jira");
+        assert_eq!(json["name"], "adele_jira");
         assert_eq!(json["description"], "Jira project tools");
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);

@@ -18,6 +18,7 @@ pub struct BedrockClient {
     model: String,
     base_url: String,
     api_key: String,
+    aws_profile: Option<String>,
     client: OnceCell<Client>,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -38,6 +39,7 @@ impl BedrockClient {
             model: Self::get_default_model().unwrap_or_default().to_string(),
             base_url: Self::get_default_base_url().unwrap_or_default().to_string(),
             api_key,
+            aws_profile: None,
             client: OnceCell::new(),
             temperature: None,
             top_p: None,
@@ -71,10 +73,25 @@ impl BedrockClient {
         self
     }
 
+    pub fn with_aws_profile(mut self, profile: Option<String>) -> Self {
+        self.aws_profile = profile.filter(|s| !s.trim().is_empty());
+        self
+    }
+
     async fn client(&self) -> Result<&Client, CoreError> {
         self.client
             .get_or_try_init(|| async {
                 let mut loader = aws_config::defaults(BehaviorVersion::latest());
+
+                let effective_profile = self
+                    .aws_profile
+                    .clone()
+                    .or_else(|| aws_profile_exists("adele").then(|| "adele".to_string()));
+
+                if let Some(ref profile) = effective_profile {
+                    tracing::info!(aws_profile = %profile, "using AWS profile");
+                    loader = loader.profile_name(profile);
+                }
 
                 if let Some(region) = region_from_base_url(&self.base_url) {
                     loader = loader.region(Region::new(region));
@@ -137,6 +154,31 @@ impl BedrockClient {
 struct BedrockEmbeddingResponse {
     #[serde(default)]
     embedding: Vec<f32>,
+}
+
+/// Check whether an AWS profile exists in `~/.aws/config` or `~/.aws/credentials`.
+fn aws_profile_exists(name: &str) -> bool {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return false;
+    };
+    let aws_dir = std::path::Path::new(&home).join(".aws");
+
+    // ~/.aws/config uses [profile <name>] (except [default])
+    let config_section = format!("[profile {name}]");
+    // ~/.aws/credentials uses [<name>]
+    let creds_section = format!("[{name}]");
+
+    for (path, needle) in [
+        (aws_dir.join("config"), config_section.as_str()),
+        (aws_dir.join("credentials"), creds_section.as_str()),
+    ] {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if contents.contains(needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn region_from_base_url(base_url: &str) -> Option<String> {
