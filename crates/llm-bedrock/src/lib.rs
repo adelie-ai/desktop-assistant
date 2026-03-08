@@ -248,17 +248,36 @@ fn convert_messages(
                 system.push(SystemContentBlock::Text(msg.content.clone()));
             }
             Role::User => {
-                api_messages.push(
-                    BedrockMessage::builder()
-                        .role(ConversationRole::User)
-                        .content(ContentBlock::Text(msg.content.clone()))
-                        .build()
-                        .map_err(|e| {
-                            CoreError::Llm(format!(
-                                "failed to build Bedrock user message payload: {e}"
-                            ))
-                        })?,
-                );
+                // Merge consecutive user messages to maintain alternation.
+                let is_consecutive_user = api_messages
+                    .last()
+                    .map_or(false, |m: &BedrockMessage| m.role() == &ConversationRole::User);
+                if is_consecutive_user {
+                    let prev = api_messages.pop().unwrap();
+                    let mut builder = BedrockMessage::builder().role(ConversationRole::User);
+                    for block in prev.content() {
+                        let b: ContentBlock = block.clone();
+                        builder = builder.content(b);
+                    }
+                    builder = builder.content(ContentBlock::Text(msg.content.clone()));
+                    api_messages.push(builder.build().map_err(|e| {
+                        CoreError::Llm(format!(
+                            "failed to build Bedrock user message payload: {e}"
+                        ))
+                    })?);
+                } else {
+                    api_messages.push(
+                        BedrockMessage::builder()
+                            .role(ConversationRole::User)
+                            .content(ContentBlock::Text(msg.content.clone()))
+                            .build()
+                            .map_err(|e| {
+                                CoreError::Llm(format!(
+                                    "failed to build Bedrock user message payload: {e}"
+                                ))
+                            })?,
+                    );
+                }
             }
             Role::Assistant => {
                 let mut builder = BedrockMessage::builder().role(ConversationRole::Assistant);
@@ -293,27 +312,55 @@ fn convert_messages(
             }
             Role::Tool => {
                 let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
-                api_messages.push(
-                    BedrockMessage::builder()
-                        .role(ConversationRole::User)
-                        .content(ContentBlock::ToolResult(
-                            ToolResultBlock::builder()
-                                .tool_use_id(tool_use_id)
-                                .content(ToolResultContentBlock::Text(msg.content.clone()))
-                                .build()
-                                .map_err(|e| {
-                                    CoreError::Llm(format!(
-                                        "failed to build Bedrock tool-result payload: {e}"
-                                    ))
-                                })?,
-                        ))
+                let result_block = ContentBlock::ToolResult(
+                    ToolResultBlock::builder()
+                        .tool_use_id(tool_use_id)
+                        .content(ToolResultContentBlock::Text(msg.content.clone()))
                         .build()
                         .map_err(|e| {
                             CoreError::Llm(format!(
-                                "failed to build Bedrock tool message payload: {e}"
+                                "failed to build Bedrock tool-result payload: {e}"
                             ))
                         })?,
                 );
+                // Bedrock requires all tool results for a single assistant turn
+                // to be in one user message. Merge consecutive tool results.
+                let merged = api_messages.last().and_then(|m: &BedrockMessage| {
+                    if m.role() == &ConversationRole::User
+                        && m.content().iter().all(|c| matches!(c, ContentBlock::ToolResult(_)))
+                        && !m.content().is_empty()
+                    {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                });
+                if merged.is_some() {
+                    let prev = api_messages.pop().unwrap();
+                    let mut builder = BedrockMessage::builder().role(ConversationRole::User);
+                    for block in prev.content() {
+                        let b: ContentBlock = block.clone();
+                        builder = builder.content(b);
+                    }
+                    builder = builder.content(result_block);
+                    api_messages.push(builder.build().map_err(|e| {
+                        CoreError::Llm(format!(
+                            "failed to build Bedrock tool message payload: {e}"
+                        ))
+                    })?);
+                } else {
+                    api_messages.push(
+                        BedrockMessage::builder()
+                            .role(ConversationRole::User)
+                            .content(result_block)
+                            .build()
+                            .map_err(|e| {
+                                CoreError::Llm(format!(
+                                    "failed to build Bedrock tool message payload: {e}"
+                                ))
+                            })?,
+                    );
+                }
             }
         }
     }
@@ -495,7 +542,30 @@ impl LlmClient for BedrockClient {
         let response = request
             .send()
             .await
-            .map_err(|e| CoreError::Llm(format!("Bedrock converse_stream request failed: {e}")))?;
+            .map_err(|e| {
+                use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+                let detail = match e.as_service_error() {
+                    Some(ConverseStreamError::ValidationException(ve)) => {
+                        format!("validation error: {}", ve.message().unwrap_or("unknown"))
+                    }
+                    Some(ConverseStreamError::AccessDeniedException(ad)) => {
+                        format!("access denied: {}", ad.message().unwrap_or("unknown"))
+                    }
+                    Some(ConverseStreamError::ThrottlingException(te)) => {
+                        format!("throttled: {}", te.message().unwrap_or("unknown"))
+                    }
+                    Some(ConverseStreamError::ModelTimeoutException(mt)) => {
+                        format!("model timeout: {}", mt.message().unwrap_or("unknown"))
+                    }
+                    Some(ConverseStreamError::ModelNotReadyException(mr)) => {
+                        format!("model not ready: {}", mr.message().unwrap_or("unknown"))
+                    }
+                    Some(other) => format!("{other}"),
+                    None => format!("{e:#}"),
+                };
+                tracing::warn!("Bedrock converse_stream error: {detail}");
+                CoreError::Llm(format!("Bedrock converse_stream request failed: {detail}"))
+            })?;
 
         let mut stream = response.stream;
 

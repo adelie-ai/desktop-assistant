@@ -956,6 +956,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         let removed = trim_tool_pairs(&mut conv.messages);
                         conv.compacted_through = conv.compacted_through.saturating_sub(removed);
                         tracing::info!("removed {removed} messages to reduce context");
+                        if removed == 0 {
+                            // Nothing left to trim — retrying won't help.
+                            let friendly = user_visible_llm_error_message(&e);
+                            conv.messages.push(Message::new(Role::Assistant, &friendly));
+                            conv.updated_at = now_timestamp();
+                            self.store.update(conv).await?;
+                            return Ok(friendly);
+                        }
                         conv.messages.push(Message::new(
                             Role::System,
                             format!(
