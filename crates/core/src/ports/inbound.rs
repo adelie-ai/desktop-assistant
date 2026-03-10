@@ -64,6 +64,16 @@ pub struct McpServerView {
 }
 
 #[derive(Debug, Clone)]
+pub struct WsAuthSettingsView {
+    pub methods: Vec<String>,
+    pub oidc_issuer: String,
+    pub oidc_auth_endpoint: String,
+    pub oidc_token_endpoint: String,
+    pub oidc_client_id: String,
+    pub oidc_scopes: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct BackendTasksSettingsView {
     /// Whether `[backend_tasks.llm]` is explicitly configured (vs. falling back to primary LLM).
     pub has_separate_llm: bool,
@@ -250,6 +260,20 @@ pub trait SettingsService: Send + Sync {
         action: String,
         server: Option<String>,
     ) -> impl std::future::Future<Output = Result<Vec<McpServerView>, CoreError>> + Send;
+
+    fn get_ws_auth_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<WsAuthSettingsView, CoreError>> + Send;
+
+    fn set_ws_auth_settings(
+        &self,
+        methods: Vec<String>,
+        oidc_issuer: String,
+        oidc_auth_endpoint: String,
+        oidc_token_endpoint: String,
+        oidc_client_id: String,
+        oidc_scopes: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
 #[cfg(test)]

@@ -774,6 +774,51 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .collect())
     }
 
+    /// Return WebSocket auth settings.
+    ///
+    /// Returns: (methods, oidc_issuer, oidc_auth_endpoint, oidc_token_endpoint, oidc_client_id, oidc_scopes)
+    async fn get_ws_auth_settings(
+        &self,
+    ) -> fdo::Result<(Vec<String>, String, String, String, String, String)> {
+        let settings = self
+            .service
+            .get_ws_auth_settings()
+            .await
+            .map_err(to_fdo_error)?;
+
+        Ok((
+            settings.methods,
+            settings.oidc_issuer,
+            settings.oidc_auth_endpoint,
+            settings.oidc_token_endpoint,
+            settings.oidc_client_id,
+            settings.oidc_scopes,
+        ))
+    }
+
+    /// Update WebSocket auth settings.
+    async fn set_ws_auth_settings(
+        &self,
+        methods: Vec<String>,
+        oidc_issuer: &str,
+        oidc_auth_endpoint: &str,
+        oidc_token_endpoint: &str,
+        oidc_client_id: &str,
+        oidc_scopes: &str,
+    ) -> fdo::Result<()> {
+        self.service
+            .set_ws_auth_settings(
+                methods,
+                oidc_issuer.to_string(),
+                oidc_auth_endpoint.to_string(),
+                oidc_token_endpoint.to_string(),
+                oidc_client_id.to_string(),
+                oidc_scopes.to_string(),
+            )
+            .await
+            .map_err(to_fdo_error)
+    }
+
     /// Signal emitted after a successful aggregate config update.
     #[zbus(signal)]
     async fn config_changed(emitter: &SignalEmitter<'_>, config: &ConfigData) -> zbus::Result<()>;
@@ -786,6 +831,7 @@ mod tests {
     use desktop_assistant_core::ports::inbound::{
         BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
         EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView, SettingsService,
+        WsAuthSettingsView,
     };
     use std::sync::Mutex;
 
@@ -1035,6 +1081,29 @@ mod tests {
             _server: Option<String>,
         ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
+        }
+
+        async fn get_ws_auth_settings(&self) -> Result<WsAuthSettingsView, CoreError> {
+            Ok(WsAuthSettingsView {
+                methods: vec!["password".to_string()],
+                oidc_issuer: String::new(),
+                oidc_auth_endpoint: String::new(),
+                oidc_token_endpoint: String::new(),
+                oidc_client_id: String::new(),
+                oidc_scopes: String::new(),
+            })
+        }
+
+        async fn set_ws_auth_settings(
+            &self,
+            _methods: Vec<String>,
+            _oidc_issuer: String,
+            _oidc_auth_endpoint: String,
+            _oidc_token_endpoint: String,
+            _oidc_client_id: String,
+            _oidc_scopes: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
         }
     }
 

@@ -42,6 +42,13 @@ class DesktopAssistantKcm : public KQuickConfigModule {
     Q_PROPERTY(QString btLlmBaseUrl READ btLlmBaseUrl WRITE setBtLlmBaseUrl NOTIFY btLlmBaseUrlChanged)
     Q_PROPERTY(int hostedToolSearch READ hostedToolSearch WRITE setHostedToolSearch NOTIFY hostedToolSearchChanged)
     Q_PROPERTY(bool hostedToolSearchAvailable READ hostedToolSearchAvailable NOTIFY hostedToolSearchAvailableChanged)
+    Q_PROPERTY(bool wsAuthPasswordEnabled READ wsAuthPasswordEnabled WRITE setWsAuthPasswordEnabled NOTIFY wsAuthMethodsChanged)
+    Q_PROPERTY(bool wsAuthOidcEnabled READ wsAuthOidcEnabled WRITE setWsAuthOidcEnabled NOTIFY wsAuthMethodsChanged)
+    Q_PROPERTY(QString oidcIssuer READ oidcIssuer WRITE setOidcIssuer NOTIFY oidcIssuerChanged)
+    Q_PROPERTY(QString oidcAuthEndpoint READ oidcAuthEndpoint WRITE setOidcAuthEndpoint NOTIFY oidcAuthEndpointChanged)
+    Q_PROPERTY(QString oidcTokenEndpoint READ oidcTokenEndpoint WRITE setOidcTokenEndpoint NOTIFY oidcTokenEndpointChanged)
+    Q_PROPERTY(QString oidcClientId READ oidcClientId WRITE setOidcClientId NOTIFY oidcClientIdChanged)
+    Q_PROPERTY(QString oidcScopes READ oidcScopes WRITE setOidcScopes NOTIFY oidcScopesChanged)
 
 public:
     DesktopAssistantKcm(QObject *parent, const KPluginMetaData &metaData, const QVariantList &args);
@@ -134,6 +141,22 @@ public:
     void setHostedToolSearch(int value);
     bool hostedToolSearchAvailable() const;
 
+    bool wsAuthPasswordEnabled() const;
+    void setWsAuthPasswordEnabled(bool value);
+    bool wsAuthOidcEnabled() const;
+    void setWsAuthOidcEnabled(bool value);
+
+    QString oidcIssuer() const;
+    void setOidcIssuer(const QString &value);
+    QString oidcAuthEndpoint() const;
+    void setOidcAuthEndpoint(const QString &value);
+    QString oidcTokenEndpoint() const;
+    void setOidcTokenEndpoint(const QString &value);
+    QString oidcClientId() const;
+    void setOidcClientId(const QString &value);
+    QString oidcScopes() const;
+    void setOidcScopes(const QString &value);
+
     Q_INVOKABLE void load() override;
     Q_INVOKABLE void save() override;
     Q_INVOKABLE void defaults() override;
@@ -179,6 +202,12 @@ Q_SIGNALS:
     void btLlmBaseUrlChanged();
     void hostedToolSearchChanged();
     void hostedToolSearchAvailableChanged();
+    void wsAuthMethodsChanged();
+    void oidcIssuerChanged();
+    void oidcAuthEndpointChanged();
+    void oidcTokenEndpointChanged();
+    void oidcClientIdChanged();
+    void oidcScopesChanged();
 
 private:
     struct ConnectionProfile {
@@ -226,4 +255,10 @@ private:
     QString m_btLlmBaseUrl;
     int m_hostedToolSearch = -1; // -1 = connector default, 0 = off, 1 = on
     bool m_hostedToolSearchAvailable = true;
+    QStringList m_wsAuthMethods = {QStringLiteral("password")};
+    QString m_oidcIssuer;
+    QString m_oidcAuthEndpoint;
+    QString m_oidcTokenEndpoint;
+    QString m_oidcClientId;
+    QString m_oidcScopes = QStringLiteral("openid profile email");
 };

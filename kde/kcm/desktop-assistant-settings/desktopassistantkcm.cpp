@@ -563,6 +563,89 @@ bool DesktopAssistantKcm::hostedToolSearchAvailable() const
     return m_hostedToolSearchAvailable;
 }
 
+bool DesktopAssistantKcm::wsAuthPasswordEnabled() const
+{
+    return m_wsAuthMethods.contains(QStringLiteral("password"));
+}
+
+void DesktopAssistantKcm::setWsAuthPasswordEnabled(bool value)
+{
+    const auto method = QStringLiteral("password");
+    if (value && !m_wsAuthMethods.contains(method)) {
+        m_wsAuthMethods.append(method);
+        Q_EMIT wsAuthMethodsChanged();
+        setNeedsSave(true);
+    } else if (!value && m_wsAuthMethods.contains(method)) {
+        m_wsAuthMethods.removeAll(method);
+        Q_EMIT wsAuthMethodsChanged();
+        setNeedsSave(true);
+    }
+}
+
+bool DesktopAssistantKcm::wsAuthOidcEnabled() const
+{
+    return m_wsAuthMethods.contains(QStringLiteral("oidc"));
+}
+
+void DesktopAssistantKcm::setWsAuthOidcEnabled(bool value)
+{
+    const auto method = QStringLiteral("oidc");
+    if (value && !m_wsAuthMethods.contains(method)) {
+        m_wsAuthMethods.append(method);
+        Q_EMIT wsAuthMethodsChanged();
+        setNeedsSave(true);
+    } else if (!value && m_wsAuthMethods.contains(method)) {
+        m_wsAuthMethods.removeAll(method);
+        Q_EMIT wsAuthMethodsChanged();
+        setNeedsSave(true);
+    }
+}
+
+QString DesktopAssistantKcm::oidcIssuer() const { return m_oidcIssuer; }
+void DesktopAssistantKcm::setOidcIssuer(const QString &value)
+{
+    if (m_oidcIssuer == value) return;
+    m_oidcIssuer = value;
+    Q_EMIT oidcIssuerChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::oidcAuthEndpoint() const { return m_oidcAuthEndpoint; }
+void DesktopAssistantKcm::setOidcAuthEndpoint(const QString &value)
+{
+    if (m_oidcAuthEndpoint == value) return;
+    m_oidcAuthEndpoint = value;
+    Q_EMIT oidcAuthEndpointChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::oidcTokenEndpoint() const { return m_oidcTokenEndpoint; }
+void DesktopAssistantKcm::setOidcTokenEndpoint(const QString &value)
+{
+    if (m_oidcTokenEndpoint == value) return;
+    m_oidcTokenEndpoint = value;
+    Q_EMIT oidcTokenEndpointChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::oidcClientId() const { return m_oidcClientId; }
+void DesktopAssistantKcm::setOidcClientId(const QString &value)
+{
+    if (m_oidcClientId == value) return;
+    m_oidcClientId = value;
+    Q_EMIT oidcClientIdChanged();
+    setNeedsSave(true);
+}
+
+QString DesktopAssistantKcm::oidcScopes() const { return m_oidcScopes; }
+void DesktopAssistantKcm::setOidcScopes(const QString &value)
+{
+    if (m_oidcScopes == value) return;
+    m_oidcScopes = value;
+    Q_EMIT oidcScopesChanged();
+    setNeedsSave(true);
+}
+
 void DesktopAssistantKcm::load()
 {
     QDBusInterface iface(SERVICE, PATH, IFACE, QDBusConnection::sessionBus());
@@ -658,6 +741,22 @@ void DesktopAssistantKcm::load()
     m_btDreamingEnabled = btArgs[4].toBool();
     m_btDreamingIntervalSecs = static_cast<int>(btArgs[5].toULongLong());
 
+    QDBusMessage wsAuthReply = iface.call("GetWsAuthSettings");
+    if (!setStatusFromDbusError(wsAuthReply)) {
+        const auto wsAuthArgs = wsAuthReply.arguments();
+        if (wsAuthArgs.size() >= 6) {
+            m_wsAuthMethods = wsAuthArgs[0].toStringList();
+            m_oidcIssuer = wsAuthArgs[1].toString();
+            m_oidcAuthEndpoint = wsAuthArgs[2].toString();
+            m_oidcTokenEndpoint = wsAuthArgs[3].toString();
+            m_oidcClientId = wsAuthArgs[4].toString();
+            m_oidcScopes = wsAuthArgs[5].toString();
+            if (m_oidcScopes.isEmpty()) {
+                m_oidcScopes = QStringLiteral("openid profile email");
+            }
+        }
+    }
+
     loadWidgetConnectionSettings();
 
     Q_EMIT connectorChanged();
@@ -688,6 +787,12 @@ void DesktopAssistantKcm::load()
     Q_EMIT btLlmBaseUrlChanged();
     Q_EMIT hostedToolSearchChanged();
     Q_EMIT hostedToolSearchAvailableChanged();
+    Q_EMIT wsAuthMethodsChanged();
+    Q_EMIT oidcIssuerChanged();
+    Q_EMIT oidcAuthEndpointChanged();
+    Q_EMIT oidcTokenEndpointChanged();
+    Q_EMIT oidcClientIdChanged();
+    Q_EMIT oidcScopesChanged();
 
     m_statusText = QStringLiteral("Loaded settings from desktop-assistant daemon");
     Q_EMIT statusTextChanged();
@@ -737,6 +842,19 @@ void DesktopAssistantKcm::save()
         static_cast<qulonglong>(m_btDreamingIntervalSecs)
     );
     if (setStatusFromDbusError(btSaveReply)) {
+        return;
+    }
+
+    QDBusMessage wsAuthSaveReply = iface.call(
+        "SetWsAuthSettings",
+        m_wsAuthMethods,
+        m_oidcIssuer,
+        m_oidcAuthEndpoint,
+        m_oidcTokenEndpoint,
+        m_oidcClientId,
+        m_oidcScopes
+    );
+    if (setStatusFromDbusError(wsAuthSaveReply)) {
         return;
     }
 

@@ -25,6 +25,47 @@ pub struct DaemonConfig {
     pub backend_tasks: BackendTasksConfig,
     #[serde(default)]
     pub profiling: ProfilingConfig,
+    #[serde(default)]
+    pub ws_auth: WsAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WsAuthConfig {
+    #[serde(default = "default_ws_auth_methods")]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+}
+
+impl Default for WsAuthConfig {
+    fn default() -> Self {
+        Self {
+            methods: default_ws_auth_methods(),
+            oidc: None,
+        }
+    }
+}
+
+fn default_ws_auth_methods() -> Vec<String> {
+    vec!["password".to_string()]
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OidcConfig {
+    pub issuer_url: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: String,
+    #[serde(default)]
+    pub jwks_uri: String,
+    #[serde(default)]
+    pub audience: String,
+}
+
+fn default_oidc_scopes() -> String {
+    "openid profile email".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1334,6 +1375,160 @@ pub fn validate_ws_jwt(token: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
     }
+}
+
+/// Cached JWKS key set for validating external OIDC tokens.
+pub struct OidcValidator {
+    decoding_keys: Vec<DecodingKey>,
+    validation: Validation,
+}
+
+impl OidcValidator {
+    /// Fetch JWKS from the IdP and build a validator.
+    pub async fn from_config(oidc: &OidcConfig) -> anyhow::Result<Self> {
+        let jwks_uri = if oidc.jwks_uri.is_empty() {
+            let discovery_url = format!(
+                "{}/.well-known/openid-configuration",
+                oidc.issuer_url.trim_end_matches('/')
+            );
+            let client = reqwest::Client::new();
+            let discovery: serde_json::Value =
+                client.get(&discovery_url).send().await?.json().await?;
+            discovery["jwks_uri"]
+                .as_str()
+                .ok_or_else(|| anyhow!("no jwks_uri in OIDC discovery document"))?
+                .to_string()
+        } else {
+            oidc.jwks_uri.clone()
+        };
+
+        let client = reqwest::Client::new();
+        let jwks: serde_json::Value = client.get(&jwks_uri).send().await?.json().await?;
+
+        let keys = jwks["keys"]
+            .as_array()
+            .ok_or_else(|| anyhow!("no keys in JWKS response"))?;
+
+        let mut decoding_keys = Vec::new();
+        for key in keys {
+            if key["kty"].as_str() == Some("RSA") {
+                let n = key["n"].as_str().unwrap_or_default();
+                let e = key["e"].as_str().unwrap_or_default();
+                if let Ok(dk) = DecodingKey::from_rsa_components(n, e) {
+                    decoding_keys.push(dk);
+                }
+            }
+        }
+
+        if decoding_keys.is_empty() {
+            anyhow::bail!("no usable RSA keys found in JWKS");
+        }
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = true;
+        validation.set_issuer(&[&oidc.issuer_url]);
+        if !oidc.audience.is_empty() {
+            validation.set_audience(&[&oidc.audience]);
+        }
+
+        Ok(Self {
+            decoding_keys,
+            validation,
+        })
+    }
+
+    pub fn validate_token(&self, token: &str) -> bool {
+        for key in &self.decoding_keys {
+            if jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WsAuthDiscoveryInfo {
+    pub methods: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcDiscoveryInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OidcDiscoveryInfo {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub scopes: String,
+}
+
+pub fn get_ws_auth_discovery(config_path: &Path) -> anyhow::Result<WsAuthDiscoveryInfo> {
+    let config = load_daemon_config(config_path)?.unwrap_or_default();
+    let ws_auth = config.ws_auth;
+
+    let oidc_info = if ws_auth.methods.contains(&"oidc".to_string()) {
+        ws_auth.oidc.as_ref().map(|oidc| OidcDiscoveryInfo {
+            authorization_endpoint: oidc.authorization_endpoint.clone(),
+            token_endpoint: oidc.token_endpoint.clone(),
+            client_id: oidc.client_id.clone(),
+            scopes: oidc.scopes.clone(),
+        })
+    } else {
+        None
+    };
+
+    Ok(WsAuthDiscoveryInfo {
+        methods: ws_auth.methods,
+        oidc: oidc_info,
+    })
+}
+
+pub fn get_ws_auth_settings(config_path: &Path) -> anyhow::Result<WsAuthConfig> {
+    let config = load_daemon_config(config_path)?.unwrap_or_default();
+    Ok(config.ws_auth)
+}
+
+pub fn set_ws_auth_settings(
+    config_path: &Path,
+    methods: &[String],
+    oidc_issuer: &str,
+    oidc_auth_endpoint: &str,
+    oidc_token_endpoint: &str,
+    oidc_client_id: &str,
+    oidc_scopes: &str,
+) -> anyhow::Result<()> {
+    let mut config = load_daemon_config(config_path)?.unwrap_or_default();
+
+    config.ws_auth.methods = methods.to_vec();
+
+    if methods.contains(&"oidc".to_string()) && !oidc_issuer.is_empty() {
+        let existing_oidc = config.ws_auth.oidc.unwrap_or_else(|| OidcConfig {
+            issuer_url: String::new(),
+            authorization_endpoint: String::new(),
+            token_endpoint: String::new(),
+            client_id: String::new(),
+            scopes: default_oidc_scopes(),
+            jwks_uri: String::new(),
+            audience: String::new(),
+        });
+        config.ws_auth.oidc = Some(OidcConfig {
+            issuer_url: oidc_issuer.to_string(),
+            authorization_endpoint: oidc_auth_endpoint.to_string(),
+            token_endpoint: oidc_token_endpoint.to_string(),
+            client_id: oidc_client_id.to_string(),
+            scopes: if oidc_scopes.is_empty() {
+                existing_oidc.scopes
+            } else {
+                oidc_scopes.to_string()
+            },
+            jwks_uri: existing_oidc.jwks_uri,
+            audience: existing_oidc.audience,
+        });
+    } else {
+        config.ws_auth.oidc = None;
+    }
+
+    save_daemon_config(config_path, &config)
 }
 
 pub fn authenticate_os_user_password(username: &str, password: &str) -> anyhow::Result<bool> {

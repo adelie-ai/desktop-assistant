@@ -4,6 +4,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
     BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView,
     LlmSettingsView, McpServerView, PersistenceSettingsView, SettingsService,
+    WsAuthSettingsView,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
@@ -321,6 +322,59 @@ impl SettingsService for DaemonSettingsService {
                 tool_count: s.tool_count,
             })
             .collect())
+    }
+
+    async fn get_ws_auth_settings(&self) -> Result<WsAuthSettingsView, CoreError> {
+        let ws_auth = config::get_ws_auth_settings(&self.config_path)
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+
+        let (oidc_issuer, oidc_auth_endpoint, oidc_token_endpoint, oidc_client_id, oidc_scopes) =
+            match ws_auth.oidc {
+                Some(oidc) => (
+                    oidc.issuer_url,
+                    oidc.authorization_endpoint,
+                    oidc.token_endpoint,
+                    oidc.client_id,
+                    oidc.scopes,
+                ),
+                None => (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+            };
+
+        Ok(WsAuthSettingsView {
+            methods: ws_auth.methods,
+            oidc_issuer,
+            oidc_auth_endpoint,
+            oidc_token_endpoint,
+            oidc_client_id,
+            oidc_scopes,
+        })
+    }
+
+    async fn set_ws_auth_settings(
+        &self,
+        methods: Vec<String>,
+        oidc_issuer: String,
+        oidc_auth_endpoint: String,
+        oidc_token_endpoint: String,
+        oidc_client_id: String,
+        oidc_scopes: String,
+    ) -> Result<(), CoreError> {
+        config::set_ws_auth_settings(
+            &self.config_path,
+            &methods,
+            &oidc_issuer,
+            &oidc_auth_endpoint,
+            &oidc_token_endpoint,
+            &oidc_client_id,
+            &oidc_scopes,
+        )
+        .map_err(|e| CoreError::SystemService(e.to_string()))
     }
 }
 

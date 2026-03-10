@@ -33,6 +33,7 @@ KCM.SimpleKCM {
             QQC2.TabButton { text: "Backend Tasks" }
             QQC2.TabButton { text: "Data Sync" }
             QQC2.TabButton { text: "Connections" }
+            QQC2.TabButton { text: "Authentication" }
         }
 
         StackLayout {
@@ -566,6 +567,130 @@ KCM.SimpleKCM {
                     Item { Layout.fillHeight: true }
                 }
             }
+
+            QQC2.ScrollView {
+                clip: true
+
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 12
+
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: "Configure which authentication methods the WebSocket API accepts. Password uses local OS credentials or a static password. OIDC delegates to an external identity provider."
+                    }
+
+                    QQC2.Label {
+                        font.bold: true
+                        text: "Enabled Methods"
+                    }
+
+                    QQC2.CheckBox {
+                        id: authPasswordCheck
+                        text: "Password authentication"
+                        checked: kcm.wsAuthPasswordEnabled
+                        onToggled: kcm.wsAuthPasswordEnabled = checked
+                    }
+
+                    QQC2.CheckBox {
+                        id: authOidcCheck
+                        text: "OIDC / OAuth2 authentication"
+                        checked: kcm.wsAuthOidcEnabled
+                        onToggled: kcm.wsAuthOidcEnabled = checked
+                    }
+
+                    Kirigami.Separator { Layout.fillWidth: true }
+
+                    QQC2.Label {
+                        font.bold: true
+                        text: "OIDC Configuration"
+                        enabled: authOidcCheck.checked
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: authOidcCheck.checked
+                        QQC2.Label {
+                            text: "Issuer URL"
+                            Layout.preferredWidth: 140
+                        }
+                        QQC2.TextField {
+                            id: oidcIssuerField
+                            Layout.fillWidth: true
+                            placeholderText: "https://myapp.auth0.com"
+                            text: kcm.oidcIssuer
+                            onTextEdited: kcm.oidcIssuer = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: authOidcCheck.checked
+                        QQC2.Label {
+                            text: "Authorization Endpoint"
+                            Layout.preferredWidth: 140
+                        }
+                        QQC2.TextField {
+                            id: oidcAuthEndpointField
+                            Layout.fillWidth: true
+                            placeholderText: "https://myapp.auth0.com/authorize"
+                            text: kcm.oidcAuthEndpoint
+                            onTextEdited: kcm.oidcAuthEndpoint = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: authOidcCheck.checked
+                        QQC2.Label {
+                            text: "Token Endpoint"
+                            Layout.preferredWidth: 140
+                        }
+                        QQC2.TextField {
+                            id: oidcTokenEndpointField
+                            Layout.fillWidth: true
+                            placeholderText: "https://myapp.auth0.com/oauth/token"
+                            text: kcm.oidcTokenEndpoint
+                            onTextEdited: kcm.oidcTokenEndpoint = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: authOidcCheck.checked
+                        QQC2.Label {
+                            text: "Client ID"
+                            Layout.preferredWidth: 140
+                        }
+                        QQC2.TextField {
+                            id: oidcClientIdField
+                            Layout.fillWidth: true
+                            placeholderText: "abc123public"
+                            text: kcm.oidcClientId
+                            onTextEdited: kcm.oidcClientId = text
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: authOidcCheck.checked
+                        QQC2.Label {
+                            text: "Scopes"
+                            Layout.preferredWidth: 140
+                        }
+                        QQC2.TextField {
+                            id: oidcScopesField
+                            Layout.fillWidth: true
+                            placeholderText: "openid profile email"
+                            text: kcm.oidcScopes
+                            onTextEdited: kcm.oidcScopes = text
+                        }
+                    }
+
+                    Item { Layout.fillHeight: true }
+                }
+            }
         }
 
         RowLayout {
@@ -683,6 +808,36 @@ KCM.SimpleKCM {
             function onBtLlmBaseUrlChanged() {
                 if (btBaseUrlField.text !== kcm.btLlmBaseUrl) {
                     btBaseUrlField.text = kcm.btLlmBaseUrl
+                }
+            }
+
+            function onOidcIssuerChanged() {
+                if (oidcIssuerField.text !== kcm.oidcIssuer) {
+                    oidcIssuerField.text = kcm.oidcIssuer
+                }
+            }
+
+            function onOidcAuthEndpointChanged() {
+                if (oidcAuthEndpointField.text !== kcm.oidcAuthEndpoint) {
+                    oidcAuthEndpointField.text = kcm.oidcAuthEndpoint
+                }
+            }
+
+            function onOidcTokenEndpointChanged() {
+                if (oidcTokenEndpointField.text !== kcm.oidcTokenEndpoint) {
+                    oidcTokenEndpointField.text = kcm.oidcTokenEndpoint
+                }
+            }
+
+            function onOidcClientIdChanged() {
+                if (oidcClientIdField.text !== kcm.oidcClientId) {
+                    oidcClientIdField.text = kcm.oidcClientId
+                }
+            }
+
+            function onOidcScopesChanged() {
+                if (oidcScopesField.text !== kcm.oidcScopes) {
+                    oidcScopesField.text = kcm.oidcScopes
                 }
             }
         }

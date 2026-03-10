@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::{future::Future, future::pending};
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{State, ws::Message, ws::WebSocket, ws::WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -47,6 +47,7 @@ pub struct WsServerState {
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
     login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
 }
 
 #[async_trait::async_trait]
@@ -58,6 +59,13 @@ pub trait WsAuthValidator: Send + Sync {
 pub trait WsLoginService: Send + Sync {
     async fn authenticate_basic(&self, username: &str, password: &str) -> bool;
     async fn issue_token_for_subject(&self, subject: &str) -> Result<String, String>;
+}
+
+/// Provides auth discovery information for `GET /auth/config`.
+#[async_trait::async_trait]
+pub trait WsAuthDiscovery: Send + Sync {
+    /// Returns JSON-serializable auth discovery info.
+    async fn auth_config(&self) -> serde_json::Value;
 }
 
 pub fn router(
@@ -72,15 +80,26 @@ pub fn router_with_login(
     auth_validator: Arc<dyn WsAuthValidator>,
     login_service: Option<Arc<dyn WsLoginService>>,
 ) -> Router {
+    router_with_auth(handler, auth_validator, login_service, None)
+}
+
+pub fn router_with_auth(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+) -> Router {
     let state = WsServerState {
         handler,
         auth_validator,
         login_service,
+        auth_discovery,
     };
 
     Router::new()
         .route("/ws", get(ws_handler))
         .route("/login", post(login_handler))
+        .route("/auth/config", get(auth_config_handler))
         .with_state(state)
 }
 
@@ -163,6 +182,20 @@ async fn login_handler(
         )
             .into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+async fn auth_config_handler(State(state): State<WsServerState>) -> impl IntoResponse {
+    match state.auth_discovery {
+        Some(discovery) => {
+            let config = discovery.auth_config().await;
+            (StatusCode::OK, Json(config)).into_response()
+        }
+        None => {
+            // Default: password-only (backward-compatible)
+            let default = serde_json::json!({ "methods": ["password"] });
+            (StatusCode::OK, Json(default)).into_response()
+        }
     }
 }
 
@@ -378,7 +411,21 @@ pub async fn serve_with_shutdown_and_login<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let app = router_with_login(handler, auth_validator, login_service);
+    serve_with_shutdown_and_auth(handler, auth_validator, login_service, None, bind, shutdown).await
+}
+
+pub async fn serve_with_shutdown_and_auth<F>(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    bind: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let app = router_with_auth(handler, auth_validator, login_service, auth_discovery);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

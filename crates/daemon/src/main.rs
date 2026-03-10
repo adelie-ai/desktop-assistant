@@ -48,6 +48,38 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
     }
 }
 
+/// Auth validator that tries the local HS256 JWT first, then falls back to OIDC RS256.
+struct OidcAwareAuth<S: SettingsService + 'static> {
+    local: WsSettingsAuth<S>,
+    oidc_validator: config::OidcValidator,
+}
+
+#[async_trait]
+impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
+    async fn validate_bearer_token(&self, token: &str) -> bool {
+        // Try local HS256 JWT first
+        if self.local.validate_bearer_token(token).await {
+            return true;
+        }
+        // Fall back to OIDC RS256 validation
+        self.oidc_validator.validate_token(token)
+    }
+}
+
+/// Provides auth discovery info from the daemon config.
+struct WsAuthDiscoveryProvider {
+    discovery: config::WsAuthDiscoveryInfo,
+}
+
+#[async_trait]
+impl ws::WsAuthDiscovery for WsAuthDiscoveryProvider {
+    async fn auth_config(&self) -> serde_json::Value {
+        serde_json::to_value(&self.discovery).unwrap_or_else(|_| {
+            serde_json::json!({ "methods": ["password"] })
+        })
+    }
+}
+
 struct WsBasicLogin<S: SettingsService + 'static> {
     settings: Arc<S>,
     username: String,
@@ -1101,7 +1133,50 @@ async fn main() -> Result<()> {
         Arc::clone(&conversation_service),
         Arc::clone(&settings_service),
     ));
-    let ws_auth = Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)));
+
+    // Build auth validator: OIDC-aware if configured, otherwise local-only
+    let ws_auth_config = config::get_ws_auth_settings(&config_path).ok();
+    let oidc_config = ws_auth_config
+        .as_ref()
+        .and_then(|c| c.oidc.clone())
+        .filter(|_| {
+            ws_auth_config
+                .as_ref()
+                .map(|c| c.methods.contains(&"oidc".to_string()))
+                .unwrap_or(false)
+        });
+
+    let ws_auth: Arc<dyn ws::WsAuthValidator> = if let Some(oidc) = &oidc_config {
+        match config::OidcValidator::from_config(oidc).await {
+            Ok(oidc_validator) => {
+                tracing::info!("OIDC JWT validation enabled (issuer={})", oidc.issuer_url);
+                Arc::new(OidcAwareAuth {
+                    local: WsSettingsAuth::new(Arc::clone(&settings_service)),
+                    oidc_validator,
+                })
+            }
+            Err(e) => {
+                tracing::warn!("failed to initialize OIDC validator: {e}; falling back to local JWT only");
+                Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)))
+            }
+        }
+    } else {
+        Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)))
+    };
+
+    // Build auth discovery provider
+    let auth_discovery: Option<Arc<dyn ws::WsAuthDiscovery>> =
+        match config::get_ws_auth_discovery(&config_path) {
+            Ok(discovery) => {
+                tracing::info!("auth discovery: methods={:?}", discovery.methods);
+                Some(Arc::new(WsAuthDiscoveryProvider { discovery }))
+            }
+            Err(e) => {
+                tracing::warn!("failed to load auth discovery config: {e}");
+                None
+            }
+        };
+
     let ws_login_service: Option<Arc<dyn ws::WsLoginService>> =
         resolve_ws_login_mode().map(|(username, mode)| {
             match &mode {
@@ -1129,11 +1204,12 @@ async fn main() -> Result<()> {
 
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let ws_task = tokio::spawn(async move {
-        tracing::info!("WebSocket listening on {ws_addr} (/ws)");
-        if let Err(e) = ws::serve_with_shutdown_and_login(
+        tracing::info!("WebSocket listening on {ws_addr} (/ws, /auth/config)");
+        if let Err(e) = ws::serve_with_shutdown_and_auth(
             api_handler,
             ws_auth,
             ws_login_service,
+            auth_discovery,
             ws_addr,
             async {
                 let _ = ws_shutdown_rx.await;
