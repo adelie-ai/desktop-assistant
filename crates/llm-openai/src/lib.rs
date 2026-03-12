@@ -38,7 +38,7 @@ impl OpenAiClient {
             temperature: None,
             top_p: None,
             max_tokens: None,
-            hosted_tool_search: true,
+            hosted_tool_search: false,
         }
     }
 
