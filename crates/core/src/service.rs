@@ -1926,10 +1926,12 @@ mod tests {
         )];
 
         let responses = vec![
-            // Round 0: LLM requests tool call
+            // Round 0: LLM requests first tool call
             LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "big_tool", "{}")]),
-            // Round 1: fails (simulated by FailingLlm, call index 1)
-            // Round 2 (retry after trim): LLM succeeds with final text
+            // Round 1: LLM requests second tool call (creates 2 groups so trim can remove one)
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c2", "big_tool", "{}")]),
+            // Round 2: fails (simulated by FailingLlm, call index 2)
+            // Round 3 (retry after trim): LLM succeeds with final text
             LlmResponse::text("I adjusted my approach"),
         ];
 
@@ -1940,7 +1942,7 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(0));
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
-            FailingLlm::new(responses, 1), // fail on 2nd LLM call
+            FailingLlm::new(responses, 2), // fail on 3rd LLM call (after 2 tool groups exist)
             MockToolExecutor::new(tools, tool_results),
             Box::new(move || {
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
