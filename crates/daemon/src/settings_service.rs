@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
     BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView,
-    LlmSettingsView, McpServerView, PersistenceSettingsView, SettingsService,
-    WsAuthSettingsView,
+    LlmSettingsView, McpServerView, PersistenceSettingsView, SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
@@ -190,6 +189,7 @@ impl SettingsService for DaemonSettingsService {
             llm_base_url: view.llm_base_url,
             dreaming_enabled: view.dreaming_enabled,
             dreaming_interval_secs: view.dreaming_interval_secs,
+            archive_after_days: view.archive_after_days,
         })
     }
 
@@ -200,6 +200,7 @@ impl SettingsService for DaemonSettingsService {
         llm_base_url: Option<String>,
         dreaming_enabled: bool,
         dreaming_interval_secs: u64,
+        archive_after_days: u32,
     ) -> Result<(), CoreError> {
         config::set_backend_tasks_settings(
             &self.config_path,
@@ -208,6 +209,7 @@ impl SettingsService for DaemonSettingsService {
             llm_base_url.as_deref(),
             dreaming_enabled,
             dreaming_interval_secs,
+            archive_after_days,
         )
         .map_err(|e| CoreError::SystemService(e.to_string()))
     }

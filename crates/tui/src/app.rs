@@ -76,6 +76,8 @@ pub struct App {
     pub should_quit: bool,
     /// Lines scrolled up from the bottom. 0 = auto-scroll to bottom.
     pub scroll_offset: u16,
+    /// Whether to include archived conversations in the list.
+    pub show_archived: bool,
 }
 
 impl App {
@@ -93,6 +95,7 @@ impl App {
             status_message: "Connected".to_string(),
             should_quit: false,
             scroll_offset: 0,
+            show_archived: false,
         }
     }
 
@@ -371,16 +374,19 @@ mod tests {
                 id: "1".into(),
                 title: "First".into(),
                 message_count: 2,
+                archived: false,
             },
             ConversationSummary {
                 id: "2".into(),
                 title: "Second".into(),
                 message_count: 0,
+                archived: false,
             },
             ConversationSummary {
                 id: "3".into(),
                 title: "Third".into(),
                 message_count: 5,
+                archived: false,
             },
         ]
     }
@@ -460,6 +466,7 @@ mod tests {
             id: "1".into(),
             title: "Only".into(),
             message_count: 0,
+            archived: false,
         }]);
         app.selected_conversation = Some(0);
         app.next_conversation();
@@ -690,6 +697,7 @@ mod tests {
             id: "1".into(),
             title: "Only".into(),
             message_count: 0,
+            archived: false,
         }]);
         assert_eq!(app.selected_conversation, Some(0));
     }
@@ -745,6 +753,7 @@ mod tests {
             id: "1".into(),
             title: "Only".into(),
             message_count: 0,
+            archived: false,
         }]);
         app.selected_conversation = Some(0);
 

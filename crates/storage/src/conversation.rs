@@ -43,8 +43,8 @@ impl ConversationStore for PgConversationStore {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO conversations (id, title, created_at, updated_at, context_summary, compacted_through)
-             VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5, $6)"
+            "INSERT INTO conversations (id, title, created_at, updated_at, context_summary, compacted_through, archived_at)
+             VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5, $6, $7)"
         )
         .bind(&conv.id.0)
         .bind(&conv.title)
@@ -52,6 +52,7 @@ impl ConversationStore for PgConversationStore {
         .bind(parse_timestamp(&conv.updated_at))
         .bind(&conv.context_summary)
         .bind(conv.compacted_through as i32)
+        .bind(conv.archived_at.as_deref().map(parse_timestamp))
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -68,7 +69,7 @@ impl ConversationStore for PgConversationStore {
 
     async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
         let row: Option<ConvRow> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, context_summary, compacted_through
+            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at
              FROM conversations WHERE id = $1",
         )
         .bind(&id.0)
@@ -117,12 +118,13 @@ impl ConversationStore for PgConversationStore {
             context_summary: row.context_summary,
             compacted_through: row.compacted_through as usize,
             summaries,
+            archived_at: row.archived_at.map(format_timestamp),
         })
     }
 
     async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
         let rows: Vec<ConvRow> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, context_summary, compacted_through
+            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at
              FROM conversations ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -170,6 +172,7 @@ impl ConversationStore for PgConversationStore {
                 context_summary: row.context_summary,
                 compacted_through: row.compacted_through as usize,
                 summaries,
+                archived_at: row.archived_at.map(format_timestamp),
             });
         }
 
@@ -220,6 +223,43 @@ impl ConversationStore for PgConversationStore {
 
     async fn delete(&self, id: &ConversationId) -> Result<(), CoreError> {
         let result = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(&id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(CoreError::ConversationNotFound(id.0.clone()));
+        }
+        Ok(())
+    }
+
+    async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let result = sqlx::query(
+            "UPDATE conversations SET archived_at = NOW() WHERE id = $1 AND archived_at IS NULL",
+        )
+        .bind(&id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            // Either not found or already archived — check which.
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT 1 FROM conversations WHERE id = $1")
+                    .bind(&id.0)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| CoreError::Storage(e.to_string()))?;
+            if exists.is_none() {
+                return Err(CoreError::ConversationNotFound(id.0.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let result = sqlx::query("UPDATE conversations SET archived_at = NULL WHERE id = $1")
             .bind(&id.0)
             .execute(&self.pool)
             .await
@@ -349,6 +389,7 @@ struct ConvRow {
     updated_at: chrono::DateTime<chrono::Utc>,
     context_summary: String,
     compacted_through: i32,
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(sqlx::FromRow)]

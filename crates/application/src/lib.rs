@@ -317,10 +317,13 @@ where
                 Ok(api::CommandResult::ConversationId { id: conv.id.0 })
             }
 
-            api::Command::ListConversations { max_age_days } => {
+            api::Command::ListConversations {
+                max_age_days,
+                include_archived,
+            } => {
                 let list = self
                     .conversations
-                    .list_conversations(max_age_days)
+                    .list_conversations(max_age_days, include_archived)
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Conversations(
@@ -330,6 +333,7 @@ where
                             title: s.title,
                             message_count: s.message_count as u32,
                             updated_at: s.updated_at,
+                            archived: s.archived,
                         })
                         .collect(),
                 ))
@@ -374,6 +378,26 @@ where
                         &desktop_assistant_core::domain::ConversationId::from(id.as_str()),
                         title,
                     )
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::ArchiveConversation { id } => {
+                self.conversations
+                    .archive_conversation(&desktop_assistant_core::domain::ConversationId::from(
+                        id.as_str(),
+                    ))
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::UnarchiveConversation { id } => {
+                self.conversations
+                    .unarchive_conversation(&desktop_assistant_core::domain::ConversationId::from(
+                        id.as_str(),
+                    ))
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)
@@ -736,6 +760,7 @@ mod tests {
         async fn list_conversations(
             &self,
             _max_age_days: Option<u32>,
+            _include_archived: bool,
         ) -> Result<Vec<ConversationSummary>, CoreError> {
             Ok(vec![])
         }
@@ -752,6 +777,12 @@ mod tests {
             _id: &ConversationId,
             _title: String,
         ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
             Ok(())
         }
         async fn clear_all_history(&self) -> Result<u32, CoreError> {
@@ -878,6 +909,7 @@ mod tests {
                 llm_base_url: "https://api.openai.com/v1".into(),
                 dreaming_enabled: false,
                 dreaming_interval_secs: 3600,
+                archive_after_days: 0,
             })
         }
         async fn set_backend_tasks_settings(
@@ -887,6 +919,7 @@ mod tests {
             _llm_base_url: Option<String>,
             _dreaming_enabled: bool,
             _dreaming_interval_secs: u64,
+            _archive_after_days: u32,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -921,6 +954,29 @@ mod tests {
             _server: Option<String>,
         ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
+        }
+        async fn get_ws_auth_settings(
+            &self,
+        ) -> Result<desktop_assistant_core::ports::inbound::WsAuthSettingsView, CoreError> {
+            Ok(desktop_assistant_core::ports::inbound::WsAuthSettingsView {
+                methods: vec![],
+                oidc_issuer: String::new(),
+                oidc_auth_endpoint: String::new(),
+                oidc_token_endpoint: String::new(),
+                oidc_client_id: String::new(),
+                oidc_scopes: String::new(),
+            })
+        }
+        async fn set_ws_auth_settings(
+            &self,
+            _methods: Vec<String>,
+            _oidc_issuer: String,
+            _oidc_auth_endpoint: String,
+            _oidc_token_endpoint: String,
+            _oidc_client_id: String,
+            _oidc_scopes: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
         }
     }
 
@@ -1106,6 +1162,7 @@ mod tests {
                 llm_base_url: "https://api.openai.com/v1".into(),
                 dreaming_enabled: false,
                 dreaming_interval_secs: 3600,
+                archive_after_days: 0,
             })
         }
         async fn set_backend_tasks_settings(
@@ -1115,6 +1172,7 @@ mod tests {
             _llm_base_url: Option<String>,
             _dreaming_enabled: bool,
             _dreaming_interval_secs: u64,
+            _archive_after_days: u32,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -1150,6 +1208,29 @@ mod tests {
         ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
             Ok(vec![])
         }
+        async fn get_ws_auth_settings(
+            &self,
+        ) -> Result<desktop_assistant_core::ports::inbound::WsAuthSettingsView, CoreError> {
+            Ok(desktop_assistant_core::ports::inbound::WsAuthSettingsView {
+                methods: vec![],
+                oidc_issuer: String::new(),
+                oidc_auth_endpoint: String::new(),
+                oidc_token_endpoint: String::new(),
+                oidc_client_id: String::new(),
+                oidc_scopes: String::new(),
+            })
+        }
+        async fn set_ws_auth_settings(
+            &self,
+            _methods: Vec<String>,
+            _oidc_issuer: String,
+            _oidc_auth_endpoint: String,
+            _oidc_token_endpoint: String,
+            _oidc_client_id: String,
+            _oidc_scopes: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
     }
 
     struct CollectSink(tokio::sync::Mutex<Vec<api::Event>>);
@@ -1179,6 +1260,7 @@ mod tests {
         async fn list_conversations(
             &self,
             _max_age_days: Option<u32>,
+            _include_archived: bool,
         ) -> Result<Vec<ConversationSummary>, CoreError> {
             Ok(vec![])
         }
@@ -1193,6 +1275,12 @@ mod tests {
             _id: &ConversationId,
             _title: String,
         ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
             Ok(())
         }
         async fn clear_all_history(&self) -> Result<u32, CoreError> {

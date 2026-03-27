@@ -87,6 +87,8 @@ pub struct BackendTasksSettingsView {
     pub dreaming_enabled: bool,
     /// Interval in seconds between dreaming cycles.
     pub dreaming_interval_secs: u64,
+    /// Archive conversations older than this many days (0 = disabled).
+    pub archive_after_days: u32,
 }
 
 /// Inbound port for health/status queries.
@@ -111,6 +113,7 @@ pub trait ConversationService: Send + Sync {
     fn list_conversations(
         &self,
         max_age_days: Option<u32>,
+        include_archived: bool,
     ) -> impl std::future::Future<Output = Result<Vec<ConversationSummary>, CoreError>> + Send;
 
     fn get_conversation(
@@ -127,6 +130,16 @@ pub trait ConversationService: Send + Sync {
         &self,
         id: &ConversationId,
         title: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn archive_conversation(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn unarchive_conversation(
+        &self,
+        id: &ConversationId,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
     fn clear_all_history(&self)
@@ -227,6 +240,7 @@ pub trait SettingsService: Send + Sync {
         llm_base_url: Option<String>,
         dreaming_enabled: bool,
         dreaming_interval_secs: u64,
+        archive_after_days: u32,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
     // MCP server management

@@ -263,7 +263,7 @@ async fn handle_action(
             if let Some(client) = client.as_ref() {
                 match client.create_conversation("New Conversation").await {
                     Ok(id) => {
-                        match client.list_conversations().await {
+                        match fetch_conversations(client, app.show_archived).await {
                             Ok(convs) => {
                                 let new_idx = convs.iter().position(|c| c.id == id);
                                 app.set_conversations(convs);
@@ -309,9 +309,63 @@ async fn handle_action(
         Action::InsertNewline => {
             app.textarea.insert_newline();
         }
+        Action::ToggleShowArchived => {
+            app.show_archived = !app.show_archived;
+            if let Some(client) = client.as_ref() {
+                match fetch_conversations(client, app.show_archived).await {
+                    Ok(convs) => app.set_conversations(convs),
+                    Err(e) => app.status_message = format!("Error refreshing: {e}"),
+                }
+            }
+            app.status_message = if app.show_archived {
+                "Showing all conversations (including archived)".into()
+            } else {
+                "Showing active conversations only".into()
+            };
+        }
+        Action::ArchiveConversation => {
+            if let (Some(client), Some(id)) = (client.as_ref(), app.selected_conversation_id()) {
+                let id = id.to_string();
+                // Determine if conversation is currently archived
+                let is_archived = app
+                    .conversations
+                    .get(app.selected_conversation.unwrap_or(0))
+                    .is_some_and(|c| c.archived);
+                let result = if is_archived {
+                    client.unarchive_conversation(&id).await
+                } else {
+                    client.archive_conversation(&id).await
+                };
+                match result {
+                    Ok(()) => {
+                        match fetch_conversations(client, app.show_archived).await {
+                            Ok(convs) => app.set_conversations(convs),
+                            Err(e) => app.status_message = format!("Error refreshing: {e}"),
+                        }
+                        app.status_message = if is_archived {
+                            "Conversation unarchived".into()
+                        } else {
+                            "Conversation archived".into()
+                        };
+                    }
+                    Err(e) => app.status_message = format!("Archive error: {e}"),
+                }
+            }
+        }
         Action::ScrollUp => app.scroll_up(5),
         Action::ScrollDown => app.scroll_down(5),
         Action::ScrollToBottom => app.scroll_to_bottom(),
+    }
+}
+
+async fn fetch_conversations(
+    client: &desktop_assistant_client_common::TransportClient,
+    include_archived: bool,
+) -> Result<Vec<desktop_assistant_client_common::ConversationSummary>> {
+    if include_archived {
+        client.list_conversations_with_archived().await
+    } else {
+        client.list_conversations().await
     }
 }
 

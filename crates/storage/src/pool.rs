@@ -106,5 +106,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Conversation archival — nullable archived_at timestamp.
+    sqlx::raw_sql(include_str!(
+        "../migrations/009_conversation_archived_at.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

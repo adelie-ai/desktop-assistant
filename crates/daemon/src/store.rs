@@ -175,6 +175,26 @@ impl ConversationStore for PersistentConversationStore {
         }
     }
 
+    async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+        if conv.archived_at.is_none() {
+            conv.archived_at = Some(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+        self.persist(&data)
+    }
+
+    async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+        conv.archived_at = None;
+        self.persist(&data)
+    }
+
     async fn create_summary(
         &self,
         conversation_id: &ConversationId,
@@ -272,6 +292,26 @@ impl ConversationStore for InMemoryConversationStore {
             .remove(&id.0)
             .map(|_| ())
             .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+    }
+
+    async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+        if conv.archived_at.is_none() {
+            conv.archived_at = Some(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+        Ok(())
+    }
+
+    async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+        conv.archived_at = None;
+        Ok(())
     }
 
     async fn create_summary(

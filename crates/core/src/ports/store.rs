@@ -27,6 +27,18 @@ pub trait ConversationStore: Send + Sync {
         id: &ConversationId,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
+    /// Mark a conversation as archived.
+    fn archive(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// Remove the archived flag from a conversation.
+    fn unarchive(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
     /// Collapse a range of messages behind a summary. Returns the new summary ID.
     fn create_summary(
         &self,
@@ -99,6 +111,24 @@ mod tests {
                 .remove(&id.0)
                 .map(|_| ())
                 .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+        }
+
+        async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            let mut data = self.data.lock().unwrap();
+            let conv = data
+                .get_mut(&id.0)
+                .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+            conv.archived_at = Some("2026-01-01 00:00:00".to_string());
+            Ok(())
+        }
+
+        async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            let mut data = self.data.lock().unwrap();
+            let conv = data
+                .get_mut(&id.0)
+                .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+            conv.archived_at = None;
+            Ok(())
         }
 
         async fn create_summary(

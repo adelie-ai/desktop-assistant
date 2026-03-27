@@ -756,8 +756,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
     async fn list_conversations(
         &self,
         max_age_days: Option<u32>,
+        include_archived: bool,
     ) -> Result<Vec<ConversationSummary>, CoreError> {
         let mut convs = self.store.list().await?;
+
+        if !include_archived {
+            convs.retain(|conv| conv.archived_at.is_none());
+        }
 
         if let Some(days) = max_age_days.filter(|days| *days > 0) {
             let cutoff = cutoff_timestamp(days);
@@ -793,6 +798,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         conv.title = title;
         conv.updated_at = now_timestamp();
         self.store.update(conv).await
+    }
+
+    async fn archive_conversation(&self, id: &ConversationId) -> Result<(), CoreError> {
+        self.store.archive(id).await
+    }
+
+    async fn unarchive_conversation(&self, id: &ConversationId) -> Result<(), CoreError> {
+        self.store.unarchive(id).await
     }
 
     async fn clear_all_history(&self) -> Result<u32, CoreError> {
@@ -888,8 +901,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             };
             tool_defs.extend(activated_tools.values().cloned());
 
-            let deferred_ns: &[ToolNamespace] =
-                if !hosted_search_demoted { &namespaces } else { &[] };
+            let deferred_ns: &[ToolNamespace] = if !hosted_search_demoted {
+                &namespaces
+            } else {
+                &[]
+            };
             let llm_messages = llm_messages_for_turn(
                 &conv.messages,
                 &conv.summaries,
@@ -1200,6 +1216,24 @@ mod tests {
                 .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
         }
 
+        async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            let mut data = self.data.lock().unwrap();
+            let conv = data
+                .get_mut(&id.0)
+                .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+            conv.archived_at = Some("2026-01-01 00:00:00".to_string());
+            Ok(())
+        }
+
+        async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            let mut data = self.data.lock().unwrap();
+            let conv = data
+                .get_mut(&id.0)
+                .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+            conv.archived_at = None;
+            Ok(())
+        }
+
         async fn create_summary(
             &self,
             _conversation_id: &ConversationId,
@@ -1292,6 +1326,14 @@ mod tests {
             Ok(())
         }
 
+        async fn archive(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn unarchive(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+
         async fn create_summary(
             &self,
             _conversation_id: &ConversationId,
@@ -1342,7 +1384,7 @@ mod tests {
         handler.create_conversation("A".into()).await.unwrap();
         handler.create_conversation("B".into()).await.unwrap();
 
-        let summaries = handler.list_conversations(None).await.unwrap();
+        let summaries = handler.list_conversations(None, false).await.unwrap();
         assert_eq!(summaries.len(), 2);
         for s in &summaries {
             assert_eq!(s.message_count, 0);
@@ -1379,7 +1421,7 @@ mod tests {
             Box::new(|| "unused".to_string()),
         );
 
-        let filtered = handler.list_conversations(Some(7)).await.unwrap();
+        let filtered = handler.list_conversations(Some(7), false).await.unwrap();
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].id.as_str(), "newest");
         assert_eq!(filtered[1].id.as_str(), "newer");
@@ -1404,7 +1446,7 @@ mod tests {
         let deleted = handler.clear_all_history().await.unwrap();
         assert_eq!(deleted, 2);
 
-        let summaries = handler.list_conversations(None).await.unwrap();
+        let summaries = handler.list_conversations(None, false).await.unwrap();
         assert!(summaries.is_empty());
     }
 
@@ -1501,7 +1543,12 @@ mod tests {
     async fn send_prompt_nonexistent_conversation_fails() {
         let handler = make_handler(vec![]);
         let result = handler
-            .send_prompt(&ConversationId::from("nope"), "hi".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &ConversationId::from("nope"),
+                "hi".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await;
         assert!(matches!(result, Err(CoreError::ConversationNotFound(_))));
     }
@@ -1628,7 +1675,12 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Read /tmp/test".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "Read /tmp/test".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await
             .unwrap();
         assert_eq!(result, "The file contains: hello world");
@@ -1702,7 +1754,12 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Try bad tool".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "Try bad tool".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await
             .unwrap();
         assert_eq!(result, "Tool failed, but I can continue");
@@ -1738,7 +1795,12 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Loop forever".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "Loop forever".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await;
         assert!(matches!(result, Err(CoreError::Llm(_))));
     }
@@ -1889,7 +1951,12 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Use big tool".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "Use big tool".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await
             .unwrap();
         assert_eq!(result, "I adjusted my approach");
@@ -2015,7 +2082,12 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
         let result = handler
-            .send_prompt(&conv.id, "Use my tool".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "Use my tool".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await
             .unwrap();
 
@@ -2264,7 +2336,12 @@ mod tests {
         assert_eq!(conv.title, "New Chat");
 
         handler
-            .send_prompt(&conv.id, "Let's plan a trip!".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "Let's plan a trip!".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await
             .unwrap();
 
@@ -2303,7 +2380,12 @@ mod tests {
 
         // Second prompt — title must remain unchanged
         handler
-            .send_prompt(&conv.id, "Follow-up question".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "Follow-up question".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await
             .unwrap();
         let after_second = handler.get_conversation(&conv.id).await.unwrap();

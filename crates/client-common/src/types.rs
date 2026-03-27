@@ -5,6 +5,7 @@ pub struct ConversationSummary {
     pub id: String,
     pub title: String,
     pub message_count: u32,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,7 @@ impl From<api::ConversationSummary> for ConversationSummary {
             id: value.id,
             title: value.title,
             message_count: value.message_count,
+            archived: value.archived,
         }
     }
 }

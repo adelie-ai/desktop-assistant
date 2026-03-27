@@ -38,7 +38,8 @@ const MAX_CONVERSATIONS_PER_SCAN: i64 = 10;
 /// Maximum number of KB entries to include in a consolidation review.
 const MAX_ENTRIES_FOR_CONSOLIDATION: i64 = 50;
 
-/// Run one dreaming scan cycle: extract new facts, then consolidate existing memories.
+/// Run one dreaming scan cycle: extract new facts, consolidate existing memories,
+/// and archive old conversations.
 ///
 /// Returns the total number of new facts written to the knowledge base.
 pub async fn run_dreaming_scan(
@@ -46,6 +47,7 @@ pub async fn run_dreaming_scan(
     llm_fn: &DreamingLlmFn,
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
+    archive_after_days: u32,
 ) -> Result<usize, String> {
     // Phase 1: Extract new facts from conversations
     let new_facts = run_extraction_phase(pool, llm_fn, embed_fn, embedding_model).await?;
@@ -70,6 +72,24 @@ pub async fn run_dreaming_scan(
         }
         Err(e) => {
             tracing::warn!("dreaming: consolidation phase failed: {e}");
+        }
+    }
+
+    // Phase 3: Archive old conversations
+    if archive_after_days > 0 {
+        match run_archival_phase(pool, archive_after_days).await {
+            Ok(archived) => {
+                if archived > 0 {
+                    tracing::info!(
+                        "dreaming: archived {archived} conversation(s) older than {archive_after_days} day(s)"
+                    );
+                } else {
+                    tracing::debug!("dreaming: no conversations to archive");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("dreaming: archival phase failed: {e}");
+            }
         }
     }
 
@@ -401,6 +421,27 @@ async fn apply_delete(pool: &PgPool, id: &str) -> Result<(), String> {
         .map_err(|e| format!("dreaming: delete failed: {e}"))?;
 
     Ok(())
+}
+
+// ── Phase 3: Conversation Archival ────────────────────────────────────────
+
+/// Archive conversations whose `updated_at` is older than `days` days ago
+/// and that are not already archived.
+///
+/// Returns the number of conversations archived.
+async fn run_archival_phase(pool: &PgPool, days: u32) -> Result<usize, String> {
+    let result = sqlx::query(
+        "UPDATE conversations
+         SET archived_at = NOW()
+         WHERE archived_at IS NULL
+           AND updated_at < NOW() - make_interval(days => $1)",
+    )
+    .bind(days as i32)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("dreaming: archival query failed: {e}"))?;
+
+    Ok(result.rows_affected() as usize)
 }
 
 /// Conversations that have messages beyond their watermark.

@@ -80,6 +80,9 @@ pub struct BackendTasksConfig {
     pub dreaming_enabled: bool,
     #[serde(default = "default_dreaming_interval_secs")]
     pub dreaming_interval_secs: u64,
+    /// Archive conversations older than this many days (0 = disabled).
+    #[serde(default = "default_archive_after_days")]
+    pub archive_after_days: u32,
 }
 
 impl Default for BackendTasksConfig {
@@ -88,8 +91,13 @@ impl Default for BackendTasksConfig {
             llm: None,
             dreaming_enabled: false,
             dreaming_interval_secs: default_dreaming_interval_secs(),
+            archive_after_days: default_archive_after_days(),
         }
     }
+}
+
+fn default_archive_after_days() -> u32 {
+    7
 }
 
 fn default_dreaming_interval_secs() -> u64 {
@@ -635,6 +643,7 @@ pub struct BackendTasksSettingsViewConfig {
     pub llm_base_url: String,
     pub dreaming_enabled: bool,
     pub dreaming_interval_secs: u64,
+    pub archive_after_days: u32,
 }
 
 pub fn get_backend_tasks_settings_view(
@@ -647,6 +656,9 @@ pub fn get_backend_tasks_settings_view(
     let dreaming_interval_secs = bt
         .map(|b| b.dreaming_interval_secs)
         .unwrap_or_else(default_dreaming_interval_secs);
+    let archive_after_days = bt
+        .map(|b| b.archive_after_days)
+        .unwrap_or_else(default_archive_after_days);
 
     let resolved = resolve_backend_tasks_llm_config(config.as_ref());
 
@@ -657,6 +669,7 @@ pub fn get_backend_tasks_settings_view(
         llm_base_url: resolved.base_url,
         dreaming_enabled,
         dreaming_interval_secs,
+        archive_after_days,
     })
 }
 
@@ -667,11 +680,13 @@ pub fn set_backend_tasks_settings(
     llm_base_url: Option<&str>,
     dreaming_enabled: bool,
     dreaming_interval_secs: u64,
+    archive_after_days: u32,
 ) -> anyhow::Result<()> {
     let mut config = load_daemon_config(path)?.unwrap_or_default();
 
     config.backend_tasks.dreaming_enabled = dreaming_enabled;
     config.backend_tasks.dreaming_interval_secs = dreaming_interval_secs;
+    config.backend_tasks.archive_after_days = archive_after_days;
 
     // If connector is provided, configure a separate backend-tasks LLM.
     // If connector is None/empty, clear the override (fall back to primary).
@@ -843,7 +858,9 @@ fn default_llm_model(connector: &str) -> String {
 
 fn default_backend_llm_model(connector: &str) -> String {
     match connector {
-        "ollama" => OllamaClient::get_default_model().unwrap_or_default().to_string(),
+        "ollama" => OllamaClient::get_default_model()
+            .unwrap_or_default()
+            .to_string(),
         "anthropic" => "claude-haiku-4-5-20251001".to_string(),
         "bedrock" | "aws-bedrock" => "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
         _ => "gpt-4o-mini".to_string(),

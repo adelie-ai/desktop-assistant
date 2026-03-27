@@ -624,10 +624,10 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
 
     /// Return backend-tasks settings (LLM override + dreaming config).
     ///
-    /// Returns: (has_separate_llm, llm_connector, llm_model, llm_base_url, dreaming_enabled, dreaming_interval_secs)
+    /// Returns: (has_separate_llm, llm_connector, llm_model, llm_base_url, dreaming_enabled, dreaming_interval_secs, archive_after_days)
     async fn get_backend_tasks_settings(
         &self,
-    ) -> fdo::Result<(bool, String, String, String, bool, u64)> {
+    ) -> fdo::Result<(bool, String, String, String, bool, u64, u32)> {
         let settings = self
             .service
             .get_backend_tasks_settings()
@@ -641,6 +641,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             settings.llm_base_url,
             settings.dreaming_enabled,
             settings.dreaming_interval_secs,
+            settings.archive_after_days,
         ))
     }
 
@@ -652,6 +653,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         llm_base_url: &str,
         dreaming_enabled: bool,
         dreaming_interval_secs: u64,
+        archive_after_days: u32,
     ) -> fdo::Result<()> {
         let llm_connector = if llm_connector.trim().is_empty() {
             None
@@ -678,6 +680,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 llm_base_url,
                 dreaming_enabled,
                 dreaming_interval_secs,
+                archive_after_days,
             )
             .await
             .map_err(to_fdo_error)
@@ -888,6 +891,7 @@ mod tests {
                         llm_base_url: "https://api.openai.com/v1".to_string(),
                         dreaming_enabled: false,
                         dreaming_interval_secs: 3600,
+                        archive_after_days: 0,
                     },
                     api_key_set: false,
                 }),
@@ -1033,6 +1037,7 @@ mod tests {
             llm_base_url: Option<String>,
             dreaming_enabled: bool,
             dreaming_interval_secs: u64,
+            archive_after_days: u32,
         ) -> Result<(), CoreError> {
             let mut state = self.state.lock().unwrap();
             state.backend_tasks.has_separate_llm = llm_connector.is_some();
@@ -1047,6 +1052,7 @@ mod tests {
             }
             state.backend_tasks.dreaming_enabled = dreaming_enabled;
             state.backend_tasks.dreaming_interval_secs = dreaming_interval_secs;
+            state.backend_tasks.archive_after_days = archive_after_days;
             Ok(())
         }
 

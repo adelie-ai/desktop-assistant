@@ -9,6 +9,7 @@ pub enum Action {
     PreviousConversation,
     OpenConversation,
     DeleteConversation,
+    ArchiveConversation,
     NewConversation,
     EnterEditMode,
     ExitEditMode,
@@ -17,6 +18,7 @@ pub enum Action {
     ScrollUp,
     ScrollDown,
     ScrollToBottom,
+    ToggleShowArchived,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -53,6 +55,8 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('k') | KeyCode::Up => Some(Action::PreviousConversation),
                 KeyCode::Char('d') => Some(Action::DeleteConversation),
                 KeyCode::Char('n') => Some(Action::NewConversation),
+                KeyCode::Char('a') => Some(Action::ToggleShowArchived),
+                KeyCode::Char('A') => Some(Action::ArchiveConversation),
                 KeyCode::Char('i') => Some(Action::EnterEditMode),
                 KeyCode::PageUp => Some(Action::ScrollUp),
                 KeyCode::PageDown => Some(Action::ScrollDown),

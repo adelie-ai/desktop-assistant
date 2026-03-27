@@ -74,6 +74,24 @@ impl ConversationStore for TestStore {
             .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
     }
 
+    async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+        conv.archived_at = Some("2026-01-01 00:00:00".to_string());
+        Ok(())
+    }
+
+    async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let mut data = self.data.lock().unwrap();
+        let conv = data
+            .get_mut(&id.0)
+            .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
+        conv.archived_at = None;
+        Ok(())
+    }
+
     async fn create_summary(
         &self,
         _conversation_id: &ConversationId,
@@ -144,7 +162,7 @@ async fn full_conversation_lifecycle() {
     assert!(conv.messages.is_empty());
 
     // 2. List conversations — should have one
-    let summaries = service.list_conversations(None).await.unwrap();
+    let summaries = service.list_conversations(None, false).await.unwrap();
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].id.as_str(), "conv-1");
     assert_eq!(summaries[0].message_count, 0);
@@ -176,7 +194,7 @@ async fn full_conversation_lifecycle() {
     assert_eq!(updated.messages[1].content, "Hello, world!");
 
     // 5. List should show message_count = 2
-    let summaries = service.list_conversations(None).await.unwrap();
+    let summaries = service.list_conversations(None, false).await.unwrap();
     assert_eq!(summaries[0].message_count, 2);
 
     // 6. Delete the conversation
@@ -187,7 +205,7 @@ async fn full_conversation_lifecycle() {
     assert!(matches!(result, Err(CoreError::ConversationNotFound(_))));
 
     // 8. List should be empty
-    let summaries = service.list_conversations(None).await.unwrap();
+    let summaries = service.list_conversations(None, false).await.unwrap();
     assert!(summaries.is_empty());
 }
 
@@ -200,7 +218,7 @@ async fn multiple_conversations() {
 
     assert_ne!(c1.id, c2.id);
 
-    let summaries = service.list_conversations(None).await.unwrap();
+    let summaries = service.list_conversations(None, false).await.unwrap();
     assert_eq!(summaries.len(), 2);
 
     // Send prompt only to c1

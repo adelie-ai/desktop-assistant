@@ -17,7 +17,7 @@ use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationS
 use desktop_assistant_core::ports::inbound::{
     AssistantService, BackendTasksSettingsView, ConnectorDefaultsView, ConversationService,
     DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
-    SettingsService,
+    SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 
@@ -83,6 +83,7 @@ impl ConversationService for FakeConversations {
     async fn list_conversations(
         &self,
         _max_age_days: Option<u32>,
+        _include_archived: bool,
     ) -> Result<Vec<ConversationSummary>, CoreError> {
         Ok(vec![])
     }
@@ -97,6 +98,12 @@ impl ConversationService for FakeConversations {
         _id: &ConversationId,
         _title: String,
     ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
         Ok(())
     }
     async fn clear_all_history(&self) -> Result<u32, CoreError> {
@@ -125,6 +132,7 @@ impl ConversationService for CancelAwareConversations {
     async fn list_conversations(
         &self,
         _max_age_days: Option<u32>,
+        _include_archived: bool,
     ) -> Result<Vec<ConversationSummary>, CoreError> {
         Ok(vec![])
     }
@@ -139,6 +147,12 @@ impl ConversationService for CancelAwareConversations {
         _id: &ConversationId,
         _title: String,
     ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
         Ok(())
     }
     async fn clear_all_history(&self) -> Result<u32, CoreError> {
@@ -270,6 +284,7 @@ impl SettingsService for FakeSettings {
             llm_base_url: "https://api.openai.com/v1".into(),
             dreaming_enabled: false,
             dreaming_interval_secs: 3600,
+            archive_after_days: 0,
         })
     }
     async fn set_backend_tasks_settings(
@@ -279,6 +294,7 @@ impl SettingsService for FakeSettings {
         _llm_base_url: Option<String>,
         _dreaming_enabled: bool,
         _dreaming_interval_secs: u64,
+        _archive_after_days: u32,
     ) -> Result<(), CoreError> {
         Ok(())
     }
@@ -309,6 +325,27 @@ impl SettingsService for FakeSettings {
         _server: Option<String>,
     ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
         Ok(vec![])
+    }
+    async fn get_ws_auth_settings(&self) -> Result<WsAuthSettingsView, CoreError> {
+        Ok(WsAuthSettingsView {
+            methods: vec![],
+            oidc_issuer: String::new(),
+            oidc_auth_endpoint: String::new(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+            oidc_scopes: String::new(),
+        })
+    }
+    async fn set_ws_auth_settings(
+        &self,
+        _methods: Vec<String>,
+        _oidc_issuer: String,
+        _oidc_auth_endpoint: String,
+        _oidc_token_endpoint: String,
+        _oidc_client_id: String,
+        _oidc_scopes: String,
+    ) -> Result<(), CoreError> {
+        Ok(())
     }
 }
 
@@ -490,6 +527,7 @@ impl SettingsService for StatefulSettings {
             llm_base_url: "https://api.openai.com/v1".into(),
             dreaming_enabled: false,
             dreaming_interval_secs: 3600,
+            archive_after_days: 0,
         })
     }
     async fn set_backend_tasks_settings(
@@ -499,6 +537,7 @@ impl SettingsService for StatefulSettings {
         _llm_base_url: Option<String>,
         _dreaming_enabled: bool,
         _dreaming_interval_secs: u64,
+        _archive_after_days: u32,
     ) -> Result<(), CoreError> {
         Ok(())
     }
@@ -529,6 +568,27 @@ impl SettingsService for StatefulSettings {
         _server: Option<String>,
     ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
         Ok(vec![])
+    }
+    async fn get_ws_auth_settings(&self) -> Result<WsAuthSettingsView, CoreError> {
+        Ok(WsAuthSettingsView {
+            methods: vec![],
+            oidc_issuer: String::new(),
+            oidc_auth_endpoint: String::new(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+            oidc_scopes: String::new(),
+        })
+    }
+    async fn set_ws_auth_settings(
+        &self,
+        _methods: Vec<String>,
+        _oidc_issuer: String,
+        _oidc_auth_endpoint: String,
+        _oidc_token_endpoint: String,
+        _oidc_client_id: String,
+        _oidc_scopes: String,
+    ) -> Result<(), CoreError> {
+        Ok(())
     }
 }
 

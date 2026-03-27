@@ -27,6 +27,8 @@ pub enum Command {
     },
     ListConversations {
         max_age_days: Option<u32>,
+        #[serde(default)]
+        include_archived: bool,
     },
     GetConversation {
         id: String,
@@ -37,6 +39,12 @@ pub enum Command {
     RenameConversation {
         id: String,
         title: String,
+    },
+    ArchiveConversation {
+        id: String,
+    },
+    UnarchiveConversation {
+        id: String,
     },
     ClearAllHistory,
 
@@ -233,6 +241,8 @@ pub struct ConversationSummary {
     pub title: String,
     pub message_count: u32,
     pub updated_at: String,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

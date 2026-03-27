@@ -124,7 +124,10 @@ impl WsClient {
 
     pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
         let result = self
-            .send_command(api::Command::ListConversations { max_age_days: None })
+            .send_command(api::Command::ListConversations {
+                max_age_days: None,
+                include_archived: false,
+            })
             .await?;
 
         let api::CommandResult::Conversations(items) = result else {
@@ -134,6 +137,51 @@ impl WsClient {
         };
 
         Ok(items.into_iter().map(ConversationSummary::from).collect())
+    }
+
+    pub async fn list_conversations_with_archived(&self) -> Result<Vec<ConversationSummary>> {
+        let result = self
+            .send_command(api::Command::ListConversations {
+                max_age_days: None,
+                include_archived: true,
+            })
+            .await?;
+
+        let api::CommandResult::Conversations(items) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for list_conversations"
+            ));
+        };
+
+        Ok(items.into_iter().map(ConversationSummary::from).collect())
+    }
+
+    pub async fn archive_conversation(&self, id: &str) -> Result<()> {
+        let result = self
+            .send_command(api::Command::ArchiveConversation { id: id.to_string() })
+            .await?;
+
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for archive_conversation"
+            ));
+        };
+
+        Ok(())
+    }
+
+    pub async fn unarchive_conversation(&self, id: &str) -> Result<()> {
+        let result = self
+            .send_command(api::Command::UnarchiveConversation { id: id.to_string() })
+            .await?;
+
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for unarchive_conversation"
+            ));
+        };
+
+        Ok(())
     }
 
     pub async fn get_conversation(&self, id: &str) -> Result<ConversationDetail> {

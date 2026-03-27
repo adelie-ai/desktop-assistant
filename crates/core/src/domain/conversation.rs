@@ -52,6 +52,9 @@ pub struct Conversation {
     /// Collapsed message ranges with their summary text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<MessageSummary>,
+    /// When the conversation was archived (None = active).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
 }
 
 impl Conversation {
@@ -65,6 +68,7 @@ impl Conversation {
             context_summary: String::new(),
             compacted_through: 0,
             summaries: Vec::new(),
+            archived_at: None,
         }
     }
 }
@@ -77,6 +81,7 @@ pub struct ConversationSummary {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: usize,
+    pub archived: bool,
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -87,6 +92,7 @@ impl From<&Conversation> for ConversationSummary {
             created_at: conv.created_at.clone(),
             updated_at: conv.updated_at.clone(),
             message_count: conv.messages.len(),
+            archived: conv.archived_at.is_some(),
         }
     }
 }
@@ -146,6 +152,7 @@ mod tests {
         assert_eq!(summary.created_at, "");
         assert_eq!(summary.updated_at, "");
         assert_eq!(summary.message_count, 2);
+        assert!(!summary.archived);
     }
 
     #[test]

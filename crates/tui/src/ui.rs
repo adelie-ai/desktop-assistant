@@ -59,15 +59,31 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
         .conversations
         .iter()
         .map(|c| {
-            ListItem::new(Line::from(vec![
-                Span::styled(c.title.as_str(), Style::default().fg(Color::White)),
-                Span::styled(
-                    format!(" ({})", c.message_count),
-                    Style::default().fg(COLOR_COUNT_DIM),
-                ),
-            ]))
+            let mut spans = vec![];
+            if c.archived {
+                spans.push(Span::styled("⌂ ", Style::default().fg(Color::DarkGray)));
+            }
+            spans.push(Span::styled(
+                c.title.as_str(),
+                if c.archived {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ));
+            spans.push(Span::styled(
+                format!(" ({})", c.message_count),
+                Style::default().fg(COLOR_COUNT_DIM),
+            ));
+            ListItem::new(Line::from(spans))
         })
         .collect();
+
+    let title = if app.show_archived {
+        "Conversations (all)"
+    } else {
+        "Conversations"
+    };
 
     let list = List::new(items)
         .block(
@@ -75,7 +91,7 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(COLOR_LIST_BORDER))
                 .title(Line::from(Span::styled(
-                    "Conversations",
+                    title,
                     Style::default()
                         .fg(Color::Rgb(136, 214, 240))
                         .add_modifier(Modifier::BOLD),
@@ -265,11 +281,13 @@ mod tests {
                 id: "1".into(),
                 title: "Chat 1".into(),
                 message_count: 3,
+                archived: false,
             },
             ConversationSummary {
                 id: "2".into(),
                 title: "Chat 2".into(),
                 message_count: 0,
+                archived: false,
             },
         ]);
         app.selected_conversation = Some(0);

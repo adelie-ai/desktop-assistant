@@ -74,9 +74,8 @@ struct WsAuthDiscoveryProvider {
 #[async_trait]
 impl ws::WsAuthDiscovery for WsAuthDiscoveryProvider {
     async fn auth_config(&self) -> serde_json::Value {
-        serde_json::to_value(&self.discovery).unwrap_or_else(|_| {
-            serde_json::json!({ "methods": ["password"] })
-        })
+        serde_json::to_value(&self.discovery)
+            .unwrap_or_else(|_| serde_json::json!({ "methods": ["password"] }))
     }
 }
 
@@ -272,6 +271,26 @@ impl desktop_assistant_core::ports::store::ConversationStore for AnyConversation
         match self {
             Self::Json(s) => s.delete(id).await,
             Self::Postgres(s) => s.delete(id).await,
+        }
+    }
+
+    async fn archive(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Json(s) => s.archive(id).await,
+            Self::Postgres(s) => s.archive(id).await,
+        }
+    }
+
+    async fn unarchive(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Json(s) => s.unarchive(id).await,
+            Self::Postgres(s) => s.unarchive(id).await,
         }
     }
 
@@ -895,6 +914,10 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|c| c.backend_tasks.dreaming_interval_secs)
         .unwrap_or(3600);
+    let archive_after_days = daemon_config
+        .as_ref()
+        .map(|c| c.backend_tasks.archive_after_days)
+        .unwrap_or(7);
 
     let (dreaming_shutdown_tx, dreaming_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let dreaming_task = if dreaming_enabled {
@@ -962,7 +985,11 @@ async fn main() -> Result<()> {
                 loop {
                     tracing::info!("dreaming: starting scan cycle");
                     match desktop_assistant_storage::dreaming::run_dreaming_scan(
-                        &pool, &llm_fn, &embed_fn, &emb_model,
+                        &pool,
+                        &llm_fn,
+                        &embed_fn,
+                        &emb_model,
+                        archive_after_days,
                     )
                     .await
                     {
@@ -1156,7 +1183,9 @@ async fn main() -> Result<()> {
                 })
             }
             Err(e) => {
-                tracing::warn!("failed to initialize OIDC validator: {e}; falling back to local JWT only");
+                tracing::warn!(
+                    "failed to initialize OIDC validator: {e}; falling back to local JWT only"
+                );
                 Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)))
             }
         }

@@ -11,10 +11,13 @@ use crate::ws_client::WsClient;
 #[async_trait]
 pub trait AssistantClient: Send + Sync {
     async fn list_conversations(&self) -> Result<Vec<ConversationSummary>>;
+    async fn list_conversations_with_archived(&self) -> Result<Vec<ConversationSummary>>;
     async fn get_conversation(&self, id: &str) -> Result<ConversationDetail>;
     async fn create_conversation(&self, title: &str) -> Result<String>;
     async fn delete_conversation(&self, id: &str) -> Result<()>;
     async fn rename_conversation(&self, id: &str, title: &str) -> Result<()>;
+    async fn archive_conversation(&self, id: &str) -> Result<()>;
+    async fn unarchive_conversation(&self, id: &str) -> Result<()>;
     async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String>;
 }
 
@@ -31,6 +34,14 @@ impl AssistantClient for TransportClient {
             #[cfg(feature = "dbus")]
             Self::Dbus(client) => client.list_conversations().await,
             Self::Ws(client) => client.list_conversations().await,
+        }
+    }
+
+    async fn list_conversations_with_archived(&self) -> Result<Vec<ConversationSummary>> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(client) => client.list_conversations_with_archived().await,
+            Self::Ws(client) => client.list_conversations_with_archived().await,
         }
     }
 
@@ -63,6 +74,22 @@ impl AssistantClient for TransportClient {
             #[cfg(feature = "dbus")]
             Self::Dbus(client) => client.rename_conversation(id, title).await,
             Self::Ws(client) => client.rename_conversation(id, title).await,
+        }
+    }
+
+    async fn archive_conversation(&self, id: &str) -> Result<()> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(client) => client.archive_conversation(id).await,
+            Self::Ws(client) => client.archive_conversation(id).await,
+        }
+    }
+
+    async fn unarchive_conversation(&self, id: &str) -> Result<()> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(client) => client.unarchive_conversation(id).await,
+            Self::Ws(client) => client.unarchive_conversation(id).await,
         }
     }
 

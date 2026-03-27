@@ -39,22 +39,47 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         Ok(conv.id.0)
     }
 
-    /// List conversations as an array of (id, title, message_count, updated_at),
+    /// List conversations as an array of (id, title, message_count, updated_at, archived),
     /// optionally filtered by max age in days (0 means no filtering).
     async fn list_conversations(
         &self,
         max_age_days: i32,
-    ) -> fdo::Result<Vec<(String, String, u32, String)>> {
+        include_archived: bool,
+    ) -> fdo::Result<Vec<(String, String, u32, String, bool)>> {
         let max_age = u32::try_from(max_age_days).ok().filter(|days| *days > 0);
         let summaries = self
             .service
-            .list_conversations(max_age)
+            .list_conversations(max_age, include_archived)
             .await
             .map_err(|e| fdo::Error::Failed(e.to_string()))?;
         Ok(summaries
             .into_iter()
-            .map(|s| (s.id.0, s.title, s.message_count as u32, s.updated_at))
+            .map(|s| {
+                (
+                    s.id.0,
+                    s.title,
+                    s.message_count as u32,
+                    s.updated_at,
+                    s.archived,
+                )
+            })
             .collect())
+    }
+
+    /// Archive a conversation by ID.
+    async fn archive_conversation(&self, id: &str) -> fdo::Result<()> {
+        self.service
+            .archive_conversation(&ConversationId::from(id))
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
+
+    /// Unarchive a conversation by ID.
+    async fn unarchive_conversation(&self, id: &str) -> fdo::Result<()> {
+        self.service
+            .unarchive_conversation(&ConversationId::from(id))
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     /// Get a conversation by ID, returns (id, title, messages) where
@@ -197,8 +222,7 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
             let callback: desktop_assistant_core::ports::llm::ChunkCallback =
                 Box::new(move |chunk| tx_chunk.send(StreamEvent::Chunk(chunk)).is_ok());
 
-            let on_status: desktop_assistant_core::ports::llm::StatusCallback =
-                Box::new(|_| {});
+            let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(|_| {});
 
             match service
                 .send_prompt(
@@ -311,6 +335,7 @@ mod tests {
         async fn list_conversations(
             &self,
             _max_age_days: Option<u32>,
+            _include_archived: bool,
         ) -> Result<Vec<ConversationSummary>, CoreError> {
             Ok(vec![ConversationSummary {
                 id: ConversationId::from("test-id"),
@@ -318,6 +343,7 @@ mod tests {
                 created_at: "2026-02-16 00:00:00".to_string(),
                 updated_at: "2026-02-16 00:00:00".to_string(),
                 message_count: 0,
+                archived: false,
             }])
         }
 
@@ -336,6 +362,14 @@ mod tests {
             _id: &ConversationId,
             _title: String,
         ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
             Ok(())
         }
 
@@ -380,7 +414,11 @@ mod tests {
     async fn adapter_list_conversations() {
         let service = Arc::new(FakeConversationService);
         let adapter = DbusConversationAdapter::new(service);
-        let summaries = adapter.service.list_conversations(None).await.unwrap();
+        let summaries = adapter
+            .service
+            .list_conversations(None, false)
+            .await
+            .unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].title, "Test");
     }
@@ -423,6 +461,7 @@ mod tests {
             async fn list_conversations(
                 &self,
                 _: Option<u32>,
+                _: bool,
             ) -> Result<Vec<ConversationSummary>, CoreError> {
                 Ok(vec![])
             }
@@ -447,6 +486,12 @@ mod tests {
                 _: &ConversationId,
                 _: String,
             ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn archive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn unarchive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
                 Ok(())
             }
             async fn clear_all_history(&self) -> Result<u32, CoreError> {
@@ -509,6 +554,7 @@ mod tests {
             async fn list_conversations(
                 &self,
                 _: Option<u32>,
+                _: bool,
             ) -> Result<Vec<ConversationSummary>, CoreError> {
                 Ok(vec![])
             }
@@ -531,6 +577,12 @@ mod tests {
                 _: &ConversationId,
                 _: String,
             ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn archive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn unarchive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
                 Ok(())
             }
             async fn clear_all_history(&self) -> Result<u32, CoreError> {

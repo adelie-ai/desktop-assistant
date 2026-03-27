@@ -17,7 +17,12 @@ trait Conversations {
     async fn list_conversations(
         &self,
         max_age_days: i32,
-    ) -> zbus::fdo::Result<Vec<(String, String, u32, String)>>;
+        include_archived: bool,
+    ) -> zbus::fdo::Result<Vec<(String, String, u32, String, bool)>>;
+
+    async fn archive_conversation(&self, id: &str) -> zbus::fdo::Result<()>;
+
+    async fn unarchive_conversation(&self, id: &str) -> zbus::fdo::Result<()>;
 
     async fn get_conversation(
         &self,
@@ -97,17 +102,43 @@ impl DbusClient {
     }
 
     pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
-        let raw = self.proxy.list_conversations(0).await?;
+        let raw = self.proxy.list_conversations(0, false).await?;
         Ok(raw
             .into_iter()
             .map(
-                |(id, title, message_count, _updated_at)| ConversationSummary {
+                |(id, title, message_count, _updated_at, archived)| ConversationSummary {
                     id,
                     title,
                     message_count,
+                    archived,
                 },
             )
             .collect())
+    }
+
+    pub async fn list_conversations_with_archived(&self) -> Result<Vec<ConversationSummary>> {
+        let raw = self.proxy.list_conversations(0, true).await?;
+        Ok(raw
+            .into_iter()
+            .map(
+                |(id, title, message_count, _updated_at, archived)| ConversationSummary {
+                    id,
+                    title,
+                    message_count,
+                    archived,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn archive_conversation(&self, id: &str) -> Result<()> {
+        self.proxy.archive_conversation(id).await?;
+        Ok(())
+    }
+
+    pub async fn unarchive_conversation(&self, id: &str) -> Result<()> {
+        self.proxy.unarchive_conversation(id).await?;
+        Ok(())
     }
 
     pub async fn get_conversation(&self, id: &str) -> Result<ConversationDetail> {
