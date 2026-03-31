@@ -1049,20 +1049,32 @@ fn write_common_file_secret(account: &str, value: &str) -> anyhow::Result<()> {
     }
 
     let path = common_secret_file_path(account);
-    std::fs::write(&path, value)
-        .map_err(|error| anyhow!("failed to write secret file {}: {error}", path.display()))?;
 
+    // Write the secret file with restricted permissions atomically to avoid a
+    // TOCTOU window where the file is world-readable before chmod.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |error| {
-                anyhow!(
-                    "failed to set secret file permissions {}: {error}",
-                    path.display()
-                )
-            },
-        )?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| {
+                anyhow!("failed to write secret file {}: {error}", path.display())
+            })?;
+        file.write_all(value.as_bytes()).map_err(|error| {
+            anyhow!("failed to write secret file {}: {error}", path.display())
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, value).map_err(|error| {
+            anyhow!("failed to write secret file {}: {error}", path.display())
+        })?;
     }
 
     Ok(())
@@ -1401,16 +1413,45 @@ pub struct OidcValidator {
 }
 
 impl OidcValidator {
+    /// Build a reqwest client with timeouts suitable for OIDC discovery.
+    fn oidc_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// Maximum response body size for OIDC discovery / JWKS documents (1 MiB).
+    const MAX_OIDC_RESPONSE_BYTES: usize = 1_048_576;
+
+    /// Fetch a JSON document with size limits.
+    async fn fetch_oidc_json(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let response = client.get(url).send().await?;
+        let bytes = response.bytes().await?;
+        if bytes.len() > Self::MAX_OIDC_RESPONSE_BYTES {
+            return Err(anyhow!(
+                "OIDC response from {url} exceeds size limit ({} bytes)",
+                bytes.len()
+            ));
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     /// Fetch JWKS from the IdP and build a validator.
     pub async fn from_config(oidc: &OidcConfig) -> anyhow::Result<Self> {
+        let client = Self::oidc_http_client();
+
         let jwks_uri = if oidc.jwks_uri.is_empty() {
             let discovery_url = format!(
                 "{}/.well-known/openid-configuration",
                 oidc.issuer_url.trim_end_matches('/')
             );
-            let client = reqwest::Client::new();
-            let discovery: serde_json::Value =
-                client.get(&discovery_url).send().await?.json().await?;
+            let discovery = Self::fetch_oidc_json(&client, &discovery_url).await?;
             discovery["jwks_uri"]
                 .as_str()
                 .ok_or_else(|| anyhow!("no jwks_uri in OIDC discovery document"))?
@@ -1419,8 +1460,7 @@ impl OidcValidator {
             oidc.jwks_uri.clone()
         };
 
-        let client = reqwest::Client::new();
-        let jwks: serde_json::Value = client.get(&jwks_uri).send().await?.json().await?;
+        let jwks = Self::fetch_oidc_json(&client, &jwks_uri).await?;
 
         let keys = jwks["keys"]
             .as_array()
@@ -1720,12 +1760,15 @@ mod pam_auth {
             CString::new(password).map_err(|error| anyhow!("invalid password bytes: {error}"))?;
 
         let mut handle: *mut PamHandle = ptr::null_mut();
-        let conv_data = ConvData {
+        // Box the ConvData so its address is heap-stable and cannot be
+        // invalidated by stack moves.  The box is kept alive until after
+        // pam_end, guaranteeing the pointer remains valid for all callbacks.
+        let conv_data = Box::new(ConvData {
             password: password_c.as_ptr(),
-        };
+        });
         let conversation = PamConv {
             conv: Some(conversation),
-            appdata_ptr: (&conv_data as *const ConvData).cast_mut().cast(),
+            appdata_ptr: Box::into_raw(conv_data).cast(),
         };
 
         // SAFETY: all pointers passed are valid for this call.
@@ -1750,6 +1793,12 @@ mod pam_auth {
         // SAFETY: handle came from pam_start and must be terminated once.
         unsafe {
             pam_end(handle, status);
+        }
+        // SAFETY: reclaim the boxed ConvData that was leaked via Box::into_raw.
+        // This must happen after pam_end so the pointer remains valid for all
+        // PAM callbacks.
+        unsafe {
+            drop(Box::from_raw(conversation.appdata_ptr as *mut ConvData));
         }
 
         Ok(status == PAM_SUCCESS)

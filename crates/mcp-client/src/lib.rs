@@ -14,6 +14,9 @@ use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 /// Error type for MCP client operations.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
+    #[error("invalid MCP server command: {0}")]
+    InvalidCommand(String),
+
     #[error("failed to spawn MCP server process: {0}")]
     SpawnFailed(std::io::Error),
 
@@ -39,6 +42,28 @@ pub enum McpError {
     NotConnected,
 }
 
+/// Characters that could cause unintended behaviour if they appear in the
+/// command name.  `Command::new` does not invoke a shell, but rejecting these
+/// in the command string catches obvious misuse (e.g. `"cmd; rm -rf /"`) and
+/// enforces that the command field is a simple program name or path.
+///
+/// Arguments are **not** checked because they are passed directly to `execve`
+/// and are never shell-interpreted.
+const SHELL_META: &str = ";&|<>$(){}!#`\n\r";
+
+/// Validate an MCP command before spawning.
+fn validate_command(command: &str, _args: &[String]) -> Result<(), McpError> {
+    if command.is_empty() {
+        return Err(McpError::InvalidCommand("command is empty".into()));
+    }
+    if command.contains(|c: char| SHELL_META.contains(c)) {
+        return Err(McpError::InvalidCommand(format!(
+            "command contains shell metacharacters: {command}"
+        )));
+    }
+    Ok(())
+}
+
 /// Client for a single MCP server process, communicating via JSON-RPC over stdio.
 pub struct McpClient {
     child: Child,
@@ -52,7 +77,13 @@ pub struct McpClient {
 
 impl McpClient {
     /// Spawn an MCP server process and perform the initialize handshake.
+    ///
+    /// The command is validated before spawning: it must be a single
+    /// program name or absolute path and must not contain shell
+    /// metacharacters. Arguments are checked individually as well.
     pub async fn connect(command: &str, args: &[String]) -> Result<Self, McpError> {
+        validate_command(command, args)?;
+
         let mut child = Command::new(command)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -379,6 +410,38 @@ struct RawToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_command_rejects_empty() {
+        assert!(validate_command("", &[]).is_err());
+    }
+
+    #[test]
+    fn validate_command_rejects_shell_metacharacters() {
+        assert!(validate_command("cmd; rm -rf /", &[]).is_err());
+        assert!(validate_command("$(whoami)", &[]).is_err());
+        assert!(validate_command("cmd | cat", &[]).is_err());
+        assert!(validate_command("cmd > /tmp/out", &[]).is_err());
+        assert!(validate_command("cmd &", &[]).is_err());
+        assert!(validate_command("`whoami`", &[]).is_err());
+    }
+
+    #[test]
+    fn validate_command_allows_metacharacters_in_args() {
+        // Arguments are passed directly to execve, not shell-interpreted.
+        assert!(validate_command("safe-cmd", &["-c".into(), "echo $HOME".into()]).is_ok());
+    }
+
+    #[test]
+    fn validate_command_accepts_safe_commands() {
+        assert!(validate_command("fileio-mcp", &[]).is_ok());
+        assert!(validate_command("/usr/bin/fileio-mcp", &[]).is_ok());
+        assert!(validate_command(
+            "genmcp",
+            &["--config".into(), "/path/to/config.toml".into()]
+        )
+        .is_ok());
+    }
 
     #[test]
     fn mcp_error_display() {

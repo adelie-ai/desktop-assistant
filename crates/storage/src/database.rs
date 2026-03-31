@@ -45,11 +45,7 @@ async fn execute_read(
     upper: &str,
     limit: usize,
 ) -> Result<serde_json::Value, CoreError> {
-    let query = if upper.contains(" LIMIT ") {
-        sql.to_string()
-    } else {
-        format!("{sql} LIMIT {limit}")
-    };
+    let has_limit = upper.contains(" LIMIT ");
 
     let mut tx = pool
         .begin()
@@ -61,10 +57,21 @@ async fn execute_read(
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-    let rows: Vec<PgRow> = sqlx::query(&query)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?;
+    // When the user query lacks a LIMIT clause, wrap it in a subquery with a
+    // parameterised limit to avoid string-formatting user SQL.
+    let rows: Vec<PgRow> = if has_limit {
+        sqlx::query(sql)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?
+    } else {
+        let wrapped = format!("SELECT * FROM ({sql}) AS _limited LIMIT $1");
+        sqlx::query(&wrapped)
+            .bind(limit as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?
+    };
 
     tx.rollback()
         .await

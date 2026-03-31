@@ -50,18 +50,6 @@ struct CliArgs {
         default_value = DEFAULT_WS_URL
     )]
     ws_url: String,
-    #[arg(long = "ws-jwt", env = "DESKTOP_ASSISTANT_TUI_WS_JWT")]
-    ws_jwt: Option<String>,
-    #[arg(
-        long = "ws-login-username",
-        env = "DESKTOP_ASSISTANT_TUI_WS_LOGIN_USERNAME"
-    )]
-    ws_login_username: Option<String>,
-    #[arg(
-        long = "ws-login-password",
-        env = "DESKTOP_ASSISTANT_TUI_WS_LOGIN_PASSWORD"
-    )]
-    ws_login_password: Option<String>,
     #[arg(
         long = "ws-subject",
         env = "DESKTOP_ASSISTANT_TUI_WS_SUBJECT",
@@ -81,21 +69,6 @@ impl From<CliArgs> for ConnectionConfig {
             }
         };
 
-        let ws_jwt = cli
-            .ws_jwt
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
-        let ws_login_username = cli
-            .ws_login_username
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
-        let ws_login_password = cli
-            .ws_login_password
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
         let ws_subject = {
             let trimmed = cli.ws_subject.trim();
             if trimmed.is_empty() {
@@ -113,9 +86,9 @@ impl From<CliArgs> for ConnectionConfig {
         Self {
             transport_mode,
             ws_url,
-            ws_jwt,
-            ws_login_username,
-            ws_login_password,
+            ws_jwt: None,
+            ws_login_username: None,
+            ws_login_password: None,
             ws_subject,
         }
     }
@@ -386,12 +359,6 @@ mod tests {
             "dbus",
             "--ws-url",
             "wss://example/ws",
-            "--ws-jwt",
-            "jwt123",
-            "--ws-login-username",
-            "alice",
-            "--ws-login-password",
-            "s3cr3t",
             "--ws-subject",
             "custom-client",
         ]))
@@ -399,9 +366,6 @@ mod tests {
 
         assert_eq!(parsed.transport, CliTransportMode::Dbus);
         assert_eq!(parsed.ws_url, "wss://example/ws");
-        assert_eq!(parsed.ws_jwt.as_deref(), Some("jwt123"));
-        assert_eq!(parsed.ws_login_username.as_deref(), Some("alice"));
-        assert_eq!(parsed.ws_login_password.as_deref(), Some("s3cr3t"));
         assert_eq!(parsed.ws_subject, "custom-client");
     }
 

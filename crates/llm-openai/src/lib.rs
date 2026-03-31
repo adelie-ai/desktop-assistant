@@ -573,9 +573,7 @@ impl OpenAiClient {
                                     .map(String::from)
                             })
                             .unwrap_or_else(|| "response.failed".into());
-                        return Err(CoreError::Llm(format!(
-                            "OpenAI server_error: {msg}"
-                        )));
+                        return Err(CoreError::Llm(format!("OpenAI server_error: {msg}")));
                     }
                     Some("error") => {
                         tracing::warn!("OpenAI stream error: {data}");

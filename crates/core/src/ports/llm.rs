@@ -392,7 +392,9 @@ mod tests {
 
     #[test]
     fn retryable_error_server_error() {
-        let e = CoreError::Llm("OpenAI server_error: An error occurred while processing your request.".into());
+        let e = CoreError::Llm(
+            "OpenAI server_error: An error occurred while processing your request.".into(),
+        );
         assert!(is_retryable_error(&e));
     }
 
