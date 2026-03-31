@@ -75,15 +75,6 @@ WebSocket frame size relies on Axum defaults rather than an explicit configurati
 
 ---
 
-## Resolved (2026-03-31)
-
-- MCP command validation — shell metacharacter rejection added
-- SQL LIMIT parameterization — wrapped in subquery with `$1` bind
-- PAM FFI lifetime — ConvData boxed with explicit cleanup after pam_end
-- JWT signing key TOCTOU — atomic file creation with `mode(0o600)`
-- OIDC discovery timeouts — 10s connect, 30s request, 5 redirect limit, 1 MiB cap
-- Client CLI credential removal — `--ws-jwt`/`--ws-login-*` removed from TUI
-
 ## Positive Findings
 
 - JWT uses HS256 with proper secret generation and validation (issuer, audience, expiry)
