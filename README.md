@@ -1,19 +1,29 @@
 # Adelie Linux AI Platform
 
-An API-first AI platform for Linux desktops and applications, with:
-- D-Bus API for conversation lifecycle and streaming responses
-- Multiple LLM backends (`ollama`, `openai`, `anthropic`, `bedrock`)
-- MCP tool integration over stdio
-- Optional terminal UI (TUI) client
-- KDE plasmoids and control panel, with other DEs to come
+An API-first AI platform for Linux desktops and applications, with full-featured D-Bus and Websocket API
 
 Provides the **Adele** desktop assistant.
 
+## Features
+
+- Automated knowledge base maintenance and the ability to introspect memory
+- Dream cycle to consolidate knowledge base and learn from conversations
+- Support for long tool lists with a vectorized tool search.
+- Storage in Postgres, with vectorized knowledge base and tool search using `pgvector`
+- Use different connectors and models for primary interactions, backend tasks, and search vectorization
+
+## Integrations
+- Multiple LLM backends (`ollama`, `openai`, `anthropic`, `aws bedrock`)
+- MCP tool integration over stdio with several MCP servers provided by the `adelie-mcp` project
+- `ratatui`-based TUI client
+- `gtk-client` standalone GTK-based client
+- KDE plasmoids and control panel, with other DEs to come
+
 ## Project Status
 
-Much of this codebase is currently AI-generated, and it has not yet been comprehensively reviewed by humans. It appears to work well in practice, but it should still be treated as experimental.
+**Much of this codebase is currently AI-generated**, and it has not yet been comprehensively reviewed by humans. It appears to work well in practice, but it should still be treated as **EXPERIMENTAL**.
 
-The current phase of the project is focused on mapping the landscape and getting core functionality in place, so this experimental status is expected to remain for a while.
+The current phase of the project is focused on mapping the landscape and getting core functionality in place as quickly as possible, so this experimental status is expected to remain for a while. It's already extremely capable and useful, especially coupled with the MCP servers from the project, but please be careful with it.
 
 Community feedback and contributions are very welcome as the platform matures.
 
@@ -23,36 +33,35 @@ The core platform is called the **Adelie** AI platform. The assistant persona im
 
 This branding is fairly superficial and isn't extensively reflected in code at this point, but once it settles, that will probably change. 
 
-## The Future
+## Current AI Connectors
 
-The platform itself is not necessarily desktop-specific, and could be used as a non-dbus web service. This is planned, but we need to choose our battles. The desktop platform route is great for hammering out features for the short term. 
+The project currently can use AWS Bedrock, Ollama, OpenAI, and Anthropic APIs.
 
-Connectors are being developed for a wide range of cloud services, from standard OpenAI and Anthropic to less common AWS Bedrock and others. This is to allow the user to choose "effort" vs "ease", and the associated levels of privacy and control. 
+## Configuration Recommendations
 
-## Workspace at a Glance
+Configuration is a personal thing. You'll want to experiment. Note that there are differences between the connectors in terms of how they do token caching (if they do it at all), and there are connector-specific instructions which help to fine-tune how the model behaves. So they're not all created equally. Try them out if you don't have a hard requirement, and see what works best for you.
 
-- `crates/core` — domain model + ports (hexagonal core)
-- `crates/dbus-interface` — D-Bus adapter for conversation service
-- `crates/daemon` — runtime wiring and D-Bus service host
-- `crates/llm-openai` — streaming OpenAI-compatible client
-- `crates/llm-anthropic` — streaming Anthropic Messages client
-- `crates/llm-ollama` — streaming Ollama chat + embedding client
-- `crates/llm-bedrock` — streaming AWS Bedrock client
-- `crates/mcp-client` — MCP process client + tool executor
-- `crates/tui` — interactive terminal client
+### My Setup
 
-## Desktop Integrations
+I personally configure Adelie with **AWS Bedrock** using the **Anthropic Sonnet and Haiku models** for primary and backend work respectively, and have it use **local ollama** for knowledge base and tool search vectorization. I just find the Anthropic models are better for the type of tasks I give it. Local Ollama for vectorization is great because the models and search requests are small, and much of it happens in the background where the user doesn't know about it.
 
-- KDE widgets (Plasmoids) and app are provided in this repository.
-- TUI provided for terminal useage (more basic CLI also planned)
-- A DBUS integration surface is provided for interacting with the assistant from any program.
-- GNOME, COSMIC, and generic desktop integration support are planned.
+AWS Bedrock gives me "better" privacy, is faster than Anthropic and OpenAI's APIs, and I don't need to subscribe to another service. I don't have a decent GPU, so local work is mostly out of the question for me, and I can pay for Bedrock for years before I break even buying GPUs. AWS Bedrock DOES carry the risk of costing yourself some cash if something starts looping, but AWS also puts consumption limits that you'll hit by default unless you want to raise them (via AWS support request), so it's not entirely unmanaged risk.
+
+### OpenAI
+
+I initially used the OpenAI connector with GPT 5.3, which worked great. I liked the ability to pay as I go and constrain cost if something ran amuck. I'd just add 10 bucks at a time and know I couldn't accidentally cost myself 1000 bucks if Adelie went haywire. It saved me a couple times early on while I was building the event loops! This is still a good approach to consider. I found that 5.3 worked better than 5.4 for my tasks, but your mileage may vary. 
+
+OpenAI's automatic token caching seems to work really well, but I was not able to get their built-in dynamic tool search working properly. I'm sure it's something silly, but I've punted it for now. 
+
+### Anthropic
+
+The Anthropic connector works, but for some reason seems to burn a lot of tokens and hit daily limits very quickly. I do use the Anthropic models, but via AWS Bedrock. Anthropic's caching doesn't work the same way as OpenAI's, and I think with the dynamic tool lists, it keeps getting invalidated. I wasn't able to get their built-in tool search working (nor for Open AI, for that matter). I've punted these issues for now.
 
 ## Integration Model
 
 - This project is intended to be an AI platform with integration points for desktop environments and applications, not only a standalone desktop assistant.
-- The platform exposes extensive D-Bus-based APIs for integration with desktop environments and applications.
-- The platform makes extensive use of MCP services for pluggable (and un-pluggable) functionality.
+- The platform exposes extensive D-Bus- and Web-socket-based APIs for integration with desktop environments and applications.
+- The platform makes extensive use of MCP services for pluggable (and un-pluggable) functionality, and can even write its own MCP servers.
 
 > **MCP servers are essential for real-world usefulness.** Without configured MCP servers, the assistant can hold conversations but cannot take actions (file I/O, task management, time tracking, shell execution, etc.). The built-in memory tools are always present, but meaningful capability comes from external MCP servers.
 >
@@ -73,7 +82,7 @@ Quick provider privacy + setup links: [docs/cloud-providers.md](docs/cloud-provi
 ## Requirements
 
 - Rust (stable, edition 2024)
-- Linux session D-Bus (`DBUS_SESSION_BUS_ADDRESS` available)
+- Linux session D-Bus (`DBUS_SESSION_BUS_ADDRESS` available) for desktop integrations, but service can run websocket-only.
 - PostgreSQL with the `pgvector` extension (see below)
 - For cloud connectors, connector credentials (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or AWS credentials for Bedrock)
 - Optional MCP servers (for tools)
@@ -345,7 +354,6 @@ Usage:
 
 - Add **Desktop Assistant** to the panel/task bar for quick popup chat.
 - Add **Desktop Assistant (Desktop)** to the desktop for an always-visible chat card.
-- Click **Settings** in chat widgets to open **System Settings → Desktop Assistant** for connector/model/search configuration.
 - Widget controls include:
 	- **New**: start a fresh conversation.
 	- **Debug**: show/hide low-level tool execution status lines.
@@ -353,9 +361,9 @@ Usage:
 
 Notes:
 
-- Both chat widgets include a **service selector** (Production/Development) and call the selected D-Bus service at `/org/desktopAssistant/Conversations`.
+- Both chat widgets include a **service selector** (Production/Development) and call the selected D-Bus service at `/org/desktopAssistant/Conversations`. Only visible if dev and prod services are both running.
 - Widgets auto-detect whether `org.desktopAssistant.Dev` currently has an owner on the session bus.
-- If the dev environment is not running, chat widgets hide themselves.
+- If the dev environment is not running, environment selection is hidden.
 - Both widgets shell out to `python3` and `gdbus` to call methods documented in `docs/dbus-api.md`.
 - API keys are write-only over D-Bus (`SetApiKey` only) and are never returned to clients.
 - Daemon can auto-start on first D-Bus method call once `just install-service` is set up.
@@ -516,3 +524,6 @@ Knowledge base data is stored in PostgreSQL (requires database configuration, se
 
 Desktop Assistant is licensed under **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`).
 See the [LICENSE](LICENSE) file for the full text.
+
+There are tons of commercial implementations which do not impose FOSS stipulations. This is the open-source alternative. Let's keep it that way.
+
