@@ -29,6 +29,9 @@ pub struct McpServerConfig {
     /// Whether this server is enabled. Disabled servers are not started.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Environment variables to set when spawning the server process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Status information for an MCP server.
@@ -250,7 +253,7 @@ impl McpExecutorState {
             config.command
         );
 
-        match McpClient::connect(&config.command, &config.args).await {
+        match McpClient::connect(&config.command, &config.args, &config.env).await {
             Ok(client) => {
                 let mut clients = self.clients.lock().await;
                 clients[idx] = Some(client);
@@ -610,7 +613,7 @@ impl McpToolExecutor {
                     config.command
                 );
 
-                match McpClient::connect(&config.command, &config.args).await {
+                match McpClient::connect(&config.command, &config.args, &config.env).await {
                     Ok(client) => {
                         clients[idx] = Some(client);
                     }
@@ -849,6 +852,7 @@ mod tests {
             args: vec![],
             namespace: None,
             enabled: true,
+            env: HashMap::new(),
         };
         assert_eq!(config.name, "fileio");
         assert_eq!(config.command, "fileio-mcp");
@@ -865,6 +869,7 @@ mod tests {
             args: vec![],
             namespace: Some("jira".into()),
             enabled: true,
+            env: HashMap::new(),
         };
         assert_eq!(config.namespace.as_deref(), Some("jira"));
     }
@@ -877,6 +882,7 @@ mod tests {
             args: vec!["--config".into(), "/path/to/config.toml".into()],
             namespace: None,
             enabled: true,
+            env: HashMap::new(),
         };
         assert_eq!(config.args.len(), 2);
     }
@@ -951,6 +957,7 @@ mod tests {
                 args: vec![],
                 namespace: None,
                 enabled: true,
+                env: HashMap::new(),
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -958,6 +965,7 @@ mod tests {
                 args: vec![],
                 namespace: Some("jira".into()),
                 enabled: false,
+                env: HashMap::new(),
             },
         ];
         let executor = McpToolExecutor::new(configs);
@@ -980,6 +988,7 @@ mod tests {
             args: vec![],
             namespace: None,
             enabled: true,
+            env: HashMap::new(),
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();

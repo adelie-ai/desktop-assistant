@@ -149,6 +149,7 @@ async fn executor_refreshes_resources_and_prompts_after_live_list_changed() {
         args: vec!["-u".into(), "-c".into(), script],
         namespace: None,
         enabled: true,
+        env: std::collections::HashMap::new(),
     }];
 
     let executor = McpToolExecutor::new(configs);

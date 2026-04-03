@@ -3,6 +3,7 @@ pub mod config;
 pub mod executor;
 mod jsonrpc;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use desktop_assistant_core::domain::ToolDefinition;
@@ -81,16 +82,22 @@ impl McpClient {
     /// The command is validated before spawning: it must be a single
     /// program name or absolute path and must not contain shell
     /// metacharacters. Arguments are checked individually as well.
-    pub async fn connect(command: &str, args: &[String]) -> Result<Self, McpError> {
+    pub async fn connect(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<Self, McpError> {
         validate_command(command, args)?;
 
-        let mut child = Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(McpError::SpawnFailed)?;
+            .stderr(std::process::Stdio::null());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd.spawn().map_err(McpError::SpawnFailed)?;
 
         let stdin = child.stdin.take().ok_or(McpError::NoStdin)?;
         let stdout = child.stdout.take().ok_or(McpError::NoStdout)?;

@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use crate::McpError;
@@ -25,6 +26,13 @@ pub fn default_config_path() -> PathBuf {
         .join("mcp_servers.toml")
 }
 
+/// Ensure the config file is owner-only (0600) since it may contain secrets.
+fn enforce_permissions(path: &std::path::Path) -> Result<(), McpError> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        McpError::UnexpectedResponse(format!("failed to set config file permissions: {e}"))
+    })
+}
+
 /// Load MCP server configurations from a TOML file.
 /// Returns an empty vec if the file doesn't exist.
 pub fn load_mcp_configs(path: &std::path::Path) -> Result<Vec<McpServerConfig>, McpError> {
@@ -35,6 +43,8 @@ pub fn load_mcp_configs(path: &std::path::Path) -> Result<Vec<McpServerConfig>, 
         );
         return Ok(Vec::new());
     }
+
+    enforce_permissions(path)?;
 
     let contents = std::fs::read_to_string(path).map_err(|e| {
         McpError::UnexpectedResponse(format!("failed to read MCP config file: {e}"))
@@ -75,6 +85,8 @@ pub fn save_mcp_configs(
         McpError::UnexpectedResponse(format!("failed to write MCP config file: {e}"))
     })?;
 
+    enforce_permissions(path)?;
+
     tracing::info!(
         "saved {} MCP server config(s) to {}",
         configs.len(),
@@ -104,8 +116,32 @@ args = ["--config", "/path/to/config.toml"]
         assert_eq!(config.servers[0].name, "fileio");
         assert_eq!(config.servers[0].command, "fileio-mcp");
         assert!(config.servers[0].args.is_empty());
+        assert!(config.servers[0].env.is_empty(), "env should default to empty");
         assert_eq!(config.servers[1].name, "genmcp");
         assert_eq!(config.servers[1].args.len(), 2);
+    }
+
+    #[test]
+    fn parse_mcp_config_with_env() {
+        let toml = r#"
+[[servers]]
+name = "github"
+command = "github-mcp-server"
+args = ["stdio"]
+
+[servers.env]
+GITHUB_PERSONAL_ACCESS_TOKEN = "my-token"
+OTHER_VAR = "value"
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].name, "github");
+        assert_eq!(config.servers[0].env.len(), 2);
+        assert_eq!(
+            config.servers[0].env.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            "my-token"
+        );
+        assert_eq!(config.servers[0].env.get("OTHER_VAR").unwrap(), "value");
     }
 
     #[test]
@@ -141,6 +177,7 @@ args = ["--config", "/path/to/config.toml"]
                 args: vec![],
                 namespace: None,
                 enabled: true,
+                env: std::collections::HashMap::new(),
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -148,6 +185,7 @@ args = ["--config", "/path/to/config.toml"]
                 args: vec!["--host".into(), "jira.example.com".into()],
                 namespace: Some("jira".into()),
                 enabled: false,
+                env: std::collections::HashMap::new(),
             },
         ];
 

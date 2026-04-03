@@ -23,6 +23,7 @@ async fn connect_and_list_tools() {
     let mut client = McpClient::connect(
         "fileio-mcp",
         &["serve".into(), "--mode".into(), "stdio".into()],
+        &std::collections::HashMap::new(),
     )
     .await
     .expect("failed to connect to fileio-mcp");
@@ -65,6 +66,7 @@ async fn call_read_lines_tool() {
     let mut client = McpClient::connect(
         "fileio-mcp",
         &["serve".into(), "--mode".into(), "stdio".into()],
+        &std::collections::HashMap::new(),
     )
     .await
     .expect("failed to connect to fileio-mcp");
@@ -106,6 +108,7 @@ async fn executor_with_real_mcp_server() {
         args: vec!["serve".into(), "--mode".into(), "stdio".into()],
         namespace: None,
         enabled: true,
+        env: std::collections::HashMap::new(),
     }];
 
     let executor = McpToolExecutor::new(configs);
