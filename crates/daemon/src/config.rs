@@ -35,6 +35,11 @@ pub struct WsAuthConfig {
     pub methods: Vec<String>,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    /// Allowed browser origins for WebSocket and login requests.
+    /// Empty (default) means no browser clients are permitted.
+    /// Native clients (which do not send an Origin header) are always allowed.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for WsAuthConfig {
@@ -42,6 +47,7 @@ impl Default for WsAuthConfig {
         Self {
             methods: default_ws_auth_methods(),
             oidc: None,
+            allowed_origins: vec![],
         }
     }
 }

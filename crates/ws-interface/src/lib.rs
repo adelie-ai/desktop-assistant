@@ -26,6 +26,7 @@ pub struct WsServerState {
     auth_validator: Arc<dyn WsAuthValidator>,
     login_service: Option<Arc<dyn WsLoginService>>,
     auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Arc<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -67,11 +68,22 @@ pub fn router_with_auth(
     login_service: Option<Arc<dyn WsLoginService>>,
     auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
 ) -> Router {
+    router_full(handler, auth_validator, login_service, auth_discovery, vec![])
+}
+
+pub fn router_full(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Vec<String>,
+) -> Router {
     let state = WsServerState {
         handler,
         auth_validator,
         login_service,
         auth_discovery,
+        allowed_origins: Arc::new(allowed_origins),
     };
 
     Router::new()
@@ -79,6 +91,24 @@ pub fn router_with_auth(
         .route("/login", post(login_handler))
         .route("/auth/config", get(auth_config_handler))
         .with_state(state)
+}
+
+/// Validates the `Origin` header against the allowed origins list.
+///
+/// - No `Origin` header: always allowed (native clients like tui/gtk don't send one).
+/// - `Origin` present + empty allowlist: rejected (no browser clients permitted by default).
+/// - `Origin` present + matches an entry: allowed.
+/// - `Origin` present + no match: rejected.
+fn validate_origin(headers: &HeaderMap, allowed_origins: &[String]) -> Result<(), StatusCode> {
+    let Some(origin) = headers.get("origin") else {
+        return Ok(());
+    };
+    let origin = origin.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
+    if allowed_origins.iter().any(|a| a == origin) {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -115,6 +145,10 @@ async fn ws_handler(
     State(state): State<WsServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(status) = validate_origin(&headers, &state.allowed_origins) {
+        return (status, "origin not allowed").into_response();
+    }
+
     let Some(token) = extract_bearer_token(&headers) else {
         return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     };
@@ -137,6 +171,10 @@ async fn login_handler(
     State(state): State<WsServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(status) = validate_origin(&headers, &state.allowed_origins) {
+        return (status, "origin not allowed").into_response();
+    }
+
     let Some(login_service) = state.login_service else {
         return (StatusCode::NOT_FOUND, "login is not enabled").into_response();
     };
@@ -403,7 +441,22 @@ pub async fn serve_with_shutdown_and_auth<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let app = router_with_auth(handler, auth_validator, login_service, auth_discovery);
+    serve_full(handler, auth_validator, login_service, auth_discovery, vec![], bind, shutdown).await
+}
+
+pub async fn serve_full<F>(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Vec<String>,
+    bind: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let app = router_full(handler, auth_validator, login_service, auth_discovery, allowed_origins);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

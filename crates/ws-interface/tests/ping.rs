@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use desktop_assistant_application::DefaultAssistantApiHandler;
 use desktop_assistant_ws::{
-    WsAuthValidator, WsFrame, WsLoginService, WsRequest, router, router_with_login,
+    WsAuthValidator, WsFrame, WsLoginService, WsRequest, router, router_full, router_with_login,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Mutex;
@@ -1095,4 +1095,186 @@ async fn ws_serve_with_shutdown_exits() {
         result.is_ok(),
         "server should shut down cleanly: {result:?}"
     );
+}
+
+fn ws_request_with_origin(
+    url: &str,
+    bearer: Option<&str>,
+    origin: Option<&str>,
+) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    let mut request = url.into_client_request().unwrap();
+    if let Some(token) = bearer {
+        request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+    }
+    if let Some(origin) = origin {
+        request.headers_mut().insert(
+            "origin",
+            origin.parse().unwrap(),
+        );
+    }
+    request
+}
+
+#[tokio::test]
+async fn ws_allows_native_client_without_origin() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    // Empty allowlist — but no Origin header means native client, should be allowed.
+    let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, vec![]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(ws_request_with_origin(&url, Some("test-jwt"), None))
+            .await
+            .unwrap();
+
+    // Verify the connection works by sending a ping.
+    let req = WsRequest {
+        id: "1".into(),
+        command: desktop_assistant_api_model::Command::Ping,
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&req).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = ws.next().await.unwrap().unwrap();
+    let frame: WsFrame = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+    assert!(matches!(frame, WsFrame::Result { .. }));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_rejects_browser_origin_when_allowlist_empty() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, vec![]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let err = tokio_tungstenite::connect_async(ws_request_with_origin(
+        &url,
+        Some("test-jwt"),
+        Some("https://evil.example.com"),
+    ))
+    .await
+    .expect_err("expected forbidden due to origin");
+
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(
+                response.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_allows_configured_origin() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];
+    let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, allowed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request_with_origin(
+        &url,
+        Some("test-jwt"),
+        Some("https://daystrom.lab.spadea.tech"),
+    ))
+    .await
+    .unwrap();
+
+    let req = WsRequest {
+        id: "1".into(),
+        command: desktop_assistant_api_model::Command::Ping,
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&req).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = ws.next().await.unwrap().unwrap();
+    let frame: WsFrame = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+    assert!(matches!(frame, WsFrame::Result { .. }));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_rejects_non_matching_origin() {
+    let handler = Arc::new(DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(FakeConversations),
+        Arc::new(FakeSettings),
+    ));
+
+    let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];
+    let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, allowed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let err = tokio_tungstenite::connect_async(ws_request_with_origin(
+        &url,
+        Some("test-jwt"),
+        Some("https://evil.example.com"),
+    ))
+    .await
+    .expect_err("expected forbidden due to non-matching origin");
+
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(
+                response.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.abort();
 }

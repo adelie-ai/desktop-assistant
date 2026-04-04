@@ -1231,14 +1231,25 @@ async fn main() -> Result<()> {
         );
     }
 
+    let allowed_origins = ws_auth_config
+        .as_ref()
+        .map(|c| c.allowed_origins.clone())
+        .unwrap_or_default();
+    if allowed_origins.is_empty() {
+        tracing::info!("WebSocket origin policy: browser clients blocked (no allowed_origins configured)");
+    } else {
+        tracing::info!("WebSocket allowed origins: {allowed_origins:?}");
+    }
+
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let ws_task = tokio::spawn(async move {
         tracing::info!("WebSocket listening on {ws_addr} (/ws, /auth/config)");
-        if let Err(e) = ws::serve_with_shutdown_and_auth(
+        if let Err(e) = ws::serve_full(
             api_handler,
             ws_auth,
             ws_login_service,
             auth_discovery,
+            allowed_origins,
             ws_addr,
             async {
                 let _ = ws_shutdown_rx.await;
