@@ -15,9 +15,15 @@ Provides the **Adele** desktop assistant.
 ## Integrations
 - Multiple LLM backends (`ollama`, `openai`, `anthropic`, `aws bedrock`)
 - MCP tool integration over stdio with several MCP servers provided by the `adelie-mcp` project
-- `ratatui`-based TUI client
-- `gtk-client` standalone GTK-based client
-- KDE plasmoids and control panel, with other DEs to come
+- D-Bus and WebSocket APIs for client integration
+
+## Clients
+
+Clients have been extracted to their own repositories:
+
+- [adele-tui](https://github.com/adelie-ai/adele-tui) — Terminal UI client (`adele` binary)
+- [adele-gtk](https://github.com/adelie-ai/adele-gtk) — GTK4 desktop client (`adele-gtk` binary)
+- [adele-kde](https://github.com/adelie-ai/adele-kde) — KDE Plasma widgets and System Settings module
 
 ## Project Status
 
@@ -228,11 +234,9 @@ See [docs/mcp-services.md](docs/mcp-services.md) for the full server list and co
 cargo run -p desktop-assistant-daemon
 ```
 
-### 5) Run TUI client (separate terminal)
+### 5) Run a client (separate terminal)
 
-```bash
-cargo run -p desktop-assistant-tui
-```
+See the [Clients](#clients) section above for available clients and their repositories.
 
 ## Service Setup (systemd user + just)
 
@@ -281,14 +285,6 @@ just backend-dev-restart
 just backend-dev-logs
 ```
 
-Run TUI against that development daemon:
-
-```bash
-just dev-frontend
-```
-
-In either chat widget, set **Mode** to **Development** to make panel/desktop widgets target `org.desktopAssistant.Dev`.
-
 ### Activation Troubleshooting
 
 If D-Bus calls return "The name is not activatable":
@@ -327,136 +323,6 @@ If activatable names still do not appear, reload both managers and re-check:
 ```bash
 systemctl --user daemon-reload
 gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.ReloadConfig
-```
-
-## KDE Widgets (Plasmoids)
-
-This repository includes two KDE Plasma widgets that talk to the daemon over D-Bus:
-
-- Panel widget: `kde/plasmoid/org.desktopassistant.panelchat`
-- Desktop widget: `kde/plasmoid/org.desktopassistant.desktopchat`
-
-Install both for your user:
-
-```bash
-kpackagetool6 --type Plasma/Applet --install kde/plasmoid/org.desktopassistant.panelchat
-kpackagetool6 --type Plasma/Applet --install kde/plasmoid/org.desktopassistant.desktopchat
-```
-
-Upgrade after local changes:
-
-```bash
-kpackagetool6 --type Plasma/Applet --upgrade kde/plasmoid/org.desktopassistant.panelchat
-kpackagetool6 --type Plasma/Applet --upgrade kde/plasmoid/org.desktopassistant.desktopchat
-```
-
-Usage:
-
-- Add **Desktop Assistant** to the panel/task bar for quick popup chat.
-- Add **Desktop Assistant (Desktop)** to the desktop for an always-visible chat card.
-- Widget controls include:
-	- **New**: start a fresh conversation.
-	- **Debug**: show/hide low-level tool execution status lines.
-	- **Clear**: clear the visible transcript without deleting conversation history.
-
-Notes:
-
-- Both chat widgets include a **service selector** (Production/Development) and call the selected D-Bus service at `/org/desktopAssistant/Conversations`. Only visible if dev and prod services are both running.
-- Widgets auto-detect whether `org.desktopAssistant.Dev` currently has an owner on the session bus.
-- If the dev environment is not running, environment selection is hidden.
-- Both widgets shell out to `python3` and `gdbus` to call methods documented in `docs/dbus-api.md`.
-- API keys are write-only over D-Bus (`SetApiKey` only) and are never returned to clients.
-- Daemon can auto-start on first D-Bus method call once `just install-service` is set up.
-
-## KDE System Settings Panel (KCM)
-
-Build the Desktop Assistant KCM module:
-
-```bash
-just kcm-build
-```
-
-Install it user-locally (development copy):
-
-```bash
-just kcm-install
-```
-
-Install system-wide (recommended for daily use + KDE discovery, requires sudo):
-
-```bash
-just kcm-install-system
-```
-
-Refresh cache and verify discovery:
-
-```bash
-just kcm-refresh
-```
-
-Open using the user-local plugin environment:
-
-```bash
-just kcm-open
-```
-
-Open using system plugin paths:
-
-```bash
-just kcm-open-system
-```
-
-### KCM install modes (important)
-
-KDE can see both a **system** KCM install (`/usr/...`) and a **user-local** KCM install (`~/.local/...`).
-If both exist, it can look like settings/UI changes are "randomly" reverting depending on which one is loaded.
-
-Choose one mode and stick to it:
-
-- **System mode (recommended for stability):**
-	- Install/update with `just kcm-install-system`
-	- Open with `just kcm-open-system`
-	- Do not keep a user-local KCM copy installed
-- **Local mode (recommended for active KCM development):**
-	- Install/update with `just kcm-install`
-	- Open with `just kcm-open`
-	- Do not keep a system KCM copy installed
-
-### One-shot cleanup commands
-
-- Remove only **local** KCM artifacts (keeps system install intact):
-
-```bash
-just kcm-cleanup
-```
-
-- Remove only **system** KCM artifacts (requires sudo):
-
-```bash
-just kcm-cleanup-system
-```
-
-- Then refresh cache:
-
-```bash
-just kcm-refresh
-```
-
-### Recovery playbook (if UI looks wrong or old)
-
-1. Pick target mode (**system** or **local**).
-2. Remove the other mode's artifacts using the cleanup command above.
-3. Reinstall target mode (`just kcm-install-system` or `just kcm-install`).
-4. Refresh (`just kcm-refresh`).
-5. Open with matching command (`just kcm-open-system` or `just kcm-open`).
-
-Note: KDE loads KCM plugins from Qt6 plugin paths (for example `/usr/lib64/qt6/plugins` and `~/.local/lib64/qt6/plugins`).
-
-After install, open KDE System Settings and search for **Desktop Assistant**.
-You can also launch directly:
-
-```bash
-kcmshell6 kcm_desktopassistant
 ```
 
 ## Core Commands
