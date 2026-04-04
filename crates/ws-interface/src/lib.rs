@@ -18,29 +18,7 @@ use tracing::{debug, warn};
 
 const WS_OUTBOUND_BUFFER: usize = 64;
 
-/// WebSocket request envelope.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WsRequest {
-    pub id: String,
-    pub command: api::Command,
-}
-
-/// WebSocket frames sent from server to client.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WsFrame {
-    Result {
-        id: String,
-        result: api::CommandResult,
-    },
-    Error {
-        id: String,
-        error: String,
-    },
-    Event {
-        event: api::Event,
-    },
-}
+pub use api::{WsFrame, WsRequest};
 
 #[derive(Clone)]
 pub struct WsServerState {

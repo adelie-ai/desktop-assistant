@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use desktop_assistant_api_model as api;
-use desktop_assistant_ws::{WsFrame, WsRequest};
+use api::{WsFrame, WsRequest};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;

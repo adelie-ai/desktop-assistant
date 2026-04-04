@@ -324,6 +324,30 @@ pub struct McpServerView {
     pub tool_count: u32,
 }
 
+/// WebSocket request envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WsRequest {
+    pub id: String,
+    pub command: Command,
+}
+
+/// WebSocket frames sent from server to client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WsFrame {
+    Result {
+        id: String,
+        result: CommandResult,
+    },
+    Error {
+        id: String,
+        error: String,
+    },
+    Event {
+        event: Event,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
