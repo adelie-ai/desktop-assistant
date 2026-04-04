@@ -165,9 +165,9 @@ def wait_for_assistant_reply(conversation_id: str, initial_count: int, timeout_s
     return ""
 
 
-def list_conversations(max_age_days: int | None = None) -> list[dict[str, Any]]:
+def list_conversations(max_age_days: int | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
     age = max(0, int(max_age_days or 0))
-    response = _run_gdbus("ListConversations", str(age))
+    response = _run_gdbus("ListConversations", str(age), "true" if include_archived else "false")
     rows = response[0] if isinstance(response, tuple) and len(response) == 1 else response
     return [
         {
@@ -175,6 +175,7 @@ def list_conversations(max_age_days: int | None = None) -> list[dict[str, Any]]:
             "title": item[1],
             "message_count": item[2],
             "updated_at": item[3] if len(item) > 3 else "",
+            "archived": item[4] if len(item) > 4 else False,
         }
         for item in rows
     ]
