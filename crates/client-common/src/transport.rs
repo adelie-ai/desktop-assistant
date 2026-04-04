@@ -102,10 +102,10 @@ impl AssistantClient for TransportClient {
     }
 }
 
-pub fn transport_label(mode: TransportMode) -> &'static str {
-    match mode {
-        TransportMode::Dbus => "Connected via D-Bus",
-        TransportMode::Ws => "Connected via WebSocket",
+pub fn transport_label(config: &ConnectionConfig) -> String {
+    match config.transport_mode {
+        TransportMode::Dbus => "Connected via D-Bus".to_string(),
+        TransportMode::Ws => format!("Connected to {}", config.ws_url),
     }
 }
 
