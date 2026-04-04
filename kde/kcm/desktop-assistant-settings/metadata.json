@@ -1,9 +1,0 @@
-{
-  "KPlugin": {
-    "Id": "kcm_desktopassistant",
-    "Name": "Desktop Assistant",
-    "Description": "Configure Desktop Assistant model and API settings",
-    "Icon": "settings-configure",
-    "License": "MIT"
-  }
-}

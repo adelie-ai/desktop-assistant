@@ -14,7 +14,6 @@ members = [
     "crates/mcp-client",
     "crates/storage",
     "crates/client-common",
-    "crates/tui",
 ]
 
 [workspace.dependencies]
