@@ -22,6 +22,15 @@ axum = { version = "0.8", features = ["ws"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 
+# Optional TLS support
+tokio-rustls = { workspace = true, optional = true }
+hyper = { version = "1", optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2", "service"], optional = true }
+
+[features]
+default = []
+tls = ["dep:tokio-rustls", "dep:hyper", "dep:hyper-util"]
+
 [dev-dependencies]
 desktop-assistant-core = { path = "../core" }
 tokio-tungstenite = "0.28"

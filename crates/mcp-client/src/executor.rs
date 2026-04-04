@@ -32,6 +32,10 @@ pub struct McpServerConfig {
     /// Environment variables to set when spawning the server process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Environment variables whose values are resolved from secrets.toml.
+    /// Keys are env var names, values are secret IDs.
+    #[serde(default)]
+    pub env_secrets: HashMap<String, String>,
 }
 
 /// Status information for an MCP server.
@@ -59,9 +63,28 @@ pub struct McpExecutorState {
     cached_prompts: Mutex<Vec<serde_json::Value>>,
     /// Path to the MCP config file (for persisting changes).
     config_path: PathBuf,
+    /// Secrets loaded from secrets.toml, keyed by secret ID.
+    secrets: HashMap<String, String>,
 }
 
 impl McpExecutorState {
+    /// Resolve the final environment variables for a server config by merging
+    /// `env` (plaintext) with `env_secrets` (looked up from secrets.toml).
+    /// Secret references override plaintext if both set the same var.
+    fn resolve_env(&self, config: &McpServerConfig) -> Result<HashMap<String, String>, McpError> {
+        let mut env = config.env.clone();
+        for (var_name, secret_id) in &config.env_secrets {
+            let value = self.secrets.get(secret_id).ok_or_else(|| {
+                McpError::UnexpectedResponse(format!(
+                    "secret '{}' (referenced by env_secrets.{} in server '{}') not found in secrets.toml",
+                    secret_id, var_name, config.name
+                ))
+            })?;
+            env.insert(var_name.clone(), value.clone());
+        }
+        Ok(env)
+    }
+
     async fn maybe_refresh_metadata(&self) -> Result<(), McpError> {
         let (tools_changed, resources_changed, prompts_changed) = {
             let clients = self.clients.lock().await;
@@ -253,7 +276,8 @@ impl McpExecutorState {
             config.command
         );
 
-        match McpClient::connect(&config.command, &config.args, &config.env).await {
+        let env = self.resolve_env(config)?;
+        match McpClient::connect(&config.command, &config.args, &env).await {
             Ok(client) => {
                 let mut clients = self.clients.lock().await;
                 clients[idx] = Some(client);
@@ -555,6 +579,7 @@ impl McpToolExecutor {
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
+                secrets: HashMap::new(),
             }),
             builtin_tools,
         }
@@ -564,6 +589,7 @@ impl McpToolExecutor {
         configs: Vec<McpServerConfig>,
         builtin_tools: BuiltinToolService,
         config_path: PathBuf,
+        secrets: HashMap<String, String>,
     ) -> Self {
         let clients: Vec<Option<McpClient>> = (0..configs.len()).map(|_| None).collect();
         Self {
@@ -575,6 +601,7 @@ impl McpToolExecutor {
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
+                secrets,
             }),
             builtin_tools,
         }
@@ -613,7 +640,11 @@ impl McpToolExecutor {
                     config.command
                 );
 
-                match McpClient::connect(&config.command, &config.args, &config.env).await {
+                let env = self.state.resolve_env(config).unwrap_or_else(|e| {
+                    tracing::error!("failed to resolve secrets for '{}': {e}", config.name);
+                    config.env.clone()
+                });
+                match McpClient::connect(&config.command, &config.args, &env).await {
                     Ok(client) => {
                         clients[idx] = Some(client);
                     }
@@ -853,6 +884,7 @@ mod tests {
             namespace: None,
             enabled: true,
             env: HashMap::new(),
+            env_secrets: HashMap::new(),
         };
         assert_eq!(config.name, "fileio");
         assert_eq!(config.command, "fileio-mcp");
@@ -870,6 +902,7 @@ mod tests {
             namespace: Some("jira".into()),
             enabled: true,
             env: HashMap::new(),
+            env_secrets: HashMap::new(),
         };
         assert_eq!(config.namespace.as_deref(), Some("jira"));
     }
@@ -883,6 +916,7 @@ mod tests {
             namespace: None,
             enabled: true,
             env: HashMap::new(),
+            env_secrets: HashMap::new(),
         };
         assert_eq!(config.args.len(), 2);
     }
@@ -958,6 +992,7 @@ mod tests {
                 namespace: None,
                 enabled: true,
                 env: HashMap::new(),
+                env_secrets: HashMap::new(),
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -966,6 +1001,7 @@ mod tests {
                 namespace: Some("jira".into()),
                 enabled: false,
                 env: HashMap::new(),
+                env_secrets: HashMap::new(),
             },
         ];
         let executor = McpToolExecutor::new(configs);
@@ -989,6 +1025,7 @@ mod tests {
             namespace: None,
             enabled: true,
             env: HashMap::new(),
+            env_secrets: HashMap::new(),
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();

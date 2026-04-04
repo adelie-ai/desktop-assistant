@@ -125,7 +125,8 @@ pub async fn connect_transport(
         )),
         TransportMode::Ws => {
             let token = resolve_ws_bearer_token(config).await?;
-            let (client, signal_rx) = WsClient::connect(&config.ws_url, &token).await?;
+            let (client, signal_rx) =
+                WsClient::connect(&config.ws_url, &token, config.tls_ca_cert.as_deref()).await?;
             Ok((TransportClient::Ws(client), signal_rx))
         }
     }

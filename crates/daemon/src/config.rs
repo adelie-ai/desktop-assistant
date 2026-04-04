@@ -27,6 +27,8 @@ pub struct DaemonConfig {
     pub profiling: ProfilingConfig,
     #[serde(default)]
     pub ws_auth: WsAuthConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -50,6 +52,34 @@ impl Default for WsAuthConfig {
             allowed_origins: vec![],
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TlsConfig {
+    /// Enable TLS for WebSocket connections. Default: true.
+    /// Can be overridden by `DESKTOP_ASSISTANT_WS_TLS=false`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Path to a PEM-encoded certificate chain (overrides auto-generated cert).
+    #[serde(default)]
+    pub cert_file: Option<std::path::PathBuf>,
+    /// Path to a PEM-encoded private key (overrides auto-generated key).
+    #[serde(default)]
+    pub key_file: Option<std::path::PathBuf>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cert_file: None,
+            key_file: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_ws_auth_methods() -> Vec<String> {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
@@ -95,6 +96,57 @@ pub fn save_mcp_configs(
     Ok(())
 }
 
+/// Top-level secrets file structure.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SecretsConfig {
+    #[serde(default)]
+    secrets: HashMap<String, String>,
+}
+
+/// Returns the default path for the secrets file.
+/// Uses `$XDG_CONFIG_HOME/desktop-assistant/secrets.toml`,
+/// falling back to `~/.config/desktop-assistant/secrets.toml`.
+pub fn default_secrets_path() -> PathBuf {
+    let config_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".config")
+        });
+    config_dir
+        .join("desktop-assistant")
+        .join("secrets.toml")
+}
+
+/// Load secrets from a TOML file.
+/// Returns an empty map if the file doesn't exist.
+pub fn load_secrets(path: &std::path::Path) -> Result<HashMap<String, String>, McpError> {
+    if !path.exists() {
+        tracing::debug!(
+            "secrets file not found at {}, no secrets loaded",
+            path.display()
+        );
+        return Ok(HashMap::new());
+    }
+
+    enforce_permissions(path)?;
+
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        McpError::UnexpectedResponse(format!("failed to read secrets file: {e}"))
+    })?;
+
+    let config: SecretsConfig = toml::from_str(&contents).map_err(|e| {
+        McpError::UnexpectedResponse(format!("failed to parse secrets file: {e}"))
+    })?;
+
+    tracing::info!(
+        "loaded {} secret(s) from {}",
+        config.secrets.len(),
+        path.display()
+    );
+    Ok(config.secrets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +230,7 @@ OTHER_VAR = "value"
                 namespace: None,
                 enabled: true,
                 env: std::collections::HashMap::new(),
+                env_secrets: std::collections::HashMap::new(),
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -186,6 +239,7 @@ OTHER_VAR = "value"
                 namespace: Some("jira".into()),
                 enabled: false,
                 env: std::collections::HashMap::new(),
+                env_secrets: std::collections::HashMap::new(),
             },
         ];
 
@@ -201,5 +255,77 @@ OTHER_VAR = "value"
         assert_eq!(loaded[1].args.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_mcp_config_with_env_secrets() {
+        let toml = r#"
+[[servers]]
+name = "github"
+command = "github-mcp-server"
+args = ["stdio"]
+
+[servers.env_secrets]
+GITHUB_PERSONAL_ACCESS_TOKEN = "github_pat"
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(
+            config.servers[0].env_secrets.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            "github_pat"
+        );
+        assert!(config.servers[0].env.is_empty());
+    }
+
+    #[test]
+    fn parse_mcp_config_with_both_env_and_env_secrets() {
+        let toml = r#"
+[[servers]]
+name = "github"
+command = "github-mcp-server"
+args = ["stdio"]
+
+[servers.env]
+SOME_PUBLIC_VAR = "public-value"
+
+[servers.env_secrets]
+SECRET_VAR = "my_secret_id"
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.servers[0].env.get("SOME_PUBLIC_VAR").unwrap(), "public-value");
+        assert_eq!(config.servers[0].env_secrets.get("SECRET_VAR").unwrap(), "my_secret_id");
+    }
+
+    #[test]
+    fn parse_secrets_toml() {
+        let toml = r#"
+[secrets]
+github_pat = "ghp_abc123"
+other_key = "secret-value"
+"#;
+        let config: SecretsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.secrets.len(), 2);
+        assert_eq!(config.secrets.get("github_pat").unwrap(), "ghp_abc123");
+        assert_eq!(config.secrets.get("other_key").unwrap(), "secret-value");
+    }
+
+    #[test]
+    fn parse_empty_secrets_toml() {
+        let toml = "";
+        let config: SecretsConfig = toml::from_str(toml).unwrap();
+        assert!(config.secrets.is_empty());
+    }
+
+    #[test]
+    fn load_nonexistent_secrets_returns_empty() {
+        let result = load_secrets(std::path::Path::new("/nonexistent/secrets.toml")).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn default_secrets_path_is_reasonable() {
+        let path = default_secrets_path();
+        assert!(path.to_str().unwrap().contains("secrets.toml"));
+        assert!(path.to_str().unwrap().contains("desktop-assistant"));
     }
 }

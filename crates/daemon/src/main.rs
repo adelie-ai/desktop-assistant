@@ -16,6 +16,7 @@ mod app;
 mod config;
 mod settings_service;
 mod store;
+mod tls;
 
 use crate::app::Assistant;
 use desktop_assistant_application::DefaultAssistantApiHandler;
@@ -503,6 +504,9 @@ async fn main() -> Result<()> {
 
     tracing::info!("desktop-assistant starting");
 
+    // Install the rustls crypto provider for TLS support.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Build the LLM client from daemon.toml + KWallet (fallback to env)
     let config_path = config::default_daemon_config_path();
     let daemon_config = match config::load_daemon_config(&config_path) {
@@ -720,11 +724,16 @@ async fn main() -> Result<()> {
         ))
     });
 
-    // Load MCP server configuration
+    // Load MCP server configuration and secrets
     let mcp_config_path = mcp_config::default_config_path();
     let mcp_configs = mcp_config::load_mcp_configs(&mcp_config_path).unwrap_or_else(|e| {
         tracing::warn!("failed to load MCP config: {e}");
         Vec::new()
+    });
+    let secrets_path = mcp_config::default_secrets_path();
+    let mcp_secrets = mcp_config::load_secrets(&secrets_path).unwrap_or_else(|e| {
+        tracing::warn!("failed to load secrets: {e}");
+        std::collections::HashMap::new()
     });
 
     // Build the MCP tool executor with builtin tools
@@ -799,6 +808,7 @@ async fn main() -> Result<()> {
         mcp_configs,
         builtin_tools,
         mcp_config_path,
+        mcp_secrets,
     );
     let mcp_handle = tool_executor.control_handle();
     tool_executor
@@ -1241,22 +1251,68 @@ async fn main() -> Result<()> {
         tracing::info!("WebSocket allowed origins: {allowed_origins:?}");
     }
 
+    // TLS configuration
+    let tls_config = daemon_config
+        .as_ref()
+        .map(|c| c.tls.clone())
+        .unwrap_or_default();
+    let tls_env_override = std::env::var("DESKTOP_ASSISTANT_WS_TLS")
+        .ok()
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"));
+    let tls_enabled = tls_env_override.unwrap_or(tls_config.enabled);
+
+    let tls_acceptor = if tls_enabled {
+        match tls::setup(
+            tls_config.cert_file.as_deref(),
+            tls_config.key_file.as_deref(),
+        ) {
+            Ok(server_config) => {
+                tracing::info!(
+                    "TLS enabled; CA cert at {}",
+                    tls::default_ca_cert_path().display()
+                );
+                Some(tokio_rustls::TlsAcceptor::from(server_config))
+            }
+            Err(e) => {
+                tracing::error!("TLS setup failed: {e:#}; falling back to plain ws://");
+                None
+            }
+        }
+    } else {
+        tracing::info!("TLS disabled; serving plain ws://");
+        None
+    };
+
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let ws_task = tokio::spawn(async move {
-        tracing::info!("WebSocket listening on {ws_addr} (/ws, /auth/config)");
-        if let Err(e) = ws::serve_full(
-            api_handler,
-            ws_auth,
-            ws_login_service,
-            auth_discovery,
-            allowed_origins,
-            ws_addr,
-            async {
-                let _ = ws_shutdown_rx.await;
-            },
-        )
-        .await
-        {
+        let shutdown = async { let _ = ws_shutdown_rx.await; };
+        let result = if let Some(acceptor) = tls_acceptor {
+            tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
+            ws::serve_full_tls(
+                api_handler,
+                ws_auth,
+                ws_login_service,
+                auth_discovery,
+                allowed_origins,
+                acceptor,
+                ws_addr,
+                shutdown,
+            )
+            .await
+        } else {
+            tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
+            ws::serve_full(
+                api_handler,
+                ws_auth,
+                ws_login_service,
+                auth_discovery,
+                allowed_origins,
+                ws_addr,
+                shutdown,
+            )
+            .await
+        };
+        if let Err(e) = result {
             tracing::error!("WebSocket server error: {e}");
         }
     });

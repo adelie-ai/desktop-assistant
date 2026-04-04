@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -23,6 +24,7 @@ impl WsClient {
     pub async fn connect(
         ws_url: &str,
         bearer_token: &str,
+        tls_ca_cert: Option<&Path>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<SignalEvent>)> {
         let mut request = ws_url.into_client_request()?;
         request.headers_mut().insert(
@@ -30,7 +32,19 @@ impl WsClient {
             format!("Bearer {bearer_token}").parse()?,
         );
 
-        let (socket, _response) = tokio_tungstenite::connect_async(request).await?;
+        let connector = if ws_url.starts_with("wss://") {
+            Some(build_tls_connector(tls_ca_cert)?)
+        } else {
+            None
+        };
+
+        let (socket, _response) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            connector,
+        )
+        .await?;
         let (mut ws_tx, mut ws_rx) = socket.split();
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
@@ -254,6 +268,29 @@ impl WsClient {
         // WS send-message ack does not include request id; first stream event carries it.
         Ok(String::new())
     }
+}
+
+fn build_tls_connector(
+    ca_cert_path: Option<&Path>,
+) -> Result<tokio_tungstenite::Connector> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    if let Some(ca_path) = ca_cert_path {
+        let pem_bytes = std::fs::read(ca_path)
+            .map_err(|e| anyhow!("reading CA cert {}: {e}", ca_path.display()))?;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(pem_bytes.as_slice()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+        for cert in certs {
+            root_store.add(cert)?;
+        }
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
 }
 
 pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {

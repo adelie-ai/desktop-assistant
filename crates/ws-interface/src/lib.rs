@@ -463,3 +463,59 @@ where
         .await?;
     Ok(())
 }
+
+#[cfg(feature = "tls")]
+pub async fn serve_full_tls<F>(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Vec<String>,
+    tls_acceptor: tokio_rustls::TlsAcceptor,
+    bind: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::service::TowerToHyperService;
+
+    let app = router_full(handler, auth_validator, login_service, auth_discovery, allowed_origins);
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (tcp_stream, _remote_addr) = result?;
+                let acceptor = tls_acceptor.clone();
+                let app = app.clone();
+
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(tcp_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            debug!("TLS handshake failed: {e}");
+                            return;
+                        }
+                    };
+
+                    let io = TokioIo::new(tls_stream);
+                    let service = TowerToHyperService::new(app.into_service());
+                    if let Err(e) = ConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await
+                    {
+                        debug!("connection error: {e}");
+                    }
+                });
+            }
+            _ = &mut shutdown => break,
+        }
+    }
+
+    Ok(())
+}

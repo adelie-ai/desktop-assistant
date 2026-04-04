@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -31,11 +32,17 @@ pub async fn request_ws_login_token(
     ws_url: &str,
     username: &str,
     password: &str,
+    tls_ca_cert: Option<&Path>,
 ) -> Result<String> {
     let login_url = derive_login_url_from_ws_url(ws_url)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+    if let Some(ca_path) = tls_ca_cert {
+        let pem_bytes = std::fs::read(ca_path)
+            .map_err(|e| anyhow::anyhow!("reading CA cert {}: {e}", ca_path.display()))?;
+        let cert = reqwest::tls::Certificate::from_pem(&pem_bytes)?;
+        builder = builder.add_root_certificate(cert);
+    }
+    let client = builder.build()?;
 
     let response = client
         .post(login_url)
@@ -84,14 +91,19 @@ pub async fn resolve_ws_bearer_token(config: &ConnectionConfig) -> Result<String
                     config.ws_login_username.as_deref(),
                     config.ws_login_password.as_deref(),
                 ) {
-                    request_ws_login_token(&config.ws_url, username, password)
-                        .await
-                        .map_err(|login_error| {
-                            anyhow::anyhow!(
-                                "failed to obtain websocket token via D-Bus ({dbus_error}); \
-                             fallback /login on websocket host also failed ({login_error})"
-                            )
-                        })
+                    request_ws_login_token(
+                        &config.ws_url,
+                        username,
+                        password,
+                        config.tls_ca_cert.as_deref(),
+                    )
+                    .await
+                    .map_err(|login_error| {
+                        anyhow::anyhow!(
+                            "failed to obtain websocket token via D-Bus ({dbus_error}); \
+                         fallback /login on websocket host also failed ({login_error})"
+                        )
+                    })
                 } else {
                     Err(anyhow::anyhow!(
                         "failed to obtain websocket token via D-Bus ({dbus_error}); \
@@ -108,7 +120,13 @@ pub async fn resolve_ws_bearer_token(config: &ConnectionConfig) -> Result<String
             config.ws_login_username.as_deref(),
             config.ws_login_password.as_deref(),
         ) {
-            return request_ws_login_token(&config.ws_url, username, password).await;
+            return request_ws_login_token(
+                &config.ws_url,
+                username,
+                password,
+                config.tls_ca_cert.as_deref(),
+            )
+            .await;
         }
         Err(anyhow::anyhow!(
             "no JWT provided and D-Bus not available; \
