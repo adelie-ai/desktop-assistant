@@ -17,6 +17,16 @@ pub enum CoreError {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    /// The prompt exceeded the model's context window. The core service
+    /// handles this by truncating the most recent oversized tool result
+    /// and retrying (bounded), rather than surfacing a hard failure.
+    #[error("LLM context overflow: {detail}")]
+    ContextOverflow {
+        prompt_tokens: Option<u64>,
+        max_tokens: Option<u64>,
+        detail: String,
+    },
+
     #[error("storage error: {0}")]
     Storage(String),
 
