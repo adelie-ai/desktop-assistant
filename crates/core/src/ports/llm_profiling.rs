@@ -186,6 +186,10 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         self.inner.get_default_base_url()
     }
 
+    fn max_context_tokens(&self) -> Option<u64> {
+        self.inner.max_context_tokens()
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
@@ -346,6 +350,13 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
         match self {
             Self::Plain(l) => l.get_default_base_url(),
             Self::Profiled(l) => l.get_default_base_url(),
+        }
+    }
+
+    fn max_context_tokens(&self) -> Option<u64> {
+        match self {
+            Self::Plain(l) => l.max_context_tokens(),
+            Self::Profiled(l) => l.max_context_tokens(),
         }
     }
 

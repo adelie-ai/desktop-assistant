@@ -390,6 +390,15 @@ impl LlmClient for AnyLlmClient {
         }
     }
 
+    fn max_context_tokens(&self) -> Option<u64> {
+        match self {
+            Self::Anthropic(c) => c.max_context_tokens(),
+            Self::Bedrock(c) => c.max_context_tokens(),
+            Self::OpenAi(c) => c.max_context_tokens(),
+            Self::Ollama(c) => c.max_context_tokens(),
+        }
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,

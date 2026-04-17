@@ -76,6 +76,13 @@ pub trait LlmClient: Send + Sync {
         None
     }
 
+    /// Maximum prompt-token budget for the configured model, if known.
+    /// Used by the core service to trigger proactive context compaction
+    /// before the provider rejects an oversized request.
+    fn max_context_tokens(&self) -> Option<u64> {
+        None
+    }
+
     /// Stream a completion from the LLM given a message history.
     /// Calls `on_chunk` for each text token/chunk received.
     /// Optionally accepts tool definitions to enable tool calling.
@@ -150,6 +157,10 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
 
     fn get_default_base_url(&self) -> Option<&str> {
         self.inner.get_default_base_url()
+    }
+
+    fn max_context_tokens(&self) -> Option<u64> {
+        self.inner.max_context_tokens()
     }
 
     async fn stream_completion(

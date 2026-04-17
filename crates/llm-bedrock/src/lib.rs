@@ -479,6 +479,31 @@ fn apply_stream_event(
     true
 }
 
+/// Return the prompt-token context window for a known Bedrock model ID.
+///
+/// Accepts cross-region inference-profile prefixes (`us.`, `eu.`, `apac.`).
+/// Returns `None` for models without a known limit; callers should treat
+/// `None` as "disable token-based compaction" and rely on message-count
+/// fallbacks instead.
+pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
+    // Strip cross-region inference-profile prefixes.
+    let base = model_id
+        .strip_prefix("us.")
+        .or_else(|| model_id.strip_prefix("eu."))
+        .or_else(|| model_id.strip_prefix("apac."))
+        .unwrap_or(model_id);
+
+    // Anthropic Claude on Bedrock: 3.x and 4.x all ship with 200K context.
+    if base.starts_with("anthropic.claude-3") || base.starts_with("anthropic.claude-sonnet-4")
+        || base.starts_with("anthropic.claude-opus-4")
+        || base.starts_with("anthropic.claude-haiku-4")
+    {
+        return Some(200_000);
+    }
+
+    None
+}
+
 impl LlmClient for BedrockClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -486,6 +511,10 @@ impl LlmClient for BedrockClient {
 
     fn get_default_base_url(&self) -> Option<&str> {
         Self::get_default_base_url()
+    }
+
+    fn max_context_tokens(&self) -> Option<u64> {
+        context_limit_for_model(&self.model)
     }
 
     async fn stream_completion(
@@ -652,6 +681,44 @@ mod tests {
     #[test]
     fn region_parsing_rejects_unknown_endpoint() {
         assert!(region_from_base_url("https://example.com").is_none());
+    }
+
+    #[test]
+    fn context_limit_claude_sonnet_4_cross_region() {
+        assert_eq!(
+            context_limit_for_model("us.anthropic.claude-sonnet-4-6"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_for_model("eu.anthropic.claude-sonnet-4-5"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn context_limit_claude_opus_and_haiku_4() {
+        assert_eq!(
+            context_limit_for_model("anthropic.claude-opus-4-1"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_for_model("us.anthropic.claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn context_limit_claude_3() {
+        assert_eq!(
+            context_limit_for_model("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn context_limit_unknown_model_returns_none() {
+        assert_eq!(context_limit_for_model("amazon.nova-pro-v1:0"), None);
+        assert_eq!(context_limit_for_model("meta.llama3-70b"), None);
     }
 
     #[test]

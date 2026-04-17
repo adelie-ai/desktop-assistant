@@ -12,14 +12,23 @@ use chrono::{Duration, Local};
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
 
-/// Maximum number of conversation messages sent to the LLM per turn.
+/// Default maximum number of conversation messages sent to the LLM per turn.
 /// When the conversation exceeds this limit, only the most recent messages
 /// are included, with the cut point snapped forward to a genuine `Role::User`
 /// message to avoid splitting tool-call/result pairs.
 const MAX_CONTEXT_MESSAGES: usize = 40;
 
+/// Lower bound applied when the window is shrunk in response to token pressure.
+/// Keeps enough room for at least the current user prompt plus a tool round.
+const MIN_CONTEXT_MESSAGES: usize = 8;
+
 /// Minimum number of newly-dropped messages before re-compacting the summary.
 const COMPACTION_INTERVAL: usize = 20;
+
+/// Fraction of the model's prompt-token budget at which proactive compaction
+/// triggers. Checked against `LlmResponse.usage.input_tokens` after each
+/// successful LLM call.
+const COMPACTION_TOKEN_RATIO: f64 = 0.85;
 
 fn now_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -37,6 +46,7 @@ fn llm_messages_for_turn(
     tool_defs: &[ToolDefinition],
     deferred_namespaces: &[ToolNamespace],
     context_summary: &str,
+    max_messages: usize,
 ) -> Vec<Message> {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
 
@@ -93,7 +103,7 @@ fn llm_messages_for_turn(
     // Apply context windowing: if the conversation exceeds the limit, keep
     // only the most recent messages, snapping the cut point forward to a
     // genuine User message so we never split tool-call/result pairs.
-    let start = window_start(conversation_messages);
+    let start = window_start(conversation_messages, max_messages);
     let windowed = &conversation_messages[start..];
     let is_windowed = start > 0;
 
@@ -393,11 +403,12 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
 /// message — which the OpenAI API rejects with HTTP 400.  We prefer snapping
 /// to a `Role::User` boundary; when none exists (common in long agentic
 /// tool-calling loops) we skip past any leading Tool messages instead.
-fn window_start(messages: &[Message]) -> usize {
-    if messages.len() <= MAX_CONTEXT_MESSAGES {
+fn window_start(messages: &[Message], max_messages: usize) -> usize {
+    let max = max_messages.max(MIN_CONTEXT_MESSAGES);
+    if messages.len() <= max {
         return 0;
     }
-    let tentative = messages.len() - MAX_CONTEXT_MESSAGES;
+    let tentative = messages.len() - max;
     let search = &messages[tentative..];
     // Prefer starting on a User message to keep tool groups intact.
     if let Some(offset) = search.iter().position(|m| m.role == Role::User) {
@@ -414,8 +425,8 @@ fn window_start(messages: &[Message]) -> usize {
 /// Determine which message range (if any) should be compacted into the
 /// rolling context summary. Returns `Some((from, to))` when there are
 /// enough newly-dropped messages, or `None` otherwise.
-fn compaction_range(conv: &Conversation) -> Option<(usize, usize)> {
-    let start = window_start(&conv.messages);
+fn compaction_range(conv: &Conversation, max_messages: usize) -> Option<(usize, usize)> {
+    let start = window_start(&conv.messages, max_messages);
     if start == 0 {
         return None;
     }
@@ -423,8 +434,13 @@ fn compaction_range(conv: &Conversation) -> Option<(usize, usize)> {
     if conv.compacted_through == 0 {
         return Some((0, start));
     }
-    // Subsequent compactions: require COMPACTION_INTERVAL new messages.
-    if start >= conv.compacted_through + COMPACTION_INTERVAL {
+    // Subsequent compactions: require COMPACTION_INTERVAL new messages,
+    // OR any forward progress when the window has been shrunk below the
+    // default (so token-pressure triggers don't stall waiting for 20 more
+    // messages to accumulate).
+    if start >= conv.compacted_through + COMPACTION_INTERVAL
+        || (max_messages < MAX_CONTEXT_MESSAGES && start > conv.compacted_through)
+    {
         return Some((conv.compacted_through, start));
     }
     None
@@ -831,8 +847,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let is_first_message = conv.messages.is_empty();
         conv.messages.push(Message::new(Role::User, &prompt));
 
+        // Effective window size for this turn. May shrink further if the
+        // provider reports input-token usage above COMPACTION_TOKEN_RATIO.
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+
         // Run compaction if enough messages have been dropped by windowing.
-        if let Some((from, to)) = compaction_range(&conv) {
+        if let Some((from, to)) = compaction_range(&conv, target_window) {
             let summary = generate_context_summary(
                 &conv.context_summary,
                 &conv.messages[from..to],
@@ -912,6 +932,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 &tool_defs,
                 deferred_ns,
                 &conv.context_summary,
+                target_window,
             );
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
@@ -1001,6 +1022,47 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         return Ok(friendly);
                     }
                 };
+
+            // Token-pressure check: if the provider reports input tokens
+            // above COMPACTION_TOKEN_RATIO of its context window, shrink the
+            // effective message window and compact the newly-dropped range
+            // before building the next turn's prompt.
+            if let (Some(max_tokens), Some(usage)) =
+                (self.llm.max_context_tokens(), response.usage.as_ref())
+                && let Some(input_tokens) = usage.input_tokens
+            {
+                let threshold = (max_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
+                if input_tokens > threshold {
+                    let new_window = (target_window / 2).max(MIN_CONTEXT_MESSAGES);
+                    if new_window < target_window {
+                        tracing::info!(
+                            input_tokens,
+                            max_tokens,
+                            prev_window = target_window,
+                            new_window,
+                            "context pressure — shrinking window and compacting"
+                        );
+                        target_window = new_window;
+                        if let Some((from, to)) = compaction_range(&conv, target_window) {
+                            let summary = generate_context_summary(
+                                &conv.context_summary,
+                                &conv.messages[from..to],
+                                self.task_llm(),
+                            )
+                            .await;
+                            conv.context_summary = summary;
+                            conv.compacted_through = to;
+                        }
+                    } else {
+                        tracing::debug!(
+                            input_tokens,
+                            max_tokens,
+                            window = target_window,
+                            "context pressure with window already at minimum"
+                        );
+                    }
+                }
+            }
 
             if !response.has_tool_calls() {
                 // Hosted-search fallback: if the model returned text-only
@@ -1161,7 +1223,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 mod tests {
     use super::*;
     use crate::domain::{ToolCall, ToolDefinition};
-    use crate::ports::llm::LlmResponse;
+    use crate::ports::llm::{LlmResponse, TokenUsage};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -2476,7 +2538,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
         // System message + all 10 conversation messages
         assert_eq!(result.len(), 11);
         assert_eq!(result[0].role, Role::System);
@@ -2499,7 +2561,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
         // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
         // a User message (even index), so the window starts exactly there.
         // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
@@ -2532,7 +2594,7 @@ mod tests {
         msgs.push(Message::new(Role::User, "final-user"));
         msgs.push(Message::new(Role::Assistant, "final-reply"));
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
 
         // The first conversation message (after System) must be a User message.
         assert_eq!(result[0].role, Role::System);
@@ -2564,7 +2626,7 @@ mod tests {
         // Total = 1 + num_groups*2.  tentative = total - MAX_CONTEXT_MESSAGES.
         // The tentative index lands inside the tool groups.  If it happens to
         // land on a tool_result, the old code would start there (orphaned).
-        let start = window_start(&msgs);
+        let start = window_start(&msgs, MAX_CONTEXT_MESSAGES);
         assert_ne!(
             msgs[start].role,
             Role::Tool,
@@ -2581,7 +2643,7 @@ mod tests {
             conv.messages
                 .push(Message::new(Role::User, format!("msg-{i}")));
         }
-        assert!(compaction_range(&conv).is_none());
+        assert!(compaction_range(&conv, MAX_CONTEXT_MESSAGES).is_none());
     }
 
     #[test]
@@ -2597,7 +2659,7 @@ mod tests {
                     .push(Message::new(Role::Assistant, format!("asst-{i}")));
             }
         }
-        let range = compaction_range(&conv);
+        let range = compaction_range(&conv, MAX_CONTEXT_MESSAGES);
         assert!(range.is_some());
         let (from, to) = range.unwrap();
         assert_eq!(from, 0);
@@ -2619,11 +2681,11 @@ mod tests {
             }
         }
         // Simulate first compaction already done
-        let start = window_start(&conv.messages);
+        let start = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
         conv.compacted_through = start;
 
         // No new messages dropped beyond compacted_through → None
-        assert!(compaction_range(&conv).is_none());
+        assert!(compaction_range(&conv, MAX_CONTEXT_MESSAGES).is_none());
 
         // Add COMPACTION_INTERVAL more messages so window slides
         for i in 0..COMPACTION_INTERVAL {
@@ -2632,11 +2694,187 @@ mod tests {
             conv.messages
                 .push(Message::new(Role::Assistant, format!("extra-asst-{i}")));
         }
-        let range = compaction_range(&conv);
+        let range = compaction_range(&conv, MAX_CONTEXT_MESSAGES);
         assert!(range.is_some());
         let (from, to) = range.unwrap();
         assert_eq!(from, start);
         assert!(to > start);
+    }
+
+    #[test]
+    fn compaction_range_advances_on_shrunk_window_without_interval() {
+        // When the window has been shrunk below MAX_CONTEXT_MESSAGES (e.g.
+        // because the provider reported token pressure), any forward
+        // progress past `compacted_through` should re-trigger compaction —
+        // the interval guard only applies at the default window size.
+        let mut conv = Conversation::new("c1", "Test");
+        let count = MAX_CONTEXT_MESSAGES + 4;
+        for i in 0..count {
+            if i % 2 == 0 {
+                conv.messages
+                    .push(Message::new(Role::User, format!("user-{i}")));
+            } else {
+                conv.messages
+                    .push(Message::new(Role::Assistant, format!("asst-{i}")));
+            }
+        }
+        // Simulate the default-window compaction already ran.
+        conv.compacted_through = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+
+        // Shrinking the window pushes `start` past `compacted_through` but
+        // less than COMPACTION_INTERVAL messages of new progress — should
+        // still trigger because the window has been shrunk.
+        let shrunk = MAX_CONTEXT_MESSAGES / 2;
+        let range = compaction_range(&conv, shrunk);
+        assert!(
+            range.is_some(),
+            "shrunken window should trigger compaction on any forward progress"
+        );
+        let (from, to) = range.unwrap();
+        assert_eq!(from, conv.compacted_through);
+        assert!(to > from);
+    }
+
+    #[test]
+    fn window_start_honors_minimum_messages() {
+        // A pathologically small max should be clamped to MIN_CONTEXT_MESSAGES
+        // so we never serve fewer messages than the minimum.
+        let msgs: Vec<Message> = (0..30)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("u-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("a-{i}"))
+                }
+            })
+            .collect();
+        let start = window_start(&msgs, 2);
+        // With effective floor of MIN_CONTEXT_MESSAGES (=8), start should be
+        // around 30 - 8 = 22, snapped forward to a User boundary.
+        assert!(start >= 30 - MIN_CONTEXT_MESSAGES);
+        assert!(matches!(msgs[start].role, Role::User | Role::Assistant));
+    }
+
+    // --- Token-pressure compaction tests ---
+
+    /// Mock LLM that reports configurable token usage and a declared
+    /// `max_context_tokens`, used to drive the token-pressure path in
+    /// `send_prompt`.
+    struct TokenReportingLlm {
+        text: String,
+        input_tokens: u64,
+        max_context: Option<u64>,
+    }
+
+    impl LlmClient for TokenReportingLlm {
+        fn max_context_tokens(&self) -> Option<u64> {
+            self.max_context
+        }
+
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            on_chunk(self.text.clone());
+            let usage = TokenUsage {
+                input_tokens: Some(self.input_tokens),
+                output_tokens: Some(10),
+                ..Default::default()
+            };
+            Ok(LlmResponse::text(self.text.clone()).with_usage(usage))
+        }
+    }
+
+    #[tokio::test]
+    async fn send_prompt_shrinks_window_on_token_pressure() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            TokenReportingLlm {
+                text: "ok".into(),
+                input_tokens: 180_000, // 90% of 200K — above 85% threshold
+                max_context: Some(200_000),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        // Prime the conversation with enough messages to exceed the default
+        // window, so shrinking it triggers a new compaction range.
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for i in 0..(MAX_CONTEXT_MESSAGES + 20) {
+            if i % 2 == 0 {
+                stored
+                    .messages
+                    .push(Message::new(Role::User, format!("u-{i}")));
+            } else {
+                stored
+                    .messages
+                    .push(Message::new(Role::Assistant, format!("a-{i}")));
+            }
+        }
+        handler.store.update(stored).await.unwrap();
+
+        let before = handler.get_conversation(&conv.id).await.unwrap();
+        let baseline_compacted = before.compacted_through;
+
+        // Drive a turn that will receive high token usage and trigger
+        // the token-pressure shrink + compaction path.
+        handler
+            .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            after.compacted_through > baseline_compacted,
+            "token pressure should have advanced compacted_through"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_no_shrink_when_tokens_under_threshold() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            TokenReportingLlm {
+                text: "ok".into(),
+                input_tokens: 100_000, // 50% — below threshold
+                max_context: Some(200_000),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        // Small conversation: no windowing, no compaction expected.
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for _ in 0..5 {
+            stored.messages.push(Message::new(Role::User, "hi"));
+        }
+        handler.store.update(stored).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(
+            after.compacted_through, 0,
+            "no compaction expected when token usage is below threshold"
+        );
     }
 
     #[test]
@@ -2652,7 +2890,14 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "- User prefers dark mode");
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "- User prefers dark mode",
+            MAX_CONTEXT_MESSAGES,
+        );
 
         // System prompt, then summary system message, then windowed messages
         assert_eq!(result[0].role, Role::System);
@@ -2681,7 +2926,14 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "- Some summary");
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "- Some summary",
+            MAX_CONTEXT_MESSAGES,
+        );
 
         // No summary injected when under limit
         assert_eq!(result[0].role, Role::System);
@@ -2706,7 +2958,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
 
         // System prompt directly followed by windowed messages — no summary
         assert_eq!(result[0].role, Role::System);
@@ -2737,7 +2989,7 @@ mod tests {
             end_ordinal: 3,
         }];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
 
         // System + "start" + summary injection + "follow up" + "final" = 5
         assert_eq!(result.len(), 5);
@@ -2757,7 +3009,7 @@ mod tests {
             Message::new(Role::Assistant, "hello"),
         ];
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
         // System + 2 messages
         assert_eq!(result.len(), 3);
         assert_eq!(result[1].content, "hi");
@@ -2795,7 +3047,7 @@ mod tests {
             },
         ];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "");
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
         // System + "start" + summary1 + "middle" + summary2 + "end" = 6
         assert_eq!(result.len(), 6);
         assert!(result[2].content.contains("First batch."));
