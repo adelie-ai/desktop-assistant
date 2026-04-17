@@ -479,6 +479,29 @@ fn apply_stream_event(
     true
 }
 
+/// Parse a Bedrock validation-error message of the form
+/// `"prompt is too long: 203524 tokens > 200000 maximum"` into its
+/// numeric components. Returns `None` if the message doesn't match.
+///
+/// Used to map prompt-overflow errors into `CoreError::ContextOverflow`
+/// so the core service can truncate the offending tool result and retry
+/// rather than surfacing a hard failure.
+pub fn parse_prompt_too_long(message: &str) -> Option<(u64, u64)> {
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("prompt is too long") {
+        return None;
+    }
+    let nums: Vec<u64> = message
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    match nums.as_slice() {
+        [prompt, max, ..] => Some((*prompt, *max)),
+        _ => None,
+    }
+}
+
 /// Return the prompt-token context window for a known Bedrock model ID.
 ///
 /// Accepts cross-region inference-profile prefixes (`us.`, `eu.`, `apac.`).
@@ -569,6 +592,24 @@ impl LlmClient for BedrockClient {
 
         let response = request.send().await.map_err(|e| {
             use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+            // Detect prompt-overflow validation errors and surface them as
+            // CoreError::ContextOverflow so the core service can truncate
+            // the offending tool result and retry.
+            if let Some(ConverseStreamError::ValidationException(ve)) = e.as_service_error() {
+                let raw = ve.message().unwrap_or("unknown");
+                if let Some((prompt_tokens, max_tokens)) = parse_prompt_too_long(raw) {
+                    tracing::warn!(
+                        prompt_tokens,
+                        max_tokens,
+                        "Bedrock rejected request for context overflow"
+                    );
+                    return CoreError::ContextOverflow {
+                        prompt_tokens: Some(prompt_tokens),
+                        max_tokens: Some(max_tokens),
+                        detail: format!("Bedrock validation error: {raw}"),
+                    };
+                }
+            }
             let detail = match e.as_service_error() {
                 Some(ConverseStreamError::ValidationException(ve)) => {
                     format!("validation error: {}", ve.message().unwrap_or("unknown"))
@@ -719,6 +760,33 @@ mod tests {
     fn context_limit_unknown_model_returns_none() {
         assert_eq!(context_limit_for_model("amazon.nova-pro-v1:0"), None);
         assert_eq!(context_limit_for_model("meta.llama3-70b"), None);
+    }
+
+    #[test]
+    fn parse_prompt_too_long_extracts_counts() {
+        assert_eq!(
+            parse_prompt_too_long("prompt is too long: 203524 tokens > 200000 maximum"),
+            Some((203_524, 200_000))
+        );
+    }
+
+    #[test]
+    fn parse_prompt_too_long_case_insensitive_phrase() {
+        assert_eq!(
+            parse_prompt_too_long("Prompt Is Too Long: 250000 tokens > 200000 maximum"),
+            Some((250_000, 200_000))
+        );
+    }
+
+    #[test]
+    fn parse_prompt_too_long_rejects_unrelated_message() {
+        assert_eq!(parse_prompt_too_long("model not ready"), None);
+        assert_eq!(parse_prompt_too_long("bad token 12345 in request"), None);
+    }
+
+    #[test]
+    fn parse_prompt_too_long_handles_message_without_numbers() {
+        assert_eq!(parse_prompt_too_long("prompt is too long"), None);
     }
 
     #[test]

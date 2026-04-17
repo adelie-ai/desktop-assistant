@@ -30,6 +30,32 @@ const COMPACTION_INTERVAL: usize = 20;
 /// successful LLM call.
 const COMPACTION_TOKEN_RATIO: f64 = 0.85;
 
+/// Maximum number of `CoreError::ContextOverflow` recoveries allowed within
+/// a single `send_prompt` call. Each recovery truncates one oversized tool
+/// result; if three successive calls still overflow, we surface the error
+/// rather than loop.
+const MAX_OVERFLOW_RETRIES: u32 = 3;
+
+/// Build the replacement content used when a tool result is truncated in
+/// response to a `ContextOverflow` error. The text is addressed to the
+/// model so it learns to chunk subsequent requests more narrowly.
+fn overflow_truncation_notice(
+    original_bytes: usize,
+    prompt_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+) -> String {
+    let measured = match (prompt_tokens, max_tokens) {
+        (Some(p), Some(m)) => format!(" (prompt was {p} tokens vs {m} max)"),
+        _ => String::new(),
+    };
+    format!(
+        "<tool output omitted: {original_bytes} bytes exceeded the model's \
+         context window{measured}. Re-run the tool with a narrower request — \
+         for example read the file in smaller byte/line ranges, list a single \
+         directory level with filters, or query for only the fields you need.>"
+    )
+}
+
 fn now_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -851,6 +877,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // provider reports input-token usage above COMPACTION_TOKEN_RATIO.
         let mut target_window = MAX_CONTEXT_MESSAGES;
 
+        // Count of in-turn ContextOverflow recoveries. Bounded so a
+        // persistently-oversized request doesn't loop indefinitely.
+        let mut overflow_retries: u32 = 0;
+
         // Run compaction if enough messages have been dropped by windowing.
         if let Some((from, to)) = compaction_range(&conv, target_window) {
             let summary = generate_context_summary(
@@ -976,6 +1006,66 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         .await
                 } {
                     Ok(r) => r,
+                    Err(CoreError::ContextOverflow {
+                        prompt_tokens,
+                        max_tokens,
+                        detail,
+                    }) if overflow_retries < MAX_OVERFLOW_RETRIES => {
+                        // The provider rejected this turn's prompt for
+                        // exceeding its context window. Locate the most
+                        // recent tool result (the usual culprit — a large
+                        // file read or directory listing) and replace its
+                        // content with a chunking hint, preserving the
+                        // tool_call/tool_result pair so the model sees
+                        // what it tried.
+                        overflow_retries += 1;
+                        // Pick the largest remaining tool result. This
+                        // naturally targets the biggest bloat first, and
+                        // after truncation the notice is small enough that
+                        // subsequent retries will pick a different message.
+                        if let Some(idx) = conv
+                            .messages
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, m)| m.role == Role::Tool)
+                            .max_by_key(|(_, m)| m.content.len())
+                            .map(|(i, _)| i)
+                        {
+                            let original_bytes = conv.messages[idx].content.len();
+                            let notice = overflow_truncation_notice(
+                                original_bytes,
+                                prompt_tokens,
+                                max_tokens,
+                            );
+                            tracing::warn!(
+                                attempt = overflow_retries,
+                                max_attempts = MAX_OVERFLOW_RETRIES,
+                                tool_result_index = idx,
+                                original_bytes,
+                                prompt_tokens = ?prompt_tokens,
+                                max_tokens = ?max_tokens,
+                                "context overflow — truncating last tool result and retrying"
+                            );
+                            conv.messages[idx].content = notice;
+                            on_chunk = Box::new(|_| true);
+                            continue;
+                        }
+
+                        // No tool result to truncate — fall through to the
+                        // legacy trim path by re-wrapping as a plain LLM
+                        // error. This is rare (e.g. an oversized initial
+                        // user prompt on round 0).
+                        tracing::warn!(
+                            "context overflow with no tool result to truncate — \
+                             falling back to generic trim path"
+                        );
+                        let e = CoreError::Llm(detail);
+                        let friendly = user_visible_llm_error_message(&e);
+                        conv.messages.push(Message::new(Role::Assistant, &friendly));
+                        conv.updated_at = now_timestamp();
+                        self.store.update(conv).await?;
+                        return Ok(friendly);
+                    }
                     Err(e)
                         if round > 0
                             && !is_retryable_error(&e)
@@ -1225,6 +1315,7 @@ mod tests {
     use crate::domain::{ToolCall, ToolDefinition};
     use crate::ports::llm::{LlmResponse, TokenUsage};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     // --- Mock Store ---
@@ -2874,6 +2965,196 @@ mod tests {
         assert_eq!(
             after.compacted_through, 0,
             "no compaction expected when token usage is below threshold"
+        );
+    }
+
+    // --- Overflow-recovery tests ---
+
+    #[test]
+    fn overflow_truncation_notice_includes_byte_count_and_hint() {
+        let notice = overflow_truncation_notice(12_345, Some(203_524), Some(200_000));
+        assert!(notice.contains("12345 bytes"));
+        assert!(notice.contains("203524"));
+        assert!(notice.contains("200000"));
+        assert!(notice.contains("narrower") || notice.contains("chunk") || notice.contains("smaller"));
+    }
+
+    #[test]
+    fn overflow_truncation_notice_omits_counts_when_unknown() {
+        let notice = overflow_truncation_notice(500, None, None);
+        assert!(notice.contains("500 bytes"));
+        assert!(!notice.contains("prompt was"));
+    }
+
+    /// LLM that returns `ContextOverflow` for a configurable number of
+    /// calls before succeeding. Tracks call count so tests can assert on it.
+    struct OverflowThenSucceedLlm {
+        remaining_overflows: Mutex<u32>,
+        call_count: Arc<AtomicU32>,
+        ok_text: String,
+    }
+
+    impl LlmClient for OverflowThenSucceedLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let mut remaining = self.remaining_overflows.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(CoreError::ContextOverflow {
+                    prompt_tokens: Some(203_524),
+                    max_tokens: Some(200_000),
+                    detail: "Bedrock validation error: prompt is too long".into(),
+                });
+            }
+            drop(remaining);
+            on_chunk(self.ok_text.clone());
+            Ok(LlmResponse::text(self.ok_text.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_truncates_largest_tool_result_and_retries() {
+        use std::sync::atomic::AtomicU64;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let llm = OverflowThenSucceedLlm {
+            remaining_overflows: Mutex::new(1),
+            call_count: Arc::clone(&call_count),
+            ok_text: "all done".into(),
+        };
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            llm,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        // Prime the conversation with two tool results of different sizes
+        // so we can verify the largest is the one that gets truncated.
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        stored
+            .messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c1", "small", "{}",
+            )]));
+        stored
+            .messages
+            .push(Message::tool_result("c1", "tiny result"));
+        let big_content = "X".repeat(5_000);
+        stored
+            .messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c2", "big", "{}",
+            )]));
+        stored.messages.push(Message::tool_result("c2", &big_content));
+        handler.store.update(stored).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "what happened?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        assert_eq!(result, "all done");
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            2,
+            "expected one overflow + one retry"
+        );
+
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        // Small result is preserved verbatim.
+        let small = after
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("small tool result present");
+        assert_eq!(small.content, "tiny result");
+        // Large result was replaced with a truncation notice.
+        let big = after
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c2"))
+            .expect("big tool result present");
+        assert!(
+            big.content.starts_with("<tool output omitted"),
+            "expected truncation notice, got: {:?}",
+            &big.content
+        );
+        assert!(big.content.contains("5000 bytes"));
+    }
+
+    #[tokio::test]
+    async fn overflow_bounded_retries_surface_error() {
+        // LLM that always returns ContextOverflow. We should stop after
+        // MAX_OVERFLOW_RETRIES and return a user-visible error rather
+        // than loop forever.
+        struct AlwaysOverflowLlm {
+            call_count: Arc<AtomicU32>,
+        }
+        impl LlmClient for AlwaysOverflowLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                self.call_count.fetch_add(1, Ordering::Relaxed);
+                Err(CoreError::ContextOverflow {
+                    prompt_tokens: Some(300_000),
+                    max_tokens: Some(200_000),
+                    detail: "prompt is too long".into(),
+                })
+            }
+        }
+
+        use std::sync::atomic::AtomicU64;
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            AlwaysOverflowLlm {
+                call_count: Arc::clone(&call_count),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        stored
+            .messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c1", "t", "{}",
+            )]));
+        stored
+            .messages
+            .push(Message::tool_result("c1", "x".repeat(10_000)));
+        handler.store.update(stored).await.unwrap();
+
+        // Returns Ok with a user-visible error message rather than propagating.
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert!(result.to_ascii_lowercase().contains("context"));
+
+        // MAX_OVERFLOW_RETRIES + 1 calls total: the attempts that were
+        // recovered, plus the final one whose error is surfaced.
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            MAX_OVERFLOW_RETRIES + 1,
+            "should stop after bounded retries"
         );
     }
 
