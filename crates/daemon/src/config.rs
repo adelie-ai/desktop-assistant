@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::connections::{
     ConnectionConfig, ConnectionId, ConnectionsError, ConnectionsMap, connection_from_legacy_llm,
 };
+use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DaemonConfig {
@@ -40,11 +41,19 @@ pub struct DaemonConfig {
     pub persistence: PersistenceConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
-    /// Backend-tasks (dreaming / titling) overrides. The legacy `llm` field is
-    /// preserved as-is through migration; #10 will reshape it into purpose
-    /// configs that reference `connections` by id.
+    /// Backend-tasks (dreaming / titling) overrides. The legacy `llm` field
+    /// is reshaped into `[purposes]` during migration; see
+    /// [`maybe_migrate_legacy_purposes`]. Consumers that still read
+    /// `backend_tasks.llm` will see `None` after migration and fall back to
+    /// the primary LLM — #11 rewires dispatch to consult `[purposes]`.
     #[serde(default)]
     pub backend_tasks: BackendTasksConfig,
+    /// Per-purpose LLM configs (issue #10). Each purpose picks a connection
+    /// + model (possibly inherited from `interactive`) and an optional effort
+    /// level. Empty on fresh installs; synthesized by migration when a legacy
+    /// `[llm]` / `[backend_tasks.llm]` pair is present.
+    #[serde(default, skip_serializing_if = "Purposes::is_empty")]
+    pub purposes: Purposes,
     #[serde(default)]
     pub profiling: ProfilingConfig,
     #[serde(default)]
@@ -533,6 +542,13 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
 
     let parsed: DaemonConfig = toml::from_str(&content)?;
     let explicit_connections_table = file_has_top_level_table(&content, "connections");
+    let explicit_purposes_table = file_has_top_level_table(&content, "purposes");
+    // Purpose migration runs only when the file is in a legacy shape:
+    // either `[llm]` (pre-#8) or `[backend_tasks.llm]` (pre-#10) is present.
+    // Pure new-format configs (connections + no legacy markers) are left alone
+    // so first-run users are not forced to accept synthesized purposes.
+    let legacy_shape_present = file_has_top_level_table(&content, "llm")
+        || file_has_top_level_table(&content, "backend_tasks.llm");
     let parsed = maybe_migrate_legacy_connections(path, parsed, &content)?;
 
     // Validate `[connections]` *after* migration so legacy-only configs still
@@ -547,6 +563,25 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
             .validated_connections()
             .with_context(|| format!("invalid [connections] in {}", path.display()))?;
     }
+
+    // Purpose migration runs after connection migration so it can reference
+    // the synthesized `[connections.default]`. It also rewrites the config
+    // file on first contact — only when a legacy shape was present and no
+    // `[purposes]` table has been authored yet.
+    let parsed = maybe_migrate_legacy_purposes(
+        path,
+        parsed,
+        explicit_purposes_table,
+        legacy_shape_present,
+    )?;
+
+    // Validate purposes: structural checks (interactive required when set,
+    // no `Primary` in interactive) happen here so misconfigurations surface
+    // at startup rather than at the first dispatch.
+    parsed
+        .purposes
+        .validate()
+        .with_context(|| format!("invalid [purposes] in {}", path.display()))?;
 
     Ok(Some(parsed))
 }
@@ -614,6 +649,202 @@ fn maybe_migrate_legacy_connections(
     })?;
 
     Ok(parsed)
+}
+
+/// Synthesize a `[purposes]` block from legacy `[llm]` / `[backend_tasks.llm]`
+/// when migrating an older config.
+///
+/// Trigger conditions (all must hold):
+/// - `parsed.purposes` is empty (`Purposes::default()`).
+/// - The file does not already have an explicit `[purposes]` table (even an
+///   empty one — treating an explicit empty table as "user authored, don't
+///   touch" matches how `[connections]` is handled).
+/// - At least one connection exists (either from prior migration or from an
+///   author-written `[connections]` table). Without any connection we cannot
+///   produce a valid interactive purpose.
+///
+/// Synthesis rules:
+/// - `interactive`: reference the first connection in declaration order.
+///   Model is taken from legacy `[llm].model` if set, otherwise connector
+///   defaults at dispatch time — represented here as the legacy value or
+///   `"primary"` (which we cannot use for interactive). We therefore fall
+///   back to the connector-default model name when no explicit model was
+///   configured, so the resolved purpose always has a concrete model.
+/// - `dreaming`, `titling`, `embedding`: if `[backend_tasks.llm]` is set and
+///   targets a different connector than `[llm]`, we synthesize an additional
+///   connection (`backend`) using [`connection_from_legacy_llm`] and point
+///   these purposes at it. Otherwise they inherit via `connection = "primary"`
+///   and the backend-tasks model is used for dreaming/titling (or `"primary"`
+///   when no backend-tasks model was set).
+///
+/// Post-migration, `backend_tasks.llm` is cleared in-memory (it will not
+/// serialize). Other `[backend_tasks]` fields (dreaming_enabled, intervals,
+/// archive_after_days) are preserved verbatim.
+fn maybe_migrate_legacy_purposes(
+    path: &Path,
+    mut parsed: DaemonConfig,
+    explicit_purposes_table: bool,
+    legacy_shape_present: bool,
+) -> anyhow::Result<DaemonConfig> {
+    if !parsed.purposes.is_empty() || explicit_purposes_table {
+        return Ok(parsed);
+    }
+    if !legacy_shape_present {
+        // New-format config with no legacy markers and no `[purposes]` yet.
+        // Leave it untouched — first-run users configure purposes explicitly
+        // (either through the settings API or by editing TOML directly).
+        return Ok(parsed);
+    }
+    if parsed.connections.is_empty() {
+        // Legacy shape but no connections resulted from migration. Cannot
+        // produce a valid interactive purpose without at least one; skip.
+        return Ok(parsed);
+    }
+
+    // Pick interactive's connection: prefer `default` (the name #8's migration
+    // assigns), else the first declared connection.
+    let interactive_conn_id = if parsed.connections.contains_key("default") {
+        "default".to_string()
+    } else {
+        parsed
+            .connections
+            .keys()
+            .next()
+            .cloned()
+            .expect("connections non-empty")
+    };
+    let interactive_conn = ConnectionId::new(interactive_conn_id.clone())
+        .with_context(|| {
+            format!(
+                "cannot migrate purposes: connection id {interactive_conn_id:?} is invalid"
+            )
+        })?;
+
+    // Model for interactive: take from [llm].model, else use the connector's
+    // built-in default so the resolved purpose always has a concrete model.
+    let interactive_model = parsed
+        .llm
+        .model
+        .clone()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_llm_model(&parsed.llm.connector));
+
+    tracing::warn!(
+        "daemon config at {} has no `[purposes]` block; \
+         synthesizing one from legacy `[llm]`/`[backend_tasks.llm]` \
+         (one-time; future releases drop the compatibility shims)",
+        path.display()
+    );
+
+    // Decide how to handle backend tasks (dreaming / titling / embedding).
+    //
+    // Case A: `[backend_tasks.llm]` is absent → everything inherits via
+    //         `connection = "primary"`, `model = "primary"`.
+    // Case B: `[backend_tasks.llm]` matches the primary connector → use the
+    //         `primary` connection but pin dreaming/titling to the backend
+    //         model if it was set.
+    // Case C: `[backend_tasks.llm]` targets a different connector → synthesize
+    //         a second connection (`backend`, with a suffix if taken) and
+    //         point dreaming/titling/embedding at it.
+    let bt_llm_ref = parsed.backend_tasks.llm.as_ref();
+    let primary_connector = parsed.llm.connector.trim().to_ascii_lowercase();
+
+    let (backend_conn_ref, backend_model_opt) = if let Some(bt_llm) = bt_llm_ref {
+        let bt_connector = bt_llm.connector.trim().to_ascii_lowercase();
+        let bt_model = bt_llm.model.clone().filter(|v| !v.trim().is_empty());
+
+        if bt_connector.is_empty() || bt_connector == primary_connector {
+            // Case B: same connector as primary — share the connection.
+            (ConnectionRef::Primary, bt_model)
+        } else {
+            // Case C: different connector. Synthesize a new connection.
+            let synthesized = connection_from_legacy_llm(bt_llm);
+            let backend_id = pick_free_connection_id(&parsed.connections, "backend");
+            parsed
+                .connections
+                .insert(backend_id.clone(), synthesized);
+            let id = ConnectionId::new(backend_id).expect("pick_free returns a valid slug");
+            (ConnectionRef::Named(id), bt_model)
+        }
+    } else {
+        // Case A.
+        (ConnectionRef::Primary, None)
+    };
+
+    // Build the purposes set.
+    parsed.purposes.interactive = Some(PurposeConfig {
+        connection: ConnectionRef::Named(interactive_conn),
+        model: ModelRef::Named(interactive_model),
+        effort: None,
+    });
+
+    let dreaming_model = match (&backend_conn_ref, &backend_model_opt) {
+        (ConnectionRef::Primary, Some(m)) => ModelRef::Named(m.clone()),
+        (ConnectionRef::Primary, None) => ModelRef::Primary,
+        (ConnectionRef::Named(_), Some(m)) => ModelRef::Named(m.clone()),
+        (ConnectionRef::Named(_), None) => {
+            // Different connector but no explicit model — fall back to the
+            // connector default so the resolved purpose is concrete.
+            let bt_connector = bt_llm_ref
+                .map(|l| l.connector.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| primary_connector.clone());
+            ModelRef::Named(default_backend_llm_model(&bt_connector))
+        }
+    };
+
+    parsed.purposes.dreaming = Some(PurposeConfig {
+        connection: backend_conn_ref.clone(),
+        model: dreaming_model.clone(),
+        effort: None,
+    });
+    parsed.purposes.titling = Some(PurposeConfig {
+        connection: backend_conn_ref,
+        model: dreaming_model,
+        effort: None,
+    });
+    // Embeddings always inherit from the primary connection: the embedding
+    // model lives in `[embeddings]`, not in `backend_tasks.llm`, so there is
+    // nothing connector-specific to carry over. Users with a dedicated
+    // embeddings connector keep their `[embeddings]` config unchanged.
+    parsed.purposes.embedding = Some(PurposeConfig {
+        connection: ConnectionRef::Primary,
+        model: ModelRef::Primary,
+        effort: None,
+    });
+
+    // Drop `backend_tasks.llm` from the serialized shape. The field remains
+    // in memory so existing consumers (main.rs, settings views) can still
+    // read it as `None` and fall back to the primary LLM — that fallback is
+    // already their documented behavior.
+    parsed.backend_tasks.llm = None;
+
+    save_daemon_config(path, &parsed).with_context(|| {
+        format!(
+            "failed to rewrite purpose-migrated daemon config at {}",
+            path.display()
+        )
+    })?;
+
+    Ok(parsed)
+}
+
+/// Find a `ConnectionId`-valid slug that is not already in use. Starts with
+/// `base` (e.g. `backend`) and appends `_2`, `_3`, ... as needed.
+fn pick_free_connection_id(
+    existing: &IndexMap<String, ConnectionConfig>,
+    base: &str,
+) -> String {
+    if !existing.contains_key(base) {
+        return base.to_string();
+    }
+    for n in 2..=u32::MAX {
+        let candidate = format!("{base}_{n}");
+        if !existing.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    // Effectively unreachable.
+    format!("{base}_{}", u32::MAX)
 }
 
 /// Pick a backup path: prefer `<path>.bak`, falling back to `<path>.bak.2`,
@@ -2759,14 +2990,78 @@ connector = "openai"
     }
 
     #[test]
-    fn migration_preserves_backend_tasks_llm_as_is() {
-        // Per issue scope: #10 will reshape `backend_tasks.llm`. For #8 we just
-        // preserve it verbatim so that a #10 migration can pick it up later.
-        let dir = unique_test_dir("da-test-backend-tasks-preserve");
+    fn migration_reshapes_backend_tasks_llm_into_purposes_same_connector() {
+        // Issue #10: when `[backend_tasks.llm]` uses the same connector as
+        // `[llm]`, it does not need a new connection — purposes inherit the
+        // primary connection and pin their model to the backend-tasks model.
+        let dir = unique_test_dir("da-test-bt-llm-same-connector");
         let path = dir.join("daemon.toml");
         let legacy = r#"[llm]
 connector = "openai"
 api_key_env = "OPENAI_API_KEY"
+model = "gpt-5.4"
+
+[backend_tasks]
+dreaming_enabled = true
+
+[backend_tasks.llm]
+connector = "openai"
+model = "gpt-4o-mini"
+"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        // `backend_tasks.llm` has been absorbed into `[purposes]` and removed.
+        assert!(loaded.backend_tasks.llm.is_none());
+        assert!(loaded.backend_tasks.dreaming_enabled);
+
+        // Exactly one connection: the primary synthesized by #8's migration.
+        assert_eq!(loaded.connections.len(), 1);
+        assert!(loaded.connections.contains_key("default"));
+
+        // Interactive → default connection, primary model preserved.
+        let interactive = loaded.purposes.interactive.as_ref().expect("interactive");
+        assert_eq!(interactive.connection.to_string(), "default");
+        assert_eq!(interactive.model.to_string(), "gpt-5.4");
+
+        // Dreaming/titling → primary connection, backend model.
+        let dreaming = loaded.purposes.dreaming.as_ref().expect("dreaming");
+        assert_eq!(dreaming.connection.to_string(), "primary");
+        assert_eq!(dreaming.model.to_string(), "gpt-4o-mini");
+        let titling = loaded.purposes.titling.as_ref().expect("titling");
+        assert_eq!(titling.connection.to_string(), "primary");
+        assert_eq!(titling.model.to_string(), "gpt-4o-mini");
+
+        // Embedding always inherits both (the legacy `[llm]` didn't carry an
+        // embedding model — that lives in `[embeddings]`, untouched here).
+        let embedding = loaded.purposes.embedding.as_ref().expect("embedding");
+        assert_eq!(embedding.connection.to_string(), "primary");
+        assert_eq!(embedding.model.to_string(), "primary");
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !rewritten.contains("[backend_tasks.llm]"),
+            "backend_tasks.llm should be dropped after migration: {rewritten}"
+        );
+        assert!(rewritten.contains("[purposes.interactive]"));
+        assert!(rewritten.contains("[purposes.dreaming]"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_reshapes_backend_tasks_llm_into_purposes_different_connector() {
+        // When `[backend_tasks.llm]` uses a *different* connector than
+        // `[llm]`, we must synthesize a second connection so both work
+        // concurrently. The new connection is named `backend` (or
+        // `backend_N` if taken) and owns the backend-tasks credentials.
+        let dir = unique_test_dir("da-test-bt-llm-diff-connector");
+        let path = dir.join("daemon.toml");
+        let legacy = r#"[llm]
+connector = "openai"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-5.4"
 
 [backend_tasks]
 dreaming_enabled = true
@@ -2778,25 +3073,79 @@ model = "claude-haiku-4-5-20251001"
         std::fs::write(&path, legacy).unwrap();
 
         let loaded = load_daemon_config(&path).unwrap().unwrap();
-        let bt_llm = loaded.backend_tasks.llm.as_ref().expect("bt.llm preserved");
-        assert_eq!(bt_llm.connector, "anthropic");
-        assert_eq!(bt_llm.model.as_deref(), Some("claude-haiku-4-5-20251001"));
-        assert!(loaded.backend_tasks.dreaming_enabled);
 
-        // The rewritten file should still contain both `[backend_tasks]` and
-        // `[backend_tasks.llm]`, unchanged in shape.
-        let rewritten = std::fs::read_to_string(&path).unwrap();
-        assert!(rewritten.contains("[backend_tasks.llm]"));
-        assert!(rewritten.contains("connector = \"anthropic\""));
+        assert!(loaded.backend_tasks.llm.is_none());
+        assert_eq!(loaded.connections.len(), 2);
+        assert!(loaded.connections.contains_key("default"));
+        assert!(loaded.connections.contains_key("backend"));
+        assert_eq!(
+            loaded.connections.get("backend").unwrap().connector_type(),
+            "anthropic"
+        );
+
+        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        assert_eq!(interactive.connection.to_string(), "default");
+        assert_eq!(interactive.model.to_string(), "gpt-5.4");
+
+        // Dreaming/titling → named `backend`, with the backend model.
+        let dreaming = loaded.purposes.dreaming.as_ref().unwrap();
+        assert_eq!(dreaming.connection.to_string(), "backend");
+        assert_eq!(dreaming.model.to_string(), "claude-haiku-4-5-20251001");
+        let titling = loaded.purposes.titling.as_ref().unwrap();
+        assert_eq!(titling.connection.to_string(), "backend");
+
+        // Embedding → always `primary`/`primary`, because embedding models
+        // live in `[embeddings]`, not in `backend_tasks.llm`. Users with a
+        // cross-connector embeddings config keep that config; the purpose
+        // entry is just there so #11 has a uniform lookup point.
+        let embedding = loaded.purposes.embedding.as_ref().unwrap();
+        assert_eq!(embedding.connection.to_string(), "primary");
+        assert_eq!(embedding.model.to_string(), "primary");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn migration_skipped_when_connections_already_present() {
+    fn migration_reshapes_absent_backend_tasks_llm_to_primary() {
+        // Legacy `[llm]` alone (no `[backend_tasks.llm]`) still synthesizes
+        // purposes — dreaming/titling/embedding inherit everything via
+        // `"primary"` since there is no per-backend override to honour.
+        let dir = unique_test_dir("da-test-bt-llm-absent");
+        let path = dir.join("daemon.toml");
+        let legacy = r#"[llm]
+connector = "openai"
+api_key_env = "OPENAI_API_KEY"
+"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        assert_eq!(loaded.connections.len(), 1);
+
+        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        assert_eq!(interactive.connection.to_string(), "default");
+        // Model falls back to the connector default when none was set.
+        assert_eq!(interactive.model.to_string(), "gpt-5.4");
+
+        for p in [
+            loaded.purposes.dreaming.as_ref().unwrap(),
+            loaded.purposes.titling.as_ref().unwrap(),
+            loaded.purposes.embedding.as_ref().unwrap(),
+        ] {
+            assert_eq!(p.connection.to_string(), "primary");
+            assert_eq!(p.model.to_string(), "primary");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn connection_migration_skipped_when_connections_already_present() {
         // Hybrid config (both `[llm]` and `[connections]`) must not trigger
-        // migration, because doing so would silently overwrite user-authored
-        // connections.
+        // the connection-synthesis step, because doing so would silently
+        // overwrite user-authored connections. Purpose synthesis (#10)
+        // still runs because the legacy `[llm]` marker is present and no
+        // `[purposes]` table has been authored — interactive is pinned to
+        // the first user-authored connection, not a new `default`.
         let dir = unique_test_dir("da-test-hybrid-skip");
         let path = dir.join("daemon.toml");
         let content = r#"[llm]
@@ -2809,13 +3158,75 @@ api_key_env = "OPENAI_WORK_KEY"
         std::fs::write(&path, content).unwrap();
 
         let loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        // Connections untouched.
         assert_eq!(loaded.connections.len(), 1);
         assert!(loaded.connections.contains_key("work"));
+        // No backup because connection migration was the only thing that
+        // writes .bak; purpose migration rewrites the file in place.
         assert!(!dir.join("daemon.toml.bak").exists());
 
-        // File untouched.
+        // Purposes synthesized, pointing at the user-authored connection.
+        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        assert_eq!(interactive.connection.to_string(), "work");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purpose_migration_skipped_when_purposes_already_present() {
+        // If the user already authored a `[purposes]` block, respect it.
+        let dir = unique_test_dir("da-test-purposes-respected");
+        let path = dir.join("daemon.toml");
+        let content = r#"[connections.work]
+type = "openai"
+api_key_env = "OPENAI_WORK_KEY"
+
+[purposes.interactive]
+connection = "work"
+model = "gpt-5.4"
+effort = "high"
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        assert_eq!(interactive.effort, Some(crate::purposes::Effort::High));
+        // No other purposes synthesized.
+        assert!(loaded.purposes.dreaming.is_none());
+
+        // File unchanged (no legacy shape, no purpose migration).
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk, content);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_golden_file_purposes_anthropic_backend() {
+        // Golden-file test for the purpose-migration shape when
+        // `[backend_tasks.llm]` targets a different connector than `[llm]`.
+        // Exercises: new `backend` connection synthesis, dreaming/titling
+        // pointed at it, backend_tasks.llm removed from serialized form.
+        let legacy = include_str!(
+            "../tests/fixtures/purposes_migration/legacy_anthropic_backend.toml"
+        );
+        let expected_new = include_str!(
+            "../tests/fixtures/purposes_migration/migrated_anthropic_backend.toml"
+        );
+
+        let dir = unique_test_dir("da-test-golden-purposes");
+        let path = dir.join("daemon.toml");
+        std::fs::write(&path, legacy).unwrap();
+
+        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+        let actual = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            actual.trim_end(),
+            expected_new.trim_end(),
+            "migrated form differs from golden fixture.\n--- actual ---\n{actual}\n--- expected ---\n{expected_new}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

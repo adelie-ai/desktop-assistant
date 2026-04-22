@@ -1,0 +1,15 @@
+[llm]
+connector = "openai"
+model = "gpt-5.4"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[backend_tasks]
+dreaming_enabled = true
+dreaming_interval_secs = 3600
+archive_after_days = 7
+
+[backend_tasks.llm]
+connector = "anthropic"
+model = "claude-haiku-4-5-20251001"
+base_url = "https://api.anthropic.com"

@@ -1,27 +1,17 @@
 [llm]
 connector = "openai"
-model = "gpt-4o-mini"
+model = "gpt-5.4"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
-
-[llm.secret]
-backend = "keyring"
-service = "org.desktopAssistant"
-account = "openai_api_key"
-wallet = "kdewallet"
-folder = "desktop-assistant"
 
 [connections.default]
 type = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 
-[connections.default.secret]
-backend = "keyring"
-service = "org.desktopAssistant"
-account = "openai_api_key"
-wallet = "kdewallet"
-folder = "desktop-assistant"
+[connections.backend]
+type = "anthropic"
+base_url = "https://api.anthropic.com"
 
 [embeddings]
 
@@ -40,19 +30,19 @@ archive_after_days = 7
 
 [purposes.interactive]
 connection = "default"
-model = "gpt-4o-mini"
+model = "gpt-5.4"
 
 [purposes.dreaming]
-connection = "primary"
-model = "primary"
+connection = "backend"
+model = "claude-haiku-4-5-20251001"
 
 [purposes.embedding]
 connection = "primary"
 model = "primary"
 
 [purposes.titling]
-connection = "primary"
-model = "primary"
+connection = "backend"
+model = "claude-haiku-4-5-20251001"
 
 [profiling]
 enabled = false
