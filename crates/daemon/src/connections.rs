@@ -13,10 +13,11 @@
 //! This module is intentionally schema-only: migration lives in
 //! [`super::config`] so it can share I/O helpers with the wider config layer.
 //!
-//! Several public helpers here (the `ConnectionsMap` accessors, the
-//! `connector_type` shortcut) are unused at the daemon binary call sites
-//! today; #9 wires them into `build_llm_client`. `#[allow(dead_code)]`
-//! suppresses warnings until then so the module can be reviewed on its own.
+//! The `ConnectionsMap` accessors and the `connector_type` shortcut are wired
+//! into the registry (`crates/daemon/src/registry.rs`) under #9; a few
+//! accessors remain exposed for symmetry even though no call site uses them
+//! yet, so `#[allow(dead_code)]` stays on this module until #11 consumes
+//! them.
 #![allow(dead_code)]
 
 use std::fmt;

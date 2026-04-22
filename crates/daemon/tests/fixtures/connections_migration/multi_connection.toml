@@ -1,0 +1,34 @@
+# Golden fixture for issue #9 registry build.
+#
+# Exercises the three connector shapes that don't need live credentials or
+# network access at build time:
+#   - Ollama (only needs a base URL)
+#   - Bedrock (auth deferred to the AWS SDK at request time)
+# Plus one deliberately broken entry:
+#   - An OpenAI connection whose api_key_env points at an env var that is
+#     not set, so sanity check marks it Unavailable without killing startup.
+#
+# The daemon is expected to start with `local` as the active connection
+# (first healthy entry in declaration order) and to surface the `cloud`
+# entry in `registry.status()` as Unavailable.
+
+[llm]
+connector = "ollama"
+model = "qwen3:8b"
+base_url = "http://localhost:11434"
+
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[connections.cloud]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+# Env var intentionally set to a name that tests will clear so the key
+# resolves empty and the sanity check flags the connection.
+api_key_env = "DA_ISSUE9_FIXTURE_UNSET_OPENAI_KEY"
+
+[connections.aws]
+type = "bedrock"
+aws_profile = "work"
+region = "us-west-2"

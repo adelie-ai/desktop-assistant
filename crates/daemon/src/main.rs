@@ -3,12 +3,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
+use desktop_assistant_core::domain::{Message, Role};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
-use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, RetryingLlmClient,
-};
+use desktop_assistant_core::ports::llm::{LlmClient, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tracing_subscriber::EnvFilter;
 
@@ -16,11 +14,13 @@ mod app;
 mod config;
 mod connections;
 mod purposes;
+mod registry;
 mod settings_service;
 mod store;
 mod tls;
 
 use crate::app::Assistant;
+use crate::registry::{ConnectionHealth, build_llm_client, build_registry};
 use desktop_assistant_application::DefaultAssistantApiHandler;
 use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
@@ -324,18 +324,6 @@ impl desktop_assistant_core::ports::store::ConversationStore for AnyConversation
     }
 }
 
-/// Enum wrapper to dispatch between LLM backends at runtime.
-///
-/// `LlmClient` uses `impl Future` returns, so it isn't dyn-compatible.
-/// This enum lets `ConversationHandler` stay monomorphic while supporting
-/// multiple backends.
-enum AnyLlmClient {
-    Anthropic(desktop_assistant_llm_anthropic::AnthropicClient),
-    Bedrock(desktop_assistant_llm_bedrock::BedrockClient),
-    OpenAi(desktop_assistant_llm_openai::OpenAiClient),
-    Ollama(desktop_assistant_llm_ollama::OllamaClient),
-}
-
 /// Enum wrapper to dispatch between embedding backends at runtime.
 ///
 /// Mirrors `AnyLlmClient` but for the `EmbeddingClient` trait.
@@ -373,158 +361,6 @@ impl EmbeddingClient for AnyEmbeddingClient {
     }
 }
 
-impl LlmClient for AnyLlmClient {
-    fn get_default_model(&self) -> Option<&str> {
-        match self {
-            Self::Anthropic(c) => c.get_default_model(),
-            Self::Bedrock(c) => c.get_default_model(),
-            Self::OpenAi(c) => c.get_default_model(),
-            Self::Ollama(c) => c.get_default_model(),
-        }
-    }
-
-    fn get_default_base_url(&self) -> Option<&str> {
-        match self {
-            Self::Anthropic(c) => c.get_default_base_url(),
-            Self::Bedrock(c) => c.get_default_base_url(),
-            Self::OpenAi(c) => c.get_default_base_url(),
-            Self::Ollama(c) => c.get_default_base_url(),
-        }
-    }
-
-    fn max_context_tokens(&self) -> Option<u64> {
-        match self {
-            Self::Anthropic(c) => c.max_context_tokens(),
-            Self::Bedrock(c) => c.max_context_tokens(),
-            Self::OpenAi(c) => c.max_context_tokens(),
-            Self::Ollama(c) => c.max_context_tokens(),
-        }
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        match self {
-            Self::Anthropic(c) => c.list_models().await,
-            Self::Bedrock(c) => c.list_models().await,
-            Self::OpenAi(c) => c.list_models().await,
-            Self::Ollama(c) => c.list_models().await,
-        }
-    }
-
-    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        match self {
-            Self::Anthropic(c) => c.refresh_models().await,
-            Self::Bedrock(c) => c.refresh_models().await,
-            Self::OpenAi(c) => c.refresh_models().await,
-            Self::Ollama(c) => c.refresh_models().await,
-        }
-    }
-
-    async fn stream_completion(
-        &self,
-        messages: Vec<Message>,
-        tools: &[ToolDefinition],
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        match self {
-            Self::Anthropic(c) => c.stream_completion(messages, tools, on_chunk).await,
-            Self::Bedrock(c) => c.stream_completion(messages, tools, on_chunk).await,
-            Self::OpenAi(c) => c.stream_completion(messages, tools, on_chunk).await,
-            Self::Ollama(c) => c.stream_completion(messages, tools, on_chunk).await,
-        }
-    }
-
-    fn supports_hosted_tool_search(&self) -> bool {
-        match self {
-            Self::Anthropic(c) => c.supports_hosted_tool_search(),
-            Self::OpenAi(c) => c.supports_hosted_tool_search(),
-            _ => false,
-        }
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        match self {
-            Self::Anthropic(c) => {
-                c.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
-                    .await
-            }
-            Self::OpenAi(c) => {
-                c.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
-                    .await
-            }
-            // Bedrock/Ollama: use default flattening behavior
-            _ => {
-                let mut all: Vec<ToolDefinition> = core_tools.to_vec();
-                for ns in namespaces {
-                    all.extend(ns.tools.iter().cloned());
-                }
-                self.stream_completion(messages, &all, on_chunk).await
-            }
-        }
-    }
-}
-
-/// Build an `AnyLlmClient` from a resolved LLM configuration.
-fn build_llm_client(resolved: config::ResolvedLlmConfig) -> AnyLlmClient {
-    match resolved.connector.as_str() {
-        "ollama" => AnyLlmClient::Ollama(
-            desktop_assistant_llm_ollama::OllamaClient::new(resolved.base_url, resolved.model)
-                .with_temperature(resolved.temperature)
-                .with_top_p(resolved.top_p)
-                .with_max_tokens(resolved.max_tokens),
-        ),
-        "anthropic" => {
-            if resolved.api_key.is_empty() {
-                tracing::warn!(
-                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
-                );
-            }
-            let mut client =
-                desktop_assistant_llm_anthropic::AnthropicClient::new(resolved.api_key)
-                    .with_model(resolved.model)
-                    .with_base_url(resolved.base_url)
-                    .with_temperature(resolved.temperature)
-                    .with_top_p(resolved.top_p)
-                    .with_max_tokens_override(resolved.max_tokens);
-            if let Some(hts) = resolved.hosted_tool_search {
-                client = client.with_hosted_tool_search(hts);
-            }
-            AnyLlmClient::Anthropic(client)
-        }
-        "bedrock" | "aws-bedrock" => AnyLlmClient::Bedrock(
-            desktop_assistant_llm_bedrock::BedrockClient::new(resolved.api_key)
-                .with_model(resolved.model)
-                .with_base_url(resolved.base_url)
-                .with_temperature(resolved.temperature)
-                .with_top_p(resolved.top_p)
-                .with_max_tokens(resolved.max_tokens)
-                .with_aws_profile(resolved.aws_profile),
-        ),
-        _ => {
-            if resolved.api_key.is_empty() {
-                tracing::warn!(
-                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
-                );
-            }
-            let mut client = desktop_assistant_llm_openai::OpenAiClient::new(resolved.api_key)
-                .with_model(resolved.model)
-                .with_base_url(resolved.base_url)
-                .with_temperature(resolved.temperature)
-                .with_top_p(resolved.top_p)
-                .with_max_tokens(resolved.max_tokens);
-            if let Some(hts) = resolved.hosted_tool_search {
-                client = client.with_hosted_tool_search(hts);
-            }
-            AnyLlmClient::OpenAi(client)
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -554,19 +390,68 @@ async fn main() -> Result<()> {
         .map(|c| c.profiling.clone())
         .unwrap_or_default();
 
+    // Build the per-connection client registry from the [connections] map
+    // (#9). The primary dispatch target ("active" connection) is the first
+    // declared connection that built successfully; #10 will replace this with
+    // a purpose-driven lookup. Connections that fail to build are logged and
+    // marked unavailable — the daemon still starts.
+    let mut connection_registry = match daemon_config.as_ref() {
+        Some(config) => build_registry(config),
+        None => registry::ConnectionRegistry::empty(),
+    };
+    for status in connection_registry.status() {
+        match &status.health {
+            ConnectionHealth::Ok => tracing::info!(
+                "connection {} ({}) ready",
+                status.id,
+                status.connector_type
+            ),
+            ConnectionHealth::Unavailable { reason } => tracing::warn!(
+                "connection {} ({}) unavailable: {reason}",
+                status.id,
+                status.connector_type
+            ),
+        }
+    }
+
+    // Resolve the embedding-friendly fields from the old `[llm]` block. The
+    // embedding client path still reads `[llm]` directly; #10 will move it
+    // over to a purpose-based lookup. Keeping this read here means an install
+    // with only a `[connections]` table still gets embedding defaults.
     let resolved_llm = config::resolve_llm_config(daemon_config.as_ref());
     tracing::info!(
-        "LLM connector={}, model={}, base_url={}",
+        "primary LLM resolved: connector={}, model={}, base_url={}",
         resolved_llm.connector,
         resolved_llm.model,
         resolved_llm.base_url
     );
-
     let llm_connector = resolved_llm.connector.clone();
     let llm_api_key = resolved_llm.api_key.clone();
 
-    tracing::info!("using {} LLM backend", llm_connector);
-    let llm: AnyLlmClient = build_llm_client(resolved_llm);
+    // Take the active connection's client out of the registry to feed the
+    // conversation handler. The registry retains status for diagnostics.
+    let (active_id, llm) = match connection_registry.take_active() {
+        Some((id, client)) => {
+            tracing::info!("dispatching requests through connection {id}");
+            (Some(id), client)
+        }
+        None => {
+            // No usable connection. Fall back to a client built from the
+            // legacy `[llm]` block so the daemon still comes up — this
+            // matches pre-#9 behaviour while making the failure visible in
+            // the registry status. Once #10 lands and purposes become the
+            // only dispatch path, this fallback can go away.
+            tracing::warn!(
+                "no healthy connection available; falling back to legacy [llm] client (daemon will still run but requests will likely fail until a connection is configured)"
+            );
+            (None, build_llm_client(resolved_llm.clone()))
+        }
+    };
+    if let Some(id) = &active_id {
+        tracing::info!("using {} LLM backend via connection {}", llm_connector, id);
+    } else {
+        tracing::info!("using {} LLM backend (legacy fallback)", llm_connector);
+    }
 
     // Build the embedding client from resolved config
     let resolved_emb = config::resolve_embeddings_config(daemon_config.as_ref());
