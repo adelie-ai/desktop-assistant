@@ -1,7 +1,8 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, TokenUsage,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
+    TokenUsage,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,29 @@ struct SystemBlock {
     cache_control: CacheControl,
 }
 
+/// Anthropic extended-thinking configuration block.
+///
+/// Serialized into the request body as `"thinking": { "type": "enabled",
+/// "budget_tokens": N }` when reasoning is requested. See the Anthropic
+/// Messages API reference for the exact schema; this client emits the
+/// `enabled` variant only — `disabled` is represented by omitting the
+/// field entirely.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    mode: &'static str,
+    budget_tokens: u32,
+}
+
+impl ThinkingConfig {
+    fn enabled(budget: u32) -> Self {
+        Self {
+            mode: "enabled",
+            budget_tokens: budget,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct MessagesRequest {
     model: String,
@@ -135,6 +159,8 @@ struct MessagesRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -231,6 +257,8 @@ struct MessagesRequestWithToolSearch {
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicToolEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
 }
 
 /// Convert domain messages into Anthropic API messages, extracting the system prompt.
@@ -620,20 +648,25 @@ impl LlmClient for AnthropicClient {
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let api_tools: Vec<AnthropicTool> = tools.iter().map(AnthropicTool::from).collect();
         let (system, api_messages) = convert_messages(&messages);
 
+        let thinking = thinking_for(reasoning);
+        let max_tokens = effective_max_tokens(self.max_tokens, thinking.as_ref());
+
         let request = MessagesRequest {
             model: self.model.clone(),
-            max_tokens: self.max_tokens,
+            max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
             system,
             messages: api_messages,
             stream: true,
             tools: api_tools,
+            thinking,
         };
 
         let request_json =
@@ -652,6 +685,7 @@ impl LlmClient for AnthropicClient {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let (system, api_messages) = convert_messages(&messages);
@@ -677,15 +711,19 @@ impl LlmClient for AnthropicClient {
             name: "tool_search_tool_regex".to_string(),
         }));
 
+        let thinking = thinking_for(reasoning);
+        let max_tokens = effective_max_tokens(self.max_tokens, thinking.as_ref());
+
         let request = MessagesRequestWithToolSearch {
             model: self.model.clone(),
-            max_tokens: self.max_tokens,
+            max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
             system,
             messages: api_messages,
             stream: true,
             tools: tool_entries,
+            thinking,
         };
 
         let request_json =
@@ -700,6 +738,40 @@ impl LlmClient for AnthropicClient {
         self.send_and_stream(&request_json, &request, on_chunk)
             .await
     }
+}
+
+/// Build a `ThinkingConfig` from the per-turn reasoning hint.
+///
+/// Rules:
+/// - `None` or `Some(0)` → no thinking block (omit the field).
+/// - `Some(N > 0)` → `{ type: "enabled", budget_tokens: N }`. The caller is
+///   responsible for ensuring `max_tokens > budget_tokens`; see
+///   [`effective_max_tokens`].
+fn thinking_for(reasoning: ReasoningConfig) -> Option<ThinkingConfig> {
+    match reasoning.thinking_budget_tokens {
+        Some(n) if n > 0 => Some(ThinkingConfig::enabled(n)),
+        _ => None,
+    }
+}
+
+/// Minimum headroom for the final visible response on top of the thinking
+/// budget. Anthropic requires `max_tokens > budget_tokens`, and real
+/// responses need enough room to emit both the thinking trace and the
+/// reply; we reserve 2048 tokens for the reply by default.
+const MIN_OUTPUT_HEADROOM_TOKENS: u32 = 2048;
+
+/// Compute the effective `max_tokens` for a request.
+///
+/// Anthropic's API rejects requests whose `budget_tokens` is not strictly
+/// less than `max_tokens`. When the configured `max_tokens` isn't large
+/// enough to host both the thinking budget and a non-trivial reply, bump
+/// it up to `budget + MIN_OUTPUT_HEADROOM_TOKENS`.
+fn effective_max_tokens(configured: u32, thinking: Option<&ThinkingConfig>) -> u32 {
+    let Some(t) = thinking else {
+        return configured;
+    };
+    let needed = t.budget_tokens.saturating_add(MIN_OUTPUT_HEADROOM_TOKENS);
+    configured.max(needed)
 }
 
 fn accumulate_usage(acc: &mut SseUsage, new: &SseUsage) {
@@ -962,6 +1034,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("tools"));
@@ -983,6 +1056,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![AnthropicTool::from(&def)],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -1005,6 +1079,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"system\""));
@@ -1110,9 +1185,92 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
+    }
+
+    // --- Extended-thinking (reasoning) wiring ----------------------------
+
+    #[test]
+    fn thinking_for_omitted_when_no_budget() {
+        assert!(thinking_for(ReasoningConfig::default()).is_none());
+        assert!(
+            thinking_for(ReasoningConfig::with_thinking_budget(0)).is_none(),
+            "budget=0 should disable thinking"
+        );
+    }
+
+    #[test]
+    fn thinking_for_emits_enabled_block_for_positive_budget() {
+        let t = thinking_for(ReasoningConfig::with_thinking_budget(8_000)).unwrap();
+        assert_eq!(t.mode, "enabled");
+        assert_eq!(t.budget_tokens, 8_000);
+    }
+
+    #[test]
+    fn effective_max_tokens_unchanged_without_thinking() {
+        assert_eq!(effective_max_tokens(8_192, None), 8_192);
+    }
+
+    #[test]
+    fn effective_max_tokens_bumps_up_when_budget_exceeds_configured() {
+        let thinking = ThinkingConfig::enabled(24_000);
+        // Configured max_tokens (8_192) is LESS than budget (24_000); needs bump.
+        let mt = effective_max_tokens(8_192, Some(&thinking));
+        assert!(mt > 24_000, "max_tokens should strictly exceed budget");
+        assert_eq!(mt, 24_000 + MIN_OUTPUT_HEADROOM_TOKENS);
+    }
+
+    #[test]
+    fn effective_max_tokens_preserves_configured_when_large_enough() {
+        let thinking = ThinkingConfig::enabled(4_000);
+        // Configured max_tokens (16_000) already has >2k headroom above 4_000.
+        let mt = effective_max_tokens(16_000, Some(&thinking));
+        assert_eq!(mt, 16_000);
+    }
+
+    #[test]
+    fn request_includes_thinking_when_reasoning_enabled() {
+        let thinking = thinking_for(ReasoningConfig::with_thinking_budget(8_000));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6-20260227".into(),
+            max_tokens: effective_max_tokens(8_192, thinking.as_ref()),
+            temperature: None,
+            top_p: None,
+            system: vec![],
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["thinking"]["type"], "enabled");
+        assert_eq!(parsed["thinking"]["budget_tokens"], 8_000);
+        assert!(parsed["max_tokens"].as_u64().unwrap() > 8_000);
+    }
+
+    #[test]
+    fn request_omits_thinking_when_reasoning_disabled() {
+        let thinking = thinking_for(ReasoningConfig::default());
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6-20260227".into(),
+            max_tokens: 8_192,
+            temperature: None,
+            top_p: None,
+            system: vec![],
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("thinking"),
+            "thinking field must be omitted when reasoning is off; got: {json}"
+        );
     }
 
     #[tokio::test]

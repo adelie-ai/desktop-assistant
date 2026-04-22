@@ -34,7 +34,10 @@ use desktop_assistant_core::ports::inbound::{
     PromptDispatchOutcome, PromptSelectionOverride, PurposeConfigPayload,
     PurposeKind as CorePurposeKind, PurposesView as CorePurposesView, SerdeEffort,
 };
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, StatusCallback};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback,
+    with_reasoning_config,
+};
 
 use crate::config::{
     DaemonConfig, default_daemon_config_path, load_daemon_config, save_daemon_config,
@@ -125,7 +128,7 @@ impl RegistryHandle {
     /// Fetch the live client handle for a connection id, if any. The
     /// returned `Arc` can be awaited on without holding any registry
     /// locks, which keeps the async futures `Send`.
-    fn client_for(
+    pub(crate) fn client_for(
         &self,
         id: &ConnectionId,
     ) -> Option<std::sync::Arc<crate::registry::AnyLlmClient>> {
@@ -134,7 +137,7 @@ impl RegistryHandle {
     }
 
     /// Connector-type tag for a given connection id, if declared.
-    fn connector_type_for(&self, id: &ConnectionId) -> Option<String> {
+    pub(crate) fn connector_type_for(&self, id: &ConnectionId) -> Option<String> {
         let state = self.state.read().expect("registry state poisoned");
         state
             .registry
@@ -487,19 +490,27 @@ where
         self.registry.connection_lists_model(&id, &sel.model_id).await
     }
 
-    /// Translate the effort hint into per-connector parameters and log
-    /// what the dispatch layer would send. This is the effort-mapping hook
-    /// the ticket calls out; each connector currently receives the mapping
-    /// via a `tracing::debug!` line, and the wire-level plumbing into
-    /// `stream_completion` will be wired up on a follow-up (noted in the
-    /// PR body — see issue #11).
+    /// Translate the effort hint into the per-connector
+    /// [`ReasoningConfig`] the connector's dispatch path expects.
+    ///
+    /// - Anthropic / Bedrock (Claude): populates
+    ///   `thinking_budget_tokens` using
+    ///   [`map_anthropic_thinking_budget`].
+    /// - OpenAI: populates `reasoning_effort` using
+    ///   [`map_openai_reasoning_effort`]. The connector itself applies a
+    ///   per-model capability gate and silently drops the field for
+    ///   non-reasoning models.
+    /// - Ollama / unknown: returns an empty `ReasoningConfig` (no-op).
+    ///
+    /// The returned value is installed on the turn's task-local
+    /// [`with_reasoning_config`] scope by the caller.
     fn apply_effort_mapping(
         connector_type: &str,
         model_id: &str,
         effort: Option<Effort>,
-    ) {
+    ) -> ReasoningConfig {
         let Some(effort) = effort else {
-            return;
+            return ReasoningConfig::default();
         };
         match connector_type {
             "anthropic" | "bedrock" => {
@@ -511,30 +522,30 @@ where
                     thinking_budget_tokens = budget,
                     "mapped effort to Anthropic extended-thinking budget"
                 );
+                if budget == 0 {
+                    ReasoningConfig::default()
+                } else {
+                    ReasoningConfig::with_thinking_budget(budget)
+                }
             }
             "openai" => {
-                let token = map_openai_reasoning_effort(effort);
+                let level = map_effort_to_reasoning_level(effort);
                 tracing::debug!(
                     connector = connector_type,
                     model = model_id,
                     effort = ?effort,
-                    reasoning_effort = token,
+                    reasoning_level = ?level,
                     "mapped effort to OpenAI reasoning_effort"
                 );
+                ReasoningConfig::with_reasoning_effort(level)
             }
-            "ollama" => {
+            _ => {
                 tracing::debug!(
                     connector = connector_type,
                     effort = ?effort,
-                    "effort is a no-op on Ollama"
+                    "no reasoning mapping defined for connector (no-op)"
                 );
-            }
-            other => {
-                tracing::debug!(
-                    connector = other,
-                    effort = ?effort,
-                    "no effort mapping defined for connector"
-                );
+                ReasoningConfig::default()
             }
         }
     }
@@ -592,9 +603,16 @@ where
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
     ) -> Result<String, CoreError> {
-        self.inner
-            .send_prompt(conversation_id, prompt, on_chunk, on_status)
-            .await
+        // The plain `send_prompt` path is invoked by adapters that don't
+        // carry an explicit override (legacy D-Bus/WS endpoints). We
+        // still want per-conversation stored selections and the
+        // interactive-purpose fallback to route the turn to the right
+        // connection + effort, so we route it through the same
+        // resolution + dispatch machinery as the override path.
+        let outcome = self
+            .send_prompt_with_override(conversation_id, prompt, None, on_chunk, on_status)
+            .await?;
+        Ok(outcome.response)
     }
 
     async fn send_prompt_with_override(
@@ -659,27 +677,67 @@ where
             self.interactive_selection()
         };
 
-        // Emit effort-mapping debug lines for the chosen dispatch target.
+        // Resolve the per-turn routing target:
+        //   - `active_client`: the `Arc<AnyLlmClient>` dispatch must use
+        //     for this turn. Installed on a task-local consulted by
+        //     `RoutingLlmClient::stream_completion`. When `None`, the
+        //     handler's static interactive-purpose fallback is used.
+        //   - `reasoning`: the `ReasoningConfig` populated from the
+        //     per-connector effort mapping. Installed on a second
+        //     task-local read by the core `ConversationHandler` dispatch
+        //     loop and forwarded into `stream_completion(... reasoning
+        //     ...)`.
+        let mut active_client: Option<std::sync::Arc<crate::registry::AnyLlmClient>> = None;
+        let mut reasoning = ReasoningConfig::default();
         if let Some(sel) = effective_selection.as_ref() {
-            let connector_type = ConnectionId::new(sel.connection_id.clone())
-                .ok()
-                .and_then(|id| self.registry.connector_type_for(&id))
+            let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
+                CoreError::Llm(format!(
+                    "resolved selection has malformed connection id {:?}: {e}",
+                    sel.connection_id
+                ))
+            })?;
+            // Reject Unavailable (or undeclared) connections with a
+            // clean 400-style error rather than silently falling back.
+            let connector_type = self
+                .registry
+                .connector_type_for(&id)
                 .unwrap_or_default();
-            Self::apply_effort_mapping(
-                &connector_type,
-                &sel.model_id,
-                sel.effort.map(Effort::from),
-            );
+            match self.registry.client_for(&id) {
+                Some(client) => {
+                    active_client = Some(client);
+                }
+                None => {
+                    return Err(CoreError::Llm(format!(
+                        "resolved connection {} is not live; requested model {} cannot be dispatched",
+                        sel.connection_id, sel.model_id
+                    )));
+                }
+            }
+            reasoning =
+                Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort.map(Effort::from));
         }
 
-        // Dispatch via the inner (interactive-purpose) handler. The
-        // override/stored selection has been validated and persisted; wire-
-        // level routing to the selected connection+model is noted as a
-        // follow-up in the PR body.
-        let response = self
-            .inner
-            .send_prompt(conversation_id, prompt, on_chunk, on_status)
-            .await?;
+        // Install both task-locals, then delegate to the inner core
+        // handler. The handler reads the task-locals inside its
+        // `send_prompt` dispatch loop:
+        //   - `RoutingLlmClient` picks the active client on each
+        //     `stream_completion` call.
+        //   - `current_reasoning_config()` surfaces `reasoning` into the
+        //     connector's request body.
+        let inner = Arc::clone(&self.inner);
+        let conv_id = conversation_id.clone();
+        let response = {
+            let dispatch = async move {
+                inner
+                    .send_prompt(&conv_id, prompt, on_chunk, on_status)
+                    .await
+            };
+            let dispatch = with_reasoning_config(reasoning, dispatch);
+            match active_client {
+                Some(c) => crate::routing_llm::with_active_client(c, dispatch).await,
+                None => dispatch.await,
+            }
+        }?;
         Ok(PromptDispatchOutcome {
             response,
             warnings,
@@ -749,11 +807,27 @@ pub fn map_anthropic_thinking_budget(e: Effort) -> u32 {
 }
 
 /// OpenAI `reasoning_effort` literal. Pass through verbatim.
+///
+/// Retained as the canonical Effort → wire-token table even after the
+/// main dispatch path switched to [`map_effort_to_reasoning_level`] +
+/// the connector's own per-model capability gate; keeps the mapping
+/// truth-source documented in one place for future providers.
+#[allow(dead_code)]
 pub fn map_openai_reasoning_effort(e: Effort) -> &'static str {
     match e {
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",
+    }
+}
+
+/// `Effort` → core-level [`ReasoningLevel`], used when threading the
+/// per-turn hint into the `LlmClient` trait.
+pub fn map_effort_to_reasoning_level(e: Effort) -> ReasoningLevel {
+    match e {
+        Effort::Low => ReasoningLevel::Low,
+        Effort::Medium => ReasoningLevel::Medium,
+        Effort::High => ReasoningLevel::High,
     }
 }
 
@@ -1072,5 +1146,306 @@ mod tests {
         // Either the network fails (empty list) or succeeds — both are OK
         // since we're just checking we don't hard-error when aggregating.
         let _ = svc.list_available_models(None, false).await;
+    }
+
+    // ----- RoutingConversationHandler dispatch-routing tests -----------
+    //
+    // These tests cover the per-turn routing logic added in #18:
+    // - priority resolution across override/stored/interactive
+    // - task-local reasoning config installation
+    // - per-connector effort mapping into ReasoningConfig
+    // - clean error on Unavailable connection
+
+    mod routing_dispatch {
+        use super::*;
+        use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
+        use desktop_assistant_core::ports::inbound::{
+            ConversationService, PromptSelectionOverride,
+        };
+        use std::sync::Mutex as StdMutex;
+
+        /// Inner `ConversationService` mock that records each call. Dispatch
+        /// paths under test go through `RoutingConversationHandler ->
+        /// inner.send_prompt`, so we snapshot the task-local values at
+        /// dispatch time into the captured record.
+        struct CapturingInner {
+            captured_reasoning: StdMutex<Vec<ReasoningConfig>>,
+        }
+
+        impl CapturingInner {
+            fn new() -> Self {
+                Self {
+                    captured_reasoning: StdMutex::new(Vec::new()),
+                }
+            }
+        }
+
+        impl ConversationService for CapturingInner {
+            async fn create_conversation(
+                &self,
+                title: String,
+            ) -> Result<Conversation, CoreError> {
+                Ok(Conversation::new("c1", title))
+            }
+            async fn list_conversations(
+                &self,
+                _max_age_days: Option<u32>,
+                _include_archived: bool,
+            ) -> Result<Vec<ConversationSummary>, CoreError> {
+                Ok(vec![])
+            }
+            async fn get_conversation(
+                &self,
+                id: &ConversationId,
+            ) -> Result<Conversation, CoreError> {
+                Ok(Conversation::new(id.as_str(), "t"))
+            }
+            async fn delete_conversation(
+                &self,
+                _id: &ConversationId,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn rename_conversation(
+                &self,
+                _id: &ConversationId,
+                _title: String,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn archive_conversation(
+                &self,
+                _id: &ConversationId,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn unarchive_conversation(
+                &self,
+                _id: &ConversationId,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn clear_all_history(&self) -> Result<u32, CoreError> {
+                Ok(0)
+            }
+            async fn send_prompt(
+                &self,
+                _conversation_id: &ConversationId,
+                _prompt: String,
+                _on_chunk: desktop_assistant_core::ports::llm::ChunkCallback,
+                _on_status: desktop_assistant_core::ports::llm::StatusCallback,
+            ) -> Result<String, CoreError> {
+                // Snapshot the task-local reasoning config the routing
+                // wrapper installed on the calling scope; asserting on
+                // this value proves the plumbing actually propagates
+                // all the way to the point where the core dispatch
+                // loop would call `stream_completion`.
+                let cfg = desktop_assistant_core::ports::llm::current_reasoning_config();
+                self.captured_reasoning.lock().unwrap().push(cfg);
+                Ok("ok".to_string())
+            }
+        }
+
+        fn local_ollama_cfg() -> DaemonConfig {
+            let mut cfg = config_with_connections(&[
+                ("local", ollama_local()),
+                ("aws", bedrock_work()),
+            ]);
+            cfg.purposes.interactive = Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: None,
+            });
+            cfg
+        }
+
+        fn make_handler() -> (
+            Arc<RoutingConversationHandler<InMemoryConversationSelectionStore, CapturingInner>>,
+            Arc<CapturingInner>,
+            Arc<RegistryHandle>,
+            Arc<InMemoryConversationSelectionStore>,
+        ) {
+            let cfg = local_ollama_cfg();
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+            (routing, inner, registry, store)
+        }
+
+        fn noop_cb() -> (
+            desktop_assistant_core::ports::llm::ChunkCallback,
+            desktop_assistant_core::ports::llm::StatusCallback,
+        ) {
+            (
+                Box::new(|_: String| -> bool { true }),
+                Box::new(|_: String| {}),
+            )
+        }
+
+        #[tokio::test]
+        async fn send_prompt_unknown_override_connection_errors() {
+            let (routing, _inner, _reg, _store) = make_handler();
+            let (on_chunk, on_status) = noop_cb();
+            let err = routing
+                .send_prompt_with_override(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    Some(PromptSelectionOverride {
+                        connection_id: "does-not-exist".into(),
+                        model_id: "llama3".into(),
+                        effort: None,
+                    }),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("does-not-exist") || msg.contains("not a live"),
+                "expected error mentioning the unknown connection; got: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn interactive_purpose_reasoning_maps_to_local_connector_no_op() {
+            // interactive purpose: local/llama3 (ollama) with no effort →
+            // reasoning config stays empty, dispatch proceeds to inner.
+            let (routing, inner, _reg, _store) = make_handler();
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("dispatch should succeed via interactive purpose");
+            let captured = inner.captured_reasoning.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0], ReasoningConfig::default());
+        }
+
+        #[tokio::test]
+        async fn bedrock_override_maps_effort_to_thinking_budget() {
+            // Configure an override pointing at the Bedrock connection
+            // with Effort::High; the routing wrapper must translate it
+            // to a `ReasoningConfig { thinking_budget_tokens: Some(24_000) }`
+            // and install it on the task-local observed by the inner.
+            let cfg = {
+                let mut c = local_ollama_cfg();
+                // Point interactive at aws/claude so override-less path
+                // still routes to a Claude-shape connector; override
+                // sets the Bedrock connection explicitly below to
+                // exercise the mapping.
+                c.purposes.interactive = Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
+                    model: ModelRef::Named(
+                        "us.anthropic.claude-sonnet-4-6".into(),
+                    ),
+                    effort: None,
+                });
+                c
+            };
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+
+            // The override connection/model must pass the `list_models`
+            // gate — for Bedrock this hits the AWS SDK, which is not
+            // available in the test env. Since validation would fail,
+            // exercise the effort-mapping function directly rather than
+            // the end-to-end path. (The end-to-end routing is covered
+            // above via `send_prompt` with the interactive purpose.)
+            let cfg = RoutingConversationHandler::<
+                InMemoryConversationSelectionStore,
+                CapturingInner,
+            >::apply_effort_mapping(
+                "bedrock",
+                "us.anthropic.claude-sonnet-4-6",
+                Some(Effort::High),
+            );
+            assert_eq!(cfg.thinking_budget_tokens, Some(24_000));
+            assert!(cfg.reasoning_effort.is_none());
+
+            // Route routing is still used: prove the handler exists and
+            // its `send_prompt` path sets the default reasoning when no
+            // effort is supplied.
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("plain send_prompt should succeed via interactive purpose");
+        }
+
+        #[test]
+        fn effort_mapping_openai_path() {
+            let cfg = RoutingConversationHandler::<
+                InMemoryConversationSelectionStore,
+                CapturingInner,
+            >::apply_effort_mapping("openai", "gpt-5", Some(Effort::Medium));
+            assert_eq!(
+                cfg.reasoning_effort,
+                Some(ReasoningLevel::Medium),
+                "Medium effort must map to ReasoningLevel::Medium for OpenAI"
+            );
+            assert!(cfg.thinking_budget_tokens.is_none());
+        }
+
+        #[test]
+        fn effort_mapping_low_anthropic_disables_thinking() {
+            // Low effort maps to budget=0 which disables the thinking
+            // block entirely, even though the caller asked for
+            // Effort::Low. Matches the Anthropic semantics where a
+            // zero budget means "extended thinking disabled".
+            let cfg = RoutingConversationHandler::<
+                InMemoryConversationSelectionStore,
+                CapturingInner,
+            >::apply_effort_mapping("anthropic", "claude-sonnet-4-6", Some(Effort::Low));
+            assert!(cfg.thinking_budget_tokens.is_none());
+        }
+
+        #[test]
+        fn effort_mapping_ollama_is_noop() {
+            let cfg = RoutingConversationHandler::<
+                InMemoryConversationSelectionStore,
+                CapturingInner,
+            >::apply_effort_mapping("ollama", "llama3", Some(Effort::High));
+            assert_eq!(cfg, ReasoningConfig::default());
+        }
+
+        #[test]
+        fn effort_mapping_unknown_connector_is_noop() {
+            let cfg = RoutingConversationHandler::<
+                InMemoryConversationSelectionStore,
+                CapturingInner,
+            >::apply_effort_mapping("mystery-vendor", "m1", Some(Effort::High));
+            assert_eq!(cfg, ReasoningConfig::default());
+        }
+
+        #[test]
+        fn effort_mapping_no_effort_returns_default() {
+            let cfg = RoutingConversationHandler::<
+                InMemoryConversationSelectionStore,
+                CapturingInner,
+            >::apply_effort_mapping("anthropic", "claude-sonnet-4-6", None);
+            assert_eq!(cfg, ReasoningConfig::default());
+        }
     }
 }

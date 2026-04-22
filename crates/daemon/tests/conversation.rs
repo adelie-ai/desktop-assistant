@@ -6,7 +6,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::domain::{ConversationId, Message, Role};
 use desktop_assistant_core::ports::inbound::ConversationService;
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, ReasoningConfig};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_core::service::ConversationHandler;
 use std::collections::HashMap;
@@ -126,6 +126,7 @@ impl LlmClient for TestLlm {
         &self,
         _messages: Vec<Message>,
         _tools: &[ToolDefinition],
+        _reasoning: ReasoningConfig,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let mut full = String::new();

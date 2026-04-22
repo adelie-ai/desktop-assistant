@@ -11,7 +11,8 @@ use aws_smithy_types::{Document, Number};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, TokenUsage,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
+    TokenUsage,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -747,6 +748,7 @@ impl LlmClient for BedrockClient {
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let client = self.client().await?;
@@ -791,6 +793,14 @@ impl LlmClient for BedrockClient {
         }
         if let Some(cfg) = tool_config {
             request = request.tool_config(cfg);
+        }
+
+        // Extended-thinking reasoning for Claude-family Bedrock models.
+        // Passed via `additional_model_request_fields` with the same
+        // `thinking: { type: "enabled", budget_tokens: N }` shape as the
+        // Anthropic native API. For non-Claude models this is a no-op.
+        if let Some(extra) = build_additional_model_request_fields(&self.model, reasoning) {
+            request = request.additional_model_request_fields(extra);
         }
 
         let response = request.send().await.map_err(|e| {
@@ -872,6 +882,54 @@ impl LlmClient for BedrockClient {
     }
 }
 
+/// Recognize Claude-family Bedrock model ids. Only Claude models accept
+/// the `thinking` extended-thinking block via `additionalModelRequestFields`.
+///
+/// Matches both the legacy `anthropic.claude-*` names and the cross-region
+/// inference profile aliases (`us.anthropic.claude-*`, `eu.anthropic.claude-*`,
+/// `apac.anthropic.claude-*`).
+fn is_claude_bedrock_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("anthropic.claude")
+}
+
+/// Build the `additionalModelRequestFields` Document for a Bedrock
+/// Converse request, translating the per-turn reasoning hint into the
+/// per-vendor shape.
+///
+/// - Claude-family: `{"thinking": {"type": "enabled", "budget_tokens": N}}`
+/// - Others: `None` (unrecognized field would cause a 400).
+///
+/// Returns `None` when no reasoning is requested or when the model is
+/// not known to support extended thinking.
+fn build_additional_model_request_fields(
+    model: &str,
+    reasoning: ReasoningConfig,
+) -> Option<Document> {
+    use std::collections::HashMap;
+    let budget = match reasoning.thinking_budget_tokens {
+        Some(n) if n > 0 => n,
+        _ => return None,
+    };
+    if !is_claude_bedrock_model(model) {
+        tracing::debug!(
+            model,
+            budget,
+            "Bedrock reasoning requested but model is not Claude-family; dropping thinking field"
+        );
+        return None;
+    }
+    let mut thinking: HashMap<String, Document> = HashMap::new();
+    thinking.insert("type".to_string(), Document::String("enabled".to_string()));
+    thinking.insert(
+        "budget_tokens".to_string(),
+        Document::Number(Number::PosInt(u64::from(budget))),
+    );
+    let mut root: HashMap<String, Document> = HashMap::new();
+    root.insert("thinking".to_string(), Document::Object(thinking));
+    Some(Document::Object(root))
+}
+
 fn json_to_document(value: serde_json::Value) -> Document {
     match value {
         serde_json::Value::Null => Document::Null,
@@ -905,6 +963,59 @@ mod tests {
         ConverseStreamOutput, ToolUseBlockDelta, ToolUseBlockStart,
     };
     use std::sync::{Arc, Mutex};
+
+    // --- Extended-thinking (reasoning) wiring ----------------------------
+
+    #[test]
+    fn claude_bedrock_model_detection() {
+        assert!(is_claude_bedrock_model("anthropic.claude-opus-4-1"));
+        assert!(is_claude_bedrock_model("us.anthropic.claude-sonnet-4-6"));
+        assert!(is_claude_bedrock_model("eu.anthropic.claude-haiku-4-5"));
+        assert!(!is_claude_bedrock_model("amazon.titan-text-express-v1"));
+        assert!(!is_claude_bedrock_model("meta.llama3-70b"));
+    }
+
+    #[test]
+    fn additional_model_request_fields_none_when_no_budget() {
+        assert!(
+            build_additional_model_request_fields(
+                "us.anthropic.claude-sonnet-4-6",
+                ReasoningConfig::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn additional_model_request_fields_none_for_non_claude_with_budget() {
+        let cfg = ReasoningConfig::with_thinking_budget(8_000);
+        assert!(
+            build_additional_model_request_fields("meta.llama3-70b", cfg).is_none(),
+            "thinking must not be forwarded to non-Claude Bedrock models"
+        );
+    }
+
+    #[test]
+    fn additional_model_request_fields_shape_matches_anthropic_native() {
+        let cfg = ReasoningConfig::with_thinking_budget(24_000);
+        let doc = build_additional_model_request_fields("us.anthropic.claude-opus-4-1", cfg)
+            .expect("thinking doc expected for Claude model");
+        let Document::Object(root) = doc else {
+            panic!("expected object at root");
+        };
+        let thinking = match root.get("thinking") {
+            Some(Document::Object(t)) => t,
+            _ => panic!("missing `thinking` key"),
+        };
+        assert!(
+            matches!(thinking.get("type"), Some(Document::String(s)) if s == "enabled"),
+            "thinking.type must be \"enabled\""
+        );
+        match thinking.get("budget_tokens") {
+            Some(Document::Number(Number::PosInt(n))) => assert_eq!(*n, 24_000),
+            other => panic!("budget_tokens shape unexpected: {other:?}"),
+        }
+    }
 
     #[test]
     fn region_parsing_supports_raw_region() {

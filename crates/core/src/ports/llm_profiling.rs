@@ -5,7 +5,9 @@ use serde::Serialize;
 
 use crate::CoreError;
 use crate::domain::{Message, Role, ToolDefinition, ToolNamespace};
-use crate::ports::llm::{ChunkCallback, LlmClient, LlmResponse, ModelInfo, TokenUsage};
+use crate::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig, TokenUsage,
+};
 
 /// JSONL profiling entry written for each LLM call.
 #[derive(Serialize)]
@@ -202,6 +204,7 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
@@ -212,7 +215,7 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         let start = Instant::now();
         let result = self
             .inner
-            .stream_completion(messages, tools, on_chunk)
+            .stream_completion(messages, tools, reasoning, on_chunk)
             .await;
         let duration_ms = start.elapsed().as_millis();
 
@@ -237,6 +240,7 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let mut all_names: Vec<String> = core_tools.iter().map(|t| t.name.clone()).collect();
@@ -252,7 +256,9 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         let start = Instant::now();
         let result = self
             .inner
-            .stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
+            .stream_completion_with_namespaces(
+                messages, core_tools, namespaces, reasoning, on_chunk,
+            )
             .await;
         let duration_ms = start.elapsed().as_millis();
 
@@ -386,11 +392,18 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         match self {
-            Self::Plain(l) => l.stream_completion(messages, tools, on_chunk).await,
-            Self::Profiled(l) => l.stream_completion(messages, tools, on_chunk).await,
+            Self::Plain(l) => {
+                l.stream_completion(messages, tools, reasoning, on_chunk)
+                    .await
+            }
+            Self::Profiled(l) => {
+                l.stream_completion(messages, tools, reasoning, on_chunk)
+                    .await
+            }
         }
     }
 
@@ -406,16 +419,21 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         match self {
             Self::Plain(l) => {
-                l.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
-                    .await
+                l.stream_completion_with_namespaces(
+                    messages, core_tools, namespaces, reasoning, on_chunk,
+                )
+                .await
             }
             Self::Profiled(l) => {
-                l.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
-                    .await
+                l.stream_completion_with_namespaces(
+                    messages, core_tools, namespaces, reasoning, on_chunk,
+                )
+                .await
             }
         }
     }
@@ -433,6 +451,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             _on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             Ok(LlmResponse::text("mock response").with_usage(TokenUsage {
@@ -462,6 +481,7 @@ mod tests {
                     "Read a file",
                     serde_json::json!({"type": "object"}),
                 )],
+                ReasoningConfig::default(),
                 Box::new(|_| true),
             )
             .await
@@ -491,6 +511,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "hi")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(|_| true),
             )
             .await
