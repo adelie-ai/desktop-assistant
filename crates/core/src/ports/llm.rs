@@ -22,6 +22,73 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
+/// Capability flags describing what an LLM model supports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelCapabilities {
+    /// Model supports extended-thinking / reasoning traces.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Model accepts image input.
+    #[serde(default)]
+    pub vision: bool,
+    /// Model supports tool/function calling.
+    #[serde(default)]
+    pub tools: bool,
+    /// Model is an embedding model (not a chat/completion model).
+    #[serde(default)]
+    pub embedding: bool,
+}
+
+/// Description of a single model exposed by an `LlmClient`.
+///
+/// Returned by `LlmClient::list_models()` and consumed by the model-picker
+/// UI. `context_limit` is optional: connectors should populate it when a
+/// reliable value is known (either from a curated static list or a provider
+/// API), and leave it `None` otherwise so callers fall back to
+/// message-count heuristics instead of bogus token math.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelInfo {
+    /// Stable identifier used to invoke the model (e.g.
+    /// `claude-sonnet-4-5`, `gpt-5-mini`, `us.anthropic.claude-opus-4-1`).
+    pub id: String,
+    /// Human-friendly display name for UIs. Defaults to `id` if unknown.
+    pub display_name: String,
+    /// Maximum prompt-token context window, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+    /// Feature flags for this model.
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
+}
+
+impl ModelInfo {
+    /// Convenience constructor using `id` as the display name.
+    pub fn new(id: impl Into<String>) -> Self {
+        let id: String = id.into();
+        Self {
+            display_name: id.clone(),
+            id,
+            context_limit: None,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = name.into();
+        self
+    }
+
+    pub fn with_context_limit(mut self, limit: u64) -> Self {
+        self.context_limit = Some(limit);
+        self
+    }
+
+    pub fn with_capabilities(mut self, caps: ModelCapabilities) -> Self {
+        self.capabilities = caps;
+        self
+    }
+}
+
 /// Response from the LLM, which may contain text, tool calls, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmResponse {
@@ -120,6 +187,26 @@ pub trait LlmClient: Send + Sync {
             self.stream_completion(messages, &all, on_chunk).await
         }
     }
+
+    /// Enumerate the models this connector can serve.
+    ///
+    /// Connectors should return every model the caller could reasonably
+    /// select (chat and embedding). The default implementation returns an
+    /// empty list so test mocks and decorators that delegate can opt out;
+    /// production connectors override this.
+    fn list_models(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ModelInfo>, CoreError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Force a fresh fetch of `list_models()`, bypassing any per-connector
+    /// cache. Connectors without a cache can delegate to `list_models`.
+    fn refresh_models(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ModelInfo>, CoreError>> + Send {
+        async { self.list_models().await }
+    }
 }
 
 /// Check whether a `CoreError` represents a retryable API error
@@ -161,6 +248,14 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
 
     fn max_context_tokens(&self) -> Option<u64> {
         self.inner.max_context_tokens()
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        self.inner.list_models().await
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        self.inner.refresh_models().await
     }
 
     async fn stream_completion(
@@ -520,6 +615,98 @@ mod tests {
         assert_eq!(usage, parsed);
         // cache_creation_input_tokens is None so should be skipped
         assert!(!json.contains("cache_creation_input_tokens"));
+    }
+
+    // --- ModelInfo / ModelCapabilities tests ---
+
+    #[test]
+    fn model_info_new_defaults_display_name_to_id() {
+        let info = ModelInfo::new("claude-sonnet-4-6");
+        assert_eq!(info.id, "claude-sonnet-4-6");
+        assert_eq!(info.display_name, "claude-sonnet-4-6");
+        assert_eq!(info.context_limit, None);
+        assert_eq!(info.capabilities, ModelCapabilities::default());
+    }
+
+    #[test]
+    fn model_info_builder_sets_fields() {
+        let caps = ModelCapabilities {
+            reasoning: true,
+            vision: true,
+            tools: true,
+            embedding: false,
+        };
+        let info = ModelInfo::new("gpt-5")
+            .with_display_name("GPT-5")
+            .with_context_limit(400_000)
+            .with_capabilities(caps);
+        assert_eq!(info.display_name, "GPT-5");
+        assert_eq!(info.context_limit, Some(400_000));
+        assert!(info.capabilities.reasoning);
+        assert!(info.capabilities.vision);
+        assert!(info.capabilities.tools);
+        assert!(!info.capabilities.embedding);
+    }
+
+    #[test]
+    fn model_info_serde_round_trip_full() {
+        let info = ModelInfo {
+            id: "claude-sonnet-4-6".into(),
+            display_name: "Claude Sonnet 4.6".into(),
+            context_limit: Some(200_000),
+            capabilities: ModelCapabilities {
+                reasoning: true,
+                vision: true,
+                tools: true,
+                embedding: false,
+            },
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: ModelInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn model_info_context_limit_none_is_skipped_in_json() {
+        let info = ModelInfo::new("unknown-model");
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("context_limit"));
+    }
+
+    #[test]
+    fn model_capabilities_json_deserializes_missing_flags_as_false() {
+        let caps: ModelCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(caps, ModelCapabilities::default());
+    }
+
+    #[test]
+    fn model_capabilities_embedding_flag_isolated() {
+        let caps = ModelCapabilities {
+            embedding: true,
+            ..Default::default()
+        };
+        assert!(caps.embedding);
+        assert!(!caps.reasoning);
+        assert!(!caps.tools);
+        assert!(!caps.vision);
+    }
+
+    #[tokio::test]
+    async fn default_list_models_is_empty() {
+        struct NoopLlm;
+        impl LlmClient for NoopLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(""))
+            }
+        }
+        let llm = NoopLlm;
+        assert!(llm.list_models().await.unwrap().is_empty());
+        assert!(llm.refresh_models().await.unwrap().is_empty());
     }
 
     #[tokio::test]
