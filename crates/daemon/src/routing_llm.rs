@@ -174,13 +174,15 @@ mod tests {
     use indexmap::IndexMap;
 
     fn build_ollama_registry() -> Arc<AnyLlmClient> {
-        let mut cfg = crate::config::DaemonConfig::default();
-        cfg.connections = IndexMap::from([(
-            "local".to_string(),
-            ConnectionConfig::Ollama(OllamaConnection {
-                base_url: Some("http://localhost:11434".into()),
-            }),
-        )]);
+        let cfg = crate::config::DaemonConfig {
+            connections: IndexMap::from([(
+                "local".to_string(),
+                ConnectionConfig::Ollama(OllamaConnection {
+                    base_url: Some("http://localhost:11434".into()),
+                }),
+            )]),
+            ..crate::config::DaemonConfig::default()
+        };
         let registry = build_registry(&cfg);
         let id = ConnectionId::new("local").unwrap();
         registry.get(&id).unwrap()
@@ -250,36 +252,30 @@ mod tests {
         _assert_llm_client_impl::<RoutingLlmClient>();
     }
 
-    #[test]
-    fn missing_connection_id_returns_none() {
-        let registry_handle = {
-            let mut cfg = crate::config::DaemonConfig::default();
-            cfg.connections = IndexMap::from([(
+    fn build_local_ollama_handle() -> Arc<crate::api_surface::RegistryHandle> {
+        let cfg = crate::config::DaemonConfig {
+            connections: IndexMap::from([(
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
                     base_url: Some("http://localhost:11434".into()),
                 }),
-            )]);
-            let reg = build_registry(&cfg);
-            Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg))
+            )]),
+            ..crate::config::DaemonConfig::default()
         };
+        let reg = build_registry(&cfg);
+        Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg))
+    }
+
+    #[test]
+    fn missing_connection_id_returns_none() {
+        let registry_handle = build_local_ollama_handle();
         let missing = ConnectionId::new("nonexistent").unwrap();
         assert!(resolve_client(&registry_handle, &missing).is_none());
     }
 
     #[test]
     fn existing_connection_id_resolves() {
-        let registry_handle = {
-            let mut cfg = crate::config::DaemonConfig::default();
-            cfg.connections = IndexMap::from([(
-                "local".to_string(),
-                ConnectionConfig::Ollama(OllamaConnection {
-                    base_url: Some("http://localhost:11434".into()),
-                }),
-            )]);
-            let reg = build_registry(&cfg);
-            Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg))
-        };
+        let registry_handle = build_local_ollama_handle();
         let id = ConnectionId::new("local").unwrap();
         assert!(resolve_client(&registry_handle, &id).is_some());
     }
