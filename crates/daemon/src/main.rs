@@ -10,6 +10,7 @@ use desktop_assistant_core::ports::llm::{LlmClient, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tracing_subscriber::EnvFilter;
 
+mod api_surface;
 mod app;
 mod config;
 mod connections;
@@ -324,6 +325,147 @@ impl desktop_assistant_core::ports::store::ConversationStore for AnyConversation
     }
 }
 
+/// Shareable store wrapper. The daemon owns the concrete
+/// `AnyConversationStore` once (behind an `Arc`) and hands out cloned
+/// `SharedConversationStore` handles to each consumer
+/// (`ConversationHandler`, `RoutingConversationHandler`, the
+/// selection-store layer). A newtype is required so the `ConversationStore`
+/// impl doesn't hit the orphan rule that would bite a direct
+/// `impl ... for Arc<AnyConversationStore>`.
+#[derive(Clone)]
+struct SharedConversationStore(Arc<AnyConversationStore>);
+
+impl desktop_assistant_core::ports::store::ConversationStore for SharedConversationStore {
+    async fn create(
+        &self,
+        conv: desktop_assistant_core::domain::Conversation,
+    ) -> Result<(), CoreError> {
+        self.0.create(conv).await
+    }
+
+    async fn get(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<desktop_assistant_core::domain::Conversation, CoreError> {
+        self.0.get(id).await
+    }
+
+    async fn list(&self) -> Result<Vec<desktop_assistant_core::domain::Conversation>, CoreError> {
+        self.0.list().await
+    }
+
+    async fn update(
+        &self,
+        conv: desktop_assistant_core::domain::Conversation,
+    ) -> Result<(), CoreError> {
+        self.0.update(conv).await
+    }
+
+    async fn delete(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<(), CoreError> {
+        self.0.delete(id).await
+    }
+
+    async fn archive(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<(), CoreError> {
+        self.0.archive(id).await
+    }
+
+    async fn unarchive(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<(), CoreError> {
+        self.0.unarchive(id).await
+    }
+
+    async fn create_summary(
+        &self,
+        conversation_id: &desktop_assistant_core::domain::ConversationId,
+        summary: String,
+        start_ordinal: usize,
+        end_ordinal: usize,
+    ) -> Result<String, CoreError> {
+        self.0
+            .create_summary(conversation_id, summary, start_ordinal, end_ordinal)
+            .await
+    }
+
+    async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+        self.0.expand_summary(summary_id).await
+    }
+}
+
+impl api_surface::ConversationSelectionStore for SharedConversationStore {
+    async fn get_selection(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<
+        Option<desktop_assistant_core::ports::inbound::ConversationModelSelection>,
+        CoreError,
+    > {
+        <AnyConversationStore as api_surface::ConversationSelectionStore>::get_selection(
+            &self.0, id,
+        )
+        .await
+    }
+
+    async fn set_selection(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+        selection: Option<
+            &desktop_assistant_core::ports::inbound::ConversationModelSelection,
+        >,
+    ) -> Result<(), CoreError> {
+        <AnyConversationStore as api_surface::ConversationSelectionStore>::set_selection(
+            &self.0, id, selection,
+        )
+        .await
+    }
+}
+
+// Per-conversation model selection (#11). Only the Postgres backend
+// persists selections across restarts; the JSON backend keeps them
+// in-memory and drops them on shutdown (matches pre-#11 behavior for
+// installs without a database).
+impl api_surface::ConversationSelectionStore for AnyConversationStore {
+    async fn get_selection(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<
+        Option<desktop_assistant_core::ports::inbound::ConversationModelSelection>,
+        CoreError,
+    > {
+        match self {
+            Self::Postgres(s) => s.get_conversation_model_selection(id).await,
+            Self::Json(_) => {
+                // No durable storage — treat as "no stored selection". The
+                // JSON fallback is deprecated; Postgres is the supported
+                // backend going forward.
+                Ok(None)
+            }
+        }
+    }
+
+    async fn set_selection(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+        selection: Option<&desktop_assistant_core::ports::inbound::ConversationModelSelection>,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Postgres(s) => s.set_conversation_model_selection(id, selection).await,
+            Self::Json(_) => {
+                // No-op on the JSON backend — see comment on `get_selection`.
+                let _ = selection;
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Enum wrapper to dispatch between embedding backends at runtime.
 ///
 /// Mirrors `AnyLlmClient` but for the `EmbeddingClient` trait.
@@ -391,11 +533,12 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
 
     // Build the per-connection client registry from the [connections] map
-    // (#9). The primary dispatch target ("active" connection) is the first
-    // declared connection that built successfully; #10 will replace this with
-    // a purpose-driven lookup. Connections that fail to build are logged and
+    // (#9). Purpose-based dispatch (#10 + #11) picks the right client per
+    // request via `registry.get(&purpose_resolved.connection_id)`;
+    // the legacy "active connection" fast-path from #9 is no longer the
+    // primary dispatch. Connections that fail to build are logged and
     // marked unavailable — the daemon still starts.
-    let mut connection_registry = match daemon_config.as_ref() {
+    let connection_registry = match daemon_config.as_ref() {
         Some(config) => build_registry(config),
         None => registry::ConnectionRegistry::empty(),
     };
@@ -428,21 +571,58 @@ async fn main() -> Result<()> {
     let llm_connector = resolved_llm.connector.clone();
     let llm_api_key = resolved_llm.api_key.clone();
 
-    // Take the active connection's client out of the registry to feed the
-    // conversation handler. The registry retains status for diagnostics.
-    let (active_id, llm) = match connection_registry.take_active() {
-        Some((id, client)) => {
-            tracing::info!("dispatching requests through connection {id}");
-            (Some(id), client)
+    // Resolve the `interactive` purpose and grab its client from the
+    // registry. This is the primary dispatch target for `send_prompt`
+    // (without an override) and for the conversation handler's built-in
+    // fallback path. `registry.get(&id)` gives us a borrow rather than
+    // moving the client out of the map, which is what #11 needs so other
+    // connections (for cross-connection send overrides) stay available.
+    //
+    // Rather than teaching `ConversationHandler` to borrow from the
+    // registry (which would require a lifetime on the handler that
+    // propagates into every adapter), we build a single primary client by
+    // re-resolving the interactive purpose and calling `build_llm_client`
+    // a second time. It's a duplicate client but the cost is one extra
+    // HTTP client allocation — the registry clients stay live for the
+    // connection-listing and model-listing APIs.
+    let primary_resolved = match daemon_config
+        .as_ref()
+        .and_then(|c| c.purposes.interactive.clone())
+    {
+        Some(interactive) => {
+            let connection_id = match &interactive.connection {
+                purposes::ConnectionRef::Named(id) => Some(id.clone()),
+                purposes::ConnectionRef::Primary => None,
+            };
+            if let Some(id) = connection_id
+                && let (Some(cfg), Some(conn)) = (
+                    daemon_config.as_ref(),
+                    daemon_config
+                        .as_ref()
+                        .and_then(|c| c.connections.get(id.as_str()).cloned()),
+                )
+            {
+                Some((id, config::resolve_connection_llm_config(&conn, Some(&cfg.llm))))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    let (active_id, llm) = match primary_resolved {
+        Some((id, resolved)) => {
+            tracing::info!(
+                "primary dispatch via interactive purpose → connection {id}"
+            );
+            (Some(id), build_llm_client(resolved))
         }
         None => {
-            // No usable connection. Fall back to a client built from the
-            // legacy `[llm]` block so the daemon still comes up — this
-            // matches pre-#9 behaviour while making the failure visible in
-            // the registry status. Once #10 lands and purposes become the
-            // only dispatch path, this fallback can go away.
+            // No `[purposes.interactive]` configured — fall back to the
+            // legacy `[llm]` block so the daemon still comes up. Users on
+            // fresh installs land here until they finish purpose migration.
             tracing::warn!(
-                "no healthy connection available; falling back to legacy [llm] client (daemon will still run but requests will likely fail until a connection is configured)"
+                "no interactive purpose configured; falling back to legacy [llm] client"
             );
             (None, build_llm_client(resolved_llm.clone()))
         }
@@ -946,8 +1126,13 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Build the conversation service with tool support
-    let conversation_store: AnyConversationStore = if let Some(pool) = &pg_pool {
+    // Build the conversation service with tool support. The store is shared
+    // between the core `ConversationHandler` (for CRUD + append) and the
+    // `RoutingConversationHandler` wrapper (for the per-conversation model
+    // selection column, #11) so we wrap it in
+    // `Arc<SharedConversationStore>` (a local newtype that lets us impl
+    // `ConversationStore` for the Arc despite the orphan rule).
+    let inner_store: AnyConversationStore = if let Some(pool) = &pg_pool {
         tracing::info!("using PostgreSQL conversation store");
         AnyConversationStore::Postgres(desktop_assistant_storage::PgConversationStore::new(
             pool.clone(),
@@ -962,6 +1147,7 @@ async fn main() -> Result<()> {
         );
         AnyConversationStore::Json(store)
     };
+    let conversation_store = SharedConversationStore(Arc::new(inner_store));
 
     let llm = RetryingLlmClient::new(llm, 3);
     let llm = MaybeProfiled::from_config(
@@ -971,7 +1157,7 @@ async fn main() -> Result<()> {
         profiling.full_content,
     );
     let mut handler = ConversationHandler::with_tools(
-        conversation_store,
+        conversation_store.clone(),
         llm,
         tool_executor,
         Box::new(|| uuid::Uuid::now_v7().to_string()),
@@ -1000,7 +1186,33 @@ async fn main() -> Result<()> {
         handler = handler.with_backend_llm(bt_llm);
     }
 
-    let conversation_service = Arc::new(handler);
+    // Build the shared registry handle (#11): wraps the in-memory
+    // `ConnectionRegistry` plus the loaded `DaemonConfig` behind a single
+    // `RwLock` so the connections-management API can mutate config + rebuild
+    // the registry atomically.
+    let registry_handle = Arc::new(
+        api_surface::RegistryHandle::new(
+            daemon_config.clone().unwrap_or_default(),
+            connection_registry,
+        )
+        .with_config_path(config_path.clone()),
+    );
+
+    // Wrap the core `ConversationHandler` in the routing wrapper so adapters
+    // can call `send_prompt_with_override` and have the override/stored-
+    // selection priority path applied.
+    let inner_conv = Arc::new(handler);
+    let routing_conv = Arc::new(api_surface::RoutingConversationHandler::new(
+        Arc::clone(&inner_conv),
+        Arc::new(conversation_store),
+        Arc::clone(&registry_handle),
+    ));
+    let conversation_service = routing_conv;
+
+    let connections_service = Arc::new(api_surface::DaemonConnectionsService::new(
+        Arc::clone(&registry_handle),
+    ));
+
     let settings_service =
         Arc::new(DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle));
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
@@ -1083,6 +1295,7 @@ async fn main() -> Result<()> {
         Arc::new(Assistant),
         Arc::clone(&conversation_service),
         Arc::clone(&settings_service),
+        Arc::clone(&connections_service),
     ));
 
     // Build auth validator: OIDC-aware if configured, otherwise local-only
