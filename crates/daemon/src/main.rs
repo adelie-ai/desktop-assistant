@@ -7,7 +7,7 @@ use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespac
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, RetryingLlmClient,
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, RetryingLlmClient,
 };
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tracing_subscriber::EnvFilter;
@@ -397,6 +397,24 @@ impl LlmClient for AnyLlmClient {
             Self::Bedrock(c) => c.max_context_tokens(),
             Self::OpenAi(c) => c.max_context_tokens(),
             Self::Ollama(c) => c.max_context_tokens(),
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        match self {
+            Self::Anthropic(c) => c.list_models().await,
+            Self::Bedrock(c) => c.list_models().await,
+            Self::OpenAi(c) => c.list_models().await,
+            Self::Ollama(c) => c.list_models().await,
+        }
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        match self {
+            Self::Anthropic(c) => c.refresh_models().await,
+            Self::Bedrock(c) => c.refresh_models().await,
+            Self::OpenAi(c) => c.refresh_models().await,
+            Self::Ollama(c) => c.refresh_models().await,
         }
     }
 
