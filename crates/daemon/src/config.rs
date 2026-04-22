@@ -13,7 +13,8 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
 use crate::connections::{
-    ConnectionConfig, ConnectionId, ConnectionsError, ConnectionsMap, connection_from_legacy_llm,
+    AnthropicConnection, BedrockConnection, ConnectionConfig, ConnectionId, ConnectionsError,
+    ConnectionsMap, OllamaConnection, OpenAiConnection, connection_from_legacy_llm,
 };
 use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
 
@@ -1376,6 +1377,128 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
     let max_tokens = llm_config.and_then(|c| c.max_tokens);
     let hosted_tool_search = llm_config.and_then(|c| c.hosted_tool_search);
     let aws_profile = llm_config.and_then(|c| c.aws_profile.clone());
+
+    ResolvedLlmConfig {
+        connector,
+        model,
+        base_url,
+        api_key,
+        temperature,
+        top_p,
+        max_tokens,
+        hosted_tool_search,
+        aws_profile,
+    }
+}
+
+/// Resolve a per-connection [`ResolvedLlmConfig`] from a [`ConnectionConfig`].
+///
+/// Used by the connection registry (#9) to build one client per declared
+/// connection. A [`ConnectionConfig`] holds only connector-identity fields
+/// (endpoint, credentials, aws profile); it does not carry model, temperature,
+/// hosted-tool-search, or `max_tokens` — those belong to purpose configs
+/// (#10), which will supply overrides at dispatch time.
+///
+/// For now, this resolver fills the missing per-purpose fields from
+/// `fallback_llm` (the top-level `[llm]` block) when present, then from
+/// connector defaults / env vars. That keeps existing single-config installs
+/// working until #10 lands.
+pub fn resolve_connection_llm_config(
+    connection: &ConnectionConfig,
+    fallback_llm: Option<&LlmConfig>,
+) -> ResolvedLlmConfig {
+    let connector = connection.connector_type().to_string();
+    let default_api_key_env = default_api_key_env(&connector);
+    let default_model_env = default_model_env(&connector);
+    let default_base_url_env = default_base_url_env(&connector);
+
+    // Per-connector fields.
+    let (conn_base_url, conn_api_key_env, conn_secret, conn_aws_profile): (
+        Option<String>,
+        Option<String>,
+        Option<SecretConfig>,
+        Option<String>,
+    ) = match connection {
+        ConnectionConfig::OpenAi(OpenAiConnection {
+            base_url,
+            api_key_env,
+            secret,
+        })
+        | ConnectionConfig::Anthropic(AnthropicConnection {
+            base_url,
+            api_key_env,
+            secret,
+        }) => (
+            base_url.clone(),
+            api_key_env.clone(),
+            secret.clone(),
+            None,
+        ),
+        ConnectionConfig::Ollama(OllamaConnection { base_url }) => {
+            (base_url.clone(), None, None, None)
+        }
+        ConnectionConfig::Bedrock(BedrockConnection {
+            aws_profile,
+            region,
+            base_url,
+        }) => {
+            // Bedrock historically used `base_url` to encode the region when
+            // no explicit URL was set. Preserve that shape: prefer `base_url`,
+            // fall back to `region`.
+            let effective_base = base_url
+                .clone()
+                .or_else(|| region.clone())
+                .filter(|v| !v.trim().is_empty());
+            (effective_base, None, None, aws_profile.clone())
+        }
+    };
+
+    // API key: connection secret → connection env var → fallback env var.
+    let api_key_env_name = conn_api_key_env
+        .as_deref()
+        .unwrap_or(default_api_key_env.as_str());
+    let mut api_key = conn_secret
+        .as_ref()
+        .and_then(|secret| read_secret_from_backend(secret, &connector))
+        .unwrap_or_default();
+    if api_key.is_empty() {
+        api_key = std::env::var(api_key_env_name).unwrap_or_default();
+    }
+
+    // Base URL resolution.
+    let base_url = conn_base_url
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var(&default_base_url_env).ok())
+        .unwrap_or_else(|| match connector.as_str() {
+            "ollama" => "http://localhost:11434".to_string(),
+            "anthropic" => "https://api.anthropic.com".to_string(),
+            "bedrock" | "aws-bedrock" => "us-east-1".to_string(),
+            _ => "https://api.openai.com/v1".to_string(),
+        });
+
+    // Model / tuning: not on the connection. Use the legacy `[llm]` block as
+    // a placeholder until purpose configs (#10) provide per-request overrides.
+    // If the fallback's connector differs from this connection's, its `model`
+    // value is wrong for this connector, so we skip it.
+    let fallback_model = fallback_llm
+        .filter(|c| c.connector.trim().to_lowercase() == connector)
+        .and_then(|c| c.model.clone())
+        .filter(|v| !v.trim().is_empty());
+    let model = fallback_model
+        .or_else(|| std::env::var(&default_model_env).ok())
+        .unwrap_or_else(|| default_llm_model(&connector));
+
+    let (temperature, top_p, max_tokens, hosted_tool_search) = fallback_llm
+        .filter(|c| c.connector.trim().to_lowercase() == connector)
+        .map(|c| (c.temperature, c.top_p, c.max_tokens, c.hosted_tool_search))
+        .unwrap_or((None, None, None, None));
+
+    let aws_profile = conn_aws_profile
+        .or_else(|| {
+            fallback_llm
+                .filter(|c| c.connector.trim().to_lowercase() == connector)
+                .and_then(|c| c.aws_profile.clone())
+        });
 
     ResolvedLlmConfig {
         connector,
