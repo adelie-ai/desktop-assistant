@@ -174,7 +174,7 @@ pub struct ConnectionStatus {
 /// and stores them behind the handler's own `Arc`. `IndexMap` preserves
 /// declaration order so [`ConnectionRegistry::active_connection`] is stable.
 pub struct ConnectionRegistry {
-    clients: IndexMap<ConnectionId, AnyLlmClient>,
+    clients: IndexMap<ConnectionId, std::sync::Arc<AnyLlmClient>>,
     status: IndexMap<ConnectionId, ConnectionStatus>,
     active: Option<ConnectionId>,
 }
@@ -197,8 +197,13 @@ impl ConnectionRegistry {
 
     /// Look up a live client by connection id. Returns `None` for unknown ids
     /// and for ids whose client failed to build.
-    pub fn get(&self, id: &ConnectionId) -> Option<&AnyLlmClient> {
-        self.clients.get(id)
+    ///
+    /// Returns a cloned `Arc` handle so callers can await `stream_completion`
+    /// without holding the registry lock — required by the #11 routing
+    /// handler, which resolves connections under a read lock and then
+    /// dispatches async.
+    pub fn get(&self, id: &ConnectionId) -> Option<std::sync::Arc<AnyLlmClient>> {
+        self.clients.get(id).cloned()
     }
 
     /// Status of every declared connection in declaration order (includes
@@ -240,11 +245,12 @@ impl ConnectionRegistry {
 
     /// Move the active client out of the registry.
     ///
-    /// Used by daemon startup to hand the active connection's client to the
-    /// `ConversationHandler` (which wraps it in retry/profiling layers and
-    /// takes ownership). The remaining clients stay in the registry for
-    /// future dispatch work (#10/#11).
-    pub fn take_active(&mut self) -> Option<(ConnectionId, AnyLlmClient)> {
+    /// Used by pre-#11 daemon startup (before purpose-based dispatch) to
+    /// hand the active connection's client to the `ConversationHandler`.
+    /// Under #11 dispatch is purpose-driven and callers use
+    /// [`ConnectionRegistry::get`] instead; this accessor is retained for
+    /// diagnostics and legacy tests.
+    pub fn take_active(&mut self) -> Option<(ConnectionId, std::sync::Arc<AnyLlmClient>)> {
         let id = self.active.clone()?;
         let client = self.clients.shift_remove(&id)?;
         Some((id, client))
@@ -402,7 +408,7 @@ fn build_one(
 /// registry is built from the top-level `[llm]` block under a synthetic id
 /// `default` so existing installs keep working until migration completes.
 pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
-    let mut clients: IndexMap<ConnectionId, AnyLlmClient> = IndexMap::new();
+    let mut clients: IndexMap<ConnectionId, std::sync::Arc<AnyLlmClient>> = IndexMap::new();
     let mut status: IndexMap<ConnectionId, ConnectionStatus> = IndexMap::new();
 
     let validated = match config.validated_connections() {
@@ -420,7 +426,7 @@ pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
         for (id, conn) in map.iter() {
             let (client, st) = build_one(id, conn, config);
             if let Some(c) = client {
-                clients.insert(id.clone(), c);
+                clients.insert(id.clone(), std::sync::Arc::new(c));
             }
             status.insert(id.clone(), st);
         }
@@ -441,7 +447,7 @@ pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
                     model = %resolved.model,
                     "building legacy default connection client"
                 );
-                clients.insert(id.clone(), build_llm_client(resolved));
+                clients.insert(id.clone(), std::sync::Arc::new(build_llm_client(resolved)));
                 status.insert(
                     id.clone(),
                     ConnectionStatus {
@@ -651,11 +657,11 @@ mod tests {
         let client_bedrock = registry.get(&bedrock_id).expect("bedrock present");
 
         assert!(
-            matches!(client_ollama, AnyLlmClient::Ollama(_)),
+            matches!(&*client_ollama, AnyLlmClient::Ollama(_)),
             "ollama id should map to Ollama variant"
         );
         assert!(
-            matches!(client_bedrock, AnyLlmClient::Bedrock(_)),
+            matches!(&*client_bedrock, AnyLlmClient::Bedrock(_)),
             "aws id should map to Bedrock variant"
         );
 
