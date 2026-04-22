@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_core::ports::inbound::{
-    AssistantService, ConversationService, SettingsService,
+    AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
+    ConversationService, DispatchWarning, Effort, PromptSelectionOverride, PurposeConfigPayload,
+    PurposeKind, SettingsService,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -41,6 +43,23 @@ pub trait AssistantApiHandler: Send + Sync {
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()>;
+
+    /// Handle a streaming `SendMessage` with an optional per-send model
+    /// override. The default implementation ignores the override and
+    /// forwards to `handle_send_message`; the concrete handler overrides
+    /// this to thread the override through.
+    async fn handle_send_message_with_override(
+        &self,
+        conversation_id: String,
+        content: String,
+        override_selection: Option<api::SendPromptOverride>,
+        request_id: String,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        let _ = override_selection;
+        self.handle_send_message(conversation_id, content, request_id, sink)
+            .await
+    }
 }
 
 /// Minimal sink for emitting canonical events.
@@ -54,28 +73,37 @@ pub trait EventSink: Send + Sync {
 
 const STREAM_EVENT_BUFFER: usize = 64;
 
-pub struct DefaultAssistantApiHandler<A, C, S>
+pub struct DefaultAssistantApiHandler<A, C, S, N>
 where
     A: AssistantService + 'static,
     C: ConversationService + 'static,
     S: SettingsService + 'static,
+    N: ConnectionsService + 'static,
 {
     assistant: Arc<A>,
     conversations: Arc<C>,
     settings: Arc<S>,
+    connections: Arc<N>,
 }
 
-impl<A, C, S> DefaultAssistantApiHandler<A, C, S>
+impl<A, C, S, N> DefaultAssistantApiHandler<A, C, S, N>
 where
     A: AssistantService + 'static,
     C: ConversationService + 'static,
     S: SettingsService + 'static,
+    N: ConnectionsService + 'static,
 {
-    pub fn new(assistant: Arc<A>, conversations: Arc<C>, settings: Arc<S>) -> Self {
+    pub fn new(
+        assistant: Arc<A>,
+        conversations: Arc<C>,
+        settings: Arc<S>,
+        connections: Arc<N>,
+    ) -> Self {
         Self {
             assistant,
             conversations,
             settings,
+            connections,
         }
     }
 
@@ -95,11 +123,6 @@ where
     }
 
     async fn get_config(&self) -> ApiResult<api::Config> {
-        let llm = self
-            .settings
-            .get_llm_settings()
-            .await
-            .map_err(Self::map_core_err)?;
         let embeddings = self
             .settings
             .get_embeddings_settings()
@@ -112,16 +135,6 @@ where
             .map_err(Self::map_core_err)?;
 
         Ok(api::Config {
-            llm: api::LlmSettingsView {
-                connector: llm.connector,
-                model: llm.model,
-                base_url: llm.base_url,
-                has_api_key: llm.has_api_key,
-                temperature: llm.temperature,
-                top_p: llm.top_p,
-                max_tokens: llm.max_tokens,
-                hosted_tool_search: llm.hosted_tool_search,
-            },
             embeddings: api::EmbeddingsSettingsView {
                 connector: embeddings.connector,
                 model: embeddings.model,
@@ -142,10 +155,6 @@ where
     async fn set_config(&self, changes: api::ConfigChanges) -> ApiResult<api::Config> {
         let current = self.get_config().await?;
         let api::ConfigChanges {
-            llm_connector,
-            llm_model,
-            llm_base_url,
-            llm_api_key,
             embeddings_connector,
             embeddings_model,
             embeddings_base_url,
@@ -153,74 +162,7 @@ where
             persistence_remote_url,
             persistence_remote_name,
             persistence_push_on_update,
-            llm_temperature,
-            llm_top_p,
-            llm_max_tokens,
-            llm_hosted_tool_search,
         } = changes;
-
-        let llm_changed = llm_connector.is_some()
-            || llm_model.is_some()
-            || llm_base_url.is_some()
-            || llm_temperature.is_some()
-            || llm_top_p.is_some()
-            || llm_max_tokens.is_some()
-            || llm_hosted_tool_search.is_some();
-        if llm_changed {
-            let connector = Self::normalize_optional_string(llm_connector)
-                .unwrap_or_else(|| current.llm.connector.clone());
-            let model = if llm_model.is_some() {
-                Self::normalize_optional_string(llm_model)
-            } else {
-                Some(current.llm.model.clone())
-            };
-            let base_url = if llm_base_url.is_some() {
-                Self::normalize_optional_string(llm_base_url)
-            } else {
-                Some(current.llm.base_url.clone())
-            };
-
-            let temperature = if llm_temperature.is_some() {
-                llm_temperature
-            } else {
-                current.llm.temperature
-            };
-            let top_p = if llm_top_p.is_some() {
-                llm_top_p
-            } else {
-                current.llm.top_p
-            };
-            let max_tokens = if llm_max_tokens.is_some() {
-                llm_max_tokens
-            } else {
-                current.llm.max_tokens
-            };
-            let hosted_tool_search = if llm_hosted_tool_search.is_some() {
-                llm_hosted_tool_search
-            } else {
-                current.llm.hosted_tool_search
-            };
-
-            self.settings
-                .set_llm_settings(
-                    connector,
-                    model,
-                    base_url,
-                    temperature,
-                    top_p,
-                    max_tokens,
-                    hosted_tool_search,
-                )
-                .await
-                .map_err(Self::map_core_err)?;
-        }
-
-        if let Some(api_key) = Self::normalize_optional_string(llm_api_key) {
-            self.settings
-                .set_api_key(api_key)
-                .await
-                .map_err(Self::map_core_err)?;
-        }
 
         let embeddings_changed = embeddings_connector.is_some()
             || embeddings_model.is_some()
@@ -281,12 +223,144 @@ where
     }
 }
 
+// ---- Conversion helpers between api-model wire types and core port types ----
+
+fn api_connection_config_to_core(c: api::ConnectionConfigView) -> ConnectionConfigPayload {
+    match c {
+        api::ConnectionConfigView::Anthropic {
+            base_url,
+            api_key_env,
+        } => ConnectionConfigPayload::Anthropic {
+            base_url,
+            api_key_env,
+        },
+        api::ConnectionConfigView::OpenAi {
+            base_url,
+            api_key_env,
+        } => ConnectionConfigPayload::OpenAi {
+            base_url,
+            api_key_env,
+        },
+        api::ConnectionConfigView::Bedrock {
+            aws_profile,
+            region,
+            base_url,
+        } => ConnectionConfigPayload::Bedrock {
+            aws_profile,
+            region,
+            base_url,
+        },
+        api::ConnectionConfigView::Ollama { base_url } => {
+            ConnectionConfigPayload::Ollama { base_url }
+        }
+    }
+}
+
+fn core_connection_to_api_view(
+    v: desktop_assistant_core::ports::inbound::ConnectionView,
+) -> api::ConnectionView {
+    api::ConnectionView {
+        id: v.id,
+        connector_type: v.connector_type,
+        display_label: v.display_label,
+        availability: match v.availability {
+            ConnectionAvailability::Ok => api::ConnectionAvailability::Ok,
+            ConnectionAvailability::Unavailable { reason } => {
+                api::ConnectionAvailability::Unavailable { reason }
+            }
+        },
+        has_credentials: v.has_credentials,
+    }
+}
+
+fn core_model_listing_to_api(
+    l: desktop_assistant_core::ports::inbound::ModelListing,
+) -> api::ModelListing {
+    api::ModelListing {
+        connection_id: l.connection_id,
+        connection_label: l.connection_label,
+        model: api::ModelInfoView {
+            id: l.model.id,
+            display_name: l.model.display_name,
+            context_limit: l.model.context_limit,
+            capabilities: api::ModelCapabilitiesView {
+                reasoning: l.model.capabilities.reasoning,
+                vision: l.model.capabilities.vision,
+                tools: l.model.capabilities.tools,
+                embedding: l.model.capabilities.embedding,
+            },
+        },
+    }
+}
+
+fn core_purpose_to_api(p: PurposeConfigPayload) -> api::PurposeConfigView {
+    api::PurposeConfigView {
+        connection: p.connection,
+        model: p.model,
+        effort: p.effort.map(effort_to_api),
+    }
+}
+
+fn api_purpose_to_core(p: api::PurposeConfigView) -> PurposeConfigPayload {
+    PurposeConfigPayload {
+        connection: p.connection,
+        model: p.model,
+        effort: p.effort.map(effort_from_api),
+    }
+}
+
+fn effort_to_api(e: Effort) -> api::EffortLevel {
+    match e {
+        Effort::Low => api::EffortLevel::Low,
+        Effort::Medium => api::EffortLevel::Medium,
+        Effort::High => api::EffortLevel::High,
+    }
+}
+
+fn effort_from_api(e: api::EffortLevel) -> Effort {
+    match e {
+        api::EffortLevel::Low => Effort::Low,
+        api::EffortLevel::Medium => Effort::Medium,
+        api::EffortLevel::High => Effort::High,
+    }
+}
+
+fn api_purpose_kind_to_core(k: api::PurposeKindApi) -> PurposeKind {
+    match k {
+        api::PurposeKindApi::Interactive => PurposeKind::Interactive,
+        api::PurposeKindApi::Dreaming => PurposeKind::Dreaming,
+        api::PurposeKindApi::Embedding => PurposeKind::Embedding,
+        api::PurposeKindApi::Titling => PurposeKind::Titling,
+    }
+}
+
+fn dispatch_warning_to_api(w: DispatchWarning) -> api::ConversationWarning {
+    match w {
+        DispatchWarning::DanglingModelSelection {
+            previous,
+            fallback_to,
+        } => api::ConversationWarning::DanglingModelSelection {
+            previous_selection: api::ConversationModelSelectionView {
+                connection_id: previous.connection_id,
+                model_id: previous.model_id,
+                effort: previous.effort.map(|e| effort_to_api(Effort::from(e))),
+            },
+            fallback_to: api::ConversationModelSelectionView {
+                connection_id: fallback_to.connection_id,
+                model_id: fallback_to.model_id,
+                effort: fallback_to.effort.map(|e| effort_to_api(Effort::from(e))),
+            },
+        },
+    }
+}
+
 #[async_trait::async_trait]
-impl<A, C, S> AssistantApiHandler for DefaultAssistantApiHandler<A, C, S>
+impl<A, C, S, N> AssistantApiHandler for DefaultAssistantApiHandler<A, C, S, N>
 where
     A: AssistantService + 'static,
     C: ConversationService + 'static,
     S: SettingsService + 'static,
+    N: ConnectionsService + 'static,
 {
     async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult> {
         match cmd {
@@ -359,6 +433,7 @@ where
                             content: m.content,
                         })
                         .collect(),
+                    warnings: Vec::new(),
                 }))
             }
 
@@ -413,46 +488,6 @@ where
             }
 
             // Settings
-            api::Command::GetLlmSettings => {
-                let s = self
-                    .settings
-                    .get_llm_settings()
-                    .await
-                    .map_err(Self::map_core_err)?;
-                Ok(api::CommandResult::LlmSettings(api::LlmSettingsView {
-                    connector: s.connector,
-                    model: s.model,
-                    base_url: s.base_url,
-                    has_api_key: s.has_api_key,
-                    temperature: s.temperature,
-                    top_p: s.top_p,
-                    max_tokens: s.max_tokens,
-                    hosted_tool_search: s.hosted_tool_search,
-                }))
-            }
-
-            api::Command::SetLlmSettings {
-                connector,
-                model,
-                base_url,
-                temperature,
-                top_p,
-                max_tokens,
-            } => {
-                self.settings
-                    .set_llm_settings(
-                        connector,
-                        model,
-                        base_url,
-                        temperature,
-                        top_p,
-                        max_tokens,
-                        None,
-                    )
-                    .await
-                    .map_err(Self::map_core_err)?;
-                Ok(api::CommandResult::Ack)
-            }
 
             api::Command::SetApiKey { api_key } => {
                 self.settings
@@ -615,6 +650,81 @@ where
                 ))
             }
 
+            // Named connections (#11)
+            api::Command::ListConnections => {
+                let views = self
+                    .connections
+                    .list_connections()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Connections(
+                    views.into_iter().map(core_connection_to_api_view).collect(),
+                ))
+            }
+
+            api::Command::CreateConnection { id, config } => {
+                self.connections
+                    .create_connection(id, api_connection_config_to_core(config))
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::UpdateConnection { id, config } => {
+                self.connections
+                    .update_connection(id, api_connection_config_to_core(config))
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::DeleteConnection { id, force } => {
+                self.connections
+                    .delete_connection(id, force)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::ListAvailableModels {
+                connection_id,
+                refresh,
+            } => {
+                let listings = self
+                    .connections
+                    .list_available_models(connection_id, refresh)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Models(
+                    listings.into_iter().map(core_model_listing_to_api).collect(),
+                ))
+            }
+
+            api::Command::GetPurposes => {
+                let p = self
+                    .connections
+                    .get_purposes()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Purposes(api::PurposesView {
+                    interactive: p.interactive.map(core_purpose_to_api),
+                    dreaming: p.dreaming.map(core_purpose_to_api),
+                    embedding: p.embedding.map(core_purpose_to_api),
+                    titling: p.titling.map(core_purpose_to_api),
+                }))
+            }
+
+            api::Command::SetPurpose { purpose, config } => {
+                self.connections
+                    .set_purpose(
+                        api_purpose_kind_to_core(purpose),
+                        api_purpose_to_core(config),
+                    )
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
             // Streamed commands are handled elsewhere.
             api::Command::SendMessage { .. } => Err(ApiError::Unsupported),
         }
@@ -624,6 +734,18 @@ where
         &self,
         conversation_id: String,
         content: String,
+        request_id: String,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        self.handle_send_message_with_override(conversation_id, content, None, request_id, sink)
+            .await
+    }
+
+    async fn handle_send_message_with_override(
+        &self,
+        conversation_id: String,
+        content: String,
+        override_selection: Option<api::SendPromptOverride>,
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
@@ -670,11 +792,18 @@ where
                 });
             });
 
-        let full = self
+        let override_for_core = override_selection.map(|o| PromptSelectionOverride {
+            connection_id: o.connection_id,
+            model_id: o.model_id,
+            effort: o.effort.map(effort_from_api),
+        });
+
+        let outcome = self
             .conversations
-            .send_prompt(
+            .send_prompt_with_override(
                 &desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str()),
                 content,
+                override_for_core,
                 callback,
                 on_status,
             )
@@ -684,8 +813,19 @@ where
             warn!("stream forwarder task failed: {e}");
         }
 
-        match full {
-            Ok(full_response) => {
+        match outcome {
+            Ok(outcome) => {
+                // Emit any one-time advisory warnings before the completion frame.
+                for w in outcome.warnings {
+                    let _ = sink
+                        .emit(api::Event::ConversationWarningEmitted {
+                            conversation_id: conversation_id.clone(),
+                            warning: dispatch_warning_to_api(w),
+                        })
+                        .await;
+                }
+
+                let full_response = outcome.response;
                 let _ = sink
                     .emit(api::Event::AssistantCompleted {
                         conversation_id: conversation_id.clone(),
@@ -736,11 +876,62 @@ mod tests {
     };
     use desktop_assistant_core::ports::inbound::{
         BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
-        EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
+        EmbeddingsSettingsView, LlmSettingsView, ModelListing as CoreModelListing,
+        PersistenceSettingsView, PurposesView as CorePurposesView,
     };
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FakeConnections;
+    impl ConnectionsService for FakeConnections {
+        async fn list_connections(
+            &self,
+        ) -> Result<
+            Vec<desktop_assistant_core::ports::inbound::ConnectionView>,
+            CoreError,
+        > {
+            Ok(vec![])
+        }
+        async fn create_connection(
+            &self,
+            _id: String,
+            _config: ConnectionConfigPayload,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn update_connection(
+            &self,
+            _id: String,
+            _config: ConnectionConfigPayload,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn delete_connection(
+            &self,
+            _id: String,
+            _force: bool,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn list_available_models(
+            &self,
+            _connection_id: Option<String>,
+            _refresh: bool,
+        ) -> Result<Vec<CoreModelListing>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_purposes(&self) -> Result<CorePurposesView, CoreError> {
+            Ok(CorePurposesView::default())
+        }
+        async fn set_purpose(
+            &self,
+            _purpose: PurposeKind,
+            _config: PurposeConfigPayload,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
 
     struct FakeAssistant;
     impl AssistantService for FakeAssistant {
@@ -1025,6 +1216,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn snapshot(&self) -> SettingsState {
             self.state.lock().unwrap().clone()
         }
@@ -1310,6 +1502,7 @@ mod tests {
             Arc::new(FakeAssistant),
             Arc::new(FakeConversations),
             Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
         );
 
         let res = h.handle_command(api::Command::Ping).await.unwrap();
@@ -1327,6 +1520,7 @@ mod tests {
             Arc::new(FakeAssistant),
             Arc::new(FakeConversations),
             Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
         );
 
         let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
@@ -1349,6 +1543,7 @@ mod tests {
                 aborted: Arc::clone(&aborted),
             }),
             Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
         );
 
         h.handle_send_message("c1".into(), "hi".into(), "r1".into(), Arc::new(DropSink))
@@ -1365,6 +1560,7 @@ mod tests {
             Arc::new(FakeAssistant),
             Arc::new(FakeConversations),
             Arc::clone(&settings),
+            Arc::new(FakeConnections),
         );
 
         let res = h.handle_command(api::Command::GetConfig).await.unwrap();
@@ -1372,7 +1568,6 @@ mod tests {
             panic!("unexpected result variant");
         };
 
-        assert_eq!(config.llm.connector, "openai");
         assert_eq!(config.embeddings.model, "text-embedding-3-small");
         assert_eq!(config.persistence.remote_name, "origin");
     }
@@ -1384,15 +1579,14 @@ mod tests {
             Arc::new(FakeAssistant),
             Arc::new(FakeConversations),
             Arc::clone(&settings),
+            Arc::new(FakeConnections),
         );
 
         let res = h
             .handle_command(api::Command::SetConfig {
                 changes: api::ConfigChanges {
-                    llm_connector: Some("ollama".into()),
-                    llm_model: Some("llama3.1:8b".into()),
-                    llm_base_url: Some("http://localhost:11434".into()),
-                    llm_api_key: Some("test-key".into()),
+                    embeddings_connector: Some("openai".into()),
+                    embeddings_model: Some("text-embedding-3-large".into()),
                     persistence_enabled: Some(true),
                     persistence_remote_url: Some("git@example.com/repo.git".into()),
                     persistence_remote_name: Some("upstream".into()),
@@ -1406,12 +1600,8 @@ mod tests {
         let api::CommandResult::Config(config) = res else {
             panic!("unexpected result variant");
         };
-        assert_eq!(config.llm.connector, "ollama");
-        assert_eq!(config.llm.model, "llama3.1:8b");
+        assert_eq!(config.embeddings.model, "text-embedding-3-large");
         assert_eq!(config.persistence.remote_name, "upstream");
-        assert!(config.llm.has_api_key);
-
-        let snapshot = settings.snapshot();
-        assert!(snapshot.api_key_set);
+        assert!(!config.persistence.push_on_update);
     }
 }

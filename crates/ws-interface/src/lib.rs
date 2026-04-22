@@ -262,6 +262,7 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
                     api::Command::SendMessage {
                         conversation_id,
                         content,
+                        override_selection,
                     } => {
                         // Stream via events; acknowledge immediately.
                         let request_id = uuid::Uuid::new_v4().to_string();
@@ -281,7 +282,13 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
                         let handler = Arc::clone(&state.handler);
                         tokio::spawn(async move {
                             let _ = handler
-                                .handle_send_message(conversation_id, content, request_id, sink)
+                                .handle_send_message_with_override(
+                                    conversation_id,
+                                    content,
+                                    override_selection,
+                                    request_id,
+                                    sink,
+                                )
                                 .await;
                         });
                     }

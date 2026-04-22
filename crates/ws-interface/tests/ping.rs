@@ -15,11 +15,59 @@ use tower::ServiceExt;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
 use desktop_assistant_core::ports::inbound::{
-    AssistantService, BackendTasksSettingsView, ConnectorDefaultsView, ConversationService,
-    DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView,
-    SettingsService, WsAuthSettingsView,
+    AssistantService, BackendTasksSettingsView, ConnectionConfigPayload,
+    ConnectionView as CoreConnectionView, ConnectorDefaultsView, ConversationService,
+    ConnectionsService, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
+    ModelListing as CoreModelListing, PersistenceSettingsView, PurposeConfigPayload,
+    PurposeKind as CorePurposeKind, PurposesView as CorePurposesView, SettingsService,
+    WsAuthSettingsView,
 };
 use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
+
+struct FakeConnections;
+impl ConnectionsService for FakeConnections {
+    async fn list_connections(&self) -> Result<Vec<CoreConnectionView>, CoreError> {
+        Ok(vec![])
+    }
+    async fn create_connection(
+        &self,
+        _id: String,
+        _config: ConnectionConfigPayload,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn update_connection(
+        &self,
+        _id: String,
+        _config: ConnectionConfigPayload,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn delete_connection(
+        &self,
+        _id: String,
+        _force: bool,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn list_available_models(
+        &self,
+        _connection_id: Option<String>,
+        _refresh: bool,
+    ) -> Result<Vec<CoreModelListing>, CoreError> {
+        Ok(vec![])
+    }
+    async fn get_purposes(&self) -> Result<CorePurposesView, CoreError> {
+        Ok(CorePurposesView::default())
+    }
+    async fn set_purpose(
+        &self,
+        _purpose: CorePurposeKind,
+        _config: PurposeConfigPayload,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
 
 struct FakeAssistant;
 impl AssistantService for FakeAssistant {
@@ -598,6 +646,7 @@ async fn ws_ping_roundtrip() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -651,6 +700,7 @@ async fn ws_rejects_missing_bearer_token() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -685,6 +735,7 @@ async fn ws_rejects_invalid_bearer_token() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -719,6 +770,7 @@ async fn login_issues_token_for_basic_auth_username() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router_with_login(
@@ -754,6 +806,7 @@ async fn login_rejects_invalid_basic_credentials() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router_with_login(
@@ -782,6 +835,7 @@ async fn ws_get_status_roundtrip() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -835,6 +889,7 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(StatefulSettings::new()),
+        Arc::new(FakeConnections),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -854,10 +909,7 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         id: "cfg-1".into(),
         command: desktop_assistant_api_model::Command::SetConfig {
             changes: desktop_assistant_api_model::ConfigChanges {
-                llm_connector: Some("ollama".into()),
-                llm_model: Some("llama3.1:8b".into()),
-                llm_base_url: Some("http://localhost:11434".into()),
-                llm_api_key: Some("abc123".into()),
+                embeddings_model: Some("text-embedding-3-small".into()),
                 persistence_enabled: Some(true),
                 persistence_remote_name: Some("upstream".into()),
                 ..Default::default()
@@ -884,9 +936,7 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         other => panic!("unexpected frame: {other:?}"),
     };
 
-    assert_eq!(config_from_result.llm.connector, "ollama");
-    assert_eq!(config_from_result.llm.model, "llama3.1:8b");
-    assert!(config_from_result.llm.has_api_key);
+    assert_eq!(config_from_result.embeddings.model, "text-embedding-3-small");
     assert_eq!(config_from_result.persistence.remote_name, "upstream");
 
     let event_frame =
@@ -910,6 +960,7 @@ async fn ws_send_message_ack_then_streaming_events() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -928,6 +979,7 @@ async fn ws_send_message_ack_then_streaming_events() {
     let req = WsRequest {
         id: "3".into(),
         command: desktop_assistant_api_model::Command::SendMessage {
+            override_selection: None,
             conversation_id: "c1".into(),
             content: "hello".into(),
         },
@@ -1018,6 +1070,7 @@ async fn ws_send_message_cancels_when_client_disconnects() {
             cancelled: Arc::clone(&cancelled),
         }),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -1036,6 +1089,7 @@ async fn ws_send_message_cancels_when_client_disconnects() {
     let req = WsRequest {
         id: "4".into(),
         command: desktop_assistant_api_model::Command::SendMessage {
+            override_selection: None,
             conversation_id: "c1".into(),
             content: "cancel-me".into(),
         },
@@ -1077,6 +1131,7 @@ async fn ws_serve_with_shutdown_exits() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1124,6 +1179,7 @@ async fn ws_allows_native_client_without_origin() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     // Empty allowlist — but no Origin header means native client, should be allowed.
@@ -1165,6 +1221,7 @@ async fn ws_rejects_browser_origin_when_allowlist_empty() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, vec![]);
@@ -1203,6 +1260,7 @@ async fn ws_allows_configured_origin() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];
@@ -1246,6 +1304,7 @@ async fn ws_rejects_non_matching_origin() {
         Arc::new(FakeAssistant),
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
     ));
 
     let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];
