@@ -259,6 +259,7 @@ impl WsClient {
             .send_command(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),
                 content: prompt.to_string(),
+                override_selection: None,
             })
             .await?;
         let api::CommandResult::Ack = result else {
@@ -325,6 +326,9 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             message,
         }),
         api::Event::ConfigChanged { .. } => None,
+        // Conversation advisories surface via a separate channel on the
+        // desktop UI; the streaming signal enum doesn't carry them yet.
+        api::Event::ConversationWarningEmitted { .. } => None,
     }
 }
 
@@ -369,16 +373,6 @@ mod tests {
     fn ignores_non_stream_config_events() {
         let event = map_event_to_signal(api::Event::ConfigChanged {
             config: api::Config {
-                llm: api::LlmSettingsView {
-                    connector: "openai".to_string(),
-                    model: "gpt-5.4".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    has_api_key: true,
-                    temperature: None,
-                    top_p: None,
-                    max_tokens: None,
-                    hosted_tool_search: None,
-                },
                 embeddings: api::EmbeddingsSettingsView {
                     connector: "openai".to_string(),
                     model: "text-embedding-3-small".to_string(),
