@@ -22,7 +22,7 @@ use std::fmt;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, ModelInfo};
 use indexmap::IndexMap;
 
 use crate::config::{
@@ -68,6 +68,24 @@ impl LlmClient for AnyLlmClient {
             Self::Bedrock(c) => c.max_context_tokens(),
             Self::OpenAi(c) => c.max_context_tokens(),
             Self::Ollama(c) => c.max_context_tokens(),
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        match self {
+            Self::Anthropic(c) => c.list_models().await,
+            Self::Bedrock(c) => c.list_models().await,
+            Self::OpenAi(c) => c.list_models().await,
+            Self::Ollama(c) => c.list_models().await,
+        }
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        match self {
+            Self::Anthropic(c) => c.refresh_models().await,
+            Self::Bedrock(c) => c.refresh_models().await,
+            Self::OpenAi(c) => c.refresh_models().await,
+            Self::Ollama(c) => c.refresh_models().await,
         }
     }
 
