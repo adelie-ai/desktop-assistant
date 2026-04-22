@@ -11,6 +11,106 @@ pub type ChunkCallback = Box<dyn FnMut(String) -> bool + Send>;
 /// (e.g. "Searching knowledge base...", "Querying timeclock sessions...").
 pub type StatusCallback = Box<dyn FnMut(String) + Send>;
 
+tokio::task_local! {
+    /// Per-turn reasoning configuration. Set by the daemon-side routing
+    /// handler via [`with_reasoning_config`] before invoking `send_prompt`;
+    /// read by [`current_reasoning_config`] inside the dispatch loop and
+    /// forwarded to connectors through [`LlmClient::stream_completion`].
+    ///
+    /// Lives in the task-local slot so each concurrent turn can carry a
+    /// distinct reasoning config without any coupling between the routing
+    /// wrapper and the core `ConversationHandler`.
+    static REASONING_CONFIG: ReasoningConfig;
+}
+
+/// Run `fut` with the given reasoning config installed as the current
+/// task-local value. All `current_reasoning_config()` calls inside the
+/// future (and any sub-tasks that inherit the scope) observe `config`.
+pub async fn with_reasoning_config<F, T>(config: ReasoningConfig, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    REASONING_CONFIG.scope(config, fut).await
+}
+
+/// Current task-local reasoning config, or `ReasoningConfig::default()`
+/// (all `None`) when not set. Safe to call from any async context.
+pub fn current_reasoning_config() -> ReasoningConfig {
+    REASONING_CONFIG
+        .try_with(|c| *c)
+        .unwrap_or_default()
+}
+
+/// Reasoning / extended-thinking level for a single LLM turn.
+///
+/// Mirrors the tri-state `Effort` knob that the daemon exposes on
+/// `SendMessage.override`. Kept in core so the `LlmClient` trait is
+/// self-contained and connectors don't take a daemon dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningLevel {
+    /// Lowercase literal used in OpenAI's `reasoning_effort` request field.
+    pub fn as_openai_effort(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Per-turn reasoning configuration threaded from the routing handler
+/// through the `LlmClient` trait into per-connector request bodies.
+///
+/// All fields default to `None`, which means "no reasoning-related fields
+/// in the request body" — i.e. the existing behavior. The daemon-side
+/// routing handler populates the appropriate field based on the caller's
+/// `Effort` hint and the selected connector type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReasoningConfig {
+    /// Anthropic extended-thinking budget in tokens. When `Some(N > 0)`,
+    /// the Anthropic connector adds `thinking: { type: "enabled",
+    /// budget_tokens: N }` to the request. The Bedrock connector forwards
+    /// the same shape via `additionalModelRequestFields` for Claude models.
+    /// `None` or `Some(0)` disables extended thinking.
+    pub thinking_budget_tokens: Option<u32>,
+    /// OpenAI `reasoning_effort` literal. When `Some(level)` and the model
+    /// supports reasoning (o-series / GPT-5 reasoning), the OpenAI
+    /// connector adds `reasoning_effort: "..."` to the request.
+    pub reasoning_effort: Option<ReasoningLevel>,
+}
+
+impl ReasoningConfig {
+    /// Convenience constructor for the Anthropic-flavored side only.
+    pub fn with_thinking_budget(budget: u32) -> Self {
+        Self {
+            thinking_budget_tokens: Some(budget),
+            reasoning_effort: None,
+        }
+    }
+
+    /// Convenience constructor for the OpenAI-flavored side only.
+    pub fn with_reasoning_effort(level: ReasoningLevel) -> Self {
+        Self {
+            thinking_budget_tokens: None,
+            reasoning_effort: Some(level),
+        }
+    }
+
+    /// True when no reasoning-related fields would be added to the
+    /// request body. Used by connectors to skip log spam on the fast
+    /// path.
+    pub fn is_empty(self) -> bool {
+        self.thinking_budget_tokens.is_none() && self.reasoning_effort.is_none()
+    }
+}
+
 /// Token usage statistics from an LLM call.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
@@ -153,11 +253,16 @@ pub trait LlmClient: Send + Sync {
     /// Stream a completion from the LLM given a message history.
     /// Calls `on_chunk` for each text token/chunk received.
     /// Optionally accepts tool definitions to enable tool calling.
+    /// `reasoning` carries optional extended-thinking / reasoning-effort
+    /// hints; connectors may ignore it (Ollama) or translate it into a
+    /// per-API request field (Anthropic `thinking`, OpenAI
+    /// `reasoning_effort`, Bedrock `additionalModelRequestFields`).
     /// Returns an `LlmResponse` which may include tool calls.
     fn stream_completion(
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> impl std::future::Future<Output = Result<LlmResponse, CoreError>> + Send;
 
@@ -177,6 +282,7 @@ pub trait LlmClient: Send + Sync {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> impl std::future::Future<Output = Result<LlmResponse, CoreError>> + Send {
         async move {
@@ -184,7 +290,8 @@ pub trait LlmClient: Send + Sync {
             for ns in namespaces {
                 all.extend(ns.tools.iter().cloned());
             }
-            self.stream_completion(messages, &all, on_chunk).await
+            self.stream_completion(messages, &all, reasoning, on_chunk)
+                .await
         }
     }
 
@@ -262,6 +369,7 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         // Store the real callback behind Arc<Mutex<Option<...>>> so we can
@@ -280,7 +388,11 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
             });
 
             let msgs = messages.clone();
-            match self.inner.stream_completion(msgs, tools, proxy_cb).await {
+            match self
+                .inner
+                .stream_completion(msgs, tools, reasoning, proxy_cb)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(e) if attempt < self.max_retries && is_retryable_error(&e) => {
                     let delay_secs = 1u64 << attempt;
@@ -307,6 +419,7 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let shared_cb: Arc<Mutex<Option<ChunkCallback>>> = Arc::new(Mutex::new(Some(on_chunk)));
@@ -325,7 +438,9 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
             let msgs = messages.clone();
             match self
                 .inner
-                .stream_completion_with_namespaces(msgs, core_tools, namespaces, proxy_cb)
+                .stream_completion_with_namespaces(
+                    msgs, core_tools, namespaces, reasoning, proxy_cb,
+                )
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -368,6 +483,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             let mut full = String::new();
@@ -409,6 +525,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "hi")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(move |chunk| {
                     received_clone.lock().unwrap().push(chunk);
                     true
@@ -434,6 +551,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "hi")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(move |_chunk| {
                     let mut c = count_clone.lock().unwrap();
                     *c += 1;
@@ -516,6 +634,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             let mut count = self.remaining_failures.lock().unwrap();
@@ -543,6 +662,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "hi")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(move |chunk| {
                     received_clone.lock().unwrap().push(chunk);
                     true
@@ -565,6 +685,7 @@ mod tests {
                 &self,
                 _messages: Vec<Message>,
                 _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
                 _on_chunk: ChunkCallback,
             ) -> Result<LlmResponse, CoreError> {
                 Err(CoreError::Llm("invalid API key".into()))
@@ -576,6 +697,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "hi")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(|_| true),
             )
             .await;
@@ -699,6 +821,7 @@ mod tests {
                 &self,
                 _messages: Vec<Message>,
                 _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
                 _on_chunk: ChunkCallback,
             ) -> Result<LlmResponse, CoreError> {
                 Ok(LlmResponse::text(""))
@@ -722,6 +845,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "hi")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(|_| true),
             )
             .await;

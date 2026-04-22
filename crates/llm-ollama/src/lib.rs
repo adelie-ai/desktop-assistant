@@ -1,7 +1,8 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, TokenUsage,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
+    TokenUsage,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -535,8 +536,18 @@ impl LlmClient for OllamaClient {
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
+        // Ollama exposes no standardized reasoning/thinking knob across
+        // community models; log at debug and otherwise ignore. See #18.
+        if !reasoning.is_empty() {
+            tracing::debug!(
+                model = %self.model,
+                ?reasoning,
+                "reasoning hint ignored on Ollama connector (no-op)"
+            );
+        }
         self.ensure_model_available().await?;
 
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
@@ -929,6 +940,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "hi")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(|_| true),
             )
             .await
@@ -939,6 +951,7 @@ mod tests {
             .stream_completion(
                 vec![Message::new(Role::User, "again")],
                 &[],
+                ReasoningConfig::default(),
                 Box::new(|_| true),
             )
             .await

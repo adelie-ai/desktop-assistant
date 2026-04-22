@@ -22,7 +22,9 @@ use std::fmt;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, ModelInfo};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig,
+};
 use indexmap::IndexMap;
 
 use crate::config::{
@@ -93,13 +95,26 @@ impl LlmClient for AnyLlmClient {
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         match self {
-            Self::Anthropic(c) => c.stream_completion(messages, tools, on_chunk).await,
-            Self::Bedrock(c) => c.stream_completion(messages, tools, on_chunk).await,
-            Self::OpenAi(c) => c.stream_completion(messages, tools, on_chunk).await,
-            Self::Ollama(c) => c.stream_completion(messages, tools, on_chunk).await,
+            Self::Anthropic(c) => {
+                c.stream_completion(messages, tools, reasoning, on_chunk)
+                    .await
+            }
+            Self::Bedrock(c) => {
+                c.stream_completion(messages, tools, reasoning, on_chunk)
+                    .await
+            }
+            Self::OpenAi(c) => {
+                c.stream_completion(messages, tools, reasoning, on_chunk)
+                    .await
+            }
+            Self::Ollama(c) => {
+                c.stream_completion(messages, tools, reasoning, on_chunk)
+                    .await
+            }
         }
     }
 
@@ -116,16 +131,21 @@ impl LlmClient for AnyLlmClient {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         match self {
             Self::Anthropic(c) => {
-                c.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
-                    .await
+                c.stream_completion_with_namespaces(
+                    messages, core_tools, namespaces, reasoning, on_chunk,
+                )
+                .await
             }
             Self::OpenAi(c) => {
-                c.stream_completion_with_namespaces(messages, core_tools, namespaces, on_chunk)
-                    .await
+                c.stream_completion_with_namespaces(
+                    messages, core_tools, namespaces, reasoning, on_chunk,
+                )
+                .await
             }
             // Bedrock/Ollama: use default flattening behavior
             _ => {
@@ -133,7 +153,8 @@ impl LlmClient for AnyLlmClient {
                 for ns in namespaces {
                     all.extend(ns.tools.iter().cloned());
                 }
-                self.stream_completion(messages, &all, on_chunk).await
+                self.stream_completion(messages, &all, reasoning, on_chunk)
+                    .await
             }
         }
     }

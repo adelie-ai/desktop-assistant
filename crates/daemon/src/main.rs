@@ -6,7 +6,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
-use desktop_assistant_core::ports::llm::{LlmClient, RetryingLlmClient};
+use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tracing_subscriber::EnvFilter;
 
@@ -1071,7 +1071,12 @@ async fn main() -> Result<()> {
                                 Message::new(Role::User, user_prompt),
                             ];
                             let response = llm
-                                .stream_completion(messages, &[], Box::new(|_| true))
+                                .stream_completion(
+                                    messages,
+                                    &[],
+                                    ReasoningConfig::default(),
+                                    Box::new(|_| true),
+                                )
                                 .await
                                 .map_err(|e| e.to_string())?;
                             Ok(response.text)
