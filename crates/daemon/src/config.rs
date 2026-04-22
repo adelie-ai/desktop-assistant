@@ -7,20 +7,42 @@ use desktop_assistant_llm_anthropic::AnthropicClient;
 use desktop_assistant_llm_bedrock::BedrockClient;
 use desktop_assistant_llm_ollama::OllamaClient;
 use desktop_assistant_llm_openai::OpenAiClient;
+use indexmap::IndexMap;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+
+use crate::connections::{
+    ConnectionConfig, ConnectionId, ConnectionsError, ConnectionsMap, connection_from_legacy_llm,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub llm: LlmConfig,
+    /// Named connector instances. Each entry owns its own credentials and
+    /// endpoint; the `type` tag selects which connector implementation is used.
+    ///
+    /// Populated by deserialize as `IndexMap<String, ConnectionConfig>` so TOML
+    /// parse errors surface before id-slug validation. [`load_daemon_config`]
+    /// re-wraps the map as a validated [`ConnectionsMap`], rejecting invalid
+    /// or duplicate ids.
+    ///
+    /// Note for #9/#10: this map is intentionally not yet wired into
+    /// `build_llm_client` or `resolve_*` — those call sites still read
+    /// `[llm]` / `[backend_tasks.llm]`. See the migration path in
+    /// [`load_daemon_config`] and the deprecation warning emitted there.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub connections: IndexMap<String, ConnectionConfig>,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
+    /// Backend-tasks (dreaming / titling) overrides. The legacy `llm` field is
+    /// preserved as-is through migration; #10 will reshape it into purpose
+    /// configs that reference `connections` by id.
     #[serde(default)]
     pub backend_tasks: BackendTasksConfig,
     #[serde(default)]
@@ -29,6 +51,34 @@ pub struct DaemonConfig {
     pub ws_auth: WsAuthConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+}
+
+impl DaemonConfig {
+    /// Validate the raw `connections` map and return a [`ConnectionsMap`].
+    ///
+    /// Rejects invalid id slugs and duplicates (deserialize preserves insertion
+    /// order, so this is deterministic). An empty map is not itself an error
+    /// here — that check is the caller's responsibility, because a freshly
+    /// created config with no connections is valid during first-run migration.
+    pub fn validated_connections(&self) -> Result<ConnectionsMap, ConnectionsError> {
+        let pairs = self
+            .connections
+            .iter()
+            .map(|(k, v)| {
+                let id = ConnectionId::new(k.clone())?;
+                Ok::<_, ConnectionsError>((id, v.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if pairs.is_empty() {
+            return Err(ConnectionsError::Empty);
+        }
+        ConnectionsMap::from_pairs(pairs)
+    }
+
+    /// Whether the `[connections]` table is present (even if empty).
+    pub fn has_connections(&self) -> bool {
+        !self.connections.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -482,7 +532,130 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     }
 
     let parsed: DaemonConfig = toml::from_str(&content)?;
+    let explicit_connections_table = file_has_top_level_table(&content, "connections");
+    let parsed = maybe_migrate_legacy_connections(path, parsed, &content)?;
+
+    // Validate `[connections]` *after* migration so legacy-only configs still
+    // succeed on first load. Two cases trigger validation:
+    //
+    // 1. The parsed map is non-empty (normal case).
+    // 2. The user wrote an explicit `[connections]` header but left it empty.
+    //    Catching this here surfaces the misconfiguration at startup rather
+    //    than at the first request.
+    if parsed.has_connections() || explicit_connections_table {
+        parsed
+            .validated_connections()
+            .with_context(|| format!("invalid [connections] in {}", path.display()))?;
+    }
+
     Ok(Some(parsed))
+}
+
+/// If the config has a legacy `[llm]` block and no `[connections]`, synthesize
+/// a connection named `default`, write the new form back to disk, and back up
+/// the original to `daemon.toml.bak` (or `.bak.N` if `.bak` already exists).
+///
+/// Also emits a one-time deprecation warning via `tracing::warn!`.
+///
+/// The `backend_tasks.llm` block is preserved as-is for #10 to reshape into a
+/// purpose config. We deliberately do not synthesize a second connection for
+/// it here, because that would force the user to manage two copies of the same
+/// credentials when the common case is "backend tasks share the primary
+/// connector".
+fn maybe_migrate_legacy_connections(
+    path: &Path,
+    mut parsed: DaemonConfig,
+    original_content: &str,
+) -> anyhow::Result<DaemonConfig> {
+    // Detect the legacy case: `[llm]` literally present in the file AND no
+    // `[connections]` table. Using the raw file text for `[llm]` detection
+    // avoids treating serde's default `LlmConfig` as "legacy present".
+    let has_legacy_llm_section = file_has_top_level_table(original_content, "llm");
+    let has_connections_section = file_has_top_level_table(original_content, "connections");
+
+    if !has_legacy_llm_section || has_connections_section {
+        return Ok(parsed);
+    }
+
+    tracing::warn!(
+        "daemon config at {} uses the legacy `[llm]` block; \
+         auto-migrating to `[connections.default]` \
+         (one-time; the deprecated block will be removed in a future release)",
+        path.display()
+    );
+
+    let default_id = ConnectionId::new("default").expect("literal slug is valid");
+    let connection = connection_from_legacy_llm(&parsed.llm);
+    parsed
+        .connections
+        .insert(default_id.into_string(), connection);
+
+    // Back up the original file before we overwrite it, picking a fresh
+    // `.bak.N` suffix if `.bak` already exists. We write the backup *before*
+    // rewriting the config so a mid-migration crash leaves the user with the
+    // original file recoverable from disk.
+    let backup_path = pick_backup_path(path);
+    std::fs::write(&backup_path, original_content).with_context(|| {
+        format!(
+            "failed to write daemon config backup at {}",
+            backup_path.display()
+        )
+    })?;
+    tracing::info!(
+        "backed up legacy daemon config to {}",
+        backup_path.display()
+    );
+
+    save_daemon_config(path, &parsed).with_context(|| {
+        format!(
+            "failed to rewrite migrated daemon config at {}",
+            path.display()
+        )
+    })?;
+
+    Ok(parsed)
+}
+
+/// Pick a backup path: prefer `<path>.bak`, falling back to `<path>.bak.2`,
+/// `<path>.bak.3`, ... when earlier slots are taken. Never overwrites.
+fn pick_backup_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
+
+    let primary = parent.join(format!("{file_name}.bak"));
+    if !primary.exists() {
+        return primary;
+    }
+    // `.bak.2`, `.bak.3`, ... keep trying until we find a free slot.
+    // The cap is just a sanity bound; practical users will never hit it.
+    for n in 2..=u32::MAX {
+        let candidate = parent.join(format!("{file_name}.bak.{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Extremely unlikely: fall back to overwriting the highest-numbered slot.
+    parent.join(format!("{file_name}.bak.{}", u32::MAX))
+}
+
+/// Cheap detector for a top-level `[<name>]` (or `[<name>.sub]`) TOML table in
+/// the raw file text. Good enough for "is this section present?" gating during
+/// migration; we do not try to handle all TOML edge cases (comments inside
+/// headers, multiline strings that look like headers, etc.) because the config
+/// file is a human-edited file we generated ourselves.
+fn file_has_top_level_table(content: &str, name: &str) -> bool {
+    let prefix_eq = format!("[{name}]");
+    let prefix_dot = format!("[{name}.");
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == prefix_eq || line.starts_with(&prefix_dot) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<()> {
@@ -2262,6 +2435,7 @@ mod tests {
         }
         std::fs::remove_dir_all(&test_dir).ok();
     }
+
 
     #[test]
     fn ws_jwt_rejects_wrong_issuer() {
