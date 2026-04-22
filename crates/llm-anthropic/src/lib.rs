@@ -1,6 +1,8 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, TokenUsage,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
@@ -537,6 +539,70 @@ impl AnthropicClient {
     }
 }
 
+/// Curated list of Anthropic models exposed through this connector.
+///
+/// Anthropic does offer a `GET /v1/models` endpoint, but it returns raw
+/// model IDs without capability metadata (context window, vision/tool
+/// support, reasoning) so the picker still needs a curated source of
+/// truth. Keeping the list hand-maintained here is intentional until we
+/// add a hybrid resolver that merges the API response with this table.
+// TODO(#7): hit `/v1/models` and merge with this curated table so newly
+// released models appear automatically.
+fn curated_anthropic_models() -> Vec<ModelInfo> {
+    let claude_caps = ModelCapabilities {
+        reasoning: false,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let claude_reasoning_caps = ModelCapabilities {
+        reasoning: true,
+        ..claude_caps
+    };
+    // Claude 3.x/4.x all ship with a 200K-token context window.
+    let ctx = 200_000;
+    vec![
+        // --- Claude 4.x family ---
+        ModelInfo::new("claude-opus-4-1")
+            .with_display_name("Claude Opus 4.1")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-opus-4-5")
+            .with_display_name("Claude Opus 4.5")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-sonnet-4-5")
+            .with_display_name("Claude Sonnet 4.5")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-sonnet-4-6")
+            .with_display_name("Claude Sonnet 4.6")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-sonnet-4-7")
+            .with_display_name("Claude Sonnet 4.7")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-haiku-4-5")
+            .with_display_name("Claude Haiku 4.5")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+        // --- Claude 3.x family ---
+        ModelInfo::new("claude-3-5-sonnet-latest")
+            .with_display_name("Claude 3.5 Sonnet")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+        ModelInfo::new("claude-3-5-haiku-latest")
+            .with_display_name("Claude 3.5 Haiku")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+        ModelInfo::new("claude-3-opus-latest")
+            .with_display_name("Claude 3 Opus")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+    ]
+}
+
 impl LlmClient for AnthropicClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -544,6 +610,10 @@ impl LlmClient for AnthropicClient {
 
     fn get_default_base_url(&self) -> Option<&str> {
         Self::get_default_base_url()
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        Ok(curated_anthropic_models())
     }
 
     async fn stream_completion(
@@ -1043,5 +1113,45 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_curated_claude_models() {
+        let client = AnthropicClient::new("key".into());
+        let models = client.list_models().await.unwrap();
+        assert!(!models.is_empty());
+
+        // Every curated model should have the 200K context window.
+        for model in &models {
+            assert_eq!(
+                model.context_limit,
+                Some(200_000),
+                "expected 200K context for {}",
+                model.id
+            );
+            assert!(model.capabilities.tools);
+            assert!(model.capabilities.vision);
+            assert!(!model.capabilities.embedding);
+            assert!(!model.display_name.is_empty());
+        }
+
+        // Sanity: at least one 4.x Sonnet/Opus/Haiku representative.
+        assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-5"));
+        assert!(models.iter().any(|m| m.id == "claude-haiku-4-5"));
+
+        // 4.x models are tagged as supporting extended thinking.
+        let sonnet = models
+            .iter()
+            .find(|m| m.id == "claude-sonnet-4-6")
+            .unwrap();
+        assert!(sonnet.capabilities.reasoning);
+
+        // 3.x Haiku is not flagged as a reasoning model.
+        let legacy_haiku = models
+            .iter()
+            .find(|m| m.id == "claude-3-5-haiku-latest")
+            .unwrap();
+        assert!(!legacy_haiku.capabilities.reasoning);
     }
 }

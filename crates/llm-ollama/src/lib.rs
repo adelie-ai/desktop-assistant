@@ -1,6 +1,8 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, TokenUsage,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -357,6 +359,26 @@ struct OllamaModelTag {
     digest: Option<String>,
 }
 
+/// Partial decoding of `POST /api/show` used to pluck the context window.
+///
+/// Ollama reports context length under `model_info["<arch>.context_length"]`
+/// where `<arch>` varies by model family (`llama`, `qwen2`, `gemma3`, etc).
+/// We scan every `*.context_length` key and take the first `u64` we find.
+#[derive(Deserialize, Default)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    model_info: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl OllamaShowResponse {
+    fn context_length(&self) -> Option<u64> {
+        self.model_info
+            .iter()
+            .find(|(k, _)| k.ends_with(".context_length") || k.as_str() == "context_length")
+            .and_then(|(_, v)| v.as_u64())
+    }
+}
+
 fn model_matches(configured: &str, installed: &OllamaModelTag) -> bool {
     model_name_matches(configured, &installed.name)
         || installed
@@ -399,6 +421,103 @@ struct ResponseFunction {
     arguments: serde_json::Value,
 }
 
+impl OllamaClient {
+    /// List models installed on the connected Ollama server.
+    ///
+    /// Calls `GET /api/tags` to enumerate installed models and, for each,
+    /// `POST /api/show` to extract the context window declared by the
+    /// model's GGUF metadata. `/api/show` is best-effort: failures are
+    /// logged and the model is still returned without a `context_limit`.
+    async fn list_models_impl(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        let base_url = self.base_url.trim_end_matches('/');
+        let tags_url = format!("{base_url}/api/tags");
+
+        let response = self
+            .client
+            .get(&tags_url)
+            .send()
+            .await
+            .map_err(|e| CoreError::Llm(format!("Ollama /api/tags request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(CoreError::Llm(format!(
+                "Ollama /api/tags error (HTTP {status}): {body}"
+            )));
+        }
+
+        let tags: OllamaTagsResponse = response
+            .json()
+            .await
+            .map_err(|e| CoreError::Llm(format!("failed to parse Ollama /api/tags: {e}")))?;
+
+        let mut models = Vec::with_capacity(tags.models.len());
+        for tag in tags.models {
+            let display = tag.model.clone().unwrap_or_else(|| tag.name.clone());
+            let context_limit = self.fetch_context_limit(base_url, &tag.name).await;
+
+            // Ollama is local inference for open-source chat models.
+            // Tools support is widespread on modern models, but the API
+            // doesn't expose a reliable capability flag — default to true
+            // and let callers fall back on 400 responses.
+            let capabilities = ModelCapabilities {
+                reasoning: false,
+                vision: false,
+                tools: true,
+                embedding: false,
+            };
+
+            models.push(ModelInfo {
+                id: tag.name,
+                display_name: display,
+                context_limit,
+                capabilities,
+            });
+        }
+
+        Ok(models)
+    }
+
+    async fn fetch_context_limit(&self, base_url: &str, model: &str) -> Option<u64> {
+        let show_url = format!("{base_url}/api/show");
+        let body = serde_json::json!({ "model": model });
+
+        let response = match self.client.post(&show_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(
+                    model,
+                    "Ollama /api/show request failed: {e}; leaving context_limit unset"
+                );
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::debug!(
+                model,
+                status = %response.status(),
+                "Ollama /api/show non-success; leaving context_limit unset"
+            );
+            return None;
+        }
+
+        let show: OllamaShowResponse = match response.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(model, "failed to parse /api/show response: {e}");
+                return None;
+            }
+        };
+
+        show.context_length()
+    }
+}
+
 impl LlmClient for OllamaClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -406,6 +525,10 @@ impl LlmClient for OllamaClient {
 
     fn get_default_base_url(&self) -> Option<&str> {
         Self::get_default_base_url()
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        self.list_models_impl().await
     }
 
     async fn stream_completion(
@@ -841,6 +964,112 @@ mod tests {
         let client = OllamaClient::new(server.url(""), "nomic-embed-text");
         let id = client.model_identifier().await.unwrap();
         assert_eq!(id, "nomic-embed-text@sha256:abcdef1234567890");
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_tags_enriched_with_context_limit() {
+        let server = MockServer::start();
+
+        let tags_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"models":[
+                        {"name":"llama3.2:latest","model":"llama3.2:latest","digest":"sha256:aaa"},
+                        {"name":"nomic-embed-text:latest","model":"nomic-embed-text:latest","digest":"sha256:bbb"}
+                    ]}"#,
+                );
+        });
+
+        let show_llama = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/show")
+                .body_contains("llama3.2:latest");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":131072}}"#);
+        });
+
+        let show_embed = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/show")
+                .body_contains("nomic-embed-text:latest");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"nomic-bert.context_length":8192}}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let models = client.list_models().await.unwrap();
+
+        assert_eq!(models.len(), 2);
+        let llama = models.iter().find(|m| m.id == "llama3.2:latest").unwrap();
+        assert_eq!(llama.context_limit, Some(131_072));
+        assert!(llama.capabilities.tools);
+        let embed = models
+            .iter()
+            .find(|m| m.id == "nomic-embed-text:latest")
+            .unwrap();
+        assert_eq!(embed.context_limit, Some(8_192));
+
+        tags_mock.assert_hits(1);
+        show_llama.assert_hits(1);
+        show_embed.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn list_models_skips_context_limit_when_show_fails() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"mystery:latest"}]}"#);
+        });
+
+        // /api/show returns 500 → context_limit should end up None.
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show");
+            then.status(500).body("boom");
+        });
+
+        let client = OllamaClient::new(server.url(""), "mystery");
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "mystery:latest");
+        assert_eq!(models[0].context_limit, None);
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_empty_when_no_models_installed() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200).body(r#"{"models":[]}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "whatever");
+        let models = client.list_models().await.unwrap();
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn ollama_show_extracts_context_length_for_any_arch() {
+        let show: OllamaShowResponse = serde_json::from_str(
+            r#"{"model_info":{"qwen2.context_length":32768,"qwen2.vocab_size":152064}}"#,
+        )
+        .unwrap();
+        assert_eq!(show.context_length(), Some(32_768));
+    }
+
+    #[test]
+    fn ollama_show_returns_none_when_no_context_length() {
+        let show: OllamaShowResponse =
+            serde_json::from_str(r#"{"model_info":{"general.architecture":"llama"}}"#).unwrap();
+        assert_eq!(show.context_length(), None);
     }
 
     #[tokio::test]

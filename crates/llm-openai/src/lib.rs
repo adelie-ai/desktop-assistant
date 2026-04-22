@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, TokenUsage,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
@@ -615,6 +617,88 @@ impl OpenAiClient {
     }
 }
 
+/// Curated list of OpenAI models exposed through this connector.
+///
+/// OpenAI's `/v1/models` endpoint returns a firehose of model IDs
+/// (including retired and fine-tune variants) with no capability metadata.
+/// Until we ship a resolver that merges the live list with this curated
+/// table, we hand-maintain the set that the model picker should offer.
+///
+/// To extend: append a `ModelInfo` entry here with the right
+/// `ModelCapabilities` flags. `reasoning: true` belongs on the o-series
+/// (o1, o3, o4) and any GPT-5 variant that exposes reasoning traces.
+// TODO(#7): fetch `/v1/models` and merge with this table so newly
+// released models surface automatically.
+fn curated_openai_models() -> Vec<ModelInfo> {
+    let chat_caps = ModelCapabilities {
+        reasoning: false,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let reasoning_caps = ModelCapabilities {
+        reasoning: true,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let embedding_caps = ModelCapabilities {
+        reasoning: false,
+        vision: false,
+        tools: false,
+        embedding: true,
+    };
+
+    vec![
+        // --- GPT-5 family ---
+        ModelInfo::new("gpt-5")
+            .with_display_name("GPT-5")
+            .with_context_limit(400_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("gpt-5-mini")
+            .with_display_name("GPT-5 Mini")
+            .with_context_limit(400_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("gpt-5.4")
+            .with_display_name("GPT-5.4")
+            .with_context_limit(400_000)
+            .with_capabilities(reasoning_caps),
+        // --- o-series reasoning models ---
+        ModelInfo::new("o4-mini")
+            .with_display_name("o4-mini")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("o3")
+            .with_display_name("o3")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("o3-mini")
+            .with_display_name("o3-mini")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        // --- GPT-4.1 / 4o family (fallback general chat) ---
+        ModelInfo::new("gpt-4.1")
+            .with_display_name("GPT-4.1")
+            .with_context_limit(1_000_000)
+            .with_capabilities(chat_caps),
+        ModelInfo::new("gpt-4o")
+            .with_display_name("GPT-4o")
+            .with_context_limit(128_000)
+            .with_capabilities(chat_caps),
+        ModelInfo::new("gpt-4o-mini")
+            .with_display_name("GPT-4o mini")
+            .with_context_limit(128_000)
+            .with_capabilities(chat_caps),
+        // --- Embedding models ---
+        ModelInfo::new("text-embedding-3-large")
+            .with_display_name("Text Embedding 3 Large")
+            .with_capabilities(embedding_caps),
+        ModelInfo::new("text-embedding-3-small")
+            .with_display_name("Text Embedding 3 Small")
+            .with_capabilities(embedding_caps),
+    ]
+}
+
 impl LlmClient for OpenAiClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -622,6 +706,10 @@ impl LlmClient for OpenAiClient {
 
     fn get_default_base_url(&self) -> Option<&str> {
         Self::get_default_base_url()
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        Ok(curated_openai_models())
     }
 
     async fn stream_completion(
@@ -1053,5 +1141,38 @@ mod tests {
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
         let result = OpenAiClient::from_env();
         assert!(matches!(result, Err(CoreError::Llm(_))));
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_curated_openai_models() {
+        let client = OpenAiClient::new("key".into());
+        let models = client.list_models().await.unwrap();
+        assert!(!models.is_empty());
+
+        // GPT-5 family present with reasoning.
+        let gpt5 = models.iter().find(|m| m.id == "gpt-5").unwrap();
+        assert!(gpt5.capabilities.reasoning);
+        assert!(gpt5.capabilities.tools);
+        assert!(!gpt5.capabilities.embedding);
+        assert_eq!(gpt5.context_limit, Some(400_000));
+
+        // o-series reasoning flag.
+        let o3 = models.iter().find(|m| m.id == "o3").unwrap();
+        assert!(o3.capabilities.reasoning);
+
+        // Embedding model has embedding flag, no chat flags.
+        let embed = models
+            .iter()
+            .find(|m| m.id == "text-embedding-3-large")
+            .unwrap();
+        assert!(embed.capabilities.embedding);
+        assert!(!embed.capabilities.reasoning);
+        assert!(!embed.capabilities.tools);
+        assert!(!embed.capabilities.vision);
+
+        // Non-reasoning chat model example.
+        let gpt4o = models.iter().find(|m| m.id == "gpt-4o").unwrap();
+        assert!(!gpt4o.capabilities.reasoning);
+        assert!(gpt4o.capabilities.tools);
     }
 }

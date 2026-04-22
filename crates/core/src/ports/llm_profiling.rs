@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::CoreError;
 use crate::domain::{Message, Role, ToolDefinition, ToolNamespace};
-use crate::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
+use crate::ports::llm::{ChunkCallback, LlmClient, LlmResponse, ModelInfo, TokenUsage};
 
 /// JSONL profiling entry written for each LLM call.
 #[derive(Serialize)]
@@ -190,6 +190,14 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         self.inner.max_context_tokens()
     }
 
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        self.inner.list_models().await
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        self.inner.refresh_models().await
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
@@ -357,6 +365,20 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
         match self {
             Self::Plain(l) => l.max_context_tokens(),
             Self::Profiled(l) => l.max_context_tokens(),
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        match self {
+            Self::Plain(l) => l.list_models().await,
+            Self::Profiled(l) => l.list_models().await,
+        }
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        match self {
+            Self::Plain(l) => l.refresh_models().await,
+            Self::Profiled(l) => l.refresh_models().await,
         }
     }
 
