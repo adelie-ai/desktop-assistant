@@ -1,0 +1,17 @@
+[llm]
+connector = "openai"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[llm.secret]
+backend = "keyring"
+service = "org.desktopAssistant"
+account = "openai_api_key"
+wallet = "kdewallet"
+folder = "desktop-assistant"
+
+[backend_tasks]
+dreaming_enabled = true
+dreaming_interval_secs = 3600
+archive_after_days = 7

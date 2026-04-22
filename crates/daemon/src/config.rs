@@ -2436,6 +2436,452 @@ mod tests {
         std::fs::remove_dir_all(&test_dir).ok();
     }
 
+    // --- Named-connections schema + migration (issue #8) -------------------
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_connections_map_preserves_order_and_tags() {
+        let content = r#"
+[connections.work_openai]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_WORK_KEY"
+
+[connections.home_bedrock]
+type = "bedrock"
+aws_profile = "home"
+region = "us-west-2"
+
+[connections.laptop_ollama]
+type = "ollama"
+base_url = "http://localhost:11434"
+"#;
+        let parsed: DaemonConfig = toml::from_str(content).unwrap();
+        let validated = parsed.validated_connections().expect("should validate");
+        let ids: Vec<_> = validated.iter().map(|(id, _)| id.as_str().to_owned()).collect();
+        assert_eq!(ids, vec!["work_openai", "home_bedrock", "laptop_ollama"]);
+        assert_eq!(
+            validated
+                .get(&ConnectionId::new("work_openai").unwrap())
+                .unwrap()
+                .connector_type(),
+            "openai"
+        );
+    }
+
+    #[test]
+    fn connections_roundtrip_toml() {
+        let content = r#"
+[connections.work_openai]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_WORK_KEY"
+
+[connections.home_bedrock]
+type = "bedrock"
+aws_profile = "home"
+region = "us-west-2"
+"#;
+        let parsed: DaemonConfig = toml::from_str(content).unwrap();
+        let serialized = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.connections, reparsed.connections);
+    }
+
+    #[test]
+    fn validated_connections_rejects_invalid_slug() {
+        let mut cfg = DaemonConfig::default();
+        cfg.connections
+            .insert("Bad Id".to_string(), ConnectionConfig::OpenAi(Default::default()));
+        let err = cfg.validated_connections().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Bad Id"), "error should cite bad id: {msg}");
+    }
+
+    #[test]
+    fn validated_connections_rejects_empty_table() {
+        let cfg = DaemonConfig::default();
+        // default `connections` is empty, but `validated_connections` treats empty as error
+        let err = cfg.validated_connections().unwrap_err();
+        assert_eq!(err, ConnectionsError::Empty);
+    }
+
+    #[test]
+    fn validated_connections_rejects_duplicates_if_they_appear() {
+        // serde + IndexMap silently overwrites on duplicate TOML keys, so we
+        // synthesize a duplicate through `ConnectionsMap::from_pairs` to exercise
+        // that branch.
+        let pairs = vec![
+            (
+                ConnectionId::new("default").unwrap(),
+                ConnectionConfig::OpenAi(Default::default()),
+            ),
+            (
+                ConnectionId::new("default").unwrap(),
+                ConnectionConfig::OpenAi(Default::default()),
+            ),
+        ];
+        let err = ConnectionsMap::from_pairs(pairs).unwrap_err();
+        assert_eq!(err, ConnectionsError::DuplicateId("default".to_string()));
+    }
+
+    #[test]
+    fn load_accepts_new_format_without_migration() {
+        let dir = unique_test_dir("da-test-connections-new");
+        let path = dir.join("daemon.toml");
+        let content = r#"
+[connections.work_openai]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        assert!(loaded.has_connections());
+        assert_eq!(loaded.connections.len(), 1);
+
+        // No migration side-effects
+        assert!(!dir.join("daemon.toml.bak").exists());
+        // File contents unchanged
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, content);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_invalid_connection_id_with_clear_error() {
+        let dir = unique_test_dir("da-test-connections-bad-id");
+        let path = dir.join("daemon.toml");
+        let content = r#"
+[connections."Bad Id"]
+type = "openai"
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let err = load_daemon_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Bad Id"),
+            "error should cite bad id: {msg}"
+        );
+        assert!(
+            msg.contains("connection id"),
+            "error should mention 'connection id': {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_explicitly_empty_connections_table() {
+        let dir = unique_test_dir("da-test-connections-empty-table");
+        let path = dir.join("daemon.toml");
+        // Explicit `[connections]` header with no entries. This is treated as
+        // "user meant to configure connections but made a mistake" — reject
+        // so the misconfiguration surfaces at startup, not at request time.
+        let content = r#"
+[connections]
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let err = load_daemon_config(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("at least one"),
+            "expected empty-table error, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn load_migrates_legacy_for_connector(connector: &str, extra_fields: &str) {
+        let dir = unique_test_dir(&format!("da-test-mig-{connector}"));
+        let path = dir.join("daemon.toml");
+        let legacy = format!(
+            r#"[llm]
+connector = "{connector}"
+{extra_fields}
+
+[backend_tasks]
+dreaming_enabled = true
+"#
+        );
+        std::fs::write(&path, &legacy).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        // Exactly one synthesized connection called `default`.
+        assert_eq!(loaded.connections.len(), 1);
+        let (id, conn) = loaded.connections.iter().next().unwrap();
+        assert_eq!(id, "default");
+        let type_tag = conn.connector_type();
+        let expected = match connector {
+            "aws-bedrock" => "bedrock",
+            other => other,
+        };
+        assert_eq!(type_tag, expected, "connector type mismatch for {connector}");
+
+        // Backup written alongside original.
+        let bak = dir.join("daemon.toml.bak");
+        assert!(bak.exists(), ".bak should exist after migration");
+        let backed_up = std::fs::read_to_string(&bak).unwrap();
+        assert_eq!(backed_up, legacy, ".bak should be the original content");
+
+        // New form persisted.
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            persisted.contains("[connections.default]"),
+            "rewritten config should contain migrated connection: {persisted}"
+        );
+        assert!(
+            persisted.contains(&format!("type = \"{expected}\"")),
+            "rewritten config should declare connector type: {persisted}"
+        );
+
+        // Reload is idempotent — no new .bak, no new rewrite, connections still parse.
+        let reloaded = load_daemon_config(&path).unwrap().unwrap();
+        assert_eq!(reloaded.connections.len(), 1);
+        assert!(
+            !dir.join("daemon.toml.bak.2").exists(),
+            "second load should not create a new backup"
+        );
+
+        // backend_tasks preserved (shape unchanged; #10 reshapes it).
+        assert!(reloaded.backend_tasks.dreaming_enabled);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_openai() {
+        load_migrates_legacy_for_connector(
+            "openai",
+            r#"base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY""#,
+        );
+    }
+
+    #[test]
+    fn migration_anthropic() {
+        load_migrates_legacy_for_connector(
+            "anthropic",
+            r#"base_url = "https://api.anthropic.com""#,
+        );
+    }
+
+    #[test]
+    fn migration_bedrock() {
+        load_migrates_legacy_for_connector(
+            "bedrock",
+            r#"base_url = "us-west-2"
+aws_profile = "home""#,
+        );
+    }
+
+    #[test]
+    fn migration_aws_bedrock_alias() {
+        // Legacy users of the `aws-bedrock` connector alias migrate to the
+        // canonical `bedrock` variant.
+        load_migrates_legacy_for_connector(
+            "aws-bedrock",
+            r#"base_url = "us-east-1""#,
+        );
+    }
+
+    #[test]
+    fn migration_ollama() {
+        load_migrates_legacy_for_connector(
+            "ollama",
+            r#"base_url = "http://localhost:11434""#,
+        );
+    }
+
+    #[test]
+    fn migration_picks_bak_dot_n_when_bak_exists() {
+        let dir = unique_test_dir("da-test-bak-collision");
+        let path = dir.join("daemon.toml");
+        // Pre-existing .bak file — migration must not clobber it.
+        let existing_bak_content = "# pre-existing backup from a previous migration\n";
+        std::fs::write(dir.join("daemon.toml.bak"), existing_bak_content).unwrap();
+
+        let legacy = r#"[llm]
+connector = "openai"
+api_key_env = "OPENAI_API_KEY"
+"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        // Original .bak preserved as-is.
+        let preserved = std::fs::read_to_string(dir.join("daemon.toml.bak")).unwrap();
+        assert_eq!(preserved, existing_bak_content);
+
+        // New backup in .bak.2 with original content.
+        let bak2 = dir.join("daemon.toml.bak.2");
+        assert!(bak2.exists(), ".bak.2 should exist when .bak is taken");
+        let bak2_content = std::fs::read_to_string(&bak2).unwrap();
+        assert_eq!(bak2_content, legacy);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_bumps_to_bak_dot_3_when_bak_and_bak2_exist() {
+        let dir = unique_test_dir("da-test-bak-collision-2");
+        let path = dir.join("daemon.toml");
+        std::fs::write(dir.join("daemon.toml.bak"), "old1").unwrap();
+        std::fs::write(dir.join("daemon.toml.bak.2"), "old2").unwrap();
+
+        let legacy = r#"[llm]
+connector = "openai"
+"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.toml.bak")).unwrap(),
+            "old1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.toml.bak.2")).unwrap(),
+            "old2"
+        );
+        assert!(dir.join("daemon.toml.bak.3").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_preserves_backend_tasks_llm_as_is() {
+        // Per issue scope: #10 will reshape `backend_tasks.llm`. For #8 we just
+        // preserve it verbatim so that a #10 migration can pick it up later.
+        let dir = unique_test_dir("da-test-backend-tasks-preserve");
+        let path = dir.join("daemon.toml");
+        let legacy = r#"[llm]
+connector = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[backend_tasks]
+dreaming_enabled = true
+
+[backend_tasks.llm]
+connector = "anthropic"
+model = "claude-haiku-4-5-20251001"
+"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let bt_llm = loaded.backend_tasks.llm.as_ref().expect("bt.llm preserved");
+        assert_eq!(bt_llm.connector, "anthropic");
+        assert_eq!(bt_llm.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        assert!(loaded.backend_tasks.dreaming_enabled);
+
+        // The rewritten file should still contain both `[backend_tasks]` and
+        // `[backend_tasks.llm]`, unchanged in shape.
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("[backend_tasks.llm]"));
+        assert!(rewritten.contains("connector = \"anthropic\""));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_skipped_when_connections_already_present() {
+        // Hybrid config (both `[llm]` and `[connections]`) must not trigger
+        // migration, because doing so would silently overwrite user-authored
+        // connections.
+        let dir = unique_test_dir("da-test-hybrid-skip");
+        let path = dir.join("daemon.toml");
+        let content = r#"[llm]
+connector = "openai"
+
+[connections.work]
+type = "openai"
+api_key_env = "OPENAI_WORK_KEY"
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        assert_eq!(loaded.connections.len(), 1);
+        assert!(loaded.connections.contains_key("work"));
+        assert!(!dir.join("daemon.toml.bak").exists());
+
+        // File untouched.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, content);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_golden_file_openai() {
+        // Golden-file test: a representative legacy config migrates to the
+        // expected new form byte-for-byte (modulo trailing whitespace).
+        let legacy = include_str!(
+            "../tests/fixtures/connections_migration/legacy_openai.toml"
+        );
+        let expected_new = include_str!(
+            "../tests/fixtures/connections_migration/migrated_openai.toml"
+        );
+
+        let dir = unique_test_dir("da-test-golden-openai");
+        let path = dir.join("daemon.toml");
+        std::fs::write(&path, legacy).unwrap();
+
+        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+        let actual = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            actual.trim_end(),
+            expected_new.trim_end(),
+            "migrated form differs from golden fixture.\n--- actual ---\n{actual}\n--- expected ---\n{expected_new}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pick_backup_path_returns_bak_when_nothing_exists() {
+        let dir = unique_test_dir("da-test-pick-bak-fresh");
+        let path = dir.join("daemon.toml");
+        let picked = pick_backup_path(&path);
+        assert_eq!(picked, dir.join("daemon.toml.bak"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pick_backup_path_escalates_to_bak_dot_n() {
+        let dir = unique_test_dir("da-test-pick-bak-escalate");
+        let path = dir.join("daemon.toml");
+        std::fs::write(dir.join("daemon.toml.bak"), "").unwrap();
+        std::fs::write(dir.join("daemon.toml.bak.2"), "").unwrap();
+        std::fs::write(dir.join("daemon.toml.bak.3"), "").unwrap();
+        let picked = pick_backup_path(&path);
+        assert_eq!(picked, dir.join("daemon.toml.bak.4"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_has_top_level_table_matches_dotted_and_bracketed() {
+        let content = r#"
+# leading comment
+[llm]
+x = 1
+
+[backend_tasks.llm]
+y = 2
+"#;
+        assert!(file_has_top_level_table(content, "llm"));
+        assert!(file_has_top_level_table(content, "backend_tasks"));
+        assert!(!file_has_top_level_table(content, "connections"));
+    }
 
     #[test]
     fn ws_jwt_rejects_wrong_issuer() {
