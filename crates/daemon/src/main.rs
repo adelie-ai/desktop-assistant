@@ -16,6 +16,7 @@ mod config;
 mod connections;
 mod purposes;
 mod registry;
+mod routing_llm;
 mod settings_service;
 mod store;
 mod tls;
@@ -1154,6 +1155,15 @@ async fn main() -> Result<()> {
     };
     let conversation_store = SharedConversationStore(Arc::new(inner_store));
 
+    // Wrap the interactive-purpose client in a `RoutingLlmClient`. The
+    // routing wrapper (`api_surface::RoutingConversationHandler`) installs
+    // a task-local per turn; when present, dispatch picks the registry's
+    // client for the resolved connection id. When absent (backend tasks,
+    // legacy callers without an override), the routing client falls back
+    // to this interactive-purpose client — preserving pre-#18 behaviour.
+    let fallback_client = Arc::new(llm);
+    let llm =
+        routing_llm::RoutingLlmClient::new(Arc::clone(&fallback_client), llm_connector.clone());
     let llm = RetryingLlmClient::new(llm, 3);
     let llm = MaybeProfiled::from_config(
         llm,
@@ -1180,7 +1190,16 @@ async fn main() -> Result<()> {
             resolved_bt.connector,
             resolved_bt.model
         );
+        let bt_connector = resolved_bt.connector.clone();
         let bt_llm = build_llm_client(resolved_bt);
+        // Backend-tasks dispatch never sees a per-turn routing override —
+        // title generation and context summary are initiated server-side.
+        // Wrapping in `RoutingLlmClient` with no task-local installed
+        // always dispatches to this backend-tasks fallback, but keeps the
+        // concrete type uniform with the primary handler's `L` so
+        // `with_backend_llm` accepts it.
+        let bt_fallback = Arc::new(bt_llm);
+        let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback, bt_connector);
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
         let bt_llm = MaybeProfiled::from_config(
             bt_llm,
