@@ -109,7 +109,7 @@ impl WsClient {
         ))
     }
 
-    async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
+    pub async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
         let id = uuid::Uuid::new_v4().to_string();
         let request = WsRequest {
             id: id.clone(),
@@ -326,9 +326,13 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             message,
         }),
         api::Event::ConfigChanged { .. } => None,
-        // Conversation advisories surface via a separate channel on the
-        // desktop UI; the streaming signal enum doesn't carry them yet.
-        api::Event::ConversationWarningEmitted { .. } => None,
+        api::Event::ConversationWarningEmitted {
+            conversation_id,
+            warning,
+        } => Some(SignalEvent::ConversationWarning {
+            conversation_id,
+            warning,
+        }),
     }
 }
 
