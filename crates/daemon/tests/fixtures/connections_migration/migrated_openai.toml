@@ -1,0 +1,50 @@
+[llm]
+connector = "openai"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[llm.secret]
+backend = "keyring"
+service = "org.desktopAssistant"
+account = "openai_api_key"
+wallet = "kdewallet"
+folder = "desktop-assistant"
+
+[connections.default]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[connections.default.secret]
+backend = "keyring"
+service = "org.desktopAssistant"
+account = "openai_api_key"
+wallet = "kdewallet"
+folder = "desktop-assistant"
+
+[embeddings]
+
+[persistence.git]
+enabled = false
+remote_name = "origin"
+push_on_update = true
+
+[database]
+max_connections = 5
+
+[backend_tasks]
+dreaming_enabled = true
+dreaming_interval_secs = 3600
+archive_after_days = 7
+
+[profiling]
+enabled = false
+full_content = false
+
+[ws_auth]
+methods = ["password"]
+allowed_origins = []
+
+[tls]
+enabled = true

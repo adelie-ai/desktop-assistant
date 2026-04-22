@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod app;
 mod config;
+mod connections;
 mod settings_service;
 mod store;
 mod tls;
