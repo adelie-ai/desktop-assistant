@@ -252,7 +252,7 @@ impl Default for LlmConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct SecretConfig {
     #[serde(default = "default_secret_backend")]
     pub backend: String,
