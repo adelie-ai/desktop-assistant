@@ -83,5 +83,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Per-conversation model selection (issue #11) — nullable JSONB column
+    // on `conversations`.
+    sqlx::raw_sql(include_str!(
+        "../migrations/011_conversation_last_model.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

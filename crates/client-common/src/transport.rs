@@ -27,6 +27,19 @@ pub enum TransportClient {
     Ws(WsClient),
 }
 
+impl TransportClient {
+    /// Access the underlying WebSocket client when the transport is WS, so
+    /// callers can issue commands that aren't exposed on the shared
+    /// `AssistantClient` trait (e.g. named-connection management).
+    pub fn as_ws(&self) -> Option<&WsClient> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(_) => None,
+            Self::Ws(client) => Some(client),
+        }
+    }
+}
+
 #[async_trait]
 impl AssistantClient for TransportClient {
     async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {

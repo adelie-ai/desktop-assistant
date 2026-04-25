@@ -1,6 +1,9 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
+    TokenUsage,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
@@ -119,6 +122,29 @@ struct SystemBlock {
     cache_control: CacheControl,
 }
 
+/// Anthropic extended-thinking configuration block.
+///
+/// Serialized into the request body as `"thinking": { "type": "enabled",
+/// "budget_tokens": N }` when reasoning is requested. See the Anthropic
+/// Messages API reference for the exact schema; this client emits the
+/// `enabled` variant only — `disabled` is represented by omitting the
+/// field entirely.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    mode: &'static str,
+    budget_tokens: u32,
+}
+
+impl ThinkingConfig {
+    fn enabled(budget: u32) -> Self {
+        Self {
+            mode: "enabled",
+            budget_tokens: budget,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct MessagesRequest {
     model: String,
@@ -133,6 +159,8 @@ struct MessagesRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -229,6 +257,8 @@ struct MessagesRequestWithToolSearch {
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicToolEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
 }
 
 /// Convert domain messages into Anthropic API messages, extracting the system prompt.
@@ -537,6 +567,70 @@ impl AnthropicClient {
     }
 }
 
+/// Curated list of Anthropic models exposed through this connector.
+///
+/// Anthropic does offer a `GET /v1/models` endpoint, but it returns raw
+/// model IDs without capability metadata (context window, vision/tool
+/// support, reasoning) so the picker still needs a curated source of
+/// truth. Keeping the list hand-maintained here is intentional until we
+/// add a hybrid resolver that merges the API response with this table.
+// TODO(#7): hit `/v1/models` and merge with this curated table so newly
+// released models appear automatically.
+fn curated_anthropic_models() -> Vec<ModelInfo> {
+    let claude_caps = ModelCapabilities {
+        reasoning: false,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let claude_reasoning_caps = ModelCapabilities {
+        reasoning: true,
+        ..claude_caps
+    };
+    // Claude 3.x/4.x all ship with a 200K-token context window.
+    let ctx = 200_000;
+    vec![
+        // --- Claude 4.x family ---
+        ModelInfo::new("claude-opus-4-1")
+            .with_display_name("Claude Opus 4.1")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-opus-4-5")
+            .with_display_name("Claude Opus 4.5")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-sonnet-4-5")
+            .with_display_name("Claude Sonnet 4.5")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-sonnet-4-6")
+            .with_display_name("Claude Sonnet 4.6")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-sonnet-4-7")
+            .with_display_name("Claude Sonnet 4.7")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_reasoning_caps),
+        ModelInfo::new("claude-haiku-4-5")
+            .with_display_name("Claude Haiku 4.5")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+        // --- Claude 3.x family ---
+        ModelInfo::new("claude-3-5-sonnet-latest")
+            .with_display_name("Claude 3.5 Sonnet")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+        ModelInfo::new("claude-3-5-haiku-latest")
+            .with_display_name("Claude 3.5 Haiku")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+        ModelInfo::new("claude-3-opus-latest")
+            .with_display_name("Claude 3 Opus")
+            .with_context_limit(ctx)
+            .with_capabilities(claude_caps),
+    ]
+}
+
 impl LlmClient for AnthropicClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -546,24 +640,33 @@ impl LlmClient for AnthropicClient {
         Self::get_default_base_url()
     }
 
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        Ok(curated_anthropic_models())
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let api_tools: Vec<AnthropicTool> = tools.iter().map(AnthropicTool::from).collect();
         let (system, api_messages) = convert_messages(&messages);
 
+        let thinking = thinking_for(reasoning);
+        let max_tokens = effective_max_tokens(self.max_tokens, thinking.as_ref());
+
         let request = MessagesRequest {
             model: self.model.clone(),
-            max_tokens: self.max_tokens,
+            max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
             system,
             messages: api_messages,
             stream: true,
             tools: api_tools,
+            thinking,
         };
 
         let request_json =
@@ -582,6 +685,7 @@ impl LlmClient for AnthropicClient {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let (system, api_messages) = convert_messages(&messages);
@@ -607,15 +711,19 @@ impl LlmClient for AnthropicClient {
             name: "tool_search_tool_regex".to_string(),
         }));
 
+        let thinking = thinking_for(reasoning);
+        let max_tokens = effective_max_tokens(self.max_tokens, thinking.as_ref());
+
         let request = MessagesRequestWithToolSearch {
             model: self.model.clone(),
-            max_tokens: self.max_tokens,
+            max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
             system,
             messages: api_messages,
             stream: true,
             tools: tool_entries,
+            thinking,
         };
 
         let request_json =
@@ -630,6 +738,40 @@ impl LlmClient for AnthropicClient {
         self.send_and_stream(&request_json, &request, on_chunk)
             .await
     }
+}
+
+/// Build a `ThinkingConfig` from the per-turn reasoning hint.
+///
+/// Rules:
+/// - `None` or `Some(0)` → no thinking block (omit the field).
+/// - `Some(N > 0)` → `{ type: "enabled", budget_tokens: N }`. The caller is
+///   responsible for ensuring `max_tokens > budget_tokens`; see
+///   [`effective_max_tokens`].
+fn thinking_for(reasoning: ReasoningConfig) -> Option<ThinkingConfig> {
+    match reasoning.thinking_budget_tokens {
+        Some(n) if n > 0 => Some(ThinkingConfig::enabled(n)),
+        _ => None,
+    }
+}
+
+/// Minimum headroom for the final visible response on top of the thinking
+/// budget. Anthropic requires `max_tokens > budget_tokens`, and real
+/// responses need enough room to emit both the thinking trace and the
+/// reply; we reserve 2048 tokens for the reply by default.
+const MIN_OUTPUT_HEADROOM_TOKENS: u32 = 2048;
+
+/// Compute the effective `max_tokens` for a request.
+///
+/// Anthropic's API rejects requests whose `budget_tokens` is not strictly
+/// less than `max_tokens`. When the configured `max_tokens` isn't large
+/// enough to host both the thinking budget and a non-trivial reply, bump
+/// it up to `budget + MIN_OUTPUT_HEADROOM_TOKENS`.
+fn effective_max_tokens(configured: u32, thinking: Option<&ThinkingConfig>) -> u32 {
+    let Some(t) = thinking else {
+        return configured;
+    };
+    let needed = t.budget_tokens.saturating_add(MIN_OUTPUT_HEADROOM_TOKENS);
+    configured.max(needed)
 }
 
 fn accumulate_usage(acc: &mut SseUsage, new: &SseUsage) {
@@ -892,6 +1034,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("tools"));
@@ -913,6 +1056,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![AnthropicTool::from(&def)],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -935,6 +1079,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"system\""));
@@ -1040,8 +1185,131 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
+    }
+
+    // --- Extended-thinking (reasoning) wiring ----------------------------
+
+    #[test]
+    fn thinking_for_omitted_when_no_budget() {
+        assert!(thinking_for(ReasoningConfig::default()).is_none());
+        assert!(
+            thinking_for(ReasoningConfig::with_thinking_budget(0)).is_none(),
+            "budget=0 should disable thinking"
+        );
+    }
+
+    #[test]
+    fn thinking_for_emits_enabled_block_for_positive_budget() {
+        let t = thinking_for(ReasoningConfig::with_thinking_budget(8_000)).unwrap();
+        assert_eq!(t.mode, "enabled");
+        assert_eq!(t.budget_tokens, 8_000);
+    }
+
+    #[test]
+    fn effective_max_tokens_unchanged_without_thinking() {
+        assert_eq!(effective_max_tokens(8_192, None), 8_192);
+    }
+
+    #[test]
+    fn effective_max_tokens_bumps_up_when_budget_exceeds_configured() {
+        let thinking = ThinkingConfig::enabled(24_000);
+        // Configured max_tokens (8_192) is LESS than budget (24_000); needs bump.
+        let mt = effective_max_tokens(8_192, Some(&thinking));
+        assert!(mt > 24_000, "max_tokens should strictly exceed budget");
+        assert_eq!(mt, 24_000 + MIN_OUTPUT_HEADROOM_TOKENS);
+    }
+
+    #[test]
+    fn effective_max_tokens_preserves_configured_when_large_enough() {
+        let thinking = ThinkingConfig::enabled(4_000);
+        // Configured max_tokens (16_000) already has >2k headroom above 4_000.
+        let mt = effective_max_tokens(16_000, Some(&thinking));
+        assert_eq!(mt, 16_000);
+    }
+
+    #[test]
+    fn request_includes_thinking_when_reasoning_enabled() {
+        let thinking = thinking_for(ReasoningConfig::with_thinking_budget(8_000));
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6-20260227".into(),
+            max_tokens: effective_max_tokens(8_192, thinking.as_ref()),
+            temperature: None,
+            top_p: None,
+            system: vec![],
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["thinking"]["type"], "enabled");
+        assert_eq!(parsed["thinking"]["budget_tokens"], 8_000);
+        assert!(parsed["max_tokens"].as_u64().unwrap() > 8_000);
+    }
+
+    #[test]
+    fn request_omits_thinking_when_reasoning_disabled() {
+        let thinking = thinking_for(ReasoningConfig::default());
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6-20260227".into(),
+            max_tokens: 8_192,
+            temperature: None,
+            top_p: None,
+            system: vec![],
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("thinking"),
+            "thinking field must be omitted when reasoning is off; got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_curated_claude_models() {
+        let client = AnthropicClient::new("key".into());
+        let models = client.list_models().await.unwrap();
+        assert!(!models.is_empty());
+
+        // Every curated model should have the 200K context window.
+        for model in &models {
+            assert_eq!(
+                model.context_limit,
+                Some(200_000),
+                "expected 200K context for {}",
+                model.id
+            );
+            assert!(model.capabilities.tools);
+            assert!(model.capabilities.vision);
+            assert!(!model.capabilities.embedding);
+            assert!(!model.display_name.is_empty());
+        }
+
+        // Sanity: at least one 4.x Sonnet/Opus/Haiku representative.
+        assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-5"));
+        assert!(models.iter().any(|m| m.id == "claude-haiku-4-5"));
+
+        // 4.x models are tagged as supporting extended thinking.
+        let sonnet = models
+            .iter()
+            .find(|m| m.id == "claude-sonnet-4-6")
+            .unwrap();
+        assert!(sonnet.capabilities.reasoning);
+
+        // 3.x Haiku is not flagged as a reasoning model.
+        let legacy_haiku = models
+            .iter()
+            .find(|m| m.id == "claude-3-5-haiku-latest")
+            .unwrap();
+        assert!(!legacy_haiku.capabilities.reasoning);
     }
 }

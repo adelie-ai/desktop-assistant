@@ -4,7 +4,7 @@ use crate::domain::{
     ToolDefinition, ToolNamespace,
 };
 use crate::ports::inbound::ConversationService;
-use crate::ports::llm::{ChunkCallback, LlmClient, StatusCallback};
+use crate::ports::llm::{ChunkCallback, LlmClient, ReasoningConfig, StatusCallback};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 use chrono::{Duration, Local};
@@ -409,7 +409,7 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
         ),
     ];
     match llm
-        .stream_completion(messages, &[], Box::new(|_| true))
+        .stream_completion(messages, &[], ReasoningConfig::default(), Box::new(|_| true))
         .await
     {
         Ok(response) => sanitize_generated_title(&response.text),
@@ -528,7 +528,12 @@ async fn generate_context_summary<L: LlmClient>(
     ];
 
     match llm
-        .stream_completion(llm_messages, &[], Box::new(|_| true))
+        .stream_completion(
+            llm_messages,
+            &[],
+            ReasoningConfig::default(),
+            Box::new(|_| true),
+        )
         .await
     {
         Ok(response) if !response.text.trim().is_empty() => response.text.trim().to_string(),
@@ -594,7 +599,7 @@ async fn categorize_tool_namespaces<L: LlmClient>(
     ];
 
     let response = match llm
-        .stream_completion(messages, &[], Box::new(|_| true))
+        .stream_completion(messages, &[], ReasoningConfig::default(), Box::new(|_| true))
         .await
     {
         Ok(r) => r,
@@ -990,6 +995,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 }
             });
 
+            // Reasoning config is threaded through a task-local set by
+            // the daemon-side routing wrapper (`RoutingConversationHandler`)
+            // before it calls `send_prompt`. In tests / standalone uses
+            // with no wrapper, the slot is unset and we pass the default
+            // empty config, matching the pre-issue-18 behaviour.
+            let reasoning = crate::ports::llm::current_reasoning_config();
+
             let response =
                 match if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
                     self.llm
@@ -997,12 +1009,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             llm_messages,
                             &tool_defs,
                             &namespaces,
+                            reasoning,
                             filtered_chunk_callback,
                         )
                         .await
                 } else {
                     self.llm
-                        .stream_completion(llm_messages, &tool_defs, filtered_chunk_callback)
+                        .stream_completion(
+                            llm_messages,
+                            &tool_defs,
+                            reasoning,
+                            filtered_chunk_callback,
+                        )
                         .await
                 } {
                     Ok(r) => r,
@@ -1420,6 +1438,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             let mut full = String::new();
@@ -1728,6 +1747,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             let response = {
@@ -2043,6 +2063,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             let call_idx = {
@@ -2285,6 +2306,7 @@ mod tests {
             &self,
             messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             _on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             // Only capture the first call (the main LLM turn). The second call
@@ -2866,6 +2888,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             on_chunk(self.text.clone());
@@ -2999,6 +3022,7 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
@@ -3105,6 +3129,7 @@ mod tests {
                 &self,
                 _messages: Vec<Message>,
                 _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
                 _on_chunk: ChunkCallback,
             ) -> Result<LlmResponse, CoreError> {
                 self.call_count.fetch_add(1, Ordering::Relaxed);

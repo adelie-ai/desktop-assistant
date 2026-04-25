@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, TokenUsage};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
+    TokenUsage,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
@@ -131,6 +134,16 @@ impl OpenAiClient {
 // Responses API – request serialization types
 // ---------------------------------------------------------------------------
 
+/// OpenAI Responses-API reasoning block (`{ "effort": "low|medium|high" }`).
+///
+/// Emitted only for reasoning-capable models (see
+/// [`model_supports_reasoning`]). For non-reasoning models the field is
+/// omitted entirely; sending it there causes a 400 from the API.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct ReasoningBlock {
+    effort: &'static str,
+}
+
 /// Unified request body for the Responses API (`POST /v1/responses`).
 #[derive(Serialize)]
 struct ResponsesRequest {
@@ -147,6 +160,8 @@ struct ResponsesRequest {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningBlock>,
 }
 
 /// Heterogeneous input items for the Responses API.
@@ -615,6 +630,132 @@ impl OpenAiClient {
     }
 }
 
+/// Curated list of OpenAI models exposed through this connector.
+///
+/// OpenAI's `/v1/models` endpoint returns a firehose of model IDs
+/// (including retired and fine-tune variants) with no capability metadata.
+/// Until we ship a resolver that merges the live list with this curated
+/// table, we hand-maintain the set that the model picker should offer.
+///
+/// To extend: append a `ModelInfo` entry here with the right
+/// `ModelCapabilities` flags. `reasoning: true` belongs on the o-series
+/// (o1, o3, o4) and any GPT-5 variant that exposes reasoning traces.
+// TODO(#7): fetch `/v1/models` and merge with this table so newly
+// released models surface automatically.
+/// True when `model` is one of the curated OpenAI models flagged as
+/// reasoning-capable. Used to gate the `reasoning.effort` field on
+/// requests — sending it for non-reasoning models (e.g. `gpt-4o`) is a
+/// 400 from the API, so we silently drop it with a debug log.
+///
+/// Matches by exact id AND common prefixes (e.g. `gpt-5-mini-2025…`), so
+/// custom pinned versions resolve the same way as their family name.
+fn model_supports_reasoning(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Exact id match against the curated capabilities table.
+    if curated_openai_models()
+        .iter()
+        .any(|c| c.id.eq_ignore_ascii_case(model) && c.capabilities.reasoning)
+    {
+        return true;
+    }
+    // Prefix heuristics for pinned/versioned ids not in the curated table.
+    //   o-series: `o1`, `o1-mini`, `o3`, `o3-mini`, `o4-mini`, …
+    //   GPT-5 reasoning: `gpt-5`, `gpt-5-mini`, `gpt-5.4`, …
+    let is_o_series = m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4");
+    let is_gpt5 = m.starts_with("gpt-5");
+    is_o_series || is_gpt5
+}
+
+/// Build a `ReasoningBlock` from the per-turn reasoning hint, honoring
+/// the per-model capability gate. Returns `None` for non-reasoning
+/// models (debug-logged) and when no effort is requested.
+fn reasoning_for(model: &str, reasoning: ReasoningConfig) -> Option<ReasoningBlock> {
+    let Some(level) = reasoning.reasoning_effort else {
+        return None;
+    };
+    if !model_supports_reasoning(model) {
+        tracing::debug!(
+            model,
+            requested_effort = ?level,
+            "OpenAI reasoning_effort requested but model is not reasoning-capable; dropping field"
+        );
+        return None;
+    }
+    Some(ReasoningBlock {
+        effort: level.as_openai_effort(),
+    })
+}
+
+fn curated_openai_models() -> Vec<ModelInfo> {
+    let chat_caps = ModelCapabilities {
+        reasoning: false,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let reasoning_caps = ModelCapabilities {
+        reasoning: true,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let embedding_caps = ModelCapabilities {
+        reasoning: false,
+        vision: false,
+        tools: false,
+        embedding: true,
+    };
+
+    vec![
+        // --- GPT-5 family ---
+        ModelInfo::new("gpt-5")
+            .with_display_name("GPT-5")
+            .with_context_limit(400_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("gpt-5-mini")
+            .with_display_name("GPT-5 Mini")
+            .with_context_limit(400_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("gpt-5.4")
+            .with_display_name("GPT-5.4")
+            .with_context_limit(400_000)
+            .with_capabilities(reasoning_caps),
+        // --- o-series reasoning models ---
+        ModelInfo::new("o4-mini")
+            .with_display_name("o4-mini")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("o3")
+            .with_display_name("o3")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("o3-mini")
+            .with_display_name("o3-mini")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        // --- GPT-4.1 / 4o family (fallback general chat) ---
+        ModelInfo::new("gpt-4.1")
+            .with_display_name("GPT-4.1")
+            .with_context_limit(1_000_000)
+            .with_capabilities(chat_caps),
+        ModelInfo::new("gpt-4o")
+            .with_display_name("GPT-4o")
+            .with_context_limit(128_000)
+            .with_capabilities(chat_caps),
+        ModelInfo::new("gpt-4o-mini")
+            .with_display_name("GPT-4o mini")
+            .with_context_limit(128_000)
+            .with_capabilities(chat_caps),
+        // --- Embedding models ---
+        ModelInfo::new("text-embedding-3-large")
+            .with_display_name("Text Embedding 3 Large")
+            .with_capabilities(embedding_caps),
+        ModelInfo::new("text-embedding-3-small")
+            .with_display_name("Text Embedding 3 Small")
+            .with_capabilities(embedding_caps),
+    ]
+}
+
 impl LlmClient for OpenAiClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -624,10 +765,15 @@ impl LlmClient for OpenAiClient {
         Self::get_default_base_url()
     }
 
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        Ok(curated_openai_models())
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let (input, instructions) = convert_messages(&messages);
@@ -635,6 +781,8 @@ impl LlmClient for OpenAiClient {
             .iter()
             .map(|t| ToolEntry::Function(FunctionTool::from_definition(t)))
             .collect();
+
+        let reasoning_block = reasoning_for(&self.model, reasoning);
 
         let request = ResponsesRequest {
             model: self.model.clone(),
@@ -645,6 +793,7 @@ impl LlmClient for OpenAiClient {
             temperature: self.temperature,
             top_p: self.top_p,
             max_output_tokens: self.max_tokens,
+            reasoning: reasoning_block,
         };
 
         let request_json =
@@ -663,6 +812,7 @@ impl LlmClient for OpenAiClient {
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let (input, instructions) = convert_messages(&messages);
@@ -680,6 +830,8 @@ impl LlmClient for OpenAiClient {
             r#type: "tool_search".to_string(),
         }));
 
+        let reasoning_block = reasoning_for(&self.model, reasoning);
+
         let request = ResponsesRequest {
             model: self.model.clone(),
             input,
@@ -689,6 +841,7 @@ impl LlmClient for OpenAiClient {
             temperature: self.temperature,
             top_p: self.top_p,
             max_output_tokens: self.max_tokens,
+            reasoning: reasoning_block,
         };
 
         let request_json =
@@ -708,6 +861,7 @@ impl LlmClient for OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_core::ports::llm::ReasoningLevel;
 
     // --- convert_messages tests ---
 
@@ -882,6 +1036,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: Some(1024),
+            reasoning: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_output_tokens"));
@@ -899,6 +1054,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            reasoning: None,
         };
         let json: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(json["instructions"], "Be helpful.");
@@ -915,6 +1071,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            reasoning: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("tools"));
@@ -932,6 +1089,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            reasoning: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -968,6 +1126,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            reasoning: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&req).unwrap();
@@ -976,6 +1135,91 @@ mod tests {
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[1]["type"], "namespace");
         assert_eq!(tools[2]["type"], "tool_search");
+    }
+
+    // --- Reasoning / effort tests ----------------------------------------
+
+    #[test]
+    fn model_supports_reasoning_curated_ids() {
+        assert!(model_supports_reasoning("gpt-5"));
+        assert!(model_supports_reasoning("gpt-5-mini"));
+        assert!(model_supports_reasoning("gpt-5.4"));
+        assert!(model_supports_reasoning("o3"));
+        assert!(model_supports_reasoning("o3-mini"));
+        assert!(model_supports_reasoning("o4-mini"));
+    }
+
+    #[test]
+    fn model_supports_reasoning_rejects_chat_models() {
+        assert!(!model_supports_reasoning("gpt-4o"));
+        assert!(!model_supports_reasoning("gpt-4o-mini"));
+        assert!(!model_supports_reasoning("gpt-4.1"));
+    }
+
+    #[test]
+    fn model_supports_reasoning_prefix_heuristic_versioned_ids() {
+        // Pinned versions not in the curated list still resolve correctly.
+        assert!(model_supports_reasoning("o1-2024-12-17"));
+        assert!(model_supports_reasoning("gpt-5-mini-2025-09-01"));
+        assert!(!model_supports_reasoning("gpt-4o-2024-11-20"));
+    }
+
+    #[test]
+    fn reasoning_for_omits_when_no_effort_requested() {
+        assert!(reasoning_for("gpt-5", ReasoningConfig::default()).is_none());
+    }
+
+    #[test]
+    fn reasoning_for_emits_block_on_reasoning_model() {
+        let cfg = ReasoningConfig::with_reasoning_effort(ReasoningLevel::High);
+        let block = reasoning_for("gpt-5.4", cfg).expect("reasoning block expected");
+        assert_eq!(block.effort, "high");
+    }
+
+    #[test]
+    fn reasoning_for_drops_block_on_non_reasoning_model() {
+        let cfg = ReasoningConfig::with_reasoning_effort(ReasoningLevel::High);
+        // gpt-4o does not support reasoning — field should be dropped, not sent.
+        assert!(reasoning_for("gpt-4o", cfg).is_none());
+    }
+
+    #[test]
+    fn request_includes_reasoning_for_supported_model() {
+        let cfg = ReasoningConfig::with_reasoning_effort(ReasoningLevel::Medium);
+        let block = reasoning_for("gpt-5", cfg);
+        let req = ResponsesRequest {
+            model: "gpt-5".into(),
+            input: vec![],
+            instructions: None,
+            stream: true,
+            tools: vec![],
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning: block,
+        };
+        let json: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn request_omits_reasoning_field_when_none() {
+        let req = ResponsesRequest {
+            model: "gpt-4o".into(),
+            input: vec![],
+            instructions: None,
+            stream: true,
+            tools: vec![],
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("reasoning"),
+            "reasoning field must be omitted when None; got: {json}"
+        );
     }
 
     // --- Tool accumulator tests ---
@@ -1053,5 +1297,38 @@ mod tests {
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
         let result = OpenAiClient::from_env();
         assert!(matches!(result, Err(CoreError::Llm(_))));
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_curated_openai_models() {
+        let client = OpenAiClient::new("key".into());
+        let models = client.list_models().await.unwrap();
+        assert!(!models.is_empty());
+
+        // GPT-5 family present with reasoning.
+        let gpt5 = models.iter().find(|m| m.id == "gpt-5").unwrap();
+        assert!(gpt5.capabilities.reasoning);
+        assert!(gpt5.capabilities.tools);
+        assert!(!gpt5.capabilities.embedding);
+        assert_eq!(gpt5.context_limit, Some(400_000));
+
+        // o-series reasoning flag.
+        let o3 = models.iter().find(|m| m.id == "o3").unwrap();
+        assert!(o3.capabilities.reasoning);
+
+        // Embedding model has embedding flag, no chat flags.
+        let embed = models
+            .iter()
+            .find(|m| m.id == "text-embedding-3-large")
+            .unwrap();
+        assert!(embed.capabilities.embedding);
+        assert!(!embed.capabilities.reasoning);
+        assert!(!embed.capabilities.tools);
+        assert!(!embed.capabilities.vision);
+
+        // Non-reasoning chat model example.
+        let gpt4o = models.iter().find(|m| m.id == "gpt-4o").unwrap();
+        assert!(!gpt4o.capabilities.reasoning);
+        assert!(gpt4o.capabilities.tools);
     }
 }

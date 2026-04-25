@@ -2,6 +2,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
     Conversation, ConversationId, Message, MessageSummary, Role, ToolCall,
 };
+use desktop_assistant_core::ports::inbound::ConversationModelSelection;
 use desktop_assistant_core::ports::store::ConversationStore;
 use sqlx::PgPool;
 
@@ -12,6 +13,63 @@ pub struct PgConversationStore {
 impl PgConversationStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Set (or clear) the stored model selection for a conversation.
+    ///
+    /// Passing `None` clears the column (NULL). Issue #11: used by the core
+    /// service after an override-driven send and by the dangling-selection
+    /// fallback path.
+    pub async fn set_conversation_model_selection(
+        &self,
+        conversation_id: &ConversationId,
+        selection: Option<&ConversationModelSelection>,
+    ) -> Result<(), CoreError> {
+        let json = match selection {
+            Some(sel) => Some(
+                serde_json::to_value(sel)
+                    .map_err(|e| CoreError::Storage(format!("selection json: {e}")))?,
+            ),
+            None => None,
+        };
+        let result =
+            sqlx::query("UPDATE conversations SET last_model_selection = $2 WHERE id = $1")
+                .bind(&conversation_id.0)
+                .bind(json)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(CoreError::ConversationNotFound(conversation_id.0.clone()));
+        }
+        Ok(())
+    }
+
+    /// Read the stored model selection for a conversation. Returns `None`
+    /// when the conversation exists but has no stored selection; returns
+    /// `ConversationNotFound` when the id is unknown.
+    pub async fn get_conversation_model_selection(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<ConversationModelSelection>, CoreError> {
+        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+            "SELECT last_model_selection FROM conversations WHERE id = $1",
+        )
+        .bind(&conversation_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        let row = row.ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
+        let Some(json) = row.0 else {
+            return Ok(None);
+        };
+        let sel: ConversationModelSelection = serde_json::from_value(json).map_err(|e| {
+            CoreError::Storage(format!(
+                "last_model_selection JSON in DB is malformed: {e}"
+            ))
+        })?;
+        Ok(Some(sel))
     }
 }
 

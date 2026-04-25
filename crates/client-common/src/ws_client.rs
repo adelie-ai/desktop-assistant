@@ -109,7 +109,7 @@ impl WsClient {
         ))
     }
 
-    async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
+    pub async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
         let id = uuid::Uuid::new_v4().to_string();
         let request = WsRequest {
             id: id.clone(),
@@ -259,6 +259,7 @@ impl WsClient {
             .send_command(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),
                 content: prompt.to_string(),
+                override_selection: None,
             })
             .await?;
         let api::CommandResult::Ack = result else {
@@ -325,6 +326,13 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             message,
         }),
         api::Event::ConfigChanged { .. } => None,
+        api::Event::ConversationWarningEmitted {
+            conversation_id,
+            warning,
+        } => Some(SignalEvent::ConversationWarning {
+            conversation_id,
+            warning,
+        }),
     }
 }
 
@@ -369,16 +377,6 @@ mod tests {
     fn ignores_non_stream_config_events() {
         let event = map_event_to_signal(api::Event::ConfigChanged {
             config: api::Config {
-                llm: api::LlmSettingsView {
-                    connector: "openai".to_string(),
-                    model: "gpt-5.4".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    has_api_key: true,
-                    temperature: None,
-                    top_p: None,
-                    max_tokens: None,
-                    hosted_tool_search: None,
-                },
                 embeddings: api::EmbeddingsSettingsView {
                     connector: "openai".to_string(),
                     model: "text-embedding-3-small".to_string(),

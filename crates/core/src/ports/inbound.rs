@@ -1,6 +1,6 @@
 use crate::CoreError;
 use crate::domain::{Conversation, ConversationId, ConversationSummary};
-use crate::ports::llm::{ChunkCallback, StatusCallback};
+use crate::ports::llm::{ChunkCallback, ModelInfo, StatusCallback};
 
 #[derive(Debug, Clone)]
 pub struct LlmSettingsView {
@@ -152,6 +152,263 @@ pub trait ConversationService: Send + Sync {
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
     ) -> impl std::future::Future<Output = Result<String, CoreError>> + Send;
+
+    /// Send a prompt with optional per-send model/connection override.
+    ///
+    /// Resolution priority inside the core service:
+    /// 1. `override_selection`, when supplied (validated against the
+    ///    registry; invalid selections produce `CoreError::Llm`).
+    /// 2. The conversation's stored `last_model_selection`, when it still
+    ///    resolves to a live connection + listed model.
+    /// 3. The `interactive` purpose from the daemon config.
+    ///
+    /// Returns the assistant's full response text plus any advisory
+    /// warnings that should be surfaced to the client (for example, a
+    /// dangling stored selection that was cleared on this call). Default
+    /// implementation ignores overrides and delegates to `send_prompt`; the
+    /// concrete `ConversationHandler` overrides this with the full
+    /// resolution path.
+    fn send_prompt_with_override(
+        &self,
+        conversation_id: &ConversationId,
+        prompt: String,
+        override_selection: Option<PromptSelectionOverride>,
+        on_chunk: ChunkCallback,
+        on_status: StatusCallback,
+    ) -> impl std::future::Future<Output = Result<PromptDispatchOutcome, CoreError>> + Send
+    where
+        Self: Sync,
+    {
+        async move {
+            let _ = override_selection;
+            let text = self
+                .send_prompt(conversation_id, prompt, on_chunk, on_status)
+                .await?;
+            Ok(PromptDispatchOutcome {
+                response: text,
+                warnings: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Effort hint passed to connectors and mapped to per-connector request
+/// parameters at dispatch time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+/// Per-send selection override (model/connection/effort). Supplied by API
+/// clients via `SendPrompt { override: ... }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSelectionOverride {
+    pub connection_id: String,
+    pub model_id: String,
+    pub effort: Option<Effort>,
+}
+
+/// Stored per-conversation model selection. Serialized to JSON in the
+/// `conversations.last_model_selection` column.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConversationModelSelection {
+    pub connection_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<SerdeEffort>,
+}
+
+/// Serde-friendly `Effort` that maps to lowercase strings in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SerdeEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<SerdeEffort> for Effort {
+    fn from(e: SerdeEffort) -> Self {
+        match e {
+            SerdeEffort::Low => Effort::Low,
+            SerdeEffort::Medium => Effort::Medium,
+            SerdeEffort::High => Effort::High,
+        }
+    }
+}
+
+impl From<Effort> for SerdeEffort {
+    fn from(e: Effort) -> Self {
+        match e {
+            Effort::Low => SerdeEffort::Low,
+            Effort::Medium => SerdeEffort::Medium,
+            Effort::High => SerdeEffort::High,
+        }
+    }
+}
+
+/// Advisory attached to a `send_prompt_with_override` result. Returned
+/// alongside the response text so adapters can surface a one-time UI hint
+/// to the client (e.g. "your previous model selection no longer resolves,
+/// falling back to purpose default").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchWarning {
+    DanglingModelSelection {
+        previous: ConversationModelSelection,
+        fallback_to: ConversationModelSelection,
+    },
+}
+
+/// Successful outcome from `send_prompt_with_override`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptDispatchOutcome {
+    pub response: String,
+    pub warnings: Vec<DispatchWarning>,
+}
+
+/// Availability of a connection in the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionAvailability {
+    Ok,
+    Unavailable { reason: String },
+}
+
+/// Protocol-neutral connection config view for the inbound port.
+///
+/// Mirrors `crates/daemon/src/connections.rs::ConnectionConfig` but is
+/// decoupled so the core crate has no dependency on the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionConfigPayload {
+    Anthropic {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+    },
+    OpenAi {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+    },
+    Bedrock {
+        aws_profile: Option<String>,
+        region: Option<String>,
+        base_url: Option<String>,
+    },
+    Ollama {
+        base_url: Option<String>,
+    },
+}
+
+impl ConnectionConfigPayload {
+    pub fn connector_type(&self) -> &'static str {
+        match self {
+            Self::Anthropic { .. } => "anthropic",
+            Self::OpenAi { .. } => "openai",
+            Self::Bedrock { .. } => "bedrock",
+            Self::Ollama { .. } => "ollama",
+        }
+    }
+}
+
+/// A single configured connection, including status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionView {
+    pub id: String,
+    pub connector_type: String,
+    pub display_label: String,
+    pub availability: ConnectionAvailability,
+    pub has_credentials: bool,
+}
+
+/// A model enumerated under a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelListing {
+    pub connection_id: String,
+    pub connection_label: String,
+    pub model: ModelInfo,
+}
+
+/// Purpose kind identifiers — mirrors
+/// `crates/daemon/src/purposes.rs::PurposeKind` via string keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PurposeKind {
+    Interactive,
+    Dreaming,
+    Embedding,
+    Titling,
+}
+
+impl PurposeKind {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Dreaming => "dreaming",
+            Self::Embedding => "embedding",
+            Self::Titling => "titling",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurposeConfigPayload {
+    /// Either a connection id, or the literal `"primary"` (inherit).
+    pub connection: String,
+    /// Either a model id, or the literal `"primary"`.
+    pub model: String,
+    pub effort: Option<Effort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PurposesView {
+    pub interactive: Option<PurposeConfigPayload>,
+    pub dreaming: Option<PurposeConfigPayload>,
+    pub embedding: Option<PurposeConfigPayload>,
+    pub titling: Option<PurposeConfigPayload>,
+}
+
+/// Inbound port for connection + purpose management (issue #11).
+///
+/// Implemented by the daemon against its `ConnectionRegistry` and on-disk
+/// config. Adapters (D-Bus, WebSocket) dispatch through this trait so the
+/// daemon remains the single source of truth for connection state.
+pub trait ConnectionsService: Send + Sync {
+    fn list_connections(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ConnectionView>, CoreError>> + Send;
+
+    fn create_connection(
+        &self,
+        id: String,
+        config: ConnectionConfigPayload,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn update_connection(
+        &self,
+        id: String,
+        config: ConnectionConfigPayload,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn delete_connection(
+        &self,
+        id: String,
+        force: bool,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    fn list_available_models(
+        &self,
+        connection_id: Option<String>,
+        refresh: bool,
+    ) -> impl std::future::Future<Output = Result<Vec<ModelListing>, CoreError>> + Send;
+
+    fn get_purposes(
+        &self,
+    ) -> impl std::future::Future<Output = Result<PurposesView, CoreError>> + Send;
+
+    fn set_purpose(
+        &self,
+        purpose: PurposeKind,
+        config: PurposeConfigPayload,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
 /// Inbound port for assistant settings.
