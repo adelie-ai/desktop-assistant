@@ -1239,6 +1239,18 @@ async fn main() -> Result<()> {
 
     let settings_service =
         Arc::new(DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle));
+
+    // Construct the shared API handler up-front so both the D-Bus and WS
+    // adapters can share it (the multi-connection D-Bus interface dispatches
+    // through this handler, mirroring the WS adapter).
+    let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
+        Arc::new(DefaultAssistantApiHandler::new(
+            Arc::new(Assistant),
+            Arc::clone(&conversation_service),
+            Arc::clone(&settings_service),
+            Arc::clone(&connections_service),
+        ));
+
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
         .map(|v| v.trim().to_string())
@@ -1262,6 +1274,14 @@ async fn main() -> Result<()> {
                 b.serve_at(
                     "/org/desktopAssistant/Settings",
                     DbusSettingsAdapter::new(Arc::clone(&settings_service)),
+                )
+            })
+            .and_then(|b| {
+                b.serve_at(
+                    "/org/desktopAssistant/Connections",
+                    desktop_assistant_dbus::connections::DbusConnectionsAdapter::new(
+                        Arc::clone(&api_handler),
+                    ),
                 )
             }) {
             Ok(builder) => match builder.build().await {
@@ -1314,13 +1334,6 @@ async fn main() -> Result<()> {
     let ws_addr: std::net::SocketAddr = ws_bind
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid DESKTOP_ASSISTANT_WS_BIND '{ws_bind}': {e}"))?;
-
-    let api_handler = Arc::new(DefaultAssistantApiHandler::new(
-        Arc::new(Assistant),
-        Arc::clone(&conversation_service),
-        Arc::clone(&settings_service),
-        Arc::clone(&connections_service),
-    ));
 
     // Build auth validator: OIDC-aware if configured, otherwise local-only
     let ws_auth_config = config::get_ws_auth_settings(&config_path).ok();
