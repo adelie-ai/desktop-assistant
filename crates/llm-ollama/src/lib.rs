@@ -464,12 +464,18 @@ impl OllamaClient {
             // Ollama is local inference for open-source chat models.
             // Tools support is widespread on modern models, but the API
             // doesn't expose a reliable capability flag — default to true
-            // and let callers fall back on 400 responses.
+            // and let callers fall back on 400 responses. Embedding-only
+            // models are recognised by an `embed` token in the id (matches
+            // the `*-embed-*` and `*-embedding` naming used by every Ollama
+            // embedding model on https://ollama.com/library) so the picker
+            // can filter them correctly for the embedding purpose.
+            let lower_id = tag.name.to_ascii_lowercase();
+            let is_embedding = lower_id.contains("embed");
             let capabilities = ModelCapabilities {
                 reasoning: false,
                 vision: false,
-                tools: true,
-                embedding: false,
+                tools: !is_embedding,
+                embedding: is_embedding,
             };
 
             models.push(ModelInfo {

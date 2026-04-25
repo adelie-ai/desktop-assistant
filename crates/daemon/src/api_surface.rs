@@ -295,11 +295,16 @@ impl ConnectionsService for DaemonConnectionsService {
         connection_id: Option<String>,
         refresh: bool,
     ) -> Result<Vec<CoreModelListing>, CoreError> {
-        // Snapshot (id, label, client) triples before awaiting anything.
-        // Holding the read lock across `.await` would leave the returned
-        // future `!Send`; cloning `Arc<AnyLlmClient>` releases the lock up
-        // front and the awaits run unlocked.
-        let targets: Vec<(ConnectionId, String, std::sync::Arc<crate::registry::AnyLlmClient>)> = {
+        // Snapshot (id, connector_type, label, client) tuples before awaiting
+        // anything. Holding the read lock across `.await` would leave the
+        // returned future `!Send`; cloning `Arc<AnyLlmClient>` releases the
+        // lock up front and the awaits run unlocked.
+        let targets: Vec<(
+            ConnectionId,
+            String,
+            String,
+            std::sync::Arc<crate::registry::AnyLlmClient>,
+        )> = {
             let state = self
                 .registry
                 .state
@@ -314,11 +319,12 @@ impl ConnectionsService for DaemonConnectionsService {
                 if !matches!(st.health, ConnectionHealth::Ok) {
                     return Err(CoreError::Llm(format!("connection {id} is not live")));
                 }
-                let label = format!("{} ({})", st.id, st.connector_type);
+                let connector_type = st.connector_type.to_string();
+                let label = format!("{} ({})", st.id, connector_type);
                 let Some(client) = state.registry.get(&id) else {
                     return Err(CoreError::Llm(format!("connection {id} is not live")));
                 };
-                vec![(id, label, client)]
+                vec![(id, connector_type, label, client)]
             } else {
                 state
                     .registry
@@ -326,16 +332,17 @@ impl ConnectionsService for DaemonConnectionsService {
                     .into_iter()
                     .filter(|s| matches!(s.health, ConnectionHealth::Ok))
                     .filter_map(|s| {
-                        let label = format!("{} ({})", s.id, s.connector_type);
+                        let connector_type = s.connector_type.to_string();
+                        let label = format!("{} ({})", s.id, connector_type);
                         let client = state.registry.get(&s.id)?;
-                        Some((s.id, label, client))
+                        Some((s.id, connector_type, label, client))
                     })
                     .collect()
             }
         };
 
         let mut out: Vec<CoreModelListing> = Vec::new();
-        for (id, label, client) in targets {
+        for (id, connector_type, label, client) in targets {
             let list_result = if refresh {
                 client.refresh_models().await
             } else {
@@ -343,7 +350,9 @@ impl ConnectionsService for DaemonConnectionsService {
             };
             match list_result {
                 Ok(models) => {
-                    for m in models {
+                    let merged =
+                        crate::model_defaults::merge_with_defaults(&connector_type, models);
+                    for m in merged {
                         out.push(CoreModelListing {
                             connection_id: id.as_str().to_string(),
                             connection_label: label.clone(),
