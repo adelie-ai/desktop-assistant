@@ -958,9 +958,9 @@ mod tests {
             .unwrap();
         assert_eq!(response_second.text, "Hello");
 
-        tags_mock.assert_hits(1);
-        pull_mock.assert_hits(1);
-        chat_mock.assert_hits(2);
+        tags_mock.assert_calls(1);
+        pull_mock.assert_calls(1);
+        chat_mock.assert_calls(2);
     }
 
     #[tokio::test]
@@ -998,7 +998,7 @@ mod tests {
         let show_llama = server.mock(|when, then| {
             when.method(POST)
                 .path("/api/show")
-                .body_contains("llama3.2:latest");
+                .body_includes("llama3.2:latest");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);
@@ -1007,7 +1007,7 @@ mod tests {
         let show_embed = server.mock(|when, then| {
             when.method(POST)
                 .path("/api/show")
-                .body_contains("nomic-embed-text:latest");
+                .body_includes("nomic-embed-text:latest");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"model_info":{"nomic-bert.context_length":8192}}"#);
@@ -1026,9 +1026,9 @@ mod tests {
             .unwrap();
         assert_eq!(embed.context_limit, Some(8_192));
 
-        tags_mock.assert_hits(1);
-        show_llama.assert_hits(1);
-        show_embed.assert_hits(1);
+        tags_mock.assert_calls(1);
+        show_llama.assert_calls(1);
+        show_embed.assert_calls(1);
     }
 
     #[tokio::test]
@@ -1121,8 +1121,8 @@ mod tests {
         let second = client.embed(vec!["c".to_string()]).await.unwrap();
         assert_eq!(second, vec![vec![0.1_f32, 0.2_f32], vec![0.3_f32, 0.4_f32]]);
 
-        tags_mock.assert_hits(1);
-        pull_mock.assert_hits(1);
-        embed_mock.assert_hits(2);
+        tags_mock.assert_calls(1);
+        pull_mock.assert_calls(1);
+        embed_mock.assert_calls(2);
     }
 }

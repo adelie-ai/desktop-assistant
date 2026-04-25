@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, anyhow};
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -126,8 +126,7 @@ fn ensure_server_cert(
     tracing::info!("generating server certificate");
 
     let ca_key = KeyPair::from_pem(std::str::from_utf8(ca_key_pem)?)?;
-    let ca_params = CertificateParams::from_ca_cert_pem(std::str::from_utf8(ca_cert_pem)?)?;
-    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca_issuer = Issuer::from_ca_cert_pem(std::str::from_utf8(ca_cert_pem)?, ca_key)?;
 
     let server_key = KeyPair::generate()?;
     let mut params = CertificateParams::new(vec!["localhost".to_string()])?;
@@ -148,7 +147,7 @@ fn ensure_server_cert(
     params.not_after =
         time::OffsetDateTime::from_unix_timestamp(now as i64 + 365 * 24 * 3600)?;
 
-    let cert = params.signed_by(&server_key, &ca_cert, &ca_key)?;
+    let cert = params.signed_by(&server_key, &ca_issuer)?;
     let cert_pem = cert.pem().into_bytes();
     let key_pem = server_key.serialize_pem().into_bytes();
 
