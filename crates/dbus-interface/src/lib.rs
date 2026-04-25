@@ -1,3 +1,4 @@
+pub mod connections;
 pub mod conversation;
 pub mod settings;
 
