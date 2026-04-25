@@ -14,6 +14,7 @@ mod api_surface;
 mod app;
 mod config;
 mod connections;
+mod model_defaults;
 mod purposes;
 mod registry;
 mod routing_llm;

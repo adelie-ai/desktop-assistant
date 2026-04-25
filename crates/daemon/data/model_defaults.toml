@@ -1,0 +1,62 @@
+# Curated default models per connector type.
+#
+# These defaults get merged with whatever each connector's list_models()
+# returns. The intent is two-fold:
+#
+#   * For connectors without a remote model API (Anthropic, OpenAI), this
+#     file is the source of truth for what shows up in the UI.
+#   * For connectors that only enumerate locally available models (Ollama),
+#     the defaults pre-populate the picker with commonly-used models so the
+#     user doesn't have to pull each one before it's discoverable.
+#
+# Live API metadata always wins over the defaults during merging — the
+# defaults are filled in only for ids the live response didn't return.
+#
+# Schema per entry:
+#   id              = "<connector model id>"
+#   display_name    = "<human-friendly name>"
+#   context_limit   = optional integer (tokens)
+#   capabilities    = { reasoning = bool, vision = bool, tools = bool, embedding = bool }
+
+[[ollama]]
+id = "mxbai-embed-large:335m"
+display_name = "mxbai-embed-large 335m"
+capabilities = { reasoning = false, vision = false, tools = false, embedding = true }
+
+[[ollama]]
+id = "mxbai-embed-large:latest"
+display_name = "mxbai-embed-large"
+capabilities = { reasoning = false, vision = false, tools = false, embedding = true }
+
+[[ollama]]
+id = "nomic-embed-text:latest"
+display_name = "nomic-embed-text"
+capabilities = { reasoning = false, vision = false, tools = false, embedding = true }
+
+[[ollama]]
+id = "snowflake-arctic-embed:latest"
+display_name = "snowflake-arctic-embed"
+capabilities = { reasoning = false, vision = false, tools = false, embedding = true }
+
+[[ollama]]
+id = "all-minilm:latest"
+display_name = "all-MiniLM"
+capabilities = { reasoning = false, vision = false, tools = false, embedding = true }
+
+[[ollama]]
+id = "llama3.2:latest"
+display_name = "Llama 3.2"
+context_limit = 131072
+capabilities = { reasoning = false, vision = false, tools = true, embedding = false }
+
+[[ollama]]
+id = "llama3.2:3b"
+display_name = "Llama 3.2 3B"
+context_limit = 131072
+capabilities = { reasoning = false, vision = false, tools = true, embedding = false }
+
+[[ollama]]
+id = "qwen2.5:latest"
+display_name = "Qwen 2.5"
+context_limit = 32768
+capabilities = { reasoning = false, vision = false, tools = true, embedding = false }
