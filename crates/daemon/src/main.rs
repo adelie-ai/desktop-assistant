@@ -6,7 +6,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
-use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
+use desktop_assistant_core::ports::llm::{LlmClient, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tracing_subscriber::EnvFilter;
 
@@ -1027,14 +1027,32 @@ async fn main() -> Result<()> {
             &pg_pool,
             !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
         ) {
-            let resolved_bt_llm = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
+            // Prefer `[purposes.dreaming]` (issue #27) when configured; fall
+            // back to the legacy `[backend_tasks.llm]` block otherwise so
+            // installs that haven't migrated still work. Effort threading is
+            // computed once at startup and copied into the closure — the
+            // resolved purpose is fixed for this daemon run, and
+            // `ReasoningConfig` is `Copy`.
+            let (resolved_dreaming, dreaming_reasoning, source) =
+                match api_surface::resolve_purpose_dispatch(
+                    daemon_config.as_ref(),
+                    purposes::PurposeKind::Dreaming,
+                ) {
+                    Some((r, c)) => (r, c, "purposes.dreaming"),
+                    None => (
+                        config::resolve_backend_tasks_llm_config(daemon_config.as_ref()),
+                        Default::default(),
+                        "backend_tasks.llm",
+                    ),
+                };
             tracing::info!(
-                "dreaming LLM connector={}, model={}",
-                resolved_bt_llm.connector,
-                resolved_bt_llm.model
+                "dreaming LLM connector={}, model={}, source={}",
+                resolved_dreaming.connector,
+                resolved_dreaming.model,
+                source
             );
 
-            let dreaming_llm = build_llm_client(resolved_bt_llm);
+            let dreaming_llm = build_llm_client(resolved_dreaming);
             let dreaming_llm = RetryingLlmClient::new(dreaming_llm, 3);
             let dreaming_llm = MaybeProfiled::from_config(
                 dreaming_llm,
@@ -1063,6 +1081,7 @@ async fn main() -> Result<()> {
                 let llm_fn: desktop_assistant_storage::dreaming::DreamingLlmFn =
                     Box::new(move |system_prompt, user_prompt| {
                         let llm = Arc::clone(&dreaming_llm);
+                        let reasoning = dreaming_reasoning;
                         Box::pin(async move {
                             let messages = vec![
                                 Message::new(Role::System, system_prompt),
@@ -1072,7 +1091,7 @@ async fn main() -> Result<()> {
                                 .stream_completion(
                                     messages,
                                     &[],
-                                    ReasoningConfig::default(),
+                                    reasoning,
                                     Box::new(|_| true),
                                 )
                                 .await
