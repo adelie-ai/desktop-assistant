@@ -587,30 +587,28 @@ async fn main() -> Result<()> {
     // a second time. It's a duplicate client but the cost is one extra
     // HTTP client allocation — the registry clients stay live for the
     // connection-listing and model-listing APIs.
-    let primary_resolved = match daemon_config
-        .as_ref()
-        .and_then(|c| c.purposes.interactive.clone())
-    {
-        Some(interactive) => {
-            let connection_id = match &interactive.connection {
+    // Build the primary llm via the shared `resolve_purpose_llm_config`
+    // helper (issue #33) so the interactive purpose's `model` actually
+    // lands on the resolved config — connector clients have no per-call
+    // model knob, so a dispatch via the registry's per-connection client
+    // would otherwise silently use the connection's construction-time
+    // model and ignore the user's choice. Using the same helper as the
+    // background-task purposes (#26 / #27 / #28) keeps the model-override
+    // logic in one place.
+    let primary_resolved = config::resolve_purpose_llm_config(
+        daemon_config.as_ref(),
+        purposes::PurposeKind::Interactive,
+    )
+    .and_then(|resolved| {
+        let id = daemon_config
+            .as_ref()
+            .and_then(|c| c.purposes.interactive.as_ref())
+            .and_then(|p| match &p.connection {
                 purposes::ConnectionRef::Named(id) => Some(id.clone()),
                 purposes::ConnectionRef::Primary => None,
-            };
-            if let Some(id) = connection_id
-                && let (Some(cfg), Some(conn)) = (
-                    daemon_config.as_ref(),
-                    daemon_config
-                        .as_ref()
-                        .and_then(|c| c.connections.get(id.as_str()).cloned()),
-                )
-            {
-                Some((id, config::resolve_connection_llm_config(&conn, Some(&cfg.llm))))
-            } else {
-                None
-            }
-        }
-        None => None,
-    };
+            })?;
+        Some((id, resolved))
+    });
 
     let (active_id, llm) = match primary_resolved {
         Some((id, resolved)) => {

@@ -48,6 +48,16 @@ where
     ACTIVE_CLIENT.scope(client, fut).await
 }
 
+/// Whether an [`ACTIVE_CLIENT`] task-local is set for the current
+/// scope. Used by tests in the api_surface dispatch module to assert
+/// that interactive-purpose fallbacks correctly *do not* install an
+/// override (issue #33: dispatch should fall through to the primary
+/// llm in that case so the interactive purpose's model takes effect).
+#[cfg(test)]
+pub(crate) fn active_client_is_set() -> bool {
+    ACTIVE_CLIENT.try_with(|_| ()).is_ok()
+}
+
 /// The handler's LLM facade. Delegates to the per-turn active client when
 /// one is installed, or to the static fallback otherwise.
 ///

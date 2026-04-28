@@ -681,7 +681,21 @@ where
         //   1. override (validate first; hard error if invalid)
         //   2. stored conversation selection (validate; warn + fallback if dangling)
         //   3. interactive purpose
-        let effective_selection: Option<ConversationModelSelection> = if let Some(override_sel) =
+        //
+        // We track *user_driven* separately from *effective* (issue #33):
+        // the user-driven path (override / live stored) routes through the
+        // registry's per-connection client; the interactive-fallback path
+        // routes through the handler's static primary llm, which is
+        // already built with the interactive purpose's model baked in.
+        // Without this split, interactive_selection's `model_id` would be
+        // dropped at dispatch — connector clients have no per-call model
+        // knob, so the registry client always uses the connection's
+        // construction-time model.
+        //
+        // `effective_selection` is still used for reasoning so the
+        // interactive purpose's `effort` continues to apply when no
+        // user-driven selection exists.
+        let user_driven_selection: Option<ConversationModelSelection> = if let Some(override_sel) =
             override_selection
         {
             let id = ConnectionId::new(override_sel.connection_id.clone())
@@ -711,8 +725,11 @@ where
             if self.selection_is_live(&stored).await? {
                 Some(stored)
             } else {
-                // Dangling. Fall back to interactive; clear; emit a
-                // one-time warning.
+                // Dangling. Clear; emit a one-time warning naming the
+                // interactive fallback (so the UI can surface what the
+                // turn will actually use). The fallback itself is *not*
+                // user-driven, so we leave `user_driven_selection = None`
+                // and let dispatch route through the primary llm below.
                 let fallback = self.interactive_selection();
                 self.selection_store
                     .set_selection(conversation_id, None)
@@ -723,25 +740,30 @@ where
                         fallback_to: fb.clone(),
                     });
                 }
-                fallback
+                None
             }
         } else {
-            self.interactive_selection()
+            None
         };
+
+        // For reasoning purposes, the interactive purpose still contributes
+        // when nothing user-driven exists.
+        let effective_selection: Option<ConversationModelSelection> = user_driven_selection
+            .clone()
+            .or_else(|| self.interactive_selection());
 
         // Resolve the per-turn routing target:
         //   - `active_client`: the `Arc<AnyLlmClient>` dispatch must use
-        //     for this turn. Installed on a task-local consulted by
-        //     `RoutingLlmClient::stream_completion`. When `None`, the
-        //     handler's static interactive-purpose fallback is used.
+        //     for this turn. Only installed for *user-driven* selections;
+        //     for the interactive-purpose fallback we leave it `None` so
+        //     `RoutingLlmClient` falls through to the primary llm (which
+        //     was built with the interactive purpose's model).
         //   - `reasoning`: the `ReasoningConfig` populated from the
-        //     per-connector effort mapping. Installed on a second
-        //     task-local read by the core `ConversationHandler` dispatch
-        //     loop and forwarded into `stream_completion(... reasoning
-        //     ...)`.
+        //     per-connector effort mapping. Computed from
+        //     `effective_selection` so the interactive purpose's `effort`
+        //     applies even when we don't install an active_client.
         let mut active_client: Option<std::sync::Arc<crate::registry::AnyLlmClient>> = None;
-        let mut reasoning = ReasoningConfig::default();
-        if let Some(sel) = effective_selection.as_ref() {
+        if let Some(sel) = user_driven_selection.as_ref() {
             let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
                 CoreError::Llm(format!(
                     "resolved selection has malformed connection id {:?}: {e}",
@@ -750,10 +772,6 @@ where
             })?;
             // Reject Unavailable (or undeclared) connections with a
             // clean 400-style error rather than silently falling back.
-            let connector_type = self
-                .registry
-                .connector_type_for(&id)
-                .unwrap_or_default();
             match self.registry.client_for(&id) {
                 Some(client) => {
                     active_client = Some(client);
@@ -765,6 +783,20 @@ where
                     )));
                 }
             }
+        }
+
+        let mut reasoning = ReasoningConfig::default();
+        if let Some(sel) = effective_selection.as_ref() {
+            let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
+                CoreError::Llm(format!(
+                    "resolved selection has malformed connection id {:?}: {e}",
+                    sel.connection_id
+                ))
+            })?;
+            let connector_type = self
+                .registry
+                .connector_type_for(&id)
+                .unwrap_or_default();
             reasoning =
                 Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort.map(Effort::from));
         }
@@ -1222,12 +1254,19 @@ mod tests {
         /// dispatch time into the captured record.
         struct CapturingInner {
             captured_reasoning: StdMutex<Vec<ReasoningConfig>>,
+            /// Whether the routing wrapper installed an `ACTIVE_CLIENT`
+            /// task-local on each `send_prompt`. `false` means dispatch
+            /// would fall through to the primary llm — the expected
+            /// behaviour for the interactive-purpose fallback path
+            /// (issue #33).
+            captured_active_client_set: StdMutex<Vec<bool>>,
         }
 
         impl CapturingInner {
             fn new() -> Self {
                 Self {
                     captured_reasoning: StdMutex::new(Vec::new()),
+                    captured_active_client_set: StdMutex::new(Vec::new()),
                 }
             }
         }
@@ -1294,6 +1333,8 @@ mod tests {
                 // loop would call `stream_completion`.
                 let cfg = desktop_assistant_core::ports::llm::current_reasoning_config();
                 self.captured_reasoning.lock().unwrap().push(cfg);
+                let active = crate::routing_llm::active_client_is_set();
+                self.captured_active_client_set.lock().unwrap().push(active);
                 Ok("ok".to_string())
             }
         }
@@ -1498,6 +1539,158 @@ mod tests {
                 CapturingInner,
             >::apply_effort_mapping("anthropic", "claude-sonnet-4-6", None);
             assert_eq!(cfg, ReasoningConfig::default());
+        }
+
+        // ─── Issue #33: interactive purpose's model must reach dispatch ───
+        //
+        // The dispatch path's contract changed: when the effective selection
+        // came from `interactive_selection()` (i.e. no override, no live
+        // stored selection), the routing wrapper must NOT install the
+        // registry's per-connection client. Connector clients have no
+        // per-call model knob, so the registry client always uses the
+        // connection's construction-time model — which silently drops the
+        // interactive purpose's model. By falling through to the
+        // `RoutingLlmClient`'s static fallback (the primary llm, built in
+        // `main.rs` with the interactive purpose's model baked in), we
+        // ensure the user-configured model actually reaches the wire.
+
+        #[tokio::test]
+        async fn interactive_purpose_does_not_install_active_client() {
+            // No override, no stored selection: dispatch must fall through
+            // to the primary llm. `ACTIVE_CLIENT` task-local must be
+            // *unset* in the inner handler's scope.
+            let (routing, inner, _reg, _store) = make_handler();
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("dispatch must succeed");
+
+            let active = inner.captured_active_client_set.lock().unwrap();
+            assert_eq!(active.len(), 1);
+            assert!(
+                !active[0],
+                "interactive-purpose fallback must not install ACTIVE_CLIENT \
+                 (else dispatch would route through registry's connection \
+                 client and ignore the purpose's model)"
+            );
+        }
+
+        #[tokio::test]
+        async fn interactive_purpose_effort_still_applies_without_active_client() {
+            // The purpose's effort flows through the reasoning task-local
+            // even when we *don't* install ACTIVE_CLIENT. Use ollama so
+            // the connector mapping is a no-op (default ReasoningConfig)
+            // — the assertion is that we got the expected default, not
+            // that we lost the effort entirely. A non-ollama connector
+            // can't be exercised end-to-end without a live model list,
+            // so the bedrock-effort case is covered by the unit test on
+            // `apply_effort_mapping` above.
+            let mut cfg = local_ollama_cfg();
+            cfg.purposes.interactive = Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: Some(PurposeEffort::High),
+            });
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("dispatch must succeed");
+
+            let reasoning = inner.captured_reasoning.lock().unwrap();
+            assert_eq!(reasoning.len(), 1);
+            // ollama connector → no-op mapping. Asserting `default()` here
+            // is the *correct* outcome for the connector; the value-add of
+            // the test is that we still got *here* (pipeline didn't skip
+            // reasoning resolution just because active_client wasn't set).
+            assert_eq!(reasoning[0], ReasoningConfig::default());
+
+            let active = inner.captured_active_client_set.lock().unwrap();
+            assert!(!active[0]);
+        }
+
+        #[tokio::test]
+        async fn dangling_stored_selection_falls_back_to_interactive_without_active_client() {
+            // A stored selection pointing at a connection that's no longer
+            // declared falls back to the interactive purpose. Like the
+            // plain interactive path, this fallback must NOT install
+            // ACTIVE_CLIENT — the user is no longer "driving" the
+            // selection, the system is, and the primary llm already has
+            // the interactive purpose's model baked in.
+            let (routing, inner, _reg, store) = make_handler();
+            // Stored selection points at an unknown connection id.
+            // `connection_lists_model` returns false for missing ids
+            // without an HTTP round-trip (registry has no client for it),
+            // so the dangling-fallback branch fires deterministically.
+            store
+                .set_selection(
+                    &ConversationId::from("c1"),
+                    Some(&ConversationModelSelection {
+                        connection_id: "ghost".into(),
+                        model_id: "phantom".into(),
+                        effort: None,
+                    }),
+                )
+                .await
+                .expect("set selection");
+
+            let (on_chunk, on_status) = noop_cb();
+            let outcome = routing
+                .send_prompt_with_override(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    None,
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("dispatch must succeed via fallback");
+
+            let active = inner.captured_active_client_set.lock().unwrap();
+            assert_eq!(active.len(), 1);
+            assert!(
+                !active[0],
+                "dangling stored selection must fall through to primary llm"
+            );
+
+            // The dangling path also clears the bad stored selection and
+            // emits a one-time `DanglingModelSelection` warning naming the
+            // interactive fallback. Both behaviours are pre-existing but
+            // worth pinning here since the routing changes touched the
+            // surrounding code.
+            assert_eq!(
+                outcome.warnings.len(),
+                1,
+                "expected exactly one DanglingModelSelection warning"
+            );
+            let cleared = store
+                .get_selection(&ConversationId::from("c1"))
+                .await
+                .expect("get_selection");
+            assert!(
+                cleared.is_none(),
+                "dangling stored selection must be cleared after fallback"
+            );
         }
     }
 
