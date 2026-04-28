@@ -571,7 +571,6 @@ async fn main() -> Result<()> {
         resolved_llm.base_url
     );
     let llm_connector = resolved_llm.connector.clone();
-    let llm_api_key = resolved_llm.api_key.clone();
 
     // Resolve the `interactive` purpose and grab its client from the
     // registry. This is the primary dispatch target for `send_prompt`
@@ -671,16 +670,13 @@ async fn main() -> Result<()> {
             }
             _ => {
                 tracing::info!("using OpenAI-compatible embedding backend");
-                let api_key = if resolved_emb.is_default || resolved_emb.connector == llm_connector
-                {
-                    llm_api_key.clone()
-                } else {
-                    let env_key =
-                        format!("{}_API_KEY", resolved_emb.connector.to_ascii_uppercase());
-                    std::env::var(env_key).unwrap_or_default()
-                };
+                // `resolved_emb.api_key` is now resolved by
+                // `resolve_embeddings_config` itself (purpose path uses the
+                // purpose's connection's secret/env; legacy path reuses the
+                // shared LLM key when connectors match, else falls back to
+                // `<CONNECTOR>_API_KEY`).
                 AnyEmbeddingClient::OpenAi(
-                    desktop_assistant_llm_openai::OpenAiClient::new(api_key)
+                    desktop_assistant_llm_openai::OpenAiClient::new(resolved_emb.api_key.clone())
                         .with_model(resolved_emb.model.clone())
                         .with_base_url(resolved_emb.base_url.clone()),
                 )
