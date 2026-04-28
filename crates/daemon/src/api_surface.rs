@@ -500,62 +500,105 @@ where
     }
 
     /// Translate the effort hint into the per-connector
-    /// [`ReasoningConfig`] the connector's dispatch path expects.
-    ///
-    /// - Anthropic / Bedrock (Claude): populates
-    ///   `thinking_budget_tokens` using
-    ///   [`map_anthropic_thinking_budget`].
-    /// - OpenAI: populates `reasoning_effort` using
-    ///   [`map_openai_reasoning_effort`]. The connector itself applies a
-    ///   per-model capability gate and silently drops the field for
-    ///   non-reasoning models.
-    /// - Ollama / unknown: returns an empty `ReasoningConfig` (no-op).
-    ///
-    /// The returned value is installed on the turn's task-local
-    /// [`with_reasoning_config`] scope by the caller.
+    /// [`ReasoningConfig`] the connector's dispatch path expects. Thin
+    /// wrapper around [`map_effort_to_reasoning_config`] retained so the
+    /// per-turn dispatch keeps its `Self::apply_effort_mapping(...)` shape.
     fn apply_effort_mapping(
         connector_type: &str,
         model_id: &str,
         effort: Option<Effort>,
     ) -> ReasoningConfig {
-        let Some(effort) = effort else {
-            return ReasoningConfig::default();
-        };
-        match connector_type {
-            "anthropic" | "bedrock" => {
-                let budget = map_anthropic_thinking_budget(effort);
-                tracing::debug!(
-                    connector = connector_type,
-                    model = model_id,
-                    effort = ?effort,
-                    thinking_budget_tokens = budget,
-                    "mapped effort to Anthropic extended-thinking budget"
-                );
-                if budget == 0 {
-                    ReasoningConfig::default()
-                } else {
-                    ReasoningConfig::with_thinking_budget(budget)
-                }
-            }
-            "openai" => {
-                let level = map_effort_to_reasoning_level(effort);
-                tracing::debug!(
-                    connector = connector_type,
-                    model = model_id,
-                    effort = ?effort,
-                    reasoning_level = ?level,
-                    "mapped effort to OpenAI reasoning_effort"
-                );
-                ReasoningConfig::with_reasoning_effort(level)
-            }
-            _ => {
-                tracing::debug!(
-                    connector = connector_type,
-                    effort = ?effort,
-                    "no reasoning mapping defined for connector (no-op)"
-                );
+        map_effort_to_reasoning_config(connector_type, model_id, effort)
+    }
+}
+
+/// Resolve a purpose's full dispatch config — `(ResolvedLlmConfig,
+/// ReasoningConfig)` — for use by background tasks that want to honour
+/// `[purposes.<kind>]` end-to-end (issue #27 dreaming, #28 titling).
+///
+/// Returns `None` when no purpose is configured for `kind` so callers
+/// can fall back to the legacy resolvers without an extra branch on a
+/// boolean. The returned `ReasoningConfig` is computed from the purpose's
+/// effort hint via [`map_effort_to_reasoning_config`]; it is
+/// `ReasoningConfig::default()` when the purpose has no effort set.
+///
+/// Lives here (not in `config.rs`) because the effort mapper depends on
+/// the `Effort` ↔ `ReasoningConfig` conversion glue and the connector
+/// dispatch tables, which are api_surface concerns. Putting it here
+/// keeps `config.rs` free of `tracing::debug!` per-connector decisions.
+pub(crate) fn resolve_purpose_dispatch(
+    config: Option<&crate::config::DaemonConfig>,
+    kind: PurposeKind,
+) -> Option<(crate::config::ResolvedLlmConfig, ReasoningConfig)> {
+    let resolved = crate::config::resolve_purpose_llm_config(config, kind)?;
+    // The purpose itself was resolvable, so we know `cfg.purposes.get(kind)`
+    // is `Some` — re-fetch it for the effort hint, which the
+    // `ResolvedLlmConfig` doesn't carry (it's connector/model/credentials).
+    let effort = config
+        .and_then(|c| c.purposes.get(kind))
+        .and_then(|p| p.effort)
+        .map(purpose_effort_to_core);
+    let reasoning = map_effort_to_reasoning_config(&resolved.connector, &resolved.model, effort);
+    Some((resolved, reasoning))
+}
+
+/// Translate the effort hint into the per-connector [`ReasoningConfig`]
+/// the connector's dispatch path expects.
+///
+/// - Anthropic / Bedrock (Claude): populates `thinking_budget_tokens`
+///   using [`map_anthropic_thinking_budget`].
+/// - OpenAI: populates `reasoning_effort` using
+///   [`map_openai_reasoning_effort`]. The connector itself applies a
+///   per-model capability gate and silently drops the field for
+///   non-reasoning models.
+/// - Ollama / unknown: returns an empty `ReasoningConfig` (no-op).
+///
+/// Free function so backend tasks (dreaming #27, titling #28) that don't
+/// instantiate a [`RoutingConversationHandler`] can still resolve their
+/// purpose's effort hint into a `ReasoningConfig` to thread into
+/// `stream_completion`.
+pub fn map_effort_to_reasoning_config(
+    connector_type: &str,
+    model_id: &str,
+    effort: Option<Effort>,
+) -> ReasoningConfig {
+    let Some(effort) = effort else {
+        return ReasoningConfig::default();
+    };
+    match connector_type {
+        "anthropic" | "bedrock" => {
+            let budget = map_anthropic_thinking_budget(effort);
+            tracing::debug!(
+                connector = connector_type,
+                model = model_id,
+                effort = ?effort,
+                thinking_budget_tokens = budget,
+                "mapped effort to Anthropic extended-thinking budget"
+            );
+            if budget == 0 {
                 ReasoningConfig::default()
+            } else {
+                ReasoningConfig::with_thinking_budget(budget)
             }
+        }
+        "openai" => {
+            let level = map_effort_to_reasoning_level(effort);
+            tracing::debug!(
+                connector = connector_type,
+                model = model_id,
+                effort = ?effort,
+                reasoning_level = ?level,
+                "mapped effort to OpenAI reasoning_effort"
+            );
+            ReasoningConfig::with_reasoning_effort(level)
+        }
+        _ => {
+            tracing::debug!(
+                connector = connector_type,
+                effort = ?effort,
+                "no reasoning mapping defined for connector (no-op)"
+            );
+            ReasoningConfig::default()
         }
     }
 }
@@ -910,7 +953,7 @@ fn payload_to_purpose(p: PurposeConfigPayload) -> Result<PurposeConfig, String> 
     })
 }
 
-fn purpose_effort_to_core(e: PurposeEffort) -> Effort {
+pub(crate) fn purpose_effort_to_core(e: PurposeEffort) -> Effort {
     match e {
         PurposeEffort::Low => Effort::Low,
         PurposeEffort::Medium => Effort::Medium,
@@ -1455,6 +1498,239 @@ mod tests {
                 CapturingInner,
             >::apply_effort_mapping("anthropic", "claude-sonnet-4-6", None);
             assert_eq!(cfg, ReasoningConfig::default());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Background-task purpose dispatch (issues #27 dreaming, #28 titling)
+    // ─────────────────────────────────────────────────────────────────────
+
+    mod purpose_dispatch_tests {
+        use super::super::*;
+
+        #[test]
+        fn returns_none_when_no_purpose_configured() {
+            // Bare `[llm]` config: no `[purposes]` table, no resolution.
+            let config: DaemonConfig = toml::from_str(
+                r#"
+                [llm]
+                connector = "openai"
+                "#,
+            )
+            .unwrap();
+
+            for kind in PurposeKind::all() {
+                assert!(
+                    resolve_purpose_dispatch(Some(&config), kind).is_none(),
+                    "expected None for {kind:?} on bare config"
+                );
+            }
+        }
+
+        #[test]
+        fn dreaming_purpose_with_no_effort_uses_default_reasoning() {
+            // Purpose set but no `effort` key — we must not fabricate an
+            // effort, just pass `ReasoningConfig::default()` through.
+            let config: DaemonConfig = toml::from_str(
+                r#"
+                [llm]
+                connector = "ollama"
+
+                [connections.local]
+                type = "ollama"
+                base_url = "http://localhost:11434"
+
+                [purposes.interactive]
+                connection = "local"
+                model = "llama3.2"
+
+                [purposes.dreaming]
+                connection = "local"
+                model = "qwen2.5:14b"
+                "#,
+            )
+            .unwrap();
+
+            let (resolved, reasoning) =
+                resolve_purpose_dispatch(Some(&config), PurposeKind::Dreaming)
+                    .expect("dreaming purpose should resolve");
+            assert_eq!(resolved.connector, "ollama");
+            assert_eq!(resolved.model, "qwen2.5:14b");
+            assert_eq!(
+                reasoning,
+                ReasoningConfig::default(),
+                "no effort hint → default ReasoningConfig"
+            );
+        }
+
+        #[test]
+        fn dreaming_purpose_with_medium_anthropic_sets_thinking_budget() {
+            // Anthropic + Medium effort → thinking_budget = 8_000.
+            let config: DaemonConfig = toml::from_str(
+                r#"
+                [llm]
+                connector = "anthropic"
+
+                [connections.cloud]
+                type = "anthropic"
+                base_url = "https://api.anthropic.com"
+                api_key_env = "DA_TEST_PURPOSE_DISPATCH_KEY"
+
+                [purposes.interactive]
+                connection = "cloud"
+                model = "claude-sonnet-4-6"
+
+                [purposes.dreaming]
+                connection = "cloud"
+                model = "claude-haiku-4-5"
+                effort = "medium"
+                "#,
+            )
+            .unwrap();
+
+            let (_resolved, reasoning) =
+                resolve_purpose_dispatch(Some(&config), PurposeKind::Dreaming)
+                    .expect("dreaming purpose should resolve");
+            assert_eq!(reasoning.thinking_budget_tokens, Some(8_000));
+            assert!(reasoning.reasoning_effort.is_none());
+        }
+
+        #[test]
+        fn dreaming_purpose_with_low_anthropic_disables_thinking() {
+            // Low effort → budget=0, which should leave the field as None
+            // (matches the connector's "thinking disabled" semantics).
+            let config: DaemonConfig = toml::from_str(
+                r#"
+                [llm]
+                connector = "anthropic"
+
+                [connections.cloud]
+                type = "anthropic"
+                base_url = "https://api.anthropic.com"
+                api_key_env = "DA_TEST_PURPOSE_DISPATCH_KEY"
+
+                [purposes.interactive]
+                connection = "cloud"
+                model = "claude-sonnet-4-6"
+
+                [purposes.dreaming]
+                connection = "cloud"
+                model = "claude-haiku-4-5"
+                effort = "low"
+                "#,
+            )
+            .unwrap();
+
+            let (_resolved, reasoning) =
+                resolve_purpose_dispatch(Some(&config), PurposeKind::Dreaming)
+                    .expect("dreaming purpose should resolve");
+            assert_eq!(
+                reasoning,
+                ReasoningConfig::default(),
+                "low → budget 0 → ReasoningConfig::default"
+            );
+        }
+
+        #[test]
+        fn titling_purpose_with_high_openai_sets_reasoning_effort() {
+            // Confirms #28's path is wired the same as dreaming: OpenAI
+            // gets `reasoning_effort`, not `thinking_budget_tokens`.
+            let config: DaemonConfig = toml::from_str(
+                r#"
+                [llm]
+                connector = "openai"
+
+                [connections.cloud]
+                type = "openai"
+                base_url = "https://api.openai.com/v1"
+                api_key_env = "DA_TEST_PURPOSE_DISPATCH_OPENAI_KEY"
+
+                [purposes.interactive]
+                connection = "cloud"
+                model = "gpt-5"
+
+                [purposes.titling]
+                connection = "cloud"
+                model = "gpt-4o-mini"
+                effort = "high"
+                "#,
+            )
+            .unwrap();
+
+            let (resolved, reasoning) =
+                resolve_purpose_dispatch(Some(&config), PurposeKind::Titling)
+                    .expect("titling purpose should resolve");
+            assert_eq!(resolved.connector, "openai");
+            assert_eq!(resolved.model, "gpt-4o-mini");
+            assert!(reasoning.thinking_budget_tokens.is_none());
+            assert!(
+                reasoning.reasoning_effort.is_some(),
+                "OpenAI + High should populate reasoning_effort"
+            );
+        }
+
+        #[test]
+        fn ollama_purpose_with_effort_is_noop() {
+            // Ollama has no reasoning-effort knob in the request body, so
+            // even with `effort = high` we should get the default
+            // ReasoningConfig and let the connector handle it.
+            let config: DaemonConfig = toml::from_str(
+                r#"
+                [llm]
+                connector = "ollama"
+
+                [connections.local]
+                type = "ollama"
+                base_url = "http://localhost:11434"
+
+                [purposes.interactive]
+                connection = "local"
+                model = "llama3.2"
+
+                [purposes.dreaming]
+                connection = "local"
+                model = "qwen2.5:14b"
+                effort = "high"
+                "#,
+            )
+            .unwrap();
+
+            let (_resolved, reasoning) =
+                resolve_purpose_dispatch(Some(&config), PurposeKind::Dreaming).unwrap();
+            assert_eq!(reasoning, ReasoningConfig::default());
+        }
+
+        #[test]
+        fn map_effort_free_function_handles_all_connectors() {
+            // Direct exercise of the free `map_effort_to_reasoning_config`
+            // (used by background tasks). The existing `effort_mapping_*`
+            // tests cover the same logic via the
+            // `RoutingConversationHandler::apply_effort_mapping` wrapper;
+            // this asserts the public free fn surfaces identical results
+            // for the cases dreaming/titling actually traverse.
+            assert_eq!(
+                map_effort_to_reasoning_config("anthropic", "m", Some(Effort::Medium))
+                    .thinking_budget_tokens,
+                Some(8_000)
+            );
+            assert_eq!(
+                map_effort_to_reasoning_config("anthropic", "m", Some(Effort::Low)),
+                ReasoningConfig::default(),
+                "Anthropic Low → budget=0 → default ReasoningConfig"
+            );
+            assert!(
+                map_effort_to_reasoning_config("openai", "m", Some(Effort::High))
+                    .reasoning_effort
+                    .is_some()
+            );
+            assert_eq!(
+                map_effort_to_reasoning_config("ollama", "m", Some(Effort::High)),
+                ReasoningConfig::default()
+            );
+            assert_eq!(
+                map_effort_to_reasoning_config("anthropic", "m", None),
+                ReasoningConfig::default()
+            );
         }
     }
 }
