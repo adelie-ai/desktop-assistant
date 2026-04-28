@@ -16,7 +16,7 @@ use crate::connections::{
     AnthropicConnection, BedrockConnection, ConnectionConfig, ConnectionId, ConnectionsError,
     ConnectionsMap, OllamaConnection, OpenAiConnection, connection_from_legacy_llm,
 };
-use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
+use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, PurposeKind, Purposes};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DaemonConfig {
@@ -383,6 +383,12 @@ pub struct EmbeddingsSettingsView {
     pub connector: String,
     pub model: String,
     pub base_url: String,
+    /// API key resolved from secret backend / env / shared LLM config. Used by
+    /// `main.rs` to instantiate the OpenAI-compatible embedding client.
+    /// Daemon-internal — not exposed across the settings API surface (see
+    /// `settings_service::get_embeddings_settings`, which maps to a separate
+    /// core view that omits this field).
+    pub api_key: String,
     pub has_api_key: bool,
     pub available: bool,
     pub is_default: bool,
@@ -1180,6 +1186,14 @@ pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
 }
 
 pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSettingsView {
+    // Purpose-driven path: when `[purposes.embedding]` is configured, it wins
+    // over the legacy `[embeddings]` block. The daemon API surface
+    // (`set_purpose("embedding", ...)`) writes into `[purposes]`, so without
+    // this short-circuit user-set purposes silently get ignored at startup.
+    if let Some(view) = resolve_purpose_embeddings_view(config) {
+        return view;
+    }
+
     let llm_connector = config
         .map(|c| c.llm.connector.trim().to_lowercase())
         .filter(|c| !c.is_empty())
@@ -1207,22 +1221,43 @@ pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSet
         .unwrap_or_else(|| default_base_url(&connector));
 
     // Resolve API key: reuse LLM secret config if connectors match, otherwise use env fallback
-    let has_api_key = if is_default || connector == llm_connector {
-        let resolved_llm = resolve_llm_config(config);
-        !resolved_llm.api_key.is_empty()
+    let api_key = if is_default || connector == llm_connector {
+        resolve_llm_config(config).api_key
     } else {
         let env_key = default_api_key_env(&connector);
-        !std::env::var(env_key).unwrap_or_default().trim().is_empty()
+        std::env::var(env_key).unwrap_or_default()
     };
+    let has_api_key = !api_key.trim().is_empty();
 
     EmbeddingsSettingsView {
         connector,
         model,
         base_url,
+        api_key,
         has_api_key,
         available,
         is_default,
     }
+}
+
+/// Build an `EmbeddingsSettingsView` from `purposes.embedding` if it is
+/// configured, otherwise return `None`. Centralises the purpose-aware
+/// short-circuit so the legacy resolver can skip the rest of its work.
+fn resolve_purpose_embeddings_view(config: Option<&DaemonConfig>) -> Option<EmbeddingsSettingsView> {
+    let resolved = resolve_purpose_llm_config(config, PurposeKind::Embedding)?;
+    let available = resolved.connector != "anthropic";
+    let has_api_key = !resolved.api_key.trim().is_empty();
+    Some(EmbeddingsSettingsView {
+        connector: resolved.connector,
+        model: resolved.model,
+        base_url: resolved.base_url,
+        api_key: resolved.api_key,
+        has_api_key,
+        available,
+        // Always `false` for purpose-driven config: the user explicitly chose
+        // a connection/model, so this is no longer "the inferred default".
+        is_default: false,
+    })
 }
 
 pub fn resolve_persistence_config(config: Option<&DaemonConfig>) -> ResolvedPersistenceConfig {
@@ -1328,6 +1363,70 @@ pub fn resolve_backend_tasks_llm_config(config: Option<&DaemonConfig>) -> Resolv
     } else {
         resolve_llm_config(config)
     }
+}
+
+/// Resolve the LLM config for a given [`PurposeKind`] when the user has
+/// configured `[purposes.<kind>]`. Returns `None` when no purpose is set
+/// (callers fall back to the legacy resolvers — `resolve_embeddings_config`
+/// for embedding, `resolve_backend_tasks_llm_config` for dreaming/titling).
+///
+/// Resolution flow:
+/// 1. Look up `cfg.purposes.<kind>`. If absent, return `None`.
+/// 2. Validate `[connections]`. If the map fails to validate, log + `None` —
+///    the legacy resolver still produces something usable from `[llm]`.
+/// 3. Run [`crate::purposes::resolve_purpose`] which handles `"primary"`
+///    inheritance (connection and model both fall through to interactive)
+///    and dangling-connection warnings.
+/// 4. Build a [`ResolvedLlmConfig`] from the purpose's connection via
+///    [`resolve_connection_llm_config`], then override the model with the
+///    purpose's `model_id`. The connection's resolved `api_key` /
+///    `base_url` / connector type are preserved as-is — the purpose layer
+///    only chooses *which* connection + model, not credentials.
+///
+/// Effort threading is handled at the call site (see
+/// `api_surface::RoutingConversationHandler::apply_effort_mapping` for the
+/// interactive path; backend tasks call the same mapper directly). The
+/// effort hint lives on `cfg.purposes.<kind>.effort` and can be read back
+/// via `cfg.purposes.get(kind).effort`.
+pub fn resolve_purpose_llm_config(
+    config: Option<&DaemonConfig>,
+    kind: PurposeKind,
+) -> Option<ResolvedLlmConfig> {
+    let cfg = config?;
+    cfg.purposes.get(kind)?;
+
+    let connections = match cfg.validated_connections() {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::warn!(
+                purpose = kind.as_key(),
+                error = %err,
+                "cannot resolve purpose: [connections] failed validation; falling back to legacy resolver"
+            );
+            return None;
+        }
+    };
+
+    let resolved = match crate::purposes::resolve_purpose(kind, &cfg.purposes, &connections) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                purpose = kind.as_key(),
+                error = %err,
+                "purpose resolution failed; falling back to legacy resolver"
+            );
+            return None;
+        }
+    };
+
+    // The connection must exist after `resolve_purpose` — it returns the
+    // interactive fallback id for dangling refs, and interactive itself is
+    // checked by `expect_interactive_connection`. Map miss here would be a
+    // logic bug in `resolve_purpose`, not a config issue.
+    let conn = connections.get(&resolved.connection_id)?;
+    let mut llm = resolve_connection_llm_config(conn, Some(&cfg.llm));
+    llm.model = resolved.model_id;
+    Some(llm)
 }
 
 /// Shared resolution logic: takes an optional `LlmConfig` reference and
@@ -3440,5 +3539,378 @@ y = 2
             std::env::remove_var("XDG_DATA_HOME");
         }
         std::fs::remove_dir_all(&test_dir).ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Purpose-aware LLM config resolution (issue #26)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a config with an `ollama` interactive connection at the given
+    /// id. Used as a base for purpose-resolution tests so they don't have to
+    /// repeat the same TOML each time.
+    fn config_with_ollama_interactive(connection_id: &str, model: &str) -> DaemonConfig {
+        toml::from_str(&format!(
+            r#"
+            [llm]
+            connector = "ollama"
+
+            [connections.{connection_id}]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "{connection_id}"
+            model = "{model}"
+            "#
+        ))
+        .expect("test fixture should parse")
+    }
+
+    #[test]
+    fn resolve_purpose_returns_none_when_no_purposes_configured() {
+        // Bare `[llm]` config with no `[purposes]` table: every kind returns
+        // None so callers can fall back to the legacy resolvers.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "openai"
+            "#,
+        )
+        .unwrap();
+
+        for kind in PurposeKind::all() {
+            assert!(
+                resolve_purpose_llm_config(Some(&config), kind).is_none(),
+                "expected None for {kind:?} when no purposes configured"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_purpose_returns_none_when_purpose_kind_absent() {
+        // Interactive is set; embedding is not. Asking for embedding must
+        // return None — `purposes.embedding` was never authored.
+        let config = config_with_ollama_interactive("local", "llama3.2");
+
+        assert!(resolve_purpose_llm_config(Some(&config), PurposeKind::Interactive).is_some());
+        assert!(resolve_purpose_llm_config(Some(&config), PurposeKind::Embedding).is_none());
+        assert!(resolve_purpose_llm_config(Some(&config), PurposeKind::Dreaming).is_none());
+        assert!(resolve_purpose_llm_config(Some(&config), PurposeKind::Titling).is_none());
+    }
+
+    #[test]
+    fn resolve_purpose_pulls_connector_and_overrides_model() {
+        // Purpose pins a *different* model than any connection-level default;
+        // we should see the purpose's model flow through.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "local"
+            model = "llama3.2"
+
+            [purposes.dreaming]
+            connection = "local"
+            model = "qwen2.5:14b"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_purpose_llm_config(Some(&config), PurposeKind::Dreaming)
+            .expect("dreaming purpose should resolve");
+        assert_eq!(resolved.connector, "ollama");
+        assert_eq!(resolved.model, "qwen2.5:14b");
+        assert_eq!(resolved.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn resolve_purpose_inherits_model_from_interactive_via_primary() {
+        // `model = "primary"` is the documented inheritance sentinel.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "local"
+            model = "llama3.2"
+
+            [purposes.titling]
+            connection = "primary"
+            model = "primary"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_purpose_llm_config(Some(&config), PurposeKind::Titling)
+            .expect("titling should resolve via primary inheritance");
+        assert_eq!(resolved.model, "llama3.2");
+        assert_eq!(resolved.connector, "ollama");
+    }
+
+    #[test]
+    fn resolve_purpose_uses_purpose_connection_when_different_from_interactive() {
+        // Two connections; interactive pins one, dreaming pins the other.
+        // The dreaming resolver must pick up the second connection's
+        // connector / base_url, not the interactive one's.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [connections.remote]
+            type = "ollama"
+            base_url = "http://remote.example:11434"
+
+            [purposes.interactive]
+            connection = "local"
+            model = "llama3.2"
+
+            [purposes.dreaming]
+            connection = "remote"
+            model = "qwen2.5"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_purpose_llm_config(Some(&config), PurposeKind::Dreaming)
+            .expect("dreaming should resolve");
+        assert_eq!(resolved.connector, "ollama");
+        assert_eq!(resolved.base_url, "http://remote.example:11434");
+        assert_eq!(resolved.model, "qwen2.5");
+    }
+
+    #[test]
+    fn resolve_purpose_dangling_connection_falls_back_to_interactive() {
+        // `purpose.dreaming.connection = "missing"` — `resolve_purpose` warns
+        // and falls back to interactive's connection. The model stays as
+        // authored (no sensible auto-fallback).
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "local"
+            model = "llama3.2"
+
+            [purposes.dreaming]
+            connection = "missing"
+            model = "qwen2.5"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_purpose_llm_config(Some(&config), PurposeKind::Dreaming)
+            .expect("should fall back rather than error");
+        // Connector/base_url come from interactive's `local` connection.
+        assert_eq!(resolved.connector, "ollama");
+        assert_eq!(resolved.base_url, "http://localhost:11434");
+        // Model stays as authored — `purpose.dreaming.model` was never wrong,
+        // only its connection ref was.
+        assert_eq!(resolved.model, "qwen2.5");
+    }
+
+    #[test]
+    fn resolve_purpose_returns_none_when_no_config() {
+        // Defensive: callers may pass `None` for ambient `daemon_config`.
+        for kind in PurposeKind::all() {
+            assert!(resolve_purpose_llm_config(None, kind).is_none());
+        }
+    }
+
+    #[test]
+    fn resolve_embeddings_uses_purposes_embedding_when_configured() {
+        // The whole point of issue #26: a user who has set `[purposes.embedding]`
+        // gets *that* connection/model back from `resolve_embeddings_config`,
+        // not whatever the legacy `[embeddings]` block (or `[llm]` fallback)
+        // would have inferred.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "anthropic"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "local"
+            model = "llama3.2"
+
+            [purposes.embedding]
+            connection = "local"
+            model = "nomic-embed-text"
+            "#,
+        )
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        // Without the purpose-aware path, this would resolve to `anthropic`
+        // (from `[llm].connector`) and `available = false`.
+        assert_eq!(view.connector, "ollama");
+        assert_eq!(view.model, "nomic-embed-text");
+        assert_eq!(view.base_url, "http://localhost:11434");
+        assert!(view.available, "ollama embedding must be marked available");
+        assert!(
+            !view.is_default,
+            "is_default should be false when purposes.embedding is explicit"
+        );
+    }
+
+    #[test]
+    fn resolve_embeddings_falls_back_to_legacy_when_no_purpose() {
+        // When `[purposes.embedding]` is *not* set, we keep the pre-#26
+        // behaviour byte-for-byte: legacy `[embeddings]` overrides win, then
+        // the `[llm].connector` default. This ensures the bug fix is
+        // additive — installs without a purposes block see no behaviour
+        // change at all.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "local"
+            model = "llama3.2"
+            "#,
+        )
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        // Legacy default for ollama.
+        assert_eq!(view.connector, "ollama");
+        assert_eq!(view.model, "nomic-embed-text");
+        assert!(view.available);
+        assert!(view.is_default, "no [embeddings] override → is_default");
+    }
+
+    #[test]
+    fn resolve_embeddings_purpose_with_primary_model_inherits_interactive() {
+        // `purposes.embedding.model = "primary"` inherits interactive's model.
+        // Unusual for embeddings (LLM models don't normally double as
+        // embedding models) but the resolver should still wire the
+        // inheritance correctly — model validity is a deployment concern.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "ollama"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "local"
+            model = "nomic-embed-text"
+
+            [purposes.embedding]
+            connection = "primary"
+            model = "primary"
+            "#,
+        )
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, "ollama");
+        assert_eq!(view.model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn embeddings_view_carries_api_key_through_legacy_path() {
+        // The legacy resolver populates `api_key` from the shared LLM
+        // resolver when connectors match. Use a clearly-marked env var so
+        // we can assert the value flows end-to-end without depending on
+        // ambient OPENAI_API_KEY.
+        let env_var =
+            format!("DA_TEST_PURPOSE_LEGACY_KEY_{}", uuid::Uuid::new_v4().simple());
+        // SAFETY: unique name, single-threaded test scope.
+        unsafe {
+            std::env::set_var(&env_var, "legacy-secret");
+        }
+
+        let config: DaemonConfig = toml::from_str(&format!(
+            r#"
+            [llm]
+            connector = "openai"
+            api_key_env = "{env_var}"
+            "#
+        ))
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.api_key, "legacy-secret");
+        assert!(view.has_api_key);
+
+        unsafe {
+            std::env::remove_var(&env_var);
+        }
+    }
+
+    #[test]
+    fn embeddings_view_carries_api_key_through_purpose_path() {
+        // Mirror of the legacy test, but via `purposes.embedding`. Proves
+        // the api_key from the purpose's connection's secret/env reaches the
+        // view (not just `has_api_key`), so `main.rs` can hand it to the
+        // OpenAI-compatible embedding client without an extra round-trip.
+        let env_var =
+            format!("DA_TEST_PURPOSE_KEY_{}", uuid::Uuid::new_v4().simple());
+        // SAFETY: unique name, single-threaded test scope.
+        unsafe {
+            std::env::set_var(&env_var, "purpose-secret");
+        }
+
+        let config: DaemonConfig = toml::from_str(&format!(
+            r#"
+            [llm]
+            connector = "openai"
+
+            [connections.cloud]
+            type = "openai"
+            base_url = "https://api.openai.com/v1"
+            api_key_env = "{env_var}"
+
+            [purposes.interactive]
+            connection = "cloud"
+            model = "gpt-4o"
+
+            [purposes.embedding]
+            connection = "cloud"
+            model = "text-embedding-3-small"
+            "#
+        ))
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, "openai");
+        assert_eq!(view.model, "text-embedding-3-small");
+        assert_eq!(view.api_key, "purpose-secret");
+        assert!(view.has_api_key);
+
+        unsafe {
+            std::env::remove_var(&env_var);
+        }
     }
 }
