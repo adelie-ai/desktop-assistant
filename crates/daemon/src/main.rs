@@ -6,12 +6,13 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::SettingsService;
-use desktop_assistant_core::ports::llm::{LlmClient, RetryingLlmClient};
+use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tracing_subscriber::EnvFilter;
 
 mod api_surface;
 mod app;
+mod backend_reasoning;
 mod config;
 mod connections;
 mod model_defaults;
@@ -1180,6 +1181,16 @@ async fn main() -> Result<()> {
     let fallback_client = Arc::new(llm);
     let llm =
         routing_llm::RoutingLlmClient::new(Arc::clone(&fallback_client), llm_connector.clone());
+    // Wrap the primary in a transparent `FixedReasoningLlmClient` whose
+    // override is `default()`. The interactive dispatch path goes through
+    // the per-turn task-local installed by `RoutingConversationHandler`,
+    // which calls `stream_completion` with its mapped `ReasoningConfig` —
+    // we must not stomp on that, hence the passthrough configuration.
+    // The wrapper exists here only so the primary and backend handlers
+    // share the same `L` type (issue #28: backend tasks need a non-default
+    // override, and `with_backend_llm(L)` requires both stacks to match).
+    let llm =
+        backend_reasoning::FixedReasoningLlmClient::new(llm, ReasoningConfig::default());
     let llm = RetryingLlmClient::new(llm, 3);
     let llm = MaybeProfiled::from_config(
         llm,
@@ -1194,17 +1205,46 @@ async fn main() -> Result<()> {
         Box::new(|| uuid::Uuid::now_v7().to_string()),
     );
 
-    // Build a separate LLM for backend tasks (title generation, context summary)
-    // if [backend_tasks.llm] is configured and differs from the primary.
-    let resolved_bt = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
+    // Build a separate LLM for backend tasks (title generation, context summary).
+    //
+    // Resolution order (issue #28):
+    //   1. `[purposes.titling]` — if set, always install the backend client
+    //      so the user's chosen connection / model / effort is honoured even
+    //      when it happens to coincide with the primary.
+    //   2. `[backend_tasks.llm]` legacy block — install only if it differs
+    //      from the primary (preserving pre-#28 behaviour for unmigrated
+    //      installs that haven't authored a `[purposes]` table).
+    //
+    // Effort threading: backend tasks call `stream_completion` from
+    // `core::service` with `ReasoningConfig::default()` baked in. We can't
+    // change that without touching the core service, so we wrap the backend
+    // client in `FixedReasoningLlmClient` to substitute the purpose's
+    // mapped reasoning at the daemon layer. For the legacy path we fix it
+    // to `default()` — a transparent passthrough.
+    let purpose_titling = api_surface::resolve_purpose_dispatch(
+        daemon_config.as_ref(),
+        purposes::PurposeKind::Titling,
+    );
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
-    if resolved_bt.connector != resolved_primary.connector
-        || resolved_bt.model != resolved_primary.model
-    {
+    let titling_setup = match purpose_titling {
+        Some((resolved, reasoning)) => Some((resolved, reasoning, "purposes.titling")),
+        None => {
+            let resolved = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
+            if resolved.connector != resolved_primary.connector
+                || resolved.model != resolved_primary.model
+            {
+                Some((resolved, ReasoningConfig::default(), "backend_tasks.llm"))
+            } else {
+                None
+            }
+        }
+    };
+    if let Some((resolved_bt, bt_reasoning, source)) = titling_setup {
         tracing::info!(
-            "backend-tasks LLM connector={}, model={}",
+            "backend-tasks LLM connector={}, model={}, source={}",
             resolved_bt.connector,
-            resolved_bt.model
+            resolved_bt.model,
+            source
         );
         let bt_connector = resolved_bt.connector.clone();
         let bt_llm = build_llm_client(resolved_bt);
@@ -1216,6 +1256,10 @@ async fn main() -> Result<()> {
         // `with_backend_llm` accepts it.
         let bt_fallback = Arc::new(bt_llm);
         let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback, bt_connector);
+        // Substitute the configured reasoning (purpose's mapped effort,
+        // or default for legacy installs) for whatever the core
+        // service's title/summary functions pass in.
+        let bt_llm = backend_reasoning::FixedReasoningLlmClient::new(bt_llm, bt_reasoning);
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
         let bt_llm = MaybeProfiled::from_config(
             bt_llm,
