@@ -3913,4 +3913,63 @@ y = 2
             std::env::remove_var(&env_var);
         }
     }
+
+    #[test]
+    fn purpose_only_config_without_legacy_llm_block_loads_and_resolves() {
+        // Hygiene check: a config with `[purposes.*]` + `[connections.*]` and
+        // no legacy `[llm]` / `[embeddings]` / `[backend_tasks.llm]` blocks
+        // must parse, validate, and produce a working dispatch view for
+        // every kind. This is the shape we recommend after PRs #29-31, and
+        // we should not regress on it without noticing.
+        let toml_str = r#"
+            [connections.bedrock]
+            type = "bedrock"
+            region = "us-east-1"
+
+            [connections.local]
+            type = "ollama"
+            base_url = "http://localhost:11434"
+
+            [purposes.interactive]
+            connection = "bedrock"
+            model = "us.anthropic.claude-sonnet-4-6"
+            effort = "medium"
+
+            [purposes.dreaming]
+            connection = "bedrock"
+            model = "anthropic.claude-haiku-4-5"
+
+            [purposes.embedding]
+            connection = "local"
+            model = "mxbai-embed-large:335m"
+
+            [purposes.titling]
+            connection = "bedrock"
+            model = "anthropic.claude-haiku-4-5"
+        "#;
+
+        let config: DaemonConfig = toml::from_str(toml_str).expect("parses cleanly");
+        config.purposes.validate().expect("purposes valid");
+        let _connections = config.validated_connections().expect("connections valid");
+
+        // Every configured purpose must resolve to a concrete client config.
+        for kind in PurposeKind::all() {
+            let resolved = resolve_purpose_llm_config(Some(&config), kind)
+                .expect("purpose must resolve without legacy fallback");
+            assert!(
+                !resolved.connector.is_empty() && !resolved.model.is_empty(),
+                "{kind:?} → empty connector/model"
+            );
+        }
+
+        // Embeddings view must reflect the purpose, not synthesize from the
+        // (absent) `[llm]` block.
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, "ollama");
+        assert_eq!(view.model, "mxbai-embed-large:335m");
+        assert!(
+            !view.is_default,
+            "purpose-driven view must be marked non-default"
+        );
+    }
 }
