@@ -298,6 +298,7 @@ fn core_purpose_to_api(p: PurposeConfigPayload) -> api::PurposeConfigView {
         connection: p.connection,
         model: p.model,
         effort: p.effort.map(effort_to_api),
+        max_context_tokens: p.max_context_tokens,
     }
 }
 
@@ -306,6 +307,7 @@ fn api_purpose_to_core(p: api::PurposeConfigView) -> PurposeConfigPayload {
         connection: p.connection,
         model: p.model,
         effort: p.effort.map(effort_from_api),
+        max_context_tokens: p.max_context_tokens,
     }
 }
 

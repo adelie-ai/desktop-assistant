@@ -783,6 +783,7 @@ fn maybe_migrate_legacy_purposes(
         connection: ConnectionRef::Named(interactive_conn),
         model: ModelRef::Named(interactive_model),
         effort: None,
+        max_context_tokens: None,
     });
 
     let dreaming_model = match (&backend_conn_ref, &backend_model_opt) {
@@ -803,11 +804,13 @@ fn maybe_migrate_legacy_purposes(
         connection: backend_conn_ref.clone(),
         model: dreaming_model.clone(),
         effort: None,
+        max_context_tokens: None,
     });
     parsed.purposes.titling = Some(PurposeConfig {
         connection: backend_conn_ref,
         model: dreaming_model,
         effort: None,
+        max_context_tokens: None,
     });
     // Embeddings always inherit from the primary connection: the embedding
     // model lives in `[embeddings]`, not in `backend_tasks.llm`, so there is
@@ -817,6 +820,7 @@ fn maybe_migrate_legacy_purposes(
         connection: ConnectionRef::Primary,
         model: ModelRef::Primary,
         effort: None,
+        max_context_tokens: None,
     });
 
     // Drop `backend_tasks.llm` from the serialized shape. The field remains
@@ -1427,6 +1431,51 @@ pub fn resolve_purpose_llm_config(
     let mut llm = resolve_connection_llm_config(conn, Some(&cfg.llm));
     llm.model = resolved.model_id;
     Some(llm)
+}
+
+/// Universal fallback for purpose-aware context-window resolution
+/// (issue #51). Used when no purpose override is set and the connector's
+/// curated table reports nothing for the model. Most modern frontier
+/// models meet or exceed this; under-stating is safe (we compact slightly
+/// earlier than necessary), over-stating is not (the LLM rejects).
+pub const DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS: u64 = 200_000;
+
+/// Three-tier resolution for "what's the context window for this purpose?"
+/// (issue #51).
+///
+/// Resolution order:
+///   1. The purpose's `max_context_tokens` override, if explicitly set —
+///      the user always wins.
+///   2. The connector's curated table for the configured model, surfaced
+///      via `LlmClient::max_context_tokens()` (or any equivalent the
+///      caller passes through `client_max`).
+///   3. [`DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS`] — a conservative universal
+///      fallback so token-based compaction stays on for non-curated
+///      models instead of silently disabling.
+///
+/// `purpose_override` carries tier 1; `client_max` carries tier 2. Both
+/// are optional so callers without a live `Option<u64>` can pass `None`
+/// and still get the fallback.
+pub fn resolve_max_context_tokens(
+    purpose_override: Option<u64>,
+    client_max: Option<u64>,
+) -> u64 {
+    purpose_override
+        .or(client_max)
+        .unwrap_or(DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS)
+}
+
+/// Convenience: pull `purposes.<kind>.max_context_tokens` from a
+/// `DaemonConfig`. Returns `None` when no purpose is configured for `kind`
+/// or the override is unset; in that case the caller should drop into
+/// tier 2 / tier 3 of [`resolve_max_context_tokens`].
+pub fn purpose_max_context_override(
+    config: Option<&DaemonConfig>,
+    kind: PurposeKind,
+) -> Option<u64> {
+    config
+        .and_then(|cfg| cfg.purposes.get(kind))
+        .and_then(|p| p.max_context_tokens)
 }
 
 /// Shared resolution logic: takes an optional `LlmConfig` reference and
@@ -3971,5 +4020,144 @@ y = 2
             !view.is_default,
             "purpose-driven view must be marked non-default"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Purpose-aware max_context_tokens resolution (issue #51)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn max_context_tier1_purpose_override_wins_over_curated() {
+        // Tier 1: an explicit `purpose.max_context_tokens` beats the
+        // connector's curated table even when the curated value is known.
+        // The user always wins.
+        let resolved = resolve_max_context_tokens(Some(500_000), Some(200_000));
+        assert_eq!(resolved, 500_000);
+    }
+
+    #[test]
+    fn max_context_tier2_curated_wins_over_universal_fallback() {
+        // Tier 2: when no purpose override is set, the connector's curated
+        // value (e.g. `BedrockClient::max_context_tokens()` returning
+        // 200k for Claude 3.x) wins over the universal fallback. This
+        // matters when a connector knows the model has *less* than the
+        // 200k floor (none of our current curated entries do, but the
+        // resolver mustn't pretend a smaller window is bigger).
+        let resolved = resolve_max_context_tokens(None, Some(128_000));
+        assert_eq!(resolved, 128_000);
+    }
+
+    #[test]
+    fn max_context_tier3_unknown_model_uses_universal_fallback() {
+        // Tier 3: unknown model + no override → conservative 200k
+        // fallback so token-based compaction stays on instead of
+        // silently disabling for non-curated providers.
+        let resolved = resolve_max_context_tokens(None, None);
+        assert_eq!(resolved, DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS);
+        assert_eq!(resolved, 200_000);
+    }
+
+    #[test]
+    fn max_context_purpose_override_pulls_from_config() {
+        // The `purpose_max_context_override` helper extracts the field
+        // from the right purpose without exposing the `Purposes` map to
+        // every caller.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [connections.bedrock]
+            type = "bedrock"
+            region = "us-east-1"
+
+            [purposes.interactive]
+            connection = "bedrock"
+            model = "us.amazon.nova-premier-v1:0"
+            max_context_tokens = 1000000
+
+            [purposes.dreaming]
+            connection = "bedrock"
+            model = "anthropic.claude-haiku-4-5"
+            "#,
+        )
+        .unwrap();
+
+        // Interactive carries an explicit override.
+        assert_eq!(
+            purpose_max_context_override(Some(&config), PurposeKind::Interactive),
+            Some(1_000_000)
+        );
+        // Dreaming has the field absent → None (caller falls through to
+        // tier 2/3).
+        assert_eq!(
+            purpose_max_context_override(Some(&config), PurposeKind::Dreaming),
+            None
+        );
+        // Unconfigured purpose → None.
+        assert_eq!(
+            purpose_max_context_override(Some(&config), PurposeKind::Embedding),
+            None
+        );
+        // No config at all → None.
+        assert_eq!(
+            purpose_max_context_override(None, PurposeKind::Interactive),
+            None
+        );
+    }
+
+    #[test]
+    fn max_context_purpose_override_roundtrips_through_toml() {
+        // Migration check: a config WITHOUT the field deserializes (legacy
+        // shape). A config WITH the field round-trips byte-equivalent
+        // (modulo whitespace) — `None` on serialize is omitted, `Some`
+        // on serialize is preserved.
+
+        // 1. Legacy config — no `max_context_tokens` anywhere.
+        let legacy_toml = r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[purposes.interactive]
+connection = "local"
+model = "llama3.2"
+"#;
+        let legacy: DaemonConfig = toml::from_str(legacy_toml).expect("legacy parses");
+        assert_eq!(
+            legacy.purposes.interactive.as_ref().unwrap().max_context_tokens,
+            None
+        );
+        let reserialized = toml::to_string(&legacy).unwrap();
+        assert!(
+            !reserialized.contains("max_context_tokens"),
+            "None must not appear on the wire: {reserialized}"
+        );
+
+        // 2. Config with an explicit override round-trips.
+        let with_override_toml = r#"
+[connections.bedrock]
+type = "bedrock"
+region = "us-east-1"
+
+[purposes.interactive]
+connection = "bedrock"
+model = "us.amazon.nova-premier-v1:0"
+max_context_tokens = 1000000
+"#;
+        let parsed: DaemonConfig = toml::from_str(with_override_toml).unwrap();
+        assert_eq!(
+            parsed
+                .purposes
+                .interactive
+                .as_ref()
+                .unwrap()
+                .max_context_tokens,
+            Some(1_000_000)
+        );
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert!(
+            serialized.contains("max_context_tokens"),
+            "explicit override must be preserved: {serialized}"
+        );
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.purposes, reparsed.purposes);
     }
 }

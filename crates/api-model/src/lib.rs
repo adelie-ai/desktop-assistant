@@ -509,6 +509,11 @@ pub struct PurposeConfigView {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<EffortLevel>,
+    /// Optional per-purpose override for the model's context window in
+    /// tokens (issue #51). When omitted, the daemon consults the
+    /// connector's curated table and a conservative universal fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// Aggregate purpose view. Missing entries mean the purpose is not
@@ -720,11 +725,39 @@ mod tests {
                 connection: "primary".into(),
                 model: "primary".into(),
                 effort: Some(EffortLevel::Low),
+                max_context_tokens: None,
             },
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn set_purpose_view_carries_max_context_tokens() {
+        // Issue #51: the wire type carries the user's per-purpose
+        // `max_context_tokens` override end-to-end so the KCM can read
+        // and write it.
+        let cfg = PurposeConfigView {
+            connection: "work_bedrock".into(),
+            model: "us.amazon.nova-premier-v1:0".into(),
+            effort: Some(EffortLevel::Medium),
+            max_context_tokens: Some(1_000_000),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("max_context_tokens"));
+        let back: PurposeConfigView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+
+        // Round-trip with `None` must omit the field on the wire.
+        let cfg_none = PurposeConfigView {
+            connection: "work".into(),
+            model: "gpt-5".into(),
+            effort: None,
+            max_context_tokens: None,
+        };
+        let json_none = serde_json::to_string(&cfg_none).unwrap();
+        assert!(!json_none.contains("max_context_tokens"));
     }
 
     #[test]

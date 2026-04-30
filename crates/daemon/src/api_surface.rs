@@ -801,11 +801,23 @@ where
                 Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort.map(Effort::from));
         }
 
-        // Install both task-locals, then delegate to the inner core
+        // Resolve the per-turn `max_context_tokens` override (issue #51).
+        // Interactive is the purpose that drives `send_prompt`; if the user
+        // has authored `purposes.interactive.max_context_tokens`, surface it
+        // through the routing wrapper so token-based compaction in
+        // `core::Service` honours their override. When unset (the common
+        // case), the wrapper falls through to tier 2/3.
+        let max_context_override = crate::config::purpose_max_context_override(
+            Some(&self.registry.snapshot_config()),
+            PurposeKind::Interactive,
+        );
+
+        // Install task-locals, then delegate to the inner core
         // handler. The handler reads the task-locals inside its
         // `send_prompt` dispatch loop:
         //   - `RoutingLlmClient` picks the active client on each
-        //     `stream_completion` call.
+        //     `stream_completion` call and uses `MAX_CONTEXT_OVERRIDE` to
+        //     resolve the context window.
         //   - `current_reasoning_config()` surfaces `reasoning` into the
         //     connector's request body.
         let inner = Arc::clone(&self.inner);
@@ -817,6 +829,8 @@ where
                     .await
             };
             let dispatch = with_reasoning_config(reasoning, dispatch);
+            let dispatch =
+                crate::routing_llm::with_max_context_override(max_context_override, dispatch);
             match active_client {
                 Some(c) => crate::routing_llm::with_active_client(c, dispatch).await,
                 None => dispatch.await,
@@ -961,6 +975,7 @@ fn purpose_to_payload(p: &PurposeConfig) -> PurposeConfigPayload {
             ModelRef::Primary => "primary".to_string(),
         },
         effort: p.effort.map(purpose_effort_to_core),
+        max_context_tokens: p.max_context_tokens,
     }
 }
 
@@ -982,6 +997,7 @@ fn payload_to_purpose(p: PurposeConfigPayload) -> Result<PurposeConfig, String> 
         connection,
         model,
         effort: p.effort.map(core_effort_to_purpose),
+        max_context_tokens: p.max_context_tokens,
     })
 }
 
@@ -1126,11 +1142,13 @@ mod tests {
             connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
             model: ModelRef::Named("llama3".into()),
             effort: None,
+            max_context_tokens: None,
         });
         cfg.purposes.dreaming = Some(PurposeConfig {
             connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
             model: ModelRef::Named("claude".into()),
             effort: None,
+            max_context_tokens: None,
         });
 
         let svc = DaemonConnectionsService::new(make_handle_with(cfg));
@@ -1151,11 +1169,13 @@ mod tests {
             connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
             model: ModelRef::Named("llama3".into()),
             effort: None,
+            max_context_tokens: None,
         });
         cfg.purposes.dreaming = Some(PurposeConfig {
             connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
             model: ModelRef::Named("claude".into()),
             effort: None,
+            max_context_tokens: None,
         });
 
         let handle = make_handle_with(cfg);
@@ -1179,6 +1199,7 @@ mod tests {
                     connection: "primary".into(),
                     model: "llama3".into(),
                     effort: None,
+                    max_context_tokens: None,
                 },
             )
             .await
@@ -1193,6 +1214,7 @@ mod tests {
             connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
             model: ModelRef::Named("llama3".into()),
             effort: Some(PurposeEffort::Medium),
+            max_context_tokens: None,
         });
         let svc = DaemonConnectionsService::new(make_handle_with(cfg));
         let view = svc.get_purposes().await.unwrap();
@@ -1348,6 +1370,7 @@ mod tests {
                 connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
                 model: ModelRef::Named("llama3".into()),
                 effort: None,
+                max_context_tokens: None,
             });
             cfg
         }
@@ -1443,6 +1466,7 @@ mod tests {
                         "us.anthropic.claude-sonnet-4-6".into(),
                     ),
                     effort: None,
+                    max_context_tokens: None,
                 });
                 c
             };
@@ -1596,6 +1620,7 @@ mod tests {
                 connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
                 model: ModelRef::Named("llama3".into()),
                 effort: Some(PurposeEffort::High),
+                max_context_tokens: None,
             });
             let registry = make_handle_with(cfg);
             let inner = Arc::new(CapturingInner::new());
