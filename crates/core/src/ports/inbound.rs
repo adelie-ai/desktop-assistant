@@ -356,6 +356,10 @@ pub struct PurposeConfigPayload {
     /// Either a model id, or the literal `"primary"`.
     pub model: String,
     pub effort: Option<Effort>,
+    /// Optional per-purpose override for the model's context window in
+    /// tokens (issue #51). `None` means "use the connector's curated
+    /// table, then a conservative universal fallback."
+    pub max_context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

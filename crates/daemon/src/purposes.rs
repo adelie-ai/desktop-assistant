@@ -142,7 +142,14 @@ pub enum Effort {
 /// connection = "home_bedrock"
 /// model = "claude-haiku-4-5"
 /// effort = "low"
+/// max_context_tokens = 1_000_000
 /// ```
+///
+/// `max_context_tokens` is a user-supplied override for the model's context
+/// window in tokens. When set, it takes priority over the connector's
+/// curated table (issue #51). Leaving it unset (the default) lets the
+/// daemon-side resolver consult the connector's per-model table and fall
+/// back to a conservative universal default.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PurposeConfig {
@@ -158,6 +165,11 @@ pub struct PurposeConfig {
     pub model: ModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// Optional override for the model's max context window, in tokens.
+    /// When `Some`, it wins over the connector's curated default and the
+    /// universal fallback (see `crate::config::resolve_max_context_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// All purpose configs, keyed by [`PurposeKind`].
@@ -530,6 +542,7 @@ mod tests {
             connection: ConnectionRef::Named(conn_id(conn)),
             model: ModelRef::Named(model.to_string()),
             effort: Some(Effort::Medium),
+            max_context_tokens: None,
         }
     }
 
@@ -644,6 +657,7 @@ mystery = "x"
                 connection: ConnectionRef::Primary,
                 model: ModelRef::Primary,
                 effort: None,
+                max_context_tokens: None,
             }),
             ..Purposes::default()
         };
@@ -657,6 +671,7 @@ mystery = "x"
                 connection: ConnectionRef::Primary,
                 model: ModelRef::Named("gpt-5.4".to_string()),
                 effort: None,
+                max_context_tokens: None,
             }),
             ..Purposes::default()
         };
@@ -673,6 +688,7 @@ mystery = "x"
                 connection: ConnectionRef::Named(conn_id("work")),
                 model: ModelRef::Primary,
                 effort: None,
+                max_context_tokens: None,
             }),
             ..Purposes::default()
         };
@@ -706,6 +722,7 @@ mystery = "x"
                 connection: ConnectionRef::Primary,
                 model: ModelRef::Primary,
                 effort: Some(Effort::Low),
+                max_context_tokens: None,
             }),
             ..Purposes::default()
         };
@@ -726,6 +743,7 @@ mystery = "x"
                 connection: ConnectionRef::Primary,
                 model: ModelRef::Named("claude-haiku-4-5".to_string()),
                 effort: None,
+                max_context_tokens: None,
             }),
             ..Purposes::default()
         };
@@ -752,6 +770,7 @@ mystery = "x"
                 connection: ConnectionRef::Named(conn_id("ghost")),
                 model: ModelRef::Named("claude-haiku-4-5".to_string()),
                 effort: None,
+                max_context_tokens: None,
             }),
             ..Purposes::default()
         };
@@ -788,6 +807,7 @@ mystery = "x"
                 connection: ConnectionRef::Primary,
                 model: ModelRef::Primary,
                 effort: None,
+                max_context_tokens: None,
             }),
             ..Purposes::default()
         };
@@ -833,5 +853,53 @@ model = "primary"
             assert_eq!(PurposeKind::from_key(k.as_key()), Some(k));
         }
         assert_eq!(PurposeKind::from_key("nope"), None);
+    }
+
+    // --- max_context_tokens (#51) ----------------------------------------
+
+    #[test]
+    fn purpose_config_parses_max_context_tokens() {
+        let toml_src = r#"
+connection = "work_bedrock"
+model = "us.amazon.nova-premier-v1:0"
+effort = "medium"
+max_context_tokens = 1000000
+"#;
+        let parsed: PurposeConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(parsed.max_context_tokens, Some(1_000_000));
+    }
+
+    #[test]
+    fn purpose_config_omits_max_context_tokens_when_none() {
+        // Round-trip a config with no override; the serialized form must not
+        // mention `max_context_tokens` at all so legacy configs stay clean.
+        let cfg = PurposeConfig {
+            connection: ConnectionRef::Named(conn_id("work")),
+            model: ModelRef::Named("gpt-5.4".to_string()),
+            effort: Some(Effort::Medium),
+            max_context_tokens: None,
+        };
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(
+            !serialized.contains("max_context_tokens"),
+            "None should be skipped: {serialized}"
+        );
+        let reparsed: PurposeConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(cfg, reparsed);
+    }
+
+    #[test]
+    fn purpose_config_legacy_toml_without_field_deserializes() {
+        // Migration: configs predating #51 must still parse — `max_context_tokens`
+        // has `#[serde(default)]` so the absence is fine even with
+        // `deny_unknown_fields` on the struct.
+        let legacy = r#"
+connection = "work_openai"
+model = "gpt-5.4"
+effort = "high"
+"#;
+        let parsed: PurposeConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.max_context_tokens, None);
+        assert_eq!(parsed.effort, Some(Effort::High));
     }
 }

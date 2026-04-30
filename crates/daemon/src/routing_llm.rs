@@ -36,6 +36,13 @@ tokio::task_local! {
     /// [`RoutingLlmClient`]'s static fallback. Populated by
     /// [`with_active_client`] from inside the routing wrapper.
     static ACTIVE_CLIENT: Arc<AnyLlmClient>;
+
+    /// Per-turn purpose-driven `max_context_tokens` override (issue #51).
+    /// When set, [`RoutingLlmClient::max_context_tokens`] uses this value
+    /// as tier 1 of the three-tier resolution (user override beats the
+    /// connector's curated table beats the universal fallback). Populated
+    /// by [`with_max_context_override`].
+    static MAX_CONTEXT_OVERRIDE: Option<u64>;
 }
 
 /// Run `fut` with `client` installed as the current turn's active LLM
@@ -46,6 +53,22 @@ where
     F: std::future::Future<Output = T>,
 {
     ACTIVE_CLIENT.scope(client, fut).await
+}
+
+/// Run `fut` with `override_value` installed as the per-turn
+/// `max_context_tokens` override (issue #51). The wrapper's
+/// [`LlmClient::max_context_tokens`] consults this slot first, falling
+/// through to the resolved client's curated value and then to
+/// [`crate::config::DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS`].
+///
+/// `override_value` is `Option<u64>` so callers can install the slot
+/// unconditionally — `None` simply means "no purpose-level override; use
+/// the connector's table or the universal fallback."
+pub async fn with_max_context_override<F, T>(override_value: Option<u64>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    MAX_CONTEXT_OVERRIDE.scope(override_value, fut).await
 }
 
 /// Whether an [`ACTIVE_CLIENT`] task-local is set for the current
@@ -106,7 +129,19 @@ impl LlmClient for RoutingLlmClient {
     }
 
     fn max_context_tokens(&self) -> Option<u64> {
-        self.resolve().max_context_tokens()
+        // Three-tier resolution (issue #51):
+        //   1. Per-turn purpose override from `MAX_CONTEXT_OVERRIDE`.
+        //   2. Resolved client's curated value (`max_context_tokens` on the
+        //      underlying `AnyLlmClient`, e.g. `BedrockClient`'s table).
+        //   3. `DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS` (200k) — conservative
+        //      universal fallback so token-based compaction stays on even
+        //      when the connector has no curated entry.
+        let purpose_override = MAX_CONTEXT_OVERRIDE.try_with(|v| *v).unwrap_or(None);
+        let client_max = self.resolve().max_context_tokens();
+        Some(crate::config::resolve_max_context_tokens(
+            purpose_override,
+            client_max,
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -294,5 +329,52 @@ mod tests {
     fn unused_core_error_type_still_compiles() {
         // Make sure the CoreError import isn't elided by mistake.
         let _e: Option<CoreError> = None;
+    }
+
+    // --- max_context_tokens three-tier resolution (issue #51) ------------
+
+    #[tokio::test]
+    async fn max_context_falls_back_to_universal_when_unset() {
+        // Tier 3: ollama exposes no curated `max_context_tokens` and we
+        // installed no override → 200k universal fallback. This is the
+        // safety net that keeps token-based compaction on for non-curated
+        // providers instead of silently disabling.
+        let fallback = build_ollama_registry();
+        let client = RoutingLlmClient::new(fallback, "ollama".into());
+        let resolved = client.max_context_tokens();
+        assert_eq!(
+            resolved,
+            Some(crate::config::DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS)
+        );
+    }
+
+    #[tokio::test]
+    async fn max_context_uses_purpose_override_when_set() {
+        // Tier 1: an installed `MAX_CONTEXT_OVERRIDE` task-local takes
+        // precedence over the connector's value (or lack thereof).
+        let fallback = build_ollama_registry();
+        let client = RoutingLlmClient::new(fallback, "ollama".into());
+        let resolved = with_max_context_override(Some(1_000_000), async {
+            client.max_context_tokens()
+        })
+        .await;
+        assert_eq!(resolved, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn max_context_override_none_falls_through_to_curated_or_universal() {
+        // An installed-but-`None` override means "no purpose-level
+        // override; use tier 2/3." For ollama (no curated value) that's
+        // the universal fallback.
+        let fallback = build_ollama_registry();
+        let client = RoutingLlmClient::new(fallback, "ollama".into());
+        let resolved = with_max_context_override(None, async {
+            client.max_context_tokens()
+        })
+        .await;
+        assert_eq!(
+            resolved,
+            Some(crate::config::DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS)
+        );
     }
 }
