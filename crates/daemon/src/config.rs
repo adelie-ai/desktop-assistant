@@ -907,8 +907,31 @@ pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<
     }
 
     let content = toml::to_string_pretty(config)?;
-    std::fs::write(path, content)
-        .with_context(|| format!("failed to write daemon config at {}", path.display()))
+
+    // The config can carry credential references and OIDC client identifiers;
+    // open with restrictive perms before writing so the file is never briefly
+    // world-readable. Mirrors `write_secret_file` below.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)
+            .with_context(|| format!("failed to write daemon config at {}", path.display()))
+    }
 }
 
 pub fn get_llm_settings_view(path: &Path) -> anyhow::Result<LlmSettingsView> {
@@ -974,9 +997,12 @@ pub fn set_llm_settings(
 pub fn set_api_key(path: &Path, api_key: &str) -> anyhow::Result<()> {
     let api_key = api_key.trim();
     let (key_len, key_fingerprint) = redacted_secret_audit(api_key);
+    // Logging the precise length narrows the search space for guessing the
+    // connector type from logs (e.g. 51 chars ≈ Anthropic, 32 ≈ OpenAI).
+    let key_len_bucket = bucket_secret_len(key_len);
 
     tracing::info!(
-        secret_len = key_len,
+        secret_len_bucket = key_len_bucket,
         secret_fingerprint = %key_fingerprint,
         "received SetApiKey request"
     );
@@ -987,7 +1013,7 @@ pub fn set_api_key(path: &Path, api_key: &str) -> anyhow::Result<()> {
 
     if is_placeholder_secret_value(api_key) {
         tracing::warn!(
-            secret_len = key_len,
+            secret_len_bucket = key_len_bucket,
             secret_fingerprint = %key_fingerprint,
             "rejecting placeholder-like SetApiKey value"
         );
@@ -1862,6 +1888,17 @@ fn is_placeholder_secret_value(value: &str) -> bool {
         || normalized.contains("leave blank")
 }
 
+fn bucket_secret_len(len: usize) -> &'static str {
+    match len {
+        0 => "0",
+        1..=15 => "<16",
+        16..=31 => "16-31",
+        32..=47 => "32-47",
+        48..=79 => "48-79",
+        _ => ">=80",
+    }
+}
+
 fn redacted_secret_audit(value: &str) -> (usize, String) {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -2137,6 +2174,29 @@ impl OidcValidator {
     /// Maximum response body size for OIDC discovery / JWKS documents (1 MiB).
     const MAX_OIDC_RESPONSE_BYTES: usize = 1_048_576;
 
+    fn require_https_or_loopback(url: &str, field: &str) -> anyhow::Result<()> {
+        let lower = url.trim().to_ascii_lowercase();
+        if lower.starts_with("https://") {
+            return Ok(());
+        }
+        if let Some(rest) = lower.strip_prefix("http://") {
+            let host = rest
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("")
+                .rsplit_once('@')
+                .map(|(_, h)| h)
+                .unwrap_or(rest.split(['/', '?', '#']).next().unwrap_or(""));
+            let host_only = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+            if matches!(host_only, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "OIDC {field} must use https:// (or http://localhost for development); got {url}"
+        ))
+    }
+
     /// Fetch a JSON document with size limits.
     async fn fetch_oidc_json(
         client: &reqwest::Client,
@@ -2157,16 +2217,27 @@ impl OidcValidator {
     pub async fn from_config(oidc: &OidcConfig) -> anyhow::Result<Self> {
         let client = Self::oidc_http_client();
 
+        // JWKS must travel over a confidential channel — plaintext fetch lets
+        // an attacker swap keys and forge tokens. Permit http only for explicit
+        // loopback (development). The jwks_uri override is checked for the
+        // same reason.
+        Self::require_https_or_loopback(&oidc.issuer_url, "issuer_url")?;
+        if !oidc.jwks_uri.is_empty() {
+            Self::require_https_or_loopback(&oidc.jwks_uri, "jwks_uri")?;
+        }
+
         let jwks_uri = if oidc.jwks_uri.is_empty() {
             let discovery_url = format!(
                 "{}/.well-known/openid-configuration",
                 oidc.issuer_url.trim_end_matches('/')
             );
             let discovery = Self::fetch_oidc_json(&client, &discovery_url).await?;
-            discovery["jwks_uri"]
+            let resolved = discovery["jwks_uri"]
                 .as_str()
                 .ok_or_else(|| anyhow!("no jwks_uri in OIDC discovery document"))?
-                .to_string()
+                .to_string();
+            Self::require_https_or_loopback(&resolved, "discovered jwks_uri")?;
+            resolved
         } else {
             oidc.jwks_uri.clone()
         };
@@ -2179,12 +2250,31 @@ impl OidcValidator {
 
         let mut decoding_keys = Vec::new();
         for key in keys {
-            if key["kty"].as_str() == Some("RSA") {
-                let n = key["n"].as_str().unwrap_or_default();
-                let e = key["e"].as_str().unwrap_or_default();
-                if let Ok(dk) = DecodingKey::from_rsa_components(n, e) {
-                    decoding_keys.push(dk);
-                }
+            if key["kty"].as_str() != Some("RSA") {
+                continue;
+            }
+            // JWKS entries optionally declare key usage (`use`) and algorithm
+            // (`alg`). Skip keys that are explicitly tagged for encryption or a
+            // non-RS256 algorithm — otherwise a key meant for `enc` would be
+            // accepted as a token signature.
+            if let Some(usage) = key["use"].as_str()
+                && usage != "sig"
+            {
+                continue;
+            }
+            if let Some(alg) = key["alg"].as_str()
+                && alg != "RS256"
+            {
+                continue;
+            }
+            let (Some(n), Some(e)) = (key["n"].as_str(), key["e"].as_str()) else {
+                continue;
+            };
+            if n.is_empty() || e.is_empty() {
+                continue;
+            }
+            if let Ok(dk) = DecodingKey::from_rsa_components(n, e) {
+                decoding_keys.push(dk);
             }
         }
 
@@ -2668,6 +2758,58 @@ mod tests {
         let (empty_len, empty_fp) = redacted_secret_audit("   ");
         assert_eq!(empty_len, 0);
         assert_eq!(empty_fp, "fnv1a64:cbf29ce484222325");
+    }
+
+    #[test]
+    fn oidc_require_https_accepts_https() {
+        OidcValidator::require_https_or_loopback("https://idp.example.com", "issuer_url")
+            .expect("https URL is permitted");
+        OidcValidator::require_https_or_loopback(
+            "HTTPS://Idp.Example.com/realms/main",
+            "issuer_url",
+        )
+        .expect("scheme check is case-insensitive");
+    }
+
+    #[test]
+    fn oidc_require_https_accepts_loopback_http() {
+        OidcValidator::require_https_or_loopback("http://localhost:8080", "issuer_url")
+            .expect("loopback http is permitted for development");
+        OidcValidator::require_https_or_loopback("http://127.0.0.1:9090/path", "issuer_url")
+            .expect("ipv4 loopback http is permitted");
+        OidcValidator::require_https_or_loopback("http://[::1]:9090/path", "issuer_url")
+            .expect("ipv6 loopback http is permitted");
+    }
+
+    #[test]
+    fn oidc_require_https_rejects_non_loopback_http() {
+        // Plaintext JWKS lets a network attacker swap the keys and forge
+        // tokens — must reject.
+        let err = OidcValidator::require_https_or_loopback(
+            "http://idp.example.com",
+            "issuer_url",
+        )
+        .expect_err("plaintext IdP rejected");
+        assert!(err.to_string().contains("https://"));
+
+        OidcValidator::require_https_or_loopback("ftp://idp.example.com", "issuer_url")
+            .expect_err("non-http(s) scheme rejected");
+    }
+
+    #[test]
+    fn bucket_secret_len_collapses_into_coarse_buckets() {
+        // Hides the precise length so audit logs don't distinguish 32-char
+        // OpenAI keys from 51-char Anthropic keys at info level.
+        assert_eq!(bucket_secret_len(0), "0");
+        assert_eq!(bucket_secret_len(8), "<16");
+        assert_eq!(bucket_secret_len(15), "<16");
+        assert_eq!(bucket_secret_len(16), "16-31");
+        assert_eq!(bucket_secret_len(32), "32-47");  // typical OpenAI sk- key
+        assert_eq!(bucket_secret_len(47), "32-47");
+        assert_eq!(bucket_secret_len(51), "48-79");  // typical Anthropic key
+        assert_eq!(bucket_secret_len(79), "48-79");
+        assert_eq!(bucket_secret_len(80), ">=80");
+        assert_eq!(bucket_secret_len(2048), ">=80");
     }
 
     #[test]

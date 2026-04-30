@@ -82,9 +82,25 @@ pub fn save_mcp_configs(
         })?;
     }
 
-    std::fs::write(path, contents).map_err(|e| {
-        McpError::UnexpectedResponse(format!("failed to write MCP config file: {e}"))
-    })?;
+    // Open with 0600 *before* writing — `std::fs::write` followed by chmod
+    // leaves a window where the file (which carries env_secrets references) is
+    // world-readable.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| {
+                McpError::UnexpectedResponse(format!("failed to open MCP config file: {e}"))
+            })?;
+        file.write_all(contents.as_bytes()).map_err(|e| {
+            McpError::UnexpectedResponse(format!("failed to write MCP config file: {e}"))
+        })?;
+    }
 
     enforce_permissions(path)?;
 

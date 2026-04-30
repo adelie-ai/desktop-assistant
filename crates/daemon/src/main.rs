@@ -514,8 +514,19 @@ async fn main() -> Result<()> {
 
     tracing::info!("desktop-assistant starting");
 
-    // Install the rustls crypto provider for TLS support.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // Install the rustls crypto provider for TLS support. Returns Err if a
+    // provider is already installed — fine on fresh start, but assert success
+    // on the first install path so we don't silently run with an unexpected
+    // provider (e.g. one pulled in by a transitive dep).
+    if rustls::crypto::CryptoProvider::get_default().is_none()
+        && rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .is_err()
+    {
+        return Err(anyhow::anyhow!(
+            "failed to install rustls aws_lc_rs crypto provider"
+        ));
+    }
 
     // Build the LLM client from daemon.toml + KWallet (fallback to env)
     let config_path = config::default_daemon_config_path();
