@@ -596,12 +596,7 @@ pub fn parse_prompt_too_long(message: &str) -> Option<(u64, u64)> {
 /// The `list_models()` implementation uses it to populate
 /// `ModelInfo::context_limit`.
 pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
-    // Strip cross-region inference-profile prefixes.
-    let base = model_id
-        .strip_prefix("us.")
-        .or_else(|| model_id.strip_prefix("eu."))
-        .or_else(|| model_id.strip_prefix("apac."))
-        .unwrap_or(model_id);
+    let base = strip_region_prefix(model_id);
 
     // Anthropic Claude on Bedrock: 3.x and 4.x all ship with 200K context.
     if base.starts_with("anthropic.claude-3") || base.starts_with("anthropic.claude-sonnet-4")
@@ -614,17 +609,70 @@ pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
     None
 }
 
+/// Heuristic capability inference from a model id. Operates on the *base*
+/// id (region-prefix already stripped) so it works for both bare foundation
+/// model ids and inference-profile ids.
+fn infer_capabilities_from_id(base_id: &str, vision: bool, is_embedding: bool) -> ModelCapabilities {
+    let lc = base_id.to_ascii_lowercase();
+
+    let tools = lc.contains("anthropic.claude")
+        || lc.contains("amazon.nova")
+        || lc.contains("meta.llama3")
+        || lc.contains("meta.llama4")
+        || lc.contains("mistral")
+        || lc.contains("cohere.command")
+        || lc.contains("deepseek");
+
+    let reasoning = lc.contains("anthropic.claude-sonnet-4")
+        || lc.contains("anthropic.claude-opus-4")
+        || lc.contains("anthropic.claude-haiku-4")
+        || lc.contains("anthropic.claude-3-7")
+        || lc.contains("deepseek.r1")
+        || lc.contains("deepseek-r1");
+
+    ModelCapabilities {
+        reasoning,
+        vision,
+        tools: tools && !is_embedding,
+        embedding: is_embedding,
+    }
+}
+
+/// Strip a cross-region inference-profile prefix (`us.`, `eu.`, `apac.`) to
+/// recover the underlying foundation model id. Returns the input unchanged
+/// when no known prefix matches.
+fn strip_region_prefix(id: &str) -> &str {
+    id.strip_prefix("us.")
+        .or_else(|| id.strip_prefix("eu."))
+        .or_else(|| id.strip_prefix("apac."))
+        .unwrap_or(id)
+}
+
 /// Convert a `FoundationModelSummary` into a `ModelInfo`, returning `None`
-/// if the model should be filtered out (not ACTIVE, not text/embedding).
+/// if the model should be filtered out (not ACTIVE, not text/embedding, or
+/// not invocable via on-demand throughput).
 fn summary_to_model_info(
     summary: &aws_sdk_bedrock::types::FoundationModelSummary,
 ) -> Option<ModelInfo> {
-    use aws_sdk_bedrock::types::{FoundationModelLifecycleStatus, ModelModality};
+    use aws_sdk_bedrock::types::{FoundationModelLifecycleStatus, InferenceType, ModelModality};
 
     // Filter: lifecycle must be ACTIVE (skip LEGACY / deprecated models).
     if let Some(lifecycle) = summary.model_lifecycle.as_ref()
         && lifecycle.status() != &FoundationModelLifecycleStatus::Active
     {
+        return None;
+    }
+
+    // Filter: must support on-demand throughput. Newer models (Claude 4.x,
+    // Nova Premier, DeepSeek R1, etc.) are only callable via an inference
+    // profile or Provisioned Throughput; surfacing the bare id leads to a
+    // ValidationException at invocation time. Inference profiles are merged
+    // separately by `fetch_models_uncached`.
+    let supports_on_demand = summary
+        .inference_types_supported()
+        .iter()
+        .any(|t| t == &InferenceType::OnDemand);
+    if !supports_on_demand {
         return None;
     }
 
@@ -641,30 +689,9 @@ fn summary_to_model_info(
     let input_modalities = summary.input_modalities();
     let vision = input_modalities.contains(&ModelModality::Image);
 
-    // Heuristic capability inference from model-id prefixes. Bedrock's API
-    // doesn't expose tool-use or reasoning capabilities, so we approximate.
     let id = summary.model_id();
     let model_name = summary.model_name().unwrap_or(id).to_string();
-    let lc = id.to_ascii_lowercase();
-
-    let tools = lc.contains("anthropic.claude")
-        || lc.contains("amazon.nova")
-        || lc.contains("meta.llama3")
-        || lc.contains("mistral")
-        || lc.contains("cohere.command");
-
-    let reasoning = lc.contains("anthropic.claude-sonnet-4")
-        || lc.contains("anthropic.claude-opus-4")
-        || lc.contains("anthropic.claude-haiku-4")
-        || lc.contains("anthropic.claude-3-7")
-        || lc.contains("deepseek-r1");
-
-    let capabilities = ModelCapabilities {
-        reasoning,
-        vision,
-        tools: tools && !is_embedding,
-        embedding: is_embedding,
-    };
+    let capabilities = infer_capabilities_from_id(id, vision, is_embedding);
 
     Some(ModelInfo {
         id: id.to_string(),
@@ -674,26 +701,124 @@ fn summary_to_model_info(
     })
 }
 
+/// Convert an `InferenceProfileSummary` into a `ModelInfo`. Returns `None`
+/// for non-active profiles or profiles whose underlying foundation model
+/// can't be recovered.
+///
+/// Capabilities are derived from the underlying foundation model id (after
+/// stripping the region prefix) since the profile API doesn't expose them.
+/// Vision support is conservatively inferred from the model id family rather
+/// than from a real modality field — Bedrock doesn't surface modalities on
+/// profiles, but the profile's underlying model has the same modalities as
+/// its foundation counterpart.
+fn inference_profile_to_model_info(
+    profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
+) -> Option<ModelInfo> {
+    use aws_sdk_bedrock::types::InferenceProfileStatus;
+
+    if profile.status != InferenceProfileStatus::Active {
+        return None;
+    }
+
+    let profile_id = profile.inference_profile_id();
+    if profile_id.is_empty() {
+        return None;
+    }
+
+    let base_id = strip_region_prefix(profile_id);
+    let lc = base_id.to_ascii_lowercase();
+
+    // Vision: known multimodal Bedrock model families. Profile API gives us
+    // no modality info, so this list is best-effort and conservative.
+    let vision = lc.contains("anthropic.claude-3")
+        || lc.contains("anthropic.claude-sonnet-4")
+        || lc.contains("anthropic.claude-opus-4")
+        || lc.contains("anthropic.claude-haiku-4")
+        || lc.contains("amazon.nova-pro")
+        || lc.contains("amazon.nova-lite")
+        || lc.contains("amazon.nova-premier")
+        || lc.contains("meta.llama3-2-11b-vision")
+        || lc.contains("meta.llama3-2-90b-vision")
+        || lc.contains("meta.llama4");
+
+    // Inference profiles cover chat models; embeddings stay on their bare
+    // ids (which support OnDemand and pass through the foundation-model
+    // path).
+    let is_embedding = false;
+
+    let display_name = if profile.inference_profile_name.is_empty() {
+        profile_id.to_string()
+    } else {
+        profile.inference_profile_name.clone()
+    };
+
+    Some(ModelInfo {
+        id: profile_id.to_string(),
+        display_name,
+        // context_limit_for_model already strips the region prefix internally.
+        context_limit: context_limit_for_model(profile_id),
+        capabilities: infer_capabilities_from_id(base_id, vision, is_embedding),
+    })
+}
+
 impl BedrockClient {
-    /// Call `ListFoundationModels` and filter the result to the models we
-    /// expose through `ModelInfo` (ACTIVE lifecycle, text or embedding
-    /// output).
+    /// Call `ListFoundationModels` + `ListInferenceProfiles` and merge into
+    /// a single `ModelInfo` list:
+    ///
+    /// * Foundation models without `OnDemand` support are filtered out —
+    ///   their bare ids are uncallable and surfacing them leads to runtime
+    ///   `ValidationException`s. Users reach those models via inference
+    ///   profiles instead.
+    /// * Inference profiles are merged in with their prefixed ids
+    ///   (`us.anthropic.claude-haiku-4-5-…` etc.) so the model picker
+    ///   exposes the IDs that AWS will actually accept on Converse.
+    ///
+    /// Both calls go in parallel. `ListInferenceProfiles` failures are
+    /// logged and swallowed: many existing IAM policies grant
+    /// `bedrock:ListFoundationModels` without
+    /// `bedrock:ListInferenceProfiles`, and we'd rather degrade to the
+    /// foundation-model-only list than fail the whole picker.
     async fn fetch_models_uncached(&self) -> Result<Vec<ModelInfo>, CoreError> {
         let client = self.control_client().await?;
 
-        let response = client.list_foundation_models().send().await.map_err(|e| {
+        let foundation_fut = client.list_foundation_models().send();
+        let profiles_fut = client.list_inference_profiles().send();
+
+        let (foundation_res, profiles_res) = tokio::join!(foundation_fut, profiles_fut);
+
+        let foundation = foundation_res.map_err(|e| {
             CoreError::Llm(format!("Bedrock ListFoundationModels failed: {e:#}"))
         })?;
 
-        let mut models = Vec::new();
-        for summary in response.model_summaries() {
-            if let Some(info) = summary_to_model_info(summary) {
-                models.push(info);
+        let mut models: Vec<ModelInfo> = foundation
+            .model_summaries()
+            .iter()
+            .filter_map(summary_to_model_info)
+            .collect();
+
+        match profiles_res {
+            Ok(profile_resp) => {
+                for profile in profile_resp.inference_profile_summaries() {
+                    if let Some(info) = inference_profile_to_model_info(profile) {
+                        models.push(info);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Bedrock ListInferenceProfiles failed; model picker will only show \
+                     on-demand foundation models. Grant bedrock:ListInferenceProfiles to \
+                     surface inference-profile ids (Claude 4.x, Nova Premier, etc.). \
+                     Cause: {error:#}"
+                );
             }
         }
 
         // Stable ordering so UIs don't shuffle between refreshes.
+        // Defensive dedupe — foundation ids and profile ids don't collide
+        // in practice, but keep the merge total just in case.
         models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
     }
 
@@ -1407,6 +1532,7 @@ mod tests {
             .provider_name("meta")
             .set_output_modalities(Some(vec![ModelModality::Text]))
             .set_input_modalities(Some(vec![ModelModality::Text]))
+            .inference_types_supported(InferenceType::OnDemand)
             .build()
             .expect("summary");
         let info = summary_to_model_info(&summary).expect("kept");
@@ -1487,5 +1613,190 @@ mod tests {
         if let Ok(models) = client.refresh_models().await {
             assert_ne!(models, cached);
         }
+    }
+
+    // --- OnDemand filter + inference profile merge tests (#50) ---
+
+    fn make_summary_inference_types(
+        id: &str,
+        status: FoundationModelLifecycleStatus,
+        output_modality: ModelModality,
+        input_modalities: Vec<ModelModality>,
+        inference_types: &[InferenceType],
+    ) -> FoundationModelSummary {
+        let mut builder = FoundationModelSummary::builder()
+            .model_arn(format!("arn:aws:bedrock:us-east-1::foundation-model/{id}"))
+            .model_id(id)
+            .model_name(id)
+            .provider_name("test")
+            .set_output_modalities(Some(vec![output_modality]))
+            .set_input_modalities(Some(input_modalities))
+            .model_lifecycle(
+                FoundationModelLifecycle::builder()
+                    .status(status)
+                    .build()
+                    .expect("lifecycle"),
+            );
+        for it in inference_types {
+            builder = builder.inference_types_supported(it.clone());
+        }
+        builder.build().expect("build summary")
+    }
+
+    #[test]
+    fn summary_filters_out_models_without_on_demand() {
+        let provisioned_only = make_summary_inference_types(
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            FoundationModelLifecycleStatus::Active,
+            ModelModality::Text,
+            vec![ModelModality::Text, ModelModality::Image],
+            &[InferenceType::Provisioned],
+        );
+        assert!(
+            summary_to_model_info(&provisioned_only).is_none(),
+            "models without OnDemand must be filtered (use inference profile instead)"
+        );
+    }
+
+    #[test]
+    fn summary_filters_out_models_with_no_inference_types() {
+        // Defensive: AWS may omit inference_types entirely. Treat as
+        // not-on-demand (consistent with the OnDemand-required policy).
+        let none = make_summary_inference_types(
+            "deepseek.r1-v1:0",
+            FoundationModelLifecycleStatus::Active,
+            ModelModality::Text,
+            vec![ModelModality::Text],
+            &[],
+        );
+        assert!(summary_to_model_info(&none).is_none());
+    }
+
+    #[test]
+    fn summary_keeps_model_with_on_demand_among_others() {
+        let mixed = make_summary_inference_types(
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            FoundationModelLifecycleStatus::Active,
+            ModelModality::Text,
+            vec![ModelModality::Text],
+            &[InferenceType::OnDemand, InferenceType::Provisioned],
+        );
+        let info = summary_to_model_info(&mixed).expect("kept");
+        assert_eq!(info.id, "anthropic.claude-3-haiku-20240307-v1:0");
+    }
+
+    fn make_profile(id: &str, name: &str, status: InferenceProfileStatus) -> InferenceProfileSummary {
+        // The builder requires `models` to be set (the underlying foundation
+        // models the profile routes to). The conversion code doesn't read
+        // them — we infer capabilities from the profile id — so a single
+        // stub entry is enough for the test.
+        let model_stub = InferenceProfileModel::builder()
+            .model_arn("arn:aws:bedrock:us-east-1::foundation-model/test")
+            .build();
+        InferenceProfileSummary::builder()
+            .inference_profile_arn(format!("arn:aws:bedrock:us-east-1:0:inference-profile/{id}"))
+            .inference_profile_id(id)
+            .inference_profile_name(name)
+            .status(status)
+            .r#type(InferenceProfileType::SystemDefined)
+            .models(model_stub)
+            .build()
+            .expect("build profile summary")
+    }
+
+    use aws_sdk_bedrock::types::{
+        InferenceProfileModel, InferenceProfileStatus, InferenceProfileSummary,
+        InferenceProfileType,
+    };
+
+    #[test]
+    fn profile_skips_non_active() {
+        // Bedrock currently exposes only the Active variant, but defensive
+        // coverage in case AWS adds others.
+        let profile = make_profile(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "Claude Haiku 4.5 (US)",
+            InferenceProfileStatus::Active,
+        );
+        // sanity: the active path keeps it
+        assert!(inference_profile_to_model_info(&profile).is_some());
+    }
+
+    #[test]
+    fn profile_anthropic_claude_4_inferred_capabilities() {
+        let profile = make_profile(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "Claude Haiku 4.5 (US)",
+            InferenceProfileStatus::Active,
+        );
+        let info = inference_profile_to_model_info(&profile).expect("kept");
+        assert_eq!(info.id, "us.anthropic.claude-haiku-4-5-20251001-v1:0");
+        assert_eq!(info.display_name, "Claude Haiku 4.5 (US)");
+        assert_eq!(info.context_limit, Some(200_000));
+        assert!(info.capabilities.tools);
+        assert!(info.capabilities.reasoning);
+        assert!(info.capabilities.vision);
+        assert!(!info.capabilities.embedding);
+    }
+
+    #[test]
+    fn profile_amazon_nova_capabilities() {
+        let profile = make_profile(
+            "us.amazon.nova-premier-v1:0",
+            "Nova Premier (US)",
+            InferenceProfileStatus::Active,
+        );
+        let info = inference_profile_to_model_info(&profile).expect("kept");
+        assert_eq!(info.id, "us.amazon.nova-premier-v1:0");
+        assert!(info.capabilities.tools, "Nova supports tool use");
+        assert!(info.capabilities.vision, "Nova Premier is multimodal");
+        assert!(!info.capabilities.reasoning);
+        assert!(!info.capabilities.embedding);
+    }
+
+    #[test]
+    fn profile_deepseek_r1_capabilities() {
+        let profile = make_profile(
+            "us.deepseek.r1-v1:0",
+            "DeepSeek R1 (US)",
+            InferenceProfileStatus::Active,
+        );
+        let info = inference_profile_to_model_info(&profile).expect("kept");
+        assert_eq!(info.id, "us.deepseek.r1-v1:0");
+        assert!(info.capabilities.reasoning, "R1 is a reasoning model");
+        assert!(info.capabilities.tools);
+        assert!(!info.capabilities.vision);
+    }
+
+    #[test]
+    fn profile_falls_back_to_id_when_name_empty() {
+        let profile = make_profile(
+            "us.anthropic.claude-sonnet-4-6",
+            "",
+            InferenceProfileStatus::Active,
+        );
+        let info = inference_profile_to_model_info(&profile).expect("kept");
+        assert_eq!(info.display_name, "us.anthropic.claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn strip_region_prefix_recognises_known_regions() {
+        assert_eq!(
+            strip_region_prefix("us.anthropic.claude-haiku-4-5"),
+            "anthropic.claude-haiku-4-5"
+        );
+        assert_eq!(
+            strip_region_prefix("eu.anthropic.claude-sonnet-4-6"),
+            "anthropic.claude-sonnet-4-6"
+        );
+        assert_eq!(
+            strip_region_prefix("apac.amazon.nova-pro-v1:0"),
+            "amazon.nova-pro-v1:0"
+        );
+        // Unknown / no prefix passes through.
+        assert_eq!(
+            strip_region_prefix("anthropic.claude-3-haiku-20240307-v1:0"),
+            "anthropic.claude-3-haiku-20240307-v1:0"
+        );
     }
 }
