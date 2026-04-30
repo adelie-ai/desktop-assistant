@@ -1903,12 +1903,14 @@ mod tests {
                 .await
                 .expect("dispatch must succeed via fallback");
 
-            let active = inner.captured_active_client_set.lock().unwrap();
-            assert_eq!(active.len(), 1);
-            assert!(
-                !active[0],
-                "dangling stored selection must fall through to primary llm"
-            );
+            {
+                let active = inner.captured_active_client_set.lock().unwrap();
+                assert_eq!(active.len(), 1);
+                assert!(
+                    !active[0],
+                    "dangling stored selection must fall through to primary llm"
+                );
+            } // drop std::sync::MutexGuard before the next .await — clippy::await_holding_lock
 
             // The dangling path also clears the bad stored selection and
             // emits a one-time `DanglingModelSelection` warning naming the
