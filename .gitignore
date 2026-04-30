@@ -3,6 +3,7 @@
 **/build/
 .env
 .claude/settings.local.json
+.claude/worktrees/
 
 # Python bytecode/cache
 __pycache__/
