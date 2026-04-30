@@ -2,7 +2,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage,
+    TokenUsage, current_model_override,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -556,6 +556,15 @@ impl LlmClient for OllamaClient {
         }
         self.ensure_model_available().await?;
 
+        // Per-turn model override (issue #34): when the daemon-side routing
+        // layer has set `MODEL_OVERRIDE`, dispatch the user-chosen model
+        // instead of the connector's baked-in `self.model`. Note that the
+        // pre-flight `ensure_model_available()` above still keys on
+        // `self.model` (the connection's default); when overriding to a
+        // different local model, Ollama itself surfaces a clean error if
+        // it isn't pulled.
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
 
         let options =
@@ -570,7 +579,7 @@ impl LlmClient for OllamaClient {
             };
 
         let request = ChatRequest {
-            model: self.model.clone(),
+            model,
             messages: messages.iter().map(ChatMessage::from).collect(),
             stream: true,
             tools: chat_tools,
@@ -910,6 +919,80 @@ mod tests {
         let args = serde_json::json!({"path": "/tmp/a"});
         let serialized = serde_json::to_string(&args).unwrap();
         assert_eq!(serialized, r#"{"path":"/tmp/a"}"#);
+    }
+
+    #[tokio::test]
+    async fn stream_completion_uses_self_model_when_override_unset() {
+        // Issue #34 negative case: with no `MODEL_OVERRIDE` task-local set,
+        // dispatch must use the connector's baked-in `self.model`.
+        let server = MockServer::start();
+
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let chat = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/chat")
+                .body_includes(r#""model":"llama3.2""#);
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect("dispatch must succeed");
+        chat.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn stream_completion_uses_model_override_when_set() {
+        // Issue #34 happy path: with `MODEL_OVERRIDE` task-local set, the
+        // chat request body carries the override model id rather than
+        // `self.model`.
+        use desktop_assistant_core::ports::llm::with_model_override;
+
+        let server = MockServer::start();
+
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let chat = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/chat")
+                .body_includes(r#""model":"qwen3""#);
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        with_model_override("qwen3".into(), async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("dispatch must succeed with override");
+        })
+        .await;
+        chat.assert_calls(1);
     }
 
     #[tokio::test]

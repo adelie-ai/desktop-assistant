@@ -36,7 +36,7 @@ use desktop_assistant_core::ports::inbound::{
 };
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback,
-    with_reasoning_config,
+    with_model_override, with_reasoning_config,
 };
 
 use crate::config::{
@@ -758,11 +758,20 @@ where
         //     for the interactive-purpose fallback we leave it `None` so
         //     `RoutingLlmClient` falls through to the primary llm (which
         //     was built with the interactive purpose's model).
+        //   - `model_override`: the resolved `model_id` to inject into the
+        //     connector's request body via the `MODEL_OVERRIDE` task-local
+        //     (issue #34). Set whenever we install an `active_client` so
+        //     dispatch is deterministic — even if the user picked the
+        //     connector's default model, we still pin it explicitly rather
+        //     than relying on `self.model`. For the interactive-purpose
+        //     fallback we leave it unset so the primary llm's baked-in
+        //     model takes effect (same rationale as `active_client`).
         //   - `reasoning`: the `ReasoningConfig` populated from the
         //     per-connector effort mapping. Computed from
         //     `effective_selection` so the interactive purpose's `effort`
         //     applies even when we don't install an active_client.
         let mut active_client: Option<std::sync::Arc<crate::registry::AnyLlmClient>> = None;
+        let mut model_override: Option<String> = None;
         if let Some(sel) = user_driven_selection.as_ref() {
             let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
                 CoreError::Llm(format!(
@@ -775,6 +784,7 @@ where
             match self.registry.client_for(&id) {
                 Some(client) => {
                     active_client = Some(client);
+                    model_override = Some(sel.model_id.clone());
                 }
                 None => {
                     return Err(CoreError::Llm(format!(
@@ -820,6 +830,9 @@ where
         //     resolve the context window.
         //   - `current_reasoning_config()` surfaces `reasoning` into the
         //     connector's request body.
+        //   - `current_model_override()` (issue #34) surfaces the resolved
+        //     `model_id` so connectors send the user-chosen model rather
+        //     than `self.model` (the connection's startup default).
         let inner = Arc::clone(&self.inner);
         let conv_id = conversation_id.clone();
         let response = {
@@ -831,9 +844,16 @@ where
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch =
                 crate::routing_llm::with_max_context_override(max_context_override, dispatch);
-            match active_client {
-                Some(c) => crate::routing_llm::with_active_client(c, dispatch).await,
-                None => dispatch.await,
+            // Wrap in `with_model_override` only when we installed an
+            // `active_client`; the interactive-purpose fallback path
+            // intentionally leaves both unset (see #33).
+            match (active_client, model_override) {
+                (Some(c), Some(m)) => {
+                    let dispatch = with_model_override(m, dispatch);
+                    crate::routing_llm::with_active_client(c, dispatch).await
+                }
+                (Some(c), None) => crate::routing_llm::with_active_client(c, dispatch).await,
+                (None, _) => dispatch.await,
             }
         }?;
         Ok(PromptDispatchOutcome {
@@ -1282,6 +1302,11 @@ mod tests {
             /// behaviour for the interactive-purpose fallback path
             /// (issue #33).
             captured_active_client_set: StdMutex<Vec<bool>>,
+            /// Snapshot of the `MODEL_OVERRIDE` task-local at each
+            /// `send_prompt`. `None` means no override was installed —
+            /// connectors will fall back to their baked-in `self.model`
+            /// (issue #34).
+            captured_model_override: StdMutex<Vec<Option<String>>>,
         }
 
         impl CapturingInner {
@@ -1289,6 +1314,7 @@ mod tests {
                 Self {
                     captured_reasoning: StdMutex::new(Vec::new()),
                     captured_active_client_set: StdMutex::new(Vec::new()),
+                    captured_model_override: StdMutex::new(Vec::new()),
                 }
             }
         }
@@ -1357,6 +1383,9 @@ mod tests {
                 self.captured_reasoning.lock().unwrap().push(cfg);
                 let active = crate::routing_llm::active_client_is_set();
                 self.captured_active_client_set.lock().unwrap().push(active);
+                let model =
+                    desktop_assistant_core::ports::llm::current_model_override();
+                self.captured_model_override.lock().unwrap().push(model);
                 Ok("ok".to_string())
             }
         }
@@ -1652,6 +1681,189 @@ mod tests {
 
             let active = inner.captured_active_client_set.lock().unwrap();
             assert!(!active[0]);
+        }
+
+        #[tokio::test]
+        async fn interactive_purpose_dispatch_does_not_install_model_override() {
+            // Issue #34 negative case: when no user-driven selection exists
+            // (override is None, no stored selection), `send_prompt` must
+            // NOT install `MODEL_OVERRIDE`. Connectors then fall back to
+            // their baked-in `self.model` — preserving the pre-#34
+            // dispatch shape for this fallback path.
+            let (routing, inner, _reg, _store) = make_handler();
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("dispatch should succeed via interactive purpose");
+            let captured = inner.captured_model_override.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                captured[0], None,
+                "interactive-purpose fallback must leave MODEL_OVERRIDE unset"
+            );
+        }
+
+        #[tokio::test]
+        async fn override_dispatch_installs_model_override_task_local() {
+            // Issue #34 happy path: a `send_prompt_with_override` whose
+            // resolved selection picks a non-default model results in that
+            // `model_id` reaching the per-turn `MODEL_OVERRIDE` task-local
+            // observed inside the inner `send_prompt`. We use httpmock to
+            // satisfy the `connection_lists_model` validation gate.
+            let server = httpmock::MockServer::start();
+
+            // Validation calls `list_models()` which on Ollama hits
+            // `/api/tags` and (for models with details) `/api/show`. We
+            // need both `llama3.2` (the connection default) and our
+            // override target `qwen3` to be present.
+            let _tags = server.mock(|when, then| {
+                when.method(httpmock::Method::GET).path("/api/tags");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{"models":[
+                            {"name":"llama3.2","model":"llama3.2","digest":"sha256:aaa"},
+                            {"name":"qwen3","model":"qwen3","digest":"sha256:bbb"}
+                        ]}"#,
+                    );
+            });
+            // `/api/show` is called per-model to enrich context limits;
+            // a 404 is harmless — the connector skips context limits.
+            let _show = server.mock(|when, then| {
+                when.method(httpmock::Method::POST).path("/api/show");
+                then.status(404).body("not found");
+            });
+
+            let cfg = {
+                let mut c = config_with_connections(&[(
+                    "local",
+                    ConnectionConfig::Ollama(OllamaConnection {
+                        base_url: Some(server.url("")),
+                    }),
+                )]);
+                c.purposes.interactive = Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named("llama3.2".into()),
+                    effort: None,
+                    max_context_tokens: None,
+                });
+                c
+            };
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt_with_override(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    Some(PromptSelectionOverride {
+                        connection_id: "local".into(),
+                        // Pick a model that differs from the connection's
+                        // baked-in default (`llama3.2`) so the assertion
+                        // is meaningful — pre-#34 the connector would
+                        // dispatch `self.model` and silently drop this.
+                        model_id: "qwen3".into(),
+                        effort: None,
+                    }),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("override dispatch should succeed via mocked /api/tags");
+
+            let captured = inner.captured_model_override.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                captured[0],
+                Some("qwen3".to_string()),
+                "MODEL_OVERRIDE must carry the resolved override model id"
+            );
+            // And the active-client task-local must also be set, since
+            // the override-driven path always routes through the
+            // registry rather than the primary llm.
+            let active = inner.captured_active_client_set.lock().unwrap();
+            assert!(active[0]);
+        }
+
+        #[tokio::test]
+        async fn override_with_default_model_still_installs_override() {
+            // Determinism: even when the user picks the connection's
+            // default model, `send_prompt_with_override` installs
+            // `MODEL_OVERRIDE` so dispatch does not silently rely on
+            // `self.model`. Eliminates a sometimes-set state.
+            let server = httpmock::MockServer::start();
+            let _tags = server.mock(|when, then| {
+                when.method(httpmock::Method::GET).path("/api/tags");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{"models":[{"name":"llama3.2","model":"llama3.2","digest":"sha256:aaa"}]}"#,
+                    );
+            });
+            let _show = server.mock(|when, then| {
+                when.method(httpmock::Method::POST).path("/api/show");
+                then.status(404).body("not found");
+            });
+
+            let cfg = {
+                let mut c = config_with_connections(&[(
+                    "local",
+                    ConnectionConfig::Ollama(OllamaConnection {
+                        base_url: Some(server.url("")),
+                    }),
+                )]);
+                c.purposes.interactive = Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named("llama3.2".into()),
+                    effort: None,
+                    max_context_tokens: None,
+                });
+                c
+            };
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt_with_override(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    Some(PromptSelectionOverride {
+                        connection_id: "local".into(),
+                        model_id: "llama3.2".into(),
+                        effort: None,
+                    }),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("default-model override should succeed");
+
+            let captured = inner.captured_model_override.lock().unwrap();
+            assert_eq!(
+                captured[0],
+                Some("llama3.2".to_string()),
+                "MODEL_OVERRIDE installs even when override matches the default"
+            );
         }
 
         #[tokio::test]

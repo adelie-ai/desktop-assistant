@@ -12,7 +12,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage,
+    TokenUsage, current_model_override,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -880,6 +880,13 @@ impl LlmClient for BedrockClient {
         let (system, api_messages) = convert_messages(&messages)?;
         let tool_config = convert_tools(tools)?;
 
+        // Per-turn model override (issue #34): when the daemon-side routing
+        // layer has set `MODEL_OVERRIDE`, dispatch the user-chosen model id
+        // instead of the connector's baked-in `self.model`. Used both for
+        // the request `model_id` and for keying reasoning support /
+        // context-window heuristics below.
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
         let msg_count = api_messages.len();
         let tool_count = tools.len();
         let system_chars: usize = system.iter().map(|b| format!("{b:?}").len()).sum();
@@ -889,13 +896,13 @@ impl LlmClient for BedrockClient {
             msg_count,
             tool_count,
             system_chars,
-            model = %self.model,
+            model = %model,
             "LLM request payload"
         );
 
         let mut request = client
             .converse_stream()
-            .model_id(self.model.clone())
+            .model_id(model.clone())
             .set_messages(Some(api_messages));
 
         if self.temperature.is_some() || self.top_p.is_some() || self.max_tokens.is_some() {
@@ -924,7 +931,10 @@ impl LlmClient for BedrockClient {
         // Passed via `additional_model_request_fields` with the same
         // `thinking: { type: "enabled", budget_tokens: N }` shape as the
         // Anthropic native API. For non-Claude models this is a no-op.
-        if let Some(extra) = build_additional_model_request_fields(&self.model, reasoning) {
+        // Keyed on the resolved (possibly-overridden) model so a per-turn
+        // override to a Claude model gets the thinking block even when
+        // the connection's default is non-Claude.
+        if let Some(extra) = build_additional_model_request_fields(&model, reasoning) {
             request = request.additional_model_request_fields(extra);
         }
 
