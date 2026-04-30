@@ -4,7 +4,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage,
+    TokenUsage, current_model_override,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -782,10 +782,18 @@ impl LlmClient for OpenAiClient {
             .map(|t| ToolEntry::Function(FunctionTool::from_definition(t)))
             .collect();
 
-        let reasoning_block = reasoning_for(&self.model, reasoning);
+        // Per-turn model override (issue #34): when the daemon-side routing
+        // layer has set `MODEL_OVERRIDE`, dispatch the user-chosen model
+        // instead of the connector's baked-in `self.model`. The reasoning
+        // gating below is keyed on the dispatched model so e.g. a request
+        // for `gpt-5` carries `reasoning_effort` even when the connection
+        // was built with a non-reasoning default.
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
+        let reasoning_block = reasoning_for(&model, reasoning);
 
         let request = ResponsesRequest {
-            model: self.model.clone(),
+            model,
             input,
             instructions,
             stream: true,
@@ -830,10 +838,13 @@ impl LlmClient for OpenAiClient {
             r#type: "tool_search".to_string(),
         }));
 
-        let reasoning_block = reasoning_for(&self.model, reasoning);
+        // Per-turn model override (issue #34); see `stream_completion`.
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
+        let reasoning_block = reasoning_for(&model, reasoning);
 
         let request = ResponsesRequest {
-            model: self.model.clone(),
+            model,
             input,
             instructions,
             stream: true,
@@ -1330,5 +1341,65 @@ mod tests {
         let gpt4o = models.iter().find(|m| m.id == "gpt-4o").unwrap();
         assert!(!gpt4o.capabilities.reasoning);
         assert!(gpt4o.capabilities.tools);
+    }
+
+    // --- MODEL_OVERRIDE wiring (issue #34) -------------------------------
+
+    /// Minimal SSE body that lets `send_and_stream` reach `break` on
+    /// `response.completed` — empty `response` object is enough.
+    const STUB_SSE_BODY: &str =
+        "event: response.completed\ndata: {\"response\":{}}\n\n";
+
+    #[tokio::test]
+    async fn stream_completion_uses_self_model_when_override_unset() {
+        let server = httpmock::MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/responses")
+                .body_includes(r#""model":"gpt-5.4""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await;
+        m.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn stream_completion_uses_model_override_when_set() {
+        use desktop_assistant_core::ports::llm::with_model_override;
+
+        let server = httpmock::MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/responses")
+                .body_includes(r#""model":"gpt-4o-mini""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        with_model_override("gpt-4o-mini".into(), async {
+            let _ = client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await;
+        })
+        .await;
+        m.assert_calls(1);
     }
 }

@@ -1028,6 +1028,7 @@ dependencies = [
  "desktop-assistant-mcp-client",
  "desktop-assistant-storage",
  "desktop-assistant-ws",
+ "httpmock",
  "indexmap",
  "jsonwebtoken",
  "keyring",
@@ -1072,6 +1073,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "desktop-assistant-core",
+ "httpmock",
  "reqwest",
  "serde",
  "serde_json",
@@ -1117,6 +1119,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "desktop-assistant-core",
+ "httpmock",
  "reqwest",
  "serde",
  "serde_json",

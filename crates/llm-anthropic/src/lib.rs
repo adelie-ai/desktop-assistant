@@ -2,7 +2,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage,
+    TokenUsage, current_model_override,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -654,11 +654,16 @@ impl LlmClient for AnthropicClient {
         let api_tools: Vec<AnthropicTool> = tools.iter().map(AnthropicTool::from).collect();
         let (system, api_messages) = convert_messages(&messages);
 
+        // Per-turn model override (issue #34): when the daemon-side routing
+        // layer has set `MODEL_OVERRIDE`, dispatch the user-chosen model
+        // instead of the connector's baked-in `self.model`.
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
         let thinking = thinking_for(reasoning);
         let max_tokens = effective_max_tokens(self.max_tokens, thinking.as_ref());
 
         let request = MessagesRequest {
-            model: self.model.clone(),
+            model,
             max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
@@ -711,11 +716,14 @@ impl LlmClient for AnthropicClient {
             name: "tool_search_tool_regex".to_string(),
         }));
 
+        // Per-turn model override (issue #34); see `stream_completion`.
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
         let thinking = thinking_for(reasoning);
         let max_tokens = effective_max_tokens(self.max_tokens, thinking.as_ref());
 
         let request = MessagesRequestWithToolSearch {
-            model: self.model.clone(),
+            model,
             max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
@@ -1311,5 +1319,68 @@ mod tests {
             .find(|m| m.id == "claude-3-5-haiku-latest")
             .unwrap();
         assert!(!legacy_haiku.capabilities.reasoning);
+    }
+
+    // --- MODEL_OVERRIDE wiring (issue #34) -------------------------------
+
+    /// Helper that drains a one-event SSE stream into a complete-but-empty
+    /// response — just enough to make `send_and_stream` return `Ok` so the
+    /// test can focus on the *request* body.
+    const STUB_SSE_BODY: &str =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"x\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n";
+
+    #[tokio::test]
+    async fn stream_completion_uses_self_model_when_override_unset() {
+        let server = httpmock::MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/messages")
+                .body_includes(r#""model":"claude-sonnet-4-6-20260227""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await;
+        m.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn stream_completion_uses_model_override_when_set() {
+        use desktop_assistant_core::ports::llm::with_model_override;
+
+        let server = httpmock::MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/messages")
+                .body_includes(r#""model":"claude-opus-4-5""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+
+        with_model_override("claude-opus-4-5".into(), async {
+            let _ = client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await;
+        })
+        .await;
+        m.assert_calls(1);
     }
 }

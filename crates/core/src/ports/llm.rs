@@ -21,6 +21,19 @@ tokio::task_local! {
     /// distinct reasoning config without any coupling between the routing
     /// wrapper and the core `ConversationHandler`.
     static REASONING_CONFIG: ReasoningConfig;
+
+    /// Per-turn model override (issue #34). Set by the daemon-side routing
+    /// handler via [`with_model_override`] before invoking `send_prompt`,
+    /// populated from the resolved `(connection_id, model_id, effort)`
+    /// selection. Connectors read it via [`current_model_override`] at the
+    /// top of `stream_completion` and use it instead of `self.model` when
+    /// set. When unset, connectors fall back to `self.model` — preserving
+    /// pre-#34 behaviour for callers that don't route through the daemon
+    /// (tests, dreaming jobs, etc.).
+    ///
+    /// Lives in core (next to `REASONING_CONFIG`) precisely so the
+    /// connector crates — which can't depend on the daemon — can read it.
+    static MODEL_OVERRIDE: String;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -39,6 +52,24 @@ pub fn current_reasoning_config() -> ReasoningConfig {
     REASONING_CONFIG
         .try_with(|c| *c)
         .unwrap_or_default()
+}
+
+/// Run `fut` with `model` installed as the current turn's model override.
+/// Connectors read it via [`current_model_override`] in `stream_completion`
+/// and use it in place of `self.model`. See [`MODEL_OVERRIDE`].
+pub async fn with_model_override<F, T>(model: String, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    MODEL_OVERRIDE.scope(model, fut).await
+}
+
+/// Current task-local model override, or `None` when not set. Connectors
+/// call this at the top of `stream_completion` to determine which model id
+/// to send in the request body — falling back to their own `self.model`
+/// when unset.
+pub fn current_model_override() -> Option<String> {
+    MODEL_OVERRIDE.try_with(|m| m.clone()).ok()
 }
 
 /// Reasoning / extended-thinking level for a single LLM turn.
@@ -852,5 +883,32 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("429"));
+    }
+
+    // --- MODEL_OVERRIDE tests (issue #34) ---
+
+    #[tokio::test]
+    async fn current_model_override_is_none_outside_scope() {
+        assert_eq!(current_model_override(), None);
+    }
+
+    #[tokio::test]
+    async fn current_model_override_observes_scope() {
+        let observed = with_model_override("gpt-5-mini".to_string(), async {
+            current_model_override()
+        })
+        .await;
+        assert_eq!(observed, Some("gpt-5-mini".to_string()));
+        // After the scope exits the task-local is unset again.
+        assert_eq!(current_model_override(), None);
+    }
+
+    #[tokio::test]
+    async fn nested_model_override_shadows_outer() {
+        let inner = with_model_override("outer".into(), async {
+            with_model_override("inner".into(), async { current_model_override() }).await
+        })
+        .await;
+        assert_eq!(inner, Some("inner".into()));
     }
 }
