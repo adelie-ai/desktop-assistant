@@ -721,17 +721,27 @@ impl ToolExecutor for NoopToolExecutor {
     }
 }
 
-/// Compute a stable hash over the sorted tool names in a set of namespaces.
+/// Compute a stable hash over the tool set (names AND descriptions),
+/// sorted by name so input ordering does not affect the hash.
+///
+/// Why: The hash is the cache key for `categorize_tool_namespaces`. That LLM
+/// call sees both names and descriptions in its prompt, so a description
+/// change can produce a different categorization. Hashing names alone would
+/// hide such a change and serve a stale categorization. Re-categorizing on
+/// any name OR description edit keeps the cache honest.
 fn tool_set_hash(namespaces: &[ToolNamespace]) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut names: Vec<&str> = namespaces
+    let mut entries: Vec<(&str, &str)> = namespaces
         .iter()
         .flat_map(|ns| &ns.tools)
-        .map(|t| t.name.as_str())
+        .map(|t| (t.name.as_str(), t.description.as_str()))
         .collect();
-    names.sort_unstable();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    names.hash(&mut hasher);
+    for (name, description) in &entries {
+        name.hash(&mut hasher);
+        description.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -743,6 +753,15 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     backend_llm: Option<L>,
     tools: T,
     id_generator: Box<dyn Fn() -> String + Send + Sync>,
+    /// Memoized result of `categorize_tool_namespaces`, keyed by `tool_set_hash`.
+    ///
+    /// Why: Categorization is an LLM call carrying the full tool manifest
+    /// (often ≥1K input tokens). Re-running it every turn is wasteful when
+    /// the underlying tools have not changed. Lifetime is per-handler
+    /// (process-lifetime — there is no eviction); invalidation happens
+    /// implicitly when the hash of the current tool set differs from the
+    /// stored one. The hash covers tool names AND descriptions, so any
+    /// edit to either triggers a fresh categorization.
     namespace_cache: std::sync::Mutex<Option<(u64, Vec<ToolNamespace>)>>,
 }
 
@@ -918,9 +937,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         .map(|(_, ns)| ns.clone())
                 };
                 if let Some(ns) = cached_hit {
-                    tracing::debug!("reusing cached namespace categorization (hash={hash:#x})");
+                    tracing::debug!(
+                        hash,
+                        namespace_count = ns.len(),
+                        "tool categorization cache hit"
+                    );
                     ns
                 } else {
+                    tracing::debug!(hash, "tool categorization cache miss; invoking LLM");
                     let result = categorize_tool_namespaces(raw_namespaces, self.task_llm()).await;
                     *self.namespace_cache.lock().unwrap() = Some((hash, result.clone()));
                     result
@@ -3475,5 +3499,258 @@ mod tests {
         let llm = MockLlm::new(vec!["should not be called"]);
         let result = generate_context_summary("old summary", &messages, &llm).await;
         assert_eq!(result, "old summary");
+    }
+
+    // --- Tool namespace categorization cache tests ---
+    //
+    // These exercise the `namespace_cache` on `ConversationHandler` by driving
+    // `send_prompt` end-to-end with a mock LLM that supports hosted tool
+    // search. The mock recognises the categorization call by its system prompt
+    // and counts how many times the categorizer is invoked across calls.
+
+    /// System-prompt fragment unique to `categorize_tool_namespaces`.
+    /// Used by the mock LLM to distinguish categorization calls from
+    /// regular completion calls.
+    const CATEGORIZATION_SYSTEM_FRAGMENT: &str = "You organize tools into semantic categories";
+
+    /// Mock LLM that:
+    /// - Reports hosted tool search support so the cache path runs.
+    /// - Counts categorization calls (system prompt fragment match) and
+    ///   returns a deterministic JSON categorization for them.
+    /// - For all other calls returns plain text so `send_prompt` exits.
+    struct CategorizingLlm {
+        categorization_calls: Arc<AtomicU32>,
+        category_payload: Mutex<String>,
+    }
+
+    impl CategorizingLlm {
+        fn new(category_payload: String) -> Self {
+            Self {
+                categorization_calls: Arc::new(AtomicU32::new(0)),
+                category_payload: Mutex::new(category_payload),
+            }
+        }
+
+        fn calls(&self) -> Arc<AtomicU32> {
+            Arc::clone(&self.categorization_calls)
+        }
+    }
+
+    impl LlmClient for CategorizingLlm {
+        fn supports_hosted_tool_search(&self) -> bool {
+            true
+        }
+
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let is_categorization = messages.iter().any(|m| {
+                matches!(m.role, Role::System) && m.content.contains(CATEGORIZATION_SYSTEM_FRAGMENT)
+            });
+            if is_categorization {
+                self.categorization_calls.fetch_add(1, Ordering::SeqCst);
+                let payload = self.category_payload.lock().unwrap().clone();
+                return Ok(LlmResponse::text(payload));
+            }
+            let text = "ok".to_string();
+            on_chunk(text.clone());
+            Ok(LlmResponse::text(text))
+        }
+    }
+
+    /// Mock tool executor with a mutable namespace set so individual tests
+    /// can edit names/descriptions between `send_prompt` calls.
+    struct NamespacedToolExecutor {
+        namespaces: Mutex<Vec<ToolNamespace>>,
+    }
+
+    impl NamespacedToolExecutor {
+        fn new(namespaces: Vec<ToolNamespace>) -> Self {
+            Self {
+                namespaces: Mutex::new(namespaces),
+            }
+        }
+
+        fn mutate<F: FnOnce(&mut Vec<ToolNamespace>)>(&self, f: F) {
+            let mut guard = self.namespaces.lock().unwrap();
+            f(&mut guard);
+        }
+    }
+
+    impl ToolExecutor for NamespacedToolExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn tool_definition(
+            &self,
+            _name: &str,
+        ) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(None)
+        }
+
+        async fn tool_namespaces(&self) -> Vec<ToolNamespace> {
+            self.namespaces.lock().unwrap().clone()
+        }
+
+        async fn execute_tool(
+            &self,
+            name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            Err(CoreError::ToolExecution(format!("unexpected exec: {name}")))
+        }
+    }
+
+    /// Build a single namespace containing `count` distinct tools so the
+    /// total tool count exceeds `categorize_tool_namespaces`'s skip threshold.
+    fn make_oversized_namespace(count: usize) -> ToolNamespace {
+        let tools: Vec<ToolDefinition> = (0..count)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("tool_{i}"),
+                    format!("Description for tool {i}"),
+                    serde_json::json!({"type": "object"}),
+                )
+            })
+            .collect();
+        ToolNamespace::new("seed_namespace", "Seed namespace for tests", tools)
+    }
+
+    /// Categorization payload that puts every `tool_*` into one bucket.
+    /// Construction matches `make_oversized_namespace` so the LLM-shaped
+    /// JSON is internally consistent and `categorize_tool_namespaces`
+    /// accepts it (every tool appears in exactly one category).
+    fn make_categorization_payload(count: usize) -> String {
+        let names: Vec<String> = (0..count).map(|i| format!("\"tool_{i}\"")).collect();
+        format!(
+            r#"[{{"name":"all","description":"All tools","tools":[{}]}}]"#,
+            names.join(",")
+        )
+    }
+
+    fn build_categorization_handler(
+        executor: NamespacedToolExecutor,
+        llm: CategorizingLlm,
+    ) -> ConversationHandler<MockStore, CategorizingLlm, NamespacedToolExecutor> {
+        use std::sync::atomic::{AtomicU64, Ordering as IdOrdering};
+        let counter = Arc::new(AtomicU64::new(0));
+        ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            executor,
+            Box::new(move || {
+                let n = counter.fetch_add(1, IdOrdering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn categorization_cache_hits_on_unchanged_tools() {
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let calls = llm.calls();
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
+            .await
+            .expect("invariant: first send_prompt with valid conv must succeed");
+        handler
+            .send_prompt(&conv.id, "second".into(), noop_callback(), noop_status())
+            .await
+            .expect("invariant: second send_prompt with valid conv must succeed");
+
+        // Cache hit on second call: categorizer runs at most once.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "categorizer should run once and be served from cache thereafter"
+        );
+    }
+
+    #[tokio::test]
+    async fn categorization_cache_invalidates_on_description_change() {
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let calls = llm.calls();
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
+            .await
+            .expect("invariant: first send_prompt must succeed");
+
+        // Mutate a description without changing any name. Without
+        // descriptions in the hash, the cache would falsely hit.
+        handler.tools.mutate(|namespaces| {
+            namespaces[0].tools[0].description = "Description for tool 0 (edited)".to_string();
+        });
+
+        handler
+            .send_prompt(&conv.id, "second".into(), noop_callback(), noop_status())
+            .await
+            .expect("invariant: second send_prompt must succeed");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "description change must invalidate the categorization cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn categorization_cache_invalidates_on_tool_addition() {
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        // Pre-build a payload that covers the post-addition tool set so the
+        // second categorization call returns valid JSON for `count + 1` tools.
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let calls = llm.calls();
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
+            .await
+            .expect("invariant: first send_prompt must succeed");
+
+        // Add a tool, then update the LLM's stored payload so the second
+        // categorization succeeds (and thus actually runs end-to-end).
+        handler.tools.mutate(|namespaces| {
+            namespaces[0].tools.push(ToolDefinition::new(
+                format!("tool_{count}"),
+                "Description for added tool",
+                serde_json::json!({"type": "object"}),
+            ));
+        });
+        *handler.llm.category_payload.lock().unwrap() = make_categorization_payload(count + 1);
+
+        handler
+            .send_prompt(&conv.id, "second".into(), noop_callback(), noop_status())
+            .await
+            .expect("invariant: second send_prompt must succeed");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "tool addition must invalidate the categorization cache"
+        );
     }
 }
