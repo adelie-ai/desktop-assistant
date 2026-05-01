@@ -25,12 +25,16 @@ impl From<&str> for ConversationId {
 }
 
 /// A collapsed range of messages replaced by a summary text.
+///
+/// Why: the range covered by a summary is recovered at render time from
+/// the positions of `Message`s whose `summary_id` matches `id`. Storing
+/// vec-index ordinals on the summary itself duplicates information already
+/// carried by `Message::summary_id` and breaks if any message in the
+/// conversation is deleted (the recorded indices would silently drift).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageSummary {
     pub id: String,
     pub summary: String,
-    pub start_ordinal: usize,
-    pub end_ordinal: usize,
 }
 
 /// A conversation aggregate containing its messages.
@@ -205,5 +209,21 @@ mod tests {
         let conv = Conversation::new("id-1", "Chat");
         let json = serde_json::to_string(&conv).unwrap();
         assert!(!json.contains("context_summary"));
+    }
+
+    #[test]
+    fn message_summary_tolerates_legacy_ordinal_fields() {
+        // Persisted JSON from before the ordinal fields were dropped must
+        // still deserialize. Serde tolerates unknown keys by default
+        // (no #[serde(deny_unknown_fields)] on the struct).
+        let json = r#"{
+            "id": "s1",
+            "summary": "First batch.",
+            "start_ordinal": 1,
+            "end_ordinal": 3
+        }"#;
+        let summary: MessageSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(summary.id, "s1");
+        assert_eq!(summary.summary, "First batch.");
     }
 }

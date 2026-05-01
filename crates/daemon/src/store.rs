@@ -216,8 +216,6 @@ impl ConversationStore for PersistentConversationStore {
         conv.summaries.push(MessageSummary {
             id: id.clone(),
             summary,
-            start_ordinal,
-            end_ordinal,
         });
         self.persist(&data)?;
         Ok(id)
@@ -335,8 +333,6 @@ impl ConversationStore for InMemoryConversationStore {
         conv.summaries.push(MessageSummary {
             id: id.clone(),
             summary,
-            start_ordinal,
-            end_ordinal,
         });
         Ok(id)
     }

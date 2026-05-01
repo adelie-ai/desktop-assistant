@@ -149,7 +149,7 @@ impl ConversationStore for PgConversationStore {
         let messages = msg_rows.into_iter().map(msg_from_row).collect();
 
         let summary_rows: Vec<SummaryRow> = sqlx::query_as(
-            "SELECT id, summary, start_ordinal, end_ordinal
+            "SELECT id, summary
              FROM message_summaries WHERE conversation_id = $1 ORDER BY start_ordinal",
         )
         .bind(&id.0)
@@ -162,8 +162,6 @@ impl ConversationStore for PgConversationStore {
             .map(|r| MessageSummary {
                 id: r.id,
                 summary: r.summary,
-                start_ordinal: r.start_ordinal as usize,
-                end_ordinal: r.end_ordinal as usize,
             })
             .collect();
 
@@ -203,7 +201,7 @@ impl ConversationStore for PgConversationStore {
             let messages = msg_rows.into_iter().map(msg_from_row).collect();
 
             let summary_rows: Vec<SummaryRow> = sqlx::query_as(
-                "SELECT id, summary, start_ordinal, end_ordinal
+                "SELECT id, summary
                  FROM message_summaries WHERE conversation_id = $1 ORDER BY start_ordinal",
             )
             .bind(&row.id)
@@ -216,8 +214,6 @@ impl ConversationStore for PgConversationStore {
                 .map(|r| MessageSummary {
                     id: r.id,
                     summary: r.summary,
-                    start_ordinal: r.start_ordinal as usize,
-                    end_ordinal: r.end_ordinal as usize,
                 })
                 .collect();
 
@@ -465,6 +461,4 @@ struct MsgRow {
 struct SummaryRow {
     id: String,
     summary: String,
-    start_ordinal: i32,
-    end_ordinal: i32,
 }

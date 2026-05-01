@@ -151,8 +151,6 @@ mod tests {
             conv.summaries.push(MessageSummary {
                 id: id.clone(),
                 summary,
-                start_ordinal,
-                end_ordinal,
             });
             Ok(id)
         }

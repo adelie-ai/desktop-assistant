@@ -133,10 +133,6 @@ fn llm_messages_for_turn(
     let windowed = &conversation_messages[start..];
     let is_windowed = start > 0;
 
-    // Build a map from start_ordinal -> summary for active summaries in the window.
-    let summary_map: std::collections::HashMap<usize, &MessageSummary> =
-        summaries.iter().map(|s| (s.start_ordinal, s)).collect();
-
     // Track which summary IDs are active so we know to skip their messages.
     let active_summary_ids: std::collections::HashSet<&str> =
         summaries.iter().map(|s| s.id.as_str()).collect();
@@ -155,9 +151,7 @@ fn llm_messages_for_turn(
     // Track which summaries have already been injected.
     let mut injected_summaries: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-    for (i, msg) in windowed.iter().enumerate() {
-        let ordinal = start + i;
-
+    for msg in windowed.iter() {
         if let Some(sid) = &msg.summary_id
             && active_summary_ids.contains(sid.as_str())
         {
@@ -165,20 +159,30 @@ fn llm_messages_for_turn(
             // collapsed message we encounter for this summary.
             if !injected_summaries.contains(sid.as_str()) {
                 injected_summaries.insert(sid);
-                // Look up by ordinal first, then fall back to finding by ID
-                // (the window may not start at the summary's start_ordinal).
-                let found = summary_map
-                    .get(&ordinal)
-                    .copied()
-                    .or_else(|| summaries.iter().find(|s| s.id == *sid));
-                if let Some(s) = found {
-                    messages.push(Message::new(
-                        Role::System,
-                        format!(
+                if let Some(s) = summaries.iter().find(|s| s.id == *sid) {
+                    // Recover the absolute ordinal range from the message
+                    // positions tagged with this summary_id. The window may
+                    // not contain the full range; fall back to a
+                    // range-less label when no tagged message is visible.
+                    let mut first: Option<usize> = None;
+                    let mut last: Option<usize> = None;
+                    for (i, m) in windowed.iter().enumerate() {
+                        if m.summary_id.as_deref() == Some(s.id.as_str()) {
+                            let abs = start + i;
+                            if first.is_none() {
+                                first = Some(abs);
+                            }
+                            last = Some(abs);
+                        }
+                    }
+                    let body = match (first, last) {
+                        (Some(f), Some(l)) => format!(
                             "[Summary of messages {}\u{2013}{}] {}",
-                            s.start_ordinal, s.end_ordinal, s.summary
+                            f, l, s.summary
                         ),
-                    ));
+                        _ => format!("[Summary of earlier messages] {}", s.summary),
+                    };
+                    messages.push(Message::new(Role::System, body));
                 }
             }
             continue;
@@ -3291,8 +3295,6 @@ mod tests {
         let summaries = vec![MessageSummary {
             id: "s1".to_string(),
             summary: "Assistant performed steps 1-3.".to_string(),
-            start_ordinal: 1,
-            end_ordinal: 3,
         }];
 
         let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
@@ -3342,24 +3344,102 @@ mod tests {
             MessageSummary {
                 id: "s1".to_string(),
                 summary: "First batch.".to_string(),
-                start_ordinal: 1,
-                end_ordinal: 2,
             },
             MessageSummary {
                 id: "s2".to_string(),
                 summary: "Second batch.".to_string(),
-                start_ordinal: 4,
-                end_ordinal: 5,
             },
         ];
 
         let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
         // System + "start" + summary1 + "middle" + summary2 + "end" = 6
         assert_eq!(result.len(), 6);
+        assert!(result[2].content.contains("Summary of messages 1\u{2013}2"));
         assert!(result[2].content.contains("First batch."));
         assert_eq!(result[3].content, "middle");
+        assert!(result[4].content.contains("Summary of messages 4\u{2013}5"));
         assert!(result[4].content.contains("Second batch."));
         assert_eq!(result[5].content, "end");
+    }
+
+    #[test]
+    fn llm_messages_for_turn_renders_absolute_ordinals_when_windowed() {
+        // Build a long conversation so windowing kicks in. Messages
+        // alternate User/Assistant so window_start can land on a User.
+        // We tag a contiguous run that survives the window; the rendered
+        // range must be the absolute ordinals (offset by the window
+        // start), not the windowed-slice positions.
+        let total = MAX_CONTEXT_MESSAGES + 20;
+        let mut msgs: Vec<Message> = (0..total)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("asst-{i}"))
+                }
+            })
+            .collect();
+
+        // Tag the last three messages with the summary so they're inside
+        // the window regardless of where it starts.
+        let first_tagged = total - 3;
+        let last_tagged = total - 1;
+        for m in &mut msgs[first_tagged..=last_tagged] {
+            m.summary_id = Some("s1".to_string());
+        }
+
+        let summaries = vec![MessageSummary {
+            id: "s1".to_string(),
+            summary: "Tail collapsed.".to_string(),
+        }];
+
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
+
+        let injected = result
+            .iter()
+            .find(|m| m.content.contains("Tail collapsed."))
+            .expect("summary must be injected when its messages are in window");
+        let expected = format!("Summary of messages {first_tagged}\u{2013}{last_tagged}");
+        assert!(
+            injected.content.contains(&expected),
+            "expected {expected:?} in {:?}",
+            injected.content
+        );
+    }
+
+    #[test]
+    fn llm_messages_for_turn_skips_summary_when_all_tagged_messages_outside_window() {
+        // Tag only messages that the window will exclude. With no tagged
+        // message in the window, there's no anchor at which to inject the
+        // summary, so it must not appear at all.
+        let total = MAX_CONTEXT_MESSAGES + 20;
+        let mut msgs: Vec<Message> = (0..total)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("asst-{i}"))
+                }
+            })
+            .collect();
+
+        // Tag messages 0..=2 — guaranteed to fall outside a window that
+        // keeps only the most recent MAX_CONTEXT_MESSAGES.
+        for m in msgs.iter_mut().take(3) {
+            m.summary_id = Some("s_outside".to_string());
+        }
+
+        let summaries = vec![MessageSummary {
+            id: "s_outside".to_string(),
+            summary: "Old context.".to_string(),
+        }];
+
+        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
+
+        assert!(
+            result.iter().all(|m| !m.content.contains("Old context.")),
+            "summary whose tagged messages fall outside the window must not be injected"
+        );
     }
 
     #[tokio::test]
