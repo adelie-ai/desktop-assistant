@@ -3759,7 +3759,16 @@ mod tests {
             summary: "Tail collapsed.".to_string(),
         }];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &summaries,
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+        );
 
         let injected = result
             .iter()
@@ -3800,7 +3809,16 @@ mod tests {
             summary: "Old context.".to_string(),
         }];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &summaries,
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+        );
 
         assert!(
             result.iter().all(|m| !m.content.contains("Old context.")),
