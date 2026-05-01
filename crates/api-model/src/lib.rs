@@ -288,6 +288,13 @@ pub struct ConversationView {
     /// conversation's last model selection no longer resolves and was cleared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ConversationWarning>,
+    /// The conversation's currently stored (connection, model, effort)
+    /// selection, when one has been pinned by a prior `SendMessage` override.
+    /// `None` means the daemon will fall back to the `interactive` purpose on
+    /// the next send. Cleared automatically when the previous selection no
+    /// longer resolves (see `ConversationWarning::DanglingModelSelection`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<ConversationModelSelectionView>,
 }
 
 /// Advisory conditions attached to a conversation view. Modeled as an enum

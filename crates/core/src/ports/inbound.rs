@@ -121,6 +121,26 @@ pub trait ConversationService: Send + Sync {
         id: &ConversationId,
     ) -> impl std::future::Future<Output = Result<Conversation, CoreError>> + Send;
 
+    /// Read the conversation's currently stored model selection, if one has
+    /// been pinned by a prior override. Returns `Ok(None)` when the
+    /// conversation has no stored selection (the daemon will fall back to the
+    /// `interactive` purpose on the next send).
+    ///
+    /// The default implementation returns `Ok(None)`; the daemon's routing
+    /// wrapper overrides this to consult the persistent selection store.
+    fn get_conversation_model_selection(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<Option<ConversationModelSelection>, CoreError>> + Send
+    where
+        Self: Sync,
+    {
+        async move {
+            let _ = id;
+            Ok(None)
+        }
+    }
+
     fn delete_conversation(
         &self,
         id: &ConversationId,

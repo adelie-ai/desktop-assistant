@@ -8,8 +8,8 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
-    ConversationService, DispatchWarning, Effort, PromptSelectionOverride, PurposeConfigPayload,
-    PurposeKind, SettingsService,
+    ConversationModelSelection, ConversationService, DispatchWarning, Effort,
+    PromptSelectionOverride, PurposeConfigPayload, PurposeKind, SettingsService,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -336,6 +336,14 @@ fn api_purpose_kind_to_core(k: api::PurposeKindApi) -> PurposeKind {
     }
 }
 
+fn model_selection_to_view(sel: ConversationModelSelection) -> api::ConversationModelSelectionView {
+    api::ConversationModelSelectionView {
+        connection_id: sel.connection_id,
+        model_id: sel.model_id,
+        effort: sel.effort.map(|e| effort_to_api(Effort::from(e))),
+    }
+}
+
 fn dispatch_warning_to_api(w: DispatchWarning) -> api::ConversationWarning {
     match w {
         DispatchWarning::DanglingModelSelection {
@@ -416,13 +424,19 @@ where
             }
 
             api::Command::GetConversation { id } => {
+                let conv_id =
+                    desktop_assistant_core::domain::ConversationId::from(id.as_str());
                 let conv = self
                     .conversations
-                    .get_conversation(&desktop_assistant_core::domain::ConversationId::from(
-                        id.as_str(),
-                    ))
+                    .get_conversation(&conv_id)
                     .await
                     .map_err(Self::map_core_err)?;
+                let model_selection = self
+                    .conversations
+                    .get_conversation_model_selection(&conv_id)
+                    .await
+                    .map_err(Self::map_core_err)?
+                    .map(model_selection_to_view);
 
                 Ok(api::CommandResult::Conversation(api::ConversationView {
                     id: conv.id.0,
@@ -436,6 +450,7 @@ where
                         })
                         .collect(),
                     warnings: Vec::new(),
+                    model_selection,
                 }))
             }
 

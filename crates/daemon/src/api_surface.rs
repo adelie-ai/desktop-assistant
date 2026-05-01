@@ -624,6 +624,13 @@ where
         self.inner.get_conversation(id).await
     }
 
+    async fn get_conversation_model_selection(
+        &self,
+        id: &ConversationId,
+    ) -> Result<Option<ConversationModelSelection>, CoreError> {
+        self.selection_store.get_selection(id).await
+    }
+
     async fn delete_conversation(&self, id: &ConversationId) -> Result<(), CoreError> {
         self.inner.delete_conversation(id).await
     }
