@@ -40,13 +40,16 @@ const COMPACTION_TOKEN_RATIO: f64 = 0.85;
 const MAX_OVERFLOW_RETRIES: u32 = 3;
 
 /// Floor below which a tool result isn't worth truncating in response to a
-/// `ContextOverflow`. Below this size the resulting truncation notice may
-/// be larger than the original payload, so the byte savings are negligible
-/// and step 1 of the recovery ladder hands off to step 2 instead.
+/// `ContextOverflow`. Measured in estimated tokens (via
+/// `LlmClient::estimate_tokens`) so non-ASCII payloads are weighed by the
+/// cost the model actually pays. Below this size the resulting truncation
+/// notice may be larger than the original payload, so the savings are
+/// negligible and step 1 of the recovery ladder hands off to step 2.
 ///
-/// Why a byte threshold: the picker is intentionally simple here; a future
-/// patch (#65) replaces this with a token-aware sort key.
-const MIN_TRUNCATION_BYTES: usize = 4096;
+/// Why 1024: roughly equivalent to 4 KB of ASCII at the chars/4 default
+/// estimate, but the choice is intentionally coarse — the goal is just to
+/// avoid the "notice larger than payload" pathology, not to be precise.
+const MIN_TRUNCATION_TOKENS: u64 = 1024;
 
 /// Build the replacement content used when a tool result is truncated in
 /// response to a `ContextOverflow` error. The text is addressed to the
@@ -505,15 +508,32 @@ fn trailing_tag_prefix_len(text: &str, tag: &str) -> usize {
 /// threshold — small tool results aren't worth truncating because the
 /// truncation notice may be larger than the original.
 ///
-/// Why: step 1 of [`recover_from_overflow`] targets the biggest bloater
-/// first. Re-running after a single truncation naturally picks a different
-/// tool message because the truncation notice is well below `min_bytes`.
-fn find_largest_tool_result_above(messages: &[Message], min_bytes: usize) -> Option<usize> {
+/// Why estimated tokens (not bytes): non-ASCII payloads (CJK, emoji,
+/// JSON-with-deep-escapes, base64) have wildly different byte-vs-token
+/// ratios. Sorting by bytes mis-targets those cases. Step 1 of
+/// [`recover_from_overflow`] aims to free the most prompt-token budget,
+/// not the most filesystem bytes, so we measure with the same currency
+/// the LLM pays in.
+fn find_largest_tool_result_above(
+    messages: &[Message],
+    min_tokens: u64,
+    estimate: &dyn Fn(&str) -> u64,
+) -> Option<usize> {
     messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == Role::Tool && m.content.len() >= min_bytes)
-        .max_by_key(|(_, m)| m.content.len())
+        .filter_map(|(i, m)| {
+            if m.role != Role::Tool {
+                return None;
+            }
+            let tokens = estimate(&m.content);
+            if tokens >= min_tokens {
+                Some((i, tokens))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(_, tokens)| *tokens)
         .map(|(i, _)| i)
 }
 
@@ -750,9 +770,12 @@ async fn recover_from_overflow<L: LlmClient>(
     max_tokens: Option<u64>,
     target_window: &mut usize,
     task_llm: &L,
+    estimate: &(dyn Fn(&str) -> u64 + Send + Sync),
 ) {
-    // Step 1: largest tool result, if it's >= MIN_TRUNCATION_BYTES.
-    if let Some(idx) = find_largest_tool_result_above(&conv.messages, MIN_TRUNCATION_BYTES) {
+    // Step 1: largest tool result, if it's >= MIN_TRUNCATION_TOKENS.
+    if let Some(idx) =
+        find_largest_tool_result_above(&conv.messages, MIN_TRUNCATION_TOKENS, estimate)
+    {
         let original_bytes = conv.messages[idx].content.len();
         conv.messages[idx].content =
             overflow_truncation_notice(original_bytes, prompt_tokens, max_tokens);
@@ -1346,6 +1369,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             max_tokens,
                             &mut target_window,
                             self.task_llm(),
+                            &estimate,
                         )
                         .await;
                         on_chunk = Box::new(|_| true);
@@ -2378,7 +2402,8 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(0));
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
-            FailingLlm::new(responses, 1).with_error("context_length_exceeded"),
+            FailingLlm::new(responses, 1)
+                .with_error_variant(|| CoreError::Llm("context_length_exceeded".into())),
             MockToolExecutor::new(tools, tool_results),
             Box::new(move || {
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3200,15 +3225,26 @@ mod tests {
 
         let conv = handler.create_conversation("Test".into()).await.unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
-        // Build two payloads with identical byte length but very
-        // different chars/4 token estimates.
-        let ascii_payload: String = "A".repeat(256);
+        // Build two payloads where byte length and estimated tokens
+        // give different rankings. Both clear MIN_TRUNCATION_TOKENS so
+        // either could be picked by step 1; the picker must choose by
+        // token estimate, not bytes.
+        //
+        //   ASCII:  8192 chars × 1 byte  =  8192 bytes / 2048 est. tokens
+        //   Emoji:  4096 chars × 4 bytes = 16384 bytes / 1024 est. tokens
+        //
+        // Bytes alone would pick emoji (more bytes); tokens pick ASCII
+        // (more estimated cost). That's the regression this guards.
+        let ascii_payload: String = "A".repeat(8192);
         let emoji_one = "\u{1F600}"; // 4 bytes, 1 char
-        let emoji_payload: String = emoji_one.repeat(64);
-        assert_eq!(ascii_payload.len(), emoji_payload.len(), "byte length parity");
+        let emoji_payload: String = emoji_one.repeat(4096);
+        assert!(
+            emoji_payload.len() > ascii_payload.len(),
+            "emoji payload must have more bytes so byte-picker would mis-target"
+        );
         assert!(
             ascii_payload.chars().count() > emoji_payload.chars().count(),
-            "char counts must differ to drive a token-estimate ranking"
+            "ASCII payload must have more chars so token-picker prefers it"
         );
 
         stored
@@ -3573,7 +3609,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_step1_truncates_largest_tool_result() {
         // Step 1 of the ladder: when there is at least one tool result
-        // bigger than MIN_TRUNCATION_BYTES, truncate the largest and retry.
+        // bigger than MIN_TRUNCATION_TOKENS (in estimated tokens), truncate
+        // the largest and retry.
         // Smaller tool results stay untouched.
         use std::sync::atomic::AtomicU64;
 
@@ -3609,11 +3646,14 @@ mod tests {
             .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
                 "c2", "medium", "{}",
             )]));
-        let medium_content = "m".repeat(MIN_TRUNCATION_BYTES / 2);
+        // 2048 chars ≈ 512 tokens (chars/4 default) — below the
+        // 1024-token threshold, so step 1 should leave it alone.
+        let medium_content = "m".repeat((MIN_TRUNCATION_TOKENS * 2) as usize);
         stored
             .messages
             .push(Message::tool_result("c2", &medium_content));
-        let big_content = "X".repeat(MIN_TRUNCATION_BYTES * 4);
+        // 16384 chars ≈ 4096 tokens — well above the 1024-token threshold.
+        let big_content = "X".repeat((MIN_TRUNCATION_TOKENS * 16) as usize);
         stored
             .messages
             .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
@@ -3695,7 +3735,7 @@ mod tests {
         let conv = handler.create_conversation("Test".into()).await.unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
         // Four tool-pair groups, all with tiny results (below
-        // MIN_TRUNCATION_BYTES) so step 1 declines.
+        // MIN_TRUNCATION_TOKENS in estimated tokens) so step 1 declines.
         for i in 1..=4 {
             stored
                 .messages
@@ -3898,7 +3938,10 @@ mod tests {
             )]));
         stored
             .messages
-            .push(Message::tool_result("c1", "x".repeat(MIN_TRUNCATION_BYTES * 2)));
+            .push(Message::tool_result(
+                "c1",
+                "x".repeat((MIN_TRUNCATION_TOKENS * 8) as usize),
+            ));
         handler.store.update(stored).await.unwrap();
 
         let result = handler
