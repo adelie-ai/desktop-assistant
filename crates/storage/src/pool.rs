@@ -91,5 +91,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Active-task anchor (issue #57) — nullable text column capturing the
+    // user's current goal so it can be re-injected after windowing/summary.
+    sqlx::raw_sql(include_str!(
+        "../migrations/012_conversation_active_task.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

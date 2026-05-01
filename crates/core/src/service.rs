@@ -66,6 +66,17 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
         .to_string()
 }
 
+/// Number of consecutive tool rounds within a single `send_prompt` call after
+/// which the active-task anchor must be re-injected even if it is still in
+/// the windowed message list. Why: long agentic loops drift away from the
+/// goal; surfacing it again every few rounds keeps the model on-task.
+const ACTIVE_TASK_ROUND_THRESHOLD: u32 = 5;
+
+// Why allow: this builder coordinates several independent prompt slices
+// (windowed messages, summaries, tool sets, context summary, anchor) that
+// don't naturally cluster into a single struct. Bundling them just to
+// satisfy the lint would obscure the code at every call site.
+#[allow(clippy::too_many_arguments)]
 fn llm_messages_for_turn(
     conversation_messages: &[Message],
     summaries: &[MessageSummary],
@@ -73,6 +84,8 @@ fn llm_messages_for_turn(
     deferred_namespaces: &[ToolNamespace],
     context_summary: &str,
     max_messages: usize,
+    active_task: Option<&str>,
+    tool_rounds_since_anchor: u32,
 ) -> Vec<Message> {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
 
@@ -146,6 +159,45 @@ fn llm_messages_for_turn(
             Role::System,
             format!("[Summary of earlier conversation]\n{context_summary}"),
         ));
+    }
+
+    // Re-inject the active-task anchor when the original prompt has drifted
+    // out of the model's view. Three triggers, any one of which is enough:
+    //   1. Windowing is active and the anchor user message has been windowed
+    //      out (heuristic: no User message with matching content in `windowed`).
+    //   2. The anchor user message is still in `windowed` but has been
+    //      collapsed behind an active summary (its `summary_id` is set), so
+    //      the model only sees the summary text in this turn.
+    //   3. The dispatch loop has gone through more than
+    //      `ACTIVE_TASK_ROUND_THRESHOLD` tool rounds in the current turn — even
+    //      if the anchor is still visible, surfacing it again keeps the model
+    //      on-task during long agentic loops.
+    //
+    // Why: a long tool-calling session can bury the user's goal under many
+    // tool results; an explicit `[Current task]` re-statement keeps the
+    // assistant aligned with the original intent across compaction and
+    // windowing events.
+    if let Some(task) = active_task.filter(|t| !t.is_empty()) {
+        // Find a non-collapsed User message in the window whose content
+        // matches the anchor. Messages with an active `summary_id` are
+        // about to be replaced by summary text below, so they don't count
+        // as "visible" for the purpose of this check.
+        let anchor_visible = windowed.iter().any(|m| {
+            m.role == Role::User
+                && m.content == task
+                && !m
+                    .summary_id
+                    .as_deref()
+                    .is_some_and(|sid| active_summary_ids.contains(sid))
+        });
+        let many_tool_rounds = tool_rounds_since_anchor > ACTIVE_TASK_ROUND_THRESHOLD;
+
+        if !anchor_visible || many_tool_rounds {
+            messages.push(Message::new(
+                Role::System,
+                format!("[Current task] {task}"),
+            ));
+        }
     }
 
     // Track which summaries have already been injected.
@@ -523,10 +575,12 @@ async fn generate_context_summary<L: LlmClient>(
     let llm_messages = vec![
         Message::new(
             Role::System,
-            "You are a conversation summarizer. Produce a concise bullet-point summary of the \
-             key points, decisions, user preferences, and established facts from the conversation. \
-             Merge with any existing summary provided. Keep the summary under 500 words. \
-             Output ONLY the bullet-point summary, no preamble.",
+            "You are a conversation summarizer. The summary MUST begin with a single \
+             line \"Active task: <one sentence describing what the user is currently \
+             trying to accomplish>\". After that line, produce a concise bullet-point \
+             summary of key decisions, user preferences, and established facts. Merge \
+             with any existing summary provided. Keep the total summary under 500 \
+             words. Output ONLY the formatted summary, no preamble.",
         ),
         Message::new(Role::User, prompt),
     ];
@@ -900,6 +954,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let mut conv = self.store.get(conversation_id).await?;
         let is_first_message = conv.messages.is_empty();
         conv.messages.push(Message::new(Role::User, &prompt));
+        // Capture the prompt as the active-task anchor for this turn. It is
+        // re-injected in `llm_messages_for_turn` when conditions indicate
+        // the original message has drifted out of the model's view.
+        conv.active_task = Some(prompt.clone());
 
         // Effective window size for this turn. May shrink further if the
         // provider reports input-token usage above COMPACTION_TOKEN_RATIO.
@@ -989,6 +1047,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             } else {
                 &[]
             };
+            // `tool_rounds_since_anchor` doubles as "how many tool rounds
+            // have we executed in this turn". Each completed round increments
+            // the count, and the anchor was just (re)set at the start of
+            // `send_prompt` — so this is exactly the round counter we want
+            // to thread into the active-task injection check.
+            let tool_rounds_since_anchor = u32::try_from(round).unwrap_or(u32::MAX);
             let llm_messages = llm_messages_for_turn(
                 &conv.messages,
                 &conv.summaries,
@@ -996,6 +1060,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 deferred_ns,
                 &conv.context_summary,
                 target_window,
+                conv.active_task.as_deref(),
+                tool_rounds_since_anchor,
             );
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
@@ -2679,7 +2745,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
         // System message + all 10 conversation messages
         assert_eq!(result.len(), 11);
         assert_eq!(result[0].role, Role::System);
@@ -2702,7 +2768,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
         // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
         // a User message (even index), so the window starts exactly there.
         // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
@@ -2735,7 +2801,7 @@ mod tests {
         msgs.push(Message::new(Role::User, "final-user"));
         msgs.push(Message::new(Role::Assistant, "final-reply"));
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
 
         // The first conversation message (after System) must be a User message.
         assert_eq!(result[0].role, Role::System);
@@ -3231,6 +3297,8 @@ mod tests {
             &[],
             "- User prefers dark mode",
             MAX_CONTEXT_MESSAGES,
+            None,
+            0,
         );
 
         // System prompt, then summary system message, then windowed messages
@@ -3267,6 +3335,8 @@ mod tests {
             &[],
             "- Some summary",
             MAX_CONTEXT_MESSAGES,
+            None,
+            0,
         );
 
         // No summary injected when under limit
@@ -3292,11 +3362,250 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
 
         // System prompt directly followed by windowed messages — no summary
         assert_eq!(result[0].role, Role::System);
         assert_eq!(result[1].role, Role::User);
+    }
+
+    // --- Active-task anchor tests ---
+
+    #[tokio::test]
+    async fn active_task_anchor_set_on_user_prompt() {
+        let handler = make_handler(vec!["ok"]);
+        let conv = handler.create_conversation("Chat".into()).await.unwrap();
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "refactor the auth module".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("send_prompt succeeds");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(
+            stored.active_task.as_deref(),
+            Some("refactor the auth module"),
+            "the user's prompt should be captured as the active-task anchor"
+        );
+    }
+
+    #[test]
+    fn active_task_reinjected_when_user_msg_windowed_out() {
+        let task = "build a new feature";
+        // Conversation with MAX_CONTEXT_MESSAGES + 5 messages; the original
+        // user prompt sits at index 0 and the window slides past it so
+        // the anchor must be re-injected.
+        let total = MAX_CONTEXT_MESSAGES + 5;
+        let mut msgs: Vec<Message> = Vec::with_capacity(total);
+        msgs.push(Message::new(Role::User, task));
+        for i in 1..total {
+            if i % 2 == 0 {
+                msgs.push(Message::new(Role::User, format!("noise-user-{i}")));
+            } else {
+                msgs.push(Message::new(Role::Assistant, format!("noise-asst-{i}")));
+            }
+        }
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            Some(task),
+            0,
+        );
+
+        let injected = result
+            .iter()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Current task]"))
+            .expect("[Current task] system message should be injected when windowed out");
+        assert!(
+            injected.content.contains(task),
+            "injected content {:?} must include the active-task text",
+            injected.content
+        );
+    }
+
+    #[test]
+    fn active_task_not_injected_when_user_msg_in_window() {
+        let task = "write some unit tests";
+        let msgs = vec![
+            Message::new(Role::User, task),
+            Message::new(Role::Assistant, "ok, let's start"),
+        ];
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            Some(task),
+            0,
+        );
+
+        let any_anchor = result
+            .iter()
+            .any(|m| m.role == Role::System && m.content.starts_with("[Current task]"));
+        assert!(
+            !any_anchor,
+            "no [Current task] message should be injected when the original prompt is still visible"
+        );
+    }
+
+    #[test]
+    fn active_task_reinjected_after_many_tool_rounds() {
+        let task = "trace a flaky test";
+        // Anchor message is still in the window — under normal conditions
+        // we wouldn't inject, but a high tool-rounds counter forces it.
+        let msgs = vec![
+            Message::new(Role::User, task),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
+            Message::tool_result("c1", "result"),
+        ];
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            Some(task),
+            6,
+        );
+
+        let any_anchor = result
+            .iter()
+            .any(|m| m.role == Role::System && m.content == format!("[Current task] {task}"));
+        assert!(
+            any_anchor,
+            "high tool-rounds count should force [Current task] re-injection \
+             even when the anchor is still in the window"
+        );
+    }
+
+    #[test]
+    fn active_task_not_injected_when_none() {
+        let msgs = vec![Message::new(Role::User, "hello")];
+        let result =
+            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+
+        let any_anchor = result
+            .iter()
+            .any(|m| m.role == Role::System && m.content.starts_with("[Current task]"));
+        assert!(!any_anchor, "no anchor should be injected when active_task is None");
+    }
+
+    #[test]
+    fn active_task_not_injected_when_empty_string() {
+        let msgs = vec![Message::new(Role::User, "hello")];
+        let result =
+            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, Some(""), 99);
+
+        let any_anchor = result
+            .iter()
+            .any(|m| m.role == Role::System && m.content.starts_with("[Current task]"));
+        assert!(
+            !any_anchor,
+            "no anchor should be injected when active_task is an empty string"
+        );
+    }
+
+    #[test]
+    fn active_task_placement_after_summary_before_windowed_messages() {
+        let task = "ship the release";
+        let count = MAX_CONTEXT_MESSAGES + 10;
+        let mut msgs: Vec<Message> = Vec::new();
+        msgs.push(Message::new(Role::User, task));
+        for i in 0..count {
+            if i % 2 == 0 {
+                msgs.push(Message::new(Role::User, format!("user-{i}")));
+            } else {
+                msgs.push(Message::new(Role::Assistant, format!("asst-{i}")));
+            }
+        }
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "- earlier conversation summary",
+            MAX_CONTEXT_MESSAGES,
+            Some(task),
+            0,
+        );
+
+        // Order: system instruction (0) -> rolling-summary system (1)
+        // -> [Current task] system (2) -> windowed messages start (3..)
+        assert_eq!(result[0].role, Role::System);
+        assert!(result[1].role == Role::System);
+        assert!(
+            result[1]
+                .content
+                .contains("[Summary of earlier conversation]")
+        );
+        assert_eq!(result[2].role, Role::System);
+        assert!(result[2].content.starts_with("[Current task]"));
+        assert!(result[2].content.contains(task));
+        // Whatever comes next must not be a System message.
+        assert_ne!(result[3].role, Role::System);
+    }
+
+    #[tokio::test]
+    async fn summariser_prompt_requires_active_task_header() {
+        // The system prompt used by the rolling summariser must require the
+        // model to lead with an "Active task:" line so the goal survives
+        // even when the layer-3b injection conditions are misjudged.
+        struct CapturingSummariserLlm {
+            seen: Arc<Mutex<Option<Vec<Message>>>>,
+        }
+        impl LlmClient for CapturingSummariserLlm {
+            async fn stream_completion(
+                &self,
+                messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                *self.seen.lock().unwrap() = Some(messages);
+                Ok(LlmResponse::text("Active task: stub.\n- a"))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let llm = CapturingSummariserLlm {
+            seen: Arc::clone(&seen),
+        };
+        let messages = vec![
+            Message::new(Role::User, "first user prompt"),
+            Message::new(Role::Assistant, "first assistant reply"),
+        ];
+        let _ = generate_context_summary("", &messages, &llm).await;
+
+        let captured = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("summariser LLM should have been invoked");
+        let system = captured
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("summariser must send a system message");
+        assert!(
+            system.content.contains("Active task:"),
+            "summariser system prompt must contain the Active task: directive, got: {:?}",
+            system.content
+        );
     }
 
     // --- Message summary (collapsing) tests ---
@@ -3321,7 +3630,8 @@ mod tests {
             summary: "Assistant performed steps 1-3.".to_string(),
         }];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result =
+            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
 
         // System + "start" + summary injection + "follow up" + "final" = 5
         assert_eq!(result.len(), 5);
@@ -3341,7 +3651,7 @@ mod tests {
             Message::new(Role::Assistant, "hello"),
         ];
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
         // System + 2 messages
         assert_eq!(result.len(), 3);
         assert_eq!(result[1].content, "hi");
@@ -3375,7 +3685,8 @@ mod tests {
             },
         ];
 
-        let result = llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES);
+        let result =
+            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
         // System + "start" + summary1 + "middle" + summary2 + "end" = 6
         assert_eq!(result.len(), 6);
         assert!(result[2].content.contains("Summary of messages 1\u{2013}2"));

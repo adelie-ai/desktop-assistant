@@ -101,8 +101,8 @@ impl ConversationStore for PgConversationStore {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO conversations (id, title, created_at, updated_at, context_summary, compacted_through, archived_at)
-             VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5, $6, $7)"
+            "INSERT INTO conversations (id, title, created_at, updated_at, context_summary, compacted_through, archived_at, active_task)
+             VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5, $6, $7, $8)"
         )
         .bind(&conv.id.0)
         .bind(&conv.title)
@@ -111,6 +111,7 @@ impl ConversationStore for PgConversationStore {
         .bind(&conv.context_summary)
         .bind(conv.compacted_through as i32)
         .bind(conv.archived_at.as_deref().map(parse_timestamp))
+        .bind(conv.active_task.as_deref())
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -127,7 +128,7 @@ impl ConversationStore for PgConversationStore {
 
     async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
         let row: Option<ConvRow> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at
+            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at, active_task
              FROM conversations WHERE id = $1",
         )
         .bind(&id.0)
@@ -175,12 +176,13 @@ impl ConversationStore for PgConversationStore {
             compacted_through: row.compacted_through as usize,
             summaries,
             archived_at: row.archived_at.map(format_timestamp),
+            active_task: row.active_task,
         })
     }
 
     async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
         let rows: Vec<ConvRow> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at
+            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at, active_task
              FROM conversations ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -227,6 +229,7 @@ impl ConversationStore for PgConversationStore {
                 compacted_through: row.compacted_through as usize,
                 summaries,
                 archived_at: row.archived_at.map(format_timestamp),
+                active_task: row.active_task,
             });
         }
 
@@ -242,7 +245,7 @@ impl ConversationStore for PgConversationStore {
 
         let result = sqlx::query(
             "UPDATE conversations SET title = $2, updated_at = $3::timestamptz,
-                    context_summary = $4, compacted_through = $5
+                    context_summary = $4, compacted_through = $5, active_task = $6
              WHERE id = $1",
         )
         .bind(&conv.id.0)
@@ -250,6 +253,7 @@ impl ConversationStore for PgConversationStore {
         .bind(parse_timestamp(&conv.updated_at))
         .bind(&conv.context_summary)
         .bind(conv.compacted_through as i32)
+        .bind(conv.active_task.as_deref())
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -444,6 +448,7 @@ struct ConvRow {
     context_summary: String,
     compacted_through: i32,
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    active_task: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

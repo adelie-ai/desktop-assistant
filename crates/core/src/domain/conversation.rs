@@ -59,6 +59,17 @@ pub struct Conversation {
     /// When the conversation was archived (None = active).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
+    /// The user's most recent prompt, captured at the start of each
+    /// `send_prompt`. Re-injected into the message stream as a
+    /// `[Current task]` system message when the original user message
+    /// has been windowed out, summarised, or buried under many tool
+    /// rounds.
+    ///
+    /// Why: long agentic tool loops drift away from the goal when the
+    /// rolling summary buries it; an explicit anchor keeps the model
+    /// on-task across compaction and windowing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_task: Option<String>,
 }
 
 impl Conversation {
@@ -73,6 +84,7 @@ impl Conversation {
             compacted_through: 0,
             summaries: Vec::new(),
             archived_at: None,
+            active_task: None,
         }
     }
 }
@@ -225,5 +237,39 @@ mod tests {
         let summary: MessageSummary = serde_json::from_str(json).unwrap();
         assert_eq!(summary.id, "s1");
         assert_eq!(summary.summary, "First batch.");
+    }
+
+    #[test]
+    fn new_conversation_has_no_active_task() {
+        let conv = Conversation::new("id-1", "Test Chat");
+        assert!(conv.active_task.is_none());
+    }
+
+    #[test]
+    fn conversation_deserializes_without_active_task() {
+        // Backwards compatibility: persisted state from before the active_task
+        // column existed must continue to deserialize cleanly.
+        let json = r#"{"id":"id-1","title":"Chat","messages":[]}"#;
+        let conv: Conversation = serde_json::from_str(json).expect("deserialize legacy json");
+        assert!(conv.active_task.is_none());
+    }
+
+    #[test]
+    fn conversation_serialization_roundtrip_with_active_task() {
+        let mut conv = Conversation::new("id-1", "Chat");
+        conv.active_task = Some("Refactor the authentication module".to_string());
+        let json = serde_json::to_string(&conv).expect("serialize");
+        let deserialized: Conversation = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            deserialized.active_task.as_deref(),
+            Some("Refactor the authentication module")
+        );
+    }
+
+    #[test]
+    fn conversation_skips_none_active_task_in_serialization() {
+        let conv = Conversation::new("id-1", "Chat");
+        let json = serde_json::to_string(&conv).expect("serialize");
+        assert!(!json.contains("active_task"));
     }
 }
