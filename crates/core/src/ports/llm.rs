@@ -351,6 +351,18 @@ pub trait LlmClient: Send + Sync {
         None
     }
 
+    /// Approximate the prompt-token cost of a string. Used by the core
+    /// service for pre-flight budget checks; does not need to be exact —
+    /// a consistent over-estimate is preferable to an under-estimate.
+    ///
+    /// Why a default of `chars/4` (rounded up): a well-known, dependency-free
+    /// approximation for English BPE tokenisation. Connectors that have a
+    /// more accurate option (their own tokeniser, a known per-model factor)
+    /// can override this without touching callers.
+    fn estimate_tokens(&self, text: &str) -> u64 {
+        (text.chars().count() as u64).div_ceil(4)
+    }
+
     /// Stream a completion from the LLM given a message history.
     /// Calls `on_chunk` for each text token/chunk received.
     /// Optionally accepts tool definitions to enable tool calling.
@@ -453,6 +465,10 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
 
     fn max_context_tokens(&self) -> Option<u64> {
         self.inner.max_context_tokens()
+    }
+
+    fn estimate_tokens(&self, text: &str) -> u64 {
+        self.inner.estimate_tokens(text)
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -933,6 +949,36 @@ mod tests {
         let llm = NoopLlm;
         assert!(llm.list_models().await.unwrap().is_empty());
         assert!(llm.refresh_models().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_estimate_tokens_uses_chars_div_4() {
+        struct NoopLlm;
+        impl LlmClient for NoopLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(""))
+            }
+        }
+        let llm = NoopLlm;
+        // Empty input → 0 tokens.
+        assert_eq!(llm.estimate_tokens(""), 0);
+        // 4 ASCII chars rounds to 1 token.
+        assert_eq!(llm.estimate_tokens("abcd"), 1);
+        // 5 ASCII chars rounds up to 2 tokens (over-estimate).
+        assert_eq!(llm.estimate_tokens("abcde"), 2);
+        // 16 ASCII chars → 4 tokens exactly.
+        assert_eq!(llm.estimate_tokens("0123456789abcdef"), 4);
+        // Multi-byte chars count as one each — emoji-heavy or CJK input
+        // produces a much smaller token count than `bytes/4` would.
+        let four_emoji = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}";
+        assert_eq!(four_emoji.chars().count(), 4);
+        assert_eq!(llm.estimate_tokens(four_emoji), 1);
     }
 
     #[tokio::test]

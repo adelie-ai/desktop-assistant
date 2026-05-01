@@ -5,7 +5,8 @@ use crate::domain::{
 };
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
-    ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_context_budget,
+    ChunkCallback, ContextBudget, LlmClient, ReasoningConfig, StatusCallback,
+    current_context_budget,
 };
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
@@ -74,12 +75,119 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
 /// goal; surfacing it again every few rounds keeps the model on-task.
 const ACTIVE_TASK_ROUND_THRESHOLD: u32 = 5;
 
+/// Maximum number of pre-flight shrink iterations attempted by
+/// `llm_messages_for_turn` when the assembled prompt exceeds the budget.
+/// Why bounded: each iteration halves the message window, so 5 iterations
+/// already drop the count by 32x — enough to reach `MIN_CONTEXT_MESSAGES`
+/// from any plausible starting point. The bound also guarantees termination
+/// regardless of estimator behaviour.
+const MAX_PREFLIGHT_SHRINK_ITERATIONS: u32 = 5;
+
+/// Build the message list for a single turn, optionally enforcing a
+/// pre-flight token budget by shrinking the window before any LLM call.
+///
+/// Why a separate wrapper around [`assemble_messages_inner`]: assembly is
+/// pure — given the same inputs it returns the same `Vec<Message>` — but
+/// budget enforcement is iterative (try, measure, halve, retry). Splitting
+/// keeps the inner builder simple and lets the test suite call it directly
+/// without exercising the loop.
+///
+/// When `budget` is `Some(b)`, the assembled token estimate (system
+/// instruction plus every assembled message body, summed via `estimate`)
+/// must come in below `COMPACTION_TOKEN_RATIO * b.max_input_tokens`. If
+/// not, `max_messages` is halved (clamped to `MIN_CONTEXT_MESSAGES`) and
+/// assembly is repeated, up to [`MAX_PREFLIGHT_SHRINK_ITERATIONS`] times.
+/// Once `max_messages` reaches the floor, further iterations would have no
+/// effect and the loop returns the current assembly.
+///
+/// When `budget` is `None`, the wrapper performs a single assembly pass —
+/// preserving pre-#65 behaviour for tests and background jobs that don't
+/// route through the daemon's dispatch wrapper.
+// Why allow: the inner builder coordinates several independent prompt slices
+// (windowed messages, summaries, tool sets, context summary, anchor); the
+// outer wrapper threads the same set plus the budget pair. Bundling them
+// just to satisfy the lint would obscure the code at every call site.
+#[allow(clippy::too_many_arguments)]
+fn llm_messages_for_turn(
+    conversation_messages: &[Message],
+    summaries: &[MessageSummary],
+    tool_defs: &[ToolDefinition],
+    deferred_namespaces: &[ToolNamespace],
+    context_summary: &str,
+    max_messages: usize,
+    active_task: Option<&str>,
+    tool_rounds_since_anchor: u32,
+    budget: Option<ContextBudget>,
+    estimate: &dyn Fn(&str) -> u64,
+) -> Vec<Message> {
+    let mut current_max = max_messages;
+    let mut assembled = assemble_messages_inner(
+        conversation_messages,
+        summaries,
+        tool_defs,
+        deferred_namespaces,
+        context_summary,
+        current_max,
+        active_task,
+        tool_rounds_since_anchor,
+    );
+
+    let Some(budget) = budget else {
+        return assembled;
+    };
+
+    // Pre-flight token estimate: sum the cost of every assembled message's
+    // body. The threshold mirrors `COMPACTION_TOKEN_RATIO` used by the
+    // post-call token-pressure path so the two checks agree on what
+    // counts as "near the limit".
+    let max_input_tokens = budget.max_input_tokens;
+    let threshold = (max_input_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
+
+    for _ in 0..MAX_PREFLIGHT_SHRINK_ITERATIONS {
+        let assembled_tokens: u64 = assembled
+            .iter()
+            .map(|m| estimate(&m.content))
+            .sum();
+        if assembled_tokens <= threshold {
+            return assembled;
+        }
+        // Already at the floor — further halving has no effect, so stop.
+        if current_max <= MIN_CONTEXT_MESSAGES {
+            return assembled;
+        }
+        let new_max = (current_max / 2).max(MIN_CONTEXT_MESSAGES);
+        if new_max == current_max {
+            return assembled;
+        }
+        tracing::debug!(
+            assembled_tokens,
+            budget = max_input_tokens,
+            prev_max_messages = current_max,
+            new_max_messages = new_max,
+            "assembly over budget, shrinking"
+        );
+        current_max = new_max;
+        assembled = assemble_messages_inner(
+            conversation_messages,
+            summaries,
+            tool_defs,
+            deferred_namespaces,
+            context_summary,
+            current_max,
+            active_task,
+            tool_rounds_since_anchor,
+        );
+    }
+
+    assembled
+}
+
 // Why allow: this builder coordinates several independent prompt slices
 // (windowed messages, summaries, tool sets, context summary, anchor) that
 // don't naturally cluster into a single struct. Bundling them just to
 // satisfy the lint would obscure the code at every call site.
 #[allow(clippy::too_many_arguments)]
-fn llm_messages_for_turn(
+fn assemble_messages_inner(
     conversation_messages: &[Message],
     summaries: &[MessageSummary],
     tool_defs: &[ToolDefinition],
@@ -1043,6 +1151,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // `send_prompt` — so this is exactly the round counter we want
             // to thread into the active-task injection check.
             let tool_rounds_since_anchor = u32::try_from(round).unwrap_or(u32::MAX);
+            // The estimator borrows `&self.llm` so the closure is built
+            // each iteration; constructing it is cheap (no allocation).
+            let estimate = |text: &str| self.llm.estimate_tokens(text);
             let llm_messages = llm_messages_for_turn(
                 &conv.messages,
                 &conv.summaries,
@@ -1052,6 +1163,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 target_window,
                 conv.active_task.as_deref(),
                 tool_rounds_since_anchor,
+                current_context_budget(),
+                &estimate,
             );
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
@@ -1121,16 +1234,21 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         // tool_call/tool_result pair so the model sees
                         // what it tried.
                         overflow_retries += 1;
-                        // Pick the largest remaining tool result. This
-                        // naturally targets the biggest bloat first, and
-                        // after truncation the notice is small enough that
-                        // subsequent retries will pick a different message.
+                        // Pick the tool result with the highest estimated
+                        // token cost. Why estimated tokens (not bytes):
+                        // non-ASCII payloads (CJK, emoji, JSON-with-deep-
+                        // escapes, base64) produce wildly different
+                        // byte-vs-token ratios; the byte-length heuristic
+                        // would mis-target those cases. After truncation
+                        // the notice is small enough that subsequent
+                        // retries naturally move on to a different
+                        // message.
                         if let Some(idx) = conv
                             .messages
                             .iter()
                             .enumerate()
                             .filter(|(_, m)| m.role == Role::Tool)
-                            .max_by_key(|(_, m)| m.content.len())
+                            .max_by_key(|(_, m)| self.llm.estimate_tokens(&m.content))
                             .map(|(i, _)| i)
                         {
                             let original_bytes = conv.messages[idx].content.len();
@@ -1421,7 +1539,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 mod tests {
     use super::*;
     use crate::domain::{ToolCall, ToolDefinition};
-    use crate::ports::llm::{LlmResponse, TokenUsage};
+    use crate::ports::llm::{BudgetSource, LlmResponse, TokenUsage};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1561,6 +1679,13 @@ mod tests {
 
     fn noop_status() -> StatusCallback {
         Box::new(|_| {})
+    }
+
+    /// Token estimator used by the existing assembly tests. Mirrors the
+    /// `LlmClient::estimate_tokens` default so tests don't depend on any
+    /// connector and behave identically to the real default-impl path.
+    fn default_estimate(s: &str) -> u64 {
+        (s.chars().count() as u64).div_ceil(4)
     }
 
     struct ListOnlyStore {
@@ -2772,7 +2897,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
         // System message + all 10 conversation messages
         assert_eq!(result.len(), 11);
         assert_eq!(result[0].role, Role::System);
@@ -2795,7 +2920,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
         // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
         // a User message (even index), so the window starts exactly there.
         // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
@@ -2828,7 +2953,7 @@ mod tests {
         msgs.push(Message::new(Role::User, "final-user"));
         msgs.push(Message::new(Role::Assistant, "final-reply"));
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
 
         // The first conversation message (after System) must be a User message.
         assert_eq!(result[0].role, Role::System);
@@ -2865,6 +2990,224 @@ mod tests {
             msgs[start].role,
             Role::Tool,
             "window must not start on a Tool message"
+        );
+    }
+
+    // --- Pre-flight token-budget assembly tests (issue #65) ---
+
+    #[test]
+    fn assembly_skips_pre_flight_when_no_budget() {
+        // With `budget = None` the wrapper does not iterate. The output
+        // matches the existing message-count windowing exactly — same as
+        // the pre-#65 behaviour.
+        let count = MAX_CONTEXT_MESSAGES + 20;
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{i}"))
+                } else {
+                    Message::new(Role::Assistant, format!("asst-{i}"))
+                }
+            })
+            .collect();
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
+
+        // 1 system message + MAX_CONTEXT_MESSAGES conversation messages.
+        assert_eq!(result.len(), MAX_CONTEXT_MESSAGES + 1);
+    }
+
+    #[test]
+    fn assembly_shrinks_when_over_token_budget() {
+        // Budget that the assembled prompt cannot fit at the default
+        // window. Estimator counts every char as one token so we can
+        // tune the math precisely. With the threshold at 85% of 1000,
+        // every byte over 850 forces shrinking.
+        let big_chunk = "x".repeat(200);
+        let count = MAX_CONTEXT_MESSAGES + 20;
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, big_chunk.clone())
+                } else {
+                    Message::new(Role::Assistant, big_chunk.clone())
+                }
+            })
+            .collect();
+
+        let budget = ContextBudget {
+            max_input_tokens: 1_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        // Use a 1-char-per-token estimator so the size math is direct.
+        let one_per_char = |s: &str| s.chars().count() as u64;
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            Some(budget),
+            &one_per_char,
+        );
+
+        // Without shrinking we'd return MAX_CONTEXT_MESSAGES + 1; with
+        // shrinking the count must be strictly smaller.
+        assert!(
+            result.len() < MAX_CONTEXT_MESSAGES + 1,
+            "expected pre-flight shrink, got {} messages",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn assembly_does_not_shrink_below_min_context_messages() {
+        // Even an extreme budget cannot drive the message count below
+        // MIN_CONTEXT_MESSAGES — the floor exists to keep enough room
+        // for the user's current prompt plus a tool round.
+        let big_chunk = "y".repeat(500);
+        let count = MAX_CONTEXT_MESSAGES + 20;
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, big_chunk.clone())
+                } else {
+                    Message::new(Role::Assistant, big_chunk.clone())
+                }
+            })
+            .collect();
+
+        let budget = ContextBudget {
+            max_input_tokens: 100,
+            source: BudgetSource::ConnectorTable,
+        };
+        let one_per_char = |s: &str| s.chars().count() as u64;
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            Some(budget),
+            &one_per_char,
+        );
+
+        // Result includes the system instruction message plus at least
+        // MIN_CONTEXT_MESSAGES windowed conversation messages — the
+        // floor is enforced even when the budget cannot be satisfied.
+        let conversation_count = result
+            .iter()
+            .filter(|m| !matches!(m.role, Role::System))
+            .count();
+        assert!(
+            conversation_count >= MIN_CONTEXT_MESSAGES,
+            "expected at least {} conversation messages, got {}",
+            MIN_CONTEXT_MESSAGES,
+            conversation_count
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_picks_largest_by_token_estimate_not_bytes() {
+        // Two tool results with the same byte length but different
+        // token-estimate weights (using the chars/4 default):
+        //
+        //  - `ascii`  = 256 ASCII bytes = 256 chars → 64 estimated tokens
+        //  - `emoji`  = 64 emoji × 4 bytes = 256 bytes / 64 chars → 16 tokens
+        //
+        // With the byte-length picker (the pre-#65 logic) both ties: the
+        // first one to enumerate would win. With token-estimate ranking
+        // the ASCII result wins unambiguously.
+        use std::sync::atomic::AtomicU64;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let llm = OverflowThenSucceedLlm {
+            remaining_overflows: Mutex::new(1),
+            call_count: Arc::clone(&call_count),
+            ok_text: "ok".into(),
+        };
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            llm,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        // Build two payloads with identical byte length but very
+        // different chars/4 token estimates.
+        let ascii_payload: String = "A".repeat(256);
+        let emoji_one = "\u{1F600}"; // 4 bytes, 1 char
+        let emoji_payload: String = emoji_one.repeat(64);
+        assert_eq!(ascii_payload.len(), emoji_payload.len(), "byte length parity");
+        assert!(
+            ascii_payload.chars().count() > emoji_payload.chars().count(),
+            "char counts must differ to drive a token-estimate ranking"
+        );
+
+        stored
+            .messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "ascii", "t", "{}",
+            )]));
+        stored
+            .messages
+            .push(Message::tool_result("ascii", &ascii_payload));
+        stored
+            .messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "emoji", "t", "{}",
+            )]));
+        stored
+            .messages
+            .push(Message::tool_result("emoji", &emoji_payload));
+        handler.store.update(stored).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        let ascii_after = after
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("ascii"))
+            .expect("ascii result preserved");
+        let emoji_after = after
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("emoji"))
+            .expect("emoji result preserved");
+        assert!(
+            ascii_after.content.starts_with("<tool output omitted"),
+            "token-estimate picker should target the ASCII result, got: {:?}",
+            &ascii_after.content
+        );
+        assert_eq!(
+            emoji_after.content, emoji_payload,
+            "emoji result must be preserved verbatim — fewer estimated tokens"
         );
     }
 
@@ -3346,6 +3689,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            None,
+            &default_estimate,
         );
 
         // System prompt, then summary system message, then windowed messages
@@ -3384,6 +3729,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            None,
+            &default_estimate,
         );
 
         // No summary injected when under limit
@@ -3409,7 +3756,7 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
 
         // System prompt directly followed by windowed messages — no summary
         assert_eq!(result[0].role, Role::System);
@@ -3467,6 +3814,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             0,
+            None,
+            &default_estimate,
         );
 
         let injected = result
@@ -3497,6 +3846,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             0,
+            None,
+            &default_estimate,
         );
 
         let any_anchor = result
@@ -3528,6 +3879,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             6,
+            None,
+            &default_estimate,
         );
 
         let any_anchor = result
@@ -3544,7 +3897,7 @@ mod tests {
     fn active_task_not_injected_when_none() {
         let msgs = vec![Message::new(Role::User, "hello")];
         let result =
-            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
 
         let any_anchor = result
             .iter()
@@ -3556,7 +3909,7 @@ mod tests {
     fn active_task_not_injected_when_empty_string() {
         let msgs = vec![Message::new(Role::User, "hello")];
         let result =
-            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, Some(""), 99);
+            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, Some(""), 99, None, &default_estimate);
 
         let any_anchor = result
             .iter()
@@ -3590,6 +3943,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             0,
+            None,
+            &default_estimate,
         );
 
         // Order: system instruction (0) -> rolling-summary system (1)
@@ -3678,7 +4033,7 @@ mod tests {
         }];
 
         let result =
-            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
 
         // System + "start" + summary injection + "follow up" + "final" = 5
         assert_eq!(result.len(), 5);
@@ -3698,7 +4053,7 @@ mod tests {
             Message::new(Role::Assistant, "hello"),
         ];
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
         // System + 2 messages
         assert_eq!(result.len(), 3);
         assert_eq!(result[1].content, "hi");
@@ -3733,7 +4088,7 @@ mod tests {
         ];
 
         let result =
-            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0);
+            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
         // System + "start" + summary1 + "middle" + summary2 + "end" = 6
         assert_eq!(result.len(), 6);
         assert!(result[2].content.contains("Summary of messages 1\u{2013}2"));
@@ -3784,6 +4139,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            None,
+            &default_estimate,
         );
 
         let injected = result
@@ -3834,6 +4191,8 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            None,
+            &default_estimate,
         );
 
         assert!(
