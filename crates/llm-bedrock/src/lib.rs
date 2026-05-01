@@ -584,6 +584,89 @@ pub fn parse_prompt_too_long(message: &str) -> Option<(u64, u64)> {
     }
 }
 
+/// Map a Bedrock `converse_stream` SDK error to the equivalent
+/// `CoreError`. Extracted so the dispatch logic is unit-testable
+/// independent of the network call site.
+fn map_converse_stream_error(
+    e: aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
+    >,
+) -> CoreError {
+    use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+    // Detect prompt-overflow validation errors and surface them as
+    // CoreError::ContextOverflow so the core service can truncate
+    // the offending tool result and retry.
+    if let Some(ConverseStreamError::ValidationException(ve)) = e.as_service_error() {
+        let raw = ve.message().unwrap_or("unknown");
+        if let Some((prompt_tokens, max_tokens)) = parse_prompt_too_long(raw) {
+            tracing::warn!(
+                prompt_tokens,
+                max_tokens,
+                "Bedrock rejected request for context overflow"
+            );
+            return CoreError::ContextOverflow {
+                prompt_tokens: Some(prompt_tokens),
+                max_tokens: Some(max_tokens),
+                detail: format!("Bedrock validation error: {raw}"),
+            };
+        }
+    }
+    if let Some(svc) = e.as_service_error()
+        && let Some(mapped) = map_converse_stream_service_error(svc)
+    {
+        return mapped;
+    }
+    let detail = match e.as_service_error() {
+        Some(ConverseStreamError::ValidationException(ve)) => {
+            format!("validation error: {}", ve.message().unwrap_or("unknown"))
+        }
+        Some(ConverseStreamError::AccessDeniedException(ad)) => {
+            format!("access denied: {}", ad.message().unwrap_or("unknown"))
+        }
+        Some(ConverseStreamError::ModelTimeoutException(mt)) => {
+            format!("model timeout: {}", mt.message().unwrap_or("unknown"))
+        }
+        Some(other) => format!("{other}"),
+        None => format!("{e:#}"),
+    };
+    tracing::warn!("Bedrock converse_stream error: {detail}");
+    CoreError::Llm(format!("Bedrock converse_stream request failed: {detail}"))
+}
+
+/// Map a Bedrock `ConverseStreamError` to the structured
+/// [`CoreError`] variant for the cases that have a dedicated variant
+/// (`RateLimited`, `ModelLoading`). Returns `None` if the variant has
+/// no dedicated mapping — the caller falls through to the generic
+/// `CoreError::Llm` path.
+///
+/// Doing the mapping in a dedicated function lets tests cover each
+/// arm without needing to construct an `SdkError`.
+fn map_converse_stream_service_error(
+    err: &aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
+) -> Option<CoreError> {
+    use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+    match err {
+        ConverseStreamError::ThrottlingException(te) => Some(CoreError::RateLimited {
+            retry_after: None,
+            detail: format!("Bedrock throttling: {}", te.message().unwrap_or("unknown")),
+        }),
+        ConverseStreamError::ServiceUnavailableException(se) => Some(CoreError::RateLimited {
+            retry_after: None,
+            detail: format!(
+                "Bedrock service unavailable: {}",
+                se.message().unwrap_or("unknown")
+            ),
+        }),
+        ConverseStreamError::ModelNotReadyException(mr) => Some(CoreError::ModelLoading {
+            detail: format!(
+                "Bedrock model not ready: {}",
+                mr.message().unwrap_or("unknown")
+            ),
+        }),
+        _ => None,
+    }
+}
+
 /// Return the prompt-token context window for a known Bedrock model ID.
 ///
 /// Accepts cross-region inference-profile prefixes (`us.`, `eu.`, `apac.`).
@@ -938,48 +1021,7 @@ impl LlmClient for BedrockClient {
             request = request.additional_model_request_fields(extra);
         }
 
-        let response = request.send().await.map_err(|e| {
-            use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
-            // Detect prompt-overflow validation errors and surface them as
-            // CoreError::ContextOverflow so the core service can truncate
-            // the offending tool result and retry.
-            if let Some(ConverseStreamError::ValidationException(ve)) = e.as_service_error() {
-                let raw = ve.message().unwrap_or("unknown");
-                if let Some((prompt_tokens, max_tokens)) = parse_prompt_too_long(raw) {
-                    tracing::warn!(
-                        prompt_tokens,
-                        max_tokens,
-                        "Bedrock rejected request for context overflow"
-                    );
-                    return CoreError::ContextOverflow {
-                        prompt_tokens: Some(prompt_tokens),
-                        max_tokens: Some(max_tokens),
-                        detail: format!("Bedrock validation error: {raw}"),
-                    };
-                }
-            }
-            let detail = match e.as_service_error() {
-                Some(ConverseStreamError::ValidationException(ve)) => {
-                    format!("validation error: {}", ve.message().unwrap_or("unknown"))
-                }
-                Some(ConverseStreamError::AccessDeniedException(ad)) => {
-                    format!("access denied: {}", ad.message().unwrap_or("unknown"))
-                }
-                Some(ConverseStreamError::ThrottlingException(te)) => {
-                    format!("throttled: {}", te.message().unwrap_or("unknown"))
-                }
-                Some(ConverseStreamError::ModelTimeoutException(mt)) => {
-                    format!("model timeout: {}", mt.message().unwrap_or("unknown"))
-                }
-                Some(ConverseStreamError::ModelNotReadyException(mr)) => {
-                    format!("model not ready: {}", mr.message().unwrap_or("unknown"))
-                }
-                Some(other) => format!("{other}"),
-                None => format!("{e:#}"),
-            };
-            tracing::warn!("Bedrock converse_stream error: {detail}");
-            CoreError::Llm(format!("Bedrock converse_stream request failed: {detail}"))
-        })?;
+        let response = request.send().await.map_err(map_converse_stream_error)?;
 
         let mut stream = response.stream;
 
@@ -1808,5 +1850,90 @@ mod tests {
             strip_region_prefix("anthropic.claude-3-haiku-20240307-v1:0"),
             "anthropic.claude-3-haiku-20240307-v1:0"
         );
+    }
+
+    // --- Structured CoreError mapping tests (issue #60) ---
+
+    #[test]
+    fn map_throttling_exception_emits_rate_limited() {
+        use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+        use aws_sdk_bedrockruntime::types::error::ThrottlingException;
+
+        let exc = ThrottlingException::builder()
+            .message("rate of requests exceeded")
+            .build();
+        let svc_err = ConverseStreamError::ThrottlingException(exc);
+
+        let mapped = map_converse_stream_service_error(&svc_err)
+            .expect("throttling has dedicated mapping");
+        match mapped {
+            CoreError::RateLimited {
+                retry_after,
+                detail,
+            } => {
+                assert_eq!(retry_after, None);
+                assert!(detail.contains("rate of requests exceeded"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_service_unavailable_emits_rate_limited() {
+        use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+        use aws_sdk_bedrockruntime::types::error::ServiceUnavailableException;
+
+        let exc = ServiceUnavailableException::builder()
+            .message("backend overloaded")
+            .build();
+        let svc_err = ConverseStreamError::ServiceUnavailableException(exc);
+
+        let mapped = map_converse_stream_service_error(&svc_err)
+            .expect("service unavailable has dedicated mapping");
+        match mapped {
+            CoreError::RateLimited {
+                retry_after,
+                detail,
+            } => {
+                assert_eq!(retry_after, None);
+                assert!(detail.contains("backend overloaded"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_model_not_ready_emits_model_loading() {
+        use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+        use aws_sdk_bedrockruntime::types::error::ModelNotReadyException;
+
+        let exc = ModelNotReadyException::builder()
+            .message("model warming up")
+            .build();
+        let svc_err = ConverseStreamError::ModelNotReadyException(exc);
+
+        let mapped = map_converse_stream_service_error(&svc_err)
+            .expect("model-not-ready has dedicated mapping");
+        match mapped {
+            CoreError::ModelLoading { detail } => {
+                assert!(detail.contains("model warming up"));
+            }
+            other => panic!("expected ModelLoading, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_unhandled_variants_return_none() {
+        use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+        use aws_sdk_bedrockruntime::types::error::AccessDeniedException;
+
+        let exc = AccessDeniedException::builder()
+            .message("not allowed")
+            .build();
+        let svc_err = ConverseStreamError::AccessDeniedException(exc);
+
+        // AccessDenied has no dedicated structured variant — caller
+        // falls through to the generic `CoreError::Llm` formatting.
+        assert!(map_converse_stream_service_error(&svc_err).is_none());
     }
 }

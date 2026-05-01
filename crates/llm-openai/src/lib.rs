@@ -527,6 +527,7 @@ impl OpenAiClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = parse_retry_after_header(response.headers());
             let body = response
                 .text()
                 .await
@@ -548,6 +549,30 @@ impl OpenAiClient {
                 return Err(CoreError::ContextOverflow {
                     prompt_tokens,
                     max_tokens,
+                    detail: format!("OpenAI API error (HTTP {status}): {body}"),
+                });
+            }
+            // HTTP 429 is overloaded between two semantically distinct
+            // signals on OpenAI: throttling (transient, retryable) and
+            // `insufficient_quota` (permanent, billing). Distinguish by
+            // parsing the structured error envelope so downstream
+            // classifiers don't have to.
+            if status.as_u16() == 429 {
+                if detect_openai_insufficient_quota(&body) {
+                    return Err(CoreError::QuotaExceeded {
+                        detail: format!("OpenAI API error (HTTP {status}): {body}"),
+                    });
+                }
+                return Err(CoreError::RateLimited {
+                    retry_after,
+                    detail: format!("OpenAI API error (HTTP {status}): {body}"),
+                });
+            }
+            // 503 Service Unavailable is OpenAI's "server overloaded"
+            // signal; retry-with-backoff recovers the same as 429.
+            if status.as_u16() == 503 {
+                return Err(CoreError::RateLimited {
+                    retry_after,
                     detail: format!("OpenAI API error (HTTP {status}): {body}"),
                 });
             }
@@ -699,6 +724,8 @@ struct OpenAiErrorBody {
     code: Option<String>,
     #[serde(default)]
     message: String,
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
 }
 
 /// Detect an OpenAI context-overflow rejection in an HTTP error body.
@@ -720,6 +747,36 @@ fn detect_openai_context_overflow(body: &str) -> Option<(Option<u64>, Option<u64
         return None;
     }
     Some(parse_openai_context_length_message(&envelope.error.message))
+}
+
+/// Detect OpenAI's `insufficient_quota` billing error in an HTTP error
+/// body. Returns true when the structured error envelope has either
+/// `error.code == "insufficient_quota"` or `error.type == "insufficient_quota"`.
+///
+/// Why: OpenAI uses HTTP 429 for two semantically distinct signals —
+/// transient rate-limit throttling (retryable) and permanent
+/// `insufficient_quota` (NOT retryable). Distinguishing them at the
+/// connector boundary lets `is_retryable_error` stay a flat
+/// `matches!(CoreError::RateLimited)` downstream. This is the same
+/// connector-boundary carve-out that `detect_openai_context_overflow`
+/// uses — see that function's docstring.
+fn detect_openai_insufficient_quota(body: &str) -> bool {
+    let Ok(envelope): Result<OpenAiErrorEnvelope, _> = serde_json::from_str(body) else {
+        return false;
+    };
+    envelope.error.code.as_deref() == Some("insufficient_quota")
+        || envelope.error.error_type.as_deref() == Some("insufficient_quota")
+}
+
+/// Read the `Retry-After` HTTP header and parse it as a delay.
+///
+/// Supports the integer-seconds form (e.g. `Retry-After: 30`); the HTTP-
+/// date form is rare on JSON APIs and not parsed here. Returns `None`
+/// when the header is absent or unparseable so the caller treats it as
+/// "no hint" rather than substituting a default.
+fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    raw.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
 /// Parse OpenAI's `"This model's maximum context length is 128000
@@ -1692,6 +1749,130 @@ mod tests {
         assert!(
             matches!(err, CoreError::Llm(_)),
             "non-overflow 400 should stay generic; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_429_rate_limit_emits_rate_limited() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "20")
+                .body(
+                    r#"{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"Rate limit reached"}}"#,
+                );
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("429 must fail");
+
+        match err {
+            CoreError::RateLimited {
+                retry_after,
+                detail,
+            } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(20)));
+                assert!(detail.contains("rate_limit_exceeded"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_429_insufficient_quota_emits_quota_exceeded() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"You exceeded your current quota, please check your plan and billing details."}}"#,
+                );
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("429 must fail");
+
+        match err {
+            CoreError::QuotaExceeded { detail } => {
+                assert!(detail.contains("insufficient_quota"));
+            }
+            other => panic!("expected QuotaExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_503_service_unavailable_emits_rate_limited() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(503)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"message":"Service overloaded"}}"#);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("503 must fail");
+
+        assert!(
+            matches!(err, CoreError::RateLimited { .. }),
+            "503 should map to RateLimited; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn detect_openai_insufficient_quota_matches_envelope() {
+        let body = r#"{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"You exceeded your current quota"}}"#;
+        assert!(detect_openai_insufficient_quota(body));
+    }
+
+    #[test]
+    fn detect_openai_insufficient_quota_rejects_other_errors() {
+        let body = r#"{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"slow down"}}"#;
+        assert!(!detect_openai_insufficient_quota(body));
+    }
+
+    #[test]
+    fn detect_openai_insufficient_quota_rejects_garbage() {
+        assert!(!detect_openai_insufficient_quota("not json at all"));
+    }
+
+    #[test]
+    fn parse_retry_after_integer_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("60"),
+        );
+        assert_eq!(
+            parse_retry_after_header(&headers),
+            Some(std::time::Duration::from_secs(60))
         );
     }
 }

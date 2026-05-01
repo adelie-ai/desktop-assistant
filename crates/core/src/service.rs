@@ -278,8 +278,6 @@ fn sanitize_assistant_text(text: &str) -> String {
     sanitized
 }
 
-use crate::ports::llm::is_retryable_error;
-
 /// Generate a short, human-readable status message for a tool call.
 fn tool_status_message(tool_name: &str, arguments: &serde_json::Value) -> String {
     match tool_name {
@@ -312,47 +310,37 @@ fn tool_status_message(tool_name: &str, arguments: &serde_json::Value) -> String
     }
 }
 
+/// Translate a [`CoreError`] into a user-visible explanation suitable
+/// for surfacing in chat. Each LLM-domain variant maps to a tailored
+/// message; non-LLM variants and the bare `Llm(detail)` fallback share a
+/// generic "I hit an LLM backend error..." line that includes the raw
+/// detail for debugging.
 fn user_visible_llm_error_message(error: &CoreError) -> String {
-    let raw = error.to_string();
-    let normalized = raw.to_ascii_lowercase();
-
-    if normalized.contains("429")
-        || normalized.contains("rate_limit")
-        || normalized.contains("529")
-        || normalized.contains("overloaded")
-    {
-        return format!(
-            "The API rate limit was exceeded. Please wait a moment and try again. Details: {raw}"
-        );
+    match error {
+        CoreError::ContextOverflow { detail, .. } => format!(
+            "The conversation exceeded the model's context window. We'll truncate older content and retry. Details: {detail}"
+        ),
+        CoreError::RateLimited { detail, .. } => format!(
+            "The API rate limit was exceeded. Please wait a moment and try again. Details: {detail}"
+        ),
+        CoreError::QuotaExceeded { detail } => format!(
+            "Your API quota is exhausted. Top up the account or switch to a different API key. Details: {detail}"
+        ),
+        CoreError::ModelLoading { detail } => format!(
+            "The model is still downloading or loading. Please wait a moment and try again. Details: {detail}"
+        ),
+        CoreError::ToolsUnsupported { detail } => format!(
+            "This model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: {detail}"
+        ),
+        // Bare LLM error and any non-LLM variant share the generic
+        // fallback. This intentionally does NOT enumerate every
+        // CoreError variant — `Display` already produces a readable
+        // string and the surrounding service layer is the right place
+        // to add tailored messages for non-LLM domains.
+        _ => format!(
+            "I hit an LLM backend error and could not complete this request. Details: {error}"
+        ),
     }
-
-    if normalized.contains("does not support tools") {
-        return format!(
-            "This Ollama model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: {raw}"
-        );
-    }
-
-    if normalized.contains("unable to load model")
-        || normalized.contains("model not found")
-        || normalized.contains("pull model manifest")
-        || normalized.contains("no such file")
-    {
-        return format!(
-            "The selected model could not be loaded or found. Please verify the model name and that it is installed in Ollama. Details: {raw}"
-        );
-    }
-
-    if normalized.contains("downloading")
-        || normalized.contains("currently loading")
-        || normalized.contains("is loading")
-        || normalized.contains("loading model")
-    {
-        return format!(
-            "The model is still downloading or loading. Please wait a moment and try again. Details: {raw}"
-        );
-    }
-
-    format!("I hit an LLM backend error and could not complete this request. Details: {raw}")
 }
 
 fn sanitize_assistant_text_for_stream(text: &str) -> String {
@@ -1181,10 +1169,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         return Ok(friendly);
                     }
                     Err(e)
-                        if round > 0
-                            && !is_retryable_error(&e)
-                            && !user_visible_llm_error_message(&e)
-                                .contains("rate limit was exceeded") =>
+                        if round > 0 && !matches!(e, CoreError::RateLimited { .. }) =>
                     {
                         // Mid-loop LLM error (e.g. context too long) — trim old
                         // tool call/result pairs and tell the LLM what happened
@@ -2144,7 +2129,7 @@ mod tests {
         responses: Mutex<Vec<LlmResponse>>,
         fail_on_call: usize,
         call_count: Mutex<usize>,
-        error_message: String,
+        error_factory: Box<dyn Fn() -> CoreError + Send + Sync>,
     }
 
     impl FailingLlm {
@@ -2153,12 +2138,21 @@ mod tests {
                 responses: Mutex::new(responses),
                 fail_on_call,
                 call_count: Mutex::new(0),
-                error_message: "context_length_exceeded".into(),
+                // Default to a generic LLM error; tests that need a
+                // specific structured variant call `with_error_variant`.
+                error_factory: Box::new(|| CoreError::Llm("context_length_exceeded".into())),
             }
         }
 
-        fn with_error(mut self, msg: &str) -> Self {
-            self.error_message = msg.into();
+        /// Substitute the variant produced on the failing call. Used by
+        /// tests that exercise control-flow paths keyed on the specific
+        /// `CoreError` variant (e.g. `RateLimited` skipping the trim
+        /// branch).
+        fn with_error_variant<F>(mut self, factory: F) -> Self
+        where
+            F: Fn() -> CoreError + Send + Sync + 'static,
+        {
+            self.error_factory = Box::new(factory);
             self
         }
     }
@@ -2179,7 +2173,7 @@ mod tests {
             };
 
             if call_idx == self.fail_on_call {
-                return Err(CoreError::Llm(self.error_message.clone()));
+                return Err((self.error_factory)());
             }
 
             let response = {
@@ -2284,49 +2278,68 @@ mod tests {
 
     #[test]
     fn user_visible_error_for_unsupported_tools() {
-        let err = CoreError::Llm(
-            r#"Ollama API error (HTTP 400 Bad Request): {\"error\":\"registry.ollama.ai/library/phi4:14b does not support tools\"}"#
-                .to_string(),
-        );
+        let err = CoreError::ToolsUnsupported {
+            detail: "phi4:14b does not support tools".into(),
+        };
         let msg = user_visible_llm_error_message(&err);
         assert!(msg.contains("does not support tool use"));
     }
 
     #[test]
-    fn user_visible_error_for_missing_model() {
-        let err = CoreError::Llm(
-            r#"Ollama API error (HTTP 500 Internal Server Error): {\"error\":\"unable to load model\"}"#
-                .to_string(),
-        );
-        let msg = user_visible_llm_error_message(&err);
-        assert!(msg.contains("could not be loaded or found"));
-    }
-
-    #[test]
     fn user_visible_error_for_loading_model() {
-        let err = CoreError::Llm(
-            r#"Ollama API error (HTTP 503 Service Unavailable): {\"error\":\"model is currently loading\"}"#
-                .to_string(),
-        );
+        let err = CoreError::ModelLoading {
+            detail: "model is currently loading".into(),
+        };
         let msg = user_visible_llm_error_message(&err);
         assert!(msg.contains("still downloading or loading"));
     }
 
     #[test]
     fn user_visible_error_for_rate_limit_429() {
-        let err = CoreError::Llm(
-            r#"Anthropic API error (HTTP 429 Too Many Requests): {"error":{"type":"rate_limit_error","message":"Rate limited"}}"#
-                .to_string(),
-        );
+        let err = CoreError::RateLimited {
+            retry_after: None,
+            detail: "Rate limited".into(),
+        };
         let msg = user_visible_llm_error_message(&err);
         assert!(msg.contains("rate limit was exceeded"));
     }
 
     #[test]
     fn user_visible_error_for_overloaded_529() {
-        let err = CoreError::Llm("Anthropic API error (HTTP 529): overloaded".to_string());
+        let err = CoreError::RateLimited {
+            retry_after: None,
+            detail: "overloaded".into(),
+        };
         let msg = user_visible_llm_error_message(&err);
         assert!(msg.contains("rate limit was exceeded"));
+    }
+
+    #[test]
+    fn user_visible_error_for_quota_exceeded() {
+        let err = CoreError::QuotaExceeded {
+            detail: "insufficient_quota".into(),
+        };
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("quota is exhausted"));
+    }
+
+    #[test]
+    fn user_visible_error_for_context_overflow() {
+        let err = CoreError::ContextOverflow {
+            prompt_tokens: Some(203_524),
+            max_tokens: Some(200_000),
+            detail: "prompt is too long".into(),
+        };
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("context window"));
+    }
+
+    #[test]
+    fn user_visible_error_for_generic_llm() {
+        let err = CoreError::Llm("invalid API key".into());
+        let msg = user_visible_llm_error_message(&err);
+        assert!(msg.contains("LLM backend error"));
+        assert!(msg.contains("invalid API key"));
     }
 
     #[tokio::test]
@@ -2351,8 +2364,11 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(0));
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
-            FailingLlm::new(responses, 1)
-                .with_error("Anthropic API error (HTTP 429 Too Many Requests): rate_limit_error"),
+            FailingLlm::new(responses, 1).with_error_variant(|| CoreError::RateLimited {
+                retry_after: None,
+                detail: "Anthropic API error (HTTP 429 Too Many Requests): rate_limit_error"
+                    .into(),
+            }),
             MockToolExecutor::new(tools, tool_results),
             Box::new(move || {
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;

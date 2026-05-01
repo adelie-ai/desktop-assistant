@@ -704,9 +704,29 @@ impl LlmClient for OllamaClient {
                     detail: format!("Ollama API error (HTTP {status}): {body}"),
                 });
             }
-            return Err(CoreError::Llm(format!(
-                "Ollama API error (HTTP {status}): {body}"
-            )));
+            // Why: Ollama emits unstructured error strings — the body is
+            // the only signal we get for "model loading", "tools
+            // unsupported", etc. AGENTS.md bans `.contains()` on errors
+            // outside the connector boundary; this IS the connector
+            // boundary, so the substring match here exists precisely so
+            // downstream code never has to. See
+            // `detect_ollama_context_overflow` for the same carve-out.
+            let detail = format!("Ollama API error (HTTP {status}): {body}");
+            if detect_ollama_model_loading(&body) {
+                return Err(CoreError::ModelLoading { detail });
+            }
+            if detect_ollama_tools_unsupported(&body) {
+                return Err(CoreError::ToolsUnsupported { detail });
+            }
+            // Treat 503 / 429 as transient throttling. 429 is rare on a
+            // bare Ollama daemon but possible behind a reverse proxy.
+            if status.as_u16() == 503 || status.as_u16() == 429 {
+                return Err(CoreError::RateLimited {
+                    retry_after: None,
+                    detail,
+                });
+            }
+            return Err(CoreError::Llm(detail));
         }
 
         // NDJSON streaming: each line is a complete JSON object
@@ -831,6 +851,38 @@ fn detect_ollama_context_overflow(body: &str) -> bool {
         || lower.contains("context size")
         || lower.contains("num_ctx")
         || lower.contains("context window")
+}
+
+/// Detect an Ollama "model is downloading / pulling / loading" error in an
+/// HTTP error body. Returns true on a small, fixed set of substrings.
+///
+/// Why: pattern-matching on error message strings is normally banned
+/// (see `AGENTS.md`), but Ollama's error responses are unstructured
+/// strings — the only signal we get for "the model isn't ready yet"
+/// vs. "the request was bad". Translating to
+/// `CoreError::ModelLoading` here is exactly the connector-boundary
+/// carve-out, the same as `detect_ollama_context_overflow`.
+fn detect_ollama_model_loading(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("loading")
+        || lower.contains("downloading")
+        || lower.contains("pulling")
+        || lower.contains("pull model manifest")
+        || lower.contains("no such file")
+        || lower.contains("unable to load model")
+        || lower.contains("model not found")
+}
+
+/// Detect Ollama's "model does not support tools" error in an HTTP error
+/// body.
+///
+/// Why: same connector-boundary carve-out as
+/// `detect_ollama_context_overflow` — Ollama hands us a phrase, not a
+/// structured field, and we convert it to `CoreError::ToolsUnsupported`
+/// here so the rule against `.contains()` on errors holds everywhere
+/// downstream.
+fn detect_ollama_tools_unsupported(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("does not support tools")
 }
 
 fn build_response(
@@ -1519,6 +1571,163 @@ mod tests {
         assert!(
             matches!(err, CoreError::Llm(_)),
             "non-overflow error should stay generic; got {err:?}"
+        );
+    }
+
+    // --- Model-loading / tools-unsupported / rate-limit detection ---
+
+    #[test]
+    fn detect_model_loading_matches_phrases() {
+        assert!(detect_ollama_model_loading(
+            r#"{"error":"model is currently loading"}"#
+        ));
+        assert!(detect_ollama_model_loading(
+            r#"{"error":"pull model manifest in progress"}"#
+        ));
+        assert!(detect_ollama_model_loading(
+            r#"{"error":"unable to load model"}"#
+        ));
+        assert!(detect_ollama_model_loading(
+            r#"{"error":"model not found"}"#
+        ));
+        assert!(detect_ollama_model_loading(
+            r#"{"error":"downloading layer"}"#
+        ));
+        assert!(detect_ollama_model_loading(
+            r#"{"error":"no such file"}"#
+        ));
+    }
+
+    #[test]
+    fn detect_model_loading_rejects_unrelated() {
+        assert!(!detect_ollama_model_loading(
+            r#"{"error":"gpu out of memory"}"#
+        ));
+        assert!(!detect_ollama_model_loading(
+            r#"{"error":"invalid request"}"#
+        ));
+    }
+
+    #[test]
+    fn detect_tools_unsupported_matches_phrase() {
+        assert!(detect_ollama_tools_unsupported(
+            r#"{"error":"registry.ollama.ai/library/phi4:14b does not support tools"}"#
+        ));
+    }
+
+    #[test]
+    fn detect_tools_unsupported_rejects_unrelated() {
+        assert!(!detect_ollama_tools_unsupported(
+            r#"{"error":"context length exceeded"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_error_model_loading_emits_model_loading() {
+        let server = MockServer::start();
+
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let _chat = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(503)
+                .header("content-type", "application/json")
+                .body(r#"{"error":"model is currently loading"}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("loading must fail");
+
+        match err {
+            CoreError::ModelLoading { detail } => {
+                assert!(detail.contains("loading"));
+            }
+            other => panic!("expected ModelLoading, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_error_tools_unsupported_emits_tools_unsupported() {
+        let server = MockServer::start();
+
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"phi4:latest"}]}"#);
+        });
+        let _chat = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(r#"{"error":"registry.ollama.ai/library/phi4:14b does not support tools"}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "phi4");
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("unsupported-tools must fail");
+
+        match err {
+            CoreError::ToolsUnsupported { detail } => {
+                assert!(detail.contains("does not support tools"));
+            }
+            other => panic!("expected ToolsUnsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_503_with_no_loading_marker_emits_rate_limited() {
+        // 503 without a "loading" / "downloading" marker is treated as
+        // a transient throttling/overload signal so the retry decorator
+        // can back off — same shape as the OpenAI/Anthropic path.
+        let server = MockServer::start();
+
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let _chat = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(503)
+                .header("content-type", "application/json")
+                .body(r#"{"error":"service unavailable"}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("503 must fail");
+
+        assert!(
+            matches!(err, CoreError::RateLimited { .. }),
+            "503 should map to RateLimited; got {err:?}"
         );
     }
 }

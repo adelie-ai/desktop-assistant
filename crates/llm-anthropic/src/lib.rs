@@ -481,6 +481,7 @@ impl AnthropicClient {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = parse_retry_after_header(response.headers());
             let body = response
                 .text()
                 .await
@@ -504,6 +505,16 @@ impl AnthropicClient {
                 return Err(CoreError::ContextOverflow {
                     prompt_tokens,
                     max_tokens,
+                    detail: format!("Anthropic API error (HTTP {status}): {body}"),
+                });
+            }
+            // HTTP 429 (rate limited) and 529 (Anthropic's "overloaded"
+            // status) are transient throttling signals. Map both to
+            // `CoreError::RateLimited` so the retry decorator backs off
+            // and downstream classifiers don't have to substring-match.
+            if status.as_u16() == 429 || status.as_u16() == 529 {
+                return Err(CoreError::RateLimited {
+                    retry_after,
                     detail: format!("Anthropic API error (HTTP {status}): {body}"),
                 });
             }
@@ -920,6 +931,17 @@ fn parse_prompt_too_long(message: &str) -> (Option<u64>, Option<u64>) {
         [prompt] => (Some(*prompt), None),
         _ => (None, None),
     }
+}
+
+/// Read the `Retry-After` HTTP header and parse it as a delay.
+///
+/// Supports the integer-seconds form (e.g. `Retry-After: 30`); the HTTP-
+/// date form is rare on JSON APIs and not parsed here. Returns `None`
+/// when the header is absent or unparseable so the caller treats it as
+/// "no hint" rather than substituting a default.
+fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    raw.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -1662,5 +1684,105 @@ mod tests {
             matches!(err, CoreError::Llm(_)),
             "non-overflow 400 should stay generic; got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn http_429_emits_rate_limited() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "30")
+                .body(
+                    r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}"#,
+                );
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("429 must fail");
+
+        match err {
+            CoreError::RateLimited {
+                retry_after,
+                detail,
+            } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+                assert!(detail.contains("rate_limit_error"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_529_overloaded_emits_rate_limited() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(529)
+                .header("content-type", "application/json")
+                .body(r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("529 must fail");
+
+        match err {
+            CoreError::RateLimited {
+                retry_after,
+                detail,
+            } => {
+                assert_eq!(retry_after, None);
+                assert!(detail.contains("Overloaded"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_integer_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("45"),
+        );
+        assert_eq!(
+            parse_retry_after_header(&headers),
+            Some(std::time::Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_missing() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_unparseable() {
+        // HTTP-date form is uncommon on JSON APIs and intentionally
+        // unsupported; treat it as "no hint" rather than guessing.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after_header(&headers), None);
     }
 }

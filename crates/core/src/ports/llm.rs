@@ -417,19 +417,16 @@ pub trait LlmClient: Send + Sync {
     }
 }
 
-/// Check whether a `CoreError` represents a retryable API error
-/// (429/529/rate-limit/overloaded/server_error).
-/// Excludes permanent errors like `insufficient_quota` that happen to use HTTP 429.
+/// True for `CoreError` values that represent a transient backend
+/// throttling or overload signal that an automatic retry-with-backoff
+/// can recover from. Today that is exactly [`CoreError::RateLimited`].
+///
+/// Permanent failures that happen to use HTTP 429 — notably OpenAI's
+/// `insufficient_quota` — are surfaced as [`CoreError::QuotaExceeded`]
+/// at the connector boundary so this classifier never has to tell them
+/// apart from genuine rate limits.
 pub fn is_retryable_error(e: &CoreError) -> bool {
-    let normalized = e.to_string().to_ascii_lowercase();
-    if normalized.contains("insufficient_quota") || normalized.contains("rate_limit_error") {
-        return false;
-    }
-    normalized.contains("429")
-        || normalized.contains("rate_limit")
-        || normalized.contains("529")
-        || normalized.contains("overloaded")
-        || normalized.contains("server_error")
+    matches!(e, CoreError::RateLimited { .. })
 }
 
 /// Decorator that wraps any `LlmClient` and retries on transient rate-limit errors
@@ -668,59 +665,61 @@ mod tests {
     // --- is_retryable_error tests ---
 
     #[test]
-    fn retryable_error_429() {
-        let e = CoreError::Llm("HTTP 429 Too Many Requests".into());
+    fn retryable_rate_limited_variant() {
+        let e = CoreError::RateLimited {
+            retry_after: None,
+            detail: "HTTP 429 Too Many Requests".into(),
+        };
         assert!(is_retryable_error(&e));
     }
 
     #[test]
-    fn retryable_error_529() {
-        let e = CoreError::Llm("HTTP 529 overloaded".into());
+    fn rate_limited_with_retry_after_is_retryable() {
+        let e = CoreError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(5)),
+            detail: "HTTP 529 overloaded".into(),
+        };
         assert!(is_retryable_error(&e));
     }
 
     #[test]
-    fn retryable_error_rate_limit() {
-        let e = CoreError::Llm("rate_limit_exceeded".into());
-        assert!(is_retryable_error(&e));
+    fn quota_exceeded_is_not_retryable() {
+        let e = CoreError::QuotaExceeded {
+            detail: "insufficient_quota".into(),
+        };
+        assert!(!is_retryable_error(&e));
     }
 
     #[test]
-    fn retryable_error_overloaded() {
-        let e = CoreError::Llm("API is overloaded".into());
-        assert!(is_retryable_error(&e));
+    fn context_overflow_is_not_retryable() {
+        let e = CoreError::ContextOverflow {
+            prompt_tokens: Some(200_000),
+            max_tokens: Some(180_000),
+            detail: "prompt too long".into(),
+        };
+        assert!(!is_retryable_error(&e));
     }
 
     #[test]
-    fn non_retryable_error() {
+    fn model_loading_is_not_retryable() {
+        let e = CoreError::ModelLoading {
+            detail: "loading".into(),
+        };
+        assert!(!is_retryable_error(&e));
+    }
+
+    #[test]
+    fn tools_unsupported_is_not_retryable() {
+        let e = CoreError::ToolsUnsupported {
+            detail: "no tool support".into(),
+        };
+        assert!(!is_retryable_error(&e));
+    }
+
+    #[test]
+    fn generic_llm_is_not_retryable() {
         let e = CoreError::Llm("invalid API key".into());
         assert!(!is_retryable_error(&e));
-    }
-
-    #[test]
-    fn non_retryable_insufficient_quota_429() {
-        let e = CoreError::Llm(
-            "OpenAI API error (HTTP 429 Too Many Requests): {\"error\":{\"type\":\"insufficient_quota\",\"message\":\"You exceeded your current quota\"}}"
-                .into(),
-        );
-        assert!(!is_retryable_error(&e));
-    }
-
-    #[test]
-    fn non_retryable_anthropic_rate_limit_error_429() {
-        let e = CoreError::Llm(
-            "Anthropic API error (HTTP 429 Too Many Requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit\"}}"
-                .into(),
-        );
-        assert!(!is_retryable_error(&e));
-    }
-
-    #[test]
-    fn retryable_error_server_error() {
-        let e = CoreError::Llm(
-            "OpenAI server_error: An error occurred while processing your request.".into(),
-        );
-        assert!(is_retryable_error(&e));
     }
 
     // --- RetryingLlmClient tests ---
@@ -741,7 +740,10 @@ mod tests {
             let mut count = self.remaining_failures.lock().unwrap();
             if *count > 0 {
                 *count -= 1;
-                return Err(CoreError::Llm("HTTP 429 rate limited".into()));
+                return Err(CoreError::RateLimited {
+                    retry_after: None,
+                    detail: "HTTP 429 rate limited".into(),
+                });
             }
             on_chunk("ok".into());
             Ok(LlmResponse::text("ok"))

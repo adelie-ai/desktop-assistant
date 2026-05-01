@@ -27,6 +27,39 @@ pub enum CoreError {
         detail: String,
     },
 
+    /// Provider returned a transient throttling error (HTTP 429/529,
+    /// "overloaded", service-unavailable). Safe to retry with backoff;
+    /// the `RetryingLlmClient` decorator does so on this variant alone.
+    /// `retry_after` is populated when the upstream `Retry-After` header
+    /// is present and parseable, otherwise `None`.
+    #[error("LLM rate limited: {detail}")]
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+        detail: String,
+    },
+
+    /// Permanent quota/billing error. Distinct from [`Self::RateLimited`]:
+    /// some providers (notably OpenAI) signal `insufficient_quota` with
+    /// HTTP 429, which would otherwise look retryable. This variant is
+    /// NOT retried by `RetryingLlmClient` and surfaces a user-visible
+    /// message instructing the user to top up or switch keys.
+    #[error("LLM quota exceeded: {detail}")]
+    QuotaExceeded { detail: String },
+    /// Provider reported the configured model is downloading, pulling, or
+    /// loading. Today this is Ollama-specific (the daemon ships its own
+    /// inference server and may surface "model is currently loading" or
+    /// "pull model manifest" messages). Transient setup error rather than
+    /// a backend failure — the user can retry shortly.
+    #[error("LLM model loading: {detail}")]
+    ModelLoading { detail: String },
+
+    /// Provider reported the configured model does not support tool use
+    /// (e.g. Ollama models without a tool-calling template). Permanent for
+    /// the chosen model — the caller must switch model or disable tools
+    /// rather than retrying.
+    #[error("LLM tools unsupported: {detail}")]
+    ToolsUnsupported { detail: String },
+
     #[error("storage error: {0}")]
     Storage(String),
 
