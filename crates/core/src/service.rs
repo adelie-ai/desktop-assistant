@@ -51,6 +51,31 @@ const MAX_OVERFLOW_RETRIES: u32 = 3;
 /// avoid the "notice larger than payload" pathology, not to be precise.
 const MIN_TRUNCATION_TOKENS: u64 = 1024;
 
+/// Fraction of the prompt-token budget the system instruction (static
+/// prompt + tool availability listing) is allowed to consume before the
+/// listing is demoted to a namespace-only summary.
+///
+/// Why 0.20: the system block is always re-included in every turn, so
+/// any space it claims is permanently displaced from conversation
+/// history. 20% is a soft cap that comfortably accommodates ~50–100
+/// tools at the chars/4 estimate; beyond that, demotion preserves
+/// recovery headroom.
+const SYSTEM_BLOCK_BUDGET_RATIO: f64 = 0.20;
+
+/// Fraction of the prompt-token budget below which the full tool listing
+/// is considered cheap enough to enumerate without LLM-driven
+/// categorization. When the raw `(name + description)` cost of every tool
+/// fits within this slice, [`categorize_tool_namespaces`] returns the
+/// input unchanged and skips the categorization round-trip.
+///
+/// Why 0.10: leaves headroom under [`SYSTEM_BLOCK_BUDGET_RATIO`] (the
+/// demotion threshold for the assembled system block) so a listing that
+/// passes this check is also unlikely to trigger demotion at assembly
+/// time. Above the threshold the categorization LLM call is worth the
+/// expense — it compresses the listing — but below it the round-trip
+/// just adds latency and tokens.
+const FULL_LISTING_FIT_RATIO: f64 = 0.10;
+
 /// Build the replacement content used when a tool result is truncated in
 /// response to a `ContextOverflow` error. The text is addressed to the
 /// model so it learns to chunk subsequent requests more narrowly.
@@ -142,6 +167,8 @@ fn llm_messages_for_turn(
         current_max,
         active_task,
         tool_rounds_since_anchor,
+        budget,
+        estimate,
     );
 
     let Some(budget) = budget else {
@@ -188,10 +215,98 @@ fn llm_messages_for_turn(
             current_max,
             active_task,
             tool_rounds_since_anchor,
+            Some(budget),
+            estimate,
         );
     }
 
     assembled
+}
+
+/// Build the full tool-availability note enumerating every tool name and
+/// the deferred-namespace index. Returned by default; demoted to a
+/// namespace-only summary by [`build_demoted_tool_note`] when the
+/// assembled system block exceeds [`SYSTEM_BLOCK_BUDGET_RATIO`].
+fn build_full_tool_note(
+    tool_defs: &[ToolDefinition],
+    deferred_namespaces: &[ToolNamespace],
+) -> String {
+    if tool_defs.is_empty() && deferred_namespaces.is_empty() {
+        return "No tools are available in this turn.".to_string();
+    }
+
+    let has_tool_search = tool_defs.iter().any(|t| t.name == "builtin_tool_search");
+    let mut note = String::new();
+
+    if !tool_defs.is_empty() {
+        let names = tool_defs
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if has_tool_search {
+            note = format!(
+                "Available tools in this turn: {names}. \
+                 Additional tools may be available — use builtin_tool_search to discover \
+                 tools for tasks not covered by the tools listed above."
+            );
+        } else {
+            note = format!("Available tools in this turn: {names}.");
+        }
+    }
+
+    // When deferred namespaces exist (hosted or not), append a compact
+    // name-only index so the model knows what tools are reachable.
+    if !deferred_namespaces.is_empty() {
+        if !note.is_empty() {
+            note.push('\n');
+        }
+        for ns in deferred_namespaces {
+            let tool_names: Vec<&str> = ns.tools.iter().map(|t| t.name.as_str()).collect();
+            note.push_str(&format!("{}=[{}]\n", ns.name, tool_names.join(", ")));
+        }
+        note.push_str(
+            "These tools are available via search or deferred loading. \
+             Use builtin_tool_search if you cannot call one directly.",
+        );
+    }
+
+    note
+}
+
+/// Build a namespace-only summary used when the full tool listing would
+/// push the system block past the budget. Why: the static prompt is
+/// always re-included on every turn, so an oversized listing permanently
+/// displaces conversation history. The model still has
+/// `builtin_tool_search` as a real tool definition (in `tool_defs`); the
+/// listing demotion only collapses what the system prompt enumerates.
+fn build_demoted_tool_note(
+    tool_defs: &[ToolDefinition],
+    deferred_namespaces: &[ToolNamespace],
+) -> String {
+    let total_tools: usize = tool_defs.len()
+        + deferred_namespaces
+            .iter()
+            .map(|ns| ns.tools.len())
+            .sum::<usize>();
+    let namespace_count = deferred_namespaces.len();
+    format!(
+        "There are {total_tools} tools across {namespace_count} namespaces. \
+         Use builtin_tool_search to discover a tool for any task you need."
+    )
+}
+
+/// Render the assembled system instruction containing `tool_note` as the
+/// final tool-availability section. Centralised so the demotion path
+/// rebuilds the same shape as the default path.
+fn assemble_system_instruction(tool_note: String) -> String {
+    use crate::prompts::{self, PromptSection, PromptSectionKind};
+    let mut sections = prompts::static_sections();
+    sections.push(PromptSection::new(
+        PromptSectionKind::ToolAvailability,
+        tool_note,
+    ));
+    prompts::assemble(&sections)
 }
 
 // Why allow: this builder coordinates several independent prompt slices
@@ -208,58 +323,45 @@ fn assemble_messages_inner(
     max_messages: usize,
     active_task: Option<&str>,
     tool_rounds_since_anchor: u32,
+    budget: Option<ContextBudget>,
+    estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
-    use crate::prompts::{self, PromptSection, PromptSectionKind};
+    let tool_note = build_full_tool_note(tool_defs, deferred_namespaces);
+    let system_instruction = assemble_system_instruction(tool_note);
 
-    let has_tool_search = tool_defs.iter().any(|t| t.name == "builtin_tool_search");
-    let tool_note = if tool_defs.is_empty() && deferred_namespaces.is_empty() {
-        "No tools are available in this turn.".to_string()
-    } else {
-        let mut note = String::new();
-
-        if !tool_defs.is_empty() {
-            let names = tool_defs
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if has_tool_search {
-                note = format!(
-                    "Available tools in this turn: {names}. \
-                     Additional tools may be available — use builtin_tool_search to discover \
-                     tools for tasks not covered by the tools listed above."
-                );
-            } else {
-                note = format!("Available tools in this turn: {names}.");
-            }
-        }
-
-        // When deferred namespaces exist (hosted or not), append a compact
-        // name-only index so the model knows what tools are reachable.
-        if !deferred_namespaces.is_empty() {
-            if !note.is_empty() {
-                note.push('\n');
-            }
-            for ns in deferred_namespaces {
-                let tool_names: Vec<&str> = ns.tools.iter().map(|t| t.name.as_str()).collect();
-                note.push_str(&format!("{}=[{}]\n", ns.name, tool_names.join(", ")));
-            }
-            note.push_str(
-                "These tools are available via search or deferred loading. \
-                 Use builtin_tool_search if you cannot call one directly.",
+    // Measure the system block. The system instruction is always
+    // re-included in every turn, so any space it claims is permanently
+    // displaced from conversation history. When a budget is installed,
+    // record the size on every turn (observability) and demote the tool
+    // listing to a namespace-only summary if the block exceeds
+    // `SYSTEM_BLOCK_BUDGET_RATIO`.
+    let system_instruction = if let Some(b) = budget {
+        let system_tokens_before = estimate(&system_instruction);
+        tracing::info!(
+            system_tokens = system_tokens_before,
+            budget = b.max_input_tokens,
+            ratio = (system_tokens_before as f64 / b.max_input_tokens as f64),
+            "system block size"
+        );
+        let threshold =
+            (b.max_input_tokens as f64 * SYSTEM_BLOCK_BUDGET_RATIO) as u64;
+        if system_tokens_before > threshold {
+            let demoted_note = build_demoted_tool_note(tool_defs, deferred_namespaces);
+            let demoted_system = assemble_system_instruction(demoted_note);
+            let system_tokens_after = estimate(&demoted_system);
+            tracing::warn!(
+                original_tokens = system_tokens_before,
+                demoted_tokens = system_tokens_after,
+                budget = b.max_input_tokens,
+                "system block exceeded budget threshold; demoted tool listing"
             );
+            demoted_system
+        } else {
+            system_instruction
         }
-
-        note
+    } else {
+        system_instruction
     };
-
-    // Assemble system prompt from static sections + dynamic tool availability.
-    let mut sections = prompts::static_sections();
-    sections.push(PromptSection::new(
-        PromptSectionKind::ToolAvailability,
-        tool_note,
-    ));
-    let system_instruction = prompts::assemble(&sections);
 
     // Apply context windowing: if the conversation exceeds the limit, keep
     // only the most recent messages, snapping the cut point forward to a
@@ -832,14 +934,42 @@ async fn recover_from_overflow<L: LlmClient>(
 /// Takes the raw tool namespaces (typically grouped by MCP server) and asks
 /// the LLM to reorganize them into ≤10-tool categories with descriptive names.
 /// Falls back to the original namespaces on failure.
+///
+/// Skips the LLM round-trip when `budget` is `Some(b)` and the raw
+/// `(name + description)` cost of the full listing fits within
+/// [`FULL_LISTING_FIT_RATIO`] of `b.max_input_tokens`. Why: categorization
+/// is itself an LLM call carrying the full manifest in its prompt — only
+/// worth the cost when the raw listing pressure justifies the expense.
 async fn categorize_tool_namespaces<L: LlmClient>(
     namespaces: Vec<ToolNamespace>,
     llm: &L,
+    budget: Option<ContextBudget>,
 ) -> Vec<ToolNamespace> {
     // Collect all tools across namespaces. If there are very few, skip categorization.
     let all_tools: Vec<&ToolDefinition> = namespaces.iter().flat_map(|ns| &ns.tools).collect();
     if all_tools.len() <= 10 {
         return namespaces;
+    }
+
+    // Skip categorization if the full listing already fits comfortably
+    // in the budget. Categorization costs an LLM call AND injects category
+    // headers into the prompt; the cost is only justified when the raw
+    // listing would meaningfully crowd the budget.
+    if let Some(b) = budget {
+        let full_listing_tokens: u64 = all_tools
+            .iter()
+            .map(|t| llm.estimate_tokens(&t.name) + llm.estimate_tokens(&t.description))
+            .sum();
+        let threshold = (b.max_input_tokens as f64 * FULL_LISTING_FIT_RATIO) as u64;
+        if full_listing_tokens < threshold {
+            tracing::debug!(
+                full_listing_tokens,
+                threshold,
+                budget = b.max_input_tokens,
+                "full tool listing fits budget; skipping categorization"
+            );
+            return namespaces;
+        }
     }
 
     // Build a tool manifest for the LLM
@@ -1224,7 +1354,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     ns
                 } else {
                     tracing::debug!(hash, "tool categorization cache miss; invoking LLM");
-                    let result = categorize_tool_namespaces(raw_namespaces, self.task_llm()).await;
+                    let result = categorize_tool_namespaces(
+                        raw_namespaces,
+                        self.task_llm(),
+                        current_context_budget(),
+                    )
+                    .await;
                     *self.namespace_cache.lock().unwrap() = Some((hash, result.clone()));
                     result
                 }
@@ -4778,6 +4913,225 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "tool addition must invalidate the categorization cache"
+        );
+    }
+
+    // --- System block budget tests (issue #66) ---
+
+    /// Build a tool list whose enumerated names alone are large enough that
+    /// the assembled system block exceeds 20% of the supplied budget. The
+    /// chars/4 default estimator counts each name as `chars/4` tokens, so we
+    /// pad each tool name with enough characters to reach the threshold.
+    fn make_huge_tool_set(count: usize, name_pad: usize) -> Vec<ToolDefinition> {
+        (0..count)
+            .map(|i| {
+                let padded = format!("tool_{i}_{}", "x".repeat(name_pad));
+                ToolDefinition::new(padded, "desc", serde_json::json!({"type": "object"}))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn system_block_demoted_when_oversized() {
+        // Budget of 1000 tokens means a 20% threshold of 200 tokens. Build
+        // a tool set whose enumeration alone overshoots that, then assert
+        // the assembled system block carries the demoted "There are N
+        // tools" wording rather than the full enumeration.
+        let tools = make_huge_tool_set(60, 64);
+        let msgs = vec![Message::new(Role::User, "hi")];
+        let budget = ContextBudget {
+            max_input_tokens: 1_000,
+            source: BudgetSource::ConnectorTable,
+        };
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &tools,
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            Some(budget),
+            &default_estimate,
+        );
+
+        let system = result
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("system message must be present");
+        assert!(
+            system.content.contains(&format!("There are {} tools across", tools.len())),
+            "demoted system block must include 'There are <N> tools' wording, \
+             got: {:?}",
+            system.content
+        );
+        assert!(
+            !system.content.contains(&format!("Available tools in this turn: {}", tools[0].name)),
+            "demoted system block must not enumerate every tool name, got: {:?}",
+            system.content
+        );
+    }
+
+    #[test]
+    fn system_block_full_when_under_threshold() {
+        // Generous budget + tiny tool list — the full enumeration must be
+        // preserved verbatim.
+        let tools = vec![ToolDefinition::new(
+            "ping",
+            "Ping a host",
+            serde_json::json!({"type": "object"}),
+        )];
+        let msgs = vec![Message::new(Role::User, "hi")];
+        let budget = ContextBudget {
+            max_input_tokens: 200_000,
+            source: BudgetSource::ConnectorTable,
+        };
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &tools,
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            Some(budget),
+            &default_estimate,
+        );
+
+        let system = result
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("system message must be present");
+        assert!(
+            system.content.contains("Available tools in this turn: ping."),
+            "full enumeration must be preserved, got: {:?}",
+            system.content
+        );
+        assert!(
+            !system.content.contains("There are 1 tools across"),
+            "demoted summary must not appear when under threshold, got: {:?}",
+            system.content
+        );
+    }
+
+    #[test]
+    fn system_block_full_when_no_budget() {
+        // No budget installed — the threshold check is skipped and the
+        // full enumeration is returned regardless of how many tools there
+        // are. Preserves backward compatibility for test contexts and
+        // background jobs that don't route through `with_context_budget`.
+        let tools = make_huge_tool_set(60, 64);
+        let msgs = vec![Message::new(Role::User, "hi")];
+
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &tools,
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
+
+        let system = result
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("system message must be present");
+        // Look for the first tool name in the enumeration — its presence
+        // proves the full listing was emitted rather than the demoted
+        // summary.
+        assert!(
+            system.content.contains(tools[0].name.as_str()),
+            "full enumeration must be present when no budget installed"
+        );
+        assert!(
+            !system.content.contains(&format!("There are {} tools across", tools.len())),
+            "demoted summary must not appear when no budget installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn categorization_skipped_when_listing_fits_budget() {
+        use crate::ports::llm::with_context_budget;
+
+        // Generous budget + short tool descriptions — the raw listing
+        // sums well below 10% of the budget, so categorization should
+        // skip the LLM round-trip and return the input namespaces.
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let calls = llm.calls();
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let budget = ContextBudget {
+            max_input_tokens: 200_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            handler
+                .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
+                .await
+                .expect("invariant: first send_prompt must succeed");
+        })
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "categorizer must not be called when the full listing fits the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn categorization_runs_when_listing_too_large() {
+        use crate::ports::llm::with_context_budget;
+
+        // Same setup but with very long tool descriptions, so the raw
+        // listing pushes past the 10% threshold and categorization runs.
+        let count = 12;
+        let big_desc = "DESCRIPTION ".repeat(1000); // ~12 KB per tool
+        let tools: Vec<ToolDefinition> = (0..count)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("tool_{i}"),
+                    big_desc.clone(),
+                    serde_json::json!({"type": "object"}),
+                )
+            })
+            .collect();
+        let namespace = ToolNamespace::new("seed", "seed namespace", tools);
+        let executor = NamespacedToolExecutor::new(vec![namespace]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let calls = llm.calls();
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let budget = ContextBudget {
+            max_input_tokens: 200_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            handler
+                .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
+                .await
+                .expect("invariant: first send_prompt must succeed");
+        })
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "categorizer must run once when the raw listing exceeds the budget threshold"
         );
     }
 }
