@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
+use desktop_assistant_core::ports::llm::{BudgetSource, ContextBudget};
 use desktop_assistant_llm_anthropic::AnthropicClient;
 use desktop_assistant_llm_bedrock::BedrockClient;
 use desktop_assistant_llm_ollama::OllamaClient;
@@ -1467,34 +1468,56 @@ pub fn resolve_purpose_llm_config(
 pub const DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS: u64 = 200_000;
 
 /// Three-tier resolution for "what's the context window for this purpose?"
-/// (issue #51).
+/// (issue #51, refined in #63).
 ///
 /// Resolution order:
 ///   1. The purpose's `max_context_tokens` override, if explicitly set —
-///      the user always wins.
+///      the user always wins. Tagged [`BudgetSource::PurposeOverride`].
 ///   2. The connector's curated table for the configured model, surfaced
 ///      via `LlmClient::max_context_tokens()` (or any equivalent the
-///      caller passes through `client_max`).
+///      caller passes through `connector_max`). Tagged
+///      [`BudgetSource::ConnectorTable`].
 ///   3. [`DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS`] — a conservative universal
 ///      fallback so token-based compaction stays on for non-curated
-///      models instead of silently disabling.
+///      models instead of silently disabling. Tagged
+///      [`BudgetSource::UniversalFallback`].
 ///
-/// `purpose_override` carries tier 1; `client_max` carries tier 2. Both
-/// are optional so callers without a live `Option<u64>` can pass `None`
-/// and still get the fallback.
-pub fn resolve_max_context_tokens(
+/// `purpose_override` carries tier 1; `connector_max` carries tier 2.
+/// Both are optional so callers without a live value can pass `None` and
+/// still get the fallback.
+///
+/// Why a typed [`ContextBudget`]: the previous `u64`-only signature lost
+/// the tier provenance, so callers couldn't tell whether the value came
+/// from user config, the connector, or the silent fallback. Surfacing
+/// the source as a tag lets the dispatch wrapper log which tier won and
+/// gives operators a clean signal for "this model's window is unknown,
+/// we're guessing 200K".
+pub fn resolve_context_budget(
     purpose_override: Option<u64>,
-    client_max: Option<u64>,
-) -> u64 {
-    purpose_override
-        .or(client_max)
-        .unwrap_or(DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS)
+    connector_max: Option<u64>,
+) -> ContextBudget {
+    if let Some(value) = purpose_override {
+        return ContextBudget {
+            max_input_tokens: value,
+            source: BudgetSource::PurposeOverride,
+        };
+    }
+    if let Some(value) = connector_max {
+        return ContextBudget {
+            max_input_tokens: value,
+            source: BudgetSource::ConnectorTable,
+        };
+    }
+    ContextBudget {
+        max_input_tokens: DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS,
+        source: BudgetSource::UniversalFallback,
+    }
 }
 
 /// Convenience: pull `purposes.<kind>.max_context_tokens` from a
 /// `DaemonConfig`. Returns `None` when no purpose is configured for `kind`
 /// or the override is unset; in that case the caller should drop into
-/// tier 2 / tier 3 of [`resolve_max_context_tokens`].
+/// tier 2 / tier 3 of [`resolve_context_budget`].
 pub fn purpose_max_context_override(
     config: Option<&DaemonConfig>,
     kind: PurposeKind,
@@ -4168,35 +4191,46 @@ y = 2
     // Purpose-aware max_context_tokens resolution (issue #51)
     // ─────────────────────────────────────────────────────────────────────
 
+    // --- resolve_context_budget three-tier resolution (issue #51 / #63) -
+
     #[test]
-    fn max_context_tier1_purpose_override_wins_over_curated() {
+    fn resolve_context_budget_purpose_override_wins() {
         // Tier 1: an explicit `purpose.max_context_tokens` beats the
         // connector's curated table even when the curated value is known.
-        // The user always wins.
-        let resolved = resolve_max_context_tokens(Some(500_000), Some(200_000));
-        assert_eq!(resolved, 500_000);
+        // The user always wins. Source tag identifies user config so the
+        // dispatch wrapper can log "user said 500K" rather than guessing.
+        let budget = resolve_context_budget(Some(500_000), Some(200_000));
+        assert_eq!(budget.max_input_tokens, 500_000);
+        assert_eq!(budget.source, BudgetSource::PurposeOverride);
     }
 
     #[test]
-    fn max_context_tier2_curated_wins_over_universal_fallback() {
+    fn resolve_context_budget_connector_table_used_when_no_override() {
         // Tier 2: when no purpose override is set, the connector's curated
         // value (e.g. `BedrockClient::max_context_tokens()` returning
         // 200k for Claude 3.x) wins over the universal fallback. This
         // matters when a connector knows the model has *less* than the
         // 200k floor (none of our current curated entries do, but the
-        // resolver mustn't pretend a smaller window is bigger).
-        let resolved = resolve_max_context_tokens(None, Some(128_000));
-        assert_eq!(resolved, 128_000);
+        // resolver mustn't pretend a smaller window is bigger). Tagged
+        // so we can distinguish it from the silent fallback.
+        let budget = resolve_context_budget(None, Some(128_000));
+        assert_eq!(budget.max_input_tokens, 128_000);
+        assert_eq!(budget.source, BudgetSource::ConnectorTable);
     }
 
     #[test]
-    fn max_context_tier3_unknown_model_uses_universal_fallback() {
-        // Tier 3: unknown model + no override → conservative 200k
-        // fallback so token-based compaction stays on instead of
-        // silently disabling for non-curated providers.
-        let resolved = resolve_max_context_tokens(None, None);
-        assert_eq!(resolved, DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS);
-        assert_eq!(resolved, 200_000);
+    fn resolve_context_budget_universal_fallback_when_neither() {
+        // Tier 3: unknown model + no override → conservative 200K
+        // fallback so token-based compaction stays on instead of silently
+        // disabling for non-curated providers. Tag explicitly identifies
+        // the silent floor so operators can grep logs.
+        let budget = resolve_context_budget(None, None);
+        assert_eq!(
+            budget.max_input_tokens,
+            DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS
+        );
+        assert_eq!(budget.source, BudgetSource::UniversalFallback);
+        assert_eq!(budget.max_input_tokens, 200_000);
     }
 
     #[test]

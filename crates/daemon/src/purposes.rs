@@ -167,7 +167,7 @@ pub struct PurposeConfig {
     pub effort: Option<Effort>,
     /// Optional override for the model's max context window, in tokens.
     /// When `Some`, it wins over the connector's curated default and the
-    /// universal fallback (see `crate::config::resolve_max_context_tokens`).
+    /// universal fallback (see `crate::config::resolve_context_budget`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u64>,
 }

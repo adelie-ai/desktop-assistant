@@ -4,7 +4,9 @@ use crate::domain::{
     ToolDefinition, ToolNamespace,
 };
 use crate::ports::inbound::ConversationService;
-use crate::ports::llm::{ChunkCallback, LlmClient, ReasoningConfig, StatusCallback};
+use crate::ports::llm::{
+    ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_context_budget,
+};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 use chrono::{Duration, Local};
@@ -1229,10 +1231,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // above COMPACTION_TOKEN_RATIO of its context window, shrink the
             // effective message window and compact the newly-dropped range
             // before building the next turn's prompt.
-            if let (Some(max_tokens), Some(usage)) =
-                (self.llm.max_context_tokens(), response.usage.as_ref())
+            //
+            // The budget is resolved once at dispatch entry by the daemon's
+            // routing wrapper (issue #63) and read here via the
+            // `CONTEXT_BUDGET` task-local. When the slot is unset (test
+            // contexts, background jobs that don't route through the
+            // wrapper), token-based compaction skips — same behaviour as
+            // when the connector previously returned `None` from
+            // `max_context_tokens()`.
+            if let (Some(budget), Some(usage)) =
+                (current_context_budget(), response.usage.as_ref())
                 && let Some(input_tokens) = usage.input_tokens
             {
+                let max_tokens = budget.max_input_tokens;
                 let threshold = (max_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
                 if input_tokens > threshold {
                     let new_window = (target_window / 2).max(MIN_CONTEXT_MESSAGES);
@@ -2997,6 +3008,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_prompt_shrinks_window_on_token_pressure() {
+        use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let counter = Arc::new(AtomicU64::new(0));
@@ -3033,12 +3045,23 @@ mod tests {
         let before = handler.get_conversation(&conv.id).await.unwrap();
         let baseline_compacted = before.compacted_through;
 
-        // Drive a turn that will receive high token usage and trigger
-        // the token-pressure shrink + compaction path.
-        handler
-            .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
-            .await
-            .unwrap();
+        // Install the resolved budget the daemon's wrapper would set
+        // (issue #63) so the token-pressure check fires. Without the
+        // wrapper, `current_context_budget()` returns `None` and the
+        // token-pressure branch skips.
+        let budget = ContextBudget {
+            max_input_tokens: 200_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            // Drive a turn that will receive high token usage and trigger
+            // the token-pressure shrink + compaction path.
+            handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
 
         let after = handler.get_conversation(&conv.id).await.unwrap();
         assert!(
@@ -3049,6 +3072,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_prompt_no_shrink_when_tokens_under_threshold() {
+        use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let counter = Arc::new(AtomicU64::new(0));
@@ -3073,10 +3097,17 @@ mod tests {
         }
         handler.store.update(stored).await.unwrap();
 
-        handler
-            .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
-            .await
-            .unwrap();
+        let budget = ContextBudget {
+            max_input_tokens: 200_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
 
         let after = handler.get_conversation(&conv.id).await.unwrap();
         assert_eq!(

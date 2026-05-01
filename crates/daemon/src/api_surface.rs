@@ -36,7 +36,7 @@ use desktop_assistant_core::ports::inbound::{
 };
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback,
-    with_model_override, with_reasoning_config,
+    with_context_budget, with_model_override, with_reasoning_config,
 };
 
 use crate::config::{
@@ -818,23 +818,48 @@ where
                 Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort.map(Effort::from));
         }
 
-        // Resolve the per-turn `max_context_tokens` override (issue #51).
-        // Interactive is the purpose that drives `send_prompt`; if the user
-        // has authored `purposes.interactive.max_context_tokens`, surface it
-        // through the routing wrapper so token-based compaction in
-        // `core::Service` honours their override. When unset (the common
-        // case), the wrapper falls through to tier 2/3.
-        let max_context_override = crate::config::purpose_max_context_override(
+        // Resolve the per-turn context budget once at dispatch entry
+        // (issue #63). Tier 1 is the user's `purposes.interactive.
+        // max_context_tokens`; tier 2 is the connector's curated table for
+        // the configured (or active) client; tier 3 is the universal 200K
+        // fallback. Resolving once here freezes the value for the whole
+        // `send_prompt` call so the dispatch loop's token-pressure check
+        // doesn't re-query the LLM trait on every iteration.
+        let purpose_override = crate::config::purpose_max_context_override(
             Some(&self.registry.snapshot_config()),
             PurposeKind::Interactive,
+        );
+        // Tier 2 input: ask the client that will actually run this turn
+        // for its curated value. For user-driven selections that's
+        // `active_client`; for the interactive-purpose fallback we look up
+        // the same client the inner handler would route through.
+        let connector_max: Option<u64> = if let Some(client) = active_client.as_ref() {
+            client.max_context_tokens()
+        } else if let Some(sel) = effective_selection.as_ref() {
+            ConnectionId::new(sel.connection_id.clone())
+                .ok()
+                .and_then(|id| self.registry.client_for(&id))
+                .and_then(|c| c.max_context_tokens())
+        } else {
+            None
+        };
+        let budget = crate::config::resolve_context_budget(purpose_override, connector_max);
+        tracing::info!(
+            purpose = ?PurposeKind::Interactive,
+            connection = ?effective_selection.as_ref().map(|s| s.connection_id.as_str()),
+            model = ?effective_selection.as_ref().map(|s| s.model_id.as_str()),
+            source = ?budget.source,
+            max_input_tokens = budget.max_input_tokens,
+            "context budget resolved"
         );
 
         // Install task-locals, then delegate to the inner core
         // handler. The handler reads the task-locals inside its
         // `send_prompt` dispatch loop:
         //   - `RoutingLlmClient` picks the active client on each
-        //     `stream_completion` call and uses `MAX_CONTEXT_OVERRIDE` to
-        //     resolve the context window.
+        //     `stream_completion` call.
+        //   - `current_context_budget()` surfaces the resolved budget for
+        //     token-pressure compaction.
         //   - `current_reasoning_config()` surfaces `reasoning` into the
         //     connector's request body.
         //   - `current_model_override()` (issue #34) surfaces the resolved
@@ -849,8 +874,7 @@ where
                     .await
             };
             let dispatch = with_reasoning_config(reasoning, dispatch);
-            let dispatch =
-                crate::routing_llm::with_max_context_override(max_context_override, dispatch);
+            let dispatch = with_context_budget(budget, dispatch);
             // Wrap in `with_model_override` only when we installed an
             // `active_client`; the interactive-purpose fallback path
             // intentionally leaves both unset (see #33).

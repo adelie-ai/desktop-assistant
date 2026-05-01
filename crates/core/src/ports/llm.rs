@@ -34,6 +34,23 @@ tokio::task_local! {
     /// Lives in core (next to `REASONING_CONFIG`) precisely so the
     /// connector crates — which can't depend on the daemon — can read it.
     static MODEL_OVERRIDE: String;
+
+    /// Per-turn resolved prompt-token budget for `send_prompt`.
+    ///
+    /// Lifecycle: populated by the daemon's dispatch wrapper via
+    /// [`with_context_budget`] at the start of `send_prompt`; readable for
+    /// the duration of that call via [`current_context_budget`]. Read once
+    /// at dispatch entry from the three-tier resolution chain (purpose
+    /// override → connector curated table → universal fallback) and frozen
+    /// for the rest of the turn. The dispatch loop reads it lazily on each
+    /// iteration to drive token-pressure compaction.
+    ///
+    /// Why a task-local: keeps the existing `ConversationService::send_prompt`
+    /// signature unchanged while still threading a typed value through
+    /// without re-resolving on every turn. Lives in core so the read site
+    /// in `service::ConversationHandler` doesn't need to know the daemon's
+    /// resolution logic.
+    static CONTEXT_BUDGET: ContextBudget;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -70,6 +87,59 @@ where
 /// when unset.
 pub fn current_model_override() -> Option<String> {
     MODEL_OVERRIDE.try_with(|m| m.clone()).ok()
+}
+
+/// The resolved prompt-token budget for the current `send_prompt` call.
+///
+/// Resolution happens once at dispatch entry; downstream code reads it
+/// via [`current_context_budget`]. The `source` field records which tier
+/// of the resolution chain produced the value, for observability —
+/// distinguishing "user-authored override" from "connector knows the
+/// model" from "fell through to universal fallback".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    /// Maximum input/prompt tokens for the configured model on this turn.
+    pub max_input_tokens: u64,
+    /// Which resolution tier produced [`Self::max_input_tokens`].
+    pub source: BudgetSource,
+}
+
+/// Origin tag for a resolved [`ContextBudget`], recorded so operators
+/// can tell whether the value came from user config, the connector's
+/// curated table, or the universal fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetSource {
+    /// User-authored `purposes.<kind>.max_context_tokens`. Always wins.
+    PurposeOverride,
+    /// The connector's curated `LlmClient::max_context_tokens()` value
+    /// for the configured model (e.g. Anthropic / Bedrock tables).
+    ConnectorTable,
+    /// Conservative universal fallback used when neither the purpose
+    /// nor the connector supplied a value.
+    UniversalFallback,
+}
+
+/// Run `fut` with `budget` installed as the resolved per-turn context
+/// budget. The dispatch loop in [`crate::service::ConversationHandler`]
+/// reads this via [`current_context_budget`] to drive token-pressure
+/// compaction.
+///
+/// Why a task-local: see the doc on [`CONTEXT_BUDGET`].
+pub async fn with_context_budget<F, T>(budget: ContextBudget, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CONTEXT_BUDGET.scope(budget, fut).await
+}
+
+/// Returns the resolved budget for the current dispatch, or `None` if
+/// no budget has been installed (e.g. test contexts or background jobs
+/// that don't route through the daemon's dispatch wrapper). When `None`,
+/// callers should treat this as "no budget known" and skip token-based
+/// compaction the same way they would for a connector reporting `None`
+/// from `max_context_tokens()`.
+pub fn current_context_budget() -> Option<ContextBudget> {
+    CONTEXT_BUDGET.try_with(|b| *b).ok()
 }
 
 /// Reasoning / extended-thinking level for a single LLM turn.
@@ -910,5 +980,46 @@ mod tests {
         })
         .await;
         assert_eq!(inner, Some("inner".into()));
+    }
+
+    // --- CONTEXT_BUDGET tests (issue #63) ---
+
+    #[tokio::test]
+    async fn current_context_budget_returns_none_outside_scope() {
+        // No `with_context_budget` wrapper has been installed — typical
+        // test context or a background job that doesn't route through
+        // the daemon's dispatch wrapper. Read site must observe `None`
+        // rather than a misleading default so token-based compaction
+        // skips the way it does when a connector reports `None`.
+        assert_eq!(current_context_budget(), None);
+    }
+
+    #[tokio::test]
+    async fn current_context_budget_returns_installed_value() {
+        let budget = ContextBudget {
+            max_input_tokens: 1_000_000,
+            source: BudgetSource::PurposeOverride,
+        };
+        let observed = with_context_budget(budget, async { current_context_budget() }).await;
+        assert_eq!(observed, Some(budget));
+        // After the scope exits the task-local is unset again.
+        assert_eq!(current_context_budget(), None);
+    }
+
+    #[tokio::test]
+    async fn nested_context_budget_shadows_outer() {
+        let outer = ContextBudget {
+            max_input_tokens: 200_000,
+            source: BudgetSource::UniversalFallback,
+        };
+        let inner_budget = ContextBudget {
+            max_input_tokens: 1_000_000,
+            source: BudgetSource::PurposeOverride,
+        };
+        let observed = with_context_budget(outer, async {
+            with_context_budget(inner_budget, async { current_context_budget() }).await
+        })
+        .await;
+        assert_eq!(observed, Some(inner_budget));
     }
 }

@@ -64,7 +64,7 @@ Apply these consistently across the workspace. The pre-commit checklist at the b
 - Don't hold non-async locks (`std::sync::Mutex`, `parking_lot::Mutex`) across `.await`. Drop the guard explicitly, or use `tokio::sync::Mutex` if the lock genuinely needs to span the await.
 - `tokio::join!` for independent parallel work; `tokio::try_join!` when both must succeed and the first error should cancel the rest.
 - Long-running spawned tasks need cancellation — channel-based or `CancellationToken`. Don't leak.
-- Cross-cutting context: `tokio::task_local!`. Existing examples: `REASONING_CONFIG`, `MAX_CONTEXT_OVERRIDE`, `MODEL_OVERRIDE` in `crates/daemon/src/routing_llm.rs` and `crates/core/src/ports/llm.rs`.
+- Cross-cutting context: `tokio::task_local!`. Existing examples: `REASONING_CONFIG`, `MODEL_OVERRIDE`, `CONTEXT_BUDGET` in `crates/core/src/ports/llm.rs`, plus `ACTIVE_CLIENT` in `crates/daemon/src/routing_llm.rs`.
 
 ### Workspace organization
 - Hexagonal layout: trait boundaries in `core::ports`, infrastructure adapters in `daemon` / `storage` / `llm-*`, wire types in `api-model`.
