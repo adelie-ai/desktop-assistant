@@ -485,6 +485,28 @@ impl AnthropicClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".into());
+            // Detect prompt-overflow rejections at the connector boundary
+            // and surface them as `CoreError::ContextOverflow` so the core
+            // service can truncate the offending tool result and retry,
+            // rather than falling through to the kludgy trim-oldest-pairs
+            // path. The Anthropic Messages API returns HTTP 400 with a
+            // body shaped like `{ "type": "error", "error": { "type":
+            // "invalid_request_error", "message": "prompt is too long:
+            // 203524 tokens > 200000 maximum" } }`.
+            if let Some((prompt_tokens, max_tokens)) =
+                detect_anthropic_context_overflow(&body)
+            {
+                tracing::warn!(
+                    prompt_tokens = ?prompt_tokens,
+                    max_tokens = ?max_tokens,
+                    "Anthropic rejected request for context overflow"
+                );
+                return Err(CoreError::ContextOverflow {
+                    prompt_tokens,
+                    max_tokens,
+                    detail: format!("Anthropic API error (HTTP {status}): {body}"),
+                });
+            }
             return Err(CoreError::Llm(format!(
                 "Anthropic API error (HTTP {status}): {body}"
             )));
@@ -829,6 +851,74 @@ fn to_token_usage(sse: &SseUsage) -> TokenUsage {
         output_tokens: sse.output_tokens,
         cache_creation_input_tokens: sse.cache_creation_input_tokens,
         cache_read_input_tokens: sse.cache_read_input_tokens,
+    }
+}
+
+/// Anthropic error envelope used to detect prompt-overflow rejections.
+///
+/// The Messages API surfaces structured errors as
+/// `{ "type": "error", "error": { "type": "...", "message": "..." } }`;
+/// we only deserialize the inner `error` shape since that's the only
+/// thing this connector inspects.
+#[derive(Deserialize)]
+struct AnthropicErrorEnvelope {
+    error: AnthropicErrorBody,
+}
+
+#[derive(Deserialize)]
+struct AnthropicErrorBody {
+    #[serde(rename = "type")]
+    error_type: String,
+    message: String,
+}
+
+/// Detect an Anthropic context-overflow rejection in an HTTP error body.
+///
+/// Returns `Some((prompt_tokens, max_tokens))` (each may itself be `None`
+/// when the wording doesn't carry numbers) when the body parses as the
+/// Anthropic error envelope, the inner error type is
+/// `invalid_request_error`, and the message starts with `prompt is too
+/// long`. Returns `None` for any other shape so the caller can fall
+/// through to a generic `CoreError::Llm`.
+///
+/// Why: pattern-matching on error message strings is normally banned
+/// (see `AGENTS.md`), but at the connector boundary this is the only
+/// signal Anthropic provides for context-window rejections — converting
+/// it into structured `CoreError::ContextOverflow` here is exactly what
+/// the rule carves out, since downstream code never has to.
+fn detect_anthropic_context_overflow(body: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let envelope: AnthropicErrorEnvelope = serde_json::from_str(body).ok()?;
+    if envelope.error.error_type != "invalid_request_error" {
+        return None;
+    }
+    if !envelope
+        .error
+        .message
+        .to_ascii_lowercase()
+        .starts_with("prompt is too long")
+    {
+        return None;
+    }
+    Some(parse_prompt_too_long(&envelope.error.message))
+}
+
+/// Parse a `"prompt is too long: 203524 tokens > 200000 maximum"`-style
+/// message into its `(prompt_tokens, max_tokens)` numeric components.
+///
+/// The order is `(prompt, max)` — same as Bedrock's relayed wording. If
+/// the numbers are missing or malformed the corresponding tuple slot is
+/// `None`; the core's overflow recovery path tolerates absent
+/// measurements and uses configured fallbacks instead.
+fn parse_prompt_too_long(message: &str) -> (Option<u64>, Option<u64>) {
+    let nums: Vec<u64> = message
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    match nums.as_slice() {
+        [prompt, max, ..] => (Some(*prompt), Some(*max)),
+        [prompt] => (Some(*prompt), None),
+        _ => (None, None),
     }
 }
 
@@ -1465,5 +1555,112 @@ mod tests {
         })
         .await;
         assert_eq!(observed, Some(200_000));
+    }
+
+    // --- Context-overflow detection (issue #59) --------------------------
+
+    #[test]
+    fn detect_anthropic_context_overflow_extracts_token_counts() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 203524 tokens > 200000 maximum"}}"#;
+        let (prompt, max) =
+            detect_anthropic_context_overflow(body).expect("should detect context overflow");
+        assert_eq!(prompt, Some(203_524));
+        assert_eq!(max, Some(200_000));
+    }
+
+    #[test]
+    fn detect_anthropic_context_overflow_returns_none_for_other_errors() {
+        // Auth failure — wrong inner type.
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid api key"}}"#;
+        assert!(detect_anthropic_context_overflow(body).is_none());
+
+        // Malformed schema (missing inner error object).
+        let body = r#"{"error":"oops"}"#;
+        assert!(detect_anthropic_context_overflow(body).is_none());
+
+        // invalid_request_error but unrelated message.
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: must be a non-empty array"}}"#;
+        assert!(detect_anthropic_context_overflow(body).is_none());
+
+        // Non-JSON garbage.
+        assert!(detect_anthropic_context_overflow("HTTP 500 internal error").is_none());
+    }
+
+    #[test]
+    fn detect_anthropic_context_overflow_tolerates_missing_numbers() {
+        // Wording without numeric tokens still triggers the overflow path,
+        // but with `None` measurements — recovery falls back to configured
+        // estimates per the issue spec.
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long for this model"}}"#;
+        let (prompt, max) =
+            detect_anthropic_context_overflow(body).expect("should still trigger overflow");
+        assert_eq!(prompt, None);
+        assert_eq!(max, None);
+    }
+
+    #[tokio::test]
+    async fn http_400_prompt_too_long_emits_context_overflow() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 203524 tokens > 200000 maximum"}}"#,
+                );
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("400 prompt-too-long must fail");
+
+        match err {
+            CoreError::ContextOverflow {
+                prompt_tokens,
+                max_tokens,
+                detail,
+            } => {
+                assert_eq!(prompt_tokens, Some(203_524));
+                assert_eq!(max_tokens, Some(200_000));
+                assert!(detail.contains("prompt is too long"));
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_400_other_error_remains_generic_llm() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: must be a non-empty array"}}"#,
+                );
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("400 must fail");
+
+        assert!(
+            matches!(err, CoreError::Llm(_)),
+            "non-overflow 400 should stay generic; got {err:?}"
+        );
     }
 }

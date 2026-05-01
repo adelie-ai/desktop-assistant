@@ -687,6 +687,23 @@ impl LlmClient for OllamaClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".into());
+            // Detect prompt-overflow rejections at the connector boundary
+            // and surface them as `CoreError::ContextOverflow` so the
+            // core service can truncate the offending tool result and
+            // retry. Ollama is the loosest of the providers — its error
+            // wording is unstructured and rarely carries token counts —
+            // so we match a small set of substrings (case-insensitive)
+            // and emit `ContextOverflow` with `None` measurements.
+            if detect_ollama_context_overflow(&body) {
+                tracing::warn!(
+                    "Ollama rejected request for context overflow"
+                );
+                return Err(CoreError::ContextOverflow {
+                    prompt_tokens: None,
+                    max_tokens: None,
+                    detail: format!("Ollama API error (HTTP {status}): {body}"),
+                });
+            }
             return Err(CoreError::Llm(format!(
                 "Ollama API error (HTTP {status}): {body}"
             )));
@@ -795,6 +812,25 @@ impl LlmClient for OllamaClient {
 
         Ok(build_response(full_response, tool_calls, token_usage))
     }
+}
+
+/// Detect an Ollama context-overflow rejection in an HTTP error body.
+///
+/// Why: Ollama's error responses are unstructured strings — the server
+/// surfaces context-window rejections via a handful of phrases like
+/// `"context length"`, `"context size"`, `"num_ctx"`, or
+/// `"context window"`, often without numeric token counts. Pattern-
+/// matching on error message strings is normally banned (see
+/// `AGENTS.md`), but at the connector boundary this is the only signal
+/// Ollama provides — converting it into structured
+/// `CoreError::ContextOverflow` here is exactly what that rule carves
+/// out, since downstream code never has to.
+fn detect_ollama_context_overflow(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("context length")
+        || lower.contains("context size")
+        || lower.contains("num_ctx")
+        || lower.contains("context window")
 }
 
 fn build_response(
@@ -1378,5 +1414,111 @@ mod tests {
         })
         .await;
         assert_eq!(observed, None);
+    }
+
+    // --- Context-overflow detection (issue #59) --------------------------
+
+    #[test]
+    fn detect_ollama_context_overflow_matches_known_phrases() {
+        // Each of the substrings the helper recognises, in mixed case.
+        assert!(detect_ollama_context_overflow(
+            r#"{"error":"context length exceeded for this model"}"#
+        ));
+        assert!(detect_ollama_context_overflow(
+            r#"{"error":"requested Context Size is too small"}"#
+        ));
+        assert!(detect_ollama_context_overflow(
+            r#"{"error":"prompt exceeds num_ctx"}"#
+        ));
+        assert!(detect_ollama_context_overflow(
+            r#"{"error":"input exceeds the model's context window"}"#
+        ));
+    }
+
+    #[test]
+    fn detect_ollama_context_overflow_returns_false_for_unrelated_errors() {
+        assert!(!detect_ollama_context_overflow(
+            r#"{"error":"model 'foo' not found, try pulling it first"}"#
+        ));
+        assert!(!detect_ollama_context_overflow(
+            r#"{"error":"failed to allocate gpu memory"}"#
+        ));
+        assert!(!detect_ollama_context_overflow("plain HTTP 500"));
+    }
+
+    #[tokio::test]
+    async fn http_error_with_context_length_emits_context_overflow() {
+        let server = MockServer::start();
+
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let _chat = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(r#"{"error":"prompt exceeds context length of model"}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("400 with context length must fail");
+
+        match err {
+            CoreError::ContextOverflow {
+                prompt_tokens,
+                max_tokens,
+                detail,
+            } => {
+                assert_eq!(prompt_tokens, None);
+                assert_eq!(max_tokens, None);
+                assert!(detail.contains("context length"));
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_error_unrelated_remains_generic_llm() {
+        let server = MockServer::start();
+
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let _chat = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(500)
+                .header("content-type", "application/json")
+                .body(r#"{"error":"internal server error: gpu oom"}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("500 must fail");
+
+        assert!(
+            matches!(err, CoreError::Llm(_)),
+            "non-overflow error should stay generic; got {err:?}"
+        );
     }
 }

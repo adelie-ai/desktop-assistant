@@ -531,6 +531,26 @@ impl OpenAiClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".into());
+            // Detect prompt-overflow rejections at the connector boundary
+            // and surface them as `CoreError::ContextOverflow` so the
+            // core service can truncate the offending tool result and
+            // retry. OpenAI returns HTTP 400 with a body shaped like
+            // `{ "error": { "code": "context_length_exceeded", "type":
+            // "invalid_request_error", "message": "..." } }`.
+            if let Some((prompt_tokens, max_tokens)) =
+                detect_openai_context_overflow(&body)
+            {
+                tracing::warn!(
+                    prompt_tokens = ?prompt_tokens,
+                    max_tokens = ?max_tokens,
+                    "OpenAI rejected request for context overflow"
+                );
+                return Err(CoreError::ContextOverflow {
+                    prompt_tokens,
+                    max_tokens,
+                    detail: format!("OpenAI API error (HTTP {status}): {body}"),
+                });
+            }
             return Err(CoreError::Llm(format!(
                 "OpenAI API error (HTTP {status}): {body}"
             )));
@@ -659,6 +679,67 @@ impl OpenAiClient {
             resp = resp.with_usage(usage);
         }
         Ok(resp)
+    }
+}
+
+/// OpenAI error envelope used to detect prompt-overflow rejections.
+///
+/// The Responses API and Chat Completions API both surface structured
+/// errors as `{ "error": { "code": "...", "type": "...", "message":
+/// "..." } }`; we only deserialize the inner `error` shape since that's
+/// the only thing this connector inspects.
+#[derive(Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorBody,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAiErrorBody {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: String,
+}
+
+/// Detect an OpenAI context-overflow rejection in an HTTP error body.
+///
+/// Returns `Some((prompt_tokens, max_tokens))` (each may itself be `None`
+/// when the wording doesn't carry numbers) when the body parses as the
+/// OpenAI error envelope and `error.code == "context_length_exceeded"`.
+/// Returns `None` for any other shape so the caller can fall through to
+/// a generic `CoreError::Llm`.
+///
+/// Why: pattern-matching on error message strings is normally banned
+/// (see `AGENTS.md`), but at the connector boundary this is the only
+/// signal OpenAI provides for context-window rejections — converting
+/// it into structured `CoreError::ContextOverflow` here is exactly what
+/// the rule carves out, since downstream code never has to.
+fn detect_openai_context_overflow(body: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let envelope: OpenAiErrorEnvelope = serde_json::from_str(body).ok()?;
+    if envelope.error.code.as_deref() != Some("context_length_exceeded") {
+        return None;
+    }
+    Some(parse_openai_context_length_message(&envelope.error.message))
+}
+
+/// Parse OpenAI's `"This model's maximum context length is 128000
+/// tokens. However, your messages resulted in 153827 tokens. ..."`
+/// wording into `(prompt_tokens, max_tokens)`.
+///
+/// OpenAI lists the numbers in the order `(max, prompt)` — opposite to
+/// Bedrock/Anthropic — so this swaps them before returning. If either
+/// value is missing the corresponding tuple slot is `None`; the core's
+/// overflow recovery path tolerates absent measurements.
+fn parse_openai_context_length_message(message: &str) -> (Option<u64>, Option<u64>) {
+    let nums: Vec<u64> = message
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    match nums.as_slice() {
+        [max, prompt, ..] => (Some(*prompt), Some(*max)),
+        [max] => (None, Some(*max)),
+        _ => (None, None),
     }
 }
 
@@ -1505,5 +1586,112 @@ mod tests {
             with_model_override("gpt-4o-mini".into(), async { client.max_context_tokens() })
                 .await;
         assert_eq!(observed, Some(128_000));
+    }
+
+    // --- Context-overflow detection (issue #59) --------------------------
+
+    #[test]
+    fn detect_openai_context_overflow_extracts_token_counts() {
+        // Numbers appear as (max, prompt) in OpenAI's wording — note the
+        // helper swaps them so the returned tuple is (prompt, max).
+        let body = r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 153827 tokens. Please reduce the length of the messages."}}"#;
+        let (prompt, max) =
+            detect_openai_context_overflow(body).expect("should detect context overflow");
+        assert_eq!(prompt, Some(153_827));
+        assert_eq!(max, Some(128_000));
+    }
+
+    #[test]
+    fn detect_openai_context_overflow_returns_none_for_other_codes() {
+        // Different code → not a context overflow.
+        let body = r#"{"error":{"code":"invalid_api_key","type":"invalid_request_error","message":"Invalid API key"}}"#;
+        assert!(detect_openai_context_overflow(body).is_none());
+
+        // No code field at all.
+        let body = r#"{"error":{"type":"server_error","message":"upstream timeout"}}"#;
+        assert!(detect_openai_context_overflow(body).is_none());
+
+        // Unrelated 400 with a different validation issue.
+        let body = r#"{"error":{"code":"missing_required_parameter","type":"invalid_request_error","message":"missing 'model'"}}"#;
+        assert!(detect_openai_context_overflow(body).is_none());
+
+        // Non-JSON garbage.
+        assert!(detect_openai_context_overflow("HTTP 502 bad gateway").is_none());
+    }
+
+    #[test]
+    fn detect_openai_context_overflow_tolerates_missing_numbers() {
+        // The code triggers detection even if the message lacks numbers.
+        let body = r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"context length exceeded"}}"#;
+        let (prompt, max) =
+            detect_openai_context_overflow(body).expect("should still trigger overflow");
+        assert_eq!(prompt, None);
+        assert_eq!(max, None);
+    }
+
+    #[tokio::test]
+    async fn http_400_context_length_exceeded_emits_context_overflow() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 153827 tokens. Please reduce the length of the messages."}}"#,
+                );
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("400 context_length_exceeded must fail");
+
+        match err {
+            CoreError::ContextOverflow {
+                prompt_tokens,
+                max_tokens,
+                detail,
+            } => {
+                assert_eq!(prompt_tokens, Some(153_827));
+                assert_eq!(max_tokens, Some(128_000));
+                assert!(detail.contains("context_length_exceeded"));
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_400_other_error_remains_generic_llm() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"error":{"code":"missing_required_parameter","type":"invalid_request_error","message":"missing model"}}"#,
+                );
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("400 must fail");
+
+        assert!(
+            matches!(err, CoreError::Llm(_)),
+            "non-overflow 400 should stay generic; got {err:?}"
+        );
     }
 }
