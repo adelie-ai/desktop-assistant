@@ -9,6 +9,24 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 
+/// Return the prompt-token context window for a known Anthropic model id.
+///
+/// Anthropic's Messages API does not expose context windows in its model
+/// list, so this curated table is the source of truth. All Claude 3.x and
+/// 4.x chat models ship with a 200K token window. Returns `None` for
+/// unrecognised ids; callers fall back to the universal default and/or
+/// message-count heuristics.
+pub fn context_limit_for_model(model: &str) -> Option<u64> {
+    if model.starts_with("claude-opus-4")
+        || model.starts_with("claude-sonnet-4")
+        || model.starts_with("claude-haiku-4")
+        || model.starts_with("claude-3")
+    {
+        return Some(200_000);
+    }
+    None
+}
+
 /// Anthropic Messages API client that streams completions via SSE.
 pub struct AnthropicClient {
     client: Client,
@@ -638,6 +656,11 @@ impl LlmClient for AnthropicClient {
 
     fn get_default_base_url(&self) -> Option<&str> {
         Self::get_default_base_url()
+    }
+
+    fn max_context_tokens(&self) -> Option<u64> {
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+        context_limit_for_model(&model)
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -1382,5 +1405,65 @@ mod tests {
         })
         .await;
         m.assert_calls(1);
+    }
+
+    // --- context_limit_for_model tests ---
+
+    #[test]
+    fn context_limit_for_known_models() {
+        assert_eq!(
+            context_limit_for_model("claude-opus-4-5"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_for_model("claude-sonnet-4-6-20260227"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_for_model("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_for_model("claude-3-5-sonnet-20241022"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_limit_for_model("claude-3-opus-20240229"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn context_limit_for_unknown_model_returns_none() {
+        assert_eq!(context_limit_for_model("unknown-model"), None);
+        assert_eq!(context_limit_for_model("claude-2"), None);
+        assert_eq!(context_limit_for_model("gpt-5"), None);
+    }
+
+    #[test]
+    fn max_context_tokens_uses_configured_model() {
+        let client = AnthropicClient::new("k".into()).with_model("claude-3-5-sonnet-20241022");
+        assert_eq!(client.max_context_tokens(), Some(200_000));
+    }
+
+    #[test]
+    fn max_context_tokens_is_none_for_unknown_model() {
+        let client = AnthropicClient::new("k".into()).with_model("totally-fake-model");
+        assert_eq!(client.max_context_tokens(), None);
+    }
+
+    #[tokio::test]
+    async fn max_context_tokens_consults_model_override() {
+        use desktop_assistant_core::ports::llm::with_model_override;
+
+        let client = AnthropicClient::new("k".into()).with_model("totally-fake-model");
+        // Without override: falls back to (unknown) configured model.
+        assert_eq!(client.max_context_tokens(), None);
+        // With override: returns the override's curated value.
+        let observed = with_model_override("claude-opus-4-5".into(), async {
+            client.max_context_tokens()
+        })
+        .await;
+        assert_eq!(observed, Some(200_000));
     }
 }

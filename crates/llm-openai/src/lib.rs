@@ -11,6 +11,38 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 
+/// Return the prompt-token context window for a known OpenAI model id.
+///
+/// OpenAI exposes context windows through `/v1/models` only inconsistently,
+/// so this curated table covers the common families we ship with the model
+/// picker. Returns `None` for ids that are unknown or that intentionally
+/// defer to the daemon's universal fallback (e.g. the `gpt-5*` family,
+/// whose window varies by sub-tier).
+///
+/// Order matters: more specific prefixes are checked before their general
+/// counterparts (e.g. `gpt-4-turbo` before `gpt-4`).
+pub fn context_limit_for_model(model: &str) -> Option<u64> {
+    if model.starts_with("gpt-4o") || model.starts_with("gpt-4-turbo") {
+        return Some(128_000);
+    }
+    if model.starts_with("gpt-4-32k") {
+        return Some(32_768);
+    }
+    if model.starts_with("gpt-4") {
+        return Some(8_192);
+    }
+    if model.starts_with("gpt-3.5-turbo-16k") {
+        return Some(16_384);
+    }
+    if model.starts_with("gpt-3.5-turbo") {
+        return Some(4_096);
+    }
+    if model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+        return Some(200_000);
+    }
+    None
+}
+
 /// OpenAI-compatible LLM client that streams completions via the Responses API.
 pub struct OpenAiClient {
     client: Client,
@@ -765,6 +797,11 @@ impl LlmClient for OpenAiClient {
         Self::get_default_base_url()
     }
 
+    fn max_context_tokens(&self) -> Option<u64> {
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+        context_limit_for_model(&model)
+    }
+
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         Ok(curated_openai_models())
     }
@@ -1401,5 +1438,72 @@ mod tests {
         })
         .await;
         m.assert_calls(1);
+    }
+
+    // --- context_limit_for_model tests ---
+
+    #[test]
+    fn context_limit_for_known_models() {
+        assert_eq!(context_limit_for_model("gpt-4o"), Some(128_000));
+        assert_eq!(context_limit_for_model("gpt-4o-mini"), Some(128_000));
+        assert_eq!(
+            context_limit_for_model("gpt-4-turbo-2024-04-09"),
+            Some(128_000)
+        );
+        assert_eq!(context_limit_for_model("gpt-4-32k-0613"), Some(32_768));
+        assert_eq!(context_limit_for_model("gpt-4-0613"), Some(8_192));
+        assert_eq!(
+            context_limit_for_model("gpt-3.5-turbo-16k-0613"),
+            Some(16_384)
+        );
+        assert_eq!(context_limit_for_model("gpt-3.5-turbo"), Some(4_096));
+        assert_eq!(context_limit_for_model("o1-preview"), Some(200_000));
+        assert_eq!(context_limit_for_model("o3-mini"), Some(200_000));
+        assert_eq!(context_limit_for_model("o4-mini"), Some(200_000));
+    }
+
+    #[test]
+    fn context_limit_specific_prefix_wins_over_general() {
+        // gpt-4o is checked before the bare gpt-4 fallback, so we get
+        // 128k rather than 8k.
+        assert_eq!(context_limit_for_model("gpt-4o-2024-08-06"), Some(128_000));
+        // Likewise gpt-4-turbo is 128k, not 8k.
+        assert_eq!(context_limit_for_model("gpt-4-turbo"), Some(128_000));
+        // Likewise gpt-4-32k is 32k, not 8k.
+        assert_eq!(context_limit_for_model("gpt-4-32k"), Some(32_768));
+    }
+
+    #[test]
+    fn context_limit_for_gpt5_returns_none() {
+        // GPT-5 family is intentionally excluded — the daemon's universal
+        // fallback handles it until we curate per-tier values.
+        assert_eq!(context_limit_for_model("gpt-5"), None);
+        assert_eq!(context_limit_for_model("gpt-5-mini"), None);
+        assert_eq!(context_limit_for_model("gpt-5.4"), None);
+    }
+
+    #[test]
+    fn context_limit_for_unknown_returns_none() {
+        assert_eq!(context_limit_for_model("davinci"), None);
+        assert_eq!(context_limit_for_model("text-embedding-3-large"), None);
+        assert_eq!(context_limit_for_model("totally-fake-model"), None);
+    }
+
+    #[test]
+    fn max_context_tokens_uses_configured_model() {
+        let client = OpenAiClient::new("k".into()).with_model("gpt-4o");
+        assert_eq!(client.max_context_tokens(), Some(128_000));
+    }
+
+    #[tokio::test]
+    async fn max_context_tokens_consults_model_override() {
+        use desktop_assistant_core::ports::llm::with_model_override;
+
+        let client = OpenAiClient::new("k".into()).with_model("totally-fake-model");
+        assert_eq!(client.max_context_tokens(), None);
+        let observed =
+            with_model_override("gpt-4o-mini".into(), async { client.max_context_tokens() })
+                .await;
+        assert_eq!(observed, Some(128_000));
     }
 }

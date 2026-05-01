@@ -282,6 +282,36 @@ impl ConnectionRegistry {
     pub fn rebuild_from(&mut self, config: &DaemonConfig) {
         *self = build_registry(config);
     }
+
+    /// Fire-and-forget warmup of every Ollama client's context-length
+    /// cache. Spawns one detached task per connection that calls
+    /// `OllamaClient::warm_context_length` so that subsequent
+    /// `LlmClient::max_context_tokens()` calls return the GGUF-declared
+    /// window instead of `None`. Failures (server down, model not pulled)
+    /// are silently swallowed inside the connector — `max_context_tokens`
+    /// just keeps reporting `None` and the daemon's universal fallback
+    /// applies.
+    ///
+    /// Called once at daemon startup after [`build_registry`] returns.
+    /// Must be invoked from inside a Tokio runtime.
+    pub fn spawn_ollama_warmups(&self) {
+        for (id, client) in &self.clients {
+            if let AnyLlmClient::Ollama(_) = client.as_ref() {
+                let id = id.clone();
+                let client = std::sync::Arc::clone(client);
+                tokio::spawn(async move {
+                    if let AnyLlmClient::Ollama(c) = client.as_ref() {
+                        let value = c.warm_context_length().await;
+                        tracing::debug!(
+                            connection = %id,
+                            warmed = ?value,
+                            "ollama context-length warmup completed"
+                        );
+                    }
+                });
+            }
+        }
+    }
 }
 
 impl Default for ConnectionRegistry {

@@ -556,6 +556,10 @@ async fn main() -> Result<()> {
         Some(config) => build_registry(config),
         None => registry::ConnectionRegistry::empty(),
     };
+    // Kick off `/api/show` lookups for any Ollama connections so the per-
+    // model context window is cached before the user fires the first
+    // turn. Detached: the daemon must still start when Ollama is down.
+    connection_registry.spawn_ollama_warmups();
     for status in connection_registry.status() {
         match &status.health {
             ConnectionHealth::Ok => tracing::info!(

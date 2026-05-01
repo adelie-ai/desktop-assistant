@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
@@ -13,6 +16,19 @@ use tokio_stream::StreamExt;
 ///
 /// Uses NDJSON streaming (one JSON object per line) and Ollama's native tool
 /// calling format. No authentication is required.
+///
+/// Context windows are not curated — Ollama hosts arbitrary GGUF models, so
+/// we read the value from the per-model `POST /api/show` response. Because
+/// `LlmClient::max_context_tokens` is synchronous and the source is an HTTP
+/// call, the connector caches results per-model id in
+/// [`OllamaClient::context_length_cache`]. Callers should invoke
+/// [`OllamaClient::warm_context_length`] (fire-and-forget) shortly after
+/// construction to populate the cache for `self.model`; until then,
+/// `max_context_tokens()` returns `None` and the daemon's universal
+/// fallback applies. The cache is keyed by model id so per-turn model
+/// overrides (issue #34) can be warmed independently — but a cold lookup
+/// for an overridden model still returns `None` until that model has been
+/// warmed.
 pub struct OllamaClient {
     client: Client,
     model: String,
@@ -21,6 +37,11 @@ pub struct OllamaClient {
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
+    /// Per-model cache of `/api/show`-derived context lengths. `None`
+    /// values are cached too (when `/api/show` declines to populate the
+    /// field) so we don't keep retrying. Populated by
+    /// [`Self::warm_context_length`] and [`Self::context_length_for`].
+    context_length_cache: Mutex<HashMap<String, Option<u64>>>,
 }
 
 impl OllamaClient {
@@ -41,18 +62,21 @@ impl OllamaClient {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            context_length_cache: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self.model_ready = OnceCell::new();
+        self.context_length_cache = Mutex::new(HashMap::new());
         self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self.model_ready = OnceCell::new();
+        self.context_length_cache = Mutex::new(HashMap::new());
         self
     }
 
@@ -523,6 +547,44 @@ impl OllamaClient {
 
         show.context_length()
     }
+
+    /// Populate the context-length cache for `self.model` by calling
+    /// `/api/show` and parsing the GGUF metadata. Safe to call as
+    /// fire-and-forget: failures (server down, model not pulled, malformed
+    /// response) are logged at `debug` and the cache stays empty so a
+    /// subsequent call retries.
+    ///
+    /// Returns the same value that [`Self::max_context_tokens`] will report
+    /// after this call returns. Idempotent across concurrent invocations:
+    /// the underlying `/api/show` call may run more than once if races
+    /// occur, but the last writer wins and all readers see a consistent
+    /// value once writes settle.
+    pub async fn warm_context_length(&self) -> Option<u64> {
+        self.warm_context_length_for(&self.model).await
+    }
+
+    /// Warm the context-length cache for an arbitrary model id (used when
+    /// a per-turn override targets a model other than `self.model`).
+    pub async fn warm_context_length_for(&self, model: &str) -> Option<u64> {
+        let base_url = self.base_url.trim_end_matches('/');
+        let value = self.fetch_context_limit(base_url, model).await;
+        if let Ok(mut guard) = self.context_length_cache.lock() {
+            guard.insert(model.to_string(), value);
+        }
+        value
+    }
+
+    /// Look up a cached context-length value for `model` without firing a
+    /// network request. Returns `None` when the model has not been warmed
+    /// yet *or* when `/api/show` previously declined to populate the
+    /// field; callers can't distinguish the two cases (the daemon falls
+    /// back to its universal default in either case).
+    fn cached_context_length(&self, model: &str) -> Option<u64> {
+        self.context_length_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(model).copied().flatten())
+    }
 }
 
 impl LlmClient for OllamaClient {
@@ -532,6 +594,11 @@ impl LlmClient for OllamaClient {
 
     fn get_default_base_url(&self) -> Option<&str> {
         Self::get_default_base_url()
+    }
+
+    fn max_context_tokens(&self) -> Option<u64> {
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+        self.cached_context_length(&model)
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -1213,5 +1280,103 @@ mod tests {
         tags_mock.assert_calls(1);
         pull_mock.assert_calls(1);
         embed_mock.assert_calls(2);
+    }
+
+    // --- max_context_tokens / context-length cache tests ---
+
+    #[test]
+    fn max_context_tokens_is_none_before_warmup() {
+        let client = OllamaClient::new("http://localhost:11434", "llama3.2");
+        assert_eq!(client.max_context_tokens(), None);
+    }
+
+    #[tokio::test]
+    async fn warm_context_length_populates_cache() {
+        let server = MockServer::start();
+        let show = server.mock(|when, then| {
+            when.method(POST).path("/api/show").body_includes("llama3.2");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":131072}}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let warmed = client.warm_context_length().await;
+        assert_eq!(warmed, Some(131_072));
+        assert_eq!(client.max_context_tokens(), Some(131_072));
+        show.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn warm_context_length_caches_failures_as_none() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show");
+            then.status(500).body("boom");
+        });
+
+        let client = OllamaClient::new(server.url(""), "mystery");
+        let warmed = client.warm_context_length().await;
+        assert_eq!(warmed, None);
+        assert_eq!(client.max_context_tokens(), None);
+    }
+
+    #[tokio::test]
+    async fn max_context_tokens_consults_model_override() {
+        use desktop_assistant_core::ports::llm::with_model_override;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show").body_includes("llama3.2");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":131072}}"#);
+        });
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/show")
+                .body_includes("qwen2:latest");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"qwen2.context_length":32768}}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+
+        // Warm both models — `warm_context_length` defaults to `self.model`,
+        // and `warm_context_length_for` covers the override target.
+        let _ = client.warm_context_length().await;
+        let _ = client.warm_context_length_for("qwen2:latest").await;
+
+        assert_eq!(client.max_context_tokens(), Some(131_072));
+        let observed = with_model_override("qwen2:latest".into(), async {
+            client.max_context_tokens()
+        })
+        .await;
+        assert_eq!(observed, Some(32_768));
+    }
+
+    #[tokio::test]
+    async fn max_context_tokens_for_uncached_override_is_none() {
+        use desktop_assistant_core::ports::llm::with_model_override;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show").body_includes("llama3.2");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":131072}}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let _ = client.warm_context_length().await;
+
+        // Override targets a model that hasn't been warmed: returns None
+        // (cache miss is the safe answer).
+        let observed = with_model_override("never-warmed".into(), async {
+            client.max_context_tokens()
+        })
+        .await;
+        assert_eq!(observed, None);
     }
 }
