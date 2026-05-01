@@ -150,6 +150,7 @@ impl DbusClient {
                 .into_iter()
                 .map(|(role, content)| ChatMessage { role, content })
                 .collect(),
+            model_selection: None,
         })
     }
 

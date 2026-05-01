@@ -19,6 +19,7 @@ pub struct ConversationDetail {
     pub id: String,
     pub title: String,
     pub messages: Vec<ChatMessage>,
+    pub model_selection: Option<api::ConversationModelSelectionView>,
 }
 
 impl From<api::ConversationSummary> for ConversationSummary {
@@ -47,6 +48,7 @@ impl From<api::ConversationView> for ConversationDetail {
             id: value.id,
             title: value.title,
             messages: value.messages.into_iter().map(ChatMessage::from).collect(),
+            model_selection: value.model_selection,
         }
     }
 }

@@ -255,11 +255,21 @@ impl WsClient {
     }
 
     pub async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String> {
+        self.send_prompt_with_override(conversation_id, prompt, None)
+            .await
+    }
+
+    pub async fn send_prompt_with_override(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        override_selection: Option<api::SendPromptOverride>,
+    ) -> Result<String> {
         let result = self
             .send_command(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),
                 content: prompt.to_string(),
-                override_selection: None,
+                override_selection,
             })
             .await?;
         let api::CommandResult::Ack = result else {
@@ -268,6 +278,28 @@ impl WsClient {
 
         // WS send-message ack does not include request id; first stream event carries it.
         Ok(String::new())
+    }
+
+    /// List models across every healthy connection. Pass `connection_id =
+    /// Some(_)` to scope to a single connection. `refresh = true` bypasses
+    /// connector caches (e.g. Bedrock).
+    pub async fn list_available_models(
+        &self,
+        connection_id: Option<&str>,
+        refresh: bool,
+    ) -> Result<Vec<api::ModelListing>> {
+        let result = self
+            .send_command(api::Command::ListAvailableModels {
+                connection_id: connection_id.map(str::to_string),
+                refresh,
+            })
+            .await?;
+        let api::CommandResult::Models(items) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for list_available_models"
+            ));
+        };
+        Ok(items)
     }
 }
 
