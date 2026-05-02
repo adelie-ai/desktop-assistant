@@ -15,6 +15,7 @@ mod app;
 mod backend_reasoning;
 mod config;
 mod connections;
+mod knowledge_service;
 mod model_defaults;
 mod purposes;
 mod registry;
@@ -844,6 +845,10 @@ async fn main() -> Result<()> {
 
     // Build the MCP tool executor with builtin tools
     let mut builtin_tools = BuiltinToolService::new();
+    // Hold an extra clone for the knowledge management service (#73) so
+    // both the LLM-tool path and the client-facing service embed via
+    // the same closure.
+    let embedding_fn_for_kb_service: Option<EmbedFn> = embedding_fn.clone();
     if let Some(embed_fn) = embedding_fn {
         tracing::info!(
             "enabling built-in vector search with model={}",
@@ -1334,6 +1339,29 @@ async fn main() -> Result<()> {
     let settings_service =
         Arc::new(DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle));
 
+    // Knowledge management service (#73). When a Postgres pool is
+    // configured, wire the embedding closure so client-authored entries
+    // are discoverable by the LLM tool. Without a pool, every method
+    // surfaces a uniform "not configured" error.
+    let knowledge_service = Arc::new(match (&kb_store, embedding_fn_for_kb_service.clone()) {
+        (Some(store), embed_fn) => {
+            tracing::info!("knowledge management service ready");
+            knowledge_service::AnyKnowledgeService::Configured(
+                knowledge_service::DaemonKnowledgeService::new(
+                    Arc::clone(store),
+                    embed_fn,
+                    Some(embedding_model_id.clone()),
+                ),
+            )
+        }
+        (None, _) => {
+            tracing::info!("knowledge management service unavailable (no Postgres pool)");
+            knowledge_service::AnyKnowledgeService::Unconfigured(
+                knowledge_service::UnconfiguredKnowledgeService,
+            )
+        }
+    });
+
     // Construct the shared API handler up-front so both the D-Bus and WS
     // adapters can share it (the multi-connection D-Bus interface dispatches
     // through this handler, mirroring the WS adapter).
@@ -1343,6 +1371,7 @@ async fn main() -> Result<()> {
             Arc::clone(&conversation_service),
             Arc::clone(&settings_service),
             Arc::clone(&connections_service),
+            Arc::clone(&knowledge_service),
         ));
 
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
@@ -1374,6 +1403,14 @@ async fn main() -> Result<()> {
                 b.serve_at(
                     "/org/desktopAssistant/Connections",
                     desktop_assistant_dbus::connections::DbusConnectionsAdapter::new(
+                        Arc::clone(&api_handler),
+                    ),
+                )
+            })
+            .and_then(|b| {
+                b.serve_at(
+                    "/org/desktopAssistant/Knowledge",
+                    desktop_assistant_dbus::knowledge::DbusKnowledgeAdapter::new(
                         Arc::clone(&api_handler),
                     ),
                 )

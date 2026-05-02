@@ -13,16 +13,65 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
+use desktop_assistant_core::domain::{
+    Conversation, ConversationId, ConversationSummary, KnowledgeEntry,
+};
 use desktop_assistant_core::ports::inbound::{
     AssistantService, BackendTasksSettingsView, ConnectionConfigPayload,
     ConnectionView as CoreConnectionView, ConnectorDefaultsView, ConversationService,
-    ConnectionsService, DatabaseSettingsView, EmbeddingsSettingsView, LlmSettingsView,
-    ModelListing as CoreModelListing, PersistenceSettingsView, PurposeConfigPayload,
-    PurposeKind as CorePurposeKind, PurposesView as CorePurposesView, SettingsService,
-    WsAuthSettingsView,
+    ConnectionsService, DatabaseSettingsView, EmbeddingsSettingsView, KnowledgeService,
+    LlmSettingsView, ModelListing as CoreModelListing, PersistenceSettingsView,
+    PurposeConfigPayload, PurposeKind as CorePurposeKind, PurposesView as CorePurposesView,
+    SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
+
+struct FakeKnowledge;
+impl KnowledgeService for FakeKnowledge {
+    async fn list_entries(
+        &self,
+        _limit: usize,
+        _offset: usize,
+        _tag_filter: Option<Vec<String>>,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        Ok(vec![])
+    }
+    async fn get_entry(&self, _id: String) -> Result<Option<KnowledgeEntry>, CoreError> {
+        Ok(None)
+    }
+    async fn search_entries(
+        &self,
+        _query: String,
+        _tag_filter: Option<Vec<String>>,
+        _limit: usize,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        Ok(vec![])
+    }
+    async fn create_entry(
+        &self,
+        content: String,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> Result<KnowledgeEntry, CoreError> {
+        let mut e = KnowledgeEntry::new("kb-test", content, tags);
+        e.metadata = metadata;
+        Ok(e)
+    }
+    async fn update_entry(
+        &self,
+        id: String,
+        content: String,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> Result<KnowledgeEntry, CoreError> {
+        let mut e = KnowledgeEntry::new(id, content, tags);
+        e.metadata = metadata;
+        Ok(e)
+    }
+    async fn delete_entry(&self, _id: String) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
 
 struct FakeConnections;
 impl ConnectionsService for FakeConnections {
@@ -647,6 +696,7 @@ async fn ws_ping_roundtrip() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -701,6 +751,7 @@ async fn ws_rejects_missing_bearer_token() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -736,6 +787,7 @@ async fn ws_rejects_invalid_bearer_token() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -771,6 +823,7 @@ async fn login_issues_token_for_basic_auth_username() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router_with_login(
@@ -807,6 +860,7 @@ async fn login_rejects_invalid_basic_credentials() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router_with_login(
@@ -836,6 +890,7 @@ async fn ws_get_status_roundtrip() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -890,6 +945,7 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         Arc::new(FakeConversations),
         Arc::new(StatefulSettings::new()),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -961,6 +1017,7 @@ async fn ws_send_message_ack_then_streaming_events() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -1071,6 +1128,7 @@ async fn ws_send_message_cancels_when_client_disconnects() {
         }),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router(handler, Arc::new(StaticJwtAuth));
@@ -1132,6 +1190,7 @@ async fn ws_serve_with_shutdown_exits() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1180,6 +1239,7 @@ async fn ws_allows_native_client_without_origin() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     // Empty allowlist — but no Origin header means native client, should be allowed.
@@ -1222,6 +1282,7 @@ async fn ws_rejects_browser_origin_when_allowlist_empty() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, vec![]);
@@ -1261,6 +1322,7 @@ async fn ws_allows_configured_origin() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];
@@ -1305,6 +1367,7 @@ async fn ws_rejects_non_matching_origin() {
         Arc::new(FakeConversations),
         Arc::new(FakeSettings),
         Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
     ));
 
     let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];

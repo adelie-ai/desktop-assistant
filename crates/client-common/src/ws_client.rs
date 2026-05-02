@@ -301,6 +301,121 @@ impl WsClient {
         };
         Ok(items)
     }
+
+    // --- Knowledge management (issue #73) -------------------------------
+
+    pub async fn list_knowledge_entries(
+        &self,
+        limit: u32,
+        offset: u32,
+        tag_filter: Option<Vec<String>>,
+    ) -> Result<Vec<api::KnowledgeEntryView>> {
+        let result = self
+            .send_command(api::Command::ListKnowledgeEntries {
+                limit,
+                offset,
+                tag_filter,
+            })
+            .await?;
+        let api::CommandResult::KnowledgeEntries(items) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for list_knowledge_entries"
+            ));
+        };
+        Ok(items)
+    }
+
+    pub async fn get_knowledge_entry(
+        &self,
+        id: &str,
+    ) -> Result<Option<api::KnowledgeEntryView>> {
+        let result = self
+            .send_command(api::Command::GetKnowledgeEntry { id: id.to_string() })
+            .await?;
+        let api::CommandResult::KnowledgeEntry(entry) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for get_knowledge_entry"
+            ));
+        };
+        Ok(entry)
+    }
+
+    pub async fn search_knowledge_entries(
+        &self,
+        query: &str,
+        tag_filter: Option<Vec<String>>,
+        limit: u32,
+    ) -> Result<Vec<api::KnowledgeEntryView>> {
+        let result = self
+            .send_command(api::Command::SearchKnowledgeEntries {
+                query: query.to_string(),
+                tag_filter,
+                limit,
+            })
+            .await?;
+        let api::CommandResult::KnowledgeEntries(items) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for search_knowledge_entries"
+            ));
+        };
+        Ok(items)
+    }
+
+    pub async fn create_knowledge_entry(
+        &self,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> Result<api::KnowledgeEntryView> {
+        let result = self
+            .send_command(api::Command::CreateKnowledgeEntry {
+                content: content.to_string(),
+                tags,
+                metadata,
+            })
+            .await?;
+        let api::CommandResult::KnowledgeEntryWritten(entry) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for create_knowledge_entry"
+            ));
+        };
+        Ok(entry)
+    }
+
+    pub async fn update_knowledge_entry(
+        &self,
+        id: &str,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> Result<api::KnowledgeEntryView> {
+        let result = self
+            .send_command(api::Command::UpdateKnowledgeEntry {
+                id: id.to_string(),
+                content: content.to_string(),
+                tags,
+                metadata,
+            })
+            .await?;
+        let api::CommandResult::KnowledgeEntryWritten(entry) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for update_knowledge_entry"
+            ));
+        };
+        Ok(entry)
+    }
+
+    pub async fn delete_knowledge_entry(&self, id: &str) -> Result<()> {
+        let result = self
+            .send_command(api::Command::DeleteKnowledgeEntry { id: id.to_string() })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for delete_knowledge_entry"
+            ));
+        };
+        Ok(())
+    }
 }
 
 fn build_tls_connector(

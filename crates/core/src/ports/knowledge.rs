@@ -26,6 +26,26 @@ pub trait KnowledgeBaseStore: Send + Sync {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
 
+    /// Full-text search only (no vector similarity). Used by client-side
+    /// browsers that need responsive search without embedding round-trips
+    /// (#73). The LLM tool path keeps using [`Self::search`] for hybrid
+    /// semantic+lexical match.
+    fn search_text(
+        &self,
+        query: &str,
+        tags: Option<Vec<String>>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
+
+    /// Paginated listing of all entries, ordered by `updated_at DESC, id`.
+    /// Used by the management API (#73).
+    fn list(
+        &self,
+        limit: usize,
+        offset: usize,
+        tag_filter: Option<Vec<String>>,
+    ) -> impl Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
+
     /// Delete a knowledge entry by id.
     fn delete(&self, id: &str) -> impl Future<Output = Result<(), CoreError>> + Send;
 
@@ -86,6 +106,24 @@ mod tests {
             _query_embedding: Vec<f32>,
             _tags: Option<Vec<String>>,
             _limit: usize,
+        ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+            Ok(vec![])
+        }
+
+        async fn search_text(
+            &self,
+            _query: &str,
+            _tags: Option<Vec<String>>,
+            _limit: usize,
+        ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+            Ok(vec![])
+        }
+
+        async fn list(
+            &self,
+            _limit: usize,
+            _offset: usize,
+            _tag_filter: Option<Vec<String>>,
         ) -> Result<Vec<KnowledgeEntry>, CoreError> {
             Ok(vec![])
         }

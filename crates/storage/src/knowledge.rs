@@ -111,6 +111,58 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         Ok(rows.into_iter().map(|r| r.into_entry()).collect())
     }
 
+    async fn search_text(
+        &self,
+        query: &str,
+        tags: Option<Vec<String>>,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let result_limit = limit as i64;
+        let rows: Vec<KbRow> = sqlx::query_as(
+            "WITH q AS (SELECT plainto_tsquery('english', $1) AS query)
+             SELECT id, content, tags, metadata, created_at, updated_at
+             FROM knowledge_base
+             WHERE tsv @@ (SELECT query FROM q)
+               AND ($2::text[] IS NULL OR tags && $2)
+             ORDER BY ts_rank_cd(tsv, (SELECT query FROM q)) DESC,
+                      updated_at DESC
+             LIMIT $3",
+        )
+        .bind(query)
+        .bind(&tags)
+        .bind(result_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+    }
+
+    async fn list(
+        &self,
+        limit: usize,
+        offset: usize,
+        tag_filter: Option<Vec<String>>,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let limit_i64 = limit as i64;
+        let offset_i64 = offset as i64;
+        let rows: Vec<KbRow> = sqlx::query_as(
+            "SELECT id, content, tags, metadata, created_at, updated_at
+             FROM knowledge_base
+             WHERE ($1::text[] IS NULL OR tags && $1)
+             ORDER BY updated_at DESC, id
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(&tag_filter)
+        .bind(limit_i64)
+        .bind(offset_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+    }
+
     async fn delete(&self, id: &str) -> Result<(), CoreError> {
         sqlx::query("DELETE FROM knowledge_base WHERE id = $1")
             .bind(id)
