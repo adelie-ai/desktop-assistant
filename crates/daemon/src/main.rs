@@ -1218,61 +1218,52 @@ async fn main() -> Result<()> {
         Box::new(|| uuid::Uuid::now_v7().to_string()),
     );
 
+    // Build the shared registry handle (#11): wraps the in-memory
+    // `ConnectionRegistry` plus the loaded `DaemonConfig` behind a single
+    // `RwLock` so the connections-management API can mutate config + rebuild
+    // the registry atomically. Constructed before the backend-task wiring
+    // (#68) so the dynamic-purpose `RoutingLlmClient` can read live config
+    // on every call.
+    let registry_handle = Arc::new(
+        api_surface::RegistryHandle::new(
+            daemon_config.clone().unwrap_or_default(),
+            connection_registry,
+        )
+        .with_config_path(config_path.clone()),
+    );
+
     // Build a separate LLM for backend tasks (title generation, context summary).
     //
-    // Resolution order (issue #28):
-    //   1. `[purposes.titling]` — if set, always install the backend client
-    //      so the user's chosen connection / model / effort is honoured even
-    //      when it happens to coincide with the primary.
-    //   2. `[backend_tasks.llm]` legacy block — install only if it differs
-    //      from the primary (preserving pre-#28 behaviour for unmigrated
-    //      installs that haven't authored a `[purposes]` table).
-    //
-    // Effort threading: backend tasks call `stream_completion` from
-    // `core::service` with `ReasoningConfig::default()` baked in. We can't
-    // change that without touching the core service, so we wrap the backend
-    // client in `FixedReasoningLlmClient` to substitute the purpose's
-    // mapped reasoning at the daemon layer. For the legacy path we fix it
-    // to `default()` — a transparent passthrough.
-    let purpose_titling = api_surface::resolve_purpose_dispatch(
-        daemon_config.as_ref(),
-        purposes::PurposeKind::Titling,
-    );
+    // Resolution order:
+    //   1. `[purposes.titling]` — if set, install a dynamic-purpose client
+    //      that resolves the connection/model/effort from the live config
+    //      on every call (#68). Control-panel edits take effect on the next
+    //      backend dispatch with no daemon restart.
+    //   2. `[backend_tasks.llm]` legacy block — install a static client
+    //      only if it differs from the primary (preserving pre-#28
+    //      behaviour for unmigrated installs that haven't authored a
+    //      `[purposes]` table). The legacy path remains static — migrating
+    //      it dynamic is unnecessary as authors are expected to move to
+    //      `[purposes.titling]`.
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
-    let titling_setup = match purpose_titling {
-        Some((resolved, reasoning)) => Some((resolved, reasoning, "purposes.titling")),
-        None => {
-            let resolved = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
-            if resolved.connector != resolved_primary.connector
-                || resolved.model != resolved_primary.model
-            {
-                Some((resolved, ReasoningConfig::default(), "backend_tasks.llm"))
-            } else {
-                None
-            }
-        }
-    };
-    if let Some((resolved_bt, bt_reasoning, source)) = titling_setup {
+    let titling_configured = daemon_config
+        .as_ref()
+        .and_then(|c| c.purposes.titling.as_ref())
+        .is_some();
+    if titling_configured {
         tracing::info!(
-            "backend-tasks LLM connector={}, model={}, source={}",
-            resolved_bt.connector,
-            resolved_bt.model,
-            source
+            "backend-tasks LLM source=purposes.titling (dynamic resolution per call)"
         );
-        let bt_connector = resolved_bt.connector.clone();
-        let bt_llm = build_llm_client(resolved_bt);
-        // Backend-tasks dispatch never sees a per-turn routing override —
-        // title generation and context summary are initiated server-side.
-        // Wrapping in `RoutingLlmClient` with no task-local installed
-        // always dispatches to this backend-tasks fallback, but keeps the
-        // concrete type uniform with the primary handler's `L` so
-        // `with_backend_llm` accepts it.
-        let bt_fallback = Arc::new(bt_llm);
-        let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback, bt_connector);
-        // Substitute the configured reasoning (purpose's mapped effort,
-        // or default for legacy installs) for whatever the core
-        // service's title/summary functions pass in.
-        let bt_llm = backend_reasoning::FixedReasoningLlmClient::new(bt_llm, bt_reasoning);
+        let bt_llm = routing_llm::RoutingLlmClient::new_dynamic_purpose(
+            Arc::clone(&registry_handle),
+            purposes::PurposeKind::Titling,
+        );
+        // Wrap in `FixedReasoningLlmClient(default)` purely so the
+        // backend slot's `L` matches the primary slot's `L` —
+        // `with_backend_llm(L)` requires both to be the same type. The
+        // dynamic-purpose dispatch path overrides reasoning internally,
+        // so the wrapper is a transparent passthrough here.
+        let bt_llm = backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
         let bt_llm = MaybeProfiled::from_config(
             bt_llm,
@@ -1281,19 +1272,34 @@ async fn main() -> Result<()> {
             profiling.full_content,
         );
         handler = handler.with_backend_llm(bt_llm);
+    } else {
+        let resolved_bt = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
+        if resolved_bt.connector != resolved_primary.connector
+            || resolved_bt.model != resolved_primary.model
+        {
+            tracing::info!(
+                "backend-tasks LLM connector={}, model={}, source=backend_tasks.llm",
+                resolved_bt.connector,
+                resolved_bt.model
+            );
+            let bt_connector = resolved_bt.connector.clone();
+            let bt_llm = build_llm_client(resolved_bt);
+            let bt_fallback = Arc::new(bt_llm);
+            let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback, bt_connector);
+            let bt_llm = backend_reasoning::FixedReasoningLlmClient::new(
+                bt_llm,
+                ReasoningConfig::default(),
+            );
+            let bt_llm = RetryingLlmClient::new(bt_llm, 3);
+            let bt_llm = MaybeProfiled::from_config(
+                bt_llm,
+                profiling.enabled,
+                profiling.log_path.as_deref(),
+                profiling.full_content,
+            );
+            handler = handler.with_backend_llm(bt_llm);
+        }
     }
-
-    // Build the shared registry handle (#11): wraps the in-memory
-    // `ConnectionRegistry` plus the loaded `DaemonConfig` behind a single
-    // `RwLock` so the connections-management API can mutate config + rebuild
-    // the registry atomically.
-    let registry_handle = Arc::new(
-        api_surface::RegistryHandle::new(
-            daemon_config.clone().unwrap_or_default(),
-            connection_registry,
-        )
-        .with_config_path(config_path.clone()),
-    );
 
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters
     // can call `send_prompt_with_override` and have the override/stored-

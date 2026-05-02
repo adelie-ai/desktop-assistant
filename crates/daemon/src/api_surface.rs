@@ -173,6 +173,18 @@ impl RegistryHandle {
             .clone()
     }
 
+    /// Test-only: swap the in-memory `DaemonConfig` and rebuild the
+    /// registry, bypassing disk persistence. Lets unit tests exercise the
+    /// "config mutation visible on next dispatch" property without
+    /// touching the user's real config file.
+    #[cfg(test)]
+    pub(crate) fn replace_config_for_test(&self, config: DaemonConfig) {
+        let registry = build_registry(&config);
+        let mut state = self.state.write().expect("registry state poisoned");
+        state.config = config;
+        state.registry = registry;
+    }
+
     /// Reload the registry (and re-read the config from disk). Used when
     /// external tools mutate the config file.
     #[allow(dead_code)]
