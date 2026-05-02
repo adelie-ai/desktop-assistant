@@ -99,5 +99,16 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Conversation full-text search (issue #71) — generated tsvector
+    // columns + GIN indexes on `messages` and `conversations`. Generated-
+    // stored columns auto-backfill on `ALTER TABLE`; the rewrite takes a
+    // write lock proportional to message count, so first-run on large
+    // histories may take a moment.
+    sqlx::raw_sql(include_str!(
+        "../migrations/013_conversation_message_fts.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

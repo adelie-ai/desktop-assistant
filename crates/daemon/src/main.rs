@@ -891,6 +891,21 @@ async fn main() -> Result<()> {
                 desktop_assistant_storage::execute_database_query(&pool, &sql, limit).await
             })
         }));
+
+        // Issue #71: wire conversation full-text search.
+        let cs_store = Arc::new(desktop_assistant_storage::PgConversationSearchStore::new(
+            pool.clone(),
+        ));
+        tracing::info!("wiring conversation search into builtin tools");
+        use desktop_assistant_core::ports::conversation_search::ConversationSearchStore;
+        builtin_tools = builtin_tools.with_conversation_search(Arc::new(
+            move |query, limit, role_filter| {
+                let store = Arc::clone(&cs_store);
+                Box::pin(async move {
+                    store.search_messages(&query, limit, role_filter).await
+                })
+            },
+        ));
     }
 
     if let Some(tr) = &tool_registry_store {

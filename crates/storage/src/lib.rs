@@ -1,4 +1,5 @@
 pub mod conversation;
+pub mod conversation_search;
 pub mod database;
 pub mod dreaming;
 pub mod embedding_backfill;
@@ -8,6 +9,7 @@ pub mod pool;
 pub mod tool_registry;
 
 pub use conversation::PgConversationStore;
+pub use conversation_search::PgConversationSearchStore;
 pub use database::execute_database_query;
 pub use knowledge::PgKnowledgeBaseStore;
 pub use migrate_json::{
