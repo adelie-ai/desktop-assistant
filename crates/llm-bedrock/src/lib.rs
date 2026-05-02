@@ -14,7 +14,7 @@ use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OnceCell};
@@ -58,6 +58,13 @@ pub struct BedrockClient {
     model_cache: Arc<Mutex<ModelCache>>,
     model_cache_ttl: Duration,
     clock: Arc<dyn ModelClock>,
+    /// Models discovered at runtime to reject `ConverseStream` with
+    /// tools. Populated when the static allowlist
+    /// (`supports_streaming_with_tools`) reports `true` but Bedrock
+    /// returns the specific "doesn't support tool use in streaming
+    /// mode" validation error. Per-instance so each client warms its
+    /// own cache; not shared across `BedrockClient` instances. (#67)
+    non_streaming_tools_models: Arc<Mutex<HashSet<String>>>,
 }
 
 impl BedrockClient {
@@ -83,6 +90,7 @@ impl BedrockClient {
             model_cache: Arc::new(Mutex::new(ModelCache::default())),
             model_cache_ttl: DEFAULT_MODEL_CACHE_TTL,
             clock: Arc::new(SystemClock),
+            non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -731,6 +739,67 @@ fn strip_region_prefix(id: &str) -> &str {
         .unwrap_or(id)
 }
 
+/// Whether a Bedrock model accepts tool-use requests via `ConverseStream`.
+///
+/// AWS Bedrock has a per-model restriction: some foundation models support
+/// tools via `Converse` *only*, not `ConverseStream`. Llama 3/4 fall in
+/// that bucket; Claude does not. (#67)
+///
+/// `base_id` should be the region-prefix-stripped foundation model id —
+/// `meta.llama4-…`, not `us.meta.llama4-…`. The caller is responsible
+/// for calling [`strip_region_prefix`] first.
+///
+/// Conservative: defaults to `true` for unknown models so we keep the
+/// streaming path when in doubt. The runtime fallback in `stream_completion`
+/// catches mis-classifications by parsing the specific validation error
+/// and retrying via `Converse` — that retry also memoizes the model so
+/// subsequent calls skip straight to the non-streaming path.
+fn supports_streaming_with_tools(base_id: &str) -> bool {
+    let lc = base_id.to_ascii_lowercase();
+    if lc.starts_with("meta.llama3") || lc.starts_with("meta.llama4") {
+        return false;
+    }
+    true
+}
+
+/// Detect the Bedrock validation error that signals "this model accepts
+/// tools via Converse but not ConverseStream". The exact message text is
+/// documented on the Bedrock supported-features page; matching is
+/// case-insensitive and tolerant of leading/trailing punctuation.
+fn is_streaming_tools_unsupported_message(message: &str) -> bool {
+    let lc = message.to_ascii_lowercase();
+    lc.contains("doesn't support tool use in streaming")
+        || lc.contains("does not support tool use in streaming")
+}
+
+/// Convert an `aws_smithy_types::Document` (used for non-streaming
+/// `ToolUse.input`) into a JSON string. Inverse of `json_to_document`;
+/// used by the non-streaming dispatch to produce a `ToolCall.arguments`
+/// in the same shape the streaming path emits.
+fn document_to_json_string(doc: &Document) -> String {
+    fn doc_to_value(doc: &Document) -> serde_json::Value {
+        match doc {
+            Document::Null => serde_json::Value::Null,
+            Document::Bool(b) => serde_json::Value::Bool(*b),
+            Document::Number(n) => match n {
+                Number::PosInt(v) => serde_json::Value::Number((*v).into()),
+                Number::NegInt(v) => serde_json::Value::Number((*v).into()),
+                Number::Float(v) => serde_json::Number::from_f64(*v)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+            },
+            Document::String(s) => serde_json::Value::String(s.clone()),
+            Document::Array(a) => {
+                serde_json::Value::Array(a.iter().map(doc_to_value).collect())
+            }
+            Document::Object(o) => serde_json::Value::Object(
+                o.iter().map(|(k, v)| (k.clone(), doc_to_value(v))).collect(),
+            ),
+        }
+    }
+    serde_json::to_string(&doc_to_value(doc)).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Convert a `FoundationModelSummary` into a `ModelInfo`, returning `None`
 /// if the model should be filtered out (not ACTIVE, not text/embedding, or
 /// not invocable via on-demand throughput).
@@ -957,7 +1026,7 @@ impl LlmClient for BedrockClient {
         messages: Vec<Message>,
         tools: &[ToolDefinition],
         reasoning: ReasoningConfig,
-        mut on_chunk: ChunkCallback,
+        on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let client = self.client().await?;
         let (system, api_messages) = convert_messages(&messages)?;
@@ -983,57 +1052,162 @@ impl LlmClient for BedrockClient {
             "LLM request payload"
         );
 
+        let inputs = BedrockRequestInputs {
+            model: model.clone(),
+            api_messages,
+            system,
+            tool_config,
+            inference_cfg: self.build_inference_config(),
+            additional_request_fields: build_additional_model_request_fields(
+                &model,
+                reasoning,
+            ),
+        };
+
+        // Path selection (#67):
+        // - No tools: streaming is always safe; use the streaming path.
+        // - Tools + model on the static deny-list: skip the stream attempt
+        //   and go straight to non-streaming.
+        // - Tools + runtime cache says non-streaming: same.
+        // - Otherwise: try streaming first; on the specific
+        //   "doesn't support tool use in streaming" validation error,
+        //   memoize the model and retry via non-streaming.
+        let base_model = strip_region_prefix(&model);
+        let cache_says_non_streaming = !tools.is_empty() && {
+            let cache = self.non_streaming_tools_models.lock().await;
+            cache.contains(&model)
+        };
+        let allowlist_says_non_streaming =
+            !tools.is_empty() && !supports_streaming_with_tools(base_model);
+        if cache_says_non_streaming || allowlist_says_non_streaming {
+            if allowlist_says_non_streaming {
+                tracing::debug!(
+                    model = %model,
+                    "skipping ConverseStream: model on the non-streaming-with-tools deny-list"
+                );
+            }
+            return self.dispatch_non_streaming(&client, inputs, on_chunk).await;
+        }
+
+        match self.dispatch_streaming(&client, &inputs, on_chunk).await {
+            Ok(response) => Ok(response),
+            Err(StreamingDispatchError::StreamingToolsUnsupported {
+                on_chunk,
+                detail,
+            }) => {
+                tracing::warn!(
+                    model = %model,
+                    detail,
+                    "Bedrock rejected ConverseStream with tools; retrying via Converse \
+                     and memoizing the model so future turns skip the stream attempt"
+                );
+                self.non_streaming_tools_models
+                    .lock()
+                    .await
+                    .insert(model.clone());
+                self.dispatch_non_streaming(&client, inputs, on_chunk).await
+            }
+            Err(StreamingDispatchError::Other(err)) => Err(err),
+        }
+    }
+}
+
+/// Outcome of a `ConverseStream` dispatch attempt. The "streaming with
+/// tools is unsupported" arm carries the unconsumed callback so the
+/// caller can retry against `Converse` without rebuilding it; a
+/// `ChunkCallback` is `FnOnce`-ish in spirit (boxed dyn FnMut) and
+/// passing it back avoids forcing a `Clone` bound on the trait.
+enum StreamingDispatchError {
+    StreamingToolsUnsupported {
+        on_chunk: ChunkCallback,
+        detail: String,
+    },
+    Other(CoreError),
+}
+
+/// All the per-call parameters that `ConverseStream` and `Converse`
+/// share. Built once at the top of `stream_completion` and consumed by
+/// whichever dispatch path runs (#67).
+struct BedrockRequestInputs {
+    model: String,
+    api_messages: Vec<BedrockMessage>,
+    system: Vec<SystemContentBlock>,
+    tool_config: Option<ToolConfiguration>,
+    inference_cfg: Option<aws_sdk_bedrockruntime::types::InferenceConfiguration>,
+    additional_request_fields: Option<Document>,
+}
+
+impl BedrockClient {
+    fn build_inference_config(
+        &self,
+    ) -> Option<aws_sdk_bedrockruntime::types::InferenceConfiguration> {
+        if self.temperature.is_none() && self.top_p.is_none() && self.max_tokens.is_none() {
+            return None;
+        }
+        let mut inference_cfg =
+            aws_sdk_bedrockruntime::types::InferenceConfiguration::builder();
+        if let Some(t) = self.temperature {
+            inference_cfg = inference_cfg.temperature(t as f32);
+        }
+        if let Some(p) = self.top_p {
+            inference_cfg = inference_cfg.top_p(p as f32);
+        }
+        if let Some(m) = self.max_tokens {
+            inference_cfg = inference_cfg.max_tokens(m as i32);
+        }
+        Some(inference_cfg.build())
+    }
+
+    /// Attempt the streaming dispatch. The success path mirrors the
+    /// pre-#67 implementation; the error path tags the specific
+    /// "tools-in-streaming-mode" validation error so the caller can
+    /// transparently fall back to `Converse`.
+    async fn dispatch_streaming(
+        &self,
+        client: &Client,
+        inputs: &BedrockRequestInputs,
+        mut on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, StreamingDispatchError> {
         let mut request = client
             .converse_stream()
-            .model_id(model.clone())
-            .set_messages(Some(api_messages));
-
-        if self.temperature.is_some() || self.top_p.is_some() || self.max_tokens.is_some() {
-            let mut inference_cfg =
-                aws_sdk_bedrockruntime::types::InferenceConfiguration::builder();
-            if let Some(t) = self.temperature {
-                inference_cfg = inference_cfg.temperature(t as f32);
-            }
-            if let Some(p) = self.top_p {
-                inference_cfg = inference_cfg.top_p(p as f32);
-            }
-            if let Some(m) = self.max_tokens {
-                inference_cfg = inference_cfg.max_tokens(m as i32);
-            }
-            request = request.inference_config(inference_cfg.build());
+            .model_id(inputs.model.clone())
+            .set_messages(Some(inputs.api_messages.clone()));
+        if let Some(cfg) = inputs.inference_cfg.clone() {
+            request = request.inference_config(cfg);
         }
-
-        if !system.is_empty() {
-            request = request.set_system(Some(system));
+        if !inputs.system.is_empty() {
+            request = request.set_system(Some(inputs.system.clone()));
         }
-        if let Some(cfg) = tool_config {
+        if let Some(cfg) = inputs.tool_config.clone() {
             request = request.tool_config(cfg);
         }
-
-        // Extended-thinking reasoning for Claude-family Bedrock models.
-        // Passed via `additional_model_request_fields` with the same
-        // `thinking: { type: "enabled", budget_tokens: N }` shape as the
-        // Anthropic native API. For non-Claude models this is a no-op.
-        // Keyed on the resolved (possibly-overridden) model so a per-turn
-        // override to a Claude model gets the thinking block even when
-        // the connection's default is non-Claude.
-        if let Some(extra) = build_additional_model_request_fields(&model, reasoning) {
+        if let Some(extra) = inputs.additional_request_fields.clone() {
             request = request.additional_model_request_fields(extra);
         }
 
-        let response = request.send().await.map_err(map_converse_stream_error)?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(detail) = streaming_tools_unsupported_detail(&e) {
+                    return Err(StreamingDispatchError::StreamingToolsUnsupported {
+                        on_chunk,
+                        detail,
+                    });
+                }
+                return Err(StreamingDispatchError::Other(map_converse_stream_error(e)));
+            }
+        };
 
         let mut stream = response.stream;
-
         let mut text = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
 
-        while let Some(event) = stream
-            .recv()
-            .await
-            .map_err(|e| CoreError::Llm(format!("Bedrock stream receive failed: {e}")))?
-        {
+        while let Some(event) = stream.recv().await.map_err(|e| {
+            StreamingDispatchError::Other(CoreError::Llm(format!(
+                "Bedrock stream receive failed: {e}"
+            )))
+        })? {
             if !apply_stream_event(
                 event,
                 &mut text,
@@ -1046,7 +1220,6 @@ impl LlmClient for BedrockClient {
         }
 
         let tool_calls = tool_acc.into_tool_calls();
-
         let mut response = if tool_calls.is_empty() {
             LlmResponse::text(text)
         } else {
@@ -1056,6 +1229,166 @@ impl LlmClient for BedrockClient {
             response = response.with_usage(usage);
         }
         Ok(response)
+    }
+
+    /// Non-streaming dispatch via Bedrock's `Converse` API. Used for
+    /// models that reject tools in streaming mode (#67). Synthesises a
+    /// single `on_chunk` call with the full text so the upstream
+    /// service contract — "the callback fires at least once with the
+    /// model's prose output" — is preserved.
+    async fn dispatch_non_streaming(
+        &self,
+        client: &Client,
+        inputs: BedrockRequestInputs,
+        mut on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let mut request = client
+            .converse()
+            .model_id(inputs.model.clone())
+            .set_messages(Some(inputs.api_messages));
+        if let Some(cfg) = inputs.inference_cfg {
+            request = request.inference_config(cfg);
+        }
+        if !inputs.system.is_empty() {
+            request = request.set_system(Some(inputs.system));
+        }
+        if let Some(cfg) = inputs.tool_config {
+            request = request.tool_config(cfg);
+        }
+        if let Some(extra) = inputs.additional_request_fields {
+            request = request.additional_model_request_fields(extra);
+        }
+
+        let response = request.send().await.map_err(map_converse_error)?;
+
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        if let Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(message)) =
+            response.output
+        {
+            for block in message.content() {
+                match block {
+                    ContentBlock::Text(s) => text.push_str(s),
+                    ContentBlock::ToolUse(tool_use) => {
+                        tool_calls.push(ToolCall::new(
+                            tool_use.tool_use_id().to_string(),
+                            tool_use.name().to_string(),
+                            document_to_json_string(tool_use.input()),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Fire the callback once with the full text so the upstream
+        // service treats this as a (degenerate) stream rather than
+        // skipping its post-completion processing. Bail without erroring
+        // if the callback signals abort — the response is fully built
+        // either way.
+        if !text.is_empty() {
+            let _ = on_chunk(text.clone());
+        }
+
+        let token_usage = response.usage.as_ref().map(|usage| TokenUsage {
+            input_tokens: Some(usage.input_tokens() as u64),
+            output_tokens: Some(usage.output_tokens() as u64),
+            ..Default::default()
+        });
+
+        let mut llm_response = if tool_calls.is_empty() {
+            LlmResponse::text(text)
+        } else {
+            LlmResponse::with_tool_calls(text, tool_calls)
+        };
+        if let Some(usage) = token_usage {
+            llm_response = llm_response.with_usage(usage);
+        }
+        Ok(llm_response)
+    }
+}
+
+/// Map a Bedrock `Converse` SDK error to `CoreError`. Mirrors
+/// `map_converse_stream_error` but for the non-streaming op (#67).
+fn map_converse_error(
+    e: aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::converse::ConverseError,
+    >,
+) -> CoreError {
+    use aws_sdk_bedrockruntime::operation::converse::ConverseError;
+    if let Some(ConverseError::ValidationException(ve)) = e.as_service_error() {
+        let raw = ve.message().unwrap_or("unknown");
+        if let Some((prompt_tokens, max_tokens)) = parse_prompt_too_long(raw) {
+            tracing::warn!(
+                prompt_tokens,
+                max_tokens,
+                "Bedrock rejected non-streaming request for context overflow"
+            );
+            return CoreError::ContextOverflow {
+                prompt_tokens: Some(prompt_tokens),
+                max_tokens: Some(max_tokens),
+                detail: format!("Bedrock validation error: {raw}"),
+            };
+        }
+    }
+    let detail = match e.as_service_error() {
+        Some(ConverseError::ValidationException(ve)) => {
+            format!("validation error: {}", ve.message().unwrap_or("unknown"))
+        }
+        Some(ConverseError::ThrottlingException(te)) => {
+            return CoreError::RateLimited {
+                retry_after: None,
+                detail: format!("Bedrock throttling: {}", te.message().unwrap_or("unknown")),
+            };
+        }
+        Some(ConverseError::ServiceUnavailableException(se)) => {
+            return CoreError::RateLimited {
+                retry_after: None,
+                detail: format!(
+                    "Bedrock service unavailable: {}",
+                    se.message().unwrap_or("unknown")
+                ),
+            };
+        }
+        Some(ConverseError::ModelNotReadyException(mr)) => {
+            return CoreError::ModelLoading {
+                detail: format!(
+                    "Bedrock model not ready: {}",
+                    mr.message().unwrap_or("unknown")
+                ),
+            };
+        }
+        Some(ConverseError::AccessDeniedException(ad)) => {
+            format!("access denied: {}", ad.message().unwrap_or("unknown"))
+        }
+        Some(ConverseError::ModelTimeoutException(mt)) => {
+            format!("model timeout: {}", mt.message().unwrap_or("unknown"))
+        }
+        Some(other) => format!("{other}"),
+        None => format!("{e:#}"),
+    };
+    tracing::warn!("Bedrock converse error: {detail}");
+    CoreError::Llm(format!("Bedrock converse request failed: {detail}"))
+}
+
+/// If the SDK error is the specific "tool use in streaming mode is
+/// unsupported" validation, return the raw message; otherwise `None`.
+/// Used by `dispatch_streaming` to flag the case where we should fall
+/// back to non-streaming. (#67)
+fn streaming_tools_unsupported_detail(
+    e: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
+    >,
+) -> Option<String> {
+    use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+    let ConverseStreamError::ValidationException(ve) = e.as_service_error()? else {
+        return None;
+    };
+    let raw = ve.message().unwrap_or("");
+    if is_streaming_tools_unsupported_message(raw) {
+        Some(raw.to_string())
+    } else {
+        None
     }
 }
 
@@ -1935,5 +2268,79 @@ mod tests {
         // AccessDenied has no dedicated structured variant — caller
         // falls through to the generic `CoreError::Llm` formatting.
         assert!(map_converse_stream_service_error(&svc_err).is_none());
+    }
+
+    // --- #67: tools-in-streaming-mode fallback -------------------------------
+
+    #[test]
+    fn supports_streaming_with_tools_denies_llama_family() {
+        // Llama 3 / 4 reject tools in streaming mode; everything else
+        // is currently assumed safe (and the runtime fallback covers
+        // mis-classifications).
+        assert!(!supports_streaming_with_tools("meta.llama4-maverick-17b-instruct-v1:0"));
+        assert!(!supports_streaming_with_tools("meta.llama4-scout-17b-instruct-v1:0"));
+        assert!(!supports_streaming_with_tools("meta.llama3-70b-instruct-v1:0"));
+
+        // Claude is the canonical safe case.
+        assert!(supports_streaming_with_tools("anthropic.claude-sonnet-4-6"));
+        // Unknown models default to the streaming path so we don't
+        // regress legitimate users; the runtime fallback catches misses.
+        assert!(supports_streaming_with_tools("amazon.nova-premier-v1:0"));
+        assert!(supports_streaming_with_tools("future.unknown-model"));
+    }
+
+    #[test]
+    fn supports_streaming_with_tools_works_on_stripped_id() {
+        // Caller is responsible for stripping the region prefix; the
+        // helper itself doesn't strip. Assert the contract: passing
+        // the prefixed form would mis-classify (currently safe because
+        // unknown→true, but still worth pinning).
+        let stripped = strip_region_prefix("us.meta.llama4-maverick-17b-instruct-v1:0");
+        assert!(!supports_streaming_with_tools(stripped));
+    }
+
+    #[test]
+    fn detect_streaming_tools_unsupported_message() {
+        assert!(is_streaming_tools_unsupported_message(
+            "This model doesn't support tool use in streaming mode."
+        ));
+        assert!(is_streaming_tools_unsupported_message(
+            "Validation: this model does not support tool use in streaming mode"
+        ));
+        // Unrelated validation errors must NOT match.
+        assert!(!is_streaming_tools_unsupported_message(
+            "prompt is too long: 203524 tokens > 200000 maximum"
+        ));
+        assert!(!is_streaming_tools_unsupported_message(""));
+    }
+
+    #[test]
+    fn document_to_json_round_trips() {
+        // Build a Document of every shape the SDK might emit and verify
+        // we serialize back into the same JSON the streaming path would
+        // produce. Used as the source for `ToolCall.arguments` in the
+        // non-streaming dispatch (#67).
+        use std::collections::HashMap;
+
+        let mut inner = HashMap::new();
+        inner.insert("flag".to_string(), Document::Bool(true));
+        inner.insert("count".to_string(), Document::Number(Number::PosInt(42)));
+        inner.insert(
+            "items".to_string(),
+            Document::Array(vec![
+                Document::String("a".to_string()),
+                Document::Null,
+            ]),
+        );
+        let doc = Document::Object(inner);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&document_to_json_string(&doc)).expect("valid JSON");
+        assert_eq!(json["flag"], serde_json::json!(true));
+        assert_eq!(json["count"], serde_json::json!(42));
+        assert_eq!(
+            json["items"],
+            serde_json::json!(["a", serde_json::Value::Null])
+        );
     }
 }
