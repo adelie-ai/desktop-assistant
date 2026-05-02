@@ -1,5 +1,6 @@
 pub mod connections;
 pub mod conversation;
+pub mod knowledge;
 pub mod settings;
 
 use desktop_assistant_core::ports::inbound::AssistantService;

@@ -6,9 +6,10 @@
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
+use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
-    ConversationModelSelection, ConversationService, DispatchWarning, Effort,
+    ConversationModelSelection, ConversationService, DispatchWarning, Effort, KnowledgeService,
     PromptSelectionOverride, PurposeConfigPayload, PurposeKind, SettingsService,
 };
 use thiserror::Error;
@@ -73,37 +74,42 @@ pub trait EventSink: Send + Sync {
 
 const STREAM_EVENT_BUFFER: usize = 64;
 
-pub struct DefaultAssistantApiHandler<A, C, S, N>
+pub struct DefaultAssistantApiHandler<A, C, S, N, K>
 where
     A: AssistantService + 'static,
     C: ConversationService + 'static,
     S: SettingsService + 'static,
     N: ConnectionsService + 'static,
+    K: KnowledgeService + 'static,
 {
     assistant: Arc<A>,
     conversations: Arc<C>,
     settings: Arc<S>,
     connections: Arc<N>,
+    knowledge: Arc<K>,
 }
 
-impl<A, C, S, N> DefaultAssistantApiHandler<A, C, S, N>
+impl<A, C, S, N, K> DefaultAssistantApiHandler<A, C, S, N, K>
 where
     A: AssistantService + 'static,
     C: ConversationService + 'static,
     S: SettingsService + 'static,
     N: ConnectionsService + 'static,
+    K: KnowledgeService + 'static,
 {
     pub fn new(
         assistant: Arc<A>,
         conversations: Arc<C>,
         settings: Arc<S>,
         connections: Arc<N>,
+        knowledge: Arc<K>,
     ) -> Self {
         Self {
             assistant,
             conversations,
             settings,
             connections,
+            knowledge,
         }
     }
 
@@ -364,13 +370,25 @@ fn dispatch_warning_to_api(w: DispatchWarning) -> api::ConversationWarning {
     }
 }
 
+fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
+    api::KnowledgeEntryView {
+        id: e.id,
+        content: e.content,
+        tags: e.tags,
+        metadata: e.metadata,
+        created_at: e.created_at,
+        updated_at: e.updated_at,
+    }
+}
+
 #[async_trait::async_trait]
-impl<A, C, S, N> AssistantApiHandler for DefaultAssistantApiHandler<A, C, S, N>
+impl<A, C, S, N, K> AssistantApiHandler for DefaultAssistantApiHandler<A, C, S, N, K>
 where
     A: AssistantService + 'static,
     C: ConversationService + 'static,
     S: SettingsService + 'static,
     N: ConnectionsService + 'static,
+    K: KnowledgeService + 'static,
 {
     async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult> {
         match cmd {
@@ -587,6 +605,82 @@ where
             } => {
                 self.settings
                     .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            // Knowledge base management (issue #73)
+            api::Command::ListKnowledgeEntries {
+                limit,
+                offset,
+                tag_filter,
+            } => {
+                let entries = self
+                    .knowledge
+                    .list_entries(limit as usize, offset as usize, tag_filter)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::KnowledgeEntries(
+                    entries.into_iter().map(knowledge_entry_to_view).collect(),
+                ))
+            }
+            api::Command::GetKnowledgeEntry { id } => {
+                let entry = self
+                    .knowledge
+                    .get_entry(id)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::KnowledgeEntry(
+                    entry.map(knowledge_entry_to_view),
+                ))
+            }
+            api::Command::SearchKnowledgeEntries {
+                query,
+                tag_filter,
+                limit,
+            } => {
+                let entries = self
+                    .knowledge
+                    .search_entries(query, tag_filter, limit as usize)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::KnowledgeEntries(
+                    entries.into_iter().map(knowledge_entry_to_view).collect(),
+                ))
+            }
+            api::Command::CreateKnowledgeEntry {
+                content,
+                tags,
+                metadata,
+            } => {
+                let entry = self
+                    .knowledge
+                    .create_entry(content, tags, metadata)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::KnowledgeEntryWritten(
+                    knowledge_entry_to_view(entry),
+                ))
+            }
+            api::Command::UpdateKnowledgeEntry {
+                id,
+                content,
+                tags,
+                metadata,
+            } => {
+                let entry = self
+                    .knowledge
+                    .update_entry(id, content, tags, metadata)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::KnowledgeEntryWritten(
+                    knowledge_entry_to_view(entry),
+                ))
+            }
+            api::Command::DeleteKnowledgeEntry { id } => {
+                self.knowledge
+                    .delete_entry(id)
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)
@@ -899,6 +993,56 @@ mod tests {
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FakeKnowledge;
+    impl desktop_assistant_core::ports::inbound::KnowledgeService for FakeKnowledge {
+        async fn list_entries(
+            &self,
+            _limit: usize,
+            _offset: usize,
+            _tag_filter: Option<Vec<String>>,
+        ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_entry(
+            &self,
+            _id: String,
+        ) -> Result<Option<KnowledgeEntry>, CoreError> {
+            Ok(None)
+        }
+        async fn search_entries(
+            &self,
+            _query: String,
+            _tag_filter: Option<Vec<String>>,
+            _limit: usize,
+        ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+            Ok(vec![])
+        }
+        async fn create_entry(
+            &self,
+            content: String,
+            tags: Vec<String>,
+            metadata: serde_json::Value,
+        ) -> Result<KnowledgeEntry, CoreError> {
+            let mut e = KnowledgeEntry::new("kb-test", content, tags);
+            e.metadata = metadata;
+            Ok(e)
+        }
+        async fn update_entry(
+            &self,
+            id: String,
+            content: String,
+            tags: Vec<String>,
+            metadata: serde_json::Value,
+        ) -> Result<KnowledgeEntry, CoreError> {
+            let mut e = KnowledgeEntry::new(id, content, tags);
+            e.metadata = metadata;
+            Ok(e)
+        }
+        async fn delete_entry(&self, _id: String) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
 
     struct FakeConnections;
     impl ConnectionsService for FakeConnections {
@@ -1520,6 +1664,7 @@ mod tests {
             Arc::new(FakeConversations),
             Arc::new(FakeSettings),
             Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
         );
 
         let res = h.handle_command(api::Command::Ping).await.unwrap();
@@ -1538,6 +1683,7 @@ mod tests {
             Arc::new(FakeConversations),
             Arc::new(FakeSettings),
             Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
         );
 
         let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
@@ -1561,6 +1707,7 @@ mod tests {
             }),
             Arc::new(FakeSettings),
             Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
         );
 
         h.handle_send_message("c1".into(), "hi".into(), "r1".into(), Arc::new(DropSink))
@@ -1578,6 +1725,7 @@ mod tests {
             Arc::new(FakeConversations),
             Arc::clone(&settings),
             Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
         );
 
         let res = h.handle_command(api::Command::GetConfig).await.unwrap();
@@ -1597,6 +1745,7 @@ mod tests {
             Arc::new(FakeConversations),
             Arc::clone(&settings),
             Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
         );
 
         let res = h

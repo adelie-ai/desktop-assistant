@@ -131,6 +131,44 @@ pub enum Command {
         config: PurposeConfigView,
     },
 
+    // Knowledge base management (issue #73).
+    ListKnowledgeEntries {
+        #[serde(default = "default_kb_limit")]
+        limit: u32,
+        #[serde(default)]
+        offset: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<Vec<String>>,
+    },
+    GetKnowledgeEntry {
+        id: String,
+    },
+    SearchKnowledgeEntries {
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_filter: Option<Vec<String>>,
+        #[serde(default = "default_kb_limit")]
+        limit: u32,
+    },
+    CreateKnowledgeEntry {
+        content: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        metadata: serde_json::Value,
+    },
+    UpdateKnowledgeEntry {
+        id: String,
+        content: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        metadata: serde_json::Value,
+    },
+    DeleteKnowledgeEntry {
+        id: String,
+    },
+
     // MCP server management
     ListMcpServers,
     AddMcpServer {
@@ -161,6 +199,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_kb_limit() -> u32 {
+    50
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandResult {
@@ -185,7 +227,25 @@ pub enum CommandResult {
     Models(Vec<ModelListing>),
     Purposes(PurposesView),
 
+    KnowledgeEntries(Vec<KnowledgeEntryView>),
+    KnowledgeEntry(Option<KnowledgeEntryView>),
+    KnowledgeEntryWritten(KnowledgeEntryView),
+
     Ack,
+}
+
+/// Wire-format view of a knowledge base entry. Mirrors
+/// `desktop_assistant_core::domain::KnowledgeEntry` but lives here so
+/// transports and clients depend only on `api-model`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeEntryView {
+    pub id: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

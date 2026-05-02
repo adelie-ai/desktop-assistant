@@ -1,5 +1,5 @@
 use crate::CoreError;
-use crate::domain::{Conversation, ConversationId, ConversationSummary};
+use crate::domain::{Conversation, ConversationId, ConversationSummary, KnowledgeEntry};
 use crate::ports::llm::{ChunkCallback, ModelInfo, StatusCallback};
 
 #[derive(Debug, Clone)]
@@ -571,6 +571,62 @@ pub trait SettingsService: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
+/// Inbound port for client-facing knowledge base management (#73).
+///
+/// Distinct from the LLM-facing [`builtin_knowledge_base_*`][1] tools:
+/// adapters dispatch through this trait so client UIs (GTK browser, etc.)
+/// can browse, search, edit, and delete entries directly. Writes go
+/// through the same chunk-and-embed pipeline as the tool path so
+/// client-authored entries remain discoverable by the LLM.
+///
+/// `search_entries` is full-text only (no embedding round-trip on the
+/// client) — the LLM tool keeps the hybrid path.
+///
+/// [1]: crate::ports::knowledge::KnowledgeBaseStore
+pub trait KnowledgeService: Send + Sync {
+    fn list_entries(
+        &self,
+        limit: usize,
+        offset: usize,
+        tag_filter: Option<Vec<String>>,
+    ) -> impl std::future::Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
+
+    fn get_entry(
+        &self,
+        id: String,
+    ) -> impl std::future::Future<Output = Result<Option<KnowledgeEntry>, CoreError>> + Send;
+
+    fn search_entries(
+        &self,
+        query: String,
+        tag_filter: Option<Vec<String>>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
+
+    /// Create a new entry. The daemon assigns the id, embeds the
+    /// content, and records the embedding model used.
+    fn create_entry(
+        &self,
+        content: String,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<KnowledgeEntry, CoreError>> + Send;
+
+    /// Replace an existing entry's content/tags/metadata. Re-embeds.
+    fn update_entry(
+        &self,
+        id: String,
+        content: String,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<KnowledgeEntry, CoreError>> + Send;
+
+    fn delete_entry(
+        &self,
+        id: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,4 +659,5 @@ mod tests {
     // but we verify it's implementable via the service tests in service.rs.
     fn _assert_conversation_service<T: ConversationService>() {}
     fn _assert_settings_service<T: SettingsService>() {}
+    fn _assert_knowledge_service<T: KnowledgeService>() {}
 }

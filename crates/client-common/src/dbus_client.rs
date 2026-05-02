@@ -1,4 +1,5 @@
 use anyhow::Result;
+use desktop_assistant_api_model as api;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use zbus::Connection;
@@ -6,9 +7,44 @@ use zbus::Connection;
 use crate::signal::SignalEvent;
 use crate::types::{ChatMessage, ConversationDetail, ConversationSummary};
 
+/// Encode a tag filter for the JSON-string D-Bus argument. `None` and
+/// `Some(empty)` both serialise to `"null"`, matching the parsing on
+/// the server side (#73).
+fn tag_filter_to_json(filter: &Option<Vec<String>>) -> String {
+    match filter {
+        Some(tags) if !tags.is_empty() => {
+            serde_json::to_string(tags).unwrap_or_else(|_| "null".to_string())
+        }
+        _ => "null".to_string(),
+    }
+}
+
+fn decode_entries(raw: &str) -> Result<Vec<api::KnowledgeEntryView>> {
+    let envelope: api::CommandResult =
+        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("decoding entries: {e}"))?;
+    match envelope {
+        api::CommandResult::KnowledgeEntries(items) => Ok(items),
+        other => Err(anyhow::anyhow!(
+            "unexpected dbus response for knowledge entries: {other:?}"
+        )),
+    }
+}
+
+fn decode_entry_written(raw: &str) -> Result<api::KnowledgeEntryView> {
+    let envelope: api::CommandResult =
+        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("decoding entry: {e}"))?;
+    match envelope {
+        api::CommandResult::KnowledgeEntryWritten(entry) => Ok(entry),
+        other => Err(anyhow::anyhow!(
+            "unexpected dbus response for knowledge entry write: {other:?}"
+        )),
+    }
+}
+
 const DEFAULT_DBUS_SERVICE: &str = "org.desktopAssistant";
 const DBUS_CONVERSATIONS_PATH: &str = "/org/desktopAssistant/Conversations";
 const DBUS_SETTINGS_PATH: &str = "/org/desktopAssistant/Settings";
+const DBUS_KNOWLEDGE_PATH: &str = "/org/desktopAssistant/Knowledge";
 
 #[zbus::proxy(interface = "org.desktopAssistant.Conversations")]
 trait Conversations {
@@ -65,6 +101,42 @@ trait Settings {
     async fn generate_ws_jwt(&self, subject: &str) -> zbus::fdo::Result<String>;
 }
 
+#[zbus::proxy(interface = "org.desktopAssistant.Knowledge")]
+trait Knowledge {
+    async fn list_entries(
+        &self,
+        limit: u32,
+        offset: u32,
+        tag_filter_json: &str,
+    ) -> zbus::fdo::Result<String>;
+
+    async fn get_entry(&self, id: &str) -> zbus::fdo::Result<String>;
+
+    async fn search_entries(
+        &self,
+        query: &str,
+        tag_filter_json: &str,
+        limit: u32,
+    ) -> zbus::fdo::Result<String>;
+
+    async fn create_entry(
+        &self,
+        content: &str,
+        tags_json: &str,
+        metadata_json: &str,
+    ) -> zbus::fdo::Result<String>;
+
+    async fn update_entry(
+        &self,
+        id: &str,
+        content: &str,
+        tags_json: &str,
+        metadata_json: &str,
+    ) -> zbus::fdo::Result<String>;
+
+    async fn delete_entry(&self, id: &str) -> zbus::fdo::Result<()>;
+}
+
 fn resolve_dbus_service_name() -> String {
     std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
@@ -87,6 +159,7 @@ pub async fn generate_ws_jwt(subject: &str) -> Result<String> {
 
 pub struct DbusClient {
     proxy: ConversationsProxy<'static>,
+    knowledge: KnowledgeProxy<'static>,
 }
 
 impl DbusClient {
@@ -94,11 +167,16 @@ impl DbusClient {
         let connection = Connection::session().await?;
         let service_name = resolve_dbus_service_name();
         let proxy = ConversationsProxy::builder(&connection)
-            .destination(service_name)?
+            .destination(service_name.clone())?
             .path(DBUS_CONVERSATIONS_PATH)?
             .build()
             .await?;
-        Ok(Self { proxy })
+        let knowledge = KnowledgeProxy::builder(&connection)
+            .destination(service_name)?
+            .path(DBUS_KNOWLEDGE_PATH)?
+            .build()
+            .await?;
+        Ok(Self { proxy, knowledge })
     }
 
     pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
@@ -172,6 +250,89 @@ impl DbusClient {
     pub async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String> {
         let request_id = self.proxy.send_prompt(conversation_id, prompt).await?;
         Ok(request_id)
+    }
+
+    // --- Knowledge management (issue #73) -------------------------------
+
+    pub async fn list_knowledge_entries(
+        &self,
+        limit: u32,
+        offset: u32,
+        tag_filter: Option<Vec<String>>,
+    ) -> Result<Vec<api::KnowledgeEntryView>> {
+        let raw = self
+            .knowledge
+            .list_entries(limit, offset, &tag_filter_to_json(&tag_filter))
+            .await?;
+        decode_entries(&raw)
+    }
+
+    pub async fn get_knowledge_entry(
+        &self,
+        id: &str,
+    ) -> Result<Option<api::KnowledgeEntryView>> {
+        let raw = self.knowledge.get_entry(id).await?;
+        let envelope: api::CommandResult = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("decoding get_entry response: {e}"))?;
+        match envelope {
+            api::CommandResult::KnowledgeEntry(entry) => Ok(entry),
+            other => Err(anyhow::anyhow!(
+                "unexpected dbus response for get_knowledge_entry: {other:?}"
+            )),
+        }
+    }
+
+    pub async fn search_knowledge_entries(
+        &self,
+        query: &str,
+        tag_filter: Option<Vec<String>>,
+        limit: u32,
+    ) -> Result<Vec<api::KnowledgeEntryView>> {
+        let raw = self
+            .knowledge
+            .search_entries(query, &tag_filter_to_json(&tag_filter), limit)
+            .await?;
+        decode_entries(&raw)
+    }
+
+    pub async fn create_knowledge_entry(
+        &self,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> Result<api::KnowledgeEntryView> {
+        let tags_json =
+            serde_json::to_string(&tags).map_err(|e| anyhow::anyhow!("encoding tags: {e}"))?;
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| anyhow::anyhow!("encoding metadata: {e}"))?;
+        let raw = self
+            .knowledge
+            .create_entry(content, &tags_json, &metadata_json)
+            .await?;
+        decode_entry_written(&raw)
+    }
+
+    pub async fn update_knowledge_entry(
+        &self,
+        id: &str,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> Result<api::KnowledgeEntryView> {
+        let tags_json =
+            serde_json::to_string(&tags).map_err(|e| anyhow::anyhow!("encoding tags: {e}"))?;
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| anyhow::anyhow!("encoding metadata: {e}"))?;
+        let raw = self
+            .knowledge
+            .update_entry(id, content, &tags_json, &metadata_json)
+            .await?;
+        decode_entry_written(&raw)
+    }
+
+    pub async fn delete_knowledge_entry(&self, id: &str) -> Result<()> {
+        self.knowledge.delete_entry(id).await?;
+        Ok(())
     }
 
     pub async fn subscribe_signals(&self) -> Result<mpsc::UnboundedReceiver<SignalEvent>> {
