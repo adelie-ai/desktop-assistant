@@ -24,10 +24,12 @@ use std::sync::Arc;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig,
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig, with_model_override,
 };
 
+use crate::api_surface::RegistryHandle;
 use crate::connections::ConnectionId;
+use crate::purposes::PurposeKind;
 use crate::registry::AnyLlmClient;
 
 tokio::task_local! {
@@ -58,61 +60,170 @@ pub(crate) fn active_client_is_set() -> bool {
     ACTIVE_CLIENT.try_with(|_| ()).is_ok()
 }
 
+/// Fallback resolution mode for [`RoutingLlmClient`]. Controls what the
+/// wrapper dispatches to when no per-turn [`ACTIVE_CLIENT`] task-local is
+/// installed.
+#[derive(Clone)]
+pub enum FallbackMode {
+    /// Static client captured at construction. Used by the primary
+    /// (interactive) slot — dispatch reads `ACTIVE_CLIENT` first, then
+    /// falls back to this client for legacy callers without an override.
+    Static {
+        client: Arc<AnyLlmClient>,
+        /// Connector-type tag retained for diagnostics.
+        #[allow(dead_code)]
+        connector_type: String,
+    },
+    /// Resolve the target client from a [`RegistryHandle`] on every
+    /// dispatch by re-reading the named purpose's config. Used by the
+    /// backend-tasks slot so titling/dreaming pick up control-panel edits
+    /// without a daemon restart (issue #68). Always ignores
+    /// `ACTIVE_CLIENT` — backend tasks must not inherit the user's
+    /// per-turn model override even when invoked inside a `send_prompt`
+    /// scope.
+    DynamicPurpose {
+        registry: Arc<RegistryHandle>,
+        purpose: PurposeKind,
+    },
+}
+
 /// The handler's LLM facade. Delegates to the per-turn active client when
-/// one is installed, or to the static fallback otherwise.
+/// one is installed (Static mode only), or to the configured fallback
+/// otherwise.
 ///
 /// Note that `list_models`, capability flags, and default-model accessors
-/// always delegate to the fallback — they describe the handler's
-/// configured interactive model and are not meaningfully per-turn.
+/// always delegate to the Static fallback — they describe the handler's
+/// configured interactive model and are not meaningfully per-turn. The
+/// DynamicPurpose mode is only useful for `stream_completion` paths.
 #[derive(Clone)]
 pub struct RoutingLlmClient {
-    /// Client used when no task-local override is installed (e.g. title
-    /// generation run outside `send_prompt`, dreaming jobs that own
-    /// their own `llm` handle).
-    fallback: Arc<AnyLlmClient>,
-    /// Static fallback connector-type tag. Only used for diagnostics.
-    #[allow(dead_code)]
-    fallback_connector_type: String,
+    fallback: FallbackMode,
 }
 
 impl RoutingLlmClient {
+    /// Static-fallback constructor. Used by the primary (interactive)
+    /// slot.
     pub fn new(fallback: Arc<AnyLlmClient>, fallback_connector_type: String) -> Self {
         Self {
-            fallback,
-            fallback_connector_type,
+            fallback: FallbackMode::Static {
+                client: fallback,
+                connector_type: fallback_connector_type,
+            },
         }
     }
 
-    /// Resolve the current turn's active client. Returns the task-local
-    /// override if set, or the static fallback otherwise.
-    fn resolve(&self) -> Arc<AnyLlmClient> {
+    /// Dynamic-purpose constructor. Each `stream_completion` call resolves
+    /// the named purpose against the live `RegistryHandle.snapshot_config`
+    /// and dispatches to the registry's client for the resolved
+    /// connection, with the resolved model override and effort-mapped
+    /// reasoning installed for the duration of the call.
+    pub fn new_dynamic_purpose(registry: Arc<RegistryHandle>, purpose: PurposeKind) -> Self {
+        Self {
+            fallback: FallbackMode::DynamicPurpose { registry, purpose },
+        }
+    }
+
+    /// Snapshot of the static fallback client for accessor delegation
+    /// (`list_models`, `max_context_tokens`, etc.). Returns `None` for
+    /// dynamic-purpose wrappers, which intentionally have no single
+    /// captured client to delegate to.
+    fn static_fallback(&self) -> Option<&Arc<AnyLlmClient>> {
+        match &self.fallback {
+            FallbackMode::Static { client, .. } => Some(client),
+            FallbackMode::DynamicPurpose { .. } => None,
+        }
+    }
+
+    /// Resolve the current turn's active client for Static mode. Returns
+    /// the task-local override if set, or the static fallback otherwise.
+    /// Only meaningful for Static mode — DynamicPurpose dispatches via
+    /// [`Self::dispatch_dynamic`].
+    fn resolve_static(&self) -> Arc<AnyLlmClient> {
+        let FallbackMode::Static { client, .. } = &self.fallback else {
+            unreachable!("resolve_static called on DynamicPurpose mode");
+        };
         ACTIVE_CLIENT
             .try_with(|c| Arc::clone(c))
-            .unwrap_or_else(|_| Arc::clone(&self.fallback))
+            .unwrap_or_else(|_| Arc::clone(client))
+    }
+}
+
+impl RoutingLlmClient {
+    /// Dispatch path for [`FallbackMode::DynamicPurpose`]. Resolves the
+    /// purpose against the live config snapshot, installs the resolved
+    /// model override for the connector, and runs `op` against the
+    /// registry's client. Returns a `CoreError::Llm` describing the
+    /// failure mode if resolution can't proceed (purpose unconfigured,
+    /// connection missing from the registry).
+    async fn dispatch_dynamic<F, Fut, T>(&self, op: F) -> Result<T, CoreError>
+    where
+        F: FnOnce(Arc<AnyLlmClient>, ReasoningConfig) -> Fut,
+        Fut: std::future::Future<Output = Result<T, CoreError>>,
+    {
+        let FallbackMode::DynamicPurpose { registry, purpose } = &self.fallback else {
+            unreachable!("dispatch_dynamic called on Static mode");
+        };
+        let config = registry.snapshot_config();
+        let (resolved, reasoning) = crate::api_surface::resolve_purpose_dispatch(
+            Some(&config),
+            *purpose,
+        )
+        .ok_or_else(|| {
+            CoreError::Llm(format!(
+                "purpose {:?} is not configured; cannot dispatch backend task",
+                purpose.as_key()
+            ))
+        })?;
+        let connection_id = ConnectionId::new(resolved.connector.clone()).map_err(|e| {
+            CoreError::Llm(format!(
+                "purpose {:?} resolved to invalid connection id {:?}: {e}",
+                purpose.as_key(),
+                resolved.connector
+            ))
+        })?;
+        // `resolved.connector` carries the connection id (not the
+        // connector type) — see `resolve_purpose_llm_config`. The
+        // registry indexes by connection id so this lookup is correct.
+        let client = registry.client_for(&connection_id).ok_or_else(|| {
+            CoreError::Llm(format!(
+                "purpose {:?} references connection {:?} which is not present in the registry",
+                purpose.as_key(),
+                resolved.connector
+            ))
+        })?;
+        let model = resolved.model.clone();
+        with_model_override(model, op(client, reasoning)).await
     }
 }
 
 impl LlmClient for RoutingLlmClient {
     fn get_default_model(&self) -> Option<&str> {
         // `Option<&str>` borrows from `self`; we can't delegate through the
-        // task-local (which returns an Arc). Delegation to the fallback is
-        // correct since this accessor reports the statically configured
-        // default, not the per-turn model.
-        self.fallback.get_default_model()
+        // task-local (which returns an Arc) or a dynamic registry lookup.
+        // Static mode delegates to the captured fallback; dynamic-purpose
+        // mode has no single captured client so reports `None`. This
+        // accessor reports the statically configured default and is not
+        // meaningfully per-turn or per-purpose.
+        self.static_fallback().and_then(|c| c.get_default_model())
     }
 
     fn get_default_base_url(&self) -> Option<&str> {
-        self.fallback.get_default_base_url()
+        self.static_fallback()
+            .and_then(|c| c.get_default_base_url())
     }
 
     fn max_context_tokens(&self) -> Option<u64> {
         // The dispatch loop reads token-pressure budgets from the
         // `CONTEXT_BUDGET` task-local installed by the daemon's wrapper
-        // (issue #63), not from this trait method, so the resolution chain
-        // no longer lives here. Delegate to the resolved client so any
-        // remaining caller (capability probes, debug paths) still gets the
-        // connector's curated value.
-        self.resolve().max_context_tokens()
+        // (issue #63), not from this trait method, so the resolution
+        // chain no longer lives here. Static-mode delegates to the
+        // resolved client; dynamic-purpose mode has no single client to
+        // ask without a config snapshot, and callers (capability probes,
+        // debug paths) tolerate `None`.
+        match &self.fallback {
+            FallbackMode::Static { .. } => self.resolve_static().max_context_tokens(),
+            FallbackMode::DynamicPurpose { .. } => None,
+        }
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -120,12 +231,20 @@ impl LlmClient for RoutingLlmClient {
         // API, which resolves clients directly from the registry — not
         // through the routing wrapper. Keep this consistent with
         // connector-level behaviour and delegate to whichever client is
-        // currently active (task-local or fallback).
-        self.resolve().list_models().await
+        // currently active (task-local or static fallback). The
+        // dynamic-purpose wrapper isn't used by listing paths, so report
+        // an empty list there.
+        match &self.fallback {
+            FallbackMode::Static { .. } => self.resolve_static().list_models().await,
+            FallbackMode::DynamicPurpose { .. } => Ok(Vec::new()),
+        }
     }
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        self.resolve().refresh_models().await
+        match &self.fallback {
+            FallbackMode::Static { .. } => self.resolve_static().refresh_models().await,
+            FallbackMode::DynamicPurpose { .. } => Ok(Vec::new()),
+        }
     }
 
     async fn stream_completion(
@@ -135,19 +254,38 @@ impl LlmClient for RoutingLlmClient {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let client = self.resolve();
-        client
-            .stream_completion(messages, tools, reasoning, on_chunk)
-            .await
+        match &self.fallback {
+            FallbackMode::Static { .. } => {
+                let client = self.resolve_static();
+                client
+                    .stream_completion(messages, tools, reasoning, on_chunk)
+                    .await
+            }
+            FallbackMode::DynamicPurpose { .. } => {
+                // Backend tasks pass `ReasoningConfig::default()`; the
+                // resolved purpose's reasoning takes precedence so we
+                // discard the caller's config in dynamic mode.
+                let _ = reasoning;
+                self.dispatch_dynamic(|client, resolved_reasoning| async move {
+                    client
+                        .stream_completion(messages, tools, resolved_reasoning, on_chunk)
+                        .await
+                })
+                .await
+            }
+        }
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
         // The flag gates how `ConversationHandler` assembles the tool
         // list at the start of a turn, before any task-local is
-        // consulted. Report the fallback's capability so the handler's
-        // choice is consistent with what dispatch will actually support
-        // in the absence of per-turn routing.
-        self.fallback.supports_hosted_tool_search()
+        // consulted. Static mode reports the fallback's capability;
+        // dynamic-purpose mode is only used for backend tasks
+        // (title/summary), which don't traverse the hosted-search path,
+        // so reporting `false` is safe and matches the connector-default.
+        self.static_fallback()
+            .map(|c| c.supports_hosted_tool_search())
+            .unwrap_or(false)
     }
 
     async fn stream_completion_with_namespaces(
@@ -158,12 +296,35 @@ impl LlmClient for RoutingLlmClient {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let client = self.resolve();
-        client
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, reasoning, on_chunk,
-            )
-            .await
+        match &self.fallback {
+            FallbackMode::Static { .. } => {
+                let client = self.resolve_static();
+                client
+                    .stream_completion_with_namespaces(
+                        messages,
+                        core_tools,
+                        namespaces,
+                        reasoning,
+                        on_chunk,
+                    )
+                    .await
+            }
+            FallbackMode::DynamicPurpose { .. } => {
+                let _ = reasoning;
+                self.dispatch_dynamic(|client, resolved_reasoning| async move {
+                    client
+                        .stream_completion_with_namespaces(
+                            messages,
+                            core_tools,
+                            namespaces,
+                            resolved_reasoning,
+                            on_chunk,
+                        )
+                        .await
+                })
+                .await
+            }
+        }
     }
 }
 
@@ -210,7 +371,7 @@ mod tests {
         let client = RoutingLlmClient::new(Arc::clone(&fallback), "ollama".into());
         // Without a task-local override, `resolve()` must equal the
         // fallback pointer.
-        let resolved = client.resolve();
+        let resolved = client.resolve_static();
         assert!(
             Arc::ptr_eq(&resolved, &fallback),
             "resolve() should return fallback when task-local is unset"
@@ -231,7 +392,7 @@ mod tests {
 
         let override_clone = Arc::clone(&override_client);
         let resolved = with_active_client(override_client, async move {
-            client.resolve()
+            client.resolve_static()
         })
         .await;
         assert!(
@@ -316,5 +477,106 @@ mod tests {
         let fallback = build_ollama_registry();
         let client = RoutingLlmClient::new(fallback, "ollama".into());
         assert_eq!(client.max_context_tokens(), None);
+    }
+
+    // --- DynamicPurpose mode (issue #68) ---------------------------------
+
+    /// Build a `RegistryHandle` with `[purposes.titling]` pointed at the
+    /// "local" Ollama connection — exercises the full purpose-resolution
+    /// path used by the backend slot.
+    fn build_handle_with_titling(model: &str) -> Arc<crate::api_surface::RegistryHandle> {
+        use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
+        let cfg = crate::config::DaemonConfig {
+            connections: IndexMap::from([(
+                "local".to_string(),
+                ConnectionConfig::Ollama(OllamaConnection {
+                    base_url: Some("http://localhost:11434".into()),
+                }),
+            )]),
+            purposes: Purposes {
+                interactive: Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named("interactive-model".to_string()),
+                    effort: None,
+                    max_context_tokens: None,
+                }),
+                titling: Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named(model.to_string()),
+                    effort: None,
+                    max_context_tokens: None,
+                }),
+                ..Purposes::default()
+            },
+            ..crate::config::DaemonConfig::default()
+        };
+        let reg = build_registry(&cfg);
+        Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg))
+    }
+
+    #[tokio::test]
+    async fn dynamic_purpose_unconfigured_returns_error() {
+        // Empty config: titling purpose isn't set, so dispatch must fail
+        // with a clear error rather than panic.
+        let cfg = crate::config::DaemonConfig::default();
+        let reg = build_registry(&cfg);
+        let handle = Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg));
+        let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
+        let err = client
+            .stream_completion(
+                vec![Message::new(
+                    desktop_assistant_core::domain::Role::User,
+                    "hi",
+                )],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("dispatch should fail when purpose is unconfigured");
+        assert!(
+            matches!(err, CoreError::Llm(ref msg) if msg.contains("titling")
+                && msg.contains("not configured")),
+            "expected purpose-not-configured error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_purpose_resolves_against_live_config() {
+        // The point of #68: a single dynamic-purpose client must read
+        // the registry's current config on every call, not a snapshot
+        // captured at construction. Build a handle, swap the titling
+        // model in-place, and verify resolution observes the new value.
+        use crate::api_surface::resolve_purpose_dispatch;
+
+        let handle = build_handle_with_titling("model-v1");
+        let _client = RoutingLlmClient::new_dynamic_purpose(
+            Arc::clone(&handle),
+            PurposeKind::Titling,
+        );
+
+        let cfg = handle.snapshot_config();
+        let (resolved, _) = resolve_purpose_dispatch(Some(&cfg), PurposeKind::Titling)
+            .expect("titling resolves before mutation");
+        assert_eq!(resolved.model, "model-v1");
+
+        // Swap the in-memory config — same path `mutate_config` takes
+        // after the control panel writes a new value, minus the disk
+        // persistence (covered by the connections-management API tests).
+        let mut new_cfg = handle.snapshot_config();
+        new_cfg.purposes.titling = Some(crate::purposes::PurposeConfig {
+            connection: crate::purposes::ConnectionRef::Named(
+                ConnectionId::new("local").unwrap(),
+            ),
+            model: crate::purposes::ModelRef::Named("model-v2".to_string()),
+            effort: None,
+            max_context_tokens: None,
+        });
+        handle.replace_config_for_test(new_cfg);
+
+        let cfg2 = handle.snapshot_config();
+        let (resolved2, _) = resolve_purpose_dispatch(Some(&cfg2), PurposeKind::Titling)
+            .expect("titling resolves after mutation");
+        assert_eq!(resolved2.model, "model-v2");
     }
 }
