@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, SecondsFormat, Utc};
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::ToolDefinition;
+use desktop_assistant_core::domain::{Role, ToolDefinition};
+use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{
@@ -21,6 +22,7 @@ const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
 const TOOL_DB_QUERY: &str = "builtin_db_query";
 const TOOL_MCP_CONTROL: &str = "builtin_mcp_control";
+const TOOL_CONV_SEARCH: &str = "builtin_conversation_search";
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -39,6 +41,7 @@ pub struct BuiltinToolService {
     tool_definition_fn: Option<ToolDefinitionFn>,
     db_query_fn: Option<DbQueryFn>,
     mcp_handle: Option<McpControlHandle>,
+    conversation_search_fn: Option<ConversationSearchFn>,
 }
 
 impl Default for BuiltinToolService {
@@ -60,6 +63,7 @@ impl BuiltinToolService {
             tool_definition_fn: None,
             db_query_fn: None,
             mcp_handle: None,
+            conversation_search_fn: None,
         }
     }
 
@@ -96,6 +100,14 @@ impl BuiltinToolService {
     /// Configure database query closure for read-only SQL access.
     pub fn with_database(mut self, query_fn: DbQueryFn) -> Self {
         self.db_query_fn = Some(query_fn);
+        self
+    }
+
+    /// Configure the past-conversation full-text search closure (#71).
+    /// When unset, `builtin_conversation_search` returns a clear error
+    /// rather than silently no-op-ing.
+    pub fn with_conversation_search(mut self, search_fn: ConversationSearchFn) -> Self {
+        self.conversation_search_fn = Some(search_fn);
         self
     }
 
@@ -232,6 +244,40 @@ impl BuiltinToolService {
                 }),
             ),
             ToolDefinition::new(
+                TOOL_CONV_SEARCH,
+                "Search past conversations by full-text query. Useful for \
+                 recalling what was discussed, what decisions were made, or \
+                 finding a specific exchange. Returns matching messages \
+                 with conversation title, ordinal, role, content, a \
+                 highlighted snippet around the match, and a relevance \
+                 rank. Hits where the conversation title or summary \
+                 matches surface even if no individual message text does. \
+                 Use this when the user asks about prior conversations \
+                 (\"what did we discuss about X\", \"find where we talked \
+                 about Y\").",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Full-text search query (English tsvector). Multi-word phrases are AND-ed."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                            "description": "Max hits to return (default 10)."
+                        },
+                        "role": {
+                            "type": "string",
+                            "enum": ["user", "assistant"],
+                            "description": "Restrict matches to a specific role (omit to search all)."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            ),
+            ToolDefinition::new(
                 TOOL_MCP_CONTROL,
                 "Check status, start, stop, or restart MCP (Model Context Protocol) \
                  servers. Use this when a tool call fails because an MCP server is \
@@ -265,6 +311,7 @@ impl BuiltinToolService {
                 | TOOL_SYS_PROPS
                 | TOOL_DB_QUERY
                 | TOOL_MCP_CONTROL
+                | TOOL_CONV_SEARCH
         )
     }
 
@@ -281,6 +328,7 @@ impl BuiltinToolService {
             TOOL_SYS_PROPS => Ok(self.sys_props()),
             TOOL_DB_QUERY => self.db_query(arguments).await,
             TOOL_MCP_CONTROL => self.mcp_control(arguments).await,
+            TOOL_CONV_SEARCH => self.conversation_search(arguments).await,
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
@@ -394,6 +442,64 @@ impl BuiltinToolService {
 
         tracing::info!(result_count = items.len(), "knowledge base search results");
         tracing::debug!(results = %serde_json::to_string(&items).unwrap_or_default(), "knowledge base search response");
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "results": items,
+        })
+        .to_string())
+    }
+
+    async fn conversation_search(
+        &self,
+        arguments: serde_json::Value,
+    ) -> Result<String, CoreError> {
+        let search_fn = self.conversation_search_fn.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution("conversation search not configured".to_string())
+        })?;
+
+        let query = required_string(&arguments, "query")?;
+        let limit = arguments
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(10) as usize;
+        let role_filter = arguments
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| match s {
+                "user" => Some(Role::User),
+                "assistant" => Some(Role::Assistant),
+                // Reject other roles at the boundary so the SQL layer
+                // doesn't have to defend against arbitrary text.
+                _ => None,
+            });
+
+        tracing::info!(query = %query, limit, ?role_filter, "conversation search");
+
+        let hits = search_fn(query, limit, role_filter).await?;
+
+        let items: Vec<serde_json::Value> = hits
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "conversation_id": h.conversation_id,
+                    "conversation_title": h.conversation_title,
+                    "ordinal": h.ordinal,
+                    "role": match h.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::System => "system",
+                        Role::Tool => "tool",
+                    },
+                    "snippet": h.snippet,
+                    "content": h.content,
+                    "rank": h.rank,
+                    "updated_at": h.updated_at,
+                })
+            })
+            .collect();
+
+        tracing::info!(result_count = items.len(), "conversation search results");
 
         Ok(serde_json::json!({
             "ok": true,
@@ -757,6 +863,94 @@ mod tests {
         assert!(names.contains(&TOOL_SYS_PROPS.to_string()));
         assert!(names.contains(&TOOL_DB_QUERY.to_string()));
         assert!(names.contains(&TOOL_MCP_CONTROL.to_string()));
+        assert!(names.contains(&TOOL_CONV_SEARCH.to_string()));
+    }
+
+    #[tokio::test]
+    async fn conversation_search_without_store_returns_error() {
+        let service = BuiltinToolService::new();
+        let result = service
+            .execute_tool(TOOL_CONV_SEARCH, serde_json::json!({"query": "test"}))
+            .await;
+        assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    #[tokio::test]
+    async fn conversation_search_with_closure_returns_results() {
+        use desktop_assistant_core::ports::conversation_search::{
+            ConversationSearchFn, MessageHit,
+        };
+        use std::sync::Arc;
+
+        let search_fn: ConversationSearchFn =
+            Arc::new(move |query, limit, role_filter| {
+                let q = query.clone();
+                Box::pin(async move {
+                    assert_eq!(q, "deploy");
+                    assert_eq!(limit, 5);
+                    assert!(matches!(role_filter, Some(Role::Assistant)));
+                    Ok(vec![MessageHit {
+                        conversation_id: "c-1".into(),
+                        conversation_title: "Deploy timeline".into(),
+                        ordinal: 4,
+                        role: Role::Assistant,
+                        content: "We can deploy on Friday".into(),
+                        snippet: "We can <mark>deploy</mark> on Friday".into(),
+                        rank: 0.42,
+                        updated_at: "2026-05-02T13:00:00+00:00".into(),
+                    }])
+                })
+            });
+
+        let service = BuiltinToolService::new().with_conversation_search(search_fn);
+        let response = service
+            .execute_tool(
+                TOOL_CONV_SEARCH,
+                serde_json::json!({"query": "deploy", "limit": 5, "role": "assistant"}),
+            )
+            .await
+            .expect("search succeeds");
+
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], serde_json::json!(true));
+        let results = json["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["conversation_id"], "c-1");
+        assert_eq!(results[0]["ordinal"], 4);
+        assert_eq!(results[0]["role"], "assistant");
+        assert!(results[0]["snippet"].as_str().unwrap().contains("<mark>"));
+    }
+
+    #[tokio::test]
+    async fn conversation_search_rejects_unknown_role() {
+        // Unknown roles must not reach the search closure: the boundary
+        // strips them rather than passing through arbitrary text.
+        use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let saw_role_filter = Arc::new(AtomicBool::new(false));
+        let saw_clone = Arc::clone(&saw_role_filter);
+        let search_fn: ConversationSearchFn =
+            Arc::new(move |_q, _l, role_filter| {
+                if role_filter.is_some() {
+                    saw_clone.store(true, Ordering::SeqCst);
+                }
+                Box::pin(async { Ok(Vec::new()) })
+            });
+
+        let service = BuiltinToolService::new().with_conversation_search(search_fn);
+        let _ = service
+            .execute_tool(
+                TOOL_CONV_SEARCH,
+                serde_json::json!({"query": "x", "role": "robot"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !saw_role_filter.load(Ordering::SeqCst),
+            "unknown role values must not propagate to the search closure"
+        );
     }
 
     #[tokio::test]

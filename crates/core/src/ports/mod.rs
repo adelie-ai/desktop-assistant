@@ -28,6 +28,9 @@ pub mod tool_registry;
 /// Database query port — closure type for read-only SQL queries.
 pub mod database;
 
+/// Conversation search port — outbound trait for full-text search over past messages.
+pub mod conversation_search;
+
 #[cfg(test)]
 mod tests {
     #[test]
