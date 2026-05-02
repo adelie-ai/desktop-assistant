@@ -154,7 +154,7 @@ impl RoutingLlmClient {
     /// model override for the connector, and runs `op` against the
     /// registry's client. Returns a `CoreError::Llm` describing the
     /// failure mode if resolution can't proceed (purpose unconfigured,
-    /// connection missing from the registry).
+    /// connections invalid, connection missing from the registry).
     async fn dispatch_dynamic<F, Fut, T>(&self, op: F) -> Result<T, CoreError>
     where
         F: FnOnce(Arc<AnyLlmClient>, ReasoningConfig) -> Fut,
@@ -164,35 +164,50 @@ impl RoutingLlmClient {
             unreachable!("dispatch_dynamic called on Static mode");
         };
         let config = registry.snapshot_config();
-        let (resolved, reasoning) = crate::api_surface::resolve_purpose_dispatch(
-            Some(&config),
-            *purpose,
-        )
-        .ok_or_else(|| {
+        // Resolve the purpose to a concrete `ResolvedPurpose` carrying
+        // the connection id (not the connector type) so the registry
+        // lookup hits the right entry. `resolve_purpose_dispatch` /
+        // `resolve_purpose_llm_config` flatten the connection id away
+        // into a `ResolvedLlmConfig.connector` field that holds the
+        // connector type string — useless for registry indexing. We
+        // call the lower-level resolver here and re-derive reasoning
+        // ourselves.
+        let connections = config.validated_connections().map_err(|e| {
             CoreError::Llm(format!(
-                "purpose {:?} is not configured; cannot dispatch backend task",
+                "purpose {:?}: [connections] failed validation: {e}",
                 purpose.as_key()
             ))
         })?;
-        let connection_id = ConnectionId::new(resolved.connector.clone()).map_err(|e| {
+        let resolved =
+            crate::purposes::resolve_purpose(*purpose, &config.purposes, &connections)
+                .map_err(|e| {
+                    CoreError::Llm(format!(
+                        "purpose {:?} resolution failed: {e}",
+                        purpose.as_key()
+                    ))
+                })?;
+        let connection = connections.get(&resolved.connection_id).ok_or_else(|| {
             CoreError::Llm(format!(
-                "purpose {:?} resolved to invalid connection id {:?}: {e}",
+                "purpose {:?} resolved connection {:?} is missing from \
+                 [connections] (post-resolution invariant violated)",
                 purpose.as_key(),
-                resolved.connector
+                resolved.connection_id
             ))
         })?;
-        // `resolved.connector` carries the connection id (not the
-        // connector type) — see `resolve_purpose_llm_config`. The
-        // registry indexes by connection id so this lookup is correct.
-        let client = registry.client_for(&connection_id).ok_or_else(|| {
+        let connector_type = connection.connector_type().to_string();
+        let reasoning = crate::api_surface::map_effort_to_reasoning_config(
+            &connector_type,
+            &resolved.model_id,
+            resolved.effort.map(crate::api_surface::purpose_effort_to_core),
+        );
+        let client = registry.client_for(&resolved.connection_id).ok_or_else(|| {
             CoreError::Llm(format!(
                 "purpose {:?} references connection {:?} which is not present in the registry",
                 purpose.as_key(),
-                resolved.connector
+                resolved.connection_id
             ))
         })?;
-        let model = resolved.model.clone();
-        with_model_override(model, op(client, reasoning)).await
+        with_model_override(resolved.model_id, op(client, reasoning)).await
     }
 }
 
@@ -516,9 +531,31 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_purpose_unconfigured_returns_error() {
-        // Empty config: titling purpose isn't set, so dispatch must fail
-        // with a clear error rather than panic.
-        let cfg = crate::config::DaemonConfig::default();
+        // Connections present but `[purposes.titling]` is missing: the
+        // resolver itself surfaces a clean error rather than panicking.
+        // (An empty config also errors but earlier — at connections
+        // validation — which is a separate path covered by config-level
+        // tests.)
+        use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
+        let cfg = crate::config::DaemonConfig {
+            connections: IndexMap::from([(
+                "local".to_string(),
+                ConnectionConfig::Ollama(OllamaConnection {
+                    base_url: Some("http://localhost:11434".into()),
+                }),
+            )]),
+            purposes: Purposes {
+                interactive: Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named("interactive-model".to_string()),
+                    effort: None,
+                    max_context_tokens: None,
+                }),
+                // Note: titling intentionally absent.
+                ..Purposes::default()
+            },
+            ..crate::config::DaemonConfig::default()
+        };
         let reg = build_registry(&cfg);
         let handle = Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg));
         let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
@@ -536,9 +573,56 @@ mod tests {
             .expect_err("dispatch should fail when purpose is unconfigured");
         assert!(
             matches!(err, CoreError::Llm(ref msg) if msg.contains("titling")
-                && msg.contains("not configured")),
-            "expected purpose-not-configured error, got: {err}"
+                && msg.contains("resolution failed")),
+            "expected titling-resolution-failed error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_purpose_looks_up_registry_by_connection_id() {
+        // Regression: an earlier draft of `dispatch_dynamic` looked up
+        // the registry's client using `ResolvedLlmConfig.connector`,
+        // which carries the connector *type* string (e.g. "ollama"),
+        // not the connection id ("local"). The lookup missed and every
+        // backend dispatch errored with "connection not present in
+        // registry" — title generation fell back to the placeholder.
+        //
+        // This test fixes the connection slug and connector type to
+        // distinct strings ("local" vs "ollama") so a regression that
+        // confuses the two would fail here.
+        let handle = build_handle_with_titling("titling-model");
+        let client = RoutingLlmClient::new_dynamic_purpose(
+            Arc::clone(&handle),
+            PurposeKind::Titling,
+        );
+        let result = client
+            .stream_completion(
+                vec![Message::new(
+                    desktop_assistant_core::domain::Role::User,
+                    "hi",
+                )],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await;
+        // The Ollama connection in the test registry isn't backed by a
+        // real server, so dispatch reaches the connector and errors out
+        // there — that's fine. What we *must not* see is a registry-
+        // lookup error mentioning the connector type as a missing
+        // connection.
+        if let Err(CoreError::Llm(msg)) = &result {
+            assert!(
+                !msg.contains("\"ollama\""),
+                "registry lookup must use connection id 'local', \
+                 not connector type 'ollama' — got error: {msg}"
+            );
+            assert!(
+                !msg.contains("not present in the registry"),
+                "registry lookup with the correct id should succeed; \
+                 got: {msg}"
+            );
+        }
     }
 
     #[tokio::test]
