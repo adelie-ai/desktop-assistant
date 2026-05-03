@@ -1,6 +1,5 @@
 //! Adapter that pins a fixed [`ReasoningConfig`] onto `stream_completion`
-//! calls when the wrapper was configured with a non-empty config (issue
-//! #28).
+//! calls when the wrapper was configured with a non-empty config.
 //!
 //! Background tasks (title generation, context summary) call into the
 //! `LlmClient` trait with `ReasoningConfig::default()` because they live in

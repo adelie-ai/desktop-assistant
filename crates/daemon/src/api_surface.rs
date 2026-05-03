@@ -1,8 +1,8 @@
 //! Daemon-side implementation of the connection/purpose management API
-//! (issue #11) plus the wrapper that threads per-send overrides through
-//! the core `ConversationHandler`.
+//! plus the wrapper that threads per-send overrides through the core
+//! `ConversationHandler`.
 //!
-//! Architecture notes:
+//! Architecture:
 //!
 //! - [`DaemonConnectionsService`] wraps a shared [`ConnectionRegistry`]
 //!   (plus the on-disk config) and implements the
@@ -20,8 +20,10 @@
 //!   Stored-but-dangling selections are detected, cleared, and surfaced
 //!   via a one-time [`DispatchWarning::DanglingModelSelection`].
 //!
-//! See the ticket body on #11 for the full priority table
-//! (override → stored → interactive).
+//! Per-send model selection priority is `override → stored → interactive`:
+//! the explicit override on the request wins; if none, fall back to the
+//! conversation's last stored selection; if neither is usable, dispatch
+//! through the interactive purpose's default.
 
 use std::sync::{Arc, RwLock};
 
@@ -525,8 +527,8 @@ where
 }
 
 /// Resolve a purpose's full dispatch config — `(ResolvedLlmConfig,
-/// ReasoningConfig)` — for use by background tasks that want to honour
-/// `[purposes.<kind>]` end-to-end (issue #27 dreaming, #28 titling).
+/// ReasoningConfig)` — for background tasks that want to honour
+/// `[purposes.<kind>]` end-to-end (dreaming, titling, etc.).
 ///
 /// Returns `None` when no purpose is configured for `kind` so callers
 /// can fall back to the legacy resolvers without an extra branch on a
@@ -701,11 +703,12 @@ where
         //   2. stored conversation selection (validate; warn + fallback if dangling)
         //   3. interactive purpose
         //
-        // We track *user_driven* separately from *effective* (issue #33):
-        // the user-driven path (override / live stored) routes through the
-        // registry's per-connection client; the interactive-fallback path
-        // routes through the handler's static primary llm, which is
-        // already built with the interactive purpose's model baked in.
+        // We track *user_driven* separately from *effective*: the
+        // user-driven path (override / live stored) routes through the
+        // registry's per-connection client, while the
+        // interactive-fallback path routes through the handler's static
+        // primary llm, which is already built with the interactive
+        // purpose's model baked in.
         // Without this split, interactive_selection's `model_id` would be
         // dropped at dispatch — connector clients have no per-call model
         // knob, so the registry client always uses the connection's
@@ -778,8 +781,8 @@ where
         //     `RoutingLlmClient` falls through to the primary llm (which
         //     was built with the interactive purpose's model).
         //   - `model_override`: the resolved `model_id` to inject into the
-        //     connector's request body via the `MODEL_OVERRIDE` task-local
-        //     (issue #34). Set whenever we install an `active_client` so
+        //     connector's request body via the `MODEL_OVERRIDE` task-local.
+        //     Set whenever we install an `active_client` so
         //     dispatch is deterministic — even if the user picked the
         //     connector's default model, we still pin it explicitly rather
         //     than relying on `self.model`. For the interactive-purpose
@@ -830,11 +833,11 @@ where
                 Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort.map(Effort::from));
         }
 
-        // Resolve the per-turn context budget once at dispatch entry
-        // (issue #63). Tier 1 is the user's `purposes.interactive.
-        // max_context_tokens`; tier 2 is the connector's curated table for
-        // the configured (or active) client; tier 3 is the universal 200K
-        // fallback. Resolving once here freezes the value for the whole
+        // Resolve the per-turn context budget once at dispatch entry.
+        // Tier 1 is the user's `purposes.interactive.max_context_tokens`;
+        // tier 2 is the connector's curated table for the configured
+        // (or active) client; tier 3 is the universal 200K fallback.
+        // Resolving once here freezes the value for the whole
         // `send_prompt` call so the dispatch loop's token-pressure check
         // doesn't re-query the LLM trait on every iteration.
         let purpose_override = crate::config::purpose_max_context_override(
@@ -874,9 +877,9 @@ where
         //     token-pressure compaction.
         //   - `current_reasoning_config()` surfaces `reasoning` into the
         //     connector's request body.
-        //   - `current_model_override()` (issue #34) surfaces the resolved
-        //     `model_id` so connectors send the user-chosen model rather
-        //     than `self.model` (the connection's startup default).
+        //   - `current_model_override()` surfaces the resolved `model_id`
+        //     so connectors send the user-chosen model rather than
+        //     `self.model` (the connection's startup default).
         let inner = Arc::clone(&self.inner);
         let conv_id = conversation_id.clone();
         let response = {
@@ -1317,7 +1320,7 @@ mod tests {
 
     // ----- RoutingConversationHandler dispatch-routing tests -----------
     //
-    // These tests cover the per-turn routing logic added in #18:
+    // These tests cover the per-turn routing logic:
     // - priority resolution across override/stored/interactive
     // - task-local reasoning config installation
     // - per-connector effort mapping into ReasoningConfig
@@ -1340,13 +1343,11 @@ mod tests {
             /// Whether the routing wrapper installed an `ACTIVE_CLIENT`
             /// task-local on each `send_prompt`. `false` means dispatch
             /// would fall through to the primary llm — the expected
-            /// behaviour for the interactive-purpose fallback path
-            /// (issue #33).
+            /// behaviour for the interactive-purpose fallback path.
             captured_active_client_set: StdMutex<Vec<bool>>,
             /// Snapshot of the `MODEL_OVERRIDE` task-local at each
             /// `send_prompt`. `None` means no override was installed —
-            /// connectors will fall back to their baked-in `self.model`
-            /// (issue #34).
+            /// connectors will fall back to their baked-in `self.model`.
             captured_model_override: StdMutex<Vec<Option<String>>>,
         }
 
@@ -1726,11 +1727,10 @@ mod tests {
 
         #[tokio::test]
         async fn interactive_purpose_dispatch_does_not_install_model_override() {
-            // Issue #34 negative case: when no user-driven selection exists
+            // Negative case: when no user-driven selection exists
             // (override is None, no stored selection), `send_prompt` must
             // NOT install `MODEL_OVERRIDE`. Connectors then fall back to
-            // their baked-in `self.model` — preserving the pre-#34
-            // dispatch shape for this fallback path.
+            // their baked-in `self.model` for this fallback path.
             let (routing, inner, _reg, _store) = make_handler();
             let (on_chunk, on_status) = noop_cb();
             routing
@@ -1814,8 +1814,9 @@ mod tests {
                         connection_id: "local".into(),
                         // Pick a model that differs from the connection's
                         // baked-in default (`llama3.2`) so the assertion
-                        // is meaningful — pre-#34 the connector would
-                        // dispatch `self.model` and silently drop this.
+                        // is meaningful — without `MODEL_OVERRIDE` the
+                        // connector would dispatch `self.model` and
+                        // silently drop this.
                         model_id: "qwen3".into(),
                         effort: None,
                     }),

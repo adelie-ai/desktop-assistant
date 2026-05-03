@@ -1,24 +1,20 @@
-//! Purpose configs (issue #10).
+//! Purpose configs.
 //!
 //! Each LLM *purpose* (interactive chat, dreaming, embedding, titling)
 //! references a named connection by id and picks a model from that connection,
-//! optionally with an effort level. This replaces the legacy
-//! `[backend_tasks.llm]` block, which duplicated credentials for every extra
-//! purpose and did not scale past two call sites.
+//! optionally with an effort level. Replaces the legacy `[backend_tasks.llm]`
+//! block, which duplicated credentials for every extra purpose and didn't
+//! scale past two call sites.
 //!
-//! The schema deliberately keeps the wire format narrow: a `connection`
-//! reference, a `model` reference, and an optional `effort` hint. Both refs
-//! support a literal `"primary"` sentinel that inherits from the `interactive`
-//! purpose at load time. Resolution is one level deep (we explicitly forbid
-//! `primary -> primary` chains beyond the single inherit step) so cycles are
-//! structurally impossible, not just rejected.
+//! The wire format is narrow on purpose: a `connection` reference, a `model`
+//! reference, and an optional `effort` hint. Both refs support a literal
+//! `"primary"` sentinel that inherits from the `interactive` purpose at load
+//! time. Resolution is one level deep — `primary -> primary` chains are
+//! explicitly forbidden — so cycles are structurally impossible, not just
+//! rejected.
 //!
-//! This module is intentionally schema + resolution only:
-//! - Issue #9 wires the registry that actually instantiates connections.
-//! - Issue #11 maps [`Effort`] onto per-connector knobs (Anthropic thinking
-//!   budget, OpenAI `reasoning_effort`, etc.) at dispatch time. See the TODO
-//!   on [`Effort`] below.
-//!
+//! Schema + resolution only: registry instantiation lives in `registry.rs`,
+//! and `Effort → ReasoningConfig` mapping lives in `api_surface.rs`.
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
@@ -119,14 +115,10 @@ pub enum ModelRef {
 /// Reserved sentinel that represents the `primary` inherit token.
 const PRIMARY_SENTINEL: &str = "primary";
 
-/// Effort level hint for a purpose.
-///
-/// Mapped per-connector at request dispatch time (issue #11):
-// TODO(#11): map `Effort` onto concrete per-connector parameters at dispatch
-// time — Anthropic's thinking/extended-thinking budget_tokens, OpenAI's
-// `reasoning_effort`, Bedrock's per-model parameters, and Ollama's keep-alive/
-// num_predict. Purpose configs default the level; per-request overrides come
-// from the per-conversation selector in #11.
+/// Effort level hint for a purpose. Mapped to concrete per-connector
+/// parameters by `api_surface::map_effort_to_reasoning_config` at
+/// dispatch time (Anthropic `thinking.budget_tokens`, OpenAI
+/// `reasoning_effort`, Bedrock per-model knobs; Ollama ignores it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -148,9 +140,9 @@ pub enum Effort {
 ///
 /// `max_context_tokens` is a user-supplied override for the model's context
 /// window in tokens. When set, it takes priority over the connector's
-/// curated table (issue #51). Leaving it unset (the default) lets the
-/// daemon-side resolver consult the connector's per-model table and fall
-/// back to a conservative universal default.
+/// curated table. Leaving it unset (the default) lets the daemon-side
+/// resolver consult the connector's per-model table and fall back to a
+/// conservative universal default.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PurposeConfig {

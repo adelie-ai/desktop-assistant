@@ -2,16 +2,16 @@
 //! to swap the underlying [`AnyLlmClient`] based on the resolved
 //! `(connection_id, model_id, effort)` triple for each `send_prompt`.
 //!
-//! Rationale (issue #18): the core `ConversationHandler` owns a single
-//! `llm: L` field baked into its type parameters. Rebuilding the handler
-//! per turn is impractical (shared `namespace_cache`, non-`Clone`
-//! `id_generator`), and plumbing a per-call client argument through the
-//! ~450-line `send_prompt` would be a very invasive change.
+//! Rationale: the core `ConversationHandler` owns a single `llm: L` field
+//! baked into its type parameters. Rebuilding the handler per turn is
+//! impractical (shared `namespace_cache`, non-`Clone` `id_generator`), and
+//! plumbing a per-call client argument through the ~450-line `send_prompt`
+//! would be a very invasive change.
 //!
 //! Instead we install this wrapper as the handler's `L`. It looks up the
 //! target `AnyLlmClient` on each call via a [`tokio::task_local!`] slot
 //! populated by the daemon-side routing wrapper. When the slot is unset
-//! (e.g. backend-tasks, background jobs), dispatch falls through to a
+//! (e.g. backend tasks, background jobs), dispatch falls through to a
 //! statically-configured fallback — the interactive-purpose client at
 //! daemon startup.
 //!
@@ -52,8 +52,8 @@ where
 /// Whether an [`ACTIVE_CLIENT`] task-local is set for the current
 /// scope. Used by tests in the api_surface dispatch module to assert
 /// that interactive-purpose fallbacks correctly *do not* install an
-/// override (issue #33: dispatch should fall through to the primary
-/// llm in that case so the interactive purpose's model takes effect).
+/// override — dispatch should fall through to the primary llm in that
+/// case so the interactive purpose's model takes effect.
 #[cfg(test)]
 pub(crate) fn active_client_is_set() -> bool {
     ACTIVE_CLIENT.try_with(|_| ()).is_ok()
@@ -70,11 +70,10 @@ pub enum FallbackMode {
     Static { client: Arc<AnyLlmClient> },
     /// Resolve the target client from a [`RegistryHandle`] on every
     /// dispatch by re-reading the named purpose's config. Used by the
-    /// backend-tasks slot so titling/dreaming pick up control-panel edits
-    /// without a daemon restart (issue #68). Always ignores
-    /// `ACTIVE_CLIENT` — backend tasks must not inherit the user's
-    /// per-turn model override even when invoked inside a `send_prompt`
-    /// scope.
+    /// backend-tasks slot so titling/dreaming pick up control-panel
+    /// edits without a daemon restart. Always ignores `ACTIVE_CLIENT`
+    /// — backend tasks must not inherit the user's per-turn model
+    /// override even when invoked inside a `send_prompt` scope.
     DynamicPurpose {
         registry: Arc<RegistryHandle>,
         purpose: PurposeKind,
@@ -220,12 +219,12 @@ impl LlmClient for RoutingLlmClient {
 
     fn max_context_tokens(&self) -> Option<u64> {
         // The dispatch loop reads token-pressure budgets from the
-        // `CONTEXT_BUDGET` task-local installed by the daemon's wrapper
-        // (issue #63), not from this trait method, so the resolution
-        // chain no longer lives here. Static-mode delegates to the
-        // resolved client; dynamic-purpose mode has no single client to
-        // ask without a config snapshot, and callers (capability probes,
-        // debug paths) tolerate `None`.
+        // `CONTEXT_BUDGET` task-local installed by the daemon's wrapper,
+        // not from this trait method, so the resolution chain no longer
+        // lives here. Static-mode delegates to the resolved client;
+        // dynamic-purpose mode has no single client to ask without a
+        // config snapshot, and callers (capability probes, debug paths)
+        // tolerate `None`.
         match &self.fallback {
             FallbackMode::Static { .. } => self.resolve_static().max_context_tokens(),
             FallbackMode::DynamicPurpose { .. } => None,
@@ -458,23 +457,19 @@ mod tests {
         let _e: Option<CoreError> = None;
     }
 
-    // The three-tier `max_context_tokens` resolution previously tested
-    // here moved to `crate::config::resolve_context_budget` (issue #63).
-    // Tests against that resolver live in `crates/daemon/src/config.rs`.
-    // The task-local accessor is exercised in
-    // `crates/core/src/ports/llm.rs` against `current_context_budget`.
-
     #[tokio::test]
     async fn max_context_delegates_to_resolved_client() {
-        // After #63 `RoutingLlmClient::max_context_tokens` is plain
-        // delegation to the resolved client — no overlay, no tier
-        // fallback. Ollama returns `None`; the wrapper must too.
+        // `RoutingLlmClient::max_context_tokens` is plain delegation to
+        // the resolved client — no overlay, no tier fallback (the
+        // three-tier budget resolution lives in
+        // `config::resolve_context_budget`). Ollama returns `None`;
+        // the wrapper must too.
         let fallback = build_ollama_registry();
         let client = RoutingLlmClient::new(fallback);
         assert_eq!(client.max_context_tokens(), None);
     }
 
-    // --- DynamicPurpose mode (issue #68) ---------------------------------
+    // --- DynamicPurpose mode -------------------------------------------------
 
     /// Build a `RegistryHandle` with `[purposes.titling]` pointed at the
     /// "local" Ollama connection — exercises the full purpose-resolution

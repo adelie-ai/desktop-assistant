@@ -266,11 +266,9 @@ impl ConnectionRegistry {
 
     /// Move the active client out of the registry.
     ///
-    /// Used by pre-#11 daemon startup (before purpose-based dispatch) to
-    /// hand the active connection's client to the `ConversationHandler`.
-    /// Under #11 dispatch is purpose-driven and callers use
-    /// [`ConnectionRegistry::get`] instead; this accessor is retained for
-    /// diagnostics and legacy tests.
+    /// Legacy accessor from before purpose-based dispatch landed —
+    /// production callers use [`ConnectionRegistry::get`] now. Retained
+    /// for diagnostics and legacy tests.
     pub fn take_active(&mut self) -> Option<(ConnectionId, std::sync::Arc<AnyLlmClient>)> {
         let id = self.active.clone()?;
         let client = self.clients.shift_remove(&id)?;

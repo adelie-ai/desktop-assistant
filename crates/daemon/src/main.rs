@@ -431,10 +431,9 @@ impl api_surface::ConversationSelectionStore for SharedConversationStore {
     }
 }
 
-// Per-conversation model selection (#11). Only the Postgres backend
-// persists selections across restarts; the JSON backend keeps them
-// in-memory and drops them on shutdown (matches pre-#11 behavior for
-// installs without a database).
+// Per-conversation model selection. Only the Postgres backend persists
+// selections across restarts; the JSON backend keeps them in-memory and
+// drops them on shutdown (the same shape as installs without a database).
 impl api_surface::ConversationSelectionStore for AnyConversationStore {
     async fn get_selection(
         &self,
@@ -604,13 +603,13 @@ async fn main() -> Result<()> {
     // HTTP client allocation — the registry clients stay live for the
     // connection-listing and model-listing APIs.
     // Build the primary llm via the shared `resolve_purpose_llm_config`
-    // helper (issue #33) so the interactive purpose's `model` actually
-    // lands on the resolved config — connector clients have no per-call
-    // model knob, so a dispatch via the registry's per-connection client
-    // would otherwise silently use the connection's construction-time
-    // model and ignore the user's choice. Using the same helper as the
-    // background-task purposes (#26 / #27 / #28) keeps the model-override
-    // logic in one place.
+    // helper so the interactive purpose's `model` actually lands on the
+    // resolved config — connector clients have no per-call model knob,
+    // so a dispatch via the registry's per-connection client would
+    // otherwise silently use the connection's construction-time model
+    // and ignore the user's choice. Using the same helper for primary
+    // and background-task purposes keeps the model-override logic in
+    // one place.
     let primary_resolved = config::resolve_purpose_llm_config(
         daemon_config.as_ref(),
         purposes::PurposeKind::Interactive,
@@ -1061,9 +1060,9 @@ async fn main() -> Result<()> {
             &pg_pool,
             !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
         ) {
-            // Prefer `[purposes.dreaming]` (issue #27) when configured; fall
-            // back to the legacy `[backend_tasks.llm]` block otherwise so
-            // installs that haven't migrated still work. Effort threading is
+            // Prefer `[purposes.dreaming]` when configured; fall back to
+            // the legacy `[backend_tasks.llm]` block otherwise so installs
+            // that haven't migrated still work. Effort threading is
             // computed once at startup and copied into the closure — the
             // resolved purpose is fixed for this daemon run, and
             // `ReasoningConfig` is `Copy`.
@@ -1210,7 +1209,7 @@ async fn main() -> Result<()> {
     // a task-local per turn; when present, dispatch picks the registry's
     // client for the resolved connection id. When absent (backend tasks,
     // legacy callers without an override), the routing client falls back
-    // to this interactive-purpose client — preserving pre-#18 behaviour.
+    // to this interactive-purpose client.
     let fallback_client = Arc::new(llm);
     let llm = routing_llm::RoutingLlmClient::new(Arc::clone(&fallback_client));
     // Wrap the primary in a transparent `FixedReasoningLlmClient` whose
@@ -1219,8 +1218,8 @@ async fn main() -> Result<()> {
     // which calls `stream_completion` with its mapped `ReasoningConfig` —
     // we must not stomp on that, hence the passthrough configuration.
     // The wrapper exists here only so the primary and backend handlers
-    // share the same `L` type (issue #28: backend tasks need a non-default
-    // override, and `with_backend_llm(L)` requires both stacks to match).
+    // share the same `L` type (backend tasks need a non-default override,
+    // and `with_backend_llm(L)` requires both stacks to match).
     let llm =
         backend_reasoning::FixedReasoningLlmClient::new(llm, ReasoningConfig::default());
     let llm = RetryingLlmClient::new(llm, 3);
@@ -1256,13 +1255,12 @@ async fn main() -> Result<()> {
     // Resolution order:
     //   1. `[purposes.titling]` — if set, install a dynamic-purpose client
     //      that resolves the connection/model/effort from the live config
-    //      on every call (#68). Control-panel edits take effect on the next
+    //      on every call. Control-panel edits take effect on the next
     //      backend dispatch with no daemon restart.
     //   2. `[backend_tasks.llm]` legacy block — install a static client
-    //      only if it differs from the primary (preserving pre-#28
-    //      behaviour for unmigrated installs that haven't authored a
-    //      `[purposes]` table). The legacy path remains static — migrating
-    //      it dynamic is unnecessary as authors are expected to move to
+    //      only if it differs from the primary, so unmigrated installs
+    //      that haven't authored a `[purposes]` table still work. The
+    //      legacy path stays static; authors are expected to move to
     //      `[purposes.titling]`.
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
     let titling_configured = daemon_config
