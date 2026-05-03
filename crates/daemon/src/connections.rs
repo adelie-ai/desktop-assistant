@@ -1,23 +1,14 @@
 //! Named-connection config schema.
 //!
-//! Introduces a `connections` map keyed by a user-chosen slug ([`ConnectionId`]).
+//! A `connections` map keyed by a user-chosen slug ([`ConnectionId`]).
 //! Each connection owns its own credentials/endpoint and declares its connector
-//! type via a `#[serde(tag = "type")]` payload. This replaces the legacy single
+//! type via a `#[serde(tag = "type")]` payload, replacing the legacy single
 //! `[llm]` block which hard-coded one global connector.
 //!
-//! See issue #8. Downstream tickets:
-//! - #9 (registry) wires this into `build_llm_client`.
-//! - #10 reshapes `backend_tasks.llm` into purpose configs.
-//! - #11 exposes connections over the API.
-//!
-//! This module is intentionally schema-only: migration lives in
-//! [`super::config`] so it can share I/O helpers with the wider config layer.
-//!
-//! The `ConnectionsMap` accessors and the `connector_type` shortcut are wired
-//! into the registry (`crates/daemon/src/registry.rs`) under #9; a few
-//! accessors remain exposed for symmetry even though no call site uses them
-//! yet, so `#[allow(dead_code)]` stays on this module until #11 consumes
-//! them.
+//! Schema-only: migration lives in [`super::config`] so it can share I/O
+//! helpers with the wider config layer. The blanket `#[allow(dead_code)]`
+//! covers a handful of `ConnectionsMap` accessors that are exposed for
+//! symmetry but have no current call site.
 #![allow(dead_code)]
 
 use std::fmt;

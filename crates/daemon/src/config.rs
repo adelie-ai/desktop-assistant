@@ -31,10 +31,6 @@ pub struct DaemonConfig {
     /// re-wraps the map as a validated [`ConnectionsMap`], rejecting invalid
     /// or duplicate ids.
     ///
-    /// Note for #9/#10: this map is intentionally not yet wired into
-    /// `build_llm_client` or `resolve_*` — those call sites still read
-    /// `[llm]` / `[backend_tasks.llm]`. See the migration path in
-    /// [`load_daemon_config`] and the deprecation warning emitted there.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub connections: IndexMap<String, ConnectionConfig>,
     #[serde(default)]
@@ -46,14 +42,14 @@ pub struct DaemonConfig {
     /// Backend-tasks (dreaming / titling) overrides. The legacy `llm` field
     /// is reshaped into `[purposes]` during migration; see
     /// [`maybe_migrate_legacy_purposes`]. Consumers that still read
-    /// `backend_tasks.llm` will see `None` after migration and fall back to
-    /// the primary LLM — #11 rewires dispatch to consult `[purposes]`.
+    /// `backend_tasks.llm` see `None` after migration and fall back to
+    /// the primary LLM.
     #[serde(default)]
     pub backend_tasks: BackendTasksConfig,
-    /// Per-purpose LLM configs (issue #10). Each purpose picks a connection
-    /// + model (possibly inherited from `interactive`) and an optional effort
-    /// level. Empty on fresh installs; synthesized by migration when a legacy
-    /// `[llm]` / `[backend_tasks.llm]` pair is present.
+    /// Per-purpose LLM configs. Each purpose picks a connection + model
+    /// (possibly inherited from `interactive`) and an optional effort
+    /// level. Empty on fresh installs; synthesized by migration when a
+    /// legacy `[llm]` / `[backend_tasks.llm]` pair is present.
     #[serde(default, skip_serializing_if = "Purposes::is_empty")]
     pub purposes: Purposes,
     #[serde(default)]
@@ -552,9 +548,10 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     let explicit_connections_table = file_has_top_level_table(&content, "connections");
     let explicit_purposes_table = file_has_top_level_table(&content, "purposes");
     // Purpose migration runs only when the file is in a legacy shape:
-    // either `[llm]` (pre-#8) or `[backend_tasks.llm]` (pre-#10) is present.
-    // Pure new-format configs (connections + no legacy markers) are left alone
-    // so first-run users are not forced to accept synthesized purposes.
+    // either `[llm]` or `[backend_tasks.llm]` is present. Pure
+    // new-format configs (connections + no legacy markers) are left
+    // alone so first-run users are not forced to accept synthesized
+    // purposes.
     let legacy_shape_present = file_has_top_level_table(&content, "llm")
         || file_has_top_level_table(&content, "backend_tasks.llm");
     let parsed = maybe_migrate_legacy_connections(path, parsed, &content)?;
@@ -1460,15 +1457,14 @@ pub fn resolve_purpose_llm_config(
     Some(llm)
 }
 
-/// Universal fallback for purpose-aware context-window resolution
-/// (issue #51). Used when no purpose override is set and the connector's
-/// curated table reports nothing for the model. Most modern frontier
-/// models meet or exceed this; under-stating is safe (we compact slightly
+/// Universal fallback for purpose-aware context-window resolution.
+/// Used when no purpose override is set and the connector's curated
+/// table reports nothing for the model. Most modern frontier models
+/// meet or exceed this; under-stating is safe (we compact slightly
 /// earlier than necessary), over-stating is not (the LLM rejects).
 pub const DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS: u64 = 200_000;
 
 /// Three-tier resolution for "what's the context window for this purpose?"
-/// (issue #51, refined in #63).
 ///
 /// Resolution order:
 ///   1. The purpose's `max_context_tokens` override, if explicitly set —
@@ -3124,7 +3120,7 @@ mod tests {
         std::fs::remove_dir_all(&test_dir).ok();
     }
 
-    // --- Named-connections schema + migration (issue #8) -------------------
+    // --- Named-connections schema + migration -------------------
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
@@ -3780,7 +3776,7 @@ y = 2
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Purpose-aware LLM config resolution (issue #26)
+    // Purpose-aware LLM config resolution
     // ─────────────────────────────────────────────────────────────────────
 
     /// Build a config with an `ollama` interactive connection at the given
@@ -3977,9 +3973,9 @@ y = 2
 
     #[test]
     fn resolve_embeddings_uses_purposes_embedding_when_configured() {
-        // The whole point of issue #26: a user who has set `[purposes.embedding]`
-        // gets *that* connection/model back from `resolve_embeddings_config`,
-        // not whatever the legacy `[embeddings]` block (or `[llm]` fallback)
+        // A user who has set `[purposes.embedding]` gets *that*
+        // connection/model back from `resolve_embeddings_config`, not
+        // whatever the legacy `[embeddings]` block (or `[llm]` fallback)
         // would have inferred.
         let config: DaemonConfig = toml::from_str(
             r#"
@@ -4016,11 +4012,10 @@ y = 2
 
     #[test]
     fn resolve_embeddings_falls_back_to_legacy_when_no_purpose() {
-        // When `[purposes.embedding]` is *not* set, we keep the pre-#26
-        // behaviour byte-for-byte: legacy `[embeddings]` overrides win, then
-        // the `[llm].connector` default. This ensures the bug fix is
-        // additive — installs without a purposes block see no behaviour
-        // change at all.
+        // When `[purposes.embedding]` is *not* set, the legacy resolver
+        // path runs unchanged: `[embeddings]` overrides win, then the
+        // `[llm].connector` default. Installs without a purposes block
+        // see no behaviour change.
         let config: DaemonConfig = toml::from_str(
             r#"
             [llm]
@@ -4216,10 +4211,10 @@ y = 2
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Purpose-aware max_context_tokens resolution (issue #51)
+    // Purpose-aware max_context_tokens resolution
     // ─────────────────────────────────────────────────────────────────────
 
-    // --- resolve_context_budget three-tier resolution (issue #51 / #63) -
+    // --- resolve_context_budget three-tier resolution -------------------
 
     #[test]
     fn resolve_context_budget_purpose_override_wins() {
