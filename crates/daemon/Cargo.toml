@@ -32,6 +32,7 @@ keyring = "3"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
 libc = "0.2"
+zeroize = "1"
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
