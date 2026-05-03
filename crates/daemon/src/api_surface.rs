@@ -23,7 +23,7 @@
 //! See the ticket body on #11 for the full priority table
 //! (override → stored → interactive).
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
@@ -906,54 +906,6 @@ where
     }
 }
 
-// --- In-memory ConversationSelectionStore (for tests) ----------------------
-
-/// Trivial in-memory store used by the daemon test suite. Production code
-/// uses the Postgres-backed store via the storage crate.
-#[allow(dead_code)]
-pub struct InMemoryConversationSelectionStore {
-    inner: Mutex<std::collections::HashMap<String, ConversationModelSelection>>,
-}
-
-impl Default for InMemoryConversationSelectionStore {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-impl ConversationSelectionStore for InMemoryConversationSelectionStore {
-    async fn get_selection(
-        &self,
-        id: &ConversationId,
-    ) -> Result<Option<ConversationModelSelection>, CoreError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("selection store poisoned")
-            .get(&id.0)
-            .cloned())
-    }
-
-    async fn set_selection(
-        &self,
-        id: &ConversationId,
-        selection: Option<&ConversationModelSelection>,
-    ) -> Result<(), CoreError> {
-        let mut map = self.inner.lock().expect("selection store poisoned");
-        match selection {
-            Some(sel) => {
-                map.insert(id.0.clone(), sel.clone());
-            }
-            None => {
-                map.remove(&id.0);
-            }
-        }
-        Ok(())
-    }
-}
-
 // --- Effort → per-connector param mapping ----------------------------------
 
 /// Anthropic extended-thinking `budget_tokens`. Defaults: Low = off (0, no
@@ -967,19 +919,17 @@ pub fn map_anthropic_thinking_budget(e: Effort) -> u32 {
     }
 }
 
-/// OpenAI `reasoning_effort` literal. Pass through verbatim.
+/// OpenAI `reasoning_effort` wire literal for an effort hint.
 ///
-/// Retained as the canonical Effort → wire-token table even after the
-/// main dispatch path switched to [`map_effort_to_reasoning_level`] +
-/// the connector's own per-model capability gate; keeps the mapping
-/// truth-source documented in one place for future providers.
+/// Composed from [`map_effort_to_reasoning_level`] +
+/// [`ReasoningLevel::as_openai_effort`] so the Effort → wire-token
+/// mapping has exactly one source of truth and the two paths cannot
+/// drift. Currently only used by tests; kept on the public surface
+/// because future connectors that surface `reasoning_effort` directly
+/// (vs going through `ReasoningConfig`) will want it.
 #[allow(dead_code)]
 pub fn map_openai_reasoning_effort(e: Effort) -> &'static str {
-    match e {
-        Effort::Low => "low",
-        Effort::Medium => "medium",
-        Effort::High => "high",
-    }
+    map_effort_to_reasoning_level(e).as_openai_effort()
 }
 
 /// `Effort` → core-level [`ReasoningLevel`], used when threading the
@@ -1114,6 +1064,54 @@ fn purposes_referencing(purposes: &crate::purposes::Purposes, id: &ConnectionId)
 mod tests {
     use super::*;
     use crate::connections::{BedrockConnection, ConnectionConfig, OllamaConnection};
+
+    use std::sync::Mutex;
+
+    /// Trivial in-memory `ConversationSelectionStore` for the daemon test
+    /// suite. Production code uses the Postgres-backed store via the
+    /// storage crate.
+    pub struct InMemoryConversationSelectionStore {
+        inner: Mutex<std::collections::HashMap<String, ConversationModelSelection>>,
+    }
+
+    impl Default for InMemoryConversationSelectionStore {
+        fn default() -> Self {
+            Self {
+                inner: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl ConversationSelectionStore for InMemoryConversationSelectionStore {
+        async fn get_selection(
+            &self,
+            id: &ConversationId,
+        ) -> Result<Option<ConversationModelSelection>, CoreError> {
+            Ok(self
+                .inner
+                .lock()
+                .expect("selection store poisoned")
+                .get(&id.0)
+                .cloned())
+        }
+
+        async fn set_selection(
+            &self,
+            id: &ConversationId,
+            selection: Option<&ConversationModelSelection>,
+        ) -> Result<(), CoreError> {
+            let mut map = self.inner.lock().expect("selection store poisoned");
+            match selection {
+                Some(sel) => {
+                    map.insert(id.0.clone(), sel.clone());
+                }
+                None => {
+                    map.remove(&id.0);
+                }
+            }
+            Ok(())
+        }
+    }
 
     fn tmp_config_path() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
