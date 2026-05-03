@@ -26,10 +26,10 @@ use crate::connections::{ConnectionId, ConnectionIdError, ConnectionsMap};
 
 /// Which LLM purpose a [`PurposeConfig`] applies to.
 ///
-/// The variants are extensible: adding a new purpose is a breaking schema
-/// change, not an API one. When adding a variant, update:
+/// Adding a new purpose is a breaking schema change, not an API one.
+/// When adding a variant, update:
 /// - [`PurposeKind::as_key`] / [`PurposeKind::from_key`]
-/// - [`Purposes`] to add a slot
+/// - [`PurposeKind::all`] (the iteration order)
 /// - the migration logic in `config::maybe_migrate_legacy_purposes`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PurposeKind {
@@ -184,44 +184,43 @@ pub struct PurposeConfig {
 /// Empty / absent `[purposes]` is represented by `Purposes::default()` and is
 /// a valid state (first-run, no migration) — [`load_daemon_config`] decides
 /// whether to synthesize a set.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct Purposes {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interactive: Option<PurposeConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dreaming: Option<PurposeConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<PurposeConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub titling: Option<PurposeConfig>,
-}
+///
+/// Internally a `BTreeMap<PurposeKind, PurposeConfig>` so adding a new
+/// variant doesn't require editing four named-field arms. Custom
+/// serde implementations preserve the existing TOML named-table shape
+/// (`[purposes.interactive]`, `[purposes.dreaming]`, ...) so on-disk
+/// configs stay byte-compatible.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Purposes(BTreeMap<PurposeKind, PurposeConfig>);
 
 impl Purposes {
     /// Whether any purpose is configured.
     pub fn is_empty(&self) -> bool {
-        self.interactive.is_none()
-            && self.dreaming.is_none()
-            && self.embedding.is_none()
-            && self.titling.is_none()
+        self.0.is_empty()
     }
 
     /// Get the raw [`PurposeConfig`] for a given kind, if present.
     pub fn get(&self, kind: PurposeKind) -> Option<&PurposeConfig> {
-        match kind {
-            PurposeKind::Interactive => self.interactive.as_ref(),
-            PurposeKind::Dreaming => self.dreaming.as_ref(),
-            PurposeKind::Embedding => self.embedding.as_ref(),
-            PurposeKind::Titling => self.titling.as_ref(),
-        }
+        self.0.get(&kind)
     }
 
-    /// Mutably set the raw [`PurposeConfig`] for a given kind.
+    /// Mutable accessor used by config-mutation paths (delete-cascade,
+    /// purpose editing) that need to tweak fields on an existing entry
+    /// without going through the full `set` round-trip.
+    pub fn get_mut(&mut self, kind: PurposeKind) -> Option<&mut PurposeConfig> {
+        self.0.get_mut(&kind)
+    }
+
+    /// Mutably set the raw [`PurposeConfig`] for a given kind. Passing
+    /// `None` clears the slot.
     pub fn set(&mut self, kind: PurposeKind, cfg: Option<PurposeConfig>) {
-        match kind {
-            PurposeKind::Interactive => self.interactive = cfg,
-            PurposeKind::Dreaming => self.dreaming = cfg,
-            PurposeKind::Embedding => self.embedding = cfg,
-            PurposeKind::Titling => self.titling = cfg,
+        match cfg {
+            Some(c) => {
+                self.0.insert(kind, c);
+            }
+            None => {
+                self.0.remove(&kind);
+            }
         }
     }
 
@@ -232,9 +231,23 @@ impl Purposes {
     /// configured" command.
     #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = (PurposeKind, &PurposeConfig)> {
+        // Drive iteration order from `PurposeKind::all` rather than
+        // `BTreeMap`'s natural ordering so the public iter contract is
+        // independent of how `PurposeKind` happens to derive `Ord`.
         PurposeKind::all()
             .into_iter()
             .filter_map(|k| self.get(k).map(|c| (k, c)))
+    }
+
+    /// Build a `Purposes` from a list of `(kind, config)` pairs. Used
+    /// by tests; the daemon paths build incrementally via `set`.
+    /// Duplicate keys overwrite — last write wins, matching `set`.
+    pub fn from_pairs<I: IntoIterator<Item = (PurposeKind, PurposeConfig)>>(pairs: I) -> Self {
+        let mut out = Self::default();
+        for (kind, cfg) in pairs {
+            out.set(kind, Some(cfg));
+        }
+        out
     }
 
     /// Validate the set at load time. Currently enforces:
@@ -247,7 +260,7 @@ impl Purposes {
         if self.is_empty() {
             return Ok(());
         }
-        let Some(interactive) = self.interactive.as_ref() else {
+        let Some(interactive) = self.get(PurposeKind::Interactive) else {
             return Err(PurposeError::MissingInteractive);
         };
         if matches!(interactive.connection, ConnectionRef::Primary) {
@@ -257,6 +270,68 @@ impl Purposes {
             return Err(PurposeError::InteractivePrimaryModel);
         }
         Ok(())
+    }
+}
+
+/// Custom serde: preserve the existing TOML named-table shape on the
+/// wire (so user configs and tests don't need to change) while letting
+/// the in-memory representation be a single map. Serializes only the
+/// purposes that are present, in [`PurposeKind::all`] order; deserializes
+/// any subset of `interactive` / `dreaming` / `embedding` / `titling`
+/// keys. Unknown keys are rejected so typos surface at parse time.
+mod purposes_serde {
+    use super::{PurposeConfig, PurposeKind, Purposes};
+    use serde::de::{Error as DeError, MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
+
+    impl Serialize for Purposes {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(Some(self.0.len()))?;
+            for kind in PurposeKind::all() {
+                if let Some(cfg) = self.get(kind) {
+                    map.serialize_entry(kind.as_key(), cfg)?;
+                }
+            }
+            map.end()
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Purposes {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct PurposesVisitor;
+
+            impl<'de> Visitor<'de> for PurposesVisitor {
+                type Value = Purposes;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a `[purposes]` table with known purpose keys")
+                }
+
+                fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Purposes, M::Error> {
+                    let mut out = Purposes::default();
+                    while let Some(key) = access.next_key::<String>()? {
+                        let Some(kind) = PurposeKind::from_key(&key) else {
+                            return Err(M::Error::custom(format!(
+                                "unknown purpose `{key}`; expected one of \
+                                 `interactive`, `dreaming`, `embedding`, `titling`"
+                            )));
+                        };
+                        if out.get(kind).is_some() {
+                            return Err(M::Error::custom(format!(
+                                "duplicate purpose `{key}` in `[purposes]`"
+                            )));
+                        }
+                        let cfg: PurposeConfig = access.next_value()?;
+                        out.set(kind, Some(cfg));
+                    }
+                    Ok(out)
+                }
+            }
+
+            deserializer.deserialize_map(PurposesVisitor)
+        }
     }
 }
 
@@ -323,8 +398,7 @@ pub fn resolve_purpose(
         });
     };
     let interactive = purposes
-        .interactive
-        .as_ref()
+        .get(PurposeKind::Interactive)
         .ok_or(PurposeError::MissingInteractive)?;
 
     // Resolve connection (depth 1 max).
@@ -648,29 +722,29 @@ mystery = "x"
 
     #[test]
     fn validate_requires_interactive_when_any_purpose_set() {
-        let p = Purposes {
-            dreaming: Some(PurposeConfig {
+        let p = Purposes::from_pairs([(
+            PurposeKind::Dreaming,
+            PurposeConfig {
                 connection: ConnectionRef::Primary,
                 model: ModelRef::Primary,
                 effort: None,
                 max_context_tokens: None,
-            }),
-            ..Purposes::default()
-        };
+            },
+        )]);
         assert_eq!(p.validate().unwrap_err(), PurposeError::MissingInteractive);
     }
 
     #[test]
     fn validate_rejects_primary_in_interactive_connection() {
-        let p = Purposes {
-            interactive: Some(PurposeConfig {
+        let p = Purposes::from_pairs([(
+            PurposeKind::Interactive,
+            PurposeConfig {
                 connection: ConnectionRef::Primary,
                 model: ModelRef::Named("gpt-5.4".to_string()),
                 effort: None,
                 max_context_tokens: None,
-            }),
-            ..Purposes::default()
-        };
+            },
+        )]);
         assert_eq!(
             p.validate().unwrap_err(),
             PurposeError::InteractivePrimaryConnection
@@ -679,15 +753,15 @@ mystery = "x"
 
     #[test]
     fn validate_rejects_primary_in_interactive_model() {
-        let p = Purposes {
-            interactive: Some(PurposeConfig {
+        let p = Purposes::from_pairs([(
+            PurposeKind::Interactive,
+            PurposeConfig {
                 connection: ConnectionRef::Named(conn_id("work")),
                 model: ModelRef::Primary,
                 effort: None,
                 max_context_tokens: None,
-            }),
-            ..Purposes::default()
-        };
+            },
+        )]);
         assert_eq!(
             p.validate().unwrap_err(),
             PurposeError::InteractivePrimaryModel
@@ -698,10 +772,8 @@ mystery = "x"
 
     #[test]
     fn resolve_concrete_interactive() {
-        let p = Purposes {
-            interactive: Some(interactive_for("work", "gpt-5.4")),
-            ..Purposes::default()
-        };
+        let p =
+            Purposes::from_pairs([(PurposeKind::Interactive, interactive_for("work", "gpt-5.4"))]);
         let conns = connections_with(&["work"]);
 
         let r = resolve_purpose(PurposeKind::Interactive, &p, &conns).unwrap();
@@ -712,16 +784,18 @@ mystery = "x"
 
     #[test]
     fn resolve_primary_inherits_from_interactive() {
-        let p = Purposes {
-            interactive: Some(interactive_for("work", "gpt-5.4")),
-            dreaming: Some(PurposeConfig {
-                connection: ConnectionRef::Primary,
-                model: ModelRef::Primary,
-                effort: Some(Effort::Low),
-                max_context_tokens: None,
-            }),
-            ..Purposes::default()
-        };
+        let p = Purposes::from_pairs([
+            (PurposeKind::Interactive, interactive_for("work", "gpt-5.4")),
+            (
+                PurposeKind::Dreaming,
+                PurposeConfig {
+                    connection: ConnectionRef::Primary,
+                    model: ModelRef::Primary,
+                    effort: Some(Effort::Low),
+                    max_context_tokens: None,
+                },
+            ),
+        ]);
         let conns = connections_with(&["work"]);
 
         let r = resolve_purpose(PurposeKind::Dreaming, &p, &conns).unwrap();
@@ -733,16 +807,18 @@ mystery = "x"
 
     #[test]
     fn resolve_partial_primary_keeps_named_model() {
-        let p = Purposes {
-            interactive: Some(interactive_for("work", "gpt-5.4")),
-            dreaming: Some(PurposeConfig {
-                connection: ConnectionRef::Primary,
-                model: ModelRef::Named("claude-haiku-4-5".to_string()),
-                effort: None,
-                max_context_tokens: None,
-            }),
-            ..Purposes::default()
-        };
+        let p = Purposes::from_pairs([
+            (PurposeKind::Interactive, interactive_for("work", "gpt-5.4")),
+            (
+                PurposeKind::Dreaming,
+                PurposeConfig {
+                    connection: ConnectionRef::Primary,
+                    model: ModelRef::Named("claude-haiku-4-5".to_string()),
+                    effort: None,
+                    max_context_tokens: None,
+                },
+            ),
+        ]);
         let conns = connections_with(&["work"]);
 
         let r = resolve_purpose(PurposeKind::Dreaming, &p, &conns).unwrap();
@@ -765,16 +841,18 @@ mystery = "x"
 
     #[test]
     fn resolve_dangling_nonprimary_falls_back_to_interactive() {
-        let p = Purposes {
-            interactive: Some(interactive_for("work", "gpt-5.4")),
-            dreaming: Some(PurposeConfig {
-                connection: ConnectionRef::Named(conn_id("ghost")),
-                model: ModelRef::Named("claude-haiku-4-5".to_string()),
-                effort: None,
-                max_context_tokens: None,
-            }),
-            ..Purposes::default()
-        };
+        let p = Purposes::from_pairs([
+            (PurposeKind::Interactive, interactive_for("work", "gpt-5.4")),
+            (
+                PurposeKind::Dreaming,
+                PurposeConfig {
+                    connection: ConnectionRef::Named(conn_id("ghost")),
+                    model: ModelRef::Named("claude-haiku-4-5".to_string()),
+                    effort: None,
+                    max_context_tokens: None,
+                },
+            ),
+        ]);
         let conns = connections_with(&["work"]);
 
         let r = resolve_purpose(PurposeKind::Dreaming, &p, &conns).unwrap();
@@ -786,10 +864,10 @@ mystery = "x"
 
     #[test]
     fn resolve_dangling_interactive_connection_errors() {
-        let p = Purposes {
-            interactive: Some(interactive_for("ghost", "gpt-5.4")),
-            ..Purposes::default()
-        };
+        let p = Purposes::from_pairs([(
+            PurposeKind::Interactive,
+            interactive_for("ghost", "gpt-5.4"),
+        )]);
         let conns = connections_with(&["work"]);
         let err = resolve_purpose(PurposeKind::Interactive, &p, &conns).unwrap_err();
         match err {
@@ -802,16 +880,18 @@ mystery = "x"
 
     #[test]
     fn resolve_all_skips_absent_purposes() {
-        let p = Purposes {
-            interactive: Some(interactive_for("work", "gpt-5.4")),
-            titling: Some(PurposeConfig {
-                connection: ConnectionRef::Primary,
-                model: ModelRef::Primary,
-                effort: None,
-                max_context_tokens: None,
-            }),
-            ..Purposes::default()
-        };
+        let p = Purposes::from_pairs([
+            (PurposeKind::Interactive, interactive_for("work", "gpt-5.4")),
+            (
+                PurposeKind::Titling,
+                PurposeConfig {
+                    connection: ConnectionRef::Primary,
+                    model: ModelRef::Primary,
+                    effort: None,
+                    max_context_tokens: None,
+                },
+            ),
+        ]);
         let conns = connections_with(&["work"]);
         let resolved = resolve_all(&p, &conns).unwrap();
         assert_eq!(resolved.len(), 2);
@@ -837,10 +917,10 @@ connection = "primary"
 model = "primary"
 "#;
         let parsed: Purposes = toml::from_str(toml_src).unwrap();
-        assert!(parsed.interactive.is_some());
-        assert!(parsed.dreaming.is_some());
-        assert!(parsed.titling.is_some());
-        assert!(parsed.embedding.is_none());
+        assert!(parsed.get(PurposeKind::Interactive).is_some());
+        assert!(parsed.get(PurposeKind::Dreaming).is_some());
+        assert!(parsed.get(PurposeKind::Titling).is_some());
+        assert!(parsed.get(PurposeKind::Embedding).is_none());
         parsed.validate().expect("valid");
 
         let reserialized = toml::to_string(&parsed).unwrap();

@@ -768,12 +768,15 @@ fn maybe_migrate_legacy_purposes(
     };
 
     // Build the purposes set.
-    parsed.purposes.interactive = Some(PurposeConfig {
-        connection: ConnectionRef::Named(interactive_conn),
-        model: ModelRef::Named(interactive_model),
-        effort: None,
-        max_context_tokens: None,
-    });
+    parsed.purposes.set(
+        PurposeKind::Interactive,
+        Some(PurposeConfig {
+            connection: ConnectionRef::Named(interactive_conn),
+            model: ModelRef::Named(interactive_model),
+            effort: None,
+            max_context_tokens: None,
+        }),
+    );
 
     let dreaming_model = match (&backend_conn_ref, &backend_model_opt) {
         (ConnectionRef::Primary, Some(m)) => ModelRef::Named(m.clone()),
@@ -789,28 +792,37 @@ fn maybe_migrate_legacy_purposes(
         }
     };
 
-    parsed.purposes.dreaming = Some(PurposeConfig {
-        connection: backend_conn_ref.clone(),
-        model: dreaming_model.clone(),
-        effort: None,
-        max_context_tokens: None,
-    });
-    parsed.purposes.titling = Some(PurposeConfig {
-        connection: backend_conn_ref,
-        model: dreaming_model,
-        effort: None,
-        max_context_tokens: None,
-    });
+    parsed.purposes.set(
+        PurposeKind::Dreaming,
+        Some(PurposeConfig {
+            connection: backend_conn_ref.clone(),
+            model: dreaming_model.clone(),
+            effort: None,
+            max_context_tokens: None,
+        }),
+    );
+    parsed.purposes.set(
+        PurposeKind::Titling,
+        Some(PurposeConfig {
+            connection: backend_conn_ref,
+            model: dreaming_model,
+            effort: None,
+            max_context_tokens: None,
+        }),
+    );
     // Embeddings always inherit from the primary connection: the embedding
     // model lives in `[embeddings]`, not in `backend_tasks.llm`, so there is
     // nothing connector-specific to carry over. Users with a dedicated
     // embeddings connector keep their `[embeddings]` config unchanged.
-    parsed.purposes.embedding = Some(PurposeConfig {
-        connection: ConnectionRef::Primary,
-        model: ModelRef::Primary,
-        effort: None,
-        max_context_tokens: None,
-    });
+    parsed.purposes.set(
+        PurposeKind::Embedding,
+        Some(PurposeConfig {
+            connection: ConnectionRef::Primary,
+            model: ModelRef::Primary,
+            effort: None,
+            max_context_tokens: None,
+        }),
+    );
 
     // Drop `backend_tasks.llm` from the serialized shape. The field remains
     // in memory so existing consumers (main.rs, settings views) can still
@@ -3453,21 +3465,30 @@ model = "gpt-4o-mini"
         assert!(loaded.connections.contains_key("default"));
 
         // Interactive → default connection, primary model preserved.
-        let interactive = loaded.purposes.interactive.as_ref().expect("interactive");
+        let interactive = loaded
+            .purposes
+            .get(PurposeKind::Interactive)
+            .expect("interactive");
         assert_eq!(interactive.connection.to_string(), "default");
         assert_eq!(interactive.model.to_string(), "gpt-5.4");
 
         // Dreaming/titling → primary connection, backend model.
-        let dreaming = loaded.purposes.dreaming.as_ref().expect("dreaming");
+        let dreaming = loaded
+            .purposes
+            .get(PurposeKind::Dreaming)
+            .expect("dreaming");
         assert_eq!(dreaming.connection.to_string(), "primary");
         assert_eq!(dreaming.model.to_string(), "gpt-4o-mini");
-        let titling = loaded.purposes.titling.as_ref().expect("titling");
+        let titling = loaded.purposes.get(PurposeKind::Titling).expect("titling");
         assert_eq!(titling.connection.to_string(), "primary");
         assert_eq!(titling.model.to_string(), "gpt-4o-mini");
 
         // Embedding always inherits both (the legacy `[llm]` didn't carry an
         // embedding model — that lives in `[embeddings]`, untouched here).
-        let embedding = loaded.purposes.embedding.as_ref().expect("embedding");
+        let embedding = loaded
+            .purposes
+            .get(PurposeKind::Embedding)
+            .expect("embedding");
         assert_eq!(embedding.connection.to_string(), "primary");
         assert_eq!(embedding.model.to_string(), "primary");
 
@@ -3515,22 +3536,22 @@ model = "claude-haiku-4-5-20251001"
             "anthropic"
         );
 
-        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        let interactive = loaded.purposes.get(PurposeKind::Interactive).unwrap();
         assert_eq!(interactive.connection.to_string(), "default");
         assert_eq!(interactive.model.to_string(), "gpt-5.4");
 
         // Dreaming/titling → named `backend`, with the backend model.
-        let dreaming = loaded.purposes.dreaming.as_ref().unwrap();
+        let dreaming = loaded.purposes.get(PurposeKind::Dreaming).unwrap();
         assert_eq!(dreaming.connection.to_string(), "backend");
         assert_eq!(dreaming.model.to_string(), "claude-haiku-4-5-20251001");
-        let titling = loaded.purposes.titling.as_ref().unwrap();
+        let titling = loaded.purposes.get(PurposeKind::Titling).unwrap();
         assert_eq!(titling.connection.to_string(), "backend");
 
         // Embedding → always `primary`/`primary`, because embedding models
         // live in `[embeddings]`, not in `backend_tasks.llm`. Users with a
         // cross-connector embeddings config keep that config; the purpose
-        // entry is just there so #11 has a uniform lookup point.
-        let embedding = loaded.purposes.embedding.as_ref().unwrap();
+        // entry is just there for a uniform lookup point.
+        let embedding = loaded.purposes.get(PurposeKind::Embedding).unwrap();
         assert_eq!(embedding.connection.to_string(), "primary");
         assert_eq!(embedding.model.to_string(), "primary");
 
@@ -3553,15 +3574,15 @@ api_key_env = "OPENAI_API_KEY"
         let loaded = load_daemon_config(&path).unwrap().unwrap();
         assert_eq!(loaded.connections.len(), 1);
 
-        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        let interactive = loaded.purposes.get(PurposeKind::Interactive).unwrap();
         assert_eq!(interactive.connection.to_string(), "default");
         // Model falls back to the connector default when none was set.
         assert_eq!(interactive.model.to_string(), "gpt-5.4");
 
         for p in [
-            loaded.purposes.dreaming.as_ref().unwrap(),
-            loaded.purposes.titling.as_ref().unwrap(),
-            loaded.purposes.embedding.as_ref().unwrap(),
+            loaded.purposes.get(PurposeKind::Dreaming).unwrap(),
+            loaded.purposes.get(PurposeKind::Titling).unwrap(),
+            loaded.purposes.get(PurposeKind::Embedding).unwrap(),
         ] {
             assert_eq!(p.connection.to_string(), "primary");
             assert_eq!(p.model.to_string(), "primary");
@@ -3599,7 +3620,7 @@ api_key_env = "OPENAI_WORK_KEY"
         assert!(!dir.join("daemon.toml.bak").exists());
 
         // Purposes synthesized, pointing at the user-authored connection.
-        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        let interactive = loaded.purposes.get(PurposeKind::Interactive).unwrap();
         assert_eq!(interactive.connection.to_string(), "work");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3622,10 +3643,10 @@ effort = "high"
         std::fs::write(&path, content).unwrap();
 
         let loaded = load_daemon_config(&path).unwrap().unwrap();
-        let interactive = loaded.purposes.interactive.as_ref().unwrap();
+        let interactive = loaded.purposes.get(PurposeKind::Interactive).unwrap();
         assert_eq!(interactive.effort, Some(crate::purposes::Effort::High));
         // No other purposes synthesized.
-        assert!(loaded.purposes.dreaming.is_none());
+        assert!(loaded.purposes.get(PurposeKind::Dreaming).is_none());
 
         // File unchanged (no legacy shape, no purpose migration).
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -4295,8 +4316,7 @@ model = "llama3.2"
         assert_eq!(
             legacy
                 .purposes
-                .interactive
-                .as_ref()
+                .get(PurposeKind::Interactive)
                 .unwrap()
                 .max_context_tokens,
             None
@@ -4322,8 +4342,7 @@ max_context_tokens = 1000000
         assert_eq!(
             parsed
                 .purposes
-                .interactive
-                .as_ref()
+                .get(PurposeKind::Interactive)
                 .unwrap()
                 .max_context_tokens,
             Some(1_000_000)

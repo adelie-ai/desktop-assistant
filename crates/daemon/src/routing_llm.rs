@@ -472,6 +472,25 @@ mod tests {
     /// path used by the backend slot.
     fn build_handle_with_titling(model: &str) -> Arc<crate::api_surface::RegistryHandle> {
         use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
+        let mut purposes = Purposes::default();
+        purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("interactive-model".to_string()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        purposes.set(
+            PurposeKind::Titling,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named(model.to_string()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
         let cfg = crate::config::DaemonConfig {
             connections: IndexMap::from([(
                 "local".to_string(),
@@ -479,21 +498,7 @@ mod tests {
                     base_url: Some("http://localhost:11434".into()),
                 }),
             )]),
-            purposes: Purposes {
-                interactive: Some(PurposeConfig {
-                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-                    model: ModelRef::Named("interactive-model".to_string()),
-                    effort: None,
-                    max_context_tokens: None,
-                }),
-                titling: Some(PurposeConfig {
-                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-                    model: ModelRef::Named(model.to_string()),
-                    effort: None,
-                    max_context_tokens: None,
-                }),
-                ..Purposes::default()
-            },
+            purposes,
             ..crate::config::DaemonConfig::default()
         };
         let reg = build_registry(&cfg);
@@ -508,6 +513,17 @@ mod tests {
         // validation — which is a separate path covered by config-level
         // tests.)
         use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
+        let mut purposes = Purposes::default();
+        purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("interactive-model".to_string()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        // Note: titling intentionally absent.
         let cfg = crate::config::DaemonConfig {
             connections: IndexMap::from([(
                 "local".to_string(),
@@ -515,16 +531,7 @@ mod tests {
                     base_url: Some("http://localhost:11434".into()),
                 }),
             )]),
-            purposes: Purposes {
-                interactive: Some(PurposeConfig {
-                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-                    model: ModelRef::Named("interactive-model".to_string()),
-                    effort: None,
-                    max_context_tokens: None,
-                }),
-                // Note: titling intentionally absent.
-                ..Purposes::default()
-            },
+            purposes,
             ..crate::config::DaemonConfig::default()
         };
         let reg = build_registry(&cfg);
@@ -615,12 +622,17 @@ mod tests {
         // after the control panel writes a new value, minus the disk
         // persistence (covered by the connections-management API tests).
         let mut new_cfg = handle.snapshot_config();
-        new_cfg.purposes.titling = Some(crate::purposes::PurposeConfig {
-            connection: crate::purposes::ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-            model: crate::purposes::ModelRef::Named("model-v2".to_string()),
-            effort: None,
-            max_context_tokens: None,
-        });
+        new_cfg.purposes.set(
+            PurposeKind::Titling,
+            Some(crate::purposes::PurposeConfig {
+                connection: crate::purposes::ConnectionRef::Named(
+                    ConnectionId::new("local").unwrap(),
+                ),
+                model: crate::purposes::ModelRef::Named("model-v2".to_string()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
         handle.replace_config_for_test(new_cfg);
 
         let cfg2 = handle.snapshot_config();
