@@ -214,7 +214,11 @@ pub trait ConversationService: Send + Sync {
 
 /// Effort hint passed to connectors and mapped to per-connector request
 /// parameters at dispatch time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as the lowercase variant name (`"low"`, `"medium"`,
+/// `"high"`) for JSON columns and wire payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
     Medium,
@@ -237,36 +241,7 @@ pub struct ConversationModelSelection {
     pub connection_id: String,
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<SerdeEffort>,
-}
-
-/// Serde-friendly `Effort` that maps to lowercase strings in JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SerdeEffort {
-    Low,
-    Medium,
-    High,
-}
-
-impl From<SerdeEffort> for Effort {
-    fn from(e: SerdeEffort) -> Self {
-        match e {
-            SerdeEffort::Low => Effort::Low,
-            SerdeEffort::Medium => Effort::Medium,
-            SerdeEffort::High => Effort::High,
-        }
-    }
-}
-
-impl From<Effort> for SerdeEffort {
-    fn from(e: Effort) -> Self {
-        match e {
-            Effort::Low => SerdeEffort::Low,
-            Effort::Medium => SerdeEffort::Medium,
-            Effort::High => SerdeEffort::High,
-        }
-    }
+    pub effort: Option<Effort>,
 }
 
 /// Advisory attached to a `send_prompt_with_override` result. Returned
