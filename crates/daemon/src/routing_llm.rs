@@ -28,7 +28,6 @@ use desktop_assistant_core::ports::llm::{
 };
 
 use crate::api_surface::RegistryHandle;
-use crate::connections::ConnectionId;
 use crate::purposes::PurposeKind;
 use crate::registry::AnyLlmClient;
 
@@ -68,12 +67,7 @@ pub enum FallbackMode {
     /// Static client captured at construction. Used by the primary
     /// (interactive) slot — dispatch reads `ACTIVE_CLIENT` first, then
     /// falls back to this client for legacy callers without an override.
-    Static {
-        client: Arc<AnyLlmClient>,
-        /// Connector-type tag retained for diagnostics.
-        #[allow(dead_code)]
-        connector_type: String,
-    },
+    Static { client: Arc<AnyLlmClient> },
     /// Resolve the target client from a [`RegistryHandle`] on every
     /// dispatch by re-reading the named purpose's config. Used by the
     /// backend-tasks slot so titling/dreaming pick up control-panel edits
@@ -103,12 +97,9 @@ pub struct RoutingLlmClient {
 impl RoutingLlmClient {
     /// Static-fallback constructor. Used by the primary (interactive)
     /// slot.
-    pub fn new(fallback: Arc<AnyLlmClient>, fallback_connector_type: String) -> Self {
+    pub fn new(fallback: Arc<AnyLlmClient>) -> Self {
         Self {
-            fallback: FallbackMode::Static {
-                client: fallback,
-                connector_type: fallback_connector_type,
-            },
+            fallback: FallbackMode::Static { client: fallback },
         }
     }
 
@@ -343,22 +334,11 @@ impl LlmClient for RoutingLlmClient {
     }
 }
 
-/// Look up a connection id's live client on the registry. Wraps the
-/// existing `RegistryHandle::client_for` so [`crate::api_surface`] can
-/// hand a concrete `Arc<AnyLlmClient>` into [`with_active_client`]
-/// without pulling the `crate::registry` internals into the public API.
-#[allow(dead_code)]
-pub fn resolve_client(
-    registry: &crate::api_surface::RegistryHandle,
-    id: &ConnectionId,
-) -> Option<Arc<AnyLlmClient>> {
-    registry.client_for(id)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::{ConnectionConfig, OllamaConnection};
+    use crate::connections::{ConnectionConfig, ConnectionId, OllamaConnection};
     use crate::registry::build_registry;
     use desktop_assistant_core::CoreError;
     use desktop_assistant_core::domain::Message;
@@ -383,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_static_when_no_task_local() {
         let fallback = build_ollama_registry();
-        let client = RoutingLlmClient::new(Arc::clone(&fallback), "ollama".into());
+        let client = RoutingLlmClient::new(Arc::clone(&fallback));
         // Without a task-local override, `resolve()` must equal the
         // fallback pointer.
         let resolved = client.resolve_static();
@@ -403,7 +383,7 @@ mod tests {
             "test setup: fallback and override must be distinct"
         );
 
-        let client = RoutingLlmClient::new(Arc::clone(&fallback), "ollama".into());
+        let client = RoutingLlmClient::new(Arc::clone(&fallback));
 
         let override_clone = Arc::clone(&override_client);
         let resolved = with_active_client(override_client, async move {
@@ -423,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn stream_completion_delegates_to_resolved_client() {
         let fallback = build_ollama_registry();
-        let client = RoutingLlmClient::new(fallback, "ollama".into());
+        let client = RoutingLlmClient::new(fallback);
         let _ = client
             .stream_completion(
                 vec![Message::new(
@@ -462,14 +442,14 @@ mod tests {
     fn missing_connection_id_returns_none() {
         let registry_handle = build_local_ollama_handle();
         let missing = ConnectionId::new("nonexistent").unwrap();
-        assert!(resolve_client(&registry_handle, &missing).is_none());
+        assert!(registry_handle.client_for(&missing).is_none());
     }
 
     #[test]
     fn existing_connection_id_resolves() {
         let registry_handle = build_local_ollama_handle();
         let id = ConnectionId::new("local").unwrap();
-        assert!(resolve_client(&registry_handle, &id).is_some());
+        assert!(registry_handle.client_for(&id).is_some());
     }
 
     #[test]
@@ -490,7 +470,7 @@ mod tests {
         // delegation to the resolved client — no overlay, no tier
         // fallback. Ollama returns `None`; the wrapper must too.
         let fallback = build_ollama_registry();
-        let client = RoutingLlmClient::new(fallback, "ollama".into());
+        let client = RoutingLlmClient::new(fallback);
         assert_eq!(client.max_context_tokens(), None);
     }
 

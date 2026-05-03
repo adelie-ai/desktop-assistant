@@ -1212,8 +1212,7 @@ async fn main() -> Result<()> {
     // legacy callers without an override), the routing client falls back
     // to this interactive-purpose client — preserving pre-#18 behaviour.
     let fallback_client = Arc::new(llm);
-    let llm =
-        routing_llm::RoutingLlmClient::new(Arc::clone(&fallback_client), llm_connector.clone());
+    let llm = routing_llm::RoutingLlmClient::new(Arc::clone(&fallback_client));
     // Wrap the primary in a transparent `FixedReasoningLlmClient` whose
     // override is `default()`. The interactive dispatch path goes through
     // the per-turn task-local installed by `RoutingConversationHandler`,
@@ -1302,10 +1301,9 @@ async fn main() -> Result<()> {
                 resolved_bt.connector,
                 resolved_bt.model
             );
-            let bt_connector = resolved_bt.connector.clone();
             let bt_llm = build_llm_client(resolved_bt);
             let bt_fallback = Arc::new(bt_llm);
-            let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback, bt_connector);
+            let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback);
             let bt_llm = backend_reasoning::FixedReasoningLlmClient::new(
                 bt_llm,
                 ReasoningConfig::default(),

@@ -19,11 +19,6 @@
 //!   budget, OpenAI `reasoning_effort`, etc.) at dispatch time. See the TODO
 //!   on [`Effort`] below.
 //!
-//! Several accessors here are not yet called from the daemon binary (the
-//! registry lands in #9 and the API surface lands in #11). `#[allow(dead_code)]`
-//! keeps this module reviewable on its own.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
@@ -64,6 +59,12 @@ impl PurposeKind {
     }
 
     /// Parse a canonical key back into a [`PurposeKind`].
+    ///
+    /// Inverse of [`Self::as_key`]; kept as public API surface for
+    /// adapters that round-trip key strings (the WS protocol uses
+    /// `as_key` on the way out and would symmetrically use this on the
+    /// way in once we expose a free-form purpose endpoint).
+    #[allow(dead_code)]
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "interactive" => Some(Self::Interactive),
@@ -233,7 +234,11 @@ impl Purposes {
     }
 
     /// Iterate (kind, config) pairs in [`PurposeKind::all`] order, skipping
-    /// absent slots.
+    /// absent slots. Used by [`resolve_all`] and tests; kept on the
+    /// public surface because the daemon's purpose-config introspection
+    /// path will need this once we expose a "show me everything that's
+    /// configured" command.
+    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = (PurposeKind, &PurposeConfig)> {
         PurposeKind::all()
             .into_iter()
@@ -299,13 +304,6 @@ pub enum PurposeError {
          in `[connections]`"
     )]
     DanglingInteractiveConnection { connection: String },
-    #[error("invalid connection id {raw:?} in purpose {purpose:?}: {source}")]
-    InvalidConnectionId {
-        purpose: &'static str,
-        raw: String,
-        #[source]
-        source: ConnectionIdError,
-    },
 }
 
 /// Resolve a single purpose to a [`ResolvedPurpose`] against a validated
@@ -410,6 +408,12 @@ pub fn resolve_purpose(
 /// Resolve every configured purpose. Returns a map keyed by [`PurposeKind`].
 /// Missing purposes are simply absent from the output; it is up to call sites
 /// to decide whether a given absence is a hard error.
+///
+/// Currently only exercised by tests — the daemon resolves purposes
+/// per-call via `resolve_purpose` rather than batching at startup —
+/// but kept as part of the public surface for diagnostic and
+/// configuration-introspection use cases.
+#[allow(dead_code)]
 pub fn resolve_all(
     purposes: &Purposes,
     connections: &ConnectionsMap,
