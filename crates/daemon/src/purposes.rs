@@ -242,6 +242,7 @@ impl Purposes {
     /// Build a `Purposes` from a list of `(kind, config)` pairs. Used
     /// by tests; the daemon paths build incrementally via `set`.
     /// Duplicate keys overwrite — last write wins, matching `set`.
+    #[cfg(test)]
     pub fn from_pairs<I: IntoIterator<Item = (PurposeKind, PurposeConfig)>>(pairs: I) -> Self {
         let mut out = Self::default();
         for (kind, cfg) in pairs {

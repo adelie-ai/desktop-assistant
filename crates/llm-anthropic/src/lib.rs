@@ -1,5 +1,7 @@
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
+#[cfg(test)]
+use desktop_assistant_core::domain::ToolCall;
+use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
@@ -407,42 +409,9 @@ enum SseDelta {
     InputJsonDelta { partial_json: String },
 }
 
-/// Accumulator for building tool calls from streaming content blocks.
-#[derive(Default)]
-struct ToolCallAccumulator {
-    entries: Vec<ToolCallEntry>,
-}
-
-#[derive(Default)]
-struct ToolCallEntry {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-impl ToolCallAccumulator {
-    fn start_tool_use(&mut self, index: usize, id: String, name: String) {
-        while self.entries.len() <= index {
-            self.entries.push(ToolCallEntry::default());
-        }
-        let entry = &mut self.entries[index];
-        entry.id = id;
-        entry.name = name;
-    }
-
-    fn append_json(&mut self, index: usize, partial_json: &str) {
-        if let Some(entry) = self.entries.get_mut(index) {
-            entry.arguments.push_str(partial_json);
-        }
-    }
-
-    fn into_tool_calls(self) -> Vec<ToolCall> {
-        self.entries
-            .into_iter()
-            .map(|e| ToolCall::new(e.id, e.name, e.arguments))
-            .collect()
-    }
-}
+/// Anthropic SSE indexes content blocks with `usize`. Use the shared
+/// accumulator from core (#45).
+type ToolCallAccumulator = desktop_assistant_core::ports::llm::ToolCallAccumulator<usize>;
 
 impl AnthropicClient {
     /// Send a request and parse the SSE stream into an LlmResponse.
@@ -560,7 +529,7 @@ impl AnthropicClient {
                                         let tool_idx = tool_block_count;
                                         tool_block_count += 1;
                                         block_to_tool.insert(index, tool_idx);
-                                        tool_acc.start_tool_use(tool_idx, id.clone(), name.clone());
+                                        tool_acc.start(tool_idx, id.clone(), name.clone());
                                     }
                                     SseContentBlock::Text { .. } => {}
                                 }
@@ -580,7 +549,7 @@ impl AnthropicClient {
                                         if let Some(index) = event.index
                                             && let Some(&tool_idx) = block_to_tool.get(&index)
                                         {
-                                            tool_acc.append_json(tool_idx, partial_json);
+                                            tool_acc.append(tool_idx, partial_json);
                                         }
                                     }
                                 }
@@ -1136,36 +1105,8 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, Some(20));
     }
 
-    #[test]
-    fn tool_call_accumulator_builds_from_blocks() {
-        let mut acc = ToolCallAccumulator::default();
-
-        acc.start_tool_use(0, "toolu_1".into(), "read_file".into());
-        acc.append_json(0, "{\"pa");
-        acc.append_json(0, "th\": \"/tmp\"}");
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "toolu_1");
-        assert_eq!(calls[0].name, "read_file");
-        assert_eq!(calls[0].arguments, r#"{"path": "/tmp"}"#);
-    }
-
-    #[test]
-    fn tool_call_accumulator_multiple_tools() {
-        let mut acc = ToolCallAccumulator::default();
-
-        acc.start_tool_use(0, "t1".into(), "tool_a".into());
-        acc.append_json(0, "{}");
-
-        acc.start_tool_use(1, "t2".into(), "tool_b".into());
-        acc.append_json(1, "{}");
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "tool_a");
-        assert_eq!(calls[1].name, "tool_b");
-    }
+    // Standalone accumulator unit tests moved to
+    // `desktop_assistant_core::ports::llm` (#45).
 
     #[test]
     fn request_without_tools_omits_field() {

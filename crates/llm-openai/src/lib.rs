@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition, ToolNamespace};
+#[cfg(test)]
+use desktop_assistant_core::domain::ToolCall;
+use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
@@ -382,53 +382,9 @@ struct ResponseUsage {
     output_tokens: Option<u64>,
 }
 
-/// Entry in the tool call accumulator, keyed by `output_index`.
-#[derive(Debug, Default)]
-struct ResponseToolEntry {
-    call_id: String,
-    name: String,
-    arguments: String,
-}
-
-/// Accumulator for building tool calls from Responses API streaming events.
-#[derive(Debug, Default)]
-struct ResponseToolAccumulator {
-    entries: HashMap<usize, ResponseToolEntry>,
-}
-
-impl ResponseToolAccumulator {
-    fn register(&mut self, output_index: usize, call_id: String, name: String) {
-        self.entries.insert(
-            output_index,
-            ResponseToolEntry {
-                call_id,
-                name,
-                arguments: String::new(),
-            },
-        );
-    }
-
-    fn append_arguments(&mut self, output_index: usize, delta: &str) {
-        if let Some(entry) = self.entries.get_mut(&output_index) {
-            entry.arguments.push_str(delta);
-        }
-    }
-
-    fn finalize_arguments(&mut self, output_index: usize, arguments: &str) {
-        if let Some(entry) = self.entries.get_mut(&output_index) {
-            entry.arguments = arguments.to_string();
-        }
-    }
-
-    fn into_tool_calls(self) -> Vec<ToolCall> {
-        let mut pairs: Vec<(usize, ResponseToolEntry)> = self.entries.into_iter().collect();
-        pairs.sort_by_key(|(idx, _)| *idx);
-        pairs
-            .into_iter()
-            .map(|(_, e)| ToolCall::new(e.call_id, e.name, e.arguments))
-            .collect()
-    }
-}
+/// OpenAI Responses-API events index tool calls with `output_index`
+/// (`usize`). Use the shared accumulator from core (#45).
+type ResponseToolAccumulator = desktop_assistant_core::ports::llm::ToolCallAccumulator<usize>;
 
 // ---------------------------------------------------------------------------
 // Message conversion: domain Messages → Responses API InputItems
@@ -623,7 +579,7 @@ impl OpenAiClient {
                     Some("response.output_item.added") => {
                         if let Ok(added) = serde_json::from_str::<OutputItemAdded>(data) {
                             if added.item.r#type == "function_call" {
-                                tool_acc.register(
+                                tool_acc.start(
                                     added.output_index,
                                     added.item.call_id.unwrap_or_default(),
                                     added.item.name.unwrap_or_default(),
@@ -633,12 +589,12 @@ impl OpenAiClient {
                     }
                     Some("response.function_call_arguments.delta") => {
                         if let Ok(d) = serde_json::from_str::<FunctionArgsDelta>(data) {
-                            tool_acc.append_arguments(d.output_index, &d.delta);
+                            tool_acc.append(d.output_index, &d.delta);
                         }
                     }
                     Some("response.function_call_arguments.done") => {
                         if let Ok(d) = serde_json::from_str::<FunctionArgsDone>(data) {
-                            tool_acc.finalize_arguments(d.output_index, &d.arguments);
+                            tool_acc.finalize(d.output_index, &d.arguments);
                         }
                     }
                     Some("response.tool_search_call.searching") => {
@@ -1409,63 +1365,8 @@ mod tests {
         );
     }
 
-    // --- Tool accumulator tests ---
-
-    #[test]
-    fn response_tool_accumulator_register_and_finalize() {
-        let mut acc = ResponseToolAccumulator::default();
-        acc.register(0, "call_1".into(), "read_file".into());
-        acc.append_arguments(0, r#"{"pa"#);
-        acc.append_arguments(0, r#"th": "/tmp"}"#);
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].name, "read_file");
-        assert_eq!(calls[0].arguments, r#"{"path": "/tmp"}"#);
-    }
-
-    #[test]
-    fn response_tool_accumulator_finalize_replaces_partial() {
-        let mut acc = ResponseToolAccumulator::default();
-        acc.register(0, "c1".into(), "tool_a".into());
-        acc.append_arguments(0, "partial");
-        acc.finalize_arguments(0, r#"{"complete": true}"#);
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls[0].arguments, r#"{"complete": true}"#);
-    }
-
-    #[test]
-    fn response_tool_accumulator_multiple_tools() {
-        let mut acc = ResponseToolAccumulator::default();
-        acc.register(0, "c1".into(), "tool_a".into());
-        acc.register(1, "c2".into(), "tool_b".into());
-        acc.finalize_arguments(0, "{}");
-        acc.finalize_arguments(1, "{}");
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "tool_a");
-        assert_eq!(calls[1].name, "tool_b");
-    }
-
-    #[test]
-    fn response_tool_accumulator_sorted_by_index() {
-        let mut acc = ResponseToolAccumulator::default();
-        // Insert out of order
-        acc.register(2, "c3".into(), "tool_c".into());
-        acc.register(0, "c1".into(), "tool_a".into());
-        acc.register(1, "c2".into(), "tool_b".into());
-        acc.finalize_arguments(0, "{}");
-        acc.finalize_arguments(1, "{}");
-        acc.finalize_arguments(2, "{}");
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls[0].name, "tool_a");
-        assert_eq!(calls[1].name, "tool_b");
-        assert_eq!(calls[2].name, "tool_c");
-    }
+    // Tool accumulator unit tests moved to
+    // `desktop_assistant_core::ports::llm` (#45) along with the type.
 
     // --- Client builder test ---
 
