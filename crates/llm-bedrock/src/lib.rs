@@ -14,7 +14,7 @@ use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OnceCell};
@@ -481,41 +481,9 @@ fn convert_tools(tools: &[ToolDefinition]) -> Result<Option<ToolConfiguration>, 
     Ok(Some(cfg))
 }
 
-#[derive(Default)]
-struct ToolCallAccumulator {
-    entries: BTreeMap<i32, ToolCallEntry>,
-}
-
-#[derive(Default)]
-struct ToolCallEntry {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-impl ToolCallAccumulator {
-    fn start_tool_use(&mut self, index: i32, id: impl Into<String>, name: impl Into<String>) {
-        let entry = self.entries.entry(index).or_default();
-        entry.id = id.into();
-        entry.name = name.into();
-    }
-
-    fn append_arguments(&mut self, index: i32, chunk: &str) {
-        self.entries
-            .entry(index)
-            .or_default()
-            .arguments
-            .push_str(chunk);
-    }
-
-    fn into_tool_calls(self) -> Vec<ToolCall> {
-        self.entries
-            .into_values()
-            .filter(|entry| !entry.id.is_empty() || !entry.name.is_empty())
-            .map(|entry| ToolCall::new(entry.id, entry.name, entry.arguments))
-            .collect()
-    }
-}
+/// Bedrock indexes streamed content blocks with `i32`. Use the shared
+/// accumulator from core (#45).
+type ToolCallAccumulator = desktop_assistant_core::ports::llm::ToolCallAccumulator<i32>;
 
 fn apply_stream_event(
     event: aws_sdk_bedrockruntime::types::ConverseStreamOutput,
@@ -530,7 +498,7 @@ fn apply_stream_event(
                 && let aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(tool_use) =
                     content_start
             {
-                tool_acc.start_tool_use(
+                tool_acc.start(
                     start.content_block_index(),
                     tool_use.tool_use_id(),
                     tool_use.name(),
@@ -548,7 +516,7 @@ fn apply_stream_event(
                         }
                     }
                     aws_sdk_bedrockruntime::types::ContentBlockDelta::ToolUse(tool_delta) => {
-                        tool_acc.append_arguments(delta.content_block_index(), tool_delta.input());
+                        tool_acc.append(delta.content_block_index(), tool_delta.input());
                     }
                     _ => {}
                 }
@@ -1627,38 +1595,10 @@ mod tests {
         assert_eq!(creds.session_token(), Some("token789"));
     }
 
-    #[test]
-    fn tool_call_accumulator_builds_single_call_from_deltas() {
-        let mut acc = ToolCallAccumulator::default();
-
-        acc.start_tool_use(0, "call_1", "read_file");
-        acc.append_arguments(0, "{\"path\":\"/tmp");
-        acc.append_arguments(0, "/a\"}");
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].name, "read_file");
-        assert_eq!(calls[0].arguments, "{\"path\":\"/tmp/a\"}");
-    }
-
-    #[test]
-    fn tool_call_accumulator_orders_calls_by_block_index() {
-        let mut acc = ToolCallAccumulator::default();
-
-        acc.start_tool_use(2, "call_2", "tool_b");
-        acc.append_arguments(2, "{}");
-
-        acc.start_tool_use(1, "call_1", "tool_a");
-        acc.append_arguments(1, "{}");
-
-        let calls = acc.into_tool_calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].name, "tool_a");
-        assert_eq!(calls[1].id, "call_2");
-        assert_eq!(calls[1].name, "tool_b");
-    }
+    // The standalone accumulator unit tests moved to
+    // `desktop_assistant_core::ports::llm` (#45) where the type now
+    // lives. The Bedrock-specific stream-event integration test below
+    // still exercises the connector's wiring of the accumulator.
 
     #[test]
     fn stream_event_processing_handles_mixed_text_and_tool_calls() {

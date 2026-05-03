@@ -439,6 +439,97 @@ pub fn is_retryable_error(e: &CoreError) -> bool {
     matches!(e, CoreError::RateLimited { .. })
 }
 
+// --- Tool-call accumulator -------------------------------------------------
+
+/// Stream-time accumulator for assembling [`ToolCall`]s from a sequence
+/// of provider-specific events.
+///
+/// The shape is the same across every connector: each tool call has a
+/// stable per-stream index, an `id`, a `name`, and an `arguments` JSON
+/// string that may arrive in pieces (Anthropic / Bedrock / OpenAI all
+/// stream `arguments` as concatenated partial JSON deltas, with OpenAI
+/// also emitting a final `done` event carrying the full string).
+///
+/// Generic over the index type — Anthropic uses `usize` (zero-based
+/// content-block index), Bedrock uses `i32` (signed by the SDK),
+/// OpenAI uses `usize` (`output_index`). All three need `Ord` so
+/// [`Self::into_tool_calls`] can return calls in stable, ascending
+/// order regardless of arrival order.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallAccumulator<K> {
+    entries: std::collections::BTreeMap<K, ToolCallEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolCallEntry {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl<K: Ord + Copy> ToolCallAccumulator<K> {
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Register a new tool call at `key`. If a call already exists at
+    /// `key`, its `id` and `name` are overwritten and any
+    /// already-accumulated arguments are preserved — providers that
+    /// emit `start` for the same index twice (none seen in practice)
+    /// will get last-write-wins on the metadata without losing
+    /// streamed argument bytes.
+    pub fn start(&mut self, key: K, id: impl Into<String>, name: impl Into<String>) {
+        let entry = self.entries.entry(key).or_default();
+        entry.id = id.into();
+        entry.name = name.into();
+    }
+
+    /// Append a partial-JSON chunk to the arguments string at `key`.
+    /// Silently dropped when no `start` was emitted for `key` first
+    /// (defensive against malformed event sequences). Use this for
+    /// providers that stream `arguments` deltas (Anthropic
+    /// `input_json_delta`, Bedrock `ContentBlockDelta::ToolUse`,
+    /// OpenAI `response.function_call_arguments.delta`).
+    pub fn append(&mut self, key: K, partial_json: &str) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.arguments.push_str(partial_json);
+        }
+    }
+
+    /// Replace the arguments string at `key` with the full final
+    /// payload. Used by OpenAI's `response.function_call_arguments.done`
+    /// event, which carries the canonical full JSON; the deltas are a
+    /// preview the SDK doesn't promise are byte-equivalent. No-op for
+    /// connectors that don't emit a finalize event — they just keep
+    /// the accumulated deltas as-is.
+    pub fn finalize(&mut self, key: K, arguments: impl Into<String>) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.arguments = arguments.into();
+        }
+    }
+
+    /// Drain into [`ToolCall`]s in ascending key order. Entries with
+    /// empty `id` *and* empty `name` are filtered out — they're zombies
+    /// from a stream that emitted `append` without a matching `start`
+    /// (Bedrock's older shape did this; the new `append` guards against
+    /// it but the filter is kept as belt-and-braces).
+    pub fn into_tool_calls(self) -> Vec<ToolCall> {
+        self.entries
+            .into_values()
+            .filter(|e| !e.id.is_empty() || !e.name.is_empty())
+            .map(|e| ToolCall::new(e.id, e.name, e.arguments))
+            .collect()
+    }
+
+    /// Number of registered tool calls. Test-only.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Decorator that wraps any `LlmClient` and retries on transient rate-limit errors
 /// with exponential backoff.
 pub struct RetryingLlmClient<L> {
@@ -1065,5 +1156,74 @@ mod tests {
         })
         .await;
         assert_eq!(observed, Some(inner_budget));
+    }
+
+    // --- ToolCallAccumulator (#45) ----------------------------------------
+
+    #[test]
+    fn tool_call_accumulator_assembles_streamed_deltas() {
+        let mut acc = ToolCallAccumulator::<usize>::new();
+        acc.start(0, "call_a", "search");
+        acc.append(0, "{\"q\":");
+        acc.append(0, "\"hello\"}");
+        let calls = acc.into_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].arguments, "{\"q\":\"hello\"}");
+    }
+
+    #[test]
+    fn tool_call_accumulator_orders_by_key_ascending() {
+        let mut acc = ToolCallAccumulator::<i32>::new();
+        // Insert out of order — output must still be sorted by key.
+        acc.start(2, "call_z", "zebra");
+        acc.append(2, "{}");
+        acc.start(0, "call_a", "alpha");
+        acc.append(0, "{}");
+        acc.start(1, "call_m", "middle");
+        acc.append(1, "{}");
+        let calls = acc.into_tool_calls();
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn tool_call_accumulator_finalize_replaces_partial_arguments() {
+        let mut acc = ToolCallAccumulator::<usize>::new();
+        acc.start(0, "call_a", "search");
+        acc.append(0, "{\"part");
+        // OpenAI emits a `done` event with the full canonical JSON;
+        // finalize must replace whatever deltas have accumulated.
+        acc.finalize(0, "{\"q\":\"final\"}");
+        let calls = acc.into_tool_calls();
+        assert_eq!(calls[0].arguments, "{\"q\":\"final\"}");
+    }
+
+    #[test]
+    fn tool_call_accumulator_append_without_start_is_dropped() {
+        let mut acc = ToolCallAccumulator::<usize>::new();
+        acc.append(0, "lost data");
+        assert!(acc.into_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn tool_call_accumulator_filters_zombie_entries() {
+        // An entry whose id and name are both empty (from a hypothetical
+        // mis-sequenced provider) is filtered out — see method doc for the
+        // belt-and-braces rationale.
+        let mut acc = ToolCallAccumulator::<usize>::new();
+        acc.entries.insert(
+            0,
+            ToolCallEntry {
+                id: String::new(),
+                name: String::new(),
+                arguments: "garbage".into(),
+            },
+        );
+        acc.start(1, "real", "real");
+        let calls = acc.into_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "real");
     }
 }
