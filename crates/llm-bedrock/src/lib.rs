@@ -690,7 +690,8 @@ pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
     let base = strip_region_prefix(model_id);
 
     // Anthropic Claude on Bedrock: 3.x and 4.x all ship with 200K context.
-    if base.starts_with("anthropic.claude-3") || base.starts_with("anthropic.claude-sonnet-4")
+    if base.starts_with("anthropic.claude-3")
+        || base.starts_with("anthropic.claude-sonnet-4")
         || base.starts_with("anthropic.claude-opus-4")
         || base.starts_with("anthropic.claude-haiku-4")
     {
@@ -703,7 +704,11 @@ pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
 /// Heuristic capability inference from a model id. Operates on the *base*
 /// id (region-prefix already stripped) so it works for both bare foundation
 /// model ids and inference-profile ids.
-fn infer_capabilities_from_id(base_id: &str, vision: bool, is_embedding: bool) -> ModelCapabilities {
+fn infer_capabilities_from_id(
+    base_id: &str,
+    vision: bool,
+    is_embedding: bool,
+) -> ModelCapabilities {
     let lc = base_id.to_ascii_lowercase();
 
     let tools = lc.contains("anthropic.claude")
@@ -789,11 +794,11 @@ fn document_to_json_string(doc: &Document) -> String {
                     .unwrap_or(serde_json::Value::Null),
             },
             Document::String(s) => serde_json::Value::String(s.clone()),
-            Document::Array(a) => {
-                serde_json::Value::Array(a.iter().map(doc_to_value).collect())
-            }
+            Document::Array(a) => serde_json::Value::Array(a.iter().map(doc_to_value).collect()),
             Document::Object(o) => serde_json::Value::Object(
-                o.iter().map(|(k, v)| (k.clone(), doc_to_value(v))).collect(),
+                o.iter()
+                    .map(|(k, v)| (k.clone(), doc_to_value(v)))
+                    .collect(),
             ),
         }
     }
@@ -938,9 +943,8 @@ impl BedrockClient {
 
         let (foundation_res, profiles_res) = tokio::join!(foundation_fut, profiles_fut);
 
-        let foundation = foundation_res.map_err(|e| {
-            CoreError::Llm(format!("Bedrock ListFoundationModels failed: {e:#}"))
-        })?;
+        let foundation = foundation_res
+            .map_err(|e| CoreError::Llm(format!("Bedrock ListFoundationModels failed: {e:#}")))?;
 
         let mut models: Vec<ModelInfo> = foundation
             .model_summaries()
@@ -1058,10 +1062,7 @@ impl LlmClient for BedrockClient {
             system,
             tool_config,
             inference_cfg: self.build_inference_config(),
-            additional_request_fields: build_additional_model_request_fields(
-                &model,
-                reasoning,
-            ),
+            additional_request_fields: build_additional_model_request_fields(&model, reasoning),
         };
 
         // Path selection (#67):
@@ -1091,10 +1092,7 @@ impl LlmClient for BedrockClient {
 
         match self.dispatch_streaming(&client, &inputs, on_chunk).await {
             Ok(response) => Ok(response),
-            Err(StreamingDispatchError::StreamingToolsUnsupported {
-                on_chunk,
-                detail,
-            }) => {
+            Err(StreamingDispatchError::StreamingToolsUnsupported { on_chunk, detail }) => {
                 tracing::warn!(
                     model = %model,
                     detail,
@@ -1144,8 +1142,7 @@ impl BedrockClient {
         if self.temperature.is_none() && self.top_p.is_none() && self.max_tokens.is_none() {
             return None;
         }
-        let mut inference_cfg =
-            aws_sdk_bedrockruntime::types::InferenceConfiguration::builder();
+        let mut inference_cfg = aws_sdk_bedrockruntime::types::InferenceConfiguration::builder();
         if let Some(t) = self.temperature {
             inference_cfg = inference_cfg.temperature(t as f32);
         }
@@ -1825,8 +1822,7 @@ mod tests {
 
     impl ModelClock for MockClock {
         fn now(&self) -> Instant {
-            self.origin
-                + Duration::from_secs(self.offset.load(std::sync::atomic::Ordering::SeqCst))
+            self.origin + Duration::from_secs(self.offset.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
 
@@ -1959,10 +1955,7 @@ mod tests {
         client.__set_models_cache_for_test(cached.clone()).await;
 
         // Cache is still within TTL.
-        assert_eq!(
-            client.list_models().await.expect("within ttl"),
-            cached,
-        );
+        assert_eq!(client.list_models().await.expect("within ttl"), cached,);
 
         // Advance past TTL → next call bypasses cache and will attempt a
         // network fetch. We just verify the call path diverges (either
@@ -2070,7 +2063,11 @@ mod tests {
         assert_eq!(info.id, "anthropic.claude-3-haiku-20240307-v1:0");
     }
 
-    fn make_profile(id: &str, name: &str, status: InferenceProfileStatus) -> InferenceProfileSummary {
+    fn make_profile(
+        id: &str,
+        name: &str,
+        status: InferenceProfileStatus,
+    ) -> InferenceProfileSummary {
         // The builder requires `models` to be set (the underlying foundation
         // models the profile routes to). The conversion code doesn't read
         // them — we infer capabilities from the profile id — so a single
@@ -2079,7 +2076,9 @@ mod tests {
             .model_arn("arn:aws:bedrock:us-east-1::foundation-model/test")
             .build();
         InferenceProfileSummary::builder()
-            .inference_profile_arn(format!("arn:aws:bedrock:us-east-1:0:inference-profile/{id}"))
+            .inference_profile_arn(format!(
+                "arn:aws:bedrock:us-east-1:0:inference-profile/{id}"
+            ))
             .inference_profile_id(id)
             .inference_profile_name(name)
             .status(status)
@@ -2197,8 +2196,8 @@ mod tests {
             .build();
         let svc_err = ConverseStreamError::ThrottlingException(exc);
 
-        let mapped = map_converse_stream_service_error(&svc_err)
-            .expect("throttling has dedicated mapping");
+        let mapped =
+            map_converse_stream_service_error(&svc_err).expect("throttling has dedicated mapping");
         match mapped {
             CoreError::RateLimited {
                 retry_after,
@@ -2277,9 +2276,15 @@ mod tests {
         // Llama 3 / 4 reject tools in streaming mode; everything else
         // is currently assumed safe (and the runtime fallback covers
         // mis-classifications).
-        assert!(!supports_streaming_with_tools("meta.llama4-maverick-17b-instruct-v1:0"));
-        assert!(!supports_streaming_with_tools("meta.llama4-scout-17b-instruct-v1:0"));
-        assert!(!supports_streaming_with_tools("meta.llama3-70b-instruct-v1:0"));
+        assert!(!supports_streaming_with_tools(
+            "meta.llama4-maverick-17b-instruct-v1:0"
+        ));
+        assert!(!supports_streaming_with_tools(
+            "meta.llama4-scout-17b-instruct-v1:0"
+        ));
+        assert!(!supports_streaming_with_tools(
+            "meta.llama3-70b-instruct-v1:0"
+        ));
 
         // Claude is the canonical safe case.
         assert!(supports_streaming_with_tools("anthropic.claude-sonnet-4-6"));
@@ -2327,10 +2332,7 @@ mod tests {
         inner.insert("count".to_string(), Document::Number(Number::PosInt(42)));
         inner.insert(
             "items".to_string(),
-            Document::Array(vec![
-                Document::String("a".to_string()),
-                Document::Null,
-            ]),
+            Document::Array(vec![Document::String("a".to_string()), Document::Null]),
         );
         let doc = Document::Object(inner);
 

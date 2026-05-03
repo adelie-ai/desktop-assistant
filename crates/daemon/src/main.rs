@@ -407,10 +407,8 @@ impl api_surface::ConversationSelectionStore for SharedConversationStore {
     async fn get_selection(
         &self,
         id: &desktop_assistant_core::domain::ConversationId,
-    ) -> Result<
-        Option<desktop_assistant_core::ports::inbound::ConversationModelSelection>,
-        CoreError,
-    > {
+    ) -> Result<Option<desktop_assistant_core::ports::inbound::ConversationModelSelection>, CoreError>
+    {
         <AnyConversationStore as api_surface::ConversationSelectionStore>::get_selection(
             &self.0, id,
         )
@@ -420,9 +418,7 @@ impl api_surface::ConversationSelectionStore for SharedConversationStore {
     async fn set_selection(
         &self,
         id: &desktop_assistant_core::domain::ConversationId,
-        selection: Option<
-            &desktop_assistant_core::ports::inbound::ConversationModelSelection,
-        >,
+        selection: Option<&desktop_assistant_core::ports::inbound::ConversationModelSelection>,
     ) -> Result<(), CoreError> {
         <AnyConversationStore as api_surface::ConversationSelectionStore>::set_selection(
             &self.0, id, selection,
@@ -438,10 +434,8 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
     async fn get_selection(
         &self,
         id: &desktop_assistant_core::domain::ConversationId,
-    ) -> Result<
-        Option<desktop_assistant_core::ports::inbound::ConversationModelSelection>,
-        CoreError,
-    > {
+    ) -> Result<Option<desktop_assistant_core::ports::inbound::ConversationModelSelection>, CoreError>
+    {
         match self {
             Self::Postgres(s) => s.get_conversation_model_selection(id).await,
             Self::Json(_) => {
@@ -562,11 +556,9 @@ async fn main() -> Result<()> {
     connection_registry.spawn_ollama_warmups();
     for status in connection_registry.status() {
         match &status.health {
-            ConnectionHealth::Ok => tracing::info!(
-                "connection {} ({}) ready",
-                status.id,
-                status.connector_type
-            ),
+            ConnectionHealth::Ok => {
+                tracing::info!("connection {} ({}) ready", status.id, status.connector_type)
+            }
             ConnectionHealth::Unavailable { reason } => tracing::warn!(
                 "connection {} ({}) unavailable: {reason}",
                 status.id,
@@ -627,9 +619,7 @@ async fn main() -> Result<()> {
 
     let (active_id, llm) = match primary_resolved {
         Some((id, resolved)) => {
-            tracing::info!(
-                "primary dispatch via interactive purpose → connection {id}"
-            );
+            tracing::info!("primary dispatch via interactive purpose → connection {id}");
             (Some(id), build_llm_client(resolved))
         }
         None => {
@@ -902,14 +892,11 @@ async fn main() -> Result<()> {
         ));
         tracing::info!("wiring conversation search into builtin tools");
         use desktop_assistant_core::ports::conversation_search::ConversationSearchStore;
-        builtin_tools = builtin_tools.with_conversation_search(Arc::new(
-            move |query, limit, role_filter| {
+        builtin_tools =
+            builtin_tools.with_conversation_search(Arc::new(move |query, limit, role_filter| {
                 let store = Arc::clone(&cs_store);
-                Box::pin(async move {
-                    store.search_messages(&query, limit, role_filter).await
-                })
-            },
-        ));
+                Box::pin(async move { store.search_messages(&query, limit, role_filter).await })
+            }));
     }
 
     if let Some(tr) = &tool_registry_store {
@@ -1121,12 +1108,7 @@ async fn main() -> Result<()> {
                                 Message::new(Role::User, user_prompt),
                             ];
                             let response = llm
-                                .stream_completion(
-                                    messages,
-                                    &[],
-                                    reasoning,
-                                    Box::new(|_| true),
-                                )
+                                .stream_completion(messages, &[], reasoning, Box::new(|_| true))
                                 .await
                                 .map_err(|e| e.to_string())?;
                             Ok(response.text)
@@ -1220,8 +1202,7 @@ async fn main() -> Result<()> {
     // The wrapper exists here only so the primary and backend handlers
     // share the same `L` type (backend tasks need a non-default override,
     // and `with_backend_llm(L)` requires both stacks to match).
-    let llm =
-        backend_reasoning::FixedReasoningLlmClient::new(llm, ReasoningConfig::default());
+    let llm = backend_reasoning::FixedReasoningLlmClient::new(llm, ReasoningConfig::default());
     let llm = RetryingLlmClient::new(llm, 3);
     let llm = MaybeProfiled::from_config(
         llm,
@@ -1268,9 +1249,7 @@ async fn main() -> Result<()> {
         .and_then(|c| c.purposes.titling.as_ref())
         .is_some();
     if titling_configured {
-        tracing::info!(
-            "backend-tasks LLM source=purposes.titling (dynamic resolution per call)"
-        );
+        tracing::info!("backend-tasks LLM source=purposes.titling (dynamic resolution per call)");
         let bt_llm = routing_llm::RoutingLlmClient::new_dynamic_purpose(
             Arc::clone(&registry_handle),
             purposes::PurposeKind::Titling,
@@ -1280,7 +1259,8 @@ async fn main() -> Result<()> {
         // `with_backend_llm(L)` requires both to be the same type. The
         // dynamic-purpose dispatch path overrides reasoning internally,
         // so the wrapper is a transparent passthrough here.
-        let bt_llm = backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
+        let bt_llm =
+            backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
         let bt_llm = MaybeProfiled::from_config(
             bt_llm,
@@ -1302,10 +1282,8 @@ async fn main() -> Result<()> {
             let bt_llm = build_llm_client(resolved_bt);
             let bt_fallback = Arc::new(bt_llm);
             let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback);
-            let bt_llm = backend_reasoning::FixedReasoningLlmClient::new(
-                bt_llm,
-                ReasoningConfig::default(),
-            );
+            let bt_llm =
+                backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
             let bt_llm = RetryingLlmClient::new(bt_llm, 3);
             let bt_llm = MaybeProfiled::from_config(
                 bt_llm,
@@ -1328,9 +1306,9 @@ async fn main() -> Result<()> {
     ));
     let conversation_service = routing_conv;
 
-    let connections_service = Arc::new(api_surface::DaemonConnectionsService::new(
-        Arc::clone(&registry_handle),
-    ));
+    let connections_service = Arc::new(api_surface::DaemonConnectionsService::new(Arc::clone(
+        &registry_handle,
+    )));
 
     let settings_service =
         Arc::new(DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle));
@@ -1398,17 +1376,17 @@ async fn main() -> Result<()> {
             .and_then(|b| {
                 b.serve_at(
                     "/org/desktopAssistant/Connections",
-                    desktop_assistant_dbus::connections::DbusConnectionsAdapter::new(
-                        Arc::clone(&api_handler),
-                    ),
+                    desktop_assistant_dbus::connections::DbusConnectionsAdapter::new(Arc::clone(
+                        &api_handler,
+                    )),
                 )
             })
             .and_then(|b| {
                 b.serve_at(
                     "/org/desktopAssistant/Knowledge",
-                    desktop_assistant_dbus::knowledge::DbusKnowledgeAdapter::new(
-                        Arc::clone(&api_handler),
-                    ),
+                    desktop_assistant_dbus::knowledge::DbusKnowledgeAdapter::new(Arc::clone(
+                        &api_handler,
+                    )),
                 )
             }) {
             Ok(builder) => match builder.build().await {
@@ -1537,7 +1515,9 @@ async fn main() -> Result<()> {
         .map(|c| c.allowed_origins.clone())
         .unwrap_or_default();
     if allowed_origins.is_empty() {
-        tracing::info!("WebSocket origin policy: browser clients blocked (no allowed_origins configured)");
+        tracing::info!(
+            "WebSocket origin policy: browser clients blocked (no allowed_origins configured)"
+        );
     } else {
         tracing::info!("WebSocket allowed origins: {allowed_origins:?}");
     }
@@ -1576,7 +1556,9 @@ async fn main() -> Result<()> {
 
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let ws_task = tokio::spawn(async move {
-        let shutdown = async { let _ = ws_shutdown_rx.await; };
+        let shutdown = async {
+            let _ = ws_shutdown_rx.await;
+        };
         let result = if let Some(acceptor) = tls_acceptor {
             tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
             ws::serve_full_tls(

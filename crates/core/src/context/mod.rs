@@ -167,10 +167,7 @@ pub(crate) fn llm_messages_for_turn(
     let threshold = (max_input_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
 
     for _ in 0..MAX_PREFLIGHT_SHRINK_ITERATIONS {
-        let assembled_tokens: u64 = assembled
-            .iter()
-            .map(|m| estimate(&m.content))
-            .sum();
+        let assembled_tokens: u64 = assembled.iter().map(|m| estimate(&m.content)).sum();
         if assembled_tokens <= threshold {
             return assembled;
         }
@@ -327,8 +324,7 @@ fn assemble_messages_inner(
             ratio = (system_tokens_before as f64 / b.max_input_tokens as f64),
             "system block size"
         );
-        let threshold =
-            (b.max_input_tokens as f64 * SYSTEM_BLOCK_BUDGET_RATIO) as u64;
+        let threshold = (b.max_input_tokens as f64 * SYSTEM_BLOCK_BUDGET_RATIO) as u64;
         if system_tokens_before > threshold {
             let demoted_note = build_demoted_tool_note(tool_defs, deferred_namespaces);
             let demoted_system = assemble_system_instruction(demoted_note);
@@ -401,10 +397,7 @@ fn assemble_messages_inner(
         let many_tool_rounds = tool_rounds_since_anchor > ACTIVE_TASK_ROUND_THRESHOLD;
 
         if !anchor_visible || many_tool_rounds {
-            messages.push(Message::new(
-                Role::System,
-                format!("[Current task] {task}"),
-            ));
+            messages.push(Message::new(Role::System, format!("[Current task] {task}")));
         }
     }
 
@@ -436,10 +429,9 @@ fn assemble_messages_inner(
                         }
                     }
                     let body = match (first, last) {
-                        (Some(f), Some(l)) => format!(
-                            "[Summary of messages {}\u{2013}{}] {}",
-                            f, l, s.summary
-                        ),
+                        (Some(f), Some(l)) => {
+                            format!("[Summary of messages {}\u{2013}{}] {}", f, l, s.summary)
+                        }
                         _ => format!("[Summary of earlier messages] {}", s.summary),
                     };
                     messages.push(Message::new(Role::System, body));
@@ -1011,7 +1003,9 @@ mod tests {
         assert!(notice.contains("12345 bytes"));
         assert!(notice.contains("203524"));
         assert!(notice.contains("200000"));
-        assert!(notice.contains("narrower") || notice.contains("chunk") || notice.contains("smaller"));
+        assert!(
+            notice.contains("narrower") || notice.contains("chunk") || notice.contains("smaller")
+        );
     }
 
     #[test]
@@ -1035,7 +1029,18 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
         // System message + all 10 conversation messages
         assert_eq!(result.len(), 11);
         assert_eq!(result[0].role, Role::System);
@@ -1058,7 +1063,18 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
         // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
         // a User message (even index), so the window starts exactly there.
         // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
@@ -1091,7 +1107,18 @@ mod tests {
         msgs.push(Message::new(Role::User, "final-user"));
         msgs.push(Message::new(Role::Assistant, "final-reply"));
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
 
         // The first conversation message (after System) must be a User message.
         assert_eq!(result[0].role, Role::System);
@@ -1322,7 +1349,18 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
 
         // System prompt directly followed by windowed messages — no summary
         assert_eq!(result[0].role, Role::System);
@@ -1439,20 +1477,43 @@ mod tests {
     #[test]
     fn active_task_not_injected_when_none() {
         let msgs = vec![Message::new(Role::User, "hello")];
-        let result =
-            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
 
         let any_anchor = result
             .iter()
             .any(|m| m.role == Role::System && m.content.starts_with("[Current task]"));
-        assert!(!any_anchor, "no anchor should be injected when active_task is None");
+        assert!(
+            !any_anchor,
+            "no anchor should be injected when active_task is None"
+        );
     }
 
     #[test]
     fn active_task_not_injected_when_empty_string() {
         let msgs = vec![Message::new(Role::User, "hello")];
-        let result =
-            llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, Some(""), 99, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            Some(""),
+            99,
+            None,
+            &default_estimate,
+        );
 
         let any_anchor = result
             .iter()
@@ -1528,8 +1589,18 @@ mod tests {
             summary: "Assistant performed steps 1-3.".to_string(),
         }];
 
-        let result =
-            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &summaries,
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
 
         // System + "start" + summary injection + "follow up" + "final" = 5
         assert_eq!(result.len(), 5);
@@ -1549,7 +1620,18 @@ mod tests {
             Message::new(Role::Assistant, "hello"),
         ];
 
-        let result = llm_messages_for_turn(&msgs, &[], &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
         // System + 2 messages
         assert_eq!(result.len(), 3);
         assert_eq!(result[1].content, "hi");
@@ -1583,8 +1665,18 @@ mod tests {
             },
         ];
 
-        let result =
-            llm_messages_for_turn(&msgs, &summaries, &[], &[], "", MAX_CONTEXT_MESSAGES, None, 0, None, &default_estimate);
+        let result = llm_messages_for_turn(
+            &msgs,
+            &summaries,
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            None,
+            &default_estimate,
+        );
         // System + "start" + summary1 + "middle" + summary2 + "end" = 6
         assert_eq!(result.len(), 6);
         assert!(result[2].content.contains("Summary of messages 1\u{2013}2"));
@@ -1829,13 +1921,17 @@ mod tests {
             .find(|m| m.role == Role::System)
             .expect("system message must be present");
         assert!(
-            system.content.contains(&format!("There are {} tools across", tools.len())),
+            system
+                .content
+                .contains(&format!("There are {} tools across", tools.len())),
             "demoted system block must include 'There are <N> tools' wording, \
              got: {:?}",
             system.content
         );
         assert!(
-            !system.content.contains(&format!("Available tools in this turn: {}", tools[0].name)),
+            !system
+                .content
+                .contains(&format!("Available tools in this turn: {}", tools[0].name)),
             "demoted system block must not enumerate every tool name, got: {:?}",
             system.content
         );
@@ -1875,7 +1971,9 @@ mod tests {
             .find(|m| m.role == Role::System)
             .expect("system message must be present");
         assert!(
-            system.content.contains("Available tools in this turn: ping."),
+            system
+                .content
+                .contains("Available tools in this turn: ping."),
             "full enumeration must be preserved, got: {:?}",
             system.content
         );
@@ -1920,7 +2018,9 @@ mod tests {
             "full enumeration must be present when no budget installed"
         );
         assert!(
-            !system.content.contains(&format!("There are {} tools across", tools.len())),
+            !system
+                .content
+                .contains(&format!("There are {} tools across", tools.len())),
             "demoted summary must not appear when no budget installed"
         );
     }

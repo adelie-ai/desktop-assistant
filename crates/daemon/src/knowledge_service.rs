@@ -35,11 +35,7 @@ impl<S> DaemonKnowledgeService<S>
 where
     S: KnowledgeBaseStore + 'static,
 {
-    pub fn new(
-        store: Arc<S>,
-        embed_fn: Option<EmbedFn>,
-        embedding_model: Option<String>,
-    ) -> Self {
+    pub fn new(store: Arc<S>, embed_fn: Option<EmbedFn>, embedding_model: Option<String>) -> Self {
         Self {
             store,
             embed_fn,
@@ -61,10 +57,7 @@ where
     /// Returns `Ok(None)` when no embedding closure is wired (KB writes
     /// still succeed, just without semantic search coverage — same
     /// behaviour as the builtin tool's `embed_chunks` path).
-    async fn embed_chunks(
-        &self,
-        content: &str,
-    ) -> Result<Option<Vec<Vec<f32>>>, CoreError> {
+    async fn embed_chunks(&self, content: &str) -> Result<Option<Vec<Vec<f32>>>, CoreError> {
         let Some(embed_fn) = self.embed_fn.as_ref() else {
             return Ok(None);
         };
@@ -430,12 +423,9 @@ mod tests {
         });
 
         let store = Arc::new(InMemoryStore::default());
-        let service = DaemonKnowledgeService::new(
-            Arc::clone(&store),
-            Some(embed_fn),
-            Some("m".into()),
-        )
-        .with_id_generator(|| "kb-x".into());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store), Some(embed_fn), Some("m".into()))
+                .with_id_generator(|| "kb-x".into());
 
         service
             .create_entry("orig".into(), vec![], serde_json::json!({}))

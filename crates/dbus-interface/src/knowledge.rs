@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use desktop_assistant_application::AssistantApiHandler;
 use desktop_assistant_api_model::{self as api};
+use desktop_assistant_application::AssistantApiHandler;
 use zbus::{fdo, interface};
 
 fn to_fdo_error<E: std::fmt::Display>(error: E) -> fdo::Error {
@@ -68,9 +68,7 @@ impl DbusKnowledgeAdapter {
     /// see the same envelope.
     async fn get_entry(&self, id: &str) -> fdo::Result<String> {
         let result = self
-            .dispatch(api::Command::GetKnowledgeEntry {
-                id: id.to_string(),
-            })
+            .dispatch(api::Command::GetKnowledgeEntry { id: id.to_string() })
             .await?;
         match &result {
             api::CommandResult::KnowledgeEntry(_) => {
@@ -166,9 +164,7 @@ impl DbusKnowledgeAdapter {
 
     async fn delete_entry(&self, id: &str) -> fdo::Result<()> {
         let result = self
-            .dispatch(api::Command::DeleteKnowledgeEntry {
-                id: id.to_string(),
-            })
+            .dispatch(api::Command::DeleteKnowledgeEntry { id: id.to_string() })
             .await?;
         match result {
             api::CommandResult::Ack => Ok(()),

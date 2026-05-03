@@ -538,9 +538,7 @@ impl OpenAiClient {
             // retry. OpenAI returns HTTP 400 with a body shaped like
             // `{ "error": { "code": "context_length_exceeded", "type":
             // "invalid_request_error", "message": "..." } }`.
-            if let Some((prompt_tokens, max_tokens)) =
-                detect_openai_context_overflow(&body)
-            {
+            if let Some((prompt_tokens, max_tokens)) = detect_openai_context_overflow(&body) {
                 tracing::warn!(
                     prompt_tokens = ?prompt_tokens,
                     max_tokens = ?max_tokens,
@@ -776,7 +774,10 @@ fn detect_openai_insufficient_quota(body: &str) -> bool {
 /// "no hint" rather than substituting a default.
 fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    raw.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
 }
 
 /// Parse OpenAI's `"This model's maximum context length is 128000
@@ -1523,8 +1524,7 @@ mod tests {
 
     /// Minimal SSE body that lets `send_and_stream` reach `break` on
     /// `response.completed` — empty `response` object is enough.
-    const STUB_SSE_BODY: &str =
-        "event: response.completed\ndata: {\"response\":{}}\n\n";
+    const STUB_SSE_BODY: &str = "event: response.completed\ndata: {\"response\":{}}\n\n";
 
     #[tokio::test]
     async fn stream_completion_uses_self_model_when_override_unset() {
@@ -1641,8 +1641,7 @@ mod tests {
         let client = OpenAiClient::new("k".into()).with_model("totally-fake-model");
         assert_eq!(client.max_context_tokens(), None);
         let observed =
-            with_model_override("gpt-4o-mini".into(), async { client.max_context_tokens() })
-                .await;
+            with_model_override("gpt-4o-mini".into(), async { client.max_context_tokens() }).await;
         assert_eq!(observed, Some(128_000));
     }
 

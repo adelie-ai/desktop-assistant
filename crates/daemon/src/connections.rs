@@ -284,11 +284,7 @@ pub(crate) fn connection_from_legacy_llm(llm: &LlmConfig) -> ConnectionConfig {
                 .as_ref()
                 .filter(|v| !v.trim().is_empty() && !v.contains("://"))
                 .cloned(),
-            base_url: llm
-                .base_url
-                .as_ref()
-                .filter(|v| v.contains("://"))
-                .cloned(),
+            base_url: llm.base_url.as_ref().filter(|v| v.contains("://")).cloned(),
         }),
         // Anything else (including the legacy default "openai") maps to OpenAI.
         _ => ConnectionConfig::OpenAi(OpenAiConnection {
@@ -378,8 +374,14 @@ mod tests {
     fn connections_map_rejects_duplicate_ids() {
         let id = ConnectionId::new("default").unwrap();
         let pairs = vec![
-            (id.clone(), ConnectionConfig::OpenAi(OpenAiConnection::default())),
-            (id.clone(), ConnectionConfig::OpenAi(OpenAiConnection::default())),
+            (
+                id.clone(),
+                ConnectionConfig::OpenAi(OpenAiConnection::default()),
+            ),
+            (
+                id.clone(),
+                ConnectionConfig::OpenAi(OpenAiConnection::default()),
+            ),
         ];
         let err = ConnectionsMap::from_pairs(pairs).unwrap_err();
         assert_eq!(err, ConnectionsError::DuplicateId("default".to_string()));

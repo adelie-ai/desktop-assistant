@@ -267,10 +267,7 @@ impl DbusClient {
         decode_entries(&raw)
     }
 
-    pub async fn get_knowledge_entry(
-        &self,
-        id: &str,
-    ) -> Result<Option<api::KnowledgeEntryView>> {
+    pub async fn get_knowledge_entry(&self, id: &str) -> Result<Option<api::KnowledgeEntryView>> {
         let raw = self.knowledge.get_entry(id).await?;
         let envelope: api::CommandResult = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("decoding get_entry response: {e}"))?;

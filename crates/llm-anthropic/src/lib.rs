@@ -494,9 +494,7 @@ impl AnthropicClient {
             // body shaped like `{ "type": "error", "error": { "type":
             // "invalid_request_error", "message": "prompt is too long:
             // 203524 tokens > 200000 maximum" } }`.
-            if let Some((prompt_tokens, max_tokens)) =
-                detect_anthropic_context_overflow(&body)
-            {
+            if let Some((prompt_tokens, max_tokens)) = detect_anthropic_context_overflow(&body) {
                 tracing::warn!(
                     prompt_tokens = ?prompt_tokens,
                     max_tokens = ?max_tokens,
@@ -941,7 +939,10 @@ fn parse_prompt_too_long(message: &str) -> (Option<u64>, Option<u64>) {
 /// "no hint" rather than substituting a default.
 fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    raw.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -1443,10 +1444,7 @@ mod tests {
         assert!(models.iter().any(|m| m.id == "claude-haiku-4-5"));
 
         // 4.x models are tagged as supporting extended thinking.
-        let sonnet = models
-            .iter()
-            .find(|m| m.id == "claude-sonnet-4-6")
-            .unwrap();
+        let sonnet = models.iter().find(|m| m.id == "claude-sonnet-4-6").unwrap();
         assert!(sonnet.capabilities.reasoning);
 
         // 3.x Haiku is not flagged as a reasoning model.
@@ -1462,8 +1460,7 @@ mod tests {
     /// Helper that drains a one-event SSE stream into a complete-but-empty
     /// response — just enough to make `send_and_stream` return `Ok` so the
     /// test can focus on the *request* body.
-    const STUB_SSE_BODY: &str =
-        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"x\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n";
+    const STUB_SSE_BODY: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"x\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\ndata: [DONE]\n\n";
 
     #[tokio::test]
     async fn stream_completion_uses_self_model_when_override_unset() {
@@ -1524,10 +1521,7 @@ mod tests {
 
     #[test]
     fn context_limit_for_known_models() {
-        assert_eq!(
-            context_limit_for_model("claude-opus-4-5"),
-            Some(200_000)
-        );
+        assert_eq!(context_limit_for_model("claude-opus-4-5"), Some(200_000));
         assert_eq!(
             context_limit_for_model("claude-sonnet-4-6-20260227"),
             Some(200_000)

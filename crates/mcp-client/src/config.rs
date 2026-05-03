@@ -129,9 +129,7 @@ pub fn default_secrets_path() -> PathBuf {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(home).join(".config")
         });
-    config_dir
-        .join("desktop-assistant")
-        .join("secrets.toml")
+    config_dir.join("desktop-assistant").join("secrets.toml")
 }
 
 /// Load secrets from a TOML file.
@@ -147,13 +145,11 @@ pub fn load_secrets(path: &std::path::Path) -> Result<HashMap<String, String>, M
 
     enforce_permissions(path)?;
 
-    let contents = std::fs::read_to_string(path).map_err(|e| {
-        McpError::UnexpectedResponse(format!("failed to read secrets file: {e}"))
-    })?;
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| McpError::UnexpectedResponse(format!("failed to read secrets file: {e}")))?;
 
-    let config: SecretsConfig = toml::from_str(&contents).map_err(|e| {
-        McpError::UnexpectedResponse(format!("failed to parse secrets file: {e}"))
-    })?;
+    let config: SecretsConfig = toml::from_str(&contents)
+        .map_err(|e| McpError::UnexpectedResponse(format!("failed to parse secrets file: {e}")))?;
 
     tracing::info!(
         "loaded {} secret(s) from {}",
@@ -184,7 +180,10 @@ args = ["--config", "/path/to/config.toml"]
         assert_eq!(config.servers[0].name, "fileio");
         assert_eq!(config.servers[0].command, "fileio-mcp");
         assert!(config.servers[0].args.is_empty());
-        assert!(config.servers[0].env.is_empty(), "env should default to empty");
+        assert!(
+            config.servers[0].env.is_empty(),
+            "env should default to empty"
+        );
         assert_eq!(config.servers[1].name, "genmcp");
         assert_eq!(config.servers[1].args.len(), 2);
     }
@@ -206,7 +205,10 @@ OTHER_VAR = "value"
         assert_eq!(config.servers[0].name, "github");
         assert_eq!(config.servers[0].env.len(), 2);
         assert_eq!(
-            config.servers[0].env.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            config.servers[0]
+                .env
+                .get("GITHUB_PERSONAL_ACCESS_TOKEN")
+                .unwrap(),
             "my-token"
         );
         assert_eq!(config.servers[0].env.get("OTHER_VAR").unwrap(), "value");
@@ -287,7 +289,10 @@ GITHUB_PERSONAL_ACCESS_TOKEN = "github_pat"
         let config: McpConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.servers.len(), 1);
         assert_eq!(
-            config.servers[0].env_secrets.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            config.servers[0]
+                .env_secrets
+                .get("GITHUB_PERSONAL_ACCESS_TOKEN")
+                .unwrap(),
             "github_pat"
         );
         assert!(config.servers[0].env.is_empty());
@@ -308,8 +313,14 @@ SOME_PUBLIC_VAR = "public-value"
 SECRET_VAR = "my_secret_id"
 "#;
         let config: McpConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.servers[0].env.get("SOME_PUBLIC_VAR").unwrap(), "public-value");
-        assert_eq!(config.servers[0].env_secrets.get("SECRET_VAR").unwrap(), "my_secret_id");
+        assert_eq!(
+            config.servers[0].env.get("SOME_PUBLIC_VAR").unwrap(),
+            "public-value"
+        );
+        assert_eq!(
+            config.servers[0].env_secrets.get("SECRET_VAR").unwrap(),
+            "my_secret_id"
+        );
     }
 
     #[test]

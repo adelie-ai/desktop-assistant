@@ -37,8 +37,8 @@ use desktop_assistant_core::ports::inbound::{
     PurposeKind as CorePurposeKind, PurposesView as CorePurposesView, SerdeEffort,
 };
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback,
-    with_context_budget, with_model_override, with_reasoning_config,
+    ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
+    with_model_override, with_reasoning_config,
 };
 
 use crate::config::{
@@ -229,7 +229,8 @@ impl ConnectionsService for DaemonConnectionsService {
             if cfg.connections.contains_key(id_valid.as_str()) {
                 return Err(format!("connection id {:?} already exists", id_valid));
             }
-            cfg.connections.insert(id_valid.as_str().to_string(), new_conn);
+            cfg.connections
+                .insert(id_valid.as_str().to_string(), new_conn);
             Ok(())
         })
     }
@@ -262,8 +263,7 @@ impl ConnectionsService for DaemonConnectionsService {
             // Check whether any purpose references this id.
             let referenced_by: Vec<PurposeKind> = purposes_referencing(&cfg.purposes, &id_valid);
             if !referenced_by.is_empty() && !force {
-                let names: Vec<&'static str> =
-                    referenced_by.iter().map(|k| k.as_key()).collect();
+                let names: Vec<&'static str> = referenced_by.iter().map(|k| k.as_key()).collect();
                 return Err(format!(
                     "connection {:?} is referenced by purposes {:?}; pass force=true to cascade",
                     id_valid, names
@@ -319,11 +319,7 @@ impl ConnectionsService for DaemonConnectionsService {
             String,
             std::sync::Arc<crate::registry::AnyLlmClient>,
         )> = {
-            let state = self
-                .registry
-                .state
-                .read()
-                .expect("registry state poisoned");
+            let state = self.registry.state.read().expect("registry state poisoned");
             if let Some(id_raw) = &connection_id {
                 let id = ConnectionId::new(id_raw.clone())
                     .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
@@ -428,9 +424,7 @@ impl ConnectionsService for DaemonConnectionsService {
 
         self.registry.mutate_config(|cfg| {
             cfg.purposes.set(purpose_kind, Some(new_cfg));
-            cfg.purposes
-                .validate()
-                .map_err(|e| format!("{e}"))
+            cfg.purposes.validate().map_err(|e| format!("{e}"))
         })
     }
 }
@@ -444,9 +438,7 @@ pub trait ConversationSelectionStore: Send + Sync {
     fn get_selection(
         &self,
         id: &ConversationId,
-    ) -> impl std::future::Future<
-        Output = Result<Option<ConversationModelSelection>, CoreError>,
-    > + Send;
+    ) -> impl std::future::Future<Output = Result<Option<ConversationModelSelection>, CoreError>> + Send;
 
     fn set_selection(
         &self,
@@ -503,14 +495,13 @@ where
     /// Check a stored selection against the live registry. Returns
     /// `(is_still_valid)`. When invalid, the caller is responsible for
     /// clearing the stored selection and emitting a warning.
-    async fn selection_is_live(
-        &self,
-        sel: &ConversationModelSelection,
-    ) -> Result<bool, CoreError> {
+    async fn selection_is_live(&self, sel: &ConversationModelSelection) -> Result<bool, CoreError> {
         let Ok(id) = ConnectionId::new(sel.connection_id.clone()) else {
             return Ok(false);
         };
-        self.registry.connection_lists_model(&id, &sel.model_id).await
+        self.registry
+            .connection_lists_model(&id, &sel.model_id)
+            .await
     }
 
     /// Translate the effort hint into the per-connector
@@ -631,7 +622,9 @@ where
         max_age_days: Option<u32>,
         include_archived: bool,
     ) -> Result<Vec<ConversationSummary>, CoreError> {
-        self.inner.list_conversations(max_age_days, include_archived).await
+        self.inner
+            .list_conversations(max_age_days, include_archived)
+            .await
     }
 
     async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
@@ -825,12 +818,12 @@ where
                     sel.connection_id
                 ))
             })?;
-            let connector_type = self
-                .registry
-                .connector_type_for(&id)
-                .unwrap_or_default();
-            reasoning =
-                Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort.map(Effort::from));
+            let connector_type = self.registry.connector_type_for(&id).unwrap_or_default();
+            reasoning = Self::apply_effort_mapping(
+                &connector_type,
+                &sel.model_id,
+                sel.effort.map(Effort::from),
+            );
         }
 
         // Resolve the per-turn context budget once at dispatch entry.
@@ -902,10 +895,7 @@ where
                 (None, _) => dispatch.await,
             }
         }?;
-        Ok(PromptDispatchOutcome {
-            response,
-            warnings,
-        })
+        Ok(PromptDispatchOutcome { response, warnings })
     }
 }
 
@@ -1050,7 +1040,10 @@ fn core_to_internal_purpose(k: CorePurposeKind) -> PurposeKind {
     }
 }
 
-fn purposes_referencing(purposes: &crate::purposes::Purposes, id: &ConnectionId) -> Vec<PurposeKind> {
+fn purposes_referencing(
+    purposes: &crate::purposes::Purposes,
+    id: &ConnectionId,
+) -> Vec<PurposeKind> {
     let mut out = Vec::new();
     for kind in PurposeKind::all() {
         if let Some(p) = purposes.get(kind)
@@ -1154,10 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_connections_returns_declared_order() {
-        let cfg = config_with_connections(&[
-            ("local", ollama_local()),
-            ("aws", bedrock_work()),
-        ]);
+        let cfg = config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
         let svc = DaemonConnectionsService::new(make_handle_with(cfg));
         let views = svc.list_connections().await.unwrap();
         assert_eq!(views.len(), 2);
@@ -1198,10 +1188,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_connection_refuses_when_referenced_without_force() {
-        let mut cfg = config_with_connections(&[
-            ("local", ollama_local()),
-            ("aws", bedrock_work()),
-        ]);
+        let mut cfg =
+            config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
         cfg.purposes.interactive = Some(PurposeConfig {
             connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
             model: ModelRef::Named("llama3".into()),
@@ -1225,10 +1213,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_connection_force_cascades_to_primary() {
-        let mut cfg = config_with_connections(&[
-            ("local", ollama_local()),
-            ("aws", bedrock_work()),
-        ]);
+        let mut cfg =
+            config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
         cfg.purposes.interactive = Some(PurposeConfig {
             connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
             model: ModelRef::Named("llama3".into()),
@@ -1244,7 +1230,9 @@ mod tests {
 
         let handle = make_handle_with(cfg);
         let svc = DaemonConnectionsService::new(Arc::clone(&handle));
-        svc.delete_connection("aws".to_string(), true).await.unwrap();
+        svc.delete_connection("aws".to_string(), true)
+            .await
+            .unwrap();
 
         let cfg = handle.snapshot_config();
         assert!(!cfg.connections.contains_key("aws"));
@@ -1308,10 +1296,8 @@ mod tests {
         // we just verify the dispatch path runs without panicking and
         // filters unhealthy entries. A full integration test with mocked
         // list_models lives in `send_prompt_override_tests` below.
-        let cfg = config_with_connections(&[
-            ("local1", ollama_local()),
-            ("local2", ollama_local()),
-        ]);
+        let cfg =
+            config_with_connections(&[("local1", ollama_local()), ("local2", ollama_local())]);
         let svc = DaemonConnectionsService::new(make_handle_with(cfg));
         // Either the network fails (empty list) or succeeds — both are OK
         // since we're just checking we don't hard-error when aggregating.
@@ -1362,10 +1348,7 @@ mod tests {
         }
 
         impl ConversationService for CapturingInner {
-            async fn create_conversation(
-                &self,
-                title: String,
-            ) -> Result<Conversation, CoreError> {
+            async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
                 Ok(Conversation::new("c1", title))
             }
             async fn list_conversations(
@@ -1381,10 +1364,7 @@ mod tests {
             ) -> Result<Conversation, CoreError> {
                 Ok(Conversation::new(id.as_str(), "t"))
             }
-            async fn delete_conversation(
-                &self,
-                _id: &ConversationId,
-            ) -> Result<(), CoreError> {
+            async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
                 Ok(())
             }
             async fn rename_conversation(
@@ -1394,16 +1374,10 @@ mod tests {
             ) -> Result<(), CoreError> {
                 Ok(())
             }
-            async fn archive_conversation(
-                &self,
-                _id: &ConversationId,
-            ) -> Result<(), CoreError> {
+            async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
                 Ok(())
             }
-            async fn unarchive_conversation(
-                &self,
-                _id: &ConversationId,
-            ) -> Result<(), CoreError> {
+            async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
                 Ok(())
             }
             async fn clear_all_history(&self) -> Result<u32, CoreError> {
@@ -1425,18 +1399,15 @@ mod tests {
                 self.captured_reasoning.lock().unwrap().push(cfg);
                 let active = crate::routing_llm::active_client_is_set();
                 self.captured_active_client_set.lock().unwrap().push(active);
-                let model =
-                    desktop_assistant_core::ports::llm::current_model_override();
+                let model = desktop_assistant_core::ports::llm::current_model_override();
                 self.captured_model_override.lock().unwrap().push(model);
                 Ok("ok".to_string())
             }
         }
 
         fn local_ollama_cfg() -> DaemonConfig {
-            let mut cfg = config_with_connections(&[
-                ("local", ollama_local()),
-                ("aws", bedrock_work()),
-            ]);
+            let mut cfg =
+                config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
             cfg.purposes.interactive = Some(PurposeConfig {
                 connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
                 model: ModelRef::Named("llama3".into()),
@@ -1533,9 +1504,7 @@ mod tests {
                 // exercise the mapping.
                 c.purposes.interactive = Some(PurposeConfig {
                     connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
-                    model: ModelRef::Named(
-                        "us.anthropic.claude-sonnet-4-6".into(),
-                    ),
+                    model: ModelRef::Named("us.anthropic.claude-sonnet-4-6".into()),
                     effort: None,
                     max_context_tokens: None,
                 });
@@ -1605,7 +1574,9 @@ mod tests {
             let cfg = RoutingConversationHandler::<
                 InMemoryConversationSelectionStore,
                 CapturingInner,
-            >::apply_effort_mapping("anthropic", "claude-sonnet-4-6", Some(Effort::Low));
+            >::apply_effort_mapping(
+                "anthropic", "claude-sonnet-4-6", Some(Effort::Low)
+            );
             assert!(cfg.thinking_budget_tokens.is_none());
         }
 
@@ -1623,7 +1594,9 @@ mod tests {
             let cfg = RoutingConversationHandler::<
                 InMemoryConversationSelectionStore,
                 CapturingInner,
-            >::apply_effort_mapping("mystery-vendor", "m1", Some(Effort::High));
+            >::apply_effort_mapping(
+                "mystery-vendor", "m1", Some(Effort::High)
+            );
             assert_eq!(cfg, ReasoningConfig::default());
         }
 

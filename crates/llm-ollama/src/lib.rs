@@ -695,9 +695,7 @@ impl LlmClient for OllamaClient {
             // so we match a small set of substrings (case-insensitive)
             // and emit `ContextOverflow` with `None` measurements.
             if detect_ollama_context_overflow(&body) {
-                tracing::warn!(
-                    "Ollama rejected request for context overflow"
-                );
+                tracing::warn!("Ollama rejected request for context overflow");
                 return Err(CoreError::ContextOverflow {
                     prompt_tokens: None,
                     max_tokens: None,
@@ -1382,7 +1380,9 @@ mod tests {
     async fn warm_context_length_populates_cache() {
         let server = MockServer::start();
         let show = server.mock(|when, then| {
-            when.method(POST).path("/api/show").body_includes("llama3.2");
+            when.method(POST)
+                .path("/api/show")
+                .body_includes("llama3.2");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);
@@ -1415,7 +1415,9 @@ mod tests {
 
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(POST).path("/api/show").body_includes("llama3.2");
+            when.method(POST)
+                .path("/api/show")
+                .body_includes("llama3.2");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);
@@ -1437,10 +1439,8 @@ mod tests {
         let _ = client.warm_context_length_for("qwen2:latest").await;
 
         assert_eq!(client.max_context_tokens(), Some(131_072));
-        let observed = with_model_override("qwen2:latest".into(), async {
-            client.max_context_tokens()
-        })
-        .await;
+        let observed =
+            with_model_override("qwen2:latest".into(), async { client.max_context_tokens() }).await;
         assert_eq!(observed, Some(32_768));
     }
 
@@ -1450,7 +1450,9 @@ mod tests {
 
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(POST).path("/api/show").body_includes("llama3.2");
+            when.method(POST)
+                .path("/api/show")
+                .body_includes("llama3.2");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);
@@ -1461,10 +1463,8 @@ mod tests {
 
         // Override targets a model that hasn't been warmed: returns None
         // (cache miss is the safe answer).
-        let observed = with_model_override("never-warmed".into(), async {
-            client.max_context_tokens()
-        })
-        .await;
+        let observed =
+            with_model_override("never-warmed".into(), async { client.max_context_tokens() }).await;
         assert_eq!(observed, None);
     }
 
@@ -1593,9 +1593,7 @@ mod tests {
         assert!(detect_ollama_model_loading(
             r#"{"error":"downloading layer"}"#
         ));
-        assert!(detect_ollama_model_loading(
-            r#"{"error":"no such file"}"#
-        ));
+        assert!(detect_ollama_model_loading(r#"{"error":"no such file"}"#));
     }
 
     #[test]

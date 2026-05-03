@@ -139,7 +139,12 @@ pub(crate) async fn categorize_tool_namespaces<L: LlmClient>(
     ];
 
     let response = match llm
-        .stream_completion(messages, &[], ReasoningConfig::default(), Box::new(|_| true))
+        .stream_completion(
+            messages,
+            &[],
+            ReasoningConfig::default(),
+            Box::new(|_| true),
+        )
         .await
     {
         Ok(r) => r,

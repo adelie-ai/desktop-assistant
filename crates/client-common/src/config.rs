@@ -12,7 +12,10 @@ pub fn default_ca_cert_path() -> PathBuf {
                 .join(".local")
                 .join("share")
         });
-    data_home.join("desktop-assistant").join("tls").join("ca.pem")
+    data_home
+        .join("desktop-assistant")
+        .join("tls")
+        .join("ca.pem")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

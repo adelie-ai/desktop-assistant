@@ -443,11 +443,13 @@ mod tests {
     fn validate_command_accepts_safe_commands() {
         assert!(validate_command("fileio-mcp", &[]).is_ok());
         assert!(validate_command("/usr/bin/fileio-mcp", &[]).is_ok());
-        assert!(validate_command(
-            "genmcp",
-            &["--config".into(), "/path/to/config.toml".into()]
-        )
-        .is_ok());
+        assert!(
+            validate_command(
+                "genmcp",
+                &["--config".into(), "/path/to/config.toml".into()]
+            )
+            .is_ok()
+        );
     }
 
     #[test]

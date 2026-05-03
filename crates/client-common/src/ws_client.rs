@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use desktop_assistant_api_model as api;
 use api::{WsFrame, WsRequest};
+use desktop_assistant_api_model as api;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -38,13 +38,9 @@ impl WsClient {
             None
         };
 
-        let (socket, _response) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            connector,
-        )
-        .await?;
+        let (socket, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
+                .await?;
         let (mut ws_tx, mut ws_rx) = socket.split();
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
@@ -325,10 +321,7 @@ impl WsClient {
         Ok(items)
     }
 
-    pub async fn get_knowledge_entry(
-        &self,
-        id: &str,
-    ) -> Result<Option<api::KnowledgeEntryView>> {
+    pub async fn get_knowledge_entry(&self, id: &str) -> Result<Option<api::KnowledgeEntryView>> {
         let result = self
             .send_command(api::Command::GetKnowledgeEntry { id: id.to_string() })
             .await?;
@@ -418,9 +411,7 @@ impl WsClient {
     }
 }
 
-fn build_tls_connector(
-    ca_cert_path: Option<&Path>,
-) -> Result<tokio_tungstenite::Connector> {
+fn build_tls_connector(ca_cert_path: Option<&Path>) -> Result<tokio_tungstenite::Connector> {
     let mut root_store = rustls::RootCertStore::empty();
 
     if let Some(ca_path) = ca_cert_path {

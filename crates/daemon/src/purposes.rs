@@ -565,10 +565,7 @@ mod tests {
 
     #[test]
     fn model_ref_parses_primary_and_named() {
-        assert_eq!(
-            ModelRef::from_str("primary").unwrap(),
-            ModelRef::Primary
-        );
+        assert_eq!(ModelRef::from_str("primary").unwrap(), ModelRef::Primary);
         assert_eq!(
             ModelRef::from_str("gpt-5.4").unwrap(),
             ModelRef::Named("gpt-5.4".to_string())
@@ -583,7 +580,10 @@ model = "gpt-5.4"
 effort = "medium"
 "#;
         let parsed: PurposeConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(parsed.connection, ConnectionRef::Named(conn_id("work_openai")));
+        assert_eq!(
+            parsed.connection,
+            ConnectionRef::Named(conn_id("work_openai"))
+        );
         assert_eq!(parsed.model, ModelRef::Named("gpt-5.4".to_string()));
         assert_eq!(parsed.effort, Some(Effort::Medium));
 
@@ -755,7 +755,12 @@ mystery = "x"
         let p = Purposes::default();
         let conns = connections_with(&["work"]);
         let err = resolve_purpose(PurposeKind::Interactive, &p, &conns).unwrap_err();
-        assert!(matches!(err, PurposeError::Missing { purpose: "interactive" }));
+        assert!(matches!(
+            err,
+            PurposeError::Missing {
+                purpose: "interactive"
+            }
+        ));
     }
 
     #[test]
