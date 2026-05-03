@@ -2502,7 +2502,15 @@ mod pam_auth {
         for i in 0..count {
             let entry = unsafe { responses.add(i as usize) };
             if unsafe { !(*entry).resp.is_null() } {
+                // Zero the password bytes before handing the buffer
+                // back to libc (#38). The buffer was allocated via
+                // `libc::strdup` from a NUL-terminated C string, so
+                // `strlen` gives the byte count we need to wipe.
                 unsafe {
+                    let len = libc::strlen((*entry).resp);
+                    if len > 0 {
+                        libc::memset((*entry).resp.cast(), 0, len);
+                    }
                     libc::free((*entry).resp.cast());
                 }
             }
@@ -2588,15 +2596,22 @@ mod pam_auth {
             .map_err(|error| anyhow!("invalid PAM service name bytes: {error}"))?;
         let username_c =
             CString::new(username).map_err(|error| anyhow!("invalid username bytes: {error}"))?;
-        let password_c =
-            CString::new(password).map_err(|error| anyhow!("invalid password bytes: {error}"))?;
+        // Hold the password as a `Zeroizing<Vec<u8>>` so the buffer is
+        // wiped before the allocator reclaims it (#38). The PAM
+        // conversation callback `strdup`s this into a separate heap
+        // buffer, which `free_responses` zeroes separately.
+        let password_bytes: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(
+            CString::new(password)
+                .map_err(|error| anyhow!("invalid password bytes: {error}"))?
+                .into_bytes_with_nul(),
+        );
 
         let mut handle: *mut PamHandle = ptr::null_mut();
         // Box the ConvData so its address is heap-stable and cannot be
         // invalidated by stack moves.  The box is kept alive until after
         // pam_end, guaranteeing the pointer remains valid for all callbacks.
         let conv_data = Box::new(ConvData {
-            password: password_c.as_ptr(),
+            password: password_bytes.as_ptr() as *const c_char,
         });
         let conversation = PamConv {
             conv: Some(conversation),
