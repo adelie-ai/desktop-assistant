@@ -24,7 +24,15 @@ pub async fn execute_database_query(
 ) -> Result<serde_json::Value, CoreError> {
     let sql_trimmed = sql.trim().trim_end_matches(';');
     let upper = sql_trimmed.to_uppercase();
-    let first_keyword = upper.split_whitespace().next().unwrap_or("");
+
+    // Classify on the *first non-comment* keyword (#40). A naive
+    // `split_whitespace().next()` returns `/*` for a query that opens
+    // with a block comment, which falls through to the write path —
+    // bypassing the READ ONLY transaction reads run under. Strip
+    // leading SQL comments first so `/* */ SELECT *` correctly
+    // routes through `execute_read`.
+    let stripped = strip_leading_sql_comments(&upper);
+    let first_keyword = stripped.split_whitespace().next().unwrap_or("");
 
     let is_read = matches!(
         first_keyword,
@@ -36,6 +44,68 @@ pub async fn execute_database_query(
     } else {
         execute_write(pool, sql_trimmed, &upper).await
     }
+}
+
+/// Strip leading SQL comments (`--` line comments and `/* … */` block
+/// comments, including nested blocks per Postgres) plus the
+/// whitespace between them. Returns a substring of `sql` starting at
+/// the first character that is neither a comment nor whitespace.
+///
+/// On a malformed leading block comment (no closing `*/`), returns an
+/// empty string — the caller treats that as "no recognisable
+/// keyword", which routes to the write path where Postgres rejects
+/// the malformed statement at parse time. Same outcome as a
+/// nonsensical query without the comment.
+fn strip_leading_sql_comments(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    loop {
+        // Skip whitespace.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            // Line comment runs to end of line (LF or CR/LF) or end of input.
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            // Skip the newline so the next iteration sees the post-comment text.
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Block comment, with nesting (Postgres extension to ANSI SQL).
+            let mut depth: usize = 1;
+            i += 2;
+            while i + 1 < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                // Unterminated block comment — treat as if the whole
+                // remainder is still inside a comment so the caller
+                // sees no keyword and routes to the write path, where
+                // Postgres will reject the malformed statement.
+                return "";
+            }
+            continue;
+        }
+        break;
+    }
+    &sql[i..]
 }
 
 /// Read path — READ ONLY transaction, auto-LIMIT, always rolled back.
@@ -246,5 +316,104 @@ fn pg_value_to_json(row: &PgRow, index: usize, type_name: &str) -> serde_json::V
             Ok(None) => serde_json::Value::Null,
             Err(_) => serde_json::Value::String(format!("<unsupported type: {type_name}>")),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(sql: &str) -> bool {
+        // Mirror what `execute_database_query` does to pick the path,
+        // without needing a live Postgres pool. Returns `true` for
+        // reads, `false` for writes.
+        let trimmed = sql.trim().trim_end_matches(';');
+        let upper = trimmed.to_uppercase();
+        let stripped = strip_leading_sql_comments(&upper);
+        let first_keyword = stripped.split_whitespace().next().unwrap_or("");
+        matches!(
+            first_keyword,
+            "SELECT" | "WITH" | "TABLE" | "VALUES" | "EXPLAIN"
+        )
+    }
+
+    #[test]
+    fn plain_select_routes_to_read() {
+        assert!(classify("SELECT * FROM conversations"));
+        assert!(classify("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(classify("EXPLAIN SELECT 1"));
+    }
+
+    #[test]
+    fn plain_write_routes_to_write() {
+        assert!(!classify("DELETE FROM scratch.foo"));
+        assert!(!classify("INSERT INTO scratch.foo VALUES (1)"));
+        assert!(!classify("UPDATE scratch.foo SET bar = 1"));
+        assert!(!classify("CREATE TABLE scratch.foo (id INT)"));
+    }
+
+    #[test]
+    fn leading_block_comment_does_not_promote_write_to_read() {
+        // The original bypass: `/* */ DELETE` previously had
+        // `first_keyword = "/*"` which doesn't match read keywords,
+        // so it routed to the *write* path — but as an unwanted side
+        // effect a leading comment in front of a SELECT also routed
+        // to write (commits). After #40, comment-prefixed reads are
+        // recognised as reads, and comment-prefixed writes still
+        // route to write (so legitimate writes keep working).
+        assert!(classify("/* comment */ SELECT * FROM conversations"));
+        assert!(!classify("/* comment */ DELETE FROM public.foo"));
+    }
+
+    #[test]
+    fn line_comment_is_stripped() {
+        assert!(classify("-- hi\nSELECT 1"));
+        assert!(classify("--  multiple    spaces \nSELECT 1"));
+        assert!(!classify("-- hi\nDELETE FROM scratch.foo"));
+    }
+
+    #[test]
+    fn nested_block_comments_are_handled() {
+        // Postgres allows `/* outer /* inner */ still outer */`. A
+        // naive `find("*/")` strip would terminate after the inner
+        // close and mis-classify the outer text.
+        assert!(classify("/* outer /* nested */ still outer */ SELECT 1"));
+        assert!(classify(
+            "/* /* /* deep */ */ */ WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
+    }
+
+    #[test]
+    fn mixed_comment_kinds_strip_correctly() {
+        assert!(classify("-- first\n/* block */\n-- another\nSELECT 1"));
+        assert!(!classify("/* */ -- line\n /* */ DELETE FROM scratch.foo"));
+    }
+
+    #[test]
+    fn unterminated_block_comment_routes_to_write() {
+        // No `*/` — every char is consumed as comment, no keyword,
+        // routes to the write path where Postgres will reject the
+        // malformed statement at parse time.
+        assert!(!classify("/* never closes SELECT 1"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_only_routes_to_write() {
+        assert!(!classify(""));
+        assert!(!classify("   "));
+        assert!(!classify("\n\t\n"));
+        assert!(!classify("-- only a comment"));
+        assert!(!classify("/* only */"));
+    }
+
+    #[test]
+    fn strip_does_not_modify_keyword_after_skipping() {
+        // The strip should land *exactly* on the first non-comment
+        // character so the upstream `to_uppercase()` + keyword match
+        // still sees the canonical keyword.
+        let stripped = strip_leading_sql_comments("/* x */SELECT 1");
+        assert_eq!(stripped, "SELECT 1");
+        let stripped = strip_leading_sql_comments("--c\n--d\nSELECT 1");
+        assert_eq!(stripped, "SELECT 1");
     }
 }
