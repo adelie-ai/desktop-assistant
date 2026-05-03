@@ -8,10 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use desktop_assistant_core::ports::llm::{BudgetSource, ContextBudget};
-use desktop_assistant_llm_anthropic::AnthropicClient;
-use desktop_assistant_llm_bedrock::BedrockClient;
-use desktop_assistant_llm_ollama::OllamaClient;
-use desktop_assistant_llm_openai::OpenAiClient;
 use indexmap::IndexMap;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use keyring::Entry;
@@ -19,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connections::{
     AnthropicConnection, BedrockConnection, ConnectionConfig, ConnectionId, ConnectionsError,
-    ConnectionsMap, OllamaConnection, OpenAiConnection, connection_from_legacy_llm,
+    ConnectionsMap, Connector, OllamaConnection, OpenAiConnection, connection_from_legacy_llm,
 };
 use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, PurposeKind, Purposes};
 
@@ -1195,28 +1191,28 @@ pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
         connector
     };
 
+    let typed = parse_connector_or_openai(&connector);
     let llm_model = default_llm_model(&connector);
     let llm_base_url = default_base_url(&connector);
 
-    let embeddings_available = connector != "anthropic";
+    let embeddings_available = typed.supports_embeddings();
+    // Substitute OpenAI for the embedding lookup when this connector
+    // doesn't ship one (Anthropic) — preserves legacy behaviour where
+    // `embeddings_model` always resolves to a real value.
     let embeddings_connector = if embeddings_available {
-        connector.as_str()
+        typed
     } else {
-        "openai"
+        Connector::OpenAi
     };
-
-    let hosted_tool_search_available = connector == "openai" || connector == "anthropic";
-
-    let backend_llm_model = default_backend_llm_model(&connector);
 
     ConnectorDefaultsView {
         llm_model,
         llm_base_url,
-        backend_llm_model,
-        embeddings_model: default_embedding_model(embeddings_connector),
-        embeddings_base_url: default_base_url(embeddings_connector),
+        backend_llm_model: default_backend_llm_model(&connector),
+        embeddings_model: embeddings_connector.default_embedding_model().to_string(),
+        embeddings_base_url: embeddings_connector.default_base_url().to_string(),
         embeddings_available,
-        hosted_tool_search_available,
+        hosted_tool_search_available: typed.supports_hosted_tool_search(),
     }
 }
 
@@ -1339,45 +1335,43 @@ pub fn resolve_database_config(config: Option<&DaemonConfig>) -> (Option<String>
     (url, max_conns)
 }
 
+/// Resolve `connector` to a typed [`Connector`], falling back to
+/// `Connector::OpenAi` for unrecognised values — the historical
+/// "default to OpenAI for unknown connector strings" behaviour, now
+/// concentrated in one helper instead of repeated as a `_` arm in
+/// every match (#47).
+fn parse_connector_or_openai(connector: &str) -> Connector {
+    Connector::parse(connector).unwrap_or(Connector::OpenAi)
+}
+
 fn default_embedding_model(connector: &str) -> String {
-    match connector {
-        "ollama" => "nomic-embed-text".to_string(),
-        "bedrock" | "aws-bedrock" => "amazon.titan-embed-text-v2:0".to_string(),
-        _ => "text-embedding-3-small".to_string(),
+    let c = parse_connector_or_openai(connector);
+    let model = c.default_embedding_model();
+    // Anthropic has no embeddings; the legacy default for that case
+    // was `text-embedding-3-small` (the OpenAI default).
+    if model.is_empty() {
+        Connector::OpenAi.default_embedding_model().to_string()
+    } else {
+        model.to_string()
     }
 }
 
 fn default_base_url(connector: &str) -> String {
-    match connector {
-        "ollama" => OllamaClient::get_default_base_url(),
-        "anthropic" => AnthropicClient::get_default_base_url(),
-        "bedrock" | "aws-bedrock" => BedrockClient::get_default_base_url(),
-        _ => OpenAiClient::get_default_base_url(),
-    }
-    .unwrap_or_default()
-    .to_string()
+    parse_connector_or_openai(connector)
+        .default_base_url()
+        .to_string()
 }
 
 fn default_llm_model(connector: &str) -> String {
-    match connector {
-        "ollama" => OllamaClient::get_default_model(),
-        "anthropic" => AnthropicClient::get_default_model(),
-        "bedrock" | "aws-bedrock" => BedrockClient::get_default_model(),
-        _ => OpenAiClient::get_default_model(),
-    }
-    .unwrap_or_default()
-    .to_string()
+    parse_connector_or_openai(connector)
+        .default_chat_model()
+        .to_string()
 }
 
 fn default_backend_llm_model(connector: &str) -> String {
-    match connector {
-        "ollama" => OllamaClient::get_default_model()
-            .unwrap_or_default()
-            .to_string(),
-        "anthropic" => "claude-haiku-4-5-20251001".to_string(),
-        "bedrock" | "aws-bedrock" => "us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
-        _ => "gpt-4o-mini".to_string(),
-    }
+    parse_connector_or_openai(connector)
+        .default_backend_chat_model()
+        .to_string()
 }
 
 fn normalize_optional_value(value: Option<&str>) -> Option<String> {
@@ -1567,11 +1561,10 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
         .and_then(|c| c.base_url.clone())
         .filter(|v| !v.trim().is_empty())
         .or_else(|| std::env::var(default_base_url_env).ok())
-        .unwrap_or_else(|| match connector.as_str() {
-            "ollama" => "http://localhost:11434".to_string(),
-            "anthropic" => "https://api.anthropic.com".to_string(),
-            "bedrock" | "aws-bedrock" => "us-east-1".to_string(),
-            _ => "https://api.openai.com/v1".to_string(),
+        .unwrap_or_else(|| {
+            parse_connector_or_openai(&connector)
+                .default_http_base_url()
+                .to_string()
         });
 
     let temperature = llm_config.and_then(|c| c.temperature);
@@ -1666,11 +1659,10 @@ pub fn resolve_connection_llm_config(
     let base_url = conn_base_url
         .filter(|v| !v.trim().is_empty())
         .or_else(|| std::env::var(&default_base_url_env).ok())
-        .unwrap_or_else(|| match connector.as_str() {
-            "ollama" => "http://localhost:11434".to_string(),
-            "anthropic" => "https://api.anthropic.com".to_string(),
-            "bedrock" | "aws-bedrock" => "us-east-1".to_string(),
-            _ => "https://api.openai.com/v1".to_string(),
+        .unwrap_or_else(|| {
+            parse_connector_or_openai(&connector)
+                .default_http_base_url()
+                .to_string()
         });
 
     // Model / tuning: not on the connection. Use the legacy `[llm]` block as
