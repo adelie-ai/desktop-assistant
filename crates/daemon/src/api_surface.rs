@@ -278,7 +278,7 @@ impl ConnectionsService for DaemonConnectionsService {
                     // Pick a replacement: first remaining connection, if any.
                     if let Some((new_interactive_id, _)) = cfg.connections.iter().next() {
                         let new_id = new_interactive_id.clone();
-                        if let Some(p) = cfg.purposes.interactive.as_mut() {
+                        if let Some(p) = cfg.purposes.get_mut(PurposeKind::Interactive) {
                             p.connection = ConnectionRef::Named(
                                 ConnectionId::new(new_id)
                                     .expect("existing key was already validated"),
@@ -286,17 +286,11 @@ impl ConnectionsService for DaemonConnectionsService {
                         }
                     } else {
                         // No connections left — clear interactive entirely.
-                        cfg.purposes.interactive = None;
+                        cfg.purposes.set(PurposeKind::Interactive, None);
                     }
                     continue;
                 }
-                let slot = match kind {
-                    PurposeKind::Dreaming => cfg.purposes.dreaming.as_mut(),
-                    PurposeKind::Embedding => cfg.purposes.embedding.as_mut(),
-                    PurposeKind::Titling => cfg.purposes.titling.as_mut(),
-                    PurposeKind::Interactive => unreachable!(),
-                };
-                if let Some(p) = slot {
+                if let Some(p) = cfg.purposes.get_mut(kind) {
                     p.connection = ConnectionRef::Primary;
                 }
             }
@@ -390,10 +384,22 @@ impl ConnectionsService for DaemonConnectionsService {
     async fn get_purposes(&self) -> Result<CorePurposesView, CoreError> {
         let config = self.registry.snapshot_config();
         Ok(CorePurposesView {
-            interactive: config.purposes.interactive.as_ref().map(purpose_to_payload),
-            dreaming: config.purposes.dreaming.as_ref().map(purpose_to_payload),
-            embedding: config.purposes.embedding.as_ref().map(purpose_to_payload),
-            titling: config.purposes.titling.as_ref().map(purpose_to_payload),
+            interactive: config
+                .purposes
+                .get(PurposeKind::Interactive)
+                .map(purpose_to_payload),
+            dreaming: config
+                .purposes
+                .get(PurposeKind::Dreaming)
+                .map(purpose_to_payload),
+            embedding: config
+                .purposes
+                .get(PurposeKind::Embedding)
+                .map(purpose_to_payload),
+            titling: config
+                .purposes
+                .get(PurposeKind::Titling)
+                .map(purpose_to_payload),
         })
     }
 
@@ -475,7 +481,7 @@ where
     /// valid stored selection exists.
     fn interactive_selection(&self) -> Option<ConversationModelSelection> {
         let cfg = self.registry.snapshot_config();
-        cfg.purposes.interactive.as_ref().and_then(|p| {
+        cfg.purposes.get(PurposeKind::Interactive).and_then(|p| {
             let connection_id = match &p.connection {
                 ConnectionRef::Named(id) => id.as_str().to_string(),
                 ConnectionRef::Primary => return None,
@@ -1190,18 +1196,24 @@ mod tests {
     async fn delete_connection_refuses_when_referenced_without_force() {
         let mut cfg =
             config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
-        cfg.purposes.interactive = Some(PurposeConfig {
-            connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-            model: ModelRef::Named("llama3".into()),
-            effort: None,
-            max_context_tokens: None,
-        });
-        cfg.purposes.dreaming = Some(PurposeConfig {
-            connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
-            model: ModelRef::Named("claude".into()),
-            effort: None,
-            max_context_tokens: None,
-        });
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        cfg.purposes.set(
+            PurposeKind::Dreaming,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
+                model: ModelRef::Named("claude".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
 
         let svc = DaemonConnectionsService::new(make_handle_with(cfg));
         let err = svc
@@ -1215,18 +1227,24 @@ mod tests {
     async fn delete_connection_force_cascades_to_primary() {
         let mut cfg =
             config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
-        cfg.purposes.interactive = Some(PurposeConfig {
-            connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-            model: ModelRef::Named("llama3".into()),
-            effort: None,
-            max_context_tokens: None,
-        });
-        cfg.purposes.dreaming = Some(PurposeConfig {
-            connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
-            model: ModelRef::Named("claude".into()),
-            effort: None,
-            max_context_tokens: None,
-        });
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        cfg.purposes.set(
+            PurposeKind::Dreaming,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
+                model: ModelRef::Named("claude".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
 
         let handle = make_handle_with(cfg);
         let svc = DaemonConnectionsService::new(Arc::clone(&handle));
@@ -1236,7 +1254,10 @@ mod tests {
 
         let cfg = handle.snapshot_config();
         assert!(!cfg.connections.contains_key("aws"));
-        let dreaming = cfg.purposes.dreaming.as_ref().expect("dreaming still set");
+        let dreaming = cfg
+            .purposes
+            .get(PurposeKind::Dreaming)
+            .expect("dreaming still set");
         assert!(matches!(dreaming.connection, ConnectionRef::Primary));
     }
 
@@ -1262,12 +1283,15 @@ mod tests {
     #[tokio::test]
     async fn get_purposes_returns_current_config() {
         let mut cfg = config_with_connections(&[("local", ollama_local())]);
-        cfg.purposes.interactive = Some(PurposeConfig {
-            connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-            model: ModelRef::Named("llama3".into()),
-            effort: Some(PurposeEffort::Medium),
-            max_context_tokens: None,
-        });
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: Some(PurposeEffort::Medium),
+                max_context_tokens: None,
+            }),
+        );
         let svc = DaemonConnectionsService::new(make_handle_with(cfg));
         let view = svc.get_purposes().await.unwrap();
         let i = view.interactive.expect("interactive set");
@@ -1408,12 +1432,15 @@ mod tests {
         fn local_ollama_cfg() -> DaemonConfig {
             let mut cfg =
                 config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
-            cfg.purposes.interactive = Some(PurposeConfig {
-                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-                model: ModelRef::Named("llama3".into()),
-                effort: None,
-                max_context_tokens: None,
-            });
+            cfg.purposes.set(
+                PurposeKind::Interactive,
+                Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named("llama3".into()),
+                    effort: None,
+                    max_context_tokens: None,
+                }),
+            );
             cfg
         }
 
@@ -1502,12 +1529,15 @@ mod tests {
                 // still routes to a Claude-shape connector; override
                 // sets the Bedrock connection explicitly below to
                 // exercise the mapping.
-                c.purposes.interactive = Some(PurposeConfig {
-                    connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
-                    model: ModelRef::Named("us.anthropic.claude-sonnet-4-6".into()),
-                    effort: None,
-                    max_context_tokens: None,
-                });
+                c.purposes.set(
+                    PurposeKind::Interactive,
+                    Some(PurposeConfig {
+                        connection: ConnectionRef::Named(ConnectionId::new("aws").unwrap()),
+                        model: ModelRef::Named("us.anthropic.claude-sonnet-4-6".into()),
+                        effort: None,
+                        max_context_tokens: None,
+                    }),
+                );
                 c
             };
             let registry = make_handle_with(cfg);
@@ -1660,12 +1690,15 @@ mod tests {
             // so the bedrock-effort case is covered by the unit test on
             // `apply_effort_mapping` above.
             let mut cfg = local_ollama_cfg();
-            cfg.purposes.interactive = Some(PurposeConfig {
-                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-                model: ModelRef::Named("llama3".into()),
-                effort: Some(PurposeEffort::High),
-                max_context_tokens: None,
-            });
+            cfg.purposes.set(
+                PurposeKind::Interactive,
+                Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named("llama3".into()),
+                    effort: Some(PurposeEffort::High),
+                    max_context_tokens: None,
+                }),
+            );
             let registry = make_handle_with(cfg);
             let inner = Arc::new(CapturingInner::new());
             let store = Arc::new(InMemoryConversationSelectionStore::default());
@@ -1761,12 +1794,15 @@ mod tests {
                         base_url: Some(server.url("")),
                     }),
                 )]);
-                c.purposes.interactive = Some(PurposeConfig {
-                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-                    model: ModelRef::Named("llama3.2".into()),
-                    effort: None,
-                    max_context_tokens: None,
-                });
+                c.purposes.set(
+                    PurposeKind::Interactive,
+                    Some(PurposeConfig {
+                        connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                        model: ModelRef::Named("llama3.2".into()),
+                        effort: None,
+                        max_context_tokens: None,
+                    }),
+                );
                 c
             };
             let registry = make_handle_with(cfg);
@@ -1840,12 +1876,15 @@ mod tests {
                         base_url: Some(server.url("")),
                     }),
                 )]);
-                c.purposes.interactive = Some(PurposeConfig {
-                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
-                    model: ModelRef::Named("llama3.2".into()),
-                    effort: None,
-                    max_context_tokens: None,
-                });
+                c.purposes.set(
+                    PurposeKind::Interactive,
+                    Some(PurposeConfig {
+                        connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                        model: ModelRef::Named("llama3.2".into()),
+                        effort: None,
+                        max_context_tokens: None,
+                    }),
+                );
                 c
             };
             let registry = make_handle_with(cfg);

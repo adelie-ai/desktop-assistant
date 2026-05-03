@@ -609,7 +609,7 @@ async fn main() -> Result<()> {
     .and_then(|resolved| {
         let id = daemon_config
             .as_ref()
-            .and_then(|c| c.purposes.interactive.as_ref())
+            .and_then(|c| c.purposes.get(purposes::PurposeKind::Interactive))
             .and_then(|p| match &p.connection {
                 purposes::ConnectionRef::Named(id) => Some(id.clone()),
                 purposes::ConnectionRef::Primary => None,
@@ -1246,7 +1246,7 @@ async fn main() -> Result<()> {
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
     let titling_configured = daemon_config
         .as_ref()
-        .and_then(|c| c.purposes.titling.as_ref())
+        .and_then(|c| c.purposes.get(purposes::PurposeKind::Titling))
         .is_some();
     if titling_configured {
         tracing::info!("backend-tasks LLM source=purposes.titling (dynamic resolution per call)");
