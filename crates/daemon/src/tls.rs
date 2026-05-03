@@ -158,6 +158,13 @@ fn ensure_server_cert(
 }
 
 /// Check whether the first certificate in a PEM bundle has expired.
+///
+/// Returns `true` for "treat as expired" — used by the bootstrap path
+/// to decide whether to regenerate the local CA-signed cert. Parse
+/// failures count as expired (so a corrupted file gets replaced rather
+/// than blocking startup), but every unparseable case logs the reason
+/// at `warn` so an operator can tell the difference between a genuine
+/// expiry and a malformed-cert churn loop.
 fn is_pem_cert_expired(pem_bytes: &[u8]) -> bool {
     let mut reader = std::io::BufReader::new(pem_bytes);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
@@ -165,18 +172,34 @@ fn is_pem_cert_expired(pem_bytes: &[u8]) -> bool {
         .collect();
 
     let Some(cert_der) = certs.first() else {
-        return true; // unparseable → treat as expired
+        tracing::warn!(
+            "TLS cert PEM contained no parseable certificates; \
+             treating as expired so the bootstrap path will regenerate"
+        );
+        return true;
     };
 
     // Parse the X.509 not_after field via a minimal DER walk.
-    // We use webpki to check validity at the current time.
-    // Simpler approach: use rustls to attempt to build a verified chain — but that
-    // requires the CA. Instead, just parse the not_after from the DER directly.
-    parse_not_after_expired(cert_der.as_ref())
+    match parse_not_after_expired(cert_der.as_ref()) {
+        Ok(expired) => expired,
+        Err(reason) => {
+            tracing::warn!(
+                reason,
+                "TLS cert DER parse failed; treating as expired so the \
+                 bootstrap path will regenerate. A malformed cert here \
+                 will trigger regeneration on every startup — replace \
+                 the cert file or fix the parse error to break the loop."
+            );
+            true
+        }
+    }
 }
 
 /// Minimal DER parse to extract notAfter from an X.509 certificate.
-fn parse_not_after_expired(der: &[u8]) -> bool {
+/// Returns `Ok(true)` if `notAfter` is in the past, `Ok(false)` if the
+/// cert is still valid, and `Err(&'static str)` describing where the
+/// parse failed so the caller can log a meaningful diagnostic.
+fn parse_not_after_expired(der: &[u8]) -> Result<bool, &'static str> {
     // X.509 structure: SEQUENCE { tbsCertificate SEQUENCE { ... validity SEQUENCE { notBefore, notAfter } ... } }
     // We use a simple approach: walk through the TBS fields.
     fn read_tag_len(data: &[u8]) -> Option<(u8, usize, usize)> {
@@ -209,11 +232,14 @@ fn parse_not_after_expired(der: &[u8]) -> bool {
     }
 
     fn enter_sequence(data: &[u8]) -> Option<&[u8]> {
-        let (tag, _, header_len) = read_tag_len(data)?;
+        let (tag, len, header_len) = read_tag_len(data)?;
         if tag != 0x30 {
             return None;
         }
-        data.get(header_len..)
+        // Truncate to the SEQUENCE's declared length so trailing siblings
+        // (e.g. signatureAlgorithm + signature after the TBS SEQUENCE)
+        // don't leak into the inner walk.
+        data.get(header_len..header_len + len)
     }
 
     fn parse_time(data: &[u8]) -> Option<i64> {
@@ -263,9 +289,9 @@ fn parse_not_after_expired(der: &[u8]) -> bool {
     }
 
     // Parse: outer SEQUENCE → TBS SEQUENCE
-    let Some(tbs) = enter_sequence(der).and_then(enter_sequence) else {
-        return true;
-    };
+    let tbs = enter_sequence(der)
+        .and_then(enter_sequence)
+        .ok_or("expected outer SEQUENCE → TBS SEQUENCE")?;
 
     // TBS fields: version (explicit tag [0], optional), serialNumber, signature, issuer, validity
     let mut pos = tbs;
@@ -282,24 +308,19 @@ fn parse_not_after_expired(der: &[u8]) -> bool {
     pos = skip_element(pos).unwrap_or(pos);
 
     // Validity SEQUENCE { notBefore, notAfter }
-    let Some(validity) = enter_sequence(pos) else {
-        return true;
-    };
+    let validity = enter_sequence(pos).ok_or("expected validity SEQUENCE")?;
     // Skip notBefore
-    let Some(after_not_before) = skip_element(validity) else {
-        return true;
-    };
+    let after_not_before =
+        skip_element(validity).ok_or("validity sequence ended after notBefore")?;
     // Parse notAfter
-    let Some(not_after) = parse_time(after_not_before) else {
-        return true;
-    };
+    let not_after = parse_time(after_not_before).ok_or("could not parse notAfter timestamp")?;
 
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    now >= not_after
+    Ok(now >= not_after)
 }
 
 fn build_server_config(
