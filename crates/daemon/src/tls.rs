@@ -42,13 +42,13 @@ pub fn setup(
         (Some(cert), Some(key)) => {
             let cert_pem = std::fs::read(cert)
                 .with_context(|| format!("reading TLS cert {}", cert.display()))?;
-            let key_pem = std::fs::read(key)
-                .with_context(|| format!("reading TLS key {}", key.display()))?;
+            let key_pem =
+                std::fs::read(key).with_context(|| format!("reading TLS key {}", key.display()))?;
             build_server_config(&cert_pem, &key_pem)
         }
-        (Some(_), None) | (None, Some(_)) => {
-            Err(anyhow!("both tls.cert_file and tls.key_file must be set together"))
-        }
+        (Some(_), None) | (None, Some(_)) => Err(anyhow!(
+            "both tls.cert_file and tls.key_file must be set together"
+        )),
         (None, None) => {
             let tls_dir = default_tls_dir();
             let (ca_cert_pem, ca_key_pem) = ensure_ca(&tls_dir)?;
@@ -70,8 +70,8 @@ fn ensure_ca(tls_dir: &Path) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     if cert_path.exists() && key_path.exists() {
         let cert_pem = std::fs::read(&cert_path)
             .with_context(|| format!("reading {}", cert_path.display()))?;
-        let key_pem = std::fs::read(&key_path)
-            .with_context(|| format!("reading {}", key_path.display()))?;
+        let key_pem =
+            std::fs::read(&key_path).with_context(|| format!("reading {}", key_path.display()))?;
         return Ok((cert_pem, key_pem));
     }
 
@@ -144,8 +144,7 @@ fn ensure_server_cert(
         .unwrap()
         .as_secs();
     params.not_before = time::OffsetDateTime::from_unix_timestamp(now as i64)?;
-    params.not_after =
-        time::OffsetDateTime::from_unix_timestamp(now as i64 + 365 * 24 * 3600)?;
+    params.not_after = time::OffsetDateTime::from_unix_timestamp(now as i64 + 365 * 24 * 3600)?;
 
     let cert = params.signed_by(&server_key, &ca_issuer)?;
     let cert_pem = cert.pem().into_bytes();
@@ -245,8 +244,7 @@ fn parse_not_after_expired(der: &[u8]) -> bool {
             365 * (y - 1970) + ((y - 1969) / 4) - ((y - 1901) / 100) + ((y - 1601) / 400)
         };
         let days_in_months: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        let is_leap =
-            (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
         let mut day_of_year: u32 = 0;
         for m in 0..(month - 1) as usize {
             day_of_year += days_in_months[m];
@@ -353,15 +351,13 @@ fn write_secret_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, data)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(path, data).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
 }
 
 fn write_public_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    std::fs::write(path, data)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, data).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -415,7 +411,11 @@ mod tests {
         let mut chain = server_cert;
         chain.extend_from_slice(&ca_cert);
         let config = build_server_config(&chain, &server_key);
-        assert!(config.is_ok(), "should build valid ServerConfig: {:?}", config.err());
+        assert!(
+            config.is_ok(),
+            "should build valid ServerConfig: {:?}",
+            config.err()
+        );
     }
 
     #[test]
@@ -440,7 +440,10 @@ mod tests {
     fn not_after_check_detects_valid_cert() {
         let dir = tempfile::tempdir().unwrap();
         let (ca_cert, _) = ensure_ca(dir.path()).unwrap();
-        assert!(!is_pem_cert_expired(&ca_cert), "fresh CA should not be expired");
+        assert!(
+            !is_pem_cert_expired(&ca_cert),
+            "fresh CA should not be expired"
+        );
     }
 
     #[test]
@@ -455,10 +458,8 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        params.not_before =
-            time::OffsetDateTime::from_unix_timestamp(now - 3600).unwrap();
-        params.not_after =
-            time::OffsetDateTime::from_unix_timestamp(now - 1).unwrap();
+        params.not_before = time::OffsetDateTime::from_unix_timestamp(now - 3600).unwrap();
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(now - 1).unwrap();
         let cert = params.self_signed(&key).unwrap();
         let pem = cert.pem().into_bytes();
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use desktop_assistant_application::AssistantApiHandler;
 use desktop_assistant_api_model::{self as api};
+use desktop_assistant_application::AssistantApiHandler;
 use zbus::{fdo, interface};
 
 fn to_fdo_error<E: std::fmt::Display>(error: E) -> fdo::Error {
@@ -136,9 +136,7 @@ impl DbusConnectionsAdapter {
     async fn get_purposes(&self) -> fdo::Result<String> {
         let result = self.dispatch(api::Command::GetPurposes).await?;
         match &result {
-            api::CommandResult::Purposes(_) => {
-                serde_json::to_string(&result).map_err(to_fdo_error)
-            }
+            api::CommandResult::Purposes(_) => serde_json::to_string(&result).map_err(to_fdo_error),
             other => Err(fdo::Error::Failed(format!(
                 "unexpected GetPurposes result: {other:?}"
             ))),

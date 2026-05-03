@@ -168,14 +168,13 @@ impl RoutingLlmClient {
                 purpose.as_key()
             ))
         })?;
-        let resolved =
-            crate::purposes::resolve_purpose(*purpose, &config.purposes, &connections)
-                .map_err(|e| {
-                    CoreError::Llm(format!(
-                        "purpose {:?} resolution failed: {e}",
-                        purpose.as_key()
-                    ))
-                })?;
+        let resolved = crate::purposes::resolve_purpose(*purpose, &config.purposes, &connections)
+            .map_err(|e| {
+            CoreError::Llm(format!(
+                "purpose {:?} resolution failed: {e}",
+                purpose.as_key()
+            ))
+        })?;
         let connection = connections.get(&resolved.connection_id).ok_or_else(|| {
             CoreError::Llm(format!(
                 "purpose {:?} resolved connection {:?} is missing from \
@@ -188,15 +187,19 @@ impl RoutingLlmClient {
         let reasoning = crate::api_surface::map_effort_to_reasoning_config(
             &connector_type,
             &resolved.model_id,
-            resolved.effort.map(crate::api_surface::purpose_effort_to_core),
+            resolved
+                .effort
+                .map(crate::api_surface::purpose_effort_to_core),
         );
-        let client = registry.client_for(&resolved.connection_id).ok_or_else(|| {
-            CoreError::Llm(format!(
-                "purpose {:?} references connection {:?} which is not present in the registry",
-                purpose.as_key(),
-                resolved.connection_id
-            ))
-        })?;
+        let client = registry
+            .client_for(&resolved.connection_id)
+            .ok_or_else(|| {
+                CoreError::Llm(format!(
+                    "purpose {:?} references connection {:?} which is not present in the registry",
+                    purpose.as_key(),
+                    resolved.connection_id
+                ))
+            })?;
         with_model_override(resolved.model_id, op(client, reasoning)).await
     }
 }
@@ -306,11 +309,7 @@ impl LlmClient for RoutingLlmClient {
                 let client = self.resolve_static();
                 client
                     .stream_completion_with_namespaces(
-                        messages,
-                        core_tools,
-                        namespaces,
-                        reasoning,
-                        on_chunk,
+                        messages, core_tools, namespaces, reasoning, on_chunk,
                     )
                     .await
             }
@@ -332,7 +331,6 @@ impl LlmClient for RoutingLlmClient {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -385,10 +383,8 @@ mod tests {
         let client = RoutingLlmClient::new(Arc::clone(&fallback));
 
         let override_clone = Arc::clone(&override_client);
-        let resolved = with_active_client(override_client, async move {
-            client.resolve_static()
-        })
-        .await;
+        let resolved =
+            with_active_client(override_client, async move { client.resolve_static() }).await;
         assert!(
             Arc::ptr_eq(&resolved, &override_clone),
             "resolve() must return the task-local override when set"
@@ -566,10 +562,8 @@ mod tests {
         // distinct strings ("local" vs "ollama") so a regression that
         // confuses the two would fail here.
         let handle = build_handle_with_titling("titling-model");
-        let client = RoutingLlmClient::new_dynamic_purpose(
-            Arc::clone(&handle),
-            PurposeKind::Titling,
-        );
+        let client =
+            RoutingLlmClient::new_dynamic_purpose(Arc::clone(&handle), PurposeKind::Titling);
         let result = client
             .stream_completion(
                 vec![Message::new(
@@ -609,10 +603,8 @@ mod tests {
         use crate::api_surface::resolve_purpose_dispatch;
 
         let handle = build_handle_with_titling("model-v1");
-        let _client = RoutingLlmClient::new_dynamic_purpose(
-            Arc::clone(&handle),
-            PurposeKind::Titling,
-        );
+        let _client =
+            RoutingLlmClient::new_dynamic_purpose(Arc::clone(&handle), PurposeKind::Titling);
 
         let cfg = handle.snapshot_config();
         let (resolved, _) = resolve_purpose_dispatch(Some(&cfg), PurposeKind::Titling)
@@ -624,9 +616,7 @@ mod tests {
         // persistence (covered by the connections-management API tests).
         let mut new_cfg = handle.snapshot_config();
         new_cfg.purposes.titling = Some(crate::purposes::PurposeConfig {
-            connection: crate::purposes::ConnectionRef::Named(
-                ConnectionId::new("local").unwrap(),
-            ),
+            connection: crate::purposes::ConnectionRef::Named(ConnectionId::new("local").unwrap()),
             model: crate::purposes::ModelRef::Named("model-v2".to_string()),
             effort: None,
             max_context_tokens: None,

@@ -442,8 +442,7 @@ where
             }
 
             api::Command::GetConversation { id } => {
-                let conv_id =
-                    desktop_assistant_core::domain::ConversationId::from(id.as_str());
+                let conv_id = desktop_assistant_core::domain::ConversationId::from(id.as_str());
                 let conv = self
                     .conversations
                     .get_conversation(&conv_id)
@@ -523,7 +522,6 @@ where
             }
 
             // Settings
-
             api::Command::SetApiKey { api_key } => {
                 self.settings
                     .set_api_key(api_key)
@@ -807,7 +805,10 @@ where
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Models(
-                    listings.into_iter().map(core_model_listing_to_api).collect(),
+                    listings
+                        .into_iter()
+                        .map(core_model_listing_to_api)
+                        .collect(),
                 ))
             }
 
@@ -1004,10 +1005,7 @@ mod tests {
         ) -> Result<Vec<KnowledgeEntry>, CoreError> {
             Ok(vec![])
         }
-        async fn get_entry(
-            &self,
-            _id: String,
-        ) -> Result<Option<KnowledgeEntry>, CoreError> {
+        async fn get_entry(&self, _id: String) -> Result<Option<KnowledgeEntry>, CoreError> {
             Ok(None)
         }
         async fn search_entries(
@@ -1048,10 +1046,8 @@ mod tests {
     impl ConnectionsService for FakeConnections {
         async fn list_connections(
             &self,
-        ) -> Result<
-            Vec<desktop_assistant_core::ports::inbound::ConnectionView>,
-            CoreError,
-        > {
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::ConnectionView>, CoreError>
+        {
             Ok(vec![])
         }
         async fn create_connection(
@@ -1068,11 +1064,7 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn delete_connection(
-            &self,
-            _id: String,
-            _force: bool,
-        ) -> Result<(), CoreError> {
+        async fn delete_connection(&self, _id: String, _force: bool) -> Result<(), CoreError> {
             Ok(())
         }
         async fn list_available_models(

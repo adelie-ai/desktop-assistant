@@ -28,10 +28,7 @@ pub trait AssistantClient: Send + Sync {
         offset: u32,
         tag_filter: Option<Vec<String>>,
     ) -> Result<Vec<api::KnowledgeEntryView>>;
-    async fn get_knowledge_entry(
-        &self,
-        id: &str,
-    ) -> Result<Option<api::KnowledgeEntryView>>;
+    async fn get_knowledge_entry(&self, id: &str) -> Result<Option<api::KnowledgeEntryView>>;
     async fn search_knowledge_entries(
         &self,
         query: &str,
@@ -155,19 +152,20 @@ impl AssistantClient for TransportClient {
     ) -> Result<Vec<api::KnowledgeEntryView>> {
         match self {
             #[cfg(feature = "dbus")]
-            Self::Dbus(client) => client
-                .list_knowledge_entries(limit, offset, tag_filter)
-                .await,
-            Self::Ws(client) => client
-                .list_knowledge_entries(limit, offset, tag_filter)
-                .await,
+            Self::Dbus(client) => {
+                client
+                    .list_knowledge_entries(limit, offset, tag_filter)
+                    .await
+            }
+            Self::Ws(client) => {
+                client
+                    .list_knowledge_entries(limit, offset, tag_filter)
+                    .await
+            }
         }
     }
 
-    async fn get_knowledge_entry(
-        &self,
-        id: &str,
-    ) -> Result<Option<api::KnowledgeEntryView>> {
+    async fn get_knowledge_entry(&self, id: &str) -> Result<Option<api::KnowledgeEntryView>> {
         match self {
             #[cfg(feature = "dbus")]
             Self::Dbus(client) => client.get_knowledge_entry(id).await,
@@ -183,12 +181,16 @@ impl AssistantClient for TransportClient {
     ) -> Result<Vec<api::KnowledgeEntryView>> {
         match self {
             #[cfg(feature = "dbus")]
-            Self::Dbus(client) => client
-                .search_knowledge_entries(query, tag_filter, limit)
-                .await,
-            Self::Ws(client) => client
-                .search_knowledge_entries(query, tag_filter, limit)
-                .await,
+            Self::Dbus(client) => {
+                client
+                    .search_knowledge_entries(query, tag_filter, limit)
+                    .await
+            }
+            Self::Ws(client) => {
+                client
+                    .search_knowledge_entries(query, tag_filter, limit)
+                    .await
+            }
         }
     }
 

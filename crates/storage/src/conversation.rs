@@ -52,22 +52,19 @@ impl PgConversationStore {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<Option<ConversationModelSelection>, CoreError> {
-        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
-            "SELECT last_model_selection FROM conversations WHERE id = $1",
-        )
-        .bind(&conversation_id.0)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let row: Option<(Option<serde_json::Value>,)> =
+            sqlx::query_as("SELECT last_model_selection FROM conversations WHERE id = $1")
+                .bind(&conversation_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         let row = row.ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
         let Some(json) = row.0 else {
             return Ok(None);
         };
         let sel: ConversationModelSelection = serde_json::from_value(json).map_err(|e| {
-            CoreError::Storage(format!(
-                "last_model_selection JSON in DB is malformed: {e}"
-            ))
+            CoreError::Storage(format!("last_model_selection JSON in DB is malformed: {e}"))
         })?;
         Ok(Some(sel))
     }

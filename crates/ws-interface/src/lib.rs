@@ -68,7 +68,13 @@ pub fn router_with_auth(
     login_service: Option<Arc<dyn WsLoginService>>,
     auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
 ) -> Router {
-    router_full(handler, auth_validator, login_service, auth_discovery, vec![])
+    router_full(
+        handler,
+        auth_validator,
+        login_service,
+        auth_discovery,
+        vec![],
+    )
 }
 
 pub fn router_full(
@@ -448,7 +454,16 @@ pub async fn serve_with_shutdown_and_auth<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    serve_full(handler, auth_validator, login_service, auth_discovery, vec![], bind, shutdown).await
+    serve_full(
+        handler,
+        auth_validator,
+        login_service,
+        auth_discovery,
+        vec![],
+        bind,
+        shutdown,
+    )
+    .await
 }
 
 pub async fn serve_full<F>(
@@ -463,7 +478,13 @@ pub async fn serve_full<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let app = router_full(handler, auth_validator, login_service, auth_discovery, allowed_origins);
+    let app = router_full(
+        handler,
+        auth_validator,
+        login_service,
+        auth_discovery,
+        allowed_origins,
+    );
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -489,7 +510,13 @@ where
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
     use hyper_util::service::TowerToHyperService;
 
-    let app = router_full(handler, auth_validator, login_service, auth_discovery, allowed_origins);
+    let app = router_full(
+        handler,
+        auth_validator,
+        login_service,
+        auth_discovery,
+        allowed_origins,
+    );
     let listener = tokio::net::TcpListener::bind(bind).await?;
 
     tokio::pin!(shutdown);

@@ -101,7 +101,9 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
             self.reasoning
         };
         self.inner
-            .stream_completion_with_namespaces(messages, core_tools, namespaces, effective, on_chunk)
+            .stream_completion_with_namespaces(
+                messages, core_tools, namespaces, effective, on_chunk,
+            )
             .await
     }
 }

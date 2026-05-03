@@ -546,8 +546,8 @@ pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
 mod tests {
     use super::*;
     use crate::connections::{
-        AnthropicConnection, BedrockConnection, ConnectionConfig, ConnectionsMap,
-        OllamaConnection, OpenAiConnection,
+        AnthropicConnection, BedrockConnection, ConnectionConfig, ConnectionsMap, OllamaConnection,
+        OpenAiConnection,
     };
     use indexmap::IndexMap;
 
@@ -596,7 +596,10 @@ mod tests {
         let registry = build_registry(&config);
 
         let id = ConnectionId::new("local").unwrap();
-        assert!(registry.get(&id).is_some(), "expected live client for local");
+        assert!(
+            registry.get(&id).is_some(),
+            "expected live client for local"
+        );
         assert_eq!(registry.live_count(), 1);
         assert_eq!(registry.declared_count(), 1);
 
@@ -622,7 +625,10 @@ mod tests {
             std::env::remove_var(&unused);
         }
 
-        let pairs = vec![(ConnectionId::new("cloud").unwrap(), openai_with_key(&unused))];
+        let pairs = vec![(
+            ConnectionId::new("cloud").unwrap(),
+            openai_with_key(&unused),
+        )];
         let config = config_from_pairs(pairs);
         let registry = build_registry(&config);
 
@@ -677,7 +683,10 @@ mod tests {
         let statuses = registry.status();
         assert_eq!(statuses.len(), 2);
         assert_eq!(statuses[0].id, bad_id);
-        assert!(matches!(statuses[0].health, ConnectionHealth::Unavailable { .. }));
+        assert!(matches!(
+            statuses[0].health,
+            ConnectionHealth::Unavailable { .. }
+        ));
         assert_eq!(statuses[1].id, good_id);
         assert!(matches!(statuses[1].health, ConnectionHealth::Ok));
     }
@@ -724,10 +733,7 @@ mod tests {
         // Declaration order: x (ok), y (ok). Active must be x.
         let x = ConnectionId::new("x").unwrap();
         let y = ConnectionId::new("y").unwrap();
-        let pairs = vec![
-            (x.clone(), ollama_local()),
-            (y.clone(), ollama_local()),
-        ];
+        let pairs = vec![(x.clone(), ollama_local()), (y.clone(), ollama_local())];
         let config = config_from_pairs(pairs);
         let registry = build_registry(&config);
         assert_eq!(registry.active_connection(), Some(&x));
@@ -857,11 +863,8 @@ mod tests {
         // assert the daemon-startup invariants: at least one healthy client,
         // deterministic active id, unavailable connections surfaced without
         // aborting.
-        let fixture = include_str!(
-            "../tests/fixtures/connections_migration/multi_connection.toml"
-        );
-        let config: DaemonConfig =
-            toml::from_str(fixture).expect("fixture is valid TOML");
+        let fixture = include_str!("../tests/fixtures/connections_migration/multi_connection.toml");
+        let config: DaemonConfig = toml::from_str(fixture).expect("fixture is valid TOML");
 
         // The fixture relies on one env var being unset so the openai
         // connection resolves with no key. Clear it defensively.
@@ -878,7 +881,10 @@ mod tests {
         let aws = ConnectionId::new("aws").unwrap();
 
         // `local` (ollama) and `aws` (bedrock) are expected healthy.
-        assert!(registry.get(&local).is_some(), "local ollama should be live");
+        assert!(
+            registry.get(&local).is_some(),
+            "local ollama should be live"
+        );
         assert!(matches!(
             registry.status_of(&local).unwrap().health,
             ConnectionHealth::Ok
@@ -890,7 +896,10 @@ mod tests {
         ));
 
         // `cloud` (openai) has no key; expected unavailable.
-        assert!(registry.get(&cloud).is_none(), "cloud openai should be unavailable");
+        assert!(
+            registry.get(&cloud).is_none(),
+            "cloud openai should be unavailable"
+        );
         match &registry.status_of(&cloud).unwrap().health {
             ConnectionHealth::Unavailable { reason } => {
                 assert!(reason.contains("api key"), "reason: {reason}");

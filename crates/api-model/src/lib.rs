@@ -653,17 +653,9 @@ pub struct WsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum WsFrame {
-    Result {
-        id: String,
-        result: CommandResult,
-    },
-    Error {
-        id: String,
-        error: String,
-    },
-    Event {
-        event: Event,
-    },
+    Result { id: String, result: CommandResult },
+    Error { id: String, error: String },
+    Event { event: Event },
 }
 
 #[cfg(test)]
@@ -751,8 +743,7 @@ mod tests {
         assert_eq!(cmd, back);
 
         // Missing force flag defaults to false.
-        let cmd2: Command =
-            serde_json::from_str(r#"{"delete_connection":{"id":"old"}}"#).unwrap();
+        let cmd2: Command = serde_json::from_str(r#"{"delete_connection":{"id":"old"}}"#).unwrap();
         assert_eq!(
             cmd2,
             Command::DeleteConnection {
@@ -830,10 +821,9 @@ mod tests {
     #[test]
     fn send_message_override_is_optional() {
         // Without override.
-        let cmd: Command = serde_json::from_str(
-            r#"{"send_message":{"conversation_id":"c1","content":"hi"}}"#,
-        )
-        .unwrap();
+        let cmd: Command =
+            serde_json::from_str(r#"{"send_message":{"conversation_id":"c1","content":"hi"}}"#)
+                .unwrap();
         match &cmd {
             Command::SendMessage {
                 override_selection, ..
@@ -902,9 +892,7 @@ mod tests {
         let ok = ConnectionAvailability::Ok;
         let json = serde_json::to_string(&ok).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
-        let un = ConnectionAvailability::Unavailable {
-            reason: "x".into(),
-        };
+        let un = ConnectionAvailability::Unavailable { reason: "x".into() };
         let json2 = serde_json::to_string(&un).unwrap();
         assert!(json2.contains("\"status\":\"unavailable\""));
         let back: ConnectionAvailability = serde_json::from_str(&json2).unwrap();

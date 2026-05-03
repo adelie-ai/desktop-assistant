@@ -66,9 +66,7 @@ where
 /// Current task-local reasoning config, or `ReasoningConfig::default()`
 /// (all `None`) when not set. Safe to call from any async context.
 pub fn current_reasoning_config() -> ReasoningConfig {
-    REASONING_CONFIG
-        .try_with(|c| *c)
-        .unwrap_or_default()
+    REASONING_CONFIG.try_with(|c| *c).unwrap_or_default()
 }
 
 /// Run `fut` with `model` installed as the current turn's model override.
@@ -1012,10 +1010,8 @@ mod tests {
 
     #[tokio::test]
     async fn current_model_override_observes_scope() {
-        let observed = with_model_override("gpt-5-mini".to_string(), async {
-            current_model_override()
-        })
-        .await;
+        let observed =
+            with_model_override("gpt-5-mini".to_string(), async { current_model_override() }).await;
         assert_eq!(observed, Some("gpt-5-mini".to_string()));
         // After the scope exits the task-local is unset again.
         assert_eq!(current_model_override(), None);

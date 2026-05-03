@@ -450,10 +450,7 @@ impl BuiltinToolService {
         .to_string())
     }
 
-    async fn conversation_search(
-        &self,
-        arguments: serde_json::Value,
-    ) -> Result<String, CoreError> {
+    async fn conversation_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let search_fn = self.conversation_search_fn.as_ref().ok_or_else(|| {
             CoreError::ToolExecution("conversation search not configured".to_string())
         })?;
@@ -882,25 +879,24 @@ mod tests {
         };
         use std::sync::Arc;
 
-        let search_fn: ConversationSearchFn =
-            Arc::new(move |query, limit, role_filter| {
-                let q = query.clone();
-                Box::pin(async move {
-                    assert_eq!(q, "deploy");
-                    assert_eq!(limit, 5);
-                    assert!(matches!(role_filter, Some(Role::Assistant)));
-                    Ok(vec![MessageHit {
-                        conversation_id: "c-1".into(),
-                        conversation_title: "Deploy timeline".into(),
-                        ordinal: 4,
-                        role: Role::Assistant,
-                        content: "We can deploy on Friday".into(),
-                        snippet: "We can <mark>deploy</mark> on Friday".into(),
-                        rank: 0.42,
-                        updated_at: "2026-05-02T13:00:00+00:00".into(),
-                    }])
-                })
-            });
+        let search_fn: ConversationSearchFn = Arc::new(move |query, limit, role_filter| {
+            let q = query.clone();
+            Box::pin(async move {
+                assert_eq!(q, "deploy");
+                assert_eq!(limit, 5);
+                assert!(matches!(role_filter, Some(Role::Assistant)));
+                Ok(vec![MessageHit {
+                    conversation_id: "c-1".into(),
+                    conversation_title: "Deploy timeline".into(),
+                    ordinal: 4,
+                    role: Role::Assistant,
+                    content: "We can deploy on Friday".into(),
+                    snippet: "We can <mark>deploy</mark> on Friday".into(),
+                    rank: 0.42,
+                    updated_at: "2026-05-02T13:00:00+00:00".into(),
+                }])
+            })
+        });
 
         let service = BuiltinToolService::new().with_conversation_search(search_fn);
         let response = service
@@ -931,13 +927,12 @@ mod tests {
 
         let saw_role_filter = Arc::new(AtomicBool::new(false));
         let saw_clone = Arc::clone(&saw_role_filter);
-        let search_fn: ConversationSearchFn =
-            Arc::new(move |_q, _l, role_filter| {
-                if role_filter.is_some() {
-                    saw_clone.store(true, Ordering::SeqCst);
-                }
-                Box::pin(async { Ok(Vec::new()) })
-            });
+        let search_fn: ConversationSearchFn = Arc::new(move |_q, _l, role_filter| {
+            if role_filter.is_some() {
+                saw_clone.store(true, Ordering::SeqCst);
+            }
+            Box::pin(async { Ok(Vec::new()) })
+        });
 
         let service = BuiltinToolService::new().with_conversation_search(search_fn);
         let _ = service

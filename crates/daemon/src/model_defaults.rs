@@ -123,9 +123,11 @@ mod tests {
 
     #[test]
     fn merge_keeps_live_metadata() {
-        let live = vec![ModelInfo::new("llama3.2:3b")
-            .with_display_name("LIVE override")
-            .with_context_limit(100)];
+        let live = vec![
+            ModelInfo::new("llama3.2:3b")
+                .with_display_name("LIVE override")
+                .with_context_limit(100),
+        ];
         let merged = merge_with_defaults("ollama", live);
         let llama = merged.iter().find(|m| m.id == "llama3.2:3b").unwrap();
         assert_eq!(llama.display_name, "LIVE override");

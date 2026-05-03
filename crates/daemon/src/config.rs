@@ -573,12 +573,8 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     // the synthesized `[connections.default]`. It also rewrites the config
     // file on first contact — only when a legacy shape was present and no
     // `[purposes]` table has been authored yet.
-    let parsed = maybe_migrate_legacy_purposes(
-        path,
-        parsed,
-        explicit_purposes_table,
-        legacy_shape_present,
-    )?;
+    let parsed =
+        maybe_migrate_legacy_purposes(path, parsed, explicit_purposes_table, legacy_shape_present)?;
 
     // Validate purposes: structural checks (interactive required when set,
     // no `Primary` in interactive) happen here so misconfigurations surface
@@ -718,12 +714,9 @@ fn maybe_migrate_legacy_purposes(
             .cloned()
             .expect("connections non-empty")
     };
-    let interactive_conn = ConnectionId::new(interactive_conn_id.clone())
-        .with_context(|| {
-            format!(
-                "cannot migrate purposes: connection id {interactive_conn_id:?} is invalid"
-            )
-        })?;
+    let interactive_conn = ConnectionId::new(interactive_conn_id.clone()).with_context(|| {
+        format!("cannot migrate purposes: connection id {interactive_conn_id:?} is invalid")
+    })?;
 
     // Model for interactive: take from [llm].model, else use the connector's
     // built-in default so the resolved purpose always has a concrete model.
@@ -765,9 +758,7 @@ fn maybe_migrate_legacy_purposes(
             // Case C: different connector. Synthesize a new connection.
             let synthesized = connection_from_legacy_llm(bt_llm);
             let backend_id = pick_free_connection_id(&parsed.connections, "backend");
-            parsed
-                .connections
-                .insert(backend_id.clone(), synthesized);
+            parsed.connections.insert(backend_id.clone(), synthesized);
             let id = ConnectionId::new(backend_id).expect("pick_free returns a valid slug");
             (ConnectionRef::Named(id), bt_model)
         }
@@ -839,10 +830,7 @@ fn maybe_migrate_legacy_purposes(
 
 /// Find a `ConnectionId`-valid slug that is not already in use. Starts with
 /// `base` (e.g. `backend`) and appends `_2`, `_3`, ... as needed.
-fn pick_free_connection_id(
-    existing: &IndexMap<String, ConnectionConfig>,
-    base: &str,
-) -> String {
+fn pick_free_connection_id(existing: &IndexMap<String, ConnectionConfig>, base: &str) -> String {
     if !existing.contains_key(base) {
         return base.to_string();
     }
@@ -860,7 +848,10 @@ fn pick_free_connection_id(
 /// `<path>.bak.3`, ... when earlier slots are taken. Never overwrites.
 fn pick_backup_path(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
 
     let primary = parent.join(format!("{file_name}.bak"));
     if !primary.exists() {
@@ -1271,7 +1262,9 @@ pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSet
 /// Build an `EmbeddingsSettingsView` from `purposes.embedding` if it is
 /// configured, otherwise return `None`. Centralises the purpose-aware
 /// short-circuit so the legacy resolver can skip the rest of its work.
-fn resolve_purpose_embeddings_view(config: Option<&DaemonConfig>) -> Option<EmbeddingsSettingsView> {
+fn resolve_purpose_embeddings_view(
+    config: Option<&DaemonConfig>,
+) -> Option<EmbeddingsSettingsView> {
     let resolved = resolve_purpose_llm_config(config, PurposeKind::Embedding)?;
     let available = resolved.connector != "anthropic";
     let has_api_key = !resolved.api_key.trim().is_empty();
@@ -1621,12 +1614,7 @@ pub fn resolve_connection_llm_config(
             base_url,
             api_key_env,
             secret,
-        }) => (
-            base_url.clone(),
-            api_key_env.clone(),
-            secret.clone(),
-            None,
-        ),
+        }) => (base_url.clone(), api_key_env.clone(), secret.clone(), None),
         ConnectionConfig::Ollama(OllamaConnection { base_url }) => {
             (base_url.clone(), None, None, None)
         }
@@ -1686,12 +1674,11 @@ pub fn resolve_connection_llm_config(
         .map(|c| (c.temperature, c.top_p, c.max_tokens, c.hosted_tool_search))
         .unwrap_or((None, None, None, None));
 
-    let aws_profile = conn_aws_profile
-        .or_else(|| {
-            fallback_llm
-                .filter(|c| c.connector.trim().to_lowercase() == connector)
-                .and_then(|c| c.aws_profile.clone())
-        });
+    let aws_profile = conn_aws_profile.or_else(|| {
+        fallback_llm
+            .filter(|c| c.connector.trim().to_lowercase() == connector)
+            .and_then(|c| c.aws_profile.clone())
+    });
 
     ResolvedLlmConfig {
         connector,
@@ -1818,19 +1805,15 @@ fn write_common_file_secret(account: &str, value: &str) -> anyhow::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(&path)
-            .map_err(|error| {
-                anyhow!("failed to write secret file {}: {error}", path.display())
-            })?;
-        file.write_all(value.as_bytes()).map_err(|error| {
-            anyhow!("failed to write secret file {}: {error}", path.display())
-        })?;
+            .map_err(|error| anyhow!("failed to write secret file {}: {error}", path.display()))?;
+        file.write_all(value.as_bytes())
+            .map_err(|error| anyhow!("failed to write secret file {}: {error}", path.display()))?;
     }
 
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, value).map_err(|error| {
-            anyhow!("failed to write secret file {}: {error}", path.display())
-        })?;
+        std::fs::write(&path, value)
+            .map_err(|error| anyhow!("failed to write secret file {}: {error}", path.display()))?;
     }
 
     Ok(())
@@ -2821,11 +2804,8 @@ mod tests {
     fn oidc_require_https_rejects_non_loopback_http() {
         // Plaintext JWKS lets a network attacker swap the keys and forge
         // tokens — must reject.
-        let err = OidcValidator::require_https_or_loopback(
-            "http://idp.example.com",
-            "issuer_url",
-        )
-        .expect_err("plaintext IdP rejected");
+        let err = OidcValidator::require_https_or_loopback("http://idp.example.com", "issuer_url")
+            .expect_err("plaintext IdP rejected");
         assert!(err.to_string().contains("https://"));
 
         OidcValidator::require_https_or_loopback("ftp://idp.example.com", "issuer_url")
@@ -2840,9 +2820,9 @@ mod tests {
         assert_eq!(bucket_secret_len(8), "<16");
         assert_eq!(bucket_secret_len(15), "<16");
         assert_eq!(bucket_secret_len(16), "16-31");
-        assert_eq!(bucket_secret_len(32), "32-47");  // typical OpenAI sk- key
+        assert_eq!(bucket_secret_len(32), "32-47"); // typical OpenAI sk- key
         assert_eq!(bucket_secret_len(47), "32-47");
-        assert_eq!(bucket_secret_len(51), "48-79");  // typical Anthropic key
+        assert_eq!(bucket_secret_len(51), "48-79"); // typical Anthropic key
         assert_eq!(bucket_secret_len(79), "48-79");
         assert_eq!(bucket_secret_len(80), ">=80");
         assert_eq!(bucket_secret_len(2048), ">=80");
@@ -3147,7 +3127,10 @@ base_url = "http://localhost:11434"
 "#;
         let parsed: DaemonConfig = toml::from_str(content).unwrap();
         let validated = parsed.validated_connections().expect("should validate");
-        let ids: Vec<_> = validated.iter().map(|(id, _)| id.as_str().to_owned()).collect();
+        let ids: Vec<_> = validated
+            .iter()
+            .map(|(id, _)| id.as_str().to_owned())
+            .collect();
         assert_eq!(ids, vec!["work_openai", "home_bedrock", "laptop_ollama"]);
         assert_eq!(
             validated
@@ -3180,8 +3163,10 @@ region = "us-west-2"
     #[test]
     fn validated_connections_rejects_invalid_slug() {
         let mut cfg = DaemonConfig::default();
-        cfg.connections
-            .insert("Bad Id".to_string(), ConnectionConfig::OpenAi(Default::default()));
+        cfg.connections.insert(
+            "Bad Id".to_string(),
+            ConnectionConfig::OpenAi(Default::default()),
+        );
         let err = cfg.validated_connections().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Bad Id"), "error should cite bad id: {msg}");
@@ -3250,10 +3235,7 @@ type = "openai"
 
         let err = load_daemon_config(&path).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("Bad Id"),
-            "error should cite bad id: {msg}"
-        );
+        assert!(msg.contains("Bad Id"), "error should cite bad id: {msg}");
         assert!(
             msg.contains("connection id"),
             "error should mention 'connection id': {msg}"
@@ -3309,7 +3291,10 @@ dreaming_enabled = true
             "aws-bedrock" => "bedrock",
             other => other,
         };
-        assert_eq!(type_tag, expected, "connector type mismatch for {connector}");
+        assert_eq!(
+            type_tag, expected,
+            "connector type mismatch for {connector}"
+        );
 
         // Backup written alongside original.
         let bak = dir.join("daemon.toml.bak");
@@ -3372,18 +3357,12 @@ aws_profile = "home""#,
     fn migration_aws_bedrock_alias() {
         // Legacy users of the `aws-bedrock` connector alias migrate to the
         // canonical `bedrock` variant.
-        load_migrates_legacy_for_connector(
-            "aws-bedrock",
-            r#"base_url = "us-east-1""#,
-        );
+        load_migrates_legacy_for_connector("aws-bedrock", r#"base_url = "us-east-1""#);
     }
 
     #[test]
     fn migration_ollama() {
-        load_migrates_legacy_for_connector(
-            "ollama",
-            r#"base_url = "http://localhost:11434""#,
-        );
+        load_migrates_legacy_for_connector("ollama", r#"base_url = "http://localhost:11434""#);
     }
 
     #[test]
@@ -3661,12 +3640,10 @@ effort = "high"
         // `[backend_tasks.llm]` targets a different connector than `[llm]`.
         // Exercises: new `backend` connection synthesis, dreaming/titling
         // pointed at it, backend_tasks.llm removed from serialized form.
-        let legacy = include_str!(
-            "../tests/fixtures/purposes_migration/legacy_anthropic_backend.toml"
-        );
-        let expected_new = include_str!(
-            "../tests/fixtures/purposes_migration/migrated_anthropic_backend.toml"
-        );
+        let legacy =
+            include_str!("../tests/fixtures/purposes_migration/legacy_anthropic_backend.toml");
+        let expected_new =
+            include_str!("../tests/fixtures/purposes_migration/migrated_anthropic_backend.toml");
 
         let dir = unique_test_dir("da-test-golden-purposes");
         let path = dir.join("daemon.toml");
@@ -3688,12 +3665,9 @@ effort = "high"
     fn migration_golden_file_openai() {
         // Golden-file test: a representative legacy config migrates to the
         // expected new form byte-for-byte (modulo trailing whitespace).
-        let legacy = include_str!(
-            "../tests/fixtures/connections_migration/legacy_openai.toml"
-        );
-        let expected_new = include_str!(
-            "../tests/fixtures/connections_migration/migrated_openai.toml"
-        );
+        let legacy = include_str!("../tests/fixtures/connections_migration/legacy_openai.toml");
+        let expected_new =
+            include_str!("../tests/fixtures/connections_migration/migrated_openai.toml");
 
         let dir = unique_test_dir("da-test-golden-openai");
         let path = dir.join("daemon.toml");
@@ -4077,8 +4051,10 @@ y = 2
         // resolver when connectors match. Use a clearly-marked env var so
         // we can assert the value flows end-to-end without depending on
         // ambient OPENAI_API_KEY.
-        let env_var =
-            format!("DA_TEST_PURPOSE_LEGACY_KEY_{}", uuid::Uuid::new_v4().simple());
+        let env_var = format!(
+            "DA_TEST_PURPOSE_LEGACY_KEY_{}",
+            uuid::Uuid::new_v4().simple()
+        );
         // SAFETY: unique name, single-threaded test scope.
         unsafe {
             std::env::set_var(&env_var, "legacy-secret");
@@ -4110,8 +4086,7 @@ y = 2
         // the api_key from the purpose's connection's secret/env reaches the
         // view (not just `has_api_key`), so `main.rs` can hand it to the
         // OpenAI-compatible embedding client without an extra round-trip.
-        let env_var =
-            format!("DA_TEST_PURPOSE_KEY_{}", uuid::Uuid::new_v4().simple());
+        let env_var = format!("DA_TEST_PURPOSE_KEY_{}", uuid::Uuid::new_v4().simple());
         // SAFETY: unique name, single-threaded test scope.
         unsafe {
             std::env::set_var(&env_var, "purpose-secret");
@@ -4248,10 +4223,7 @@ y = 2
         // disabling for non-curated providers. Tag explicitly identifies
         // the silent floor so operators can grep logs.
         let budget = resolve_context_budget(None, None);
-        assert_eq!(
-            budget.max_input_tokens,
-            DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS
-        );
+        assert_eq!(budget.max_input_tokens, DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS);
         assert_eq!(budget.source, BudgetSource::UniversalFallback);
         assert_eq!(budget.max_input_tokens, 200_000);
     }
@@ -4321,7 +4293,12 @@ model = "llama3.2"
 "#;
         let legacy: DaemonConfig = toml::from_str(legacy_toml).expect("legacy parses");
         assert_eq!(
-            legacy.purposes.interactive.as_ref().unwrap().max_context_tokens,
+            legacy
+                .purposes
+                .interactive
+                .as_ref()
+                .unwrap()
+                .max_context_tokens,
             None
         );
         let reserialized = toml::to_string(&legacy).unwrap();

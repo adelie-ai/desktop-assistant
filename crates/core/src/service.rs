@@ -1,11 +1,10 @@
 use crate::CoreError;
 use crate::context::{
-    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, COMPACTION_TOKEN_RATIO,
+    COMPACTION_TOKEN_RATIO, MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES,
     compaction_range, generate_context_summary, llm_messages_for_turn, recover_from_overflow,
 };
 use crate::domain::{
-    Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition,
-    ToolNamespace,
+    Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition, ToolNamespace,
 };
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
@@ -14,7 +13,9 @@ use crate::ports::llm::{
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
-use crate::tools::{NoopToolExecutor, categorize_tool_namespaces, tool_set_hash, tool_status_message};
+use crate::tools::{
+    NoopToolExecutor, categorize_tool_namespaces, tool_set_hash, tool_status_message,
+};
 use chrono::{Duration, Local};
 
 /// Maximum number of tool-calling rounds before giving up.
@@ -94,7 +95,12 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
         ),
     ];
     match llm
-        .stream_completion(messages, &[], ReasoningConfig::default(), Box::new(|_| true))
+        .stream_completion(
+            messages,
+            &[],
+            ReasoningConfig::default(),
+            Box::new(|_| true),
+        )
         .await
     {
         Ok(response) => sanitize_generated_title(&response.text),
@@ -412,73 +418,70 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // empty config, matching the pre-issue-18 behaviour.
             let reasoning = crate::ports::llm::current_reasoning_config();
 
-            let response =
-                match if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
-                    self.llm
-                        .stream_completion_with_namespaces(
-                            llm_messages,
-                            &tool_defs,
-                            &namespaces,
-                            reasoning,
-                            filtered_chunk_callback,
-                        )
-                        .await
-                } else {
-                    self.llm
-                        .stream_completion(
-                            llm_messages,
-                            &tool_defs,
-                            reasoning,
-                            filtered_chunk_callback,
-                        )
-                        .await
-                } {
-                    Ok(r) => r,
-                    Err(CoreError::ContextOverflow {
+            let response = match if use_hosted_search
+                && !namespaces.is_empty()
+                && !hosted_search_demoted
+            {
+                self.llm
+                    .stream_completion_with_namespaces(
+                        llm_messages,
+                        &tool_defs,
+                        &namespaces,
+                        reasoning,
+                        filtered_chunk_callback,
+                    )
+                    .await
+            } else {
+                self.llm
+                    .stream_completion(llm_messages, &tool_defs, reasoning, filtered_chunk_callback)
+                    .await
+            } {
+                Ok(r) => r,
+                Err(CoreError::ContextOverflow {
+                    prompt_tokens,
+                    max_tokens,
+                    detail: _,
+                }) if overflow_retries < MAX_OVERFLOW_RETRIES => {
+                    // The provider rejected this turn's prompt for
+                    // exceeding its context window. Run the recovery
+                    // ladder (truncate large tool result → trim old
+                    // pairs → summarise-and-shrink) and retry. The
+                    // counter bounds total attempts across all steps
+                    // so persistently-oversized requests can't loop.
+                    overflow_retries += 1;
+                    tracing::warn!(
+                        attempt = overflow_retries,
+                        max_attempts = MAX_OVERFLOW_RETRIES,
+                        prompt_tokens = ?prompt_tokens,
+                        max_tokens = ?max_tokens,
+                        "context overflow — running recovery ladder"
+                    );
+                    recover_from_overflow(
+                        &mut conv,
                         prompt_tokens,
                         max_tokens,
-                        detail: _,
-                    }) if overflow_retries < MAX_OVERFLOW_RETRIES => {
-                        // The provider rejected this turn's prompt for
-                        // exceeding its context window. Run the recovery
-                        // ladder (truncate large tool result → trim old
-                        // pairs → summarise-and-shrink) and retry. The
-                        // counter bounds total attempts across all steps
-                        // so persistently-oversized requests can't loop.
-                        overflow_retries += 1;
-                        tracing::warn!(
-                            attempt = overflow_retries,
-                            max_attempts = MAX_OVERFLOW_RETRIES,
-                            prompt_tokens = ?prompt_tokens,
-                            max_tokens = ?max_tokens,
-                            "context overflow — running recovery ladder"
-                        );
-                        recover_from_overflow(
-                            &mut conv,
-                            prompt_tokens,
-                            max_tokens,
-                            &mut target_window,
-                            self.task_llm(),
-                            &estimate,
-                        )
-                        .await;
-                        on_chunk = Box::new(|_| true);
-                        continue;
-                    }
-                    Err(e) => {
-                        // Anything else — including exhausted overflow
-                        // retries — surfaces as a user-visible message.
-                        // Non-context errors are no longer trimmed-and-prayed
-                        // through old path C; that swallowed transient
-                        // failures (rate limits, server errors, malformed
-                        // tool calls) by mutating conversation state.
-                        let friendly = user_visible_llm_error_message(&e);
-                        conv.messages.push(Message::new(Role::Assistant, &friendly));
-                        conv.updated_at = now_timestamp();
-                        self.store.update(conv).await?;
-                        return Ok(friendly);
-                    }
-                };
+                        &mut target_window,
+                        self.task_llm(),
+                        &estimate,
+                    )
+                    .await;
+                    on_chunk = Box::new(|_| true);
+                    continue;
+                }
+                Err(e) => {
+                    // Anything else — including exhausted overflow
+                    // retries — surfaces as a user-visible message.
+                    // Non-context errors are no longer trimmed-and-prayed
+                    // through old path C; that swallowed transient
+                    // failures (rate limits, server errors, malformed
+                    // tool calls) by mutating conversation state.
+                    let friendly = user_visible_llm_error_message(&e);
+                    conv.messages.push(Message::new(Role::Assistant, &friendly));
+                    conv.updated_at = now_timestamp();
+                    self.store.update(conv).await?;
+                    return Ok(friendly);
+                }
+            };
 
             // Token-pressure check: if the provider reports input tokens
             // above COMPACTION_TOKEN_RATIO of its context window, shrink the
@@ -492,8 +495,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // wrapper), token-based compaction skips — same behaviour as
             // when the connector previously returned `None` from
             // `max_context_tokens()`.
-            if let (Some(budget), Some(usage)) =
-                (current_context_budget(), response.usage.as_ref())
+            if let (Some(budget), Some(usage)) = (current_context_budget(), response.usage.as_ref())
                 && let Some(input_tokens) = usage.input_tokens
             {
                 let max_tokens = budget.max_input_tokens;
@@ -1591,8 +1593,7 @@ mod tests {
             MockStore::new(),
             FailingLlm::new(responses, 1).with_error_variant(|| CoreError::RateLimited {
                 retry_after: None,
-                detail: "Anthropic API error (HTTP 429 Too Many Requests): rate_limit_error"
-                    .into(),
+                detail: "Anthropic API error (HTTP 429 Too Many Requests): rate_limit_error".into(),
             }),
             MockToolExecutor::new(tools, tool_results),
             Box::new(move || {
@@ -2311,7 +2312,9 @@ mod tests {
             .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
                 "c3", "big", "{}",
             )]));
-        stored.messages.push(Message::tool_result("c3", &big_content));
+        stored
+            .messages
+            .push(Message::tool_result("c3", &big_content));
         handler.store.update(stored).await.unwrap();
 
         let result = handler
@@ -2357,7 +2360,10 @@ mod tests {
             "expected truncation notice, got: {:?}",
             &big.content
         );
-        assert!(big.content.contains(&format!("{} bytes", big_content.len())));
+        assert!(
+            big.content
+                .contains(&format!("{} bytes", big_content.len()))
+        );
     }
 
     #[tokio::test]
@@ -2518,12 +2524,7 @@ mod tests {
             .clone();
 
         let result = handler
-            .send_prompt(
-                &conv.id,
-                "follow-up".into(),
-                noop_callback(),
-                noop_status(),
-            )
+            .send_prompt(&conv.id, "follow-up".into(), noop_callback(), noop_status())
             .await
             .unwrap();
         assert_eq!(result, "done");
@@ -2588,12 +2589,10 @@ mod tests {
             .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
                 "c1", "t", "{}",
             )]));
-        stored
-            .messages
-            .push(Message::tool_result(
-                "c1",
-                "x".repeat((MIN_TRUNCATION_TOKENS * 8) as usize),
-            ));
+        stored.messages.push(Message::tool_result(
+            "c1",
+            "x".repeat((MIN_TRUNCATION_TOKENS * 8) as usize),
+        ));
         handler.store.update(stored).await.unwrap();
 
         let result = handler
@@ -2723,10 +2722,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn tool_definition(
-            &self,
-            _name: &str,
-        ) -> Result<Option<ToolDefinition>, CoreError> {
+        async fn tool_definition(&self, _name: &str) -> Result<Option<ToolDefinition>, CoreError> {
             Ok(None)
         }
 
@@ -2964,5 +2960,4 @@ mod tests {
             "categorizer must run once when the raw listing exceeds the budget threshold"
         );
     }
-
 }

@@ -77,11 +77,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     // Repair damage from pre-idempotent runs of migration 007 on existing
     // databases. No-op on fresh installs.
-    sqlx::raw_sql(include_str!(
-        "../migrations/010_fix_damaged_embeddings.sql"
-    ))
-    .execute(pool)
-    .await?;
+    sqlx::raw_sql(include_str!("../migrations/010_fix_damaged_embeddings.sql"))
+        .execute(pool)
+        .await?;
 
     // Per-conversation model selection (issue #11) — nullable JSONB column
     // on `conversations`.

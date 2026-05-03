@@ -18,8 +18,8 @@ use desktop_assistant_core::domain::{
 };
 use desktop_assistant_core::ports::inbound::{
     AssistantService, BackendTasksSettingsView, ConnectionConfigPayload,
-    ConnectionView as CoreConnectionView, ConnectorDefaultsView, ConversationService,
-    ConnectionsService, DatabaseSettingsView, EmbeddingsSettingsView, KnowledgeService,
+    ConnectionView as CoreConnectionView, ConnectionsService, ConnectorDefaultsView,
+    ConversationService, DatabaseSettingsView, EmbeddingsSettingsView, KnowledgeService,
     LlmSettingsView, ModelListing as CoreModelListing, PersistenceSettingsView,
     PurposeConfigPayload, PurposeKind as CorePurposeKind, PurposesView as CorePurposesView,
     SettingsService, WsAuthSettingsView,
@@ -92,11 +92,7 @@ impl ConnectionsService for FakeConnections {
     ) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn delete_connection(
-        &self,
-        _id: String,
-        _force: bool,
-    ) -> Result<(), CoreError> {
+    async fn delete_connection(&self, _id: String, _force: bool) -> Result<(), CoreError> {
         Ok(())
     }
     async fn list_available_models(
@@ -992,7 +988,10 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         other => panic!("unexpected frame: {other:?}"),
     };
 
-    assert_eq!(config_from_result.embeddings.model, "text-embedding-3-small");
+    assert_eq!(
+        config_from_result.embeddings.model,
+        "text-embedding-3-small"
+    );
     assert_eq!(config_from_result.persistence.remote_name, "upstream");
 
     let event_frame =
@@ -1224,10 +1223,9 @@ fn ws_request_with_origin(
         );
     }
     if let Some(origin) = origin {
-        request.headers_mut().insert(
-            "origin",
-            origin.parse().unwrap(),
-        );
+        request
+            .headers_mut()
+            .insert("origin", origin.parse().unwrap());
     }
     request
 }
