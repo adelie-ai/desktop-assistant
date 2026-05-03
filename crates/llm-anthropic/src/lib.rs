@@ -1233,7 +1233,8 @@ mod tests {
 
     #[test]
     fn from_env_missing_key() {
-        // Ensure the env var is not set for this test
+        // SAFETY: single-threaded test scope; the env var is the one this
+        // test owns, no other test in this binary touches `ANTHROPIC_API_KEY`.
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let result = AnthropicClient::from_env();
         assert!(matches!(result, Err(CoreError::Llm(_))));
