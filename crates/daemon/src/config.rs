@@ -2487,7 +2487,24 @@ mod pam_auth {
         password: *const c_char,
     }
 
+    /// Free a PAM response array allocated by `libc::calloc` inside the
+    /// `conversation` callback below.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `responses` is either null or points to
+    /// a `count`-element array of [`PamResponse`] previously allocated by
+    /// `libc::calloc` in this module — i.e. only the `conversation` callback
+    /// (or its error paths) should call this. Each `PamResponse::resp` field,
+    /// if non-null, must point to a `libc::strdup`'d C string. This module's
+    /// callbacks uphold both invariants. Calling this with arbitrary
+    /// pointers is undefined behaviour.
     unsafe fn free_responses(responses: *mut PamResponse, count: c_int) {
+        // SAFETY: per the function contract, `responses` is either null
+        // (early-returned below) or a calloc'd array of `count` PamResponses.
+        // The pointer arithmetic stays within bounds and each `.resp` was
+        // allocated via `libc::strdup`, so `libc::free` is the matching
+        // deallocator.
         if responses.is_null() || count <= 0 {
             return;
         }
@@ -3077,7 +3094,9 @@ mod tests {
             std::env::temp_dir().join(format!("da-test-ws-jwt-{}", uuid::Uuid::new_v4()));
         let data_home = test_dir.join("data");
         std::fs::create_dir_all(&data_home).unwrap();
-        // Tests are single-process here; setting env var scopes key storage to test temp dir.
+        // SAFETY: single-test scope; the temp dir is unique per run
+        // (UUID-suffixed); no other test in this binary mutates
+        // `XDG_DATA_HOME` concurrently.
         unsafe {
             std::env::set_var("XDG_DATA_HOME", &data_home);
         }
@@ -3097,6 +3116,8 @@ mod tests {
         assert_eq!(claims_1.iss, default_ws_jwt_issuer());
         assert_eq!(claims_1.aud, default_ws_jwt_audience());
 
+        // SAFETY: same scope as the matching `set_var` above; clean up
+        // before exiting the test so we don't leak state between runs.
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
         }
@@ -3737,7 +3758,9 @@ y = 2
             std::env::temp_dir().join(format!("da-test-ws-jwt-iss-{}", uuid::Uuid::new_v4()));
         let data_home = test_dir.join("data");
         std::fs::create_dir_all(&data_home).unwrap();
-        // Tests are single-process here; setting env var scopes key storage to test temp dir.
+        // SAFETY: serialised against other JWT tests via `ws_jwt_env_lock`;
+        // the temp dir is unique per run (UUID-suffixed) so different test
+        // executions can't collide.
         unsafe {
             std::env::set_var("XDG_DATA_HOME", &data_home);
         }
@@ -3749,6 +3772,7 @@ y = 2
 
         assert!(!validate_ws_jwt(&forged).expect("validate forged token"));
 
+        // SAFETY: same scope as the matching `set_var` above (see lock guard).
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
         }
@@ -4078,6 +4102,8 @@ y = 2
         assert_eq!(view.api_key, "legacy-secret");
         assert!(view.has_api_key);
 
+        // SAFETY: same scope as the matching `set_var` above; env var
+        // name is unique per run.
         unsafe {
             std::env::remove_var(&env_var);
         }
@@ -4123,6 +4149,8 @@ y = 2
         assert_eq!(view.api_key, "purpose-secret");
         assert!(view.has_api_key);
 
+        // SAFETY: same scope as the matching `set_var` above; env var
+        // name is unique per run.
         unsafe {
             std::env::remove_var(&env_var);
         }
