@@ -1,15 +1,21 @@
 // Submodules (#41 — partial split; full 6-way split tracked as a follow-up).
+mod jwt;
+mod oidc;
 #[cfg(target_os = "linux")]
 mod pam_auth;
 
+// Re-export the JWT + OIDC public API at the `config::` path so existing
+// callers (`config::generate_ws_jwt`, `config::OidcValidator`, etc.)
+// keep working unchanged.
+pub use jwt::{current_username, generate_ws_jwt, validate_ws_jwt};
+pub use oidc::OidcValidator;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use desktop_assistant_core::ports::llm::{BudgetSource, ContextBudget};
 use indexmap::IndexMap;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
@@ -2035,286 +2041,6 @@ fn read_kwallet_secret(secret: &SecretConfig, connector: &str) -> Option<String>
     sanitize_secret_value(value.as_ref())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WsJwtClaims {
-    iss: String,
-    sub: String,
-    aud: String,
-    exp: u64,
-    iat: u64,
-    nbf: u64,
-    jti: String,
-}
-
-fn ws_jwt_signing_key_account() -> &'static str {
-    "ws_jwt_hs256_signing_key"
-}
-
-fn default_ws_jwt_issuer() -> &'static str {
-    "org.desktopAssistant.local"
-}
-
-fn default_ws_jwt_audience() -> &'static str {
-    "desktop-assistant-ws"
-}
-
-fn default_ws_jwt_ttl_seconds() -> u64 {
-    60 * 60 * 24 * 30
-}
-
-pub fn current_username() -> String {
-    std::env::var("USER")
-        .ok()
-        .or_else(|| std::env::var("LOGNAME").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "desktop-user".to_string())
-}
-
-fn normalize_ws_jwt_subject(subject: Option<String>) -> String {
-    subject
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(current_username)
-}
-
-fn unix_timestamp_seconds() -> anyhow::Result<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|error| anyhow!("failed to read system clock: {error}"))
-}
-
-fn ensure_ws_jwt_signing_key() -> anyhow::Result<String> {
-    if let Some(existing) = read_common_file_secret(ws_jwt_signing_key_account()) {
-        return Ok(existing);
-    }
-
-    // 64 hex chars from two UUIDv4 values gives a sufficiently strong local HMAC secret.
-    let generated = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    write_common_file_secret(ws_jwt_signing_key_account(), &generated)?;
-    Ok(generated)
-}
-
-fn read_ws_jwt_signing_key() -> anyhow::Result<String> {
-    read_common_file_secret(ws_jwt_signing_key_account())
-        .ok_or_else(|| anyhow!("ws jwt signing key is not initialized"))
-}
-
-fn ws_jwt_validation() -> Validation {
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
-    validation.set_issuer(&[default_ws_jwt_issuer()]);
-    validation.set_audience(&[default_ws_jwt_audience()]);
-    validation
-}
-
-fn encode_ws_jwt(claims: &WsJwtClaims) -> anyhow::Result<String> {
-    let signing_key = ensure_ws_jwt_signing_key()?;
-    jsonwebtoken::encode(
-        &Header::new(Algorithm::HS256),
-        claims,
-        &EncodingKey::from_secret(signing_key.as_bytes()),
-    )
-    .map_err(|error| anyhow!("failed to encode ws jwt: {error}"))
-}
-
-fn decode_ws_jwt_claims(token: &str) -> anyhow::Result<WsJwtClaims> {
-    let signing_key = read_ws_jwt_signing_key()?;
-    let decoded = jsonwebtoken::decode::<WsJwtClaims>(
-        token,
-        &DecodingKey::from_secret(signing_key.as_bytes()),
-        &ws_jwt_validation(),
-    )
-    .map_err(|error| anyhow!("failed to decode ws jwt: {error}"))?;
-    Ok(decoded.claims)
-}
-
-pub fn generate_ws_jwt(subject: Option<String>) -> anyhow::Result<String> {
-    let now = unix_timestamp_seconds()?;
-    let claims = WsJwtClaims {
-        iss: default_ws_jwt_issuer().to_string(),
-        sub: normalize_ws_jwt_subject(subject),
-        aud: default_ws_jwt_audience().to_string(),
-        exp: now.saturating_add(default_ws_jwt_ttl_seconds()),
-        iat: now,
-        nbf: now.saturating_sub(1),
-        jti: uuid::Uuid::new_v4().to_string(),
-    };
-
-    encode_ws_jwt(&claims)
-}
-
-pub fn validate_ws_jwt(token: &str) -> anyhow::Result<bool> {
-    let token = token.trim();
-    if token.is_empty() {
-        return Ok(false);
-    }
-
-    match decode_ws_jwt_claims(token) {
-        Ok(_) => Ok(true),
-        Err(error) => {
-            tracing::debug!("invalid ws jwt: {error}");
-            Ok(false)
-        }
-    }
-}
-
-/// Cached JWKS key set for validating external OIDC tokens.
-pub struct OidcValidator {
-    decoding_keys: Vec<DecodingKey>,
-    validation: Validation,
-}
-
-impl OidcValidator {
-    /// Build a reqwest client with timeouts suitable for OIDC discovery.
-    fn oidc_http_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    }
-
-    /// Maximum response body size for OIDC discovery / JWKS documents (1 MiB).
-    const MAX_OIDC_RESPONSE_BYTES: usize = 1_048_576;
-
-    fn require_https_or_loopback(url: &str, field: &str) -> anyhow::Result<()> {
-        let lower = url.trim().to_ascii_lowercase();
-        if lower.starts_with("https://") {
-            return Ok(());
-        }
-        if let Some(rest) = lower.strip_prefix("http://") {
-            let host = rest
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or("")
-                .rsplit_once('@')
-                .map(|(_, h)| h)
-                .unwrap_or(rest.split(['/', '?', '#']).next().unwrap_or(""));
-            let host_only = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-            if matches!(host_only, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
-                return Ok(());
-            }
-        }
-        Err(anyhow!(
-            "OIDC {field} must use https:// (or http://localhost for development); got {url}"
-        ))
-    }
-
-    /// Fetch a JSON document with size limits.
-    async fn fetch_oidc_json(
-        client: &reqwest::Client,
-        url: &str,
-    ) -> anyhow::Result<serde_json::Value> {
-        let response = client.get(url).send().await?;
-        let bytes = response.bytes().await?;
-        if bytes.len() > Self::MAX_OIDC_RESPONSE_BYTES {
-            return Err(anyhow!(
-                "OIDC response from {url} exceeds size limit ({} bytes)",
-                bytes.len()
-            ));
-        }
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    /// Fetch JWKS from the IdP and build a validator.
-    pub async fn from_config(oidc: &OidcConfig) -> anyhow::Result<Self> {
-        let client = Self::oidc_http_client();
-
-        // JWKS must travel over a confidential channel — plaintext fetch lets
-        // an attacker swap keys and forge tokens. Permit http only for explicit
-        // loopback (development). The jwks_uri override is checked for the
-        // same reason.
-        Self::require_https_or_loopback(&oidc.issuer_url, "issuer_url")?;
-        if !oidc.jwks_uri.is_empty() {
-            Self::require_https_or_loopback(&oidc.jwks_uri, "jwks_uri")?;
-        }
-
-        let jwks_uri = if oidc.jwks_uri.is_empty() {
-            let discovery_url = format!(
-                "{}/.well-known/openid-configuration",
-                oidc.issuer_url.trim_end_matches('/')
-            );
-            let discovery = Self::fetch_oidc_json(&client, &discovery_url).await?;
-            let resolved = discovery["jwks_uri"]
-                .as_str()
-                .ok_or_else(|| anyhow!("no jwks_uri in OIDC discovery document"))?
-                .to_string();
-            Self::require_https_or_loopback(&resolved, "discovered jwks_uri")?;
-            resolved
-        } else {
-            oidc.jwks_uri.clone()
-        };
-
-        let jwks = Self::fetch_oidc_json(&client, &jwks_uri).await?;
-
-        let keys = jwks["keys"]
-            .as_array()
-            .ok_or_else(|| anyhow!("no keys in JWKS response"))?;
-
-        let mut decoding_keys = Vec::new();
-        for key in keys {
-            if key["kty"].as_str() != Some("RSA") {
-                continue;
-            }
-            // JWKS entries optionally declare key usage (`use`) and algorithm
-            // (`alg`). Skip keys that are explicitly tagged for encryption or a
-            // non-RS256 algorithm — otherwise a key meant for `enc` would be
-            // accepted as a token signature.
-            if let Some(usage) = key["use"].as_str()
-                && usage != "sig"
-            {
-                continue;
-            }
-            if let Some(alg) = key["alg"].as_str()
-                && alg != "RS256"
-            {
-                continue;
-            }
-            let (Some(n), Some(e)) = (key["n"].as_str(), key["e"].as_str()) else {
-                continue;
-            };
-            if n.is_empty() || e.is_empty() {
-                continue;
-            }
-            if let Ok(dk) = DecodingKey::from_rsa_components(n, e) {
-                decoding_keys.push(dk);
-            }
-        }
-
-        if decoding_keys.is_empty() {
-            anyhow::bail!("no usable RSA keys found in JWKS");
-        }
-
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-        validation.set_issuer(&[&oidc.issuer_url]);
-        if !oidc.audience.is_empty() {
-            validation.set_audience(&[&oidc.audience]);
-        }
-
-        Ok(Self {
-            decoding_keys,
-            validation,
-        })
-    }
-
-    pub fn validate_token(&self, token: &str) -> bool {
-        for key in &self.decoding_keys {
-            if jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation).is_ok() {
-                return true;
-            }
-        }
-        false
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WsAuthDiscoveryInfo {
     pub methods: Vec<String>,
@@ -2874,12 +2600,12 @@ mod tests {
         assert!(validate_ws_jwt(&token_2).expect("validate second jwt"));
         assert!(!validate_ws_jwt("not-a-jwt").expect("validate invalid token"));
 
-        let claims_1 = decode_ws_jwt_claims(&token_1).expect("decode first jwt");
-        let claims_2 = decode_ws_jwt_claims(&token_2).expect("decode second jwt");
+        let claims_1 = jwt::decode_ws_jwt_claims(&token_1).expect("decode first jwt");
+        let claims_2 = jwt::decode_ws_jwt_claims(&token_2).expect("decode second jwt");
         assert_eq!(claims_1.sub, "tui");
         assert_eq!(claims_2.sub, "plasmoid");
-        assert_eq!(claims_1.iss, default_ws_jwt_issuer());
-        assert_eq!(claims_1.aud, default_ws_jwt_audience());
+        assert_eq!(claims_1.iss, jwt::default_ws_jwt_issuer());
+        assert_eq!(claims_1.aud, jwt::default_ws_jwt_audience());
 
         // SAFETY: same scope as the matching `set_var` above; clean up
         // before exiting the test so we don't leak state between runs.
@@ -3534,9 +3260,9 @@ y = 2
         }
 
         let token = generate_ws_jwt(Some("tui".to_string())).expect("generate jwt");
-        let mut claims = decode_ws_jwt_claims(&token).expect("decode generated jwt");
+        let mut claims = jwt::decode_ws_jwt_claims(&token).expect("decode generated jwt");
         claims.iss = "other-issuer".to_string();
-        let forged = encode_ws_jwt(&claims).expect("re-encode forged jwt");
+        let forged = jwt::encode_ws_jwt(&claims).expect("re-encode forged jwt");
 
         assert!(!validate_ws_jwt(&forged).expect("validate forged token"));
 
