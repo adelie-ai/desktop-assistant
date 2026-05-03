@@ -34,7 +34,7 @@ use desktop_assistant_core::ports::inbound::{
     ConnectionView as CoreConnectionView, ConnectionsService, ConversationModelSelection,
     ConversationService, DispatchWarning, Effort, ModelListing as CoreModelListing,
     PromptDispatchOutcome, PromptSelectionOverride, PurposeConfigPayload,
-    PurposeKind as CorePurposeKind, PurposesView as CorePurposesView, SerdeEffort,
+    PurposeKind as CorePurposeKind, PurposesView as CorePurposesView,
 };
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
@@ -493,7 +493,7 @@ where
             Some(ConversationModelSelection {
                 connection_id,
                 model_id,
-                effort: p.effort.map(effort_internal_to_serde),
+                effort: p.effort.map(purpose_effort_to_core),
             })
         })
     }
@@ -734,7 +734,7 @@ where
             let sel = ConversationModelSelection {
                 connection_id: override_sel.connection_id,
                 model_id: override_sel.model_id,
-                effort: override_sel.effort.map(SerdeEffort::from),
+                effort: override_sel.effort,
             };
             // Persist before dispatch so a crash mid-call doesn't lose the
             // user's choice.
@@ -1026,14 +1026,6 @@ fn core_effort_to_purpose(e: Effort) -> PurposeEffort {
         Effort::Low => PurposeEffort::Low,
         Effort::Medium => PurposeEffort::Medium,
         Effort::High => PurposeEffort::High,
-    }
-}
-
-fn effort_internal_to_serde(e: PurposeEffort) -> SerdeEffort {
-    match e {
-        PurposeEffort::Low => SerdeEffort::Low,
-        PurposeEffort::Medium => SerdeEffort::Medium,
-        PurposeEffort::High => SerdeEffort::High,
     }
 }
 
