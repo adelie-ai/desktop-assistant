@@ -133,12 +133,166 @@ pub enum ConnectionConfig {
 impl ConnectionConfig {
     /// Short connector-type identifier (matches the `type =` tag).
     pub fn connector_type(&self) -> &'static str {
+        self.connector().as_str()
+    }
+
+    /// Typed [`Connector`] discriminant — same shape as
+    /// [`Self::connector_type`] but lifted into an enum so per-connector
+    /// defaults (base URL, default model, etc.) can hang off the type
+    /// instead of leaking string-match tables across the daemon (#47).
+    pub fn connector(&self) -> Connector {
         match self {
-            Self::Anthropic(_) => "anthropic",
-            Self::OpenAi(_) => "openai",
-            Self::Bedrock(_) => "bedrock",
-            Self::Ollama(_) => "ollama",
+            Self::Anthropic(_) => Connector::Anthropic,
+            Self::OpenAi(_) => Connector::OpenAi,
+            Self::Bedrock(_) => Connector::Bedrock,
+            Self::Ollama(_) => Connector::Ollama,
         }
+    }
+}
+
+/// Typed connector identity. The wire/config layer continues to round-trip
+/// through `&str` (TOML, env vars, the legacy `[llm].connector` field) but
+/// internally every per-connector default — base URL, default chat model,
+/// embedding model, hosted-tool-search availability, etc. — is a method on
+/// this enum so adding a new connector or fixing an alias is a single
+/// match-arm change instead of a 5-table edit (#47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Connector {
+    Ollama,
+    Anthropic,
+    Bedrock,
+    OpenAi,
+}
+
+impl Connector {
+    /// Canonical short name. Matches the `type =` tag in
+    /// `[connections.<id>]` and the legacy `[llm].connector` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::Anthropic => "anthropic",
+            Self::Bedrock => "bedrock",
+            Self::OpenAi => "openai",
+        }
+    }
+
+    /// Parse a connector identifier with alias support.
+    ///
+    /// Accepts:
+    /// - canonical names (`ollama`, `anthropic`, `bedrock`, `openai`)
+    /// - the legacy `aws-bedrock` alias for [`Self::Bedrock`]
+    /// - leading/trailing whitespace and any case
+    ///
+    /// Returns `None` for unrecognised values; callers that need a
+    /// default for unknown input should chain `.unwrap_or(Connector::OpenAi)`
+    /// (or whichever default is right for their context).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ollama" => Some(Self::Ollama),
+            "anthropic" => Some(Self::Anthropic),
+            "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
+            "openai" => Some(Self::OpenAi),
+            _ => None,
+        }
+    }
+
+    /// Default base URL for this connector. Empty string for connectors
+    /// that don't ship a default (so `.to_string()` and `format!` callers
+    /// don't have to special-case `Option`).
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Ollama => {
+                desktop_assistant_llm_ollama::OllamaClient::get_default_base_url().unwrap_or("")
+            }
+            Self::Anthropic => {
+                desktop_assistant_llm_anthropic::AnthropicClient::get_default_base_url()
+                    .unwrap_or("")
+            }
+            Self::Bedrock => {
+                desktop_assistant_llm_bedrock::BedrockClient::get_default_base_url().unwrap_or("")
+            }
+            Self::OpenAi => {
+                desktop_assistant_llm_openai::OpenAiClient::get_default_base_url().unwrap_or("")
+            }
+        }
+    }
+
+    /// Default chat-completion model for this connector. Empty string if
+    /// the connector doesn't ship a default.
+    pub fn default_chat_model(self) -> &'static str {
+        match self {
+            Self::Ollama => {
+                desktop_assistant_llm_ollama::OllamaClient::get_default_model().unwrap_or("")
+            }
+            Self::Anthropic => {
+                desktop_assistant_llm_anthropic::AnthropicClient::get_default_model().unwrap_or("")
+            }
+            Self::Bedrock => {
+                desktop_assistant_llm_bedrock::BedrockClient::get_default_model().unwrap_or("")
+            }
+            Self::OpenAi => {
+                desktop_assistant_llm_openai::OpenAiClient::get_default_model().unwrap_or("")
+            }
+        }
+    }
+
+    /// Default model for backend tasks (titling, dreaming, summary).
+    /// Diverges from [`Self::default_chat_model`] for non-Ollama
+    /// connectors — picks a smaller/cheaper model when the connector has
+    /// one.
+    pub fn default_backend_chat_model(self) -> &'static str {
+        match self {
+            Self::Ollama => {
+                desktop_assistant_llm_ollama::OllamaClient::get_default_model().unwrap_or("")
+            }
+            Self::Anthropic => "claude-haiku-4-5-20251001",
+            Self::Bedrock => "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            Self::OpenAi => "gpt-4o-mini",
+        }
+    }
+
+    /// Default embedding model for this connector. Anthropic doesn't
+    /// ship embeddings, so `Self::Anthropic` returns an empty string —
+    /// callers should check [`Self::supports_embeddings`] first or
+    /// substitute `Connector::OpenAi`.
+    pub fn default_embedding_model(self) -> &'static str {
+        match self {
+            Self::Ollama => "nomic-embed-text",
+            Self::Bedrock => "amazon.titan-embed-text-v2:0",
+            Self::OpenAi => "text-embedding-3-small",
+            Self::Anthropic => "",
+        }
+    }
+
+    /// Default base URL for connectors that target an HTTP endpoint
+    /// directly (i.e. not Bedrock, which uses a region instead). Used
+    /// as the fallback when a [`crate::config::ResolvedLlmConfig`]
+    /// resolver runs out of more specific sources.
+    pub fn default_http_base_url(self) -> &'static str {
+        match self {
+            Self::Ollama => "http://localhost:11434",
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::Bedrock => "us-east-1",
+            Self::OpenAi => "https://api.openai.com/v1",
+        }
+    }
+
+    /// Whether this connector exposes an embeddings endpoint. Anthropic
+    /// doesn't.
+    pub fn supports_embeddings(self) -> bool {
+        !matches!(self, Self::Anthropic)
+    }
+
+    /// Whether this connector supports server-side hosted tool search
+    /// (used by the model-defaults view to gate the toggle in the KCM).
+    pub fn supports_hosted_tool_search(self) -> bool {
+        matches!(self, Self::OpenAi | Self::Anthropic)
+    }
+}
+
+impl fmt::Display for Connector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -574,5 +728,93 @@ mystery_key = "x"
         let err = toml::from_str::<ConnectionConfig>(toml_src).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown field"), "unexpected error: {msg}");
+    }
+
+    // --- Connector enum (#47) -----------------------------------------------
+
+    #[test]
+    fn connector_parse_canonical_names() {
+        assert_eq!(Connector::parse("ollama"), Some(Connector::Ollama));
+        assert_eq!(Connector::parse("anthropic"), Some(Connector::Anthropic));
+        assert_eq!(Connector::parse("bedrock"), Some(Connector::Bedrock));
+        assert_eq!(Connector::parse("openai"), Some(Connector::OpenAi));
+    }
+
+    #[test]
+    fn connector_parse_accepts_aws_bedrock_alias() {
+        assert_eq!(Connector::parse("aws-bedrock"), Some(Connector::Bedrock));
+        assert_eq!(Connector::parse("AWS-BEDROCK"), Some(Connector::Bedrock));
+        assert_eq!(
+            Connector::parse("  aws-bedrock  "),
+            Some(Connector::Bedrock)
+        );
+    }
+
+    #[test]
+    fn connector_parse_is_case_insensitive() {
+        assert_eq!(Connector::parse("OpenAI"), Some(Connector::OpenAi));
+        assert_eq!(Connector::parse("BEDROCK"), Some(Connector::Bedrock));
+    }
+
+    #[test]
+    fn connector_parse_rejects_unknown() {
+        assert_eq!(Connector::parse(""), None);
+        assert_eq!(Connector::parse("gemini"), None);
+        assert_eq!(Connector::parse("anthrop"), None);
+    }
+
+    #[test]
+    fn connector_as_str_round_trips_through_parse() {
+        for &c in &[
+            Connector::Ollama,
+            Connector::Anthropic,
+            Connector::Bedrock,
+            Connector::OpenAi,
+        ] {
+            assert_eq!(Connector::parse(c.as_str()), Some(c));
+        }
+    }
+
+    #[test]
+    fn connector_capability_flags_match_legacy_string_checks() {
+        // Pre-#47 the legacy `embeddings_available = connector != "anthropic"`
+        // and `hosted_tool_search_available = connector == "openai" || ==
+        // "anthropic"` lived inline in `get_connector_defaults`. Pin the
+        // mapping here so the typed methods can't drift.
+        assert!(Connector::Ollama.supports_embeddings());
+        assert!(Connector::Bedrock.supports_embeddings());
+        assert!(Connector::OpenAi.supports_embeddings());
+        assert!(!Connector::Anthropic.supports_embeddings());
+
+        assert!(!Connector::Ollama.supports_hosted_tool_search());
+        assert!(!Connector::Bedrock.supports_hosted_tool_search());
+        assert!(Connector::OpenAi.supports_hosted_tool_search());
+        assert!(Connector::Anthropic.supports_hosted_tool_search());
+    }
+
+    #[test]
+    fn connection_config_connector_method_matches_type_tag() {
+        let cases: [(ConnectionConfig, Connector); 4] = [
+            (
+                ConnectionConfig::Ollama(OllamaConnection::default()),
+                Connector::Ollama,
+            ),
+            (
+                ConnectionConfig::Anthropic(AnthropicConnection::default()),
+                Connector::Anthropic,
+            ),
+            (
+                ConnectionConfig::Bedrock(BedrockConnection::default()),
+                Connector::Bedrock,
+            ),
+            (
+                ConnectionConfig::OpenAi(OpenAiConnection::default()),
+                Connector::OpenAi,
+            ),
+        ];
+        for (cfg, expected) in cases {
+            assert_eq!(cfg.connector(), expected);
+            assert_eq!(cfg.connector_type(), expected.as_str());
+        }
     }
 }
