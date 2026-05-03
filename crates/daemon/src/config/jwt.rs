@@ -3,7 +3,7 @@
 //!
 //! Extracted from `config.rs` (#41). The signing key is HS256 with a
 //! key persisted via the secret-store backends in
-//! [`super::read_common_file_secret`] / [`super::write_common_file_secret`].
+//! [`super::secrets::read_common_file_secret`] / [`super::write_common_file_secret`].
 //! Issuer and audience are fixed local strings so a token from a
 //! different daemon instance can't pass validation.
 
@@ -67,7 +67,7 @@ fn unix_timestamp_seconds() -> anyhow::Result<u64> {
 }
 
 fn ensure_ws_jwt_signing_key() -> anyhow::Result<String> {
-    if let Some(existing) = super::read_common_file_secret(ws_jwt_signing_key_account()) {
+    if let Some(existing) = super::secrets::read_common_file_secret(ws_jwt_signing_key_account()) {
         return Ok(existing);
     }
 
@@ -77,12 +77,12 @@ fn ensure_ws_jwt_signing_key() -> anyhow::Result<String> {
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    super::write_common_file_secret(ws_jwt_signing_key_account(), &generated)?;
+    super::secrets::write_common_file_secret(ws_jwt_signing_key_account(), &generated)?;
     Ok(generated)
 }
 
 fn read_ws_jwt_signing_key() -> anyhow::Result<String> {
-    super::read_common_file_secret(ws_jwt_signing_key_account())
+    super::secrets::read_common_file_secret(ws_jwt_signing_key_account())
         .ok_or_else(|| anyhow!("ws jwt signing key is not initialized"))
 }
 
