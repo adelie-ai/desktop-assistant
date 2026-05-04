@@ -794,6 +794,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for MockLlm {
         async fn stream_completion(
             &self,
@@ -1103,6 +1104,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for ToolCallingLlm {
         async fn stream_completion(
             &self,
@@ -1374,6 +1376,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for FailingLlm {
         async fn stream_completion(
             &self,
@@ -1648,6 +1651,7 @@ mod tests {
         seen_messages: Arc<Mutex<Vec<Message>>>,
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for CapturingLlm {
         async fn stream_completion(
             &self,
@@ -2093,6 +2097,7 @@ mod tests {
         max_context: Option<u64>,
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for TokenReportingLlm {
         fn max_context_tokens(&self) -> Option<u64> {
             self.max_context
@@ -2235,6 +2240,7 @@ mod tests {
         ok_text: String,
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for OverflowThenSucceedLlm {
         async fn stream_completion(
             &self,
@@ -2444,6 +2450,7 @@ mod tests {
             call_count: Arc<AtomicU32>,
         }
 
+        #[async_trait::async_trait]
         impl LlmClient for OverflowThenSucceedWithSummary {
             fn max_context_tokens(&self) -> Option<u64> {
                 Some(200_000)
@@ -2551,6 +2558,7 @@ mod tests {
         struct AlwaysOverflowLlm {
             call_count: Arc<AtomicU32>,
         }
+        #[async_trait::async_trait]
         impl LlmClient for AlwaysOverflowLlm {
             async fn stream_completion(
                 &self,
@@ -2668,6 +2676,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for CategorizingLlm {
         fn supports_hosted_tool_search(&self) -> bool {
             true

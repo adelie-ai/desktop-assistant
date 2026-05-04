@@ -756,6 +756,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for MockLlm {
         async fn stream_completion(
             &self,
@@ -779,6 +780,7 @@ mod tests {
     /// fallback branches in [`generate_context_summary`].
     struct FailingLlm;
 
+    #[async_trait::async_trait]
     impl LlmClient for FailingLlm {
         async fn stream_completion(
             &self,
@@ -1835,6 +1837,7 @@ mod tests {
         struct CapturingSummariserLlm {
             seen: Arc<Mutex<Option<Vec<Message>>>>,
         }
+        #[async_trait::async_trait]
         impl LlmClient for CapturingSummariserLlm {
             async fn stream_completion(
                 &self,

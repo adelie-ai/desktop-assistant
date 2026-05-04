@@ -649,6 +649,7 @@ fn curated_anthropic_models() -> Vec<ModelInfo> {
     ]
 }
 
+#[async_trait::async_trait]
 impl LlmClient for AnthropicClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()

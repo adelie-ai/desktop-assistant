@@ -1,8 +1,8 @@
 //! Per-connection LLM client registry.
 //!
-//! Issue #9. Builds one [`AnyLlmClient`] per entry in [`ConnectionsMap`] (from
-//! #8) and tracks availability so a single misconfigured connection does not
-//! prevent daemon startup.
+//! Issue #9. Builds one `Arc<dyn LlmClient>` per entry in
+//! [`ConnectionsMap`] (from #8) and tracks availability so a single
+//! misconfigured connection does not prevent daemon startup.
 //!
 //! Downstream:
 //! - #10 layers purpose configs (model / temperature / hosted-tool-search
@@ -19,146 +19,15 @@
 //! from a fresh [`DaemonConfig`]. This is deliberately naive for #9; a future
 //! ticket can diff and reuse live clients.
 use std::fmt;
+use std::sync::Arc;
 
-use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig,
-};
+use desktop_assistant_core::ports::llm::LlmClient;
 use indexmap::IndexMap;
 
 use crate::config::{
     DaemonConfig, ResolvedLlmConfig, resolve_connection_llm_config, resolve_llm_config,
 };
 use crate::connections::{ConnectionConfig, ConnectionId};
-
-/// Enum wrapper to dispatch between LLM backends at runtime.
-///
-/// `LlmClient` uses `impl Future` returns, so it isn't dyn-compatible.
-/// This enum lets `ConversationHandler` stay monomorphic while supporting
-/// multiple backends. Variants intentionally mirror the connector types in
-/// [`ConnectionConfig`]; #9 does not widen or narrow this set.
-pub enum AnyLlmClient {
-    Anthropic(desktop_assistant_llm_anthropic::AnthropicClient),
-    Bedrock(desktop_assistant_llm_bedrock::BedrockClient),
-    OpenAi(desktop_assistant_llm_openai::OpenAiClient),
-    Ollama(desktop_assistant_llm_ollama::OllamaClient),
-}
-
-impl LlmClient for AnyLlmClient {
-    fn get_default_model(&self) -> Option<&str> {
-        match self {
-            Self::Anthropic(c) => c.get_default_model(),
-            Self::Bedrock(c) => c.get_default_model(),
-            Self::OpenAi(c) => c.get_default_model(),
-            Self::Ollama(c) => c.get_default_model(),
-        }
-    }
-
-    fn get_default_base_url(&self) -> Option<&str> {
-        match self {
-            Self::Anthropic(c) => c.get_default_base_url(),
-            Self::Bedrock(c) => c.get_default_base_url(),
-            Self::OpenAi(c) => c.get_default_base_url(),
-            Self::Ollama(c) => c.get_default_base_url(),
-        }
-    }
-
-    fn max_context_tokens(&self) -> Option<u64> {
-        match self {
-            Self::Anthropic(c) => c.max_context_tokens(),
-            Self::Bedrock(c) => c.max_context_tokens(),
-            Self::OpenAi(c) => c.max_context_tokens(),
-            Self::Ollama(c) => c.max_context_tokens(),
-        }
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        match self {
-            Self::Anthropic(c) => c.list_models().await,
-            Self::Bedrock(c) => c.list_models().await,
-            Self::OpenAi(c) => c.list_models().await,
-            Self::Ollama(c) => c.list_models().await,
-        }
-    }
-
-    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        match self {
-            Self::Anthropic(c) => c.refresh_models().await,
-            Self::Bedrock(c) => c.refresh_models().await,
-            Self::OpenAi(c) => c.refresh_models().await,
-            Self::Ollama(c) => c.refresh_models().await,
-        }
-    }
-
-    async fn stream_completion(
-        &self,
-        messages: Vec<Message>,
-        tools: &[ToolDefinition],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        match self {
-            Self::Anthropic(c) => {
-                c.stream_completion(messages, tools, reasoning, on_chunk)
-                    .await
-            }
-            Self::Bedrock(c) => {
-                c.stream_completion(messages, tools, reasoning, on_chunk)
-                    .await
-            }
-            Self::OpenAi(c) => {
-                c.stream_completion(messages, tools, reasoning, on_chunk)
-                    .await
-            }
-            Self::Ollama(c) => {
-                c.stream_completion(messages, tools, reasoning, on_chunk)
-                    .await
-            }
-        }
-    }
-
-    fn supports_hosted_tool_search(&self) -> bool {
-        match self {
-            Self::Anthropic(c) => c.supports_hosted_tool_search(),
-            Self::OpenAi(c) => c.supports_hosted_tool_search(),
-            _ => false,
-        }
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        match self {
-            Self::Anthropic(c) => {
-                c.stream_completion_with_namespaces(
-                    messages, core_tools, namespaces, reasoning, on_chunk,
-                )
-                .await
-            }
-            Self::OpenAi(c) => {
-                c.stream_completion_with_namespaces(
-                    messages, core_tools, namespaces, reasoning, on_chunk,
-                )
-                .await
-            }
-            // Bedrock/Ollama: use default flattening behavior
-            _ => {
-                let mut all: Vec<ToolDefinition> = core_tools.to_vec();
-                for ns in namespaces {
-                    all.extend(ns.tools.iter().cloned());
-                }
-                self.stream_completion(messages, &all, reasoning, on_chunk)
-                    .await
-            }
-        }
-    }
-}
 
 /// Availability of a single connection in the registry.
 #[derive(Debug, Clone, PartialEq)]
@@ -190,12 +59,13 @@ pub struct ConnectionStatus {
 
 /// Registry of per-connection LLM clients plus their status.
 ///
-/// Built at daemon startup via [`build_registry`]. Live clients are held by
-/// value (not `Arc`) because dispatch wraps them in retry/profiling layers
-/// and stores them behind the handler's own `Arc`. `IndexMap` preserves
-/// declaration order so [`ConnectionRegistry::active_connection`] is stable.
+/// Built at daemon startup via [`build_registry`]. Clients are stored as
+/// `Arc<dyn LlmClient>` (#44) so dispatch can wrap them in retry/profiling
+/// layers without committing to a concrete connector type. `IndexMap`
+/// preserves declaration order so [`ConnectionRegistry::active_connection`]
+/// is stable.
 pub struct ConnectionRegistry {
-    clients: IndexMap<ConnectionId, std::sync::Arc<AnyLlmClient>>,
+    clients: IndexMap<ConnectionId, Arc<dyn LlmClient>>,
     status: IndexMap<ConnectionId, ConnectionStatus>,
     active: Option<ConnectionId>,
 }
@@ -223,7 +93,7 @@ impl ConnectionRegistry {
     /// without holding the registry lock — required by the #11 routing
     /// handler, which resolves connections under a read lock and then
     /// dispatches async.
-    pub fn get(&self, id: &ConnectionId) -> Option<std::sync::Arc<AnyLlmClient>> {
+    pub fn get(&self, id: &ConnectionId) -> Option<Arc<dyn LlmClient>> {
         self.clients.get(id).cloned()
     }
 
@@ -269,7 +139,7 @@ impl ConnectionRegistry {
     /// Legacy accessor from before purpose-based dispatch landed —
     /// production callers use [`ConnectionRegistry::get`] now. Retained
     /// for diagnostics and legacy tests.
-    pub fn take_active(&mut self) -> Option<(ConnectionId, std::sync::Arc<AnyLlmClient>)> {
+    pub fn take_active(&mut self) -> Option<(ConnectionId, Arc<dyn LlmClient>)> {
         let id = self.active.clone()?;
         let client = self.clients.shift_remove(&id)?;
         Some((id, client))
@@ -281,33 +151,24 @@ impl ConnectionRegistry {
         *self = build_registry(config);
     }
 
-    /// Fire-and-forget warmup of every Ollama client's context-length
-    /// cache. Spawns one detached task per connection that calls
-    /// `OllamaClient::warm_context_length` so that subsequent
-    /// `LlmClient::max_context_tokens()` calls return the GGUF-declared
-    /// window instead of `None`. Failures (server down, model not pulled)
-    /// are silently swallowed inside the connector — `max_context_tokens`
-    /// just keeps reporting `None` and the daemon's universal fallback
-    /// applies.
+    /// Fire-and-forget [`LlmClient::warmup`] on every live client.
+    /// Spawns one detached task per connection. Today only Ollama
+    /// overrides the default no-op — it populates a GGUF context-length
+    /// cache so [`LlmClient::max_context_tokens`] returns the declared
+    /// window instead of `None`. Failures (server down, model not
+    /// pulled) are silently swallowed by the implementation — the
+    /// daemon's universal fallback applies if the cache stays empty.
     ///
     /// Called once at daemon startup after [`build_registry`] returns.
     /// Must be invoked from inside a Tokio runtime.
-    pub fn spawn_ollama_warmups(&self) {
+    pub fn spawn_warmups(&self) {
         for (id, client) in &self.clients {
-            if let AnyLlmClient::Ollama(_) = client.as_ref() {
-                let id = id.clone();
-                let client = std::sync::Arc::clone(client);
-                tokio::spawn(async move {
-                    if let AnyLlmClient::Ollama(c) = client.as_ref() {
-                        let value = c.warm_context_length().await;
-                        tracing::debug!(
-                            connection = %id,
-                            warmed = ?value,
-                            "ollama context-length warmup completed"
-                        );
-                    }
-                });
-            }
+            let id = id.clone();
+            let client = Arc::clone(client);
+            tokio::spawn(async move {
+                client.warmup().await;
+                tracing::debug!(connection = %id, "warmup completed");
+            });
         }
     }
 }
@@ -318,16 +179,16 @@ impl Default for ConnectionRegistry {
     }
 }
 
-/// Build an [`AnyLlmClient`] from a resolved LLM configuration.
+/// Build an `Arc<dyn LlmClient>` from a resolved LLM configuration.
 ///
 /// Infallible by design: the underlying client constructors never fail
 /// synchronously. Errors (bad credentials, unreachable endpoint) surface on
 /// the first request. [`build_registry`] does synchronous sanity checks
 /// *before* calling this so misconfigured connections can be marked
 /// unavailable up front.
-pub fn build_llm_client(resolved: ResolvedLlmConfig) -> AnyLlmClient {
+pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
     match resolved.connector.as_str() {
-        "ollama" => AnyLlmClient::Ollama(
+        "ollama" => Arc::new(
             desktop_assistant_llm_ollama::OllamaClient::new(resolved.base_url, resolved.model)
                 .with_temperature(resolved.temperature)
                 .with_top_p(resolved.top_p)
@@ -349,9 +210,9 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> AnyLlmClient {
             if let Some(hts) = resolved.hosted_tool_search {
                 client = client.with_hosted_tool_search(hts);
             }
-            AnyLlmClient::Anthropic(client)
+            Arc::new(client)
         }
-        "bedrock" | "aws-bedrock" => AnyLlmClient::Bedrock(
+        "bedrock" | "aws-bedrock" => Arc::new(
             desktop_assistant_llm_bedrock::BedrockClient::new(resolved.api_key)
                 .with_model(resolved.model)
                 .with_base_url(resolved.base_url)
@@ -375,7 +236,7 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> AnyLlmClient {
             if let Some(hts) = resolved.hosted_tool_search {
                 client = client.with_hosted_tool_search(hts);
             }
-            AnyLlmClient::OpenAi(client)
+            Arc::new(client)
         }
     }
 }
@@ -411,7 +272,7 @@ fn build_one(
     id: &ConnectionId,
     conn: &ConnectionConfig,
     config: &DaemonConfig,
-) -> (Option<AnyLlmClient>, ConnectionStatus) {
+) -> (Option<Arc<dyn LlmClient>>, ConnectionStatus) {
     let connector_type = conn.connector_type().to_string();
     let resolved = resolve_connection_llm_config(conn, Some(&config.llm));
 
@@ -457,7 +318,7 @@ fn build_one(
 /// registry is built from the top-level `[llm]` block under a synthetic id
 /// `default` so existing installs keep working until migration completes.
 pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
-    let mut clients: IndexMap<ConnectionId, std::sync::Arc<AnyLlmClient>> = IndexMap::new();
+    let mut clients: IndexMap<ConnectionId, Arc<dyn LlmClient>> = IndexMap::new();
     let mut status: IndexMap<ConnectionId, ConnectionStatus> = IndexMap::new();
 
     let validated = match config.validated_connections() {
@@ -475,7 +336,7 @@ pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
         for (id, conn) in map.iter() {
             let (client, st) = build_one(id, conn, config);
             if let Some(c) = client {
-                clients.insert(id.clone(), std::sync::Arc::new(c));
+                clients.insert(id.clone(), c);
             }
             status.insert(id.clone(), st);
         }
@@ -496,7 +357,7 @@ pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
                     model = %resolved.model,
                     "building legacy default connection client"
                 );
-                clients.insert(id.clone(), std::sync::Arc::new(build_llm_client(resolved)));
+                clients.insert(id.clone(), build_llm_client(resolved));
                 status.insert(
                     id.clone(),
                     ConnectionStatus {
@@ -693,8 +554,11 @@ mod tests {
 
     #[test]
     fn registry_get_returns_right_client_per_id() {
-        // Use two different connector types so `AnyLlmClient` discriminants
-        // differ — the registry must preserve id → client association.
+        // The registry must preserve id → client association. We can't
+        // check the underlying concrete type behind `Arc<dyn LlmClient>`
+        // (#44), so assert via the parallel `connector_type` field on
+        // `ConnectionStatus` plus the cheap `get_default_model` shape
+        // each connector reports.
         let ollama_id = ConnectionId::new("local").unwrap();
         let bedrock_id = ConnectionId::new("aws").unwrap();
         let pairs = vec![
@@ -711,17 +575,13 @@ mod tests {
         let config = config_from_pairs(pairs);
         let registry = build_registry(&config);
 
-        let client_ollama = registry.get(&ollama_id).expect("ollama present");
-        let client_bedrock = registry.get(&bedrock_id).expect("bedrock present");
+        assert!(registry.get(&ollama_id).is_some(), "ollama present");
+        assert!(registry.get(&bedrock_id).is_some(), "bedrock present");
 
-        assert!(
-            matches!(&*client_ollama, AnyLlmClient::Ollama(_)),
-            "ollama id should map to Ollama variant"
-        );
-        assert!(
-            matches!(&*client_bedrock, AnyLlmClient::Bedrock(_)),
-            "aws id should map to Bedrock variant"
-        );
+        let ollama_status = registry.status_of(&ollama_id).expect("ollama status");
+        assert_eq!(ollama_status.connector_type, "ollama");
+        let bedrock_status = registry.status_of(&bedrock_id).expect("bedrock status");
+        assert_eq!(bedrock_status.connector_type, "bedrock");
 
         // Asking for a non-existent id returns None.
         let missing = ConnectionId::new("nope").unwrap();

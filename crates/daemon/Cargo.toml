@@ -26,7 +26,7 @@ toml = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
 indexmap = { version = "2", features = ["serde"] }
 chrono.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
 keyring = "3"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }

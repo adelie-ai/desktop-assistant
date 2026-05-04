@@ -10,7 +10,7 @@ dbus = ["dep:zbus"]
 
 [dependencies]
 anyhow.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 desktop-assistant-api-model = { path = "../api-model" }
 futures = "0.3"
 reqwest = { version = "0.13", features = ["json"] }

@@ -29,20 +29,19 @@ use desktop_assistant_core::ports::llm::{
 
 use crate::api_surface::RegistryHandle;
 use crate::purposes::PurposeKind;
-use crate::registry::AnyLlmClient;
 
 tokio::task_local! {
     /// Per-turn routing override. When set, dispatch uses the contained
-    /// `Arc<AnyLlmClient>` (resolved from the registry) instead of the
+    /// `Arc<dyn LlmClient>` (resolved from the registry) instead of the
     /// [`RoutingLlmClient`]'s static fallback. Populated by
     /// [`with_active_client`] from inside the routing wrapper.
-    static ACTIVE_CLIENT: Arc<AnyLlmClient>;
+    static ACTIVE_CLIENT: Arc<dyn LlmClient>;
 }
 
 /// Run `fut` with `client` installed as the current turn's active LLM
 /// client. All `stream_completion(_with_namespaces)` calls on the
 /// enclosing [`RoutingLlmClient`] observe `client` and dispatch to it.
-pub async fn with_active_client<F, T>(client: Arc<AnyLlmClient>, fut: F) -> T
+pub async fn with_active_client<F, T>(client: Arc<dyn LlmClient>, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -67,7 +66,7 @@ pub enum FallbackMode {
     /// Static client captured at construction. Used by the primary
     /// (interactive) slot — dispatch reads `ACTIVE_CLIENT` first, then
     /// falls back to this client for legacy callers without an override.
-    Static { client: Arc<AnyLlmClient> },
+    Static { client: Arc<dyn LlmClient> },
     /// Resolve the target client from a [`RegistryHandle`] on every
     /// dispatch by re-reading the named purpose's config. Used by the
     /// backend-tasks slot so titling/dreaming pick up control-panel
@@ -96,7 +95,7 @@ pub struct RoutingLlmClient {
 impl RoutingLlmClient {
     /// Static-fallback constructor. Used by the primary (interactive)
     /// slot.
-    pub fn new(fallback: Arc<AnyLlmClient>) -> Self {
+    pub fn new(fallback: Arc<dyn LlmClient>) -> Self {
         Self {
             fallback: FallbackMode::Static { client: fallback },
         }
@@ -117,7 +116,7 @@ impl RoutingLlmClient {
     /// (`list_models`, `max_context_tokens`, etc.). Returns `None` for
     /// dynamic-purpose wrappers, which intentionally have no single
     /// captured client to delegate to.
-    fn static_fallback(&self) -> Option<&Arc<AnyLlmClient>> {
+    fn static_fallback(&self) -> Option<&Arc<dyn LlmClient>> {
         match &self.fallback {
             FallbackMode::Static { client, .. } => Some(client),
             FallbackMode::DynamicPurpose { .. } => None,
@@ -128,7 +127,7 @@ impl RoutingLlmClient {
     /// the task-local override if set, or the static fallback otherwise.
     /// Only meaningful for Static mode — DynamicPurpose dispatches via
     /// [`Self::dispatch_dynamic`].
-    fn resolve_static(&self) -> Arc<AnyLlmClient> {
+    fn resolve_static(&self) -> Arc<dyn LlmClient> {
         let FallbackMode::Static { client, .. } = &self.fallback else {
             unreachable!("resolve_static called on DynamicPurpose mode");
         };
@@ -147,7 +146,7 @@ impl RoutingLlmClient {
     /// connections invalid, connection missing from the registry).
     async fn dispatch_dynamic<F, Fut, T>(&self, op: F) -> Result<T, CoreError>
     where
-        F: FnOnce(Arc<AnyLlmClient>, ReasoningConfig) -> Fut,
+        F: FnOnce(Arc<dyn LlmClient>, ReasoningConfig) -> Fut,
         Fut: std::future::Future<Output = Result<T, CoreError>>,
     {
         let FallbackMode::DynamicPurpose { registry, purpose } = &self.fallback else {
@@ -202,6 +201,7 @@ impl RoutingLlmClient {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for RoutingLlmClient {
     fn get_default_model(&self) -> Option<&str> {
         // `Option<&str>` borrows from `self`; we can't delegate through the
@@ -340,7 +340,7 @@ mod tests {
     use desktop_assistant_core::ports::llm::ReasoningConfig;
     use indexmap::IndexMap;
 
-    fn build_ollama_registry() -> Arc<AnyLlmClient> {
+    fn build_ollama_registry() -> Arc<dyn LlmClient> {
         let cfg = crate::config::DaemonConfig {
             connections: IndexMap::from([(
                 "local".to_string(),

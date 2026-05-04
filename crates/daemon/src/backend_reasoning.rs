@@ -45,6 +45,7 @@ impl<L> FixedReasoningLlmClient<L> {
     }
 }
 
+#[async_trait::async_trait]
 impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
     fn get_default_model(&self) -> Option<&str> {
         self.inner.get_default_model()
@@ -128,6 +129,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for CapturingClient {
         fn get_default_model(&self) -> Option<&str> {
             Some("captured")

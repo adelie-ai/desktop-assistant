@@ -972,6 +972,7 @@ impl BedrockClient {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for BedrockClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -1075,6 +1076,17 @@ impl LlmClient for BedrockClient {
             }
             Err(StreamingDispatchError::Other(err)) => Err(err),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl desktop_assistant_core::ports::embedding::EmbeddingClient for BedrockClient {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+        BedrockClient::embed(self, texts).await
+    }
+
+    async fn model_identifier(&self) -> Result<String, CoreError> {
+        BedrockClient::model_identifier(self).await
     }
 }
 

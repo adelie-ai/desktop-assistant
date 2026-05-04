@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

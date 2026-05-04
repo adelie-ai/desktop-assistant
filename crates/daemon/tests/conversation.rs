@@ -121,6 +121,7 @@ impl TestLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for TestLlm {
     async fn stream_completion(
         &self,

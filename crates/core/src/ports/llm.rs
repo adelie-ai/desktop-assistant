@@ -331,6 +331,12 @@ impl LlmResponse {
 }
 
 /// Outbound port for LLM completion requests.
+///
+/// Uses [`async_trait::async_trait`] so the trait is dyn-compatible
+/// — required because the daemon registry stores clients as
+/// `Arc<dyn LlmClient>` (#44). The per-call heap allocation that
+/// async-trait introduces is negligible next to an LLM round-trip.
+#[async_trait::async_trait]
 pub trait LlmClient: Send + Sync {
     /// Return the connector's built-in default model, if it has one.
     fn get_default_model(&self) -> Option<&str> {
@@ -369,13 +375,13 @@ pub trait LlmClient: Send + Sync {
     /// per-API request field (Anthropic `thinking`, OpenAI
     /// `reasoning_effort`, Bedrock `additionalModelRequestFields`).
     /// Returns an `LlmResponse` which may include tool calls.
-    fn stream_completion(
+    async fn stream_completion(
         &self,
         messages: Vec<Message>,
         tools: &[ToolDefinition],
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
-    ) -> impl std::future::Future<Output = Result<LlmResponse, CoreError>> + Send;
+    ) -> Result<LlmResponse, CoreError>;
 
     /// Whether this connector supports server-side hosted tool search
     /// (e.g. OpenAI namespaces with deferred loading).
@@ -388,22 +394,20 @@ pub trait LlmClient: Send + Sync {
     /// Connectors that support hosted tool search (e.g. OpenAI) serialize
     /// namespaces with `defer_loading: true` and append a `tool_search` entry.
     /// The default implementation flattens everything into `stream_completion`.
-    fn stream_completion_with_namespaces(
+    async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
         core_tools: &[ToolDefinition],
         namespaces: &[ToolNamespace],
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
-    ) -> impl std::future::Future<Output = Result<LlmResponse, CoreError>> + Send {
-        async move {
-            let mut all: Vec<ToolDefinition> = core_tools.to_vec();
-            for ns in namespaces {
-                all.extend(ns.tools.iter().cloned());
-            }
-            self.stream_completion(messages, &all, reasoning, on_chunk)
-                .await
+    ) -> Result<LlmResponse, CoreError> {
+        let mut all: Vec<ToolDefinition> = core_tools.to_vec();
+        for ns in namespaces {
+            all.extend(ns.tools.iter().cloned());
         }
+        self.stream_completion(messages, &all, reasoning, on_chunk)
+            .await
     }
 
     /// Enumerate the models this connector can serve.
@@ -412,18 +416,88 @@ pub trait LlmClient: Send + Sync {
     /// select (chat and embedding). The default implementation returns an
     /// empty list so test mocks and decorators that delegate can opt out;
     /// production connectors override this.
-    fn list_models(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<ModelInfo>, CoreError>> + Send {
-        async { Ok(Vec::new()) }
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        Ok(Vec::new())
     }
 
     /// Force a fresh fetch of `list_models()`, bypassing any per-connector
     /// cache. Connectors without a cache can delegate to `list_models`.
-    fn refresh_models(
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        self.list_models().await
+    }
+
+    /// Optional one-shot warmup hook called once after registry construction.
+    /// Default no-op; Ollama uses it to populate the GGUF context-length
+    /// cache so [`max_context_tokens`] returns a real value on first use.
+    /// Errors are intentionally swallowed by the registry — warmup is
+    /// best-effort and a failure just falls back to the universal default.
+    async fn warmup(&self) {}
+}
+
+// Blanket impl so generic wrappers — `RetryingLlmClient<L>`,
+// `MaybeProfiled<L>`, `RoutingLlmClient` — accept `Arc<dyn LlmClient>`
+// as their inner type. Without this the daemon registry's
+// `Arc<dyn LlmClient>` couldn't be wrapped by the same chain that
+// existed when the inner type was a concrete enum (#44).
+#[async_trait::async_trait]
+impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    fn get_default_model(&self) -> Option<&str> {
+        (**self).get_default_model()
+    }
+
+    fn get_default_base_url(&self) -> Option<&str> {
+        (**self).get_default_base_url()
+    }
+
+    fn max_context_tokens(&self) -> Option<u64> {
+        (**self).max_context_tokens()
+    }
+
+    fn estimate_tokens(&self, text: &str) -> u64 {
+        (**self).estimate_tokens(text)
+    }
+
+    fn supports_hosted_tool_search(&self) -> bool {
+        (**self).supports_hosted_tool_search()
+    }
+
+    async fn stream_completion(
         &self,
-    ) -> impl std::future::Future<Output = Result<Vec<ModelInfo>, CoreError>> + Send {
-        async { self.list_models().await }
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        (**self)
+            .stream_completion(messages, tools, reasoning, on_chunk)
+            .await
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        (**self)
+            .stream_completion_with_namespaces(
+                messages, core_tools, namespaces, reasoning, on_chunk,
+            )
+            .await
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        (**self).list_models().await
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        (**self).refresh_models().await
+    }
+
+    async fn warmup(&self) {
+        (**self).warmup().await
     }
 }
 
@@ -543,6 +617,7 @@ impl<L> RetryingLlmClient<L> {
     }
 }
 
+#[async_trait::async_trait]
 impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
     fn get_default_model(&self) -> Option<&str> {
         self.inner.get_default_model()
@@ -673,6 +748,7 @@ mod tests {
         chunks: Vec<String>,
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for MockLlm {
         fn get_default_model(&self) -> Option<&str> {
             Some("mock")
@@ -834,6 +910,7 @@ mod tests {
         remaining_failures: Mutex<u32>,
     }
 
+    #[async_trait::async_trait]
     impl LlmClient for FailThenSucceedLlm {
         async fn stream_completion(
             &self,
@@ -888,6 +965,7 @@ mod tests {
         tokio::time::pause();
 
         struct AlwaysFailLlm;
+        #[async_trait::async_trait]
         impl LlmClient for AlwaysFailLlm {
             async fn stream_completion(
                 &self,
@@ -1024,6 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn default_list_models_is_empty() {
         struct NoopLlm;
+        #[async_trait::async_trait]
         impl LlmClient for NoopLlm {
             async fn stream_completion(
                 &self,
@@ -1043,6 +1122,7 @@ mod tests {
     #[test]
     fn default_estimate_tokens_uses_chars_div_4() {
         struct NoopLlm;
+        #[async_trait::async_trait]
         impl LlmClient for NoopLlm {
             async fn stream_completion(
                 &self,

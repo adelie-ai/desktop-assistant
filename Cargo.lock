@@ -1004,6 +1004,7 @@ dependencies = [
 name = "desktop-assistant-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "serde",
  "serde_json",
@@ -1073,6 +1074,7 @@ dependencies = [
 name = "desktop-assistant-llm-anthropic"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "desktop-assistant-core",
  "httpmock",
@@ -1089,6 +1091,7 @@ dependencies = [
 name = "desktop-assistant-llm-bedrock"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-bedrock",
@@ -1105,6 +1108,7 @@ dependencies = [
 name = "desktop-assistant-llm-ollama"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "desktop-assistant-core",
  "httpmock",
  "reqwest",
@@ -1119,6 +1123,7 @@ dependencies = [
 name = "desktop-assistant-llm-openai"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "desktop-assistant-core",
  "httpmock",
