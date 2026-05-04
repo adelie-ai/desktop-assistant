@@ -116,7 +116,15 @@ impl<S: SettingsService + 'static> ws::WsLoginService for WsBasicLogin<S> {
         }
 
         match &self.mode {
-            WsLoginMode::StaticPassword(expected) => password == expected,
+            // Constant-time compare so a byte-by-byte timing attacker
+            // can't peel the password one prefix at a time. Mostly
+            // theoretical for local-loopback HTTPS, but trivial to
+            // get right (#37). `ct_eq` returns false on length
+            // mismatch without short-circuiting per byte.
+            WsLoginMode::StaticPassword(expected) => {
+                use subtle::ConstantTimeEq;
+                password.as_bytes().ct_eq(expected.as_bytes()).into()
+            }
             WsLoginMode::SystemPassword => {
                 match config::authenticate_os_user_password(username, password) {
                     Ok(valid) => valid,
