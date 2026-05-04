@@ -9,8 +9,8 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
-    ConversationModelSelection, ConversationService, DispatchWarning, Effort, KnowledgeService,
-    PromptSelectionOverride, PurposeConfigPayload, PurposeKind, SettingsService,
+    ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
+    PromptSelectionOverride, PurposeConfigPayload, SettingsService,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -303,7 +303,7 @@ fn core_purpose_to_api(p: PurposeConfigPayload) -> api::PurposeConfigView {
     api::PurposeConfigView {
         connection: p.connection,
         model: p.model,
-        effort: p.effort.map(effort_to_api),
+        effort: p.effort,
         max_context_tokens: p.max_context_tokens,
     }
 }
@@ -312,33 +312,8 @@ fn api_purpose_to_core(p: api::PurposeConfigView) -> PurposeConfigPayload {
     PurposeConfigPayload {
         connection: p.connection,
         model: p.model,
-        effort: p.effort.map(effort_from_api),
+        effort: p.effort,
         max_context_tokens: p.max_context_tokens,
-    }
-}
-
-fn effort_to_api(e: Effort) -> api::EffortLevel {
-    match e {
-        Effort::Low => api::EffortLevel::Low,
-        Effort::Medium => api::EffortLevel::Medium,
-        Effort::High => api::EffortLevel::High,
-    }
-}
-
-fn effort_from_api(e: api::EffortLevel) -> Effort {
-    match e {
-        api::EffortLevel::Low => Effort::Low,
-        api::EffortLevel::Medium => Effort::Medium,
-        api::EffortLevel::High => Effort::High,
-    }
-}
-
-fn api_purpose_kind_to_core(k: api::PurposeKindApi) -> PurposeKind {
-    match k {
-        api::PurposeKindApi::Interactive => PurposeKind::Interactive,
-        api::PurposeKindApi::Dreaming => PurposeKind::Dreaming,
-        api::PurposeKindApi::Embedding => PurposeKind::Embedding,
-        api::PurposeKindApi::Titling => PurposeKind::Titling,
     }
 }
 
@@ -346,7 +321,7 @@ fn model_selection_to_view(sel: ConversationModelSelection) -> api::Conversation
     api::ConversationModelSelectionView {
         connection_id: sel.connection_id,
         model_id: sel.model_id,
-        effort: sel.effort.map(|e| effort_to_api(Effort::from(e))),
+        effort: sel.effort,
     }
 }
 
@@ -359,12 +334,12 @@ fn dispatch_warning_to_api(w: DispatchWarning) -> api::ConversationWarning {
             previous_selection: api::ConversationModelSelectionView {
                 connection_id: previous.connection_id,
                 model_id: previous.model_id,
-                effort: previous.effort.map(|e| effort_to_api(Effort::from(e))),
+                effort: previous.effort,
             },
             fallback_to: api::ConversationModelSelectionView {
                 connection_id: fallback_to.connection_id,
                 model_id: fallback_to.model_id,
-                effort: fallback_to.effort.map(|e| effort_to_api(Effort::from(e))),
+                effort: fallback_to.effort,
             },
         },
     }
@@ -828,10 +803,7 @@ where
 
             api::Command::SetPurpose { purpose, config } => {
                 self.connections
-                    .set_purpose(
-                        api_purpose_kind_to_core(purpose),
-                        api_purpose_to_core(config),
-                    )
+                    .set_purpose(purpose, api_purpose_to_core(config))
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)
@@ -907,7 +879,7 @@ where
         let override_for_core = override_selection.map(|o| PromptSelectionOverride {
             connection_id: o.connection_id,
             model_id: o.model_id,
-            effort: o.effort.map(effort_from_api),
+            effort: o.effort,
         });
 
         let outcome = self
@@ -989,7 +961,7 @@ mod tests {
     use desktop_assistant_core::ports::inbound::{
         BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
         EmbeddingsSettingsView, LlmSettingsView, ModelListing as CoreModelListing,
-        PersistenceSettingsView, PurposesView as CorePurposesView,
+        PersistenceSettingsView, PurposeKind, PurposesView as CorePurposesView,
     };
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;

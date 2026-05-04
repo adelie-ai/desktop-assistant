@@ -187,9 +187,7 @@ impl RoutingLlmClient {
         let reasoning = crate::api_surface::map_effort_to_reasoning_config(
             &connector_type,
             &resolved.model_id,
-            resolved
-                .effort
-                .map(crate::api_surface::purpose_effort_to_core),
+            resolved.effort,
         );
         let client = registry
             .client_for(&resolved.connection_id)

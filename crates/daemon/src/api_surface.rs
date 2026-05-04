@@ -32,9 +32,8 @@ use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationS
 use desktop_assistant_core::ports::inbound::{
     ConnectionAvailability as CoreConnectionAvailability, ConnectionConfigPayload,
     ConnectionView as CoreConnectionView, ConnectionsService, ConversationModelSelection,
-    ConversationService, DispatchWarning, Effort, ModelListing as CoreModelListing,
-    PromptDispatchOutcome, PromptSelectionOverride, PurposeConfigPayload,
-    PurposeKind as CorePurposeKind, PurposesView as CorePurposesView,
+    ConversationService, DispatchWarning, ModelListing as CoreModelListing, PromptDispatchOutcome,
+    PromptSelectionOverride, PurposeConfigPayload, PurposesView as CorePurposesView,
 };
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
@@ -48,9 +47,7 @@ use crate::connections::{
     AnthropicConnection, BedrockConnection, ConnectionConfig, ConnectionId, OllamaConnection,
     OpenAiConnection,
 };
-use crate::purposes::{
-    ConnectionRef, Effort as PurposeEffort, ModelRef, PurposeConfig, PurposeKind,
-};
+use crate::purposes::{ConnectionRef, Effort, ModelRef, PurposeConfig, PurposeKind};
 use crate::registry::{ConnectionHealth, ConnectionRegistry, build_registry};
 
 /// Shared, mutable handle to the registry + current config. Writes acquire
@@ -405,10 +402,10 @@ impl ConnectionsService for DaemonConnectionsService {
 
     async fn set_purpose(
         &self,
-        purpose: CorePurposeKind,
+        purpose: PurposeKind,
         config: PurposeConfigPayload,
     ) -> Result<(), CoreError> {
-        let purpose_kind = core_to_internal_purpose(purpose);
+        let purpose_kind = purpose;
         let new_cfg = payload_to_purpose(config)
             .map_err(|e| CoreError::Llm(format!("invalid purpose config: {e}")))?;
 
@@ -493,7 +490,7 @@ where
             Some(ConversationModelSelection {
                 connection_id,
                 model_id,
-                effort: p.effort.map(purpose_effort_to_core),
+                effort: p.effort,
             })
         })
     }
@@ -547,8 +544,7 @@ pub(crate) fn resolve_purpose_dispatch(
     // `ResolvedLlmConfig` doesn't carry (it's connector/model/credentials).
     let effort = config
         .and_then(|c| c.purposes.get(kind))
-        .and_then(|p| p.effort)
-        .map(purpose_effort_to_core);
+        .and_then(|p| p.effort);
     let reasoning = map_effort_to_reasoning_config(&resolved.connector, &resolved.model, effort);
     Some((resolved, reasoning))
 }
@@ -986,7 +982,7 @@ fn purpose_to_payload(p: &PurposeConfig) -> PurposeConfigPayload {
             ModelRef::Named(m) => m.clone(),
             ModelRef::Primary => "primary".to_string(),
         },
-        effort: p.effort.map(purpose_effort_to_core),
+        effort: p.effort,
         max_context_tokens: p.max_context_tokens,
     }
 }
@@ -1008,34 +1004,9 @@ fn payload_to_purpose(p: PurposeConfigPayload) -> Result<PurposeConfig, String> 
     Ok(PurposeConfig {
         connection,
         model,
-        effort: p.effort.map(core_effort_to_purpose),
+        effort: p.effort,
         max_context_tokens: p.max_context_tokens,
     })
-}
-
-pub(crate) fn purpose_effort_to_core(e: PurposeEffort) -> Effort {
-    match e {
-        PurposeEffort::Low => Effort::Low,
-        PurposeEffort::Medium => Effort::Medium,
-        PurposeEffort::High => Effort::High,
-    }
-}
-
-fn core_effort_to_purpose(e: Effort) -> PurposeEffort {
-    match e {
-        Effort::Low => PurposeEffort::Low,
-        Effort::Medium => PurposeEffort::Medium,
-        Effort::High => PurposeEffort::High,
-    }
-}
-
-fn core_to_internal_purpose(k: CorePurposeKind) -> PurposeKind {
-    match k {
-        CorePurposeKind::Interactive => PurposeKind::Interactive,
-        CorePurposeKind::Dreaming => PurposeKind::Dreaming,
-        CorePurposeKind::Embedding => PurposeKind::Embedding,
-        CorePurposeKind::Titling => PurposeKind::Titling,
-    }
 }
 
 fn purposes_referencing(
@@ -1259,7 +1230,7 @@ mod tests {
         let svc = DaemonConnectionsService::new(make_handle_with(cfg));
         let err = svc
             .set_purpose(
-                CorePurposeKind::Interactive,
+                PurposeKind::Interactive,
                 PurposeConfigPayload {
                     connection: "primary".into(),
                     model: "llama3".into(),
@@ -1280,7 +1251,7 @@ mod tests {
             Some(PurposeConfig {
                 connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
                 model: ModelRef::Named("llama3".into()),
-                effort: Some(PurposeEffort::Medium),
+                effort: Some(Effort::Medium),
                 max_context_tokens: None,
             }),
         );
@@ -1687,7 +1658,7 @@ mod tests {
                 Some(PurposeConfig {
                     connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
                     model: ModelRef::Named("llama3".into()),
-                    effort: Some(PurposeEffort::High),
+                    effort: Some(Effort::High),
                     max_context_tokens: None,
                 }),
             );
