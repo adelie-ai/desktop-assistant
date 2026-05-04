@@ -417,9 +417,12 @@ fn build_tls_connector(ca_cert_path: Option<&Path>) -> Result<tokio_tungstenite:
     if let Some(ca_path) = ca_cert_path {
         let pem_bytes = std::fs::read(ca_path)
             .map_err(|e| anyhow!("reading CA cert {}: {e}", ca_path.display()))?;
+        use rustls::pki_types::pem::PemObject;
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut std::io::BufReader::new(pem_bytes.as_slice()))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rustls::pki_types::CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(
+                pem_bytes.as_slice(),
+            ))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         for cert in certs {
             root_store.add(cert)?;
         }

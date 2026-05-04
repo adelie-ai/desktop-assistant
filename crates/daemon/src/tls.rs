@@ -7,6 +7,7 @@ use anyhow::{Context, anyhow};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 const CA_CERT_FILENAME: &str = "ca.pem";
@@ -167,7 +168,7 @@ fn ensure_server_cert(
 /// expiry and a malformed-cert churn loop.
 fn is_pem_cert_expired(pem_bytes: &[u8]) -> bool {
     let mut reader = std::io::BufReader::new(pem_bytes);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut reader)
         .filter_map(|r| r.ok())
         .collect();
 
@@ -328,14 +329,13 @@ fn build_server_config(
     key_pem: &[u8],
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(cert_chain_pem))
+        CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(cert_chain_pem))
             .collect::<Result<Vec<_>, _>>()
             .context("parsing certificate PEM")?;
 
     let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem))
-            .context("parsing private key PEM")?
-            .ok_or_else(|| anyhow!("no private key found in PEM"))?;
+        PrivateKeyDer::from_pem_reader(&mut std::io::BufReader::new(key_pem))
+            .context("parsing private key PEM")?;
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
