@@ -463,43 +463,6 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
     }
 }
 
-/// Enum wrapper to dispatch between embedding backends at runtime.
-///
-/// Mirrors `AnyLlmClient` but for the `EmbeddingClient` trait.
-/// `Unavailable` is used when the resolved connector doesn't support embeddings (e.g. Anthropic).
-enum AnyEmbeddingClient {
-    Bedrock(desktop_assistant_llm_bedrock::BedrockClient),
-    OpenAi(desktop_assistant_llm_openai::OpenAiClient),
-    Ollama(desktop_assistant_llm_ollama::OllamaClient),
-    Unavailable,
-}
-
-impl EmbeddingClient for AnyEmbeddingClient {
-    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
-        match self {
-            Self::Bedrock(c) => c.embed(texts).await,
-            Self::OpenAi(c) => c.embed(texts).await,
-            Self::Ollama(c) => c.embed(texts).await,
-            Self::Unavailable => Err(CoreError::Llm(
-                "embeddings are not available: current connector does not support embeddings"
-                    .to_string(),
-            )),
-        }
-    }
-
-    async fn model_identifier(&self) -> Result<String, CoreError> {
-        match self {
-            Self::Bedrock(c) => c.model_identifier().await,
-            Self::OpenAi(c) => c.model_identifier().await,
-            Self::Ollama(c) => c.model_identifier().await,
-            Self::Unavailable => Err(CoreError::Llm(
-                "embeddings are not available: current connector does not support embeddings"
-                    .to_string(),
-            )),
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -553,7 +516,7 @@ async fn main() -> Result<()> {
     // Kick off `/api/show` lookups for any Ollama connections so the per-
     // model context window is cached before the user fires the first
     // turn. Detached: the daemon must still start when Ollama is down.
-    connection_registry.spawn_ollama_warmups();
+    connection_registry.spawn_warmups();
     for status in connection_registry.status() {
         match &status.health {
             ConnectionHealth::Ok => {
@@ -649,24 +612,24 @@ async fn main() -> Result<()> {
         resolved_emb.is_default
     );
 
-    let embedding_client: AnyEmbeddingClient = if !resolved_emb.available {
+    let embedding_client: Option<Arc<dyn EmbeddingClient>> = if !resolved_emb.available {
         tracing::info!(
             "embeddings unavailable (connector={})",
             resolved_emb.connector
         );
-        AnyEmbeddingClient::Unavailable
+        None
     } else {
-        match resolved_emb.connector.as_str() {
+        Some(match resolved_emb.connector.as_str() {
             "ollama" => {
                 tracing::info!("using Ollama embedding backend");
-                AnyEmbeddingClient::Ollama(desktop_assistant_llm_ollama::OllamaClient::new(
+                Arc::new(desktop_assistant_llm_ollama::OllamaClient::new(
                     resolved_emb.base_url.clone(),
                     resolved_emb.model.clone(),
                 ))
             }
             "bedrock" | "aws-bedrock" => {
                 tracing::info!("using Bedrock embedding backend");
-                AnyEmbeddingClient::Bedrock(
+                Arc::new(
                     desktop_assistant_llm_bedrock::BedrockClient::new(String::new())
                         .with_model(resolved_emb.model.clone())
                         .with_base_url(resolved_emb.base_url.clone()),
@@ -679,25 +642,18 @@ async fn main() -> Result<()> {
                 // purpose's connection's secret/env; legacy path reuses the
                 // shared LLM key when connectors match, else falls back to
                 // `<CONNECTOR>_API_KEY`).
-                AnyEmbeddingClient::OpenAi(
+                Arc::new(
                     desktop_assistant_llm_openai::OpenAiClient::new(resolved_emb.api_key.clone())
                         .with_model(resolved_emb.model.clone())
                         .with_base_url(resolved_emb.base_url.clone()),
                 )
             }
-        }
+        })
     };
 
-    let embedding_client = Arc::new(embedding_client);
-
     // Resolve model identifier once at startup (includes digest for Ollama).
-    let embedding_model_id: String = if matches!(
-        embedding_client.as_ref(),
-        AnyEmbeddingClient::Unavailable
-    ) {
-        resolved_emb.model.clone()
-    } else {
-        match embedding_client.model_identifier().await {
+    let embedding_model_id: String = if let Some(client) = &embedding_client {
+        match client.model_identifier().await {
             Ok(id) => {
                 tracing::info!("resolved embedding model identifier: {id}");
                 id
@@ -709,18 +665,20 @@ async fn main() -> Result<()> {
                 resolved_emb.model.clone()
             }
         }
+    } else {
+        resolved_emb.model.clone()
     };
 
-    let embedding_fn: Option<EmbedFn> =
-        if matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable) {
-            None
-        } else {
-            let client = Arc::clone(&embedding_client);
-            Some(Arc::new(move |texts: Vec<String>| {
-                let client = Arc::clone(&client);
-                Box::pin(async move { client.embed(texts).await })
-            }))
-        };
+    let embedding_fn: Option<EmbedFn> = embedding_client.as_ref().map(|client| {
+        let client = Arc::clone(client);
+        Arc::new(move |texts: Vec<String>| {
+            let client = Arc::clone(&client);
+            Box::pin(async move { client.embed(texts).await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, CoreError>> + Send>,
+                >
+        }) as EmbedFn
+    });
 
     // --- Database (optional) ---
     let (db_url, db_max_conns) = config::resolve_database_config(daemon_config.as_ref());
@@ -786,7 +744,7 @@ async fn main() -> Result<()> {
     // Invalidate embeddings from a different model so that vector-dimension
     // mismatches cannot cause search errors while the backfill is running.
     if let Some(pool) = &pg_pool
-        && !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable)
+        && embedding_client.is_some()
     {
         match desktop_assistant_storage::embedding_backfill::invalidate_stale_embeddings(
             pool,
@@ -977,12 +935,9 @@ async fn main() -> Result<()> {
 
     // Spawn background embedding backfill task
     let (backfill_shutdown_tx, backfill_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let backfill_task = if let (Some(pool), true) = (
-        &pg_pool,
-        !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
-    ) {
+    let backfill_task = if let (Some(pool), Some(client)) = (&pg_pool, &embedding_client) {
         let pool = pool.clone();
-        let client = Arc::clone(&embedding_client);
+        let client = Arc::clone(client);
         let model = embedding_model_id.clone();
         Some(tokio::spawn(async move {
             // Let tool registration and MCP connections settle.
@@ -1043,10 +998,7 @@ async fn main() -> Result<()> {
 
     let (dreaming_shutdown_tx, dreaming_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let dreaming_task = if dreaming_enabled {
-        if let (Some(pool), true) = (
-            &pg_pool,
-            !matches!(embedding_client.as_ref(), AnyEmbeddingClient::Unavailable),
-        ) {
+        if let (Some(pool), Some(emb_client)) = (&pg_pool, &embedding_client) {
             // Prefer `[purposes.dreaming]` when configured; fall back to
             // the legacy `[backend_tasks.llm]` block otherwise so installs
             // that haven't migrated still work. Effort threading is
@@ -1083,7 +1035,7 @@ async fn main() -> Result<()> {
             let dreaming_llm = Arc::new(dreaming_llm);
 
             let pool = pool.clone();
-            let emb_client = Arc::clone(&embedding_client);
+            let emb_client = Arc::clone(emb_client);
             let emb_model = embedding_model_id.clone();
 
             Some(tokio::spawn(async move {

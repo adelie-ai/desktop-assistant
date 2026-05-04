@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-trait = "0.1"
+async-trait.workspace = true
 desktop-assistant-core.workspace = true
 desktop-assistant-api-model = { path = "../api-model" }
 thiserror.workspace = true

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
+use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
@@ -587,6 +588,7 @@ impl OllamaClient {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for OllamaClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -829,6 +831,25 @@ impl LlmClient for OllamaClient {
         }
 
         Ok(build_response(full_response, tool_calls, token_usage))
+    }
+
+    async fn warmup(&self) {
+        // Populate the GGUF context-length cache so subsequent
+        // `max_context_tokens()` returns a real value. Failures are
+        // best-effort — a missing cache just falls back to the daemon's
+        // universal default.
+        let _ = self.warm_context_length().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingClient for OllamaClient {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+        OllamaClient::embed(self, texts).await
+    }
+
+    async fn model_identifier(&self) -> Result<String, CoreError> {
+        OllamaClient::model_identifier(self).await
     }
 }
 

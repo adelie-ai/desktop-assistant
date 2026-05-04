@@ -179,6 +179,7 @@ impl<L> ProfilingLlmClient<L> {
     }
 }
 
+#[async_trait::async_trait]
 impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
     fn get_default_model(&self) -> Option<&str> {
         self.inner.get_default_model()
@@ -352,6 +353,7 @@ impl<L> MaybeProfiled<L> {
     }
 }
 
+#[async_trait::async_trait]
 impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
     fn get_default_model(&self) -> Option<&str> {
         match self {
@@ -446,6 +448,7 @@ mod tests {
 
     struct MockLlm;
 
+    #[async_trait::async_trait]
     impl LlmClient for MockLlm {
         async fn stream_completion(
             &self,

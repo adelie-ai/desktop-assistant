@@ -883,6 +883,7 @@ fn curated_openai_models() -> Vec<ModelInfo> {
     ]
 }
 
+#[async_trait::async_trait]
 impl LlmClient for OpenAiClient {
     fn get_default_model(&self) -> Option<&str> {
         Self::get_default_model()
@@ -998,6 +999,17 @@ impl LlmClient for OpenAiClient {
 
         self.send_and_stream(&request_json, &request, on_chunk)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl desktop_assistant_core::ports::embedding::EmbeddingClient for OpenAiClient {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+        OpenAiClient::embed(self, texts).await
+    }
+
+    async fn model_identifier(&self) -> Result<String, CoreError> {
+        OpenAiClient::model_identifier(self).await
     }
 }
 

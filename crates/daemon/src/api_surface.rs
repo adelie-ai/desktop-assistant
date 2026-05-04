@@ -130,7 +130,7 @@ impl RegistryHandle {
     pub(crate) fn client_for(
         &self,
         id: &ConnectionId,
-    ) -> Option<std::sync::Arc<crate::registry::AnyLlmClient>> {
+    ) -> Option<std::sync::Arc<dyn desktop_assistant_core::ports::llm::LlmClient>> {
         let state = self.state.read().expect("registry state poisoned");
         state.registry.get(id)
     }
@@ -302,13 +302,13 @@ impl ConnectionsService for DaemonConnectionsService {
     ) -> Result<Vec<CoreModelListing>, CoreError> {
         // Snapshot (id, connector_type, label, client) tuples before awaiting
         // anything. Holding the read lock across `.await` would leave the
-        // returned future `!Send`; cloning `Arc<AnyLlmClient>` releases the
+        // returned future `!Send`; cloning `Arc<dyn LlmClient>` releases the
         // lock up front and the awaits run unlocked.
         let targets: Vec<(
             ConnectionId,
             String,
             String,
-            std::sync::Arc<crate::registry::AnyLlmClient>,
+            std::sync::Arc<dyn desktop_assistant_core::ports::llm::LlmClient>,
         )> = {
             let state = self.registry.state.read().expect("registry state poisoned");
             if let Some(id_raw) = &connection_id {
@@ -770,7 +770,7 @@ where
             .or_else(|| self.interactive_selection());
 
         // Resolve the per-turn routing target:
-        //   - `active_client`: the `Arc<AnyLlmClient>` dispatch must use
+        //   - `active_client`: the `Arc<dyn LlmClient>` dispatch must use
         //     for this turn. Only installed for *user-driven* selections;
         //     for the interactive-purpose fallback we leave it `None` so
         //     `RoutingLlmClient` falls through to the primary llm (which
@@ -787,7 +787,9 @@ where
         //     per-connector effort mapping. Computed from
         //     `effective_selection` so the interactive purpose's `effort`
         //     applies even when we don't install an active_client.
-        let mut active_client: Option<std::sync::Arc<crate::registry::AnyLlmClient>> = None;
+        let mut active_client: Option<
+            std::sync::Arc<dyn desktop_assistant_core::ports::llm::LlmClient>,
+        > = None;
         let mut model_override: Option<String> = None;
         if let Some(sel) = user_driven_selection.as_ref() {
             let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {

@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+async-trait.workspace = true
 bytes = "1"
 desktop-assistant-core.workspace = true
 reqwest = { version = "0.13", features = ["stream", "json"] }
