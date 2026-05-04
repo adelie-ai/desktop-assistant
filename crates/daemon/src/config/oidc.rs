@@ -20,14 +20,26 @@
 //!   (RS256 only), defending against the JWKS-substitution-via-`alg=HS256`
 //!   class of attacks.
 
+use std::collections::HashMap;
+
 use anyhow::anyhow;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
 
 use super::OidcConfig;
 
 /// Cached JWKS key set for validating external OIDC tokens.
+///
+/// Keys with a `kid` are stored in [`Self::keys_by_kid`] for direct
+/// lookup; keys without a `kid` go into [`Self::kidless_keys`] and are
+/// the fallback iterate-and-try set. A presented token with a `kid`
+/// header is matched against `keys_by_kid` first; on miss (or for
+/// tokens whose header has no `kid`) we fall through to the kid-less
+/// list. The fallback exists because some IdPs serve unkeyed tokens
+/// during a key rotation, so a strict kid-only path would briefly
+/// reject otherwise valid tokens (#36).
 pub struct OidcValidator {
-    decoding_keys: Vec<DecodingKey>,
+    keys_by_kid: HashMap<String, DecodingKey>,
+    kidless_keys: Vec<DecodingKey>,
     validation: Validation,
 }
 
@@ -121,7 +133,8 @@ impl OidcValidator {
             .as_array()
             .ok_or_else(|| anyhow!("no keys in JWKS response"))?;
 
-        let mut decoding_keys = Vec::new();
+        let mut keys_by_kid: HashMap<String, DecodingKey> = HashMap::new();
+        let mut kidless_keys: Vec<DecodingKey> = Vec::new();
         for key in keys {
             if key["kty"].as_str() != Some("RSA") {
                 continue;
@@ -146,12 +159,18 @@ impl OidcValidator {
             if n.is_empty() || e.is_empty() {
                 continue;
             }
-            if let Ok(dk) = DecodingKey::from_rsa_components(n, e) {
-                decoding_keys.push(dk);
+            let Ok(dk) = DecodingKey::from_rsa_components(n, e) else {
+                continue;
+            };
+            match key["kid"].as_str().map(str::to_string) {
+                Some(kid) if !kid.is_empty() => {
+                    keys_by_kid.insert(kid, dk);
+                }
+                _ => kidless_keys.push(dk),
             }
         }
 
-        if decoding_keys.is_empty() {
+        if keys_by_kid.is_empty() && kidless_keys.is_empty() {
             anyhow::bail!("no usable RSA keys found in JWKS");
         }
 
@@ -163,13 +182,41 @@ impl OidcValidator {
         }
 
         Ok(Self {
-            decoding_keys,
+            keys_by_kid,
+            kidless_keys,
             validation,
         })
     }
 
     pub fn validate_token(&self, token: &str) -> bool {
-        for key in &self.decoding_keys {
+        // Resolution order:
+        //
+        // 1. Parse the JWT header. If it carries a `kid`, look that key
+        //    up directly in `keys_by_kid` and try only that one. A
+        //    direct hit short-circuits the rest of the verifier set,
+        //    so a JWKS with rotated-out keys can't slow validation
+        //    down to O(N) and a deliberately-mislabelled `kid` can't
+        //    reach a key it isn't authorised against.
+        // 2. If the header has no `kid`, OR the `kid` doesn't match
+        //    any cached key, fall through to the kid-less keys (the
+        //    legacy iterate-and-try set). Some IdPs serve unkeyed
+        //    tokens during a brief rotation window, so a strict
+        //    kid-only path would briefly reject otherwise-valid
+        //    tokens (#36).
+        // 3. If header parsing itself fails, the token is malformed —
+        //    skip step 1 and fall through to the same fallback set.
+        //    `jsonwebtoken::decode` will then reject the malformed
+        //    token consistently.
+        let header_kid = decode_header(token).ok().and_then(|h| h.kid);
+
+        if let Some(kid) = header_kid.as_deref()
+            && let Some(key) = self.keys_by_kid.get(kid)
+            && jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation).is_ok()
+        {
+            return true;
+        }
+
+        for key in &self.kidless_keys {
             if jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation).is_ok() {
                 return true;
             }
