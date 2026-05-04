@@ -129,16 +129,9 @@ impl OpenAiClient {
             .await
             .map_err(|e| CoreError::Llm(format!("embedding HTTP request failed: {e}")))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(CoreError::Llm(format!(
-                "OpenAI embeddings API error (HTTP {status}): {body}"
-            )));
-        }
+        let response =
+            desktop_assistant_llm_http::bail_for_status(response, "OpenAI embeddings API error")
+                .await?;
 
         let parsed: EmbeddingResponse = response
             .json()

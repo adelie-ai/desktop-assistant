@@ -114,16 +114,11 @@ impl OllamaClient {
             .await
             .map_err(|e| CoreError::Llm(format!("failed to check Ollama models: {e}")))?;
 
-        if !tags_response.status().is_success() {
-            let status = tags_response.status();
-            let body = tags_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(CoreError::Llm(format!(
-                "Ollama model list API error (HTTP {status}): {body}"
-            )));
-        }
+        let tags_response = desktop_assistant_llm_http::bail_for_status(
+            tags_response,
+            "Ollama model list API error",
+        )
+        .await?;
 
         let tags: OllamaTagsResponse = tags_response
             .json()
@@ -155,17 +150,11 @@ impl OllamaClient {
                 CoreError::Llm(format!("failed to pull Ollama model '{}': {e}", self.model))
             })?;
 
-        if !pull_response.status().is_success() {
-            let status = pull_response.status();
-            let body = pull_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(CoreError::Llm(format!(
-                "Ollama model pull API error for '{}' (HTTP {status}): {body}",
-                self.model
-            )));
-        }
+        let _ = desktop_assistant_llm_http::bail_for_status(
+            pull_response,
+            &format!("Ollama model pull API error for '{}'", self.model),
+        )
+        .await?;
 
         Ok(())
     }
@@ -184,16 +173,8 @@ impl OllamaClient {
             .await
             .map_err(|e| CoreError::Llm(format!("model tags HTTP request failed: {e}")))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(CoreError::Llm(format!(
-                "Ollama tags API error (HTTP {status}): {text}"
-            )));
-        }
+        let response =
+            desktop_assistant_llm_http::bail_for_status(response, "Ollama tags API error").await?;
 
         let tags: OllamaTagsResponse = response
             .json()
@@ -237,16 +218,9 @@ impl OllamaClient {
             .await
             .map_err(|e| CoreError::Llm(format!("embedding HTTP request failed: {e}")))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(CoreError::Llm(format!(
-                "Ollama embeddings API error (HTTP {status}): {body}"
-            )));
-        }
+        let response =
+            desktop_assistant_llm_http::bail_for_status(response, "Ollama embeddings API error")
+                .await?;
 
         let parsed: OllamaEmbedResponse = response
             .json()
@@ -465,16 +439,8 @@ impl OllamaClient {
             .await
             .map_err(|e| CoreError::Llm(format!("Ollama /api/tags request failed: {e}")))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(CoreError::Llm(format!(
-                "Ollama /api/tags error (HTTP {status}): {body}"
-            )));
-        }
+        let response =
+            desktop_assistant_llm_http::bail_for_status(response, "Ollama /api/tags error").await?;
 
         let tags: OllamaTagsResponse = response
             .json()

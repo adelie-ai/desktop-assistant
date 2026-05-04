@@ -1,0 +1,14 @@
+[package]
+name = "desktop-assistant-llm-http"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+desktop-assistant-core.workspace = true
+reqwest = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+httpmock = "0.8"
+reqwest = { version = "0.13" }

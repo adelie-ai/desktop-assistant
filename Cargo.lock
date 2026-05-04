@@ -1105,11 +1105,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-llm-http"
+version = "0.1.0"
+dependencies = [
+ "desktop-assistant-core",
+ "httpmock",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
 name = "desktop-assistant-llm-ollama"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "desktop-assistant-core",
+ "desktop-assistant-llm-http",
  "httpmock",
  "reqwest",
  "serde",
@@ -1126,6 +1137,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "desktop-assistant-core",
+ "desktop-assistant-llm-http",
  "httpmock",
  "reqwest",
  "serde",
