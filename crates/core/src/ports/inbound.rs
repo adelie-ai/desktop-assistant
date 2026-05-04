@@ -323,17 +323,31 @@ pub struct ModelListing {
     pub model: ModelInfo,
 }
 
-/// Purpose kind identifiers — mirrors
-/// `crates/daemon/src/purposes.rs::PurposeKind` via string keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Purpose kind identifiers. Canonical home for the enum that used to
+/// live in three places (this crate, `daemon::purposes`, and api-model
+/// as `PurposeKindApi`); see #43. The other crates re-export from here.
+///
+/// Wire format (`serde`) is `snake_case` so JSON / settings payloads
+/// produce `"interactive"`, `"dreaming"`, etc. The TOML config in the
+/// daemon does not derive serde on this type — it builds its own
+/// keyed map via [`Self::as_key`] / [`Self::from_key`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum PurposeKind {
+    /// The user-facing chat LLM. Cannot inherit (nothing to inherit from).
     Interactive,
+    /// Periodic fact extraction (the "dreaming" background task).
     Dreaming,
+    /// Vector embeddings for memory and retrieval.
     Embedding,
+    /// Short-title generation for conversations.
     Titling,
 }
 
 impl PurposeKind {
+    /// Canonical lowercase key used in TOML and error messages.
     pub fn as_key(self) -> &'static str {
         match self {
             Self::Interactive => "interactive",
@@ -341,6 +355,37 @@ impl PurposeKind {
             Self::Embedding => "embedding",
             Self::Titling => "titling",
         }
+    }
+
+    /// Parse a canonical key back into a [`PurposeKind`]. Inverse of
+    /// [`Self::as_key`]; used by adapters that round-trip key strings.
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "interactive" => Some(Self::Interactive),
+            "dreaming" => Some(Self::Dreaming),
+            "embedding" => Some(Self::Embedding),
+            "titling" => Some(Self::Titling),
+            _ => None,
+        }
+    }
+
+    /// Every purpose kind, in a stable order. Useful for iteration in
+    /// tests and serialization round-trips. Order matches the schema
+    /// migration order (interactive first because every other purpose
+    /// can inherit from it).
+    pub fn all() -> [Self; 4] {
+        [
+            Self::Interactive,
+            Self::Dreaming,
+            Self::Embedding,
+            Self::Titling,
+        ]
+    }
+}
+
+impl std::fmt::Display for PurposeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_key())
     }
 }
 

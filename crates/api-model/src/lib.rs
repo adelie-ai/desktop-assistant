@@ -535,34 +535,12 @@ pub struct ModelCapabilitiesView {
 
 // --- Purpose views (#10 + #11) --------------------------------------------
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum PurposeKindApi {
-    Interactive,
-    Dreaming,
-    Embedding,
-    Titling,
-}
-
-impl PurposeKindApi {
-    pub fn as_key(self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Dreaming => "dreaming",
-            Self::Embedding => "embedding",
-            Self::Titling => "titling",
-        }
-    }
-}
-
-/// Effort hint passed to connectors (mapped at dispatch time).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum EffortLevel {
-    Low,
-    Medium,
-    High,
-}
+// `PurposeKindApi` and `EffortLevel` are re-exports of the canonical
+// types in `desktop_assistant_core::ports::inbound` (#43). The aliases
+// are kept so existing callers keep compiling without churn; new code
+// can use either name.
+pub use desktop_assistant_core::ports::inbound::Effort as EffortLevel;
+pub use desktop_assistant_core::ports::inbound::PurposeKind as PurposeKindApi;
 
 /// Protocol-neutral purpose config. String `"primary"` in the connection or
 /// model field means "inherit from interactive" — the daemon resolves this

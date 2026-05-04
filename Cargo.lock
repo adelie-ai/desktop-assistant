@@ -963,6 +963,7 @@ dependencies = [
 name = "desktop-assistant-api-model"
 version = "0.1.0"
 dependencies = [
+ "desktop-assistant-core",
  "serde",
  "serde_json",
 ]

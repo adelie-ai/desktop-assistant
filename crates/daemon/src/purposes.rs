@@ -22,72 +22,12 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// `PurposeKind` is the canonical enum in `core::ports::inbound` (#43).
+// Re-exported here so the daemon can reach it through the same path it
+// always has (`crate::purposes::PurposeKind`).
+pub use desktop_assistant_core::ports::inbound::PurposeKind;
+
 use crate::connections::{ConnectionId, ConnectionIdError, ConnectionsMap};
-
-/// Which LLM purpose a [`PurposeConfig`] applies to.
-///
-/// Adding a new purpose is a breaking schema change, not an API one.
-/// When adding a variant, update:
-/// - [`PurposeKind::as_key`] / [`PurposeKind::from_key`]
-/// - [`PurposeKind::all`] (the iteration order)
-/// - the migration logic in `config::maybe_migrate_legacy_purposes`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum PurposeKind {
-    /// The user-facing chat LLM. Cannot inherit (nothing to inherit from).
-    Interactive,
-    /// Periodic fact extraction (the "dreaming" background task).
-    Dreaming,
-    /// Vector embeddings for memory and retrieval.
-    Embedding,
-    /// Short-title generation for conversations.
-    Titling,
-}
-
-impl PurposeKind {
-    /// Canonical lowercase key used in TOML and error messages.
-    pub fn as_key(self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Dreaming => "dreaming",
-            Self::Embedding => "embedding",
-            Self::Titling => "titling",
-        }
-    }
-
-    /// Parse a canonical key back into a [`PurposeKind`].
-    ///
-    /// Inverse of [`Self::as_key`]; kept as public API surface for
-    /// adapters that round-trip key strings (the WS protocol uses
-    /// `as_key` on the way out and would symmetrically use this on the
-    /// way in once we expose a free-form purpose endpoint).
-    #[allow(dead_code)]
-    pub fn from_key(key: &str) -> Option<Self> {
-        match key {
-            "interactive" => Some(Self::Interactive),
-            "dreaming" => Some(Self::Dreaming),
-            "embedding" => Some(Self::Embedding),
-            "titling" => Some(Self::Titling),
-            _ => None,
-        }
-    }
-
-    /// Every purpose kind, in a stable order. Useful for iteration in tests
-    /// and for serialization round-trips.
-    pub fn all() -> [Self; 4] {
-        [
-            Self::Interactive,
-            Self::Dreaming,
-            Self::Embedding,
-            Self::Titling,
-        ]
-    }
-}
-
-impl fmt::Display for PurposeKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_key())
-    }
-}
 
 /// A reference to a [`ConnectionId`] as it appears in a purpose config.
 ///
@@ -115,17 +55,12 @@ pub enum ModelRef {
 /// Reserved sentinel that represents the `primary` inherit token.
 const PRIMARY_SENTINEL: &str = "primary";
 
-/// Effort level hint for a purpose. Mapped to concrete per-connector
-/// parameters by `api_surface::map_effort_to_reasoning_config` at
-/// dispatch time (Anthropic `thinking.budget_tokens`, OpenAI
-/// `reasoning_effort`, Bedrock per-model knobs; Ollama ignores it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
-}
+// `Effort` is the canonical enum in `core::ports::inbound` (#43).
+// Re-exported so the daemon's purpose configs can keep referring to
+// `crate::purposes::Effort`. Maps to per-connector knobs at dispatch
+// time (Anthropic `thinking.budget_tokens`, OpenAI `reasoning_effort`,
+// Bedrock per-model; Ollama ignores).
+pub use desktop_assistant_core::ports::inbound::Effort;
 
 /// Raw config for a single purpose, as parsed from TOML.
 ///
