@@ -1,31 +1,26 @@
-//! WebSocket JWT signing — generates and validates the bearer tokens
-//! the WS adapter uses for local authentication.
+//! WebSocket JWT signing — delegates to the shared `auth-jwt` crate
+//! (extracted in #?). The daemon owns the issuer/audience/TTL policy and
+//! the key-file path; the codec and atomic file IO live in `auth-jwt` so
+//! the JWT minter can produce tokens this validator accepts.
 //!
-//! Extracted from `config.rs` (#41). The signing key is HS256 with a
-//! key persisted via the secret-store backends in
-//! [`super::secrets::read_common_file_secret`] / [`super::write_common_file_secret`].
-//! Issuer and audience are fixed local strings so a token from a
-//! different daemon instance can't pass validation.
+//! Public API (`current_username`, `generate_ws_jwt`, `validate_ws_jwt`)
+//! is preserved exactly. The `pub(super)` test API
+//! (`WsJwtClaims`, `encode_ws_jwt`, `decode_ws_jwt_claims`) is preserved
+//! so the forge-token tests in `super::tests` keep working without
+//! changes.
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use serde::{Deserialize, Serialize};
+use desktop_assistant_auth_jwt as auth_jwt;
 
-/// JWT claim payload. `pub(super)` so the JWT round-trip and forged-
-/// token tests in the parent test module can mutate fields and
-/// re-encode without going through a separate test-only API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct WsJwtClaims {
-    pub(super) iss: String,
-    pub(super) sub: String,
-    pub(super) aud: String,
-    pub(super) exp: u64,
-    pub(super) iat: u64,
-    pub(super) nbf: u64,
-    pub(super) jti: String,
-}
+/// Re-export of the shared claim type so the existing `pub(super)` test
+/// helpers keep their type names. The fields are public (the whole point
+/// of moving to the shared crate is letting the minter construct claims
+/// directly), but `pub(super) use` keeps the alias scoped to this module's
+/// supermodule, matching the pre-refactor visibility.
+pub(super) use auth_jwt::Claims as WsJwtClaims;
 
 fn ws_jwt_signing_key_account() -> &'static str {
     "ws_jwt_hs256_signing_key"
@@ -66,53 +61,24 @@ fn unix_timestamp_seconds() -> anyhow::Result<u64> {
         .map_err(|error| anyhow!("failed to read system clock: {error}"))
 }
 
-fn ensure_ws_jwt_signing_key() -> anyhow::Result<String> {
-    if let Some(existing) = super::secrets::read_common_file_secret(ws_jwt_signing_key_account()) {
-        return Ok(existing);
-    }
-
-    // 64 hex chars from two UUIDv4 values gives a sufficiently strong local HMAC secret.
-    let generated = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    super::secrets::write_common_file_secret(ws_jwt_signing_key_account(), &generated)?;
-    Ok(generated)
-}
-
-fn read_ws_jwt_signing_key() -> anyhow::Result<String> {
-    super::secrets::read_common_file_secret(ws_jwt_signing_key_account())
-        .ok_or_else(|| anyhow!("ws jwt signing key is not initialized"))
-}
-
-fn ws_jwt_validation() -> Validation {
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
-    validation.set_issuer(&[default_ws_jwt_issuer()]);
-    validation.set_audience(&[default_ws_jwt_audience()]);
-    validation
+fn signing_key_path() -> PathBuf {
+    super::default_secret_store_dir().join(ws_jwt_signing_key_account())
 }
 
 pub(super) fn encode_ws_jwt(claims: &WsJwtClaims) -> anyhow::Result<String> {
-    let signing_key = ensure_ws_jwt_signing_key()?;
-    jsonwebtoken::encode(
-        &Header::new(Algorithm::HS256),
-        claims,
-        &EncodingKey::from_secret(signing_key.as_bytes()),
-    )
-    .map_err(|error| anyhow!("failed to encode ws jwt: {error}"))
+    let signing_key = auth_jwt::ensure_signing_key_at(&signing_key_path())?;
+    auth_jwt::encode(claims, &signing_key)
 }
 
 pub(super) fn decode_ws_jwt_claims(token: &str) -> anyhow::Result<WsJwtClaims> {
-    let signing_key = read_ws_jwt_signing_key()?;
-    let decoded = jsonwebtoken::decode::<WsJwtClaims>(
+    let signing_key = auth_jwt::read_signing_key_at(&signing_key_path())
+        .ok_or_else(|| anyhow!("ws jwt signing key is not initialized"))?;
+    auth_jwt::decode(
         token,
-        &DecodingKey::from_secret(signing_key.as_bytes()),
-        &ws_jwt_validation(),
+        &signing_key,
+        default_ws_jwt_issuer(),
+        default_ws_jwt_audience(),
     )
-    .map_err(|error| anyhow!("failed to decode ws jwt: {error}"))?;
-    Ok(decoded.claims)
 }
 
 pub fn generate_ws_jwt(subject: Option<String>) -> anyhow::Result<String> {
