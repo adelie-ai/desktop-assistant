@@ -108,5 +108,21 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Tag registry (issue #108) — formal vocabulary for KB tags. Categorical
+    // tags emitted by the extractor are constrained to the registry; new
+    // tags are created via a tool call with description and examples.
+    sqlx::raw_sql(include_str!("../migrations/014_tag_registry.sql"))
+        .execute(pool)
+        .await?;
+
+    // Knowledge-base review columns (issue #108) — `reviewed_at` watermark
+    // gates per-memory consolidation; `review_generation` caps mutation
+    // re-review loops; `deleted_at` enables soft-delete with TTL.
+    sqlx::raw_sql(include_str!(
+        "../migrations/015_knowledge_base_review_columns.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
