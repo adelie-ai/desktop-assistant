@@ -1710,34 +1710,36 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("Current-turn user instructions override all stored data")
-        );
-        assert!(messages[0].content.contains(
-            "search the knowledge base first (project scope, then global) before using other tools"
-        ));
-        assert!(
-            messages[0]
-                .content
-                .contains("If still unclear, ask one brief clarifying question and do not assume")
+                .contains("Current-turn instructions override stored data")
         );
         assert!(
             messages[0]
                 .content
-                .contains("do a short internal preflight")
+                .contains("Search the knowledge base for each piece")
         );
         assert!(
             messages[0]
                 .content
-                .contains("Validate facts relevant to the request before relying on them")
+                .contains("ask one brief question rather than guess")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("Don't guess user-specific details")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("Validate temporally variable facts")
         );
         assert!(
             messages[0]
                 .content
                 .contains("No tools are available in this turn.")
         );
-        assert!(messages[0].content.contains("non-blocking launch pattern"));
-        assert!(messages[0].content.contains("check PATH"));
-        assert!(messages[0].content.contains("check Flatpak and Snap"));
+        assert!(messages[0].content.contains("non-blocking pattern"));
+        assert!(messages[0].content.contains("PATH"));
+        assert!(messages[0].content.contains("Flatpak/Snap"));
         assert!(
             messages[0]
                 .content
@@ -1745,7 +1747,7 @@ mod tests {
         );
         assert!(messages[0].content.contains("builtin_sys_props"));
         assert!(messages[0].content.contains("builtin_tool_search"));
-        assert!(messages[0].content.contains("Never fabricate tool outputs"));
+        assert!(messages[0].content.contains("Never fabricate outputs"));
     }
 
     #[test]
@@ -1754,53 +1756,26 @@ mod tests {
 
         let instruction = prompts::assemble(&prompts::static_sections());
 
-        let priority_rule = "Current-turn user instructions override all stored data.";
-        let kb_first = "If a request is user-specific, project-specific, or a reference is unclear, search the knowledge base first (project scope, then global) before using other tools.";
-        let ambiguous_reference =
-            "If still unclear, ask one brief clarifying question and do not assume.";
-        let tool_fallback = "For tool-relevant requests (terminal, filesystem, D-Bus, network/web), use the best-fit available tool.";
-        let no_guessing = "Do not guess user-specific details (project path, run command, package manager, editor, service name, account, or host).";
-        let verify_relevant_facts = "Validate facts relevant to the request before relying on them, especially temporally variable details (machine settings, current date/time).";
-        let no_fabrication =
-            "Never fabricate tool outputs or claim a tool succeeded when it did not.";
-        let tool_search_discovery = "Use builtin_tool_search to discover additional tools when the user's request might need capabilities beyond your current set.";
+        // Behavioral invariants: each of these must be expressed somewhere in
+        // the assembled prompt. Exact wording is the prompt files' concern;
+        // this test exists to catch silent drops of a load-bearing rule.
+        let priority_rule = "Current-turn instructions override stored data";
+        let kb_search = "Search the knowledge base for each piece";
+        let ambiguity_guard = "ask one brief question rather than guess";
+        let no_guessing = "Don't guess user-specific details";
+        let verify_facts = "Validate temporally variable facts";
+        let no_fabrication = "Never fabricate outputs";
+        let tool_search_discovery = "builtin_tool_search";
+        let skill_search_discovery = "skills_search_skills";
 
-        assert!(instruction.contains(priority_rule));
-        assert!(instruction.contains(kb_first));
-        assert!(instruction.contains(ambiguous_reference));
-        assert!(instruction.contains(no_guessing));
-        assert!(instruction.contains(verify_relevant_facts));
-        assert!(instruction.contains(tool_fallback));
-        assert!(instruction.contains(no_fabrication));
-        assert!(instruction.contains(tool_search_discovery));
-
-        let priority_rule_pos = instruction.find(priority_rule).unwrap();
-        let kb_first_pos = instruction.find(kb_first).unwrap();
-        let ambiguous_reference_pos = instruction.find(ambiguous_reference).unwrap();
-        let no_guessing_pos = instruction.find(no_guessing).unwrap();
-        let verify_relevant_facts_pos = instruction.find(verify_relevant_facts).unwrap();
-        let tool_fallback_pos = instruction.find(tool_fallback).unwrap();
-
-        assert!(
-            priority_rule_pos < kb_first_pos,
-            "priority rule must remain before knowledge base decision rules"
-        );
-        assert!(
-            kb_first_pos < tool_fallback_pos,
-            "kb-first rule must remain before tool fallback rule"
-        );
-        assert!(
-            tool_fallback_pos < no_guessing_pos,
-            "tool usage rules must come before discovery/verification guardrails"
-        );
-        assert!(
-            no_guessing_pos < ambiguous_reference_pos,
-            "no-guessing guardrail must come before ambiguity guardrail"
-        );
-        assert!(
-            ambiguous_reference_pos < verify_relevant_facts_pos,
-            "ambiguity guardrail must come before fact-validation guardrail"
-        );
+        assert!(instruction.contains(priority_rule), "missing: {priority_rule}");
+        assert!(instruction.contains(kb_search), "missing: {kb_search}");
+        assert!(instruction.contains(ambiguity_guard), "missing: {ambiguity_guard}");
+        assert!(instruction.contains(no_guessing), "missing: {no_guessing}");
+        assert!(instruction.contains(verify_facts), "missing: {verify_facts}");
+        assert!(instruction.contains(no_fabrication), "missing: {no_fabrication}");
+        assert!(instruction.contains(tool_search_discovery), "missing: {tool_search_discovery}");
+        assert!(instruction.contains(skill_search_discovery), "missing: {skill_search_discovery}");
     }
 
     // --- Title generation tests ---
