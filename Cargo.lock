@@ -643,6 +643,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "gloo-timers",
+ "tokio",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1005,6 +1016,7 @@ name = "desktop-assistant-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "backon",
  "chrono",
  "serde",
  "serde_json",
@@ -1076,15 +1088,14 @@ name = "desktop-assistant-llm-anthropic"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "desktop-assistant-core",
+ "eventsource-stream",
  "httpmock",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
- "tokio-util",
  "tracing",
 ]
 
@@ -1136,16 +1147,15 @@ name = "desktop-assistant-llm-openai"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "desktop-assistant-core",
  "desktop-assistant-llm-http",
+ "eventsource-stream",
  "httpmock",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
- "tokio-util",
  "tracing",
 ]
 
@@ -1392,6 +1402,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventsource-stream"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
+dependencies = [
+ "futures-core",
+ "nom",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1624,6 +1645,18 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]

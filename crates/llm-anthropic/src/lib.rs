@@ -6,9 +6,9 @@ use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
 };
+use eventsource_stream::Eventsource;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 
 /// Return the prompt-token context window for a known Anthropic model id.
@@ -490,12 +490,7 @@ impl AnthropicClient {
             )));
         }
 
-        let byte_stream = response.bytes_stream();
-        let mapped_stream = byte_stream.map(|result: Result<bytes::Bytes, reqwest::Error>| {
-            result.map_err(std::io::Error::other)
-        });
-        let stream_reader = tokio_util::io::StreamReader::new(mapped_stream);
-        let mut lines = tokio::io::BufReader::new(stream_reader).lines();
+        let mut events = response.bytes_stream().eventsource();
 
         let mut full_response = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
@@ -504,72 +499,64 @@ impl AnthropicClient {
         let mut block_to_tool: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
 
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?
-        {
-            let line = line.trim().to_string();
-            if line.is_empty() || line.starts_with(':') {
-                continue;
+        while let Some(event) = events.next().await {
+            let event = event.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
+            let data = event.data.as_str();
+            if data == "[DONE]" {
+                break;
             }
 
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    break;
-                }
-
-                match serde_json::from_str::<SseEvent>(data) {
-                    Ok(event) => match event.event_type.as_str() {
-                        "content_block_start" => {
-                            if let (Some(index), Some(block)) = (event.index, &event.content_block)
-                            {
-                                match block {
-                                    SseContentBlock::ToolUse { id, name } => {
-                                        let tool_idx = tool_block_count;
-                                        tool_block_count += 1;
-                                        block_to_tool.insert(index, tool_idx);
-                                        tool_acc.start(tool_idx, id.clone(), name.clone());
-                                    }
-                                    SseContentBlock::Text { .. } => {}
+            // Anthropic carries the event type inside the JSON payload; the SSE-level
+            // `event:` field is ignored here.
+            match serde_json::from_str::<SseEvent>(data) {
+                Ok(event) => match event.event_type.as_str() {
+                    "content_block_start" => {
+                        if let (Some(index), Some(block)) = (event.index, &event.content_block) {
+                            match block {
+                                SseContentBlock::ToolUse { id, name } => {
+                                    let tool_idx = tool_block_count;
+                                    tool_block_count += 1;
+                                    block_to_tool.insert(index, tool_idx);
+                                    tool_acc.start(tool_idx, id.clone(), name.clone());
                                 }
+                                SseContentBlock::Text { .. } => {}
                             }
                         }
-                        "content_block_delta" => {
-                            if let Some(delta) = &event.delta {
-                                match delta {
-                                    SseDelta::TextDelta { text } => {
-                                        full_response.push_str(text);
-                                        if !on_chunk(text.clone()) {
-                                            tracing::debug!("streaming aborted by callback");
-                                            return Ok(LlmResponse::text(full_response));
-                                        }
-                                    }
-                                    SseDelta::InputJsonDelta { partial_json } => {
-                                        if let Some(index) = event.index
-                                            && let Some(&tool_idx) = block_to_tool.get(&index)
-                                        {
-                                            tool_acc.append(tool_idx, partial_json);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        "message_stop" => {
-                            break;
-                        }
-                        "message_start" | "message_delta" => {
-                            if let Some(u) = &event.usage {
-                                accumulate_usage(&mut accumulated_usage, u);
-                            }
-                        }
-                        _ => {
-                            // content_block_stop, ping — ignore
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!("failed to parse SSE event: {e}, data: {data}");
                     }
+                    "content_block_delta" => {
+                        if let Some(delta) = &event.delta {
+                            match delta {
+                                SseDelta::TextDelta { text } => {
+                                    full_response.push_str(text);
+                                    if !on_chunk(text.clone()) {
+                                        tracing::debug!("streaming aborted by callback");
+                                        return Ok(LlmResponse::text(full_response));
+                                    }
+                                }
+                                SseDelta::InputJsonDelta { partial_json } => {
+                                    if let Some(index) = event.index
+                                        && let Some(&tool_idx) = block_to_tool.get(&index)
+                                    {
+                                        tool_acc.append(tool_idx, partial_json);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "message_stop" => {
+                        break;
+                    }
+                    "message_start" | "message_delta" => {
+                        if let Some(u) = &event.usage {
+                            accumulate_usage(&mut accumulated_usage, u);
+                        }
+                    }
+                    _ => {
+                        // content_block_stop, ping — ignore
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("failed to parse SSE event: {e}, data: {data}");
                 }
             }
         }

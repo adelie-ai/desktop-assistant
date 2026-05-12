@@ -1,4 +1,7 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use backon::{ExponentialBuilder, Retryable};
 
 use crate::CoreError;
 use crate::domain::{Message, ToolCall, ToolDefinition, ToolNamespace};
@@ -605,7 +608,7 @@ impl<K: Ord + Copy> ToolCallAccumulator<K> {
 }
 
 /// Decorator that wraps any `LlmClient` and retries on transient rate-limit errors
-/// with exponential backoff.
+/// with exponential backoff (1s, 2s, 4s, ...) provided by the `backon` crate.
 pub struct RetryingLlmClient<L> {
     inner: L,
     max_retries: u32,
@@ -615,6 +618,31 @@ impl<L> RetryingLlmClient<L> {
     pub fn new(inner: L, max_retries: u32) -> Self {
         Self { inner, max_retries }
     }
+
+    fn backoff(&self) -> ExponentialBuilder {
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_secs(1))
+            .with_factor(2.0)
+            .with_max_times(self.max_retries as usize)
+    }
+}
+
+/// Build a fresh per-attempt callback that forwards into the shared real callback.
+/// The real callback is consumed only once across all retries.
+fn proxy_callback(shared: &Arc<Mutex<Option<ChunkCallback>>>) -> ChunkCallback {
+    let cb_ref = Arc::clone(shared);
+    Box::new(move |chunk: String| -> bool {
+        let mut guard = cb_ref.lock().unwrap();
+        if let Some(ref mut cb) = *guard {
+            cb(chunk)
+        } else {
+            false
+        }
+    })
+}
+
+fn log_retry(err: &CoreError, dur: Duration) {
+    tracing::warn!("retryable LLM error, retrying in {:?}: {err}", dur);
 }
 
 #[async_trait::async_trait]
@@ -650,42 +678,22 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        // Store the real callback behind Arc<Mutex<Option<...>>> so we can
-        // create proxy callbacks for each retry attempt.
         let shared_cb: Arc<Mutex<Option<ChunkCallback>>> = Arc::new(Mutex::new(Some(on_chunk)));
 
-        for attempt in 0..=self.max_retries {
-            let cb_ref = Arc::clone(&shared_cb);
-            let proxy_cb: ChunkCallback = Box::new(move |chunk: String| -> bool {
-                let mut guard = cb_ref.lock().unwrap();
-                if let Some(ref mut cb) = *guard {
-                    cb(chunk)
-                } else {
-                    false
-                }
-            });
-
-            let msgs = messages.clone();
-            match self
-                .inner
-                .stream_completion(msgs, tools, reasoning, proxy_cb)
+        (|| async {
+            self.inner
+                .stream_completion(
+                    messages.clone(),
+                    tools,
+                    reasoning,
+                    proxy_callback(&shared_cb),
+                )
                 .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) if attempt < self.max_retries && is_retryable_error(&e) => {
-                    let delay_secs = 1u64 << attempt;
-                    tracing::warn!(
-                        "retryable LLM error, retrying in {delay_secs}s (attempt {}/{}): {e}",
-                        attempt + 1,
-                        self.max_retries
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        unreachable!("loop always returns")
+        })
+        .retry(self.backoff())
+        .when(is_retryable_error)
+        .notify(log_retry)
+        .await
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
@@ -702,40 +710,21 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
     ) -> Result<LlmResponse, CoreError> {
         let shared_cb: Arc<Mutex<Option<ChunkCallback>>> = Arc::new(Mutex::new(Some(on_chunk)));
 
-        for attempt in 0..=self.max_retries {
-            let cb_ref = Arc::clone(&shared_cb);
-            let proxy_cb: ChunkCallback = Box::new(move |chunk: String| -> bool {
-                let mut guard = cb_ref.lock().unwrap();
-                if let Some(ref mut cb) = *guard {
-                    cb(chunk)
-                } else {
-                    false
-                }
-            });
-
-            let msgs = messages.clone();
-            match self
-                .inner
+        (|| async {
+            self.inner
                 .stream_completion_with_namespaces(
-                    msgs, core_tools, namespaces, reasoning, proxy_cb,
+                    messages.clone(),
+                    core_tools,
+                    namespaces,
+                    reasoning,
+                    proxy_callback(&shared_cb),
                 )
                 .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) if attempt < self.max_retries && is_retryable_error(&e) => {
-                    let delay_secs = 1u64 << attempt;
-                    tracing::warn!(
-                        "retryable LLM error, retrying in {delay_secs}s (attempt {}/{}): {e}",
-                        attempt + 1,
-                        self.max_retries
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        unreachable!("loop always returns")
+        })
+        .retry(self.backoff())
+        .when(is_retryable_error)
+        .notify(log_retry)
+        .await
     }
 }
 

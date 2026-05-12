@@ -6,9 +6,9 @@ use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
 };
+use eventsource_stream::Eventsource;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 
 /// Return the prompt-token context window for a known OpenAI model id.
@@ -528,110 +528,87 @@ impl OpenAiClient {
             )));
         }
 
-        let byte_stream = response.bytes_stream();
-        let mapped_stream = byte_stream.map(|result: Result<bytes::Bytes, reqwest::Error>| {
-            result.map_err(std::io::Error::other)
-        });
-        let stream_reader = tokio_util::io::StreamReader::new(mapped_stream);
-        let mut lines = tokio::io::BufReader::new(stream_reader).lines();
+        let mut events = response.bytes_stream().eventsource();
 
         let mut full_response = String::new();
         let mut tool_acc = ResponseToolAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
-        let mut current_event: Option<String> = None;
 
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?
-        {
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-
-            // SSE: `event: <type>` sets the current event type
-            if let Some(event_type) = line.strip_prefix("event: ") {
-                current_event = Some(event_type.to_string());
-                continue;
-            }
-
-            // SSE: `data: <json>` dispatches on current event type
-            if let Some(data) = line.strip_prefix("data: ") {
-                let event = current_event.take();
-                match event.as_deref() {
-                    Some("response.output_text.delta") => {
-                        if let Ok(td) = serde_json::from_str::<TextDelta>(data) {
-                            full_response.push_str(&td.delta);
-                            if !on_chunk(td.delta) {
-                                tracing::debug!("streaming aborted by callback");
-                                break;
-                            }
+        while let Some(event) = events.next().await {
+            let event = event.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
+            let data = event.data.as_str();
+            match event.event.as_str() {
+                "response.output_text.delta" => {
+                    if let Ok(td) = serde_json::from_str::<TextDelta>(data) {
+                        full_response.push_str(&td.delta);
+                        if !on_chunk(td.delta) {
+                            tracing::debug!("streaming aborted by callback");
+                            break;
                         }
                     }
-                    Some("response.output_item.added") => {
-                        if let Ok(added) = serde_json::from_str::<OutputItemAdded>(data) {
-                            if added.item.r#type == "function_call" {
-                                tool_acc.start(
-                                    added.output_index,
-                                    added.item.call_id.unwrap_or_default(),
-                                    added.item.name.unwrap_or_default(),
-                                );
-                            }
+                }
+                "response.output_item.added" => {
+                    if let Ok(added) = serde_json::from_str::<OutputItemAdded>(data) {
+                        if added.item.r#type == "function_call" {
+                            tool_acc.start(
+                                added.output_index,
+                                added.item.call_id.unwrap_or_default(),
+                                added.item.name.unwrap_or_default(),
+                            );
                         }
                     }
-                    Some("response.function_call_arguments.delta") => {
-                        if let Ok(d) = serde_json::from_str::<FunctionArgsDelta>(data) {
-                            tool_acc.append(d.output_index, &d.delta);
+                }
+                "response.function_call_arguments.delta" => {
+                    if let Ok(d) = serde_json::from_str::<FunctionArgsDelta>(data) {
+                        tool_acc.append(d.output_index, &d.delta);
+                    }
+                }
+                "response.function_call_arguments.done" => {
+                    if let Ok(d) = serde_json::from_str::<FunctionArgsDone>(data) {
+                        tool_acc.finalize(d.output_index, &d.arguments);
+                    }
+                }
+                "response.tool_search_call.searching" => {
+                    tracing::info!("tool search initiated");
+                }
+                "response.tool_search_call.in_progress" => {
+                    // Tool search still running — nothing to do.
+                }
+                "response.tool_search_call.completed" => {
+                    tracing::info!(data, "tool search completed");
+                }
+                "response.failed" => {
+                    tracing::warn!("OpenAI response failed: {data}");
+                    // Extract a concise error message if possible.
+                    let msg = serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("response")
+                                .and_then(|r| r.get("error"))
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .map(String::from)
+                        })
+                        .unwrap_or_else(|| "response.failed".into());
+                    return Err(CoreError::Llm(format!("OpenAI server_error: {msg}")));
+                }
+                "error" => {
+                    tracing::warn!("OpenAI stream error: {data}");
+                }
+                "response.completed" => {
+                    if let Ok(rc) = serde_json::from_str::<ResponseCompleted>(data) {
+                        if let Some(u) = rc.response.usage {
+                            token_usage = Some(TokenUsage {
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                                ..Default::default()
+                            });
                         }
                     }
-                    Some("response.function_call_arguments.done") => {
-                        if let Ok(d) = serde_json::from_str::<FunctionArgsDone>(data) {
-                            tool_acc.finalize(d.output_index, &d.arguments);
-                        }
-                    }
-                    Some("response.tool_search_call.searching") => {
-                        tracing::info!("tool search initiated");
-                    }
-                    Some("response.tool_search_call.in_progress") => {
-                        // Tool search still running — nothing to do.
-                    }
-                    Some("response.tool_search_call.completed") => {
-                        tracing::info!(data, "tool search completed");
-                    }
-                    Some("response.failed") => {
-                        tracing::warn!("OpenAI response failed: {data}");
-                        // Extract a concise error message if possible.
-                        let msg = serde_json::from_str::<serde_json::Value>(data)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("response")
-                                    .and_then(|r| r.get("error"))
-                                    .and_then(|e| e.get("message"))
-                                    .and_then(|m| m.as_str())
-                                    .map(String::from)
-                            })
-                            .unwrap_or_else(|| "response.failed".into());
-                        return Err(CoreError::Llm(format!("OpenAI server_error: {msg}")));
-                    }
-                    Some("error") => {
-                        tracing::warn!("OpenAI stream error: {data}");
-                    }
-                    Some("response.completed") => {
-                        if let Ok(rc) = serde_json::from_str::<ResponseCompleted>(data) {
-                            if let Some(u) = rc.response.usage {
-                                token_usage = Some(TokenUsage {
-                                    input_tokens: u.input_tokens,
-                                    output_tokens: u.output_tokens,
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                        break;
-                    }
-                    other => {
-                        tracing::debug!("ignoring SSE event: {:?}", other);
-                    }
+                    break;
+                }
+                other => {
+                    tracing::debug!("ignoring SSE event: {:?}", other);
                 }
             }
         }
