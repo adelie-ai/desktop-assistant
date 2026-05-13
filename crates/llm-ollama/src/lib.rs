@@ -203,10 +203,14 @@ impl OllamaClient {
         self.ensure_model_available().await?;
 
         let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
+        // Set num_ctx explicitly so Ollama honors `truncate: true` as a last-resort
+        // safety net. Without it, oversized inputs get rejected with HTTP 400 even
+        // though truncate is requested.
         let body = serde_json::json!({
             "model": self.model,
             "input": texts,
             "truncate": true,
+            "options": { "num_ctx": 512 },
         });
 
         let response = self

@@ -4,8 +4,11 @@
 //! context window.  Each chunk is embedded independently; all chunk vectors are
 //! stored together so that search can compare against every chunk.
 
-/// Target maximum characters per chunk (~1500 chars ≈ ~375 tokens for English text).
-pub const CHUNK_MAX_CHARS: usize = 1500;
+/// Target maximum characters per chunk (~800 chars ≈ ~200 tokens for English text,
+/// ~600-700 tokens for dense content like ASCII tables/diagrams). Sized to stay
+/// under the 512-token context of `mxbai-embed-large` even when tokenization is
+/// near 1:1 with chars.
+pub const CHUNK_MAX_CHARS: usize = 800;
 
 /// Overlap between adjacent chunks to preserve context across boundaries.
 pub const CHUNK_OVERLAP: usize = 200;
