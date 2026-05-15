@@ -1085,18 +1085,23 @@ async fn main() -> Result<()> {
 
                 loop {
                     tracing::info!("dreaming: starting scan cycle");
-                    match desktop_assistant_storage::dreaming::run_dreaming_scan(
+                    let cycle_start = std::time::Instant::now();
+                    let result = desktop_assistant_storage::dreaming::run_dreaming_scan(
                         &pool,
                         &llm_fn,
                         &embed_fn,
                         &emb_model,
                         archive_after_days,
                     )
-                    .await
-                    {
-                        Ok(n) if n > 0 => tracing::info!("dreaming: wrote {n} new fact(s)"),
-                        Ok(_) => tracing::debug!("dreaming: no new facts extracted"),
-                        Err(e) => tracing::warn!("dreaming: scan failed: {e}"),
+                    .await;
+                    let elapsed = cycle_start.elapsed();
+                    match result {
+                        Ok(n) => tracing::info!(
+                            "dreaming: scan cycle finished in {elapsed:.2?}, wrote {n} new fact(s)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            "dreaming: scan cycle failed after {elapsed:.2?}: {e}"
+                        ),
                     }
 
                     tokio::select! {

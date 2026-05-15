@@ -36,9 +36,11 @@ pub async fn run_dreaming_scan(
     embedding_model: &str,
     archive_after_days: u32,
 ) -> Result<usize, String> {
+    tracing::info!("dreaming: phase 1/3 extraction");
     let new_facts =
         extraction::run_extraction_phase(pool, llm_fn, embed_fn, embedding_model).await?;
 
+    tracing::info!("dreaming: phase 2/3 consolidation");
     match consolidation::run_consolidation_phase(pool, llm_fn, embed_fn, embedding_model)
         .await
     {
@@ -68,6 +70,7 @@ pub async fn run_dreaming_scan(
     }
 
     if archive_after_days > 0 {
+        tracing::info!("dreaming: phase 3/3 archival");
         match archival::run_archival_phase(pool, archive_after_days).await {
             Ok(n) if n > 0 => tracing::info!(
                 "dreaming: archived {n} conversation(s) older than {archive_after_days} day(s)"
