@@ -29,7 +29,8 @@ chrono.workspace = true
 async-trait.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
 keyring = "3"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken.workspace = true
+desktop-assistant-auth-jwt.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
 libc = "0.2"
 subtle = "2"
