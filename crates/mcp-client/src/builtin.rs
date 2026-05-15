@@ -223,6 +223,11 @@ impl BuiltinToolService {
                  default to the scratch schema via search_path; the main data in the \
                  `public` schema is always readable. To modify public tables directly, \
                  use fully-qualified names (e.g. `UPDATE public.knowledge_base ...`).\n\n\
+                 You may also `CREATE SCHEMA` your own named schemas for durable \
+                 tracking, and define tables, views, functions, and procedures in \
+                 them; helper scripts that load or maintain data are fine too — see \
+                 the database design section of your system prompt for conventions \
+                 (naming, COMMENT ON, what not to touch in public).\n\n\
                  SELECT/WITH/TABLE/VALUES/EXPLAIN run in a read-only transaction. \
                  Other statements (CREATE, INSERT, UPDATE, DELETE, etc.) run in a \
                  normal transaction and are committed.",
