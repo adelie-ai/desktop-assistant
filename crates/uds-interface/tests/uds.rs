@@ -12,7 +12,7 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink};
 use desktop_assistant_auth_jwt as jwt;
 use desktop_assistant_uds::{
-    JwtUdsAuth, UdsAuthValidator, UdsServer, UdsServerConfig, read_frame, write_frame,
+    UdsAuthValidator, UdsServer, UdsServerConfig, read_frame, write_frame,
 };
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
@@ -109,7 +109,11 @@ fn start_server(
 async fn wait_for_socket(path: &std::path::Path) {
     for _ in 0..100 {
         if path.exists() {
-            return;
+            // The path might be a stale regular file the listener
+            // hasn't yet replaced. Confirm we can actually connect.
+            if UnixStream::connect(path).await.is_ok() {
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -450,7 +454,7 @@ async fn same_assistant_api_handler_services_both_transports() {
     let inbound = stream::iter(vec![Ok::<_, anyhow::Error>(req)]);
     let (out_tx, mut out_rx) = mpsc::channel::<api::WsFrame>(8);
     let dispatcher_handler = Arc::clone(&handler);
-    let _ = tokio::spawn(dispatch_loop(
+    let dispatcher_join = tokio::spawn(dispatch_loop(
         dispatcher_handler,
         AuthContext::anonymous(),
         inbound,
@@ -473,4 +477,5 @@ async fn same_assistant_api_handler_services_both_transports() {
 
     let _ = shutdown_tx.send(());
     let _ = timeout(Duration::from_secs(2), join).await;
+    dispatcher_join.abort();
 }

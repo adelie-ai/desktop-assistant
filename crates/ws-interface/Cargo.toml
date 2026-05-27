@@ -13,10 +13,12 @@ serde_json.workspace = true
 # API + handlers
 desktop-assistant-api-model = { path = "../api-model" }
 desktop-assistant-application = { path = "../application" }
+desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
 
 # Async + WS
 futures = "0.3"
 tokio.workspace = true
+tokio-util = "0.7"
 axum = { version = "0.8", features = ["ws"] }
 
 uuid = { version = "1", features = ["v4"] }
