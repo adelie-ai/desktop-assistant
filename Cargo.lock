@@ -1139,7 +1139,9 @@ dependencies = [
 name = "desktop-assistant-application"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "chrono",
  "desktop-assistant-api-model",
  "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
@@ -1148,6 +1150,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
