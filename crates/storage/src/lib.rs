@@ -9,6 +9,7 @@ pub mod migrate_json;
 pub mod pool;
 pub mod tag_registry;
 pub mod tool_registry;
+pub mod turn_state;
 
 /// Re-export the request-scoped user-id task-local API so storage call
 /// sites can resolve `current_user_id()` without depending directly on
@@ -27,3 +28,4 @@ pub use migrate_json::{
 };
 pub use pool::{create_pool, run_migrations};
 pub use tool_registry::PgToolRegistryStore;
+pub use turn_state::PgTurnStateStore;

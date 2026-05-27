@@ -133,5 +133,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Turn state machine (issue #107) — DB-persisted turn state for
+    // client-side execution of client-local MCP tools. A `pending_client_tool`
+    // row is the daemon's record of "the LLM asked for a client-local
+    // tool; we're waiting for the client to post the result back".
+    sqlx::raw_sql(include_str!("../migrations/017_turn_state.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }

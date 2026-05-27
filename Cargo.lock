@@ -1395,6 +1395,7 @@ dependencies = [
 name = "desktop-assistant-storage"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "desktop-assistant-auth-jwt",
  "desktop-assistant-core",

@@ -234,6 +234,47 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tools: Option<Vec<String>>,
     },
+
+    // --- Client-side tool execution (issue #107) ---------------------------
+    //
+    // Phase-2 architecture (rule #8) executes client-local MCPs on the
+    // user's machine rather than on the daemon. The client advertises
+    // which tools it can run at session start; when the LLM picks one
+    // the daemon suspends the turn, emits `Event::ClientToolCall`, and
+    // resumes when `Command::ClientToolResult` arrives.
+    /// Advertise the set of client-local MCP tools this connection is
+    /// able to execute. The daemon replaces any previously-registered
+    /// set on each call — clients should send the full list, not
+    /// deltas. Per-session: re-register on every connect.
+    RegisterClientTools {
+        tools: Vec<ClientToolRegistration>,
+    },
+    /// Deliver the result of a `ClientToolCall` back to the daemon so a
+    /// suspended turn can resume. Exactly one of `result` / `error`
+    /// should be populated; both `None` is treated as an error by the
+    /// daemon-side validator.
+    ClientToolResult {
+        task_id: TaskId,
+        tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+/// Single entry in a `RegisterClientTools` request. Mirrors the shape of
+/// `ToolDefinition` but kept here in `api-model` so adapters don't need
+/// to depend on `desktop-assistant-core`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientToolRegistration {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema for the tool's input. Daemon forwards verbatim to
+    /// the LLM's tool list.
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
 }
 
 fn default_true() -> bool {
@@ -289,6 +330,11 @@ pub enum CommandResult {
     /// correlate the streamed `Task*` events back to the request. Introduced
     /// alongside the background-task registry so we don't overload `Ack`.
     SendMessageAck { task_id: String },
+
+    /// Response to `RegisterClientTools`, carrying the count of tools
+    /// accepted by the daemon. Clients use this to verify registration
+    /// landed before relying on client-side execution.
+    ClientToolsRegistered { count: u32 },
 
     Ack,
 }
@@ -377,6 +423,21 @@ pub enum Event {
         status: TaskStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_error: Option<String>,
+    },
+
+    // --- Client-side tool execution (issue #107) --------------------------
+    /// The daemon's turn has suspended on a client-local MCP tool call.
+    /// The client is expected to execute `tool_name` with `arguments`
+    /// against its local environment and post the outcome back as
+    /// `Command::ClientToolResult` with the same `task_id` and
+    /// `tool_call_id`. Until that command arrives, the turn parks in
+    /// `pending_client_tool`.
+    ClientToolCall {
+        task_id: TaskId,
+        conversation_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
     },
 }
 

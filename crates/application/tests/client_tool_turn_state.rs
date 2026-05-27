@@ -13,7 +13,7 @@
 //! a real conversation store, etc. We pin behavior at the
 //! tool-coordinator boundary, which is the genuine subject of #107.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -46,6 +46,7 @@ impl InMemoryTurnStore {
     }
 }
 
+#[async_trait]
 impl TurnStateStore for InMemoryTurnStore {
     async fn create_turn(&self, row: TurnRow) -> Result<(), CoreError> {
         let mut data = self.data.lock().unwrap();
@@ -734,5 +735,4 @@ fn _api_surface_compiles_check() {
         _accepts_arc(c);
     }
     let _ = _check;
-    let _ = HashSet::<String>::new();
 }

@@ -483,6 +483,12 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
         | api::Event::TaskProgress { .. }
         | api::Event::TaskLogAppended { .. }
         | api::Event::TaskCompleted { .. } => None,
+        // Client-side tool execution (#107): handled by clients that
+        // implement the client-tool protocol directly; the legacy
+        // `SignalEvent` stream is for the GTK desktop UI and does not
+        // surface tool-call requests. Listed explicitly so a future
+        // client that DOES want to react can move it out of this arm.
+        api::Event::ClientToolCall { .. } => None,
     }
 }
 

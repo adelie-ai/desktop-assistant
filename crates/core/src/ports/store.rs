@@ -132,46 +132,43 @@ pub struct TurnRow {
 /// inside the per-request scope rely on `current_user_id()`. Cross-user
 /// reads MUST behave like the row doesn't exist (don't leak presence).
 ///
-/// The default no-op implementation makes the trait opt-in for tests and
-/// legacy non-turn-state code paths: a service that doesn't care about
-/// turn state never needs to construct a concrete store.
+/// Uses `async_trait` (not `impl Future` like the other outbound ports)
+/// because the application-layer coordinator holds the store behind a
+/// `dyn TurnStateStore` so adapters that thread the coordinator
+/// through generic plumbing don't have to monomorphize against every
+/// concrete store. `async_trait` adds a small allocation per call;
+/// the call-rate (one create + one update per turn round + sweep on
+/// startup) is low enough that this is the right trade.
+#[async_trait::async_trait]
 pub trait TurnStateStore: Send + Sync {
     /// Insert a new turn row. Implementations stamp `created_at` /
     /// `updated_at` themselves. Returns `Err` if a row with this id
     /// already exists under the same user_id — the caller chose a
     /// duplicate task_id, which is a programming error.
-    fn create_turn(
-        &self,
-        row: TurnRow,
-    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+    async fn create_turn(&self, row: TurnRow) -> Result<(), CoreError>;
 
     /// Read a turn row by id, scoped to the current user. Returns `Ok(None)`
     /// when the row doesn't exist OR exists under a different user_id —
     /// the same opacity rule as `PgConversationStore::get_conversation_model_selection`.
-    fn get_turn(
-        &self,
-        id: &str,
-    ) -> impl std::future::Future<Output = Result<Option<TurnRow>, CoreError>> + Send;
+    async fn get_turn(&self, id: &str) -> Result<Option<TurnRow>, CoreError>;
 
     /// Atomically update a turn row's status, state_json, and last_error.
     /// Implementations bump `updated_at`. Returns `Err` if the row does
     /// not exist for this user_id.
-    fn update_turn(
+    async fn update_turn(
         &self,
         id: &str,
         status: TurnStatus,
         state: &TurnStateJson,
         last_error: Option<&str>,
-    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+    ) -> Result<(), CoreError>;
 
     /// Scan every turn row whose status is non-terminal across ALL users.
     /// Called once at daemon startup so abandoned rows can be marked
     /// `failed("daemon_restarted")` instead of accumulating. Skips the
     /// `current_user_id()` scope because the caller is a system task
     /// (no JWT context); implementations explicitly bypass scoping.
-    fn scan_non_terminal(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<TurnRow>, CoreError>> + Send;
+    async fn scan_non_terminal(&self) -> Result<Vec<TurnRow>, CoreError>;
 }
 
 /// Outbound port for persisting conversations.
@@ -462,6 +459,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl TurnStateStore for MockTurnStore {
         async fn create_turn(&self, row: TurnRow) -> Result<(), CoreError> {
             let mut data = self.data.lock().unwrap();

@@ -3,6 +3,8 @@
 //! This crate maps canonical API [`desktop_assistant_api_model::Command`] values
 //! to calls into the existing inbound ports in `desktop-assistant-core`.
 
+pub mod client_tools;
+
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
@@ -941,6 +943,20 @@ where
             | api::Command::SubscribeBackgroundTasks
             | api::Command::UnsubscribeBackgroundTasks
             | api::Command::SpawnStandaloneAgent { .. } => Err(ApiError::Unsupported),
+
+            // Client-side tool execution (issue #107). The default
+            // handler doesn't carry a `ClientToolCoordinator`; a
+            // composition that wants client-side execution wraps this
+            // handler (or constructs `DefaultAssistantApiHandler` with
+            // `with_client_tool_coordinator`) and overrides these arms.
+            //
+            // We reject explicitly so transports surface a clean
+            // "feature not enabled" instead of silently dropping the
+            // command. The wrapping handler in this crate's
+            // `client_tools` module is the supported path.
+            api::Command::RegisterClientTools { .. } | api::Command::ClientToolResult { .. } => {
+                Err(ApiError::Unsupported)
+            }
         }
     }
 
