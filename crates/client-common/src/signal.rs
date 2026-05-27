@@ -28,6 +28,32 @@ pub enum SignalEvent {
         conversation_id: String,
         warning: api::ConversationWarning,
     },
+    /// A background task transitioned to `Pending`/`Running`. Carries the
+    /// full `TaskView` so process-manager UIs can populate a list row
+    /// without an extra round-trip. Sent in response to
+    /// `Command::SubscribeBackgroundTasks` (issue #110).
+    TaskStarted {
+        task: api::TaskView,
+    },
+    /// Lightweight progress signal — typically used to update a per-row
+    /// "progress hint" string without writing a log entry.
+    TaskProgress {
+        id: String,
+        progress_hint: Option<String>,
+    },
+    /// A new log entry was appended to a task's bounded log buffer.
+    TaskLogAppended {
+        id: String,
+        entry: api::TaskLogEntry,
+    },
+    /// Terminal event: the task reached `Completed`, `Failed`, or
+    /// `Cancelled`. `last_error` is set for `Failed` and may be set for
+    /// `Cancelled` when cancellation was driven by an upstream error.
+    TaskCompleted {
+        id: String,
+        status: api::TaskStatus,
+        last_error: Option<String>,
+    },
     Disconnected {
         reason: String,
     },

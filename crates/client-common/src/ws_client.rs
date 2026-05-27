@@ -480,15 +480,26 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             conversation_id,
             warning,
         }),
-        // Background-task events (issue #110) are not yet mapped onto the
-        // legacy SignalEvent stream; the process-manager UIs subscribe
-        // directly to Task* events via a dedicated channel introduced
-        // alongside the registry (see #111/#112/#113). Each arm is listed
-        // explicitly so future variants force a deliberate decision.
-        api::Event::TaskStarted { .. }
-        | api::Event::TaskProgress { .. }
-        | api::Event::TaskLogAppended { .. }
-        | api::Event::TaskCompleted { .. } => None,
+        // Background-task events (issue #110) — surfaced verbatim on the
+        // signal channel so process-manager UIs (adele-tui#45, adele-gtk
+        // follow-up) can react. The TaskView/TaskLogEntry types are
+        // re-exported from `api-model`; clients consume them directly.
+        api::Event::TaskStarted { task } => Some(SignalEvent::TaskStarted { task }),
+        api::Event::TaskProgress { id, progress_hint } => {
+            Some(SignalEvent::TaskProgress { id, progress_hint })
+        }
+        api::Event::TaskLogAppended { id, entry } => {
+            Some(SignalEvent::TaskLogAppended { id, entry })
+        }
+        api::Event::TaskCompleted {
+            id,
+            status,
+            last_error,
+        } => Some(SignalEvent::TaskCompleted {
+            id,
+            status,
+            last_error,
+        }),
         // Client-side tool execution (#107): handled by clients that
         // implement the client-tool protocol directly; the legacy
         // `SignalEvent` stream is for the GTK desktop UI and does not
@@ -533,6 +544,93 @@ mod tests {
             title: "New Title".to_string(),
         });
         assert!(matches!(event, Some(SignalEvent::TitleChanged { .. })));
+    }
+
+    #[test]
+    fn maps_task_started_event() {
+        let task = api::TaskView {
+            id: api::TaskId("t-1".into()),
+            kind: api::TaskKind::Standalone {
+                name: "researcher".into(),
+                conversation_id: "c-1".into(),
+            },
+            status: api::TaskStatus::Running,
+            started_at: 1,
+            ended_at: None,
+            last_error: None,
+            parent: None,
+            children: Vec::new(),
+            title: "Researcher: pricing data".into(),
+            progress_hint: None,
+        };
+        let signal = map_event_to_signal(api::Event::TaskStarted { task });
+        match signal {
+            Some(SignalEvent::TaskStarted { task }) => {
+                assert_eq!(task.id, api::TaskId("t-1".into()));
+                assert_eq!(task.title, "Researcher: pricing data");
+            }
+            other => panic!("expected SignalEvent::TaskStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_task_progress_event() {
+        let signal = map_event_to_signal(api::Event::TaskProgress {
+            id: "t-1".into(),
+            progress_hint: Some("step 2/5".into()),
+        });
+        match signal {
+            Some(SignalEvent::TaskProgress { id, progress_hint }) => {
+                assert_eq!(id, "t-1");
+                assert_eq!(progress_hint.as_deref(), Some("step 2/5"));
+            }
+            other => panic!("expected SignalEvent::TaskProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_task_log_appended_event() {
+        let entry = api::TaskLogEntry {
+            seq: 7,
+            timestamp: 1_700_000_000,
+            level: api::LogLevel::Info,
+            category: api::LogCategory::Status,
+            message: "fetching".into(),
+            data: None,
+        };
+        let signal = map_event_to_signal(api::Event::TaskLogAppended {
+            id: "t-1".into(),
+            entry,
+        });
+        match signal {
+            Some(SignalEvent::TaskLogAppended { id, entry }) => {
+                assert_eq!(id, "t-1");
+                assert_eq!(entry.seq, 7);
+                assert_eq!(entry.message, "fetching");
+            }
+            other => panic!("expected SignalEvent::TaskLogAppended, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_task_completed_event() {
+        let signal = map_event_to_signal(api::Event::TaskCompleted {
+            id: "t-1".into(),
+            status: api::TaskStatus::Failed,
+            last_error: Some("LLM rate limit".into()),
+        });
+        match signal {
+            Some(SignalEvent::TaskCompleted {
+                id,
+                status,
+                last_error,
+            }) => {
+                assert_eq!(id, "t-1");
+                assert!(matches!(status, api::TaskStatus::Failed));
+                assert_eq!(last_error.as_deref(), Some("LLM rate limit"));
+            }
+            other => panic!("expected SignalEvent::TaskCompleted, got {other:?}"),
+        }
     }
 
     #[test]
