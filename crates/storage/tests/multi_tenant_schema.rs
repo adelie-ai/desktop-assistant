@@ -427,6 +427,25 @@ async fn composite_user_id_index_exists_on_message_summaries() {
 // This proves the schema is in place even before #105 updates queries.
 // ---------------------------------------------------------------------------
 
+/// Running `run_migrations` a second time against an already-migrated
+/// schema must be a no-op — both the daemon and the dreaming worker
+/// invoke it at startup, and existing installs already see migrations
+/// 001-015 re-run cleanly on every boot. The multi-tenant migration
+/// has to preserve that contract.
+#[tokio::test]
+async fn migrations_are_idempotent() {
+    with_fixture("migrations_are_idempotent", |fx| async move {
+        fx.migrate().await;
+        // Second pass: must not raise (no duplicate-column errors, no
+        // duplicate-index errors, no PK-already-exists errors).
+        fx.migrate().await;
+        // Sanity-check the second pass left the column in place.
+        assert!(column_exists(&fx.pool, &fx.schema, "conversations", "user_id").await);
+        fx
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn inserting_conversation_without_user_id_fails() {
     with_fixture("inserting_conversation_without_user_id_fails", |fx| async move {

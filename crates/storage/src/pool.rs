@@ -124,5 +124,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Multi-tenant schema (issue #102) — every personal-data table gains
+    // `user_id NOT NULL` plus a `(user_id, …)` composite index for the
+    // hot query paths #105's scoping will use. Pre-existing rows are
+    // backfilled to the sentinel `'default'` user so single-tenant
+    // installs keep working without auth changes.
+    sqlx::raw_sql(include_str!("../migrations/016_multi_tenant_user_id.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
