@@ -454,6 +454,9 @@ async fn event_translator_handles_config_changed() {
 async fn event_translator_marks_unhandled_variants_explicitly() {
     // Variants we deliberately do not surface as D-Bus signals must
     // hit `Ignored` so the next person to add one notices.
+    // `Task*` events were Ignored under #106 but are now translated
+    // onto `org.desktopAssistant.BackgroundTasks` per #116; see
+    // `tests/background_tasks.rs` for that coverage.
     let cases = [
         (
             api::Event::AssistantStatus {
@@ -469,13 +472,6 @@ async fn event_translator_marks_unhandled_variants_explicitly() {
                 title: "t".into(),
             },
             "conversation_title_changed",
-        ),
-        (
-            api::Event::TaskProgress {
-                id: "t".into(),
-                progress_hint: None,
-            },
-            "task_progress",
         ),
     ];
     for (event, expected_kind) in cases {

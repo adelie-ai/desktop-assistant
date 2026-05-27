@@ -29,6 +29,9 @@ uuid = { version = "1", features = ["v4"] }
 zbus.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 desktop-assistant-auth-jwt.workspace = true
+futures-util = "0.3"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
