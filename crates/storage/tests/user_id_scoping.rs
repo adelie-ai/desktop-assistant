@@ -32,9 +32,12 @@ use std::sync::Arc;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, KnowledgeEntry, Message, Role};
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
-use desktop_assistant_core::ports::store::ConversationStore;
+use desktop_assistant_core::ports::store::{
+    ConversationStore, PendingClientToolCall, TurnRow, TurnStateJson, TurnStateStore, TurnStatus,
+};
 use desktop_assistant_storage::{
-    PgConversationStore, PgKnowledgeBaseStore, UserId, run_migrations, with_user_id,
+    PgConversationStore, PgKnowledgeBaseStore, PgTurnStateStore, UserId, run_migrations,
+    with_user_id,
 };
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -432,6 +435,158 @@ async fn knowledge_get_by_id_does_not_leak_across_users() {
                 .await
                 .unwrap();
         assert!(alice_fetch.is_some());
+        fx
+    })
+    .await;
+}
+
+// -- turn state (issue #107) -------------------------------------------------
+
+fn turn_row(id: &str, user_id: &str, conversation_id: &str, status: TurnStatus) -> TurnRow {
+    TurnRow {
+        id: id.into(),
+        user_id: user_id.into(),
+        conversation_id: conversation_id.into(),
+        status,
+        state: TurnStateJson::default(),
+        last_error: None,
+    }
+}
+
+#[tokio::test]
+async fn turn_state_round_trips_through_postgres() {
+    // Create + get + update + read-back for a single user's turn row.
+    // The acceptance value here is that the state_json column survives
+    // a serde round-trip through Postgres's JSONB representation.
+    with_fixture("turn_state_round_trips_through_postgres", |fx| async move {
+        let store = PgTurnStateStore::new(fx.pool.clone());
+
+        with_user_id(UserId::new("alice"), async {
+            store
+                .create_turn(turn_row("turn-1", "alice", "conv-1", TurnStatus::PendingLlm))
+                .await
+                .expect("create");
+
+            // Read back: alice sees her row.
+            let row = store
+                .get_turn("turn-1")
+                .await
+                .expect("get")
+                .expect("row exists");
+            assert_eq!(row.status, TurnStatus::PendingLlm);
+            assert!(row.state.pending_client_tool.is_none());
+
+            // Transition to pending_client_tool with a payload.
+            let state = TurnStateJson {
+                version: 1,
+                pending_client_tool: Some(PendingClientToolCall {
+                    tool_call_id: "call-7".into(),
+                    tool_name: "fs_read".into(),
+                    arguments: serde_json::json!({"path": "/etc/hosts"}),
+                }),
+            };
+            store
+                .update_turn("turn-1", TurnStatus::PendingClientTool, &state, None)
+                .await
+                .expect("update");
+
+            let row = store.get_turn("turn-1").await.unwrap().unwrap();
+            assert_eq!(row.status, TurnStatus::PendingClientTool);
+            let pending = row.state.pending_client_tool.unwrap();
+            assert_eq!(pending.tool_call_id, "call-7");
+            assert_eq!(pending.tool_name, "fs_read");
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn turn_state_user_b_cannot_read_user_a_turn() {
+    // Cross-user isolation, mirroring the conversation-level test
+    // above. Bob's get_turn must return None — not "not found" — and
+    // his update_turn must error out for the same opacity reason.
+    with_fixture("turn_state_user_b_cannot_read_user_a_turn", |fx| async move {
+        let store = PgTurnStateStore::new(fx.pool.clone());
+
+        with_user_id(UserId::new("alice"), async {
+            store
+                .create_turn(turn_row("turn-x", "alice", "conv-1", TurnStatus::PendingLlm))
+                .await
+                .expect("create");
+        })
+        .await;
+
+        let bob_get = with_user_id(UserId::new("bob"), async { store.get_turn("turn-x").await })
+            .await
+            .expect("get returns Ok for cross-user");
+        assert!(bob_get.is_none(), "bob must not see alice's turn");
+
+        let bob_update = with_user_id(UserId::new("bob"), async {
+            store
+                .update_turn("turn-x", TurnStatus::Failed, &TurnStateJson::default(), Some("nope"))
+                .await
+        })
+        .await;
+        assert!(bob_update.is_err(), "bob must not be able to mutate alice's turn");
+
+        // Alice's row is unaffected.
+        let alice_get = with_user_id(UserId::new("alice"), async {
+            store.get_turn("turn-x").await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(alice_get.status, TurnStatus::PendingLlm);
+        assert!(alice_get.last_error.is_none());
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn turn_state_scan_non_terminal_walks_all_users() {
+    // The cold-restart sweep is a system task — it deliberately walks
+    // every user's pending rows in a single pass. This pins that
+    // contract against the SQL.
+    with_fixture("turn_state_scan_non_terminal_walks_all_users", |fx| async move {
+        let store = PgTurnStateStore::new(fx.pool.clone());
+
+        with_user_id(UserId::new("alice"), async {
+            store
+                .create_turn(turn_row("t-a-pending", "alice", "c", TurnStatus::PendingLlm))
+                .await
+                .unwrap();
+            store
+                .create_turn(turn_row("t-a-complete", "alice", "c", TurnStatus::Complete))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        with_user_id(UserId::new("bob"), async {
+            store
+                .create_turn(turn_row(
+                    "t-b-pending",
+                    "bob",
+                    "c",
+                    TurnStatus::PendingClientTool,
+                ))
+                .await
+                .unwrap();
+            store
+                .create_turn(turn_row("t-b-failed", "bob", "c", TurnStatus::Failed))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // Sweep across all users — no scope installed.
+        let mut rows = store.scan_non_terminal().await.expect("scan");
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids, vec!["t-a-pending".to_string(), "t-b-pending".to_string()]);
         fx
     })
     .await;

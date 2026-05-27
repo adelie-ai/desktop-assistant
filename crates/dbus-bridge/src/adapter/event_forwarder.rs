@@ -120,6 +120,16 @@ pub fn translate(event: api::Event) -> ForwardAction {
         api::Event::TaskCompleted { .. } => ForwardAction::Ignored {
             kind: "task_completed",
         },
+        // Client-side tool execution (issue #107): the bridge does not
+        // forward `ClientToolCall` to D-Bus subscribers because client-
+        // side execution is a WebSocket-protocol concern. The D-Bus
+        // bridge IS a client — if the daemon ever picks a tool that's
+        // registered on a D-Bus-attached client, the bridge would need
+        // its own dispatch path; today the bridge does not register
+        // any client-local tools, so this is unreachable in practice.
+        api::Event::ClientToolCall { .. } => ForwardAction::Ignored {
+            kind: "client_tool_call",
+        },
     }
 }
 

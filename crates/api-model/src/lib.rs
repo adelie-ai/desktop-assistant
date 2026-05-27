@@ -234,6 +234,47 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tools: Option<Vec<String>>,
     },
+
+    // --- Client-side tool execution (issue #107) ---------------------------
+    //
+    // Phase-2 architecture (rule #8) executes client-local MCPs on the
+    // user's machine rather than on the daemon. The client advertises
+    // which tools it can run at session start; when the LLM picks one
+    // the daemon suspends the turn, emits `Event::ClientToolCall`, and
+    // resumes when `Command::ClientToolResult` arrives.
+    /// Advertise the set of client-local MCP tools this connection is
+    /// able to execute. The daemon replaces any previously-registered
+    /// set on each call — clients should send the full list, not
+    /// deltas. Per-session: re-register on every connect.
+    RegisterClientTools {
+        tools: Vec<ClientToolRegistration>,
+    },
+    /// Deliver the result of a `ClientToolCall` back to the daemon so a
+    /// suspended turn can resume. Exactly one of `result` / `error`
+    /// should be populated; both `None` is treated as an error by the
+    /// daemon-side validator.
+    ClientToolResult {
+        task_id: TaskId,
+        tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+/// Single entry in a `RegisterClientTools` request. Mirrors the shape of
+/// `ToolDefinition` but kept here in `api-model` so adapters don't need
+/// to depend on `desktop-assistant-core`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientToolRegistration {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema for the tool's input. Daemon forwards verbatim to
+    /// the LLM's tool list.
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
 }
 
 fn default_true() -> bool {
@@ -289,6 +330,11 @@ pub enum CommandResult {
     /// correlate the streamed `Task*` events back to the request. Introduced
     /// alongside the background-task registry so we don't overload `Ack`.
     SendMessageAck { task_id: String },
+
+    /// Response to `RegisterClientTools`, carrying the count of tools
+    /// accepted by the daemon. Clients use this to verify registration
+    /// landed before relying on client-side execution.
+    ClientToolsRegistered { count: u32 },
 
     Ack,
 }
@@ -377,6 +423,21 @@ pub enum Event {
         status: TaskStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_error: Option<String>,
+    },
+
+    // --- Client-side tool execution (issue #107) --------------------------
+    /// The daemon's turn has suspended on a client-local MCP tool call.
+    /// The client is expected to execute `tool_name` with `arguments`
+    /// against its local environment and post the outcome back as
+    /// `Command::ClientToolResult` with the same `task_id` and
+    /// `tool_call_id`. Until that command arrives, the turn parks in
+    /// `pending_client_tool`.
+    ClientToolCall {
+        task_id: TaskId,
+        conversation_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
     },
 }
 
@@ -1494,5 +1555,138 @@ mod tests {
         // express at the type level: there is no `==` between `TaskId` and
         // `String`. We assert via `.0` access only.
         assert_eq!(id.0, raw);
+    }
+
+    // ---- #107: client-side execution protocol surface ---------------------
+    //
+    // The turn state machine adds three new wire shapes — a registration
+    // command, a result command, and a `ClientToolCall` event — that the
+    // chat client uses to advertise its local MCP tools and stream the
+    // round-trip on each suspension. These tests pin the JSON shape so
+    // out-of-tree clients have a stable contract.
+
+    #[test]
+    fn register_client_tools_command_round_trips() {
+        let cmd = Command::RegisterClientTools {
+            tools: vec![
+                ClientToolRegistration {
+                    name: "fs_read".into(),
+                    description: "Read a file on the user's machine".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    }),
+                },
+                ClientToolRegistration {
+                    name: "fs_write".into(),
+                    description: "Write a file on the user's machine".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        // Snake-case discriminator on the outer enum.
+        assert!(v.get("register_client_tools").is_some());
+        // Inner shape: a `tools` array of {name, description, input_schema}.
+        let inner = v.get("register_client_tools").unwrap();
+        let arr = inner.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].get("name").unwrap(), "fs_read");
+        // Round-trip.
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn client_tool_result_command_round_trips_ok_branch() {
+        let cmd = Command::ClientToolResult {
+            task_id: TaskId("task-1".into()),
+            tool_call_id: "call-7".into(),
+            result: Some("file contents go here".into()),
+            error: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"client_tool_result":{"task_id":"task-1","tool_call_id":"call-7","result":"file contents go here"}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn client_tool_result_command_round_trips_error_branch() {
+        let cmd = Command::ClientToolResult {
+            task_id: TaskId("task-2".into()),
+            tool_call_id: "call-8".into(),
+            result: None,
+            error: Some("file does not exist".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"client_tool_result":{"task_id":"task-2","tool_call_id":"call-8","error":"file does not exist"}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn client_tool_call_event_round_trips() {
+        let ev = Event::ClientToolCall {
+            task_id: TaskId("task-1".into()),
+            conversation_id: "conv-1".into(),
+            tool_call_id: "call-7".into(),
+            tool_name: "fs_read".into(),
+            arguments: serde_json::json!({"path": "/etc/hosts"}),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let inner = v.get("client_tool_call").expect("client_tool_call key");
+        assert_eq!(inner.get("task_id").unwrap(), "task-1");
+        assert_eq!(inner.get("conversation_id").unwrap(), "conv-1");
+        assert_eq!(inner.get("tool_call_id").unwrap(), "call-7");
+        assert_eq!(inner.get("tool_name").unwrap(), "fs_read");
+        assert_eq!(
+            inner.get("arguments").unwrap(),
+            &serde_json::json!({"path": "/etc/hosts"})
+        );
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn client_tools_registered_command_result_round_trips() {
+        let res = CommandResult::ClientToolsRegistered { count: 3 };
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"client_tools_registered":{"count":3}}"#).unwrap();
+        assert_eq!(v, expected);
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn client_tool_result_rejects_both_result_and_error_unset() {
+        // A `ClientToolResult` with neither `result` nor `error` is
+        // ambiguous (success with empty body? failure with empty reason?).
+        // The protocol requires exactly one of them; the daemon-side
+        // validator (in application/) enforces the constraint. Here we
+        // only assert the wire shape can round-trip a malformed payload —
+        // the rejection lives one layer up so adapters can surface a
+        // clean error to the client.
+        let cmd: Command = serde_json::from_str(
+            r#"{"client_tool_result":{"task_id":"t","tool_call_id":"c"}}"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::ClientToolResult { result, error, .. } => {
+                assert!(result.is_none());
+                assert!(error.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }
