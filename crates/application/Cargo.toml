@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 desktop-assistant-auth-jwt.workspace = true
 desktop-assistant-core.workspace = true
 desktop-assistant-api-model = { path = "../api-model" }
@@ -12,10 +14,11 @@ thiserror.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tokio-util.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [dependencies.tokio]
 workspace = true
-features = ["sync"]
+features = ["sync", "rt", "macros"]
 
 [dev-dependencies]
 tokio.workspace = true
