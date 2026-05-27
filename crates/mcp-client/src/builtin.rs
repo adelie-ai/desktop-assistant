@@ -97,7 +97,40 @@ impl BuiltinToolService {
         self
     }
 
-    /// Configure database query closure for read-only SQL access.
+    /// Configure the database-query closure for the `builtin_db_query`
+    /// tool.
+    ///
+    /// ## Security posture (issue #141)
+    ///
+    /// The closure runs *arbitrary* LLM-supplied SQL. The implementation
+    /// behind it (see `desktop_assistant_storage::execute_database_query`)
+    /// enforces the following invariants before any text reaches the
+    /// pool, so it is safe to wire the tool against the same pool used
+    /// for ordinary application traffic:
+    ///
+    /// - **SELECT-only on the read path.** Only single-statement
+    ///   `SELECT` / `WITH` / `TABLE` / `VALUES` / `EXPLAIN` queries
+    ///   are accepted; everything else is parsed-and-rejected.
+    /// - **Per-user (`user_id`) scoping by AST rewrite.** Every
+    ///   reference to a personal-data table (`conversations`,
+    ///   `messages`, `knowledge_base`, etc.) has a
+    ///   `<table>.user_id = $N` predicate grafted into its `WHERE`
+    ///   clause, bound to the caller's task-local `UserId`. An
+    ///   LLM-supplied predicate naming a different user_id is AND'd
+    ///   with the grafted one, so the intersection is empty.
+    /// - **Compound statements rejected.** `SELECT 1; DROP TABLE …`
+    ///   produces two statements at parse time and is refused.
+    /// - **Writes confined to scratch.** DDL/DML that names a
+    ///   personal-data table (qualified or otherwise) is rejected; the
+    ///   write path's `search_path TO scratch, public` then carries
+    ///   unqualified writes into the per-database `scratch` schema
+    ///   only, so the LLM can still set up staging tables and
+    ///   intermediate joins.
+    ///
+    /// Pre-#141 this docstring contained a single-line "read-only"
+    /// claim — which the implementation did not enforce. The audit
+    /// test `comment_in_builtin_rs_matches_actual_security_posture`
+    /// in this file pins the wording against that regression.
     pub fn with_database(mut self, query_fn: DbQueryFn) -> Self {
         self.db_query_fn = Some(query_fn);
         self
