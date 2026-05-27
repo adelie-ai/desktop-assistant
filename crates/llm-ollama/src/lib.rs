@@ -593,6 +593,14 @@ impl LlmClient for OllamaClient {
                 "reasoning hint ignored on Ollama connector (no-op)"
             );
         }
+
+        // Cooperative cancellation token (issue #109).
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
+        if cancellation.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
         self.ensure_model_available().await?;
 
         // Per-turn model override (issue #34): when the daemon-side routing
@@ -644,14 +652,16 @@ impl LlmClient for OllamaClient {
 
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
 
-        let response = self
+        let send_fut = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&request)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
+            .send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -706,7 +716,19 @@ impl LlmClient for OllamaClient {
         let mut token_usage: Option<TokenUsage> = None;
         let mut buffer = String::new();
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            // Race the next NDJSON chunk against cancellation. Dropping
+            // `stream` closes the underlying reqwest body and the
+            // socket — same shape as the SSE adapters.
+            let next = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    tracing::debug!("Ollama stream cancelled by token");
+                    drop(stream);
+                    return Err(CoreError::Cancelled);
+                }
+                c = stream.next() => c,
+            };
+            let Some(chunk) = next else { break };
             let bytes = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 

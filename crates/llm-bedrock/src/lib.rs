@@ -1001,6 +1001,17 @@ impl LlmClient for BedrockClient {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
+        // Cooperative cancellation token (issue #109): pre-check before
+        // building the AWS SDK client / making any network call. Inside
+        // the streaming loop we race the next event against
+        // `token.cancelled()` so the body stream is dropped cleanly
+        // when the user cancels mid-stream.
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
+        if cancellation.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
         let client = self.client().await?;
         let (system, api_messages) = convert_messages(&messages)?;
         let tool_config = convert_tools(tools)?;
@@ -1059,7 +1070,10 @@ impl LlmClient for BedrockClient {
             return self.dispatch_non_streaming(&client, inputs, on_chunk).await;
         }
 
-        match self.dispatch_streaming(&client, &inputs, on_chunk).await {
+        match self
+            .dispatch_streaming(&client, &inputs, on_chunk, &cancellation)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(StreamingDispatchError::StreamingToolsUnsupported { on_chunk, detail }) => {
                 tracing::warn!(
@@ -1139,11 +1153,16 @@ impl BedrockClient {
     /// pre-#67 implementation; the error path tags the specific
     /// "tools-in-streaming-mode" validation error so the caller can
     /// transparently fall back to `Converse`.
+    ///
+    /// `cancellation` is checked between SDK events via `tokio::select!`
+    /// (issue #109) so the body stream is dropped cleanly when the user
+    /// cancels mid-stream.
     async fn dispatch_streaming(
         &self,
         client: &Client,
         inputs: &BedrockRequestInputs,
         mut on_chunk: ChunkCallback,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, StreamingDispatchError> {
         let mut request = client
             .converse_stream()
@@ -1162,17 +1181,26 @@ impl BedrockClient {
             request = request.additional_model_request_fields(extra);
         }
 
-        let response = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(detail) = streaming_tools_unsupported_detail(&e) {
-                    return Err(StreamingDispatchError::StreamingToolsUnsupported {
-                        on_chunk,
-                        detail,
-                    });
-                }
-                return Err(StreamingDispatchError::Other(map_converse_stream_error(e)));
+        // Race connection establishment against cancellation. If the
+        // user cancels mid-handshake we drop the in-flight request
+        // (the SDK's HTTP body) before it resolves.
+        let send_fut = request.send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(StreamingDispatchError::Other(CoreError::Cancelled));
             }
+            r = send_fut => match r {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(detail) = streaming_tools_unsupported_detail(&e) {
+                        return Err(StreamingDispatchError::StreamingToolsUnsupported {
+                            on_chunk,
+                            detail,
+                        });
+                    }
+                    return Err(StreamingDispatchError::Other(map_converse_stream_error(e)));
+                }
+            },
         };
 
         let mut stream = response.stream;
@@ -1180,11 +1208,27 @@ impl BedrockClient {
         let mut tool_acc = ToolCallAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
 
-        while let Some(event) = stream.recv().await.map_err(|e| {
-            StreamingDispatchError::Other(CoreError::Llm(format!(
-                "Bedrock stream receive failed: {e}"
-            )))
-        })? {
+        loop {
+            // Race the next streaming event against cancellation.
+            // Dropping `stream` closes the underlying HTTP body the
+            // same way the SSE adapters do.
+            let event_result = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    tracing::debug!("Bedrock stream cancelled by token");
+                    drop(stream);
+                    return Err(StreamingDispatchError::Other(CoreError::Cancelled));
+                }
+                ev = stream.recv() => ev,
+            };
+            let event = match event_result {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(StreamingDispatchError::Other(CoreError::Llm(format!(
+                        "Bedrock stream receive failed: {e}"
+                    ))));
+                }
+            };
             if !apply_stream_event(
                 event,
                 &mut text,

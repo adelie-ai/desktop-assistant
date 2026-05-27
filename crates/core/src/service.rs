@@ -8,7 +8,8 @@ use crate::domain::{
 };
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
-    ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_context_budget,
+    ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
+    current_context_budget,
 };
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
@@ -17,6 +18,31 @@ use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, tool_set_hash, tool_status_message,
 };
 use chrono::{Duration, Local};
+use tokio_util::sync::CancellationToken;
+
+/// Return `Err(CoreError::Cancelled)` if the current task's cancellation
+/// token (installed by [`crate::ports::llm::with_cancellation_token`]) has
+/// been tripped. `None` (no token installed) is treated as "never
+/// cancelled" so legacy call sites — tests, dreaming jobs, anything that
+/// doesn't route through `send_prompt_with_override` — keep their
+/// pre-#109 behaviour.
+fn bail_if_cancelled() -> Result<(), CoreError> {
+    if let Some(token) = current_cancellation_token()
+        && token.is_cancelled()
+    {
+        return Err(CoreError::Cancelled);
+    }
+    Ok(())
+}
+
+/// Return the per-turn cancellation token, falling back to a fresh
+/// never-cancelled token (via `Default::default()`) when no scope is
+/// installed. Used by the chunk callback so streaming code can call
+/// `token.is_cancelled()` without having to special-case the
+/// absent-scope path on every chunk.
+fn cancellation_token_or_default() -> CancellationToken {
+    current_cancellation_token().unwrap_or_default()
+}
 
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
@@ -263,6 +289,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         mut on_chunk: ChunkCallback,
         mut on_status: StatusCallback,
     ) -> Result<String, CoreError> {
+        // Cooperative cancellation checkpoint (issue #109): bail out
+        // before any I/O if the caller has already tripped the token.
+        bail_if_cancelled()?;
+
         let mut conv = self.store.get(conversation_id).await?;
         let is_first_message = conv.messages.is_empty();
         conv.messages.push(Message::new(Role::User, &prompt));
@@ -349,6 +379,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let mut hosted_search_demoted = false;
 
         for round in 0..MAX_TOOL_ROUNDS {
+            // Between-turns cancellation checkpoint (issue #109): if the
+            // caller cancelled while the previous tool round was
+            // executing, surface `Cancelled` before we dispatch the next
+            // LLM call. This is the contract tested by
+            // `send_prompt_returns_cancelled_when_token_fires_between_turns`
+            // and `cancellation_during_tool_dispatch_aborts_before_next_llm_call`.
+            bail_if_cancelled()?;
+
             // Build the tool set: core + dynamically activated.
             // When hosted search has been demoted, use the full core set
             // (which includes builtin_tool_search) instead of the filtered one.
@@ -388,7 +426,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             let mut raw_stream = String::new();
             let mut emitted_visible_len = 0usize;
             let mut visible_chunk_callback = on_chunk;
+            // Capture a clone of the per-turn cancellation token so the
+            // wrapped callback can short-circuit mid-stream by returning
+            // `false` — the contract LLM adapters already obey to abort
+            // the SSE/NDJSON body. The adapter's own `tokio::select!`
+            // against `token.cancelled()` is the primary signal; this
+            // callback-side check covers callbacks that fire after the
+            // adapter has already buffered a chunk but before the next
+            // `select!` poll.
+            let cancellation_token = cancellation_token_or_default();
             let filtered_chunk_callback: ChunkCallback = Box::new(move |chunk| {
+                if cancellation_token.is_cancelled() {
+                    return false;
+                }
                 raw_stream.push_str(&chunk);
                 let sanitized = sanitize_assistant_text_for_stream(&raw_stream);
 
@@ -468,6 +518,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     on_chunk = Box::new(|_| true);
                     continue;
                 }
+                Err(CoreError::Cancelled) => {
+                    // Cancellation is the user's explicit signal to
+                    // stop — surface it verbatim instead of converting
+                    // to a friendly "LLM backend error" string. The
+                    // partial assistant message is dropped on purpose:
+                    // the user asked us to abandon this turn.
+                    tracing::info!(
+                        conversation_id = %conversation_id.0,
+                        "send_prompt cancelled mid-stream"
+                    );
+                    return Err(CoreError::Cancelled);
+                }
                 Err(e) => {
                     // Anything else — including exhausted overflow
                     // retries — surfaces as a user-visible message.
@@ -482,6 +544,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     return Ok(friendly);
                 }
             };
+
+            // Post-stream cancellation check (issue #109): the adapter
+            // may have returned a partial response because the chunk
+            // callback returned `false` after observing cancellation
+            // (the cooperative-shutdown contract). In that case the
+            // adapter returns `Ok(...)` with whatever it had streamed
+            // so far, but we want to surface `Cancelled` to the caller
+            // — the partial text is discarded.
+            bail_if_cancelled()?;
 
             // Token-pressure check: if the provider reports input tokens
             // above COMPACTION_TOKEN_RATIO of its context window, shrink the
@@ -609,6 +680,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
             // Execute each tool call and append results
             for tool_call in &response.tool_calls {
+                // Per-tool cancellation checkpoint (issue #109): if the
+                // caller cancelled between tool dispatches we must stop
+                // here rather than fire more tool side-effects. The
+                // between-turns check above protects the next LLM
+                // round; this one protects the inner per-tool loop.
+                bail_if_cancelled()?;
+
                 let arguments: serde_json::Value =
                     serde_json::from_str(&tool_call.arguments).unwrap_or_default();
                 on_status(tool_status_message(&tool_call.name, &arguments));

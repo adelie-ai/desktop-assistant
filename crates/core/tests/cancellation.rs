@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
-    Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
-    ToolNamespace,
+    Conversation, ConversationId, Message, ToolCall, ToolDefinition, ToolNamespace,
 };
 use desktop_assistant_core::ports::inbound::{ConversationService, PromptDispatchOutcome};
 use desktop_assistant_core::ports::llm::{
@@ -204,7 +203,7 @@ impl LlmClient for SlowStreamLlm {
         _reasoning: ReasoningConfig,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let token = current_cancellation_token().unwrap_or_else(CancellationToken::new);
+        let token = current_cancellation_token().unwrap_or_default();
         let mut full = String::new();
         for chunk in &self.chunks {
             tokio::select! {

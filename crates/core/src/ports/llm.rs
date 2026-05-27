@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
+use tokio_util::sync::CancellationToken;
 
 use crate::CoreError;
 use crate::domain::{Message, ToolCall, ToolDefinition, ToolNamespace};
@@ -54,6 +55,26 @@ tokio::task_local! {
     /// in `service::ConversationHandler` doesn't need to know the daemon's
     /// resolution logic.
     static CONTEXT_BUDGET: ContextBudget;
+
+    /// Per-turn cancellation token for `send_prompt` (issue #109).
+    ///
+    /// Lifecycle: installed by `ConversationService::send_prompt_with_override`
+    /// at the top of the dispatch via [`with_cancellation_token`], read at the
+    /// cooperative cancellation checkpoints inside `send_prompt` (between
+    /// agentic turns, before each tool-round dispatch, inside the chunk
+    /// callback) and inside each LLM adapter's streaming loop via
+    /// [`current_cancellation_token`]. Unset outside the scope, which
+    /// `current_cancellation_token` returns as `None` so legacy callers
+    /// (tests, dreaming jobs) get the pre-#109 "never cancel" behaviour.
+    ///
+    /// Why a task-local: matches the existing pattern used by
+    /// [`MODEL_OVERRIDE`], [`REASONING_CONFIG`], and [`CONTEXT_BUDGET`] —
+    /// threading the value through every connector trait method would mean
+    /// touching dozens of call sites; the task-local keeps the
+    /// `LlmClient::stream_completion` signature unchanged so adapters opt in
+    /// at the boundary that actually needs cancellation (the streaming
+    /// loop) instead of every wrapper / decorator on the chain.
+    static CANCELLATION_TOKEN: CancellationToken;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -141,6 +162,32 @@ where
 /// from `max_context_tokens()`.
 pub fn current_context_budget() -> Option<ContextBudget> {
     CONTEXT_BUDGET.try_with(|b| *b).ok()
+}
+
+/// Run `fut` with `token` installed as the per-turn cancellation token.
+///
+/// The dispatch loop in [`crate::service::ConversationHandler`] and every
+/// LLM adapter's streaming loop read this via
+/// [`current_cancellation_token`] to cooperatively bail out of the
+/// agentic loop when the token is tripped. The token is cheap to clone
+/// (it's an `Arc<…>` internally), so the dispatch wrapper hands a clone
+/// to the inner future and keeps a clone for its own monitoring.
+///
+/// Why a task-local: see the doc on [`CANCELLATION_TOKEN`].
+pub async fn with_cancellation_token<F, T>(token: CancellationToken, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CANCELLATION_TOKEN.scope(token, fut).await
+}
+
+/// Returns the per-turn cancellation token, or `None` if no token has
+/// been installed for this task. Callers should treat `None` as "never
+/// cancelled" — matching the documented contract that legacy call sites
+/// (tests, background jobs) that don't route through the dispatch
+/// wrapper retain the pre-#109 behaviour.
+pub fn current_cancellation_token() -> Option<CancellationToken> {
+    CANCELLATION_TOKEN.try_with(|t| t.clone()).ok()
 }
 
 /// Reasoning / extended-thinking level for a single LLM turn.

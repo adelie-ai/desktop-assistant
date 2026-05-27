@@ -1,6 +1,7 @@
 use crate::CoreError;
 use crate::domain::{Conversation, ConversationId, ConversationSummary, KnowledgeEntry};
-use crate::ports::llm::{ChunkCallback, ModelInfo, StatusCallback};
+use crate::ports::llm::{ChunkCallback, ModelInfo, StatusCallback, with_cancellation_token};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct LlmSettingsView {
@@ -182,12 +183,21 @@ pub trait ConversationService: Send + Sync {
     ///    resolves to a live connection + listed model.
     /// 3. The `interactive` purpose from the daemon config.
     ///
+    /// `cancellation` is a [`tokio_util::sync::CancellationToken`] that the
+    /// core service checks at each cooperative checkpoint inside the
+    /// agentic loop (between turns, before each tool-round dispatch) and
+    /// that LLM adapters watch via `tokio::select!` in their streaming
+    /// loops. Pass [`CancellationToken::new`] for callers that never need
+    /// to cancel — that's a fresh, never-tripped token and keeps pre-#109
+    /// behaviour intact.
+    ///
     /// Returns the assistant's full response text plus any advisory
     /// warnings that should be surfaced to the client (for example, a
     /// dangling stored selection that was cleared on this call). Default
-    /// implementation ignores overrides and delegates to `send_prompt`; the
-    /// concrete `ConversationHandler` overrides this with the full
-    /// resolution path.
+    /// implementation ignores overrides and delegates to `send_prompt`,
+    /// installing the cancellation token as a task-local so adapters can
+    /// read it without per-method threading; the concrete
+    /// `ConversationHandler` overrides this with the full resolution path.
     fn send_prompt_with_override(
         &self,
         conversation_id: &ConversationId,
@@ -195,15 +205,18 @@ pub trait ConversationService: Send + Sync {
         override_selection: Option<PromptSelectionOverride>,
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
+        cancellation: CancellationToken,
     ) -> impl std::future::Future<Output = Result<PromptDispatchOutcome, CoreError>> + Send
     where
         Self: Sync,
     {
         async move {
             let _ = override_selection;
-            let text = self
-                .send_prompt(conversation_id, prompt, on_chunk, on_status)
-                .await?;
+            let inner = async move {
+                self.send_prompt(conversation_id, prompt, on_chunk, on_status)
+                    .await
+            };
+            let text = with_cancellation_token(cancellation, inner).await?;
             Ok(PromptDispatchOutcome {
                 response: text,
                 warnings: Vec::new(),

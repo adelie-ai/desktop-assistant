@@ -432,8 +432,22 @@ impl AnthropicClient {
             &request_json[..request_json.len().min(2000)]
         );
 
+        // Cooperative cancellation token (issue #109): read once at the
+        // top of the dispatch and watched inside the SSE loop via
+        // `tokio::select!`. Falling back to a fresh never-cancelled
+        // token (via `Default::default()`) when no scope is installed
+        // keeps callers that don't route through
+        // `send_prompt_with_override` working unchanged.
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
+
+        // Short-circuit before any I/O if the caller cancelled already.
+        if cancellation.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
         let url = format!("{}/v1/messages", self.base_url);
-        let response = self
+        let send_fut = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
@@ -444,9 +458,15 @@ impl AnthropicClient {
                 "interleaved-thinking-2025-05-14,tool-search-2025-04-15",
             )
             .json(request_body)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
+            .send();
+
+        // Race the connection-establishment future against cancellation
+        // so the HTTP connection itself is dropped (no orphaned socket)
+        // when the user cancels mid-handshake.
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -499,7 +519,20 @@ impl AnthropicClient {
         let mut block_to_tool: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
 
-        while let Some(event) = events.next().await {
+        loop {
+            // Race the next SSE event against cancellation. When the
+            // token trips, drop `events` (and with it the underlying
+            // reqwest body stream) so the HTTP connection is closed
+            // rather than left orphaned in the connection pool.
+            let next = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    tracing::debug!("Anthropic stream cancelled by token");
+                    drop(events);
+                    return Err(CoreError::Cancelled);
+                }
+                ev = events.next() => ev,
+            };
+            let Some(event) = next else { break };
             let event = event.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
             let data = event.data.as_str();
             if data == "[DONE]" {

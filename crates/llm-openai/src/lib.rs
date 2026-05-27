@@ -464,15 +464,25 @@ impl OpenAiClient {
             &request_json[..request_json.len().min(2000)]
         );
 
-        let response = self
+        // Cooperative cancellation token (issue #109): see Anthropic
+        // adapter for the threading rationale.
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
+        if cancellation.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
+        let send_fut = self
             .client
             .post(format!("{}/responses", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(request_body)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
+            .send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -534,7 +544,18 @@ impl OpenAiClient {
         let mut tool_acc = ResponseToolAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
 
-        while let Some(event) = events.next().await {
+        loop {
+            // Race the next SSE event against cancellation. See the
+            // Anthropic adapter for the rationale; same pattern here.
+            let next = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    tracing::debug!("OpenAI stream cancelled by token");
+                    drop(events);
+                    return Err(CoreError::Cancelled);
+                }
+                ev = events.next() => ev,
+            };
+            let Some(event) = next else { break };
             let event = event.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
             let data = event.data.as_str();
             match event.event.as_str() {
