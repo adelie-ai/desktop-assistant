@@ -128,31 +128,27 @@ async fn registry_user_scope_isolates_listings() {
     let alice = unique_user("alice");
     let bob = unique_user("bob");
 
-    let release = Arc::new(Notify::new());
-    let r1 = Arc::clone(&release);
-    let r2 = Arc::clone(&release);
-    let r3 = Arc::clone(&release);
+    // Per-task Notify so we can release each independently — using one
+    // shared Notify here is racy because `notify_one` only stores a
+    // single permit regardless of how many times it's called.
+    let r_a1 = Arc::new(Notify::new());
+    let r_a2 = Arc::new(Notify::new());
+    let r_b1 = Arc::new(Notify::new());
 
-    let a1 = registry.spawn(alice.clone(), conv_kind("c1"), "a1".into(), move |_| {
-        let r = r1.clone();
-        async move {
-            r.notified().await;
-            Ok(())
-        }
+    let r_a1_t = Arc::clone(&r_a1);
+    let a1 = registry.spawn(alice.clone(), conv_kind("c1"), "a1".into(), move |_| async move {
+        r_a1_t.notified().await;
+        Ok(())
     });
-    let a2 = registry.spawn(alice.clone(), conv_kind("c2"), "a2".into(), move |_| {
-        let r = r2.clone();
-        async move {
-            r.notified().await;
-            Ok(())
-        }
+    let r_a2_t = Arc::clone(&r_a2);
+    let a2 = registry.spawn(alice.clone(), conv_kind("c2"), "a2".into(), move |_| async move {
+        r_a2_t.notified().await;
+        Ok(())
     });
-    let b1 = registry.spawn(bob.clone(), conv_kind("c3"), "b1".into(), move |_| {
-        let r = r3.clone();
-        async move {
-            r.notified().await;
-            Ok(())
-        }
+    let r_b1_t = Arc::clone(&r_b1);
+    let b1 = registry.spawn(bob.clone(), conv_kind("c3"), "b1".into(), move |_| async move {
+        r_b1_t.notified().await;
+        Ok(())
     });
 
     let alice_view = registry.list(&alice, true, None);
@@ -172,7 +168,9 @@ async fn registry_user_scope_isolates_listings() {
     assert!(registry.get(&bob, &b1).is_some());
 
     // Drain so the runtime tasks exit cleanly.
-    release.notify_waiters();
+    r_a1.notify_one();
+    r_a2.notify_one();
+    r_b1.notify_one();
     registry.wait(&a1).await;
     registry.wait(&a2).await;
     registry.wait(&b1).await;
@@ -319,8 +317,7 @@ async fn registry_log_ring_drops_oldest_when_bounded() {
         },
     );
 
-    // Wait until all 1500 entries have been appended (the ring only holds
-    // the last 1000, but we want to make sure the loop ran).
+    // Wait until the ring is full (the loop ran past 1000 entries).
     wait_until(
         || {
             let (entries, _) = registry
@@ -328,7 +325,7 @@ async fn registry_log_ring_drops_oldest_when_bounded() {
                 .expect("task exists");
             entries.len() >= 1000
         },
-        "1000 entries appended",
+        "ring saturated",
     )
     .await;
 
@@ -339,17 +336,25 @@ async fn registry_log_ring_drops_oldest_when_bounded() {
         "ring buffer must cap at config size, got {}",
         entries.len()
     );
-    // Sequence numbers are monotonic per task; first entry kept is seq=500
-    // (entries 0..499 were evicted) and last entry is seq=1499.
-    assert_eq!(entries.first().unwrap().seq, 500);
-    assert_eq!(entries.last().unwrap().seq, 1499);
-    assert_eq!(next_seq, 1500, "next_seq must point past the last entry");
+    // Sequence numbers are monotonic per task; the most recent 1000 are
+    // retained and `next_seq` points one past the last retained seq.
+    let last_seq = entries.last().unwrap().seq;
+    let first_seq = entries.first().unwrap().seq;
+    assert_eq!(
+        last_seq - first_seq + 1,
+        1000,
+        "retained range must be exactly the ring capacity"
+    );
+    assert_eq!(next_seq, last_seq + 1);
 
     // Resuming from a known seq must skip entries already seen.
-    let (resumed, next_resumed) = registry.logs(&user, &task_id, 1490, 100).expect("task");
+    let resume_from = last_seq - 9;
+    let (resumed, next_resumed) = registry
+        .logs(&user, &task_id, resume_from, 100)
+        .expect("task");
     assert_eq!(resumed.len(), 9);
-    assert_eq!(resumed.first().unwrap().seq, 1491);
-    assert_eq!(next_resumed, 1500);
+    assert_eq!(resumed.first().unwrap().seq, resume_from + 1);
+    assert_eq!(next_resumed, last_seq + 1);
 
     release.notify_one();
     registry.wait(&task_id).await;
@@ -917,11 +922,11 @@ mod foreground_send {
             let mut found = None;
             for _ in 0..200 {
                 let listing = registry.list(&alice, true, None);
-                if let Some(view) = listing.into_iter().next() {
-                    if view.status == api::TaskStatus::Running {
-                        found = Some(view.id);
-                        break;
-                    }
+                if let Some(view) = listing.into_iter().next()
+                    && view.status == api::TaskStatus::Running
+                {
+                    found = Some(view.id);
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1026,17 +1031,19 @@ async fn log_sink_emits_log_appended_event() {
         },
     );
 
+    // We're hunting specifically for the user-emitted Warn/ToolResult
+    // entry — the registry also emits Lifecycle markers on every spawn
+    // and the test should ignore those.
     let mut saw = false;
     for _ in 0..50 {
         match timeout(Duration::from_millis(200), events.recv()).await {
-            Ok(Ok(api::Event::TaskLogAppended { id, entry })) if id == task_id.0 => {
+            Ok(Ok(api::Event::TaskLogAppended { id, entry }))
+                if id == task_id.0
+                    && entry.category == api::LogCategory::ToolResult =>
+            {
                 assert_eq!(entry.level, api::LogLevel::Warn);
-                assert_eq!(entry.category, api::LogCategory::ToolResult);
                 assert_eq!(entry.message, "tool finished");
-                assert_eq!(
-                    entry.data,
-                    Some(serde_json::json!({"ok": true}))
-                );
+                assert_eq!(entry.data, Some(serde_json::json!({"ok": true})));
                 saw = true;
                 break;
             }

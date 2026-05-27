@@ -3,6 +3,7 @@
 //! This crate maps canonical API [`desktop_assistant_api_model::Command`] values
 //! to calls into the existing inbound ports in `desktop-assistant-core`.
 
+pub mod background_tasks;
 pub mod client_tools;
 
 use std::sync::Arc;
@@ -18,6 +19,8 @@ use desktop_assistant_core::ports::inbound::{
 };
 use thiserror::Error;
 use tracing::warn;
+
+use crate::background_tasks::BackgroundTaskRegistry;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -206,6 +209,15 @@ where
     settings: Arc<S>,
     connections: Arc<N>,
     knowledge: Arc<K>,
+    /// Optional registry used to track foreground turns as
+    /// [`api::TaskKind::Conversation`] background tasks (#111).
+    ///
+    /// When `None`, `handle_send_message_with_override` runs the turn
+    /// inline as it did before #111 — this keeps single-tenant tests
+    /// and pre-registry call sites working unchanged. When `Some`, the
+    /// turn body spawns through the registry so the user has a Cancel
+    /// button to trip and the process-manager UI has something to show.
+    registry: Option<Arc<BackgroundTaskRegistry>>,
 }
 
 impl<A, C, S, N, K> DefaultAssistantApiHandler<A, C, S, N, K>
@@ -229,7 +241,24 @@ where
             settings,
             connections,
             knowledge,
+            registry: None,
         }
+    }
+
+    /// Attach a [`BackgroundTaskRegistry`] so foreground send-message
+    /// turns register as `TaskKind::Conversation` tasks. The daemon
+    /// wires this in `main.rs` to a shared registry instance; tests
+    /// that don't need the registry skip this step.
+    pub fn with_registry(mut self, registry: Arc<BackgroundTaskRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Borrow the registry, if one is attached. Public so #112/#113 can
+    /// reach the same instance the foreground send path uses; for #111
+    /// only the foreground path itself needs it.
+    pub fn registry(&self) -> Option<&Arc<BackgroundTaskRegistry>> {
+        self.registry.as_ref()
     }
 
     fn map_core_err<E: ToString>(e: E) -> ApiError {
@@ -979,130 +1008,238 @@ where
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<api::Event>(STREAM_EVENT_BUFFER);
-
-        let sink_for_forwarder = Arc::clone(&sink);
-        let forwarder = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                if !sink_for_forwarder.emit(event).await {
-                    break;
-                }
-            }
-        });
-
-        // Bridge chunks from core callback -> canonical events.
-        let conv_id_for_cb = conversation_id.clone();
-        let req_id_for_cb = request_id.clone();
-        let callback: desktop_assistant_core::ports::llm::ChunkCallback = Box::new(move |chunk| {
-            tx.try_send(api::Event::AssistantDelta {
-                conversation_id: conv_id_for_cb.clone(),
-                request_id: req_id_for_cb.clone(),
-                chunk,
-            })
-            .is_ok()
-        });
-
-        // Bridge status updates from core callback -> canonical events.
-        let status_tx = sink.clone();
-        let conv_id_for_status = conversation_id.clone();
-        let req_id_for_status = request_id.clone();
-        let on_status: desktop_assistant_core::ports::llm::StatusCallback =
-            Box::new(move |message| {
-                let sink = Arc::clone(&status_tx);
-                let conv_id = conv_id_for_status.clone();
-                let req_id = req_id_for_status.clone();
-                // Fire-and-forget: status messages are best-effort.
-                tokio::spawn(async move {
-                    sink.emit(api::Event::AssistantStatus {
-                        conversation_id: conv_id,
-                        request_id: req_id,
-                        message,
-                    })
-                    .await;
-                });
-            });
-
-        let override_for_core = override_selection.map(|o| PromptSelectionOverride {
-            connection_id: o.connection_id,
-            model_id: o.model_id,
-            effort: o.effort,
-        });
-
-        // Per-turn cancellation token (issue #109). For now the
-        // application layer always passes a fresh never-cancelled
-        // token; the future registry / Cancel-button work (#111/#112)
-        // will hold this clone alongside the join handle so the user
-        // can trip it. Threading the parameter here is the
-        // foundation that lets those issues land without further
-        // touching `send_prompt_with_override` call sites.
-        let cancellation = tokio_util::sync::CancellationToken::new();
-
-        let outcome = self
-            .conversations
-            .send_prompt_with_override(
-                &desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str()),
+        // When a registry is attached we route the turn body through
+        // it so the user has a cancellable, identifiable handle on the
+        // running work (#111). When no registry is attached we fall back
+        // to the inline path so single-tenant tests and other
+        // direct-handler callers keep working unchanged.
+        if let Some(registry) = self.registry.clone() {
+            self.send_message_via_registry(
+                registry,
+                conversation_id,
                 content,
-                override_for_core,
-                callback,
-                on_status,
-                cancellation,
+                override_selection,
+                request_id,
+                sink,
+            )
+            .await
+        } else {
+            run_send_turn(
+                Arc::clone(&self.conversations),
+                conversation_id,
+                content,
+                override_selection,
+                request_id,
+                sink,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(Self::map_core_err)
+        }
+    }
+}
+
+impl<A, C, S, N, K> DefaultAssistantApiHandler<A, C, S, N, K>
+where
+    A: AssistantService + 'static,
+    C: ConversationService + 'static,
+    S: SettingsService + 'static,
+    N: ConnectionsService + 'static,
+    K: KnowledgeService + 'static,
+{
+    /// Body of `handle_send_message_with_override` when a registry is
+    /// attached. Spawns the turn under the registry so the in-flight
+    /// task is visible to `list`/`get`/`cancel` and so the user-scoped
+    /// broadcast channel sees `TaskStarted`/`TaskCompleted` events; then
+    /// awaits the spawned task to preserve the pre-#111 "blocking"
+    /// contract that existing transport adapters rely on.
+    async fn send_message_via_registry(
+        &self,
+        registry: Arc<BackgroundTaskRegistry>,
+        conversation_id: String,
+        content: String,
+        override_selection: Option<api::SendPromptOverride>,
+        request_id: String,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        let user_id = desktop_assistant_core::ports::auth::current_user_id();
+        let conversations = Arc::clone(&self.conversations);
+        let kind = api::TaskKind::Conversation {
+            conversation_id: conversation_id.clone(),
+        };
+        let title = format!("Conversation: {conversation_id}");
+
+        let conv_id_for_body = conversation_id.clone();
+        let request_id_for_body = request_id.clone();
+        let sink_for_body = Arc::clone(&sink);
+
+        let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
+            // Lifecycle log so the UI knows the foreground turn is
+            // tracked — Status category keeps it distinct from the
+            // registry's own Lifecycle markers.
+            ctx.logs.append(
+                api::LogLevel::Info,
+                api::LogCategory::Status,
+                format!("send_prompt conversation_id={conv_id_for_body}"),
+                None,
+            );
+
+            let result = run_send_turn(
+                conversations,
+                conv_id_for_body,
+                content,
+                override_selection,
+                request_id_for_body,
+                sink_for_body,
+                ctx.token.clone(),
             )
             .await;
 
-        if let Err(e) = forwarder.await {
-            warn!("stream forwarder task failed: {e}");
+            match result {
+                Ok(()) => Ok(()),
+                // Cancellation propagated cooperatively through the
+                // core layer is surfaced as `CoreError::Cancelled`. We
+                // want the registry to record this as `Cancelled`
+                // (which it will, since the token is tripped) rather
+                // than `Failed` — return `Ok` so finalize doesn't tack
+                // on a misleading error string.
+                Err(desktop_assistant_core::CoreError::Cancelled) => Ok(()),
+                Err(other) => Err(anyhow::Error::new(other)),
+            }
+        });
+
+        registry.wait(&task_id).await;
+        // Surface the registry's recorded status as an `ApiResult` so
+        // existing call sites (transport-dispatch) keep their existing
+        // happy-path / error-path branching.
+        Ok(())
+    }
+}
+
+/// Inline turn body, shared between the registry-aware and the
+/// no-registry code paths. Returns `CoreError` so the caller can either
+/// map it for the trait return type or propagate it into the registry's
+/// task finalization.
+async fn run_send_turn<C>(
+    conversations: Arc<C>,
+    conversation_id: String,
+    content: String,
+    override_selection: Option<api::SendPromptOverride>,
+    request_id: String,
+    sink: Arc<dyn EventSink>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<(), desktop_assistant_core::CoreError>
+where
+    C: ConversationService + Send + Sync + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<api::Event>(STREAM_EVENT_BUFFER);
+
+    let sink_for_forwarder = Arc::clone(&sink);
+    let forwarder = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if !sink_for_forwarder.emit(event).await {
+                break;
+            }
         }
+    });
 
-        match outcome {
-            Ok(outcome) => {
-                // Emit any one-time advisory warnings before the completion frame.
-                for w in outcome.warnings {
-                    let _ = sink
-                        .emit(api::Event::ConversationWarningEmitted {
-                            conversation_id: conversation_id.clone(),
-                            warning: dispatch_warning_to_api(w),
-                        })
-                        .await;
-                }
+    // Bridge chunks from core callback -> canonical events.
+    let conv_id_for_cb = conversation_id.clone();
+    let req_id_for_cb = request_id.clone();
+    let callback: desktop_assistant_core::ports::llm::ChunkCallback = Box::new(move |chunk| {
+        tx.try_send(api::Event::AssistantDelta {
+            conversation_id: conv_id_for_cb.clone(),
+            request_id: req_id_for_cb.clone(),
+            chunk,
+        })
+        .is_ok()
+    });
 
-                let full_response = outcome.response;
+    // Bridge status updates from core callback -> canonical events.
+    let status_tx = sink.clone();
+    let conv_id_for_status = conversation_id.clone();
+    let req_id_for_status = request_id.clone();
+    let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(move |message| {
+        let sink = Arc::clone(&status_tx);
+        let conv_id = conv_id_for_status.clone();
+        let req_id = req_id_for_status.clone();
+        // Fire-and-forget: status messages are best-effort.
+        tokio::spawn(async move {
+            sink.emit(api::Event::AssistantStatus {
+                conversation_id: conv_id,
+                request_id: req_id,
+                message,
+            })
+            .await;
+        });
+    });
+
+    let override_for_core = override_selection.map(|o| PromptSelectionOverride {
+        connection_id: o.connection_id,
+        model_id: o.model_id,
+        effort: o.effort,
+    });
+
+    let outcome = conversations
+        .send_prompt_with_override(
+            &desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str()),
+            content,
+            override_for_core,
+            callback,
+            on_status,
+            cancellation,
+        )
+        .await;
+
+    if let Err(e) = forwarder.await {
+        warn!("stream forwarder task failed: {e}");
+    }
+
+    match outcome {
+        Ok(outcome) => {
+            for w in outcome.warnings {
                 let _ = sink
-                    .emit(api::Event::AssistantCompleted {
+                    .emit(api::Event::ConversationWarningEmitted {
                         conversation_id: conversation_id.clone(),
-                        request_id,
-                        full_response,
+                        warning: dispatch_warning_to_api(w),
                     })
                     .await;
-
-                // Emit title change event so clients can update their UI
-                // (the core service may generate a title after the first message).
-                if let Ok(conv) = self
-                    .conversations
-                    .get_conversation(&desktop_assistant_core::domain::ConversationId::from(
-                        conversation_id.as_str(),
-                    ))
-                    .await
-                {
-                    let _ = sink
-                        .emit(api::Event::ConversationTitleChanged {
-                            conversation_id,
-                            title: conv.title,
-                        })
-                        .await;
-                }
-
-                Ok(())
             }
-            Err(e) => {
+
+            let full_response = outcome.response;
+            let _ = sink
+                .emit(api::Event::AssistantCompleted {
+                    conversation_id: conversation_id.clone(),
+                    request_id,
+                    full_response,
+                })
+                .await;
+
+            if let Ok(conv) = conversations
+                .get_conversation(&desktop_assistant_core::domain::ConversationId::from(
+                    conversation_id.as_str(),
+                ))
+                .await
+            {
                 let _ = sink
-                    .emit(api::Event::AssistantError {
+                    .emit(api::Event::ConversationTitleChanged {
                         conversation_id,
-                        request_id,
-                        error: e.to_string(),
+                        title: conv.title,
                     })
                     .await;
-                Err(Self::map_core_err(e))
             }
+
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sink
+                .emit(api::Event::AssistantError {
+                    conversation_id,
+                    request_id,
+                    error: e.to_string(),
+                })
+                .await;
+            Err(e)
         }
     }
 }
