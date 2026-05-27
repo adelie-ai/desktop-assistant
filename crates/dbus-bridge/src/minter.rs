@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 /// Default UDS path the minter binds. Mirrors the convention in
@@ -95,7 +95,10 @@ pub async fn fetch_jwt(
         .await
         .map_err(|e| anyhow::anyhow!("failed to flush mint request: {e}"))?;
 
-    let mut reader = BufReader::new(read_half);
+    // Cap the reply so a misbehaving or compromised minter can't
+    // exhaust memory. A real reply is ~250 bytes; 16 KiB is generous.
+    const MAX_MINTER_REPLY: usize = 16 * 1024;
+    let mut reader = BufReader::new(read_half).take(MAX_MINTER_REPLY as u64);
     let mut line = String::new();
     let read_fut = reader.read_line(&mut line);
     tokio::time::timeout(timeout, read_fut)
