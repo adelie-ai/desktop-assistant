@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/api-model",
     "crates/application",
+    "crates/auth-jwt",
     "crates/ws-interface",
     "crates/core",
     "crates/dbus-interface",
@@ -28,6 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 
 desktop-assistant-core = { path = "crates/core" }
+desktop-assistant-auth-jwt = { path = "crates/auth-jwt" }
 desktop-assistant-dbus = { path = "crates/dbus-interface" }
 desktop-assistant-llm-anthropic = { path = "crates/llm-anthropic" }
 desktop-assistant-llm-openai = { path = "crates/llm-openai" }
@@ -44,3 +46,4 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = "0.26"
 chrono = { version = "0.4", features = ["clock"] }
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
