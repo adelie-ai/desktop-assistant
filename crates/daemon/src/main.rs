@@ -1381,8 +1381,36 @@ async fn main() -> Result<()> {
     // (#111). #114 will surface the same registry through the
     // ListBackgroundTasks / CancelBackgroundTask command arms; until
     // then it powers the existing send path's cancellation hook.
-    let background_task_registry =
-        Arc::new(desktop_assistant_application::background_tasks::BackgroundTaskRegistry::new());
+    //
+    // Issue #115: when a Postgres pool is available, attach a
+    // `PgBackgroundTaskStore` so spawned tasks survive a daemon
+    // restart. The cold-restart sweep marks every non-terminal row
+    // `Failed` immediately after construction so the user observes
+    // them via the existing `list` path instead of silently losing
+    // them. The sweep is best-effort — see the issue body for the
+    // resume policy; #129 will replace the standalone branch with a
+    // real resume.
+    let background_task_registry = {
+        let registry =
+            desktop_assistant_application::background_tasks::BackgroundTaskRegistry::new();
+        if let Some(pool) = &pg_pool {
+            let store: std::sync::Arc<
+                dyn desktop_assistant_core::ports::store::BackgroundTaskStore,
+            > = std::sync::Arc::new(
+                desktop_assistant_storage::PgBackgroundTaskStore::new(pool.clone()),
+            );
+            let registry = registry.with_store(store);
+            if let Err(e) = registry.sweep_non_terminal_on_startup().await {
+                tracing::warn!(
+                    error = %e,
+                    "cold-restart sweep of background tasks failed; continuing",
+                );
+            }
+            Arc::new(registry)
+        } else {
+            Arc::new(registry)
+        }
+    };
     let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
         Arc::new(
             DefaultAssistantApiHandler::new(

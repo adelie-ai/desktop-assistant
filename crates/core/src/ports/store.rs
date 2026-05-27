@@ -2,6 +2,11 @@ use crate::CoreError;
 use crate::domain::{Conversation, ConversationId};
 use serde::{Deserialize, Serialize};
 
+// `BackgroundTaskRow` (#115) is defined in this module rather than in
+// `application` so that storage adapters can depend on `core` only —
+// the application layer's in-memory `BackgroundTaskRegistry` plugs in
+// through this port.
+
 /// Lifecycle status of a conversation turn persisted to the DB (#107).
 ///
 /// The turn state machine drives transitions through these states so that
@@ -169,6 +174,138 @@ pub trait TurnStateStore: Send + Sync {
     /// `current_user_id()` scope because the caller is a system task
     /// (no JWT context); implementations explicitly bypass scoping.
     async fn scan_non_terminal(&self) -> Result<Vec<TurnRow>, CoreError>;
+}
+
+// ---- #115: background task persistence ------------------------------------
+
+/// Lifecycle status of a background task. Mirrors
+/// `desktop_assistant_api_model::TaskStatus` but lives in core so storage
+/// adapters can depend on this crate alone. The textual keys returned by
+/// [`BackgroundTaskStatus::as_key`] are what the DB column stores; they
+/// match the serde rename_all = "snake_case" the api-model uses on the
+/// wire so consumers that round-trip between layers see the same string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl BackgroundTaskStatus {
+    /// Canonical lowercase key persisted to the DB and broadcast on the
+    /// wire. Mirrors the snake-case serde representation so a column
+    /// value can be parsed by `from_key` and serialized by serde
+    /// interchangeably.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// `true` for `Completed | Failed | Cancelled`. Used by the
+    /// cold-restart sweep so terminal rows are skipped on the way to
+    /// marking pending/running ones `Failed`.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// A single background-task row read from or written to the DB.
+///
+/// `kind_json` is the verbatim JSON-encoded `api_model::TaskKind` —
+/// kept opaque here so the store interface doesn't depend on
+/// `api-model` (which would invert the dependency graph). The
+/// application layer is responsible for serializing and parsing this
+/// payload; the store treats it as a JSON blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskRow {
+    pub id: String,
+    pub user_id: String,
+    pub kind_json: serde_json::Value,
+    pub status: BackgroundTaskStatus,
+    pub parent_task_id: Option<String>,
+    pub title: String,
+    pub last_error: Option<String>,
+    pub progress_hint: Option<String>,
+    /// Unix epoch milliseconds when the row was first inserted in
+    /// `Running` state. Mirrors `TaskView.started_at` so the value
+    /// survives a daemon restart.
+    pub started_at: i64,
+    /// Unix epoch milliseconds when the row reached a terminal state.
+    /// `None` while non-terminal.
+    pub ended_at: Option<i64>,
+}
+
+/// Outbound port for persisting background-task rows (#115).
+///
+/// Mirrors the in-memory `BackgroundTaskRegistry` so a daemon restart
+/// can sweep abandoned tasks. Implementations enforce `(user_id, …)`
+/// scoping on every read/update except `scan_non_terminal`, which is a
+/// system-task hook that intentionally walks across users.
+#[async_trait::async_trait]
+pub trait BackgroundTaskStore: Send + Sync {
+    /// Insert a new task row. Implementations stamp `created_at` /
+    /// `updated_at` themselves. Returns `Err` when the id is already
+    /// present — the caller chose a duplicate id, which is a
+    /// programming error.
+    async fn create_task(&self, row: BackgroundTaskRow) -> Result<(), CoreError>;
+
+    /// Read a single row by id, scoped to the current user. Returns
+    /// `Ok(None)` when the row doesn't exist OR belongs to another
+    /// user — the opacity rule (#105) prevents cross-user existence
+    /// leaks.
+    async fn get_task(&self, id: &str) -> Result<Option<BackgroundTaskRow>, CoreError>;
+
+    /// Update a task row's status, last_error, progress_hint, and
+    /// ended_at, scoped to the current user. Implementations bump
+    /// `updated_at`. Returns `Err` if the row does not exist for this
+    /// user.
+    async fn update_task(
+        &self,
+        id: &str,
+        status: BackgroundTaskStatus,
+        last_error: Option<&str>,
+        progress_hint: Option<&str>,
+        ended_at: Option<i64>,
+    ) -> Result<(), CoreError>;
+
+    /// List rows owned by the given user, ordered by `started_at`
+    /// descending. When `include_finished` is `false`, only
+    /// `Pending`/`Running` rows are returned. The caller passes the
+    /// user_id explicitly because list is sometimes invoked under a
+    /// different request scope than the row's owner (e.g. test
+    /// harness) — the implementation still applies a `WHERE user_id =
+    /// $1` for the scoping audit.
+    async fn list_tasks_for_user(
+        &self,
+        user_id: &str,
+        include_finished: bool,
+        limit: Option<u32>,
+    ) -> Result<Vec<BackgroundTaskRow>, CoreError>;
+
+    /// Scan every row whose status is non-terminal across ALL users.
+    /// Called once at daemon startup. Like `TurnStateStore::scan_non_terminal`,
+    /// implementations explicitly bypass `current_user_id()` because
+    /// the caller is a system task.
+    async fn scan_non_terminal(&self) -> Result<Vec<BackgroundTaskRow>, CoreError>;
 }
 
 /// Outbound port for persisting conversations.
@@ -603,5 +740,32 @@ mod tests {
         let store = MockTurnStore::new();
         let read = store.get_turn("nope").await.unwrap();
         assert!(read.is_none());
+    }
+
+    // ---- #115: background task store ----------------------------------
+
+    #[test]
+    fn background_task_status_round_trips_via_key() {
+        for status in [
+            BackgroundTaskStatus::Pending,
+            BackgroundTaskStatus::Running,
+            BackgroundTaskStatus::Completed,
+            BackgroundTaskStatus::Failed,
+            BackgroundTaskStatus::Cancelled,
+        ] {
+            let key = status.as_key();
+            let back = BackgroundTaskStatus::from_key(key).expect("known key parses");
+            assert_eq!(status, back, "key {key} must round-trip");
+        }
+        assert_eq!(BackgroundTaskStatus::from_key("nonsense"), None);
+    }
+
+    #[test]
+    fn background_task_status_terminal_classification() {
+        assert!(BackgroundTaskStatus::Completed.is_terminal());
+        assert!(BackgroundTaskStatus::Failed.is_terminal());
+        assert!(BackgroundTaskStatus::Cancelled.is_terminal());
+        assert!(!BackgroundTaskStatus::Pending.is_terminal());
+        assert!(!BackgroundTaskStatus::Running.is_terminal());
     }
 }
