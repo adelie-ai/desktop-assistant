@@ -1375,14 +1375,25 @@ async fn main() -> Result<()> {
     // Construct the shared API handler up-front so both the D-Bus and WS
     // adapters can share it (the multi-connection D-Bus interface dispatches
     // through this handler, mirroring the WS adapter).
+    //
+    // The handler is wired with a shared [`BackgroundTaskRegistry`] so
+    // foreground turns register as `TaskKind::Conversation` tasks
+    // (#111). #114 will surface the same registry through the
+    // ListBackgroundTasks / CancelBackgroundTask command arms; until
+    // then it powers the existing send path's cancellation hook.
+    let background_task_registry =
+        Arc::new(desktop_assistant_application::background_tasks::BackgroundTaskRegistry::new());
     let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
-        Arc::new(DefaultAssistantApiHandler::new(
-            Arc::new(Assistant),
-            Arc::clone(&conversation_service),
-            Arc::clone(&settings_service),
-            Arc::clone(&connections_service),
-            Arc::clone(&knowledge_service),
-        ));
+        Arc::new(
+            DefaultAssistantApiHandler::new(
+                Arc::new(Assistant),
+                Arc::clone(&conversation_service),
+                Arc::clone(&settings_service),
+                Arc::clone(&connections_service),
+                Arc::clone(&knowledge_service),
+            )
+            .with_registry(Arc::clone(&background_task_registry)),
+        );
 
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
