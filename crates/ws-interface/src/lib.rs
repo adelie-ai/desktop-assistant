@@ -14,7 +14,9 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_application::{AssistantApiHandler, UserId};
 use desktop_assistant_transport_dispatch::{AuthContext, dispatch_loop};
 use futures::{SinkExt, StreamExt};
-use tracing::{debug, warn};
+#[cfg(feature = "tls")]
+use tracing::debug;
+use tracing::warn;
 
 pub use api::{WsFrame, WsRequest};
 
