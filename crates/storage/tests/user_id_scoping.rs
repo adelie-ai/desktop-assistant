@@ -33,11 +33,12 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, KnowledgeEntry, Message, Role};
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_core::ports::store::{
-    ConversationStore, PendingClientToolCall, TurnRow, TurnStateJson, TurnStateStore, TurnStatus,
+    BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStore, ConversationStore,
+    PendingClientToolCall, TurnRow, TurnStateJson, TurnStateStore, TurnStatus,
 };
 use desktop_assistant_storage::{
-    PgConversationStore, PgKnowledgeBaseStore, PgTurnStateStore, UserId, run_migrations,
-    with_user_id,
+    PgBackgroundTaskStore, PgConversationStore, PgKnowledgeBaseStore, PgTurnStateStore, UserId,
+    run_migrations, with_user_id,
 };
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -587,6 +588,237 @@ async fn turn_state_scan_non_terminal_walks_all_users() {
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
         assert_eq!(ids, vec!["t-a-pending".to_string(), "t-b-pending".to_string()]);
+        fx
+    })
+    .await;
+}
+
+// -- background tasks (issue #115) ------------------------------------------
+
+fn task_row(id: &str, user_id: &str, status: BackgroundTaskStatus) -> BackgroundTaskRow {
+    BackgroundTaskRow {
+        id: id.into(),
+        user_id: user_id.into(),
+        // The store treats `kind_json` opaquely; any well-formed JSON is
+        // fine. We pick a `standalone` shape because the registry tests
+        // hammer that branch hardest.
+        kind_json: serde_json::json!({
+            "standalone": {"name": "test", "conversation_id": "c"}
+        }),
+        status,
+        parent_task_id: None,
+        title: format!("title for {id}"),
+        last_error: None,
+        progress_hint: None,
+        started_at: 1_700_000_000,
+        ended_at: None,
+    }
+}
+
+#[tokio::test]
+async fn background_task_row_round_trips_through_postgres() {
+    with_fixture("background_task_row_round_trips_through_postgres", |fx| async move {
+        let store = PgBackgroundTaskStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            store
+                .create_task(task_row("bt-1", "alice", BackgroundTaskStatus::Running))
+                .await
+                .expect("create");
+            let row = store.get_task("bt-1").await.unwrap().expect("row");
+            assert_eq!(row.status, BackgroundTaskStatus::Running);
+            assert_eq!(row.title, "title for bt-1");
+
+            store
+                .update_task(
+                    "bt-1",
+                    BackgroundTaskStatus::Failed,
+                    Some("daemon restarted mid-turn"),
+                    Some("step 2/4"),
+                    Some(1_700_000_555),
+                )
+                .await
+                .expect("update");
+            let row = store.get_task("bt-1").await.unwrap().unwrap();
+            assert_eq!(row.status, BackgroundTaskStatus::Failed);
+            assert_eq!(row.last_error.as_deref(), Some("daemon restarted mid-turn"));
+            assert_eq!(row.progress_hint.as_deref(), Some("step 2/4"));
+            assert_eq!(row.ended_at, Some(1_700_000_555));
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn background_task_user_b_cannot_read_user_a_row() {
+    // Cross-user isolation: Bob's get_task returns None and his
+    // update_task errors — the same opacity rule applied elsewhere.
+    with_fixture("background_task_user_b_cannot_read_user_a_row", |fx| async move {
+        let store = PgBackgroundTaskStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            store
+                .create_task(task_row("bt-x", "alice", BackgroundTaskStatus::Running))
+                .await
+                .expect("create");
+        })
+        .await;
+
+        let bob_get =
+            with_user_id(UserId::new("bob"), async { store.get_task("bt-x").await })
+                .await
+                .expect("ok");
+        assert!(bob_get.is_none(), "bob must not see alice's task");
+
+        let bob_update = with_user_id(UserId::new("bob"), async {
+            store
+                .update_task(
+                    "bt-x",
+                    BackgroundTaskStatus::Failed,
+                    Some("nope"),
+                    None,
+                    Some(1_700_000_999),
+                )
+                .await
+        })
+        .await;
+        assert!(bob_update.is_err(), "bob must not be able to update alice's row");
+
+        // Alice's row is unaffected.
+        let alice_get = with_user_id(UserId::new("alice"), async {
+            store.get_task("bt-x").await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(alice_get.status, BackgroundTaskStatus::Running);
+        assert!(alice_get.last_error.is_none());
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn background_task_scan_non_terminal_walks_all_users() {
+    // Cold-restart sweep must see every user's non-terminal rows in a
+    // single pass — without a JWT scope installed, just like the
+    // turn-state sweep does.
+    with_fixture("background_task_scan_non_terminal_walks_all_users", |fx| async move {
+        let store = PgBackgroundTaskStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            store
+                .create_task(task_row("a-running", "alice", BackgroundTaskStatus::Running))
+                .await
+                .unwrap();
+            store
+                .create_task(task_row("a-done", "alice", BackgroundTaskStatus::Completed))
+                .await
+                .unwrap();
+        })
+        .await;
+        with_user_id(UserId::new("bob"), async {
+            store
+                .create_task(task_row("b-running", "bob", BackgroundTaskStatus::Running))
+                .await
+                .unwrap();
+            store
+                .create_task(task_row("b-cancelled", "bob", BackgroundTaskStatus::Cancelled))
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // No scope installed for the sweep call.
+        let mut rows = store.scan_non_terminal().await.expect("scan");
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["a-running".to_string(), "b-running".to_string()],
+            "only non-terminal rows from both users surface"
+        );
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn background_task_list_for_user_filters_to_owner() {
+    // The list path used by the registry must produce only the calling
+    // user's rows, in started_at DESC order. This audits the SQL: a
+    // missing `WHERE user_id = $1` would let one user see another's
+    // tasks.
+    with_fixture("background_task_list_for_user_filters_to_owner", |fx| async move {
+        let store = PgBackgroundTaskStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            let mut row1 = task_row("a-1", "alice", BackgroundTaskStatus::Running);
+            row1.started_at = 1_700_000_001;
+            let mut row2 = task_row("a-2", "alice", BackgroundTaskStatus::Completed);
+            row2.started_at = 1_700_000_002;
+            store.create_task(row1).await.unwrap();
+            store.create_task(row2).await.unwrap();
+        })
+        .await;
+        with_user_id(UserId::new("bob"), async {
+            let mut row = task_row("b-1", "bob", BackgroundTaskStatus::Running);
+            row.started_at = 1_700_000_003;
+            store.create_task(row).await.unwrap();
+        })
+        .await;
+
+        let alice_list = store
+            .list_tasks_for_user("alice", /*include_finished*/ true, None)
+            .await
+            .unwrap();
+        let alice_ids: Vec<_> = alice_list.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(alice_ids, vec!["a-2".to_string(), "a-1".to_string()]);
+
+        // include_finished=false trims to non-terminal rows.
+        let alice_active = store
+            .list_tasks_for_user("alice", false, None)
+            .await
+            .unwrap();
+        let alice_active_ids: Vec<_> = alice_active.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(alice_active_ids, vec!["a-1".to_string()]);
+
+        let bob_list = store
+            .list_tasks_for_user("bob", true, None)
+            .await
+            .unwrap();
+        let bob_ids: Vec<_> = bob_list.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(bob_ids, vec!["b-1".to_string()]);
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn background_task_parent_link_persists_through_postgres() {
+    // The parent_task_id column round-trips and supports a future
+    // children join. We don't declare a FK constraint (see migration
+    // header), so a parent that was deleted before the child surfaces
+    // as a dangling reference rather than a FK violation.
+    with_fixture("background_task_parent_link_persists_through_postgres", |fx| async move {
+        let store = PgBackgroundTaskStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            let parent = task_row("parent", "alice", BackgroundTaskStatus::Running);
+            store.create_task(parent).await.unwrap();
+
+            let mut child = task_row("child", "alice", BackgroundTaskStatus::Running);
+            child.parent_task_id = Some("parent".into());
+            child.kind_json = serde_json::json!({
+                "subagent": {
+                    "parent_task_id": "parent",
+                    "conversation_id": "c",
+                    "name": "ch"
+                }
+            });
+            store.create_task(child).await.unwrap();
+
+            let read = store.get_task("child").await.unwrap().unwrap();
+            assert_eq!(read.parent_task_id.as_deref(), Some("parent"));
+        })
+        .await;
         fx
     })
     .await;
