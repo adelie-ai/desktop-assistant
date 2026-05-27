@@ -1001,6 +1001,17 @@ impl LlmClient for BedrockClient {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
+        // Cooperative cancellation token (issue #109): pre-check before
+        // building the AWS SDK client / making any network call. Inside
+        // the streaming loop we race the next event against
+        // `token.cancelled()` so the body stream is dropped cleanly
+        // when the user cancels mid-stream.
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
+        if cancellation.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
         let client = self.client().await?;
         let (system, api_messages) = convert_messages(&messages)?;
         let tool_config = convert_tools(tools)?;
@@ -1059,7 +1070,10 @@ impl LlmClient for BedrockClient {
             return self.dispatch_non_streaming(&client, inputs, on_chunk).await;
         }
 
-        match self.dispatch_streaming(&client, &inputs, on_chunk).await {
+        match self
+            .dispatch_streaming(&client, &inputs, on_chunk, &cancellation)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(StreamingDispatchError::StreamingToolsUnsupported { on_chunk, detail }) => {
                 tracing::warn!(
@@ -1139,11 +1153,16 @@ impl BedrockClient {
     /// pre-#67 implementation; the error path tags the specific
     /// "tools-in-streaming-mode" validation error so the caller can
     /// transparently fall back to `Converse`.
+    ///
+    /// `cancellation` is checked between SDK events via `tokio::select!`
+    /// (issue #109) so the body stream is dropped cleanly when the user
+    /// cancels mid-stream.
     async fn dispatch_streaming(
         &self,
         client: &Client,
         inputs: &BedrockRequestInputs,
         mut on_chunk: ChunkCallback,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, StreamingDispatchError> {
         let mut request = client
             .converse_stream()
@@ -1162,17 +1181,26 @@ impl BedrockClient {
             request = request.additional_model_request_fields(extra);
         }
 
-        let response = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(detail) = streaming_tools_unsupported_detail(&e) {
-                    return Err(StreamingDispatchError::StreamingToolsUnsupported {
-                        on_chunk,
-                        detail,
-                    });
-                }
-                return Err(StreamingDispatchError::Other(map_converse_stream_error(e)));
+        // Race connection establishment against cancellation. If the
+        // user cancels mid-handshake we drop the in-flight request
+        // (the SDK's HTTP body) before it resolves.
+        let send_fut = request.send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(StreamingDispatchError::Other(CoreError::Cancelled));
             }
+            r = send_fut => match r {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(detail) = streaming_tools_unsupported_detail(&e) {
+                        return Err(StreamingDispatchError::StreamingToolsUnsupported {
+                            on_chunk,
+                            detail,
+                        });
+                    }
+                    return Err(StreamingDispatchError::Other(map_converse_stream_error(e)));
+                }
+            },
         };
 
         let mut stream = response.stream;
@@ -1180,11 +1208,27 @@ impl BedrockClient {
         let mut tool_acc = ToolCallAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
 
-        while let Some(event) = stream.recv().await.map_err(|e| {
-            StreamingDispatchError::Other(CoreError::Llm(format!(
-                "Bedrock stream receive failed: {e}"
-            )))
-        })? {
+        loop {
+            // Race the next streaming event against cancellation.
+            // Dropping `stream` closes the underlying HTTP body the
+            // same way the SSE adapters do.
+            let event_result = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    tracing::debug!("Bedrock stream cancelled by token");
+                    drop(stream);
+                    return Err(StreamingDispatchError::Other(CoreError::Cancelled));
+                }
+                ev = stream.recv() => ev,
+            };
+            let event = match event_result {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(StreamingDispatchError::Other(CoreError::Llm(format!(
+                        "Bedrock stream receive failed: {e}"
+                    ))));
+                }
+            };
             if !apply_stream_event(
                 event,
                 &mut text,
@@ -2295,6 +2339,60 @@ mod tests {
         assert_eq!(
             json["items"],
             serde_json::json!(["a", serde_json::Value::Null])
+        );
+    }
+
+    // --- Cancellation (issue #109) ---------------------------------------
+
+    /// The Bedrock adapter routes through the AWS SDK, which is not
+    /// trivially mockable at the HTTP level the way `httpmock` lets us
+    /// stub the other adapters. The contract we verify here is the one
+    /// the cancellation work introduces at the connector boundary:
+    /// when the task-local `CANCELLATION_TOKEN` is already tripped on
+    /// entry to `stream_completion`, the adapter returns
+    /// `CoreError::Cancelled` without dispatching any AWS request.
+    ///
+    /// The mid-stream `tokio::select!` against `token.cancelled()` is
+    /// covered indirectly by the core-level test
+    /// `send_prompt_returns_cancelled_when_token_fires_mid_stream`,
+    /// which drives a `SlowStreamLlm` modelled on the same shape the
+    /// real connector uses.
+    #[tokio::test]
+    async fn bedrock_stream_aborts_on_cancellation() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use tokio_util::sync::CancellationToken;
+
+        // Use a fake API key and no real credentials. The point is the
+        // entry-check: cancellation pre-empts the request before the
+        // SDK is invoked, so missing credentials never matter.
+        let client = BedrockClient::new("fake".into()).with_model("anthropic.claude-sonnet-4-6");
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        // The check must run *before* the SDK reaches the network. AWS
+        // credential resolution alone can take many ms; 1s is generous.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "pre-cancelled token should short-circuit before AWS dispatch; took {elapsed:?}"
         );
     }
 }

@@ -895,6 +895,15 @@ where
             effort: o.effort,
         });
 
+        // Per-turn cancellation token (issue #109). For now the
+        // application layer always passes a fresh never-cancelled
+        // token; the future registry / Cancel-button work (#111/#112)
+        // will hold this clone alongside the join handle so the user
+        // can trip it. Threading the parameter here is the
+        // foundation that lets those issues land without further
+        // touching `send_prompt_with_override` call sites.
+        let cancellation = tokio_util::sync::CancellationToken::new();
+
         let outcome = self
             .conversations
             .send_prompt_with_override(
@@ -903,6 +912,7 @@ where
                 override_for_core,
                 callback,
                 on_status,
+                cancellation,
             )
             .await;
 

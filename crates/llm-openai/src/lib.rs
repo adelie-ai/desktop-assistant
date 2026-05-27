@@ -464,15 +464,25 @@ impl OpenAiClient {
             &request_json[..request_json.len().min(2000)]
         );
 
-        let response = self
+        // Cooperative cancellation token (issue #109): see Anthropic
+        // adapter for the threading rationale.
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
+        if cancellation.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
+        let send_fut = self
             .client
             .post(format!("{}/responses", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(request_body)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
+            .send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -534,7 +544,18 @@ impl OpenAiClient {
         let mut tool_acc = ResponseToolAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
 
-        while let Some(event) = events.next().await {
+        loop {
+            // Race the next SSE event against cancellation. See the
+            // Anthropic adapter for the rationale; same pattern here.
+            let next = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    tracing::debug!("OpenAI stream cancelled by token");
+                    drop(events);
+                    return Err(CoreError::Cancelled);
+                }
+                ev = events.next() => ev,
+            };
+            let Some(event) = next else { break };
             let event = event.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
             let data = event.data.as_str();
             match event.event.as_str() {
@@ -1756,6 +1777,59 @@ mod tests {
         assert_eq!(
             parse_retry_after_header(&headers),
             Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    // --- Cancellation (issue #109) ---------------------------------------
+
+    /// Drive the streaming entrypoint against a local stub that holds the
+    /// connection open for several seconds. Cancellation must surface
+    /// `CoreError::Cancelled` and unblock well before the stub's delay
+    /// completes — that's the "stream is dropped" assertion.
+    #[tokio::test]
+    async fn openai_stream_aborts_on_cancellation() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .delay(Duration::from_secs(5))
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let token = CancellationToken::new();
+        let cancel_handle = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_handle.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stream should abort promptly on cancellation; took {elapsed:?}"
         );
     }
 }

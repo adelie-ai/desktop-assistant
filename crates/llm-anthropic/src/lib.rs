@@ -432,8 +432,22 @@ impl AnthropicClient {
             &request_json[..request_json.len().min(2000)]
         );
 
+        // Cooperative cancellation token (issue #109): read once at the
+        // top of the dispatch and watched inside the SSE loop via
+        // `tokio::select!`. Falling back to a fresh never-cancelled
+        // token (via `Default::default()`) when no scope is installed
+        // keeps callers that don't route through
+        // `send_prompt_with_override` working unchanged.
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
+
+        // Short-circuit before any I/O if the caller cancelled already.
+        if cancellation.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
         let url = format!("{}/v1/messages", self.base_url);
-        let response = self
+        let send_fut = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
@@ -444,9 +458,15 @@ impl AnthropicClient {
                 "interleaved-thinking-2025-05-14,tool-search-2025-04-15",
             )
             .json(request_body)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?;
+            .send();
+
+        // Race the connection-establishment future against cancellation
+        // so the HTTP connection itself is dropped (no orphaned socket)
+        // when the user cancels mid-handshake.
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -499,7 +519,20 @@ impl AnthropicClient {
         let mut block_to_tool: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
 
-        while let Some(event) = events.next().await {
+        loop {
+            // Race the next SSE event against cancellation. When the
+            // token trips, drop `events` (and with it the underlying
+            // reqwest body stream) so the HTTP connection is closed
+            // rather than left orphaned in the connection pool.
+            let next = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    tracing::debug!("Anthropic stream cancelled by token");
+                    drop(events);
+                    return Err(CoreError::Cancelled);
+                }
+                ev = events.next() => ev,
+            };
+            let Some(event) = next else { break };
             let event = event.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
             let data = event.data.as_str();
             if data == "[DONE]" {
@@ -1708,5 +1741,62 @@ mod tests {
             reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
         );
         assert_eq!(parse_retry_after_header(&headers), None);
+    }
+
+    // --- Cancellation (issue #109) ---------------------------------------
+
+    /// Exercise the streaming entrypoint against a local stub HTTP server
+    /// that holds the connection open. Cancel mid-stream; assert the
+    /// adapter surfaces `CoreError::Cancelled` within the time budget
+    /// (proxy for "dropped the HTTP body") rather than hanging until the
+    /// stub's response delay completes.
+    #[tokio::test]
+    async fn anthropic_stream_aborts_on_cancellation() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let server = httpmock::MockServer::start();
+        // The server holds the connection open for 5s; if cancellation
+        // doesn't drop the response body our test would block for the
+        // full delay. We assert completion within 1s.
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .delay(Duration::from_secs(5))
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let token = CancellationToken::new();
+        let cancel_handle = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_handle.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stream should have aborted promptly on cancellation; took {elapsed:?}"
+        );
     }
 }

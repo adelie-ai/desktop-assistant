@@ -677,8 +677,19 @@ where
         // interactive-purpose fallback to route the turn to the right
         // connection + effort, so we route it through the same
         // resolution + dispatch machinery as the override path.
+        //
+        // Issue #109: pass a fresh, never-tripped `CancellationToken`
+        // since this entry has no cancel knob yet. Adapters that want
+        // cancellation must call `send_prompt_with_override` directly.
         let outcome = self
-            .send_prompt_with_override(conversation_id, prompt, None, on_chunk, on_status)
+            .send_prompt_with_override(
+                conversation_id,
+                prompt,
+                None,
+                on_chunk,
+                on_status,
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await?;
         Ok(outcome.response)
     }
@@ -690,6 +701,7 @@ where
         override_selection: Option<PromptSelectionOverride>,
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<PromptDispatchOutcome, CoreError> {
         let mut warnings: Vec<DispatchWarning> = Vec::new();
 
@@ -877,6 +889,9 @@ where
         //   - `current_model_override()` surfaces the resolved `model_id`
         //     so connectors send the user-chosen model rather than
         //     `self.model` (the connection's startup default).
+        //   - `current_cancellation_token()` (issue #109) surfaces the
+        //     per-turn cancellation token so the agentic loop and each
+        //     LLM adapter can `tokio::select!` against it.
         let inner = Arc::clone(&self.inner);
         let conv_id = conversation_id.clone();
         let response = {
@@ -887,6 +902,8 @@ where
             };
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch = with_context_budget(budget, dispatch);
+            let dispatch =
+                desktop_assistant_core::ports::llm::with_cancellation_token(cancellation, dispatch);
             // Wrap in `with_model_override` only when we installed an
             // `active_client`; the interactive-purpose fallback path
             // intentionally leaves both unset (see #33).
@@ -1452,6 +1469,7 @@ mod tests {
                     }),
                     on_chunk,
                     on_status,
+                    tokio_util::sync::CancellationToken::new(),
                 )
                 .await
                 .unwrap_err();
@@ -1796,6 +1814,7 @@ mod tests {
                     }),
                     on_chunk,
                     on_status,
+                    tokio_util::sync::CancellationToken::new(),
                 )
                 .await
                 .expect("override dispatch should succeed via mocked /api/tags");
@@ -1873,6 +1892,7 @@ mod tests {
                     }),
                     on_chunk,
                     on_status,
+                    tokio_util::sync::CancellationToken::new(),
                 )
                 .await
                 .expect("default-model override should succeed");
@@ -1918,6 +1938,7 @@ mod tests {
                     None,
                     on_chunk,
                     on_status,
+                    tokio_util::sync::CancellationToken::new(),
                 )
                 .await
                 .expect("dispatch must succeed via fallback");

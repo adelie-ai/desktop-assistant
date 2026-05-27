@@ -68,6 +68,16 @@ pub enum CoreError {
 
     #[error("tool execution error: {0}")]
     ToolExecution(String),
+
+    /// The caller cancelled this `send_prompt` via a
+    /// `tokio_util::sync::CancellationToken`. Surfaced when the token is
+    /// observed tripped at one of the cooperative checkpoints in the
+    /// agentic loop — between turns, before each tool-round dispatch, or
+    /// mid-stream inside an LLM adapter's `tokio::select!`. Not retried
+    /// by `RetryingLlmClient` (see `is_retryable_error`); the cancellation
+    /// is the user's explicit signal to stop.
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 #[cfg(test)]
