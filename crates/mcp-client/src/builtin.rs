@@ -97,7 +97,40 @@ impl BuiltinToolService {
         self
     }
 
-    /// Configure database query closure for read-only SQL access.
+    /// Configure the database-query closure for the `builtin_db_query`
+    /// tool.
+    ///
+    /// ## Security posture (issue #141)
+    ///
+    /// The closure runs *arbitrary* LLM-supplied SQL. The implementation
+    /// behind it (see `desktop_assistant_storage::execute_database_query`)
+    /// enforces the following invariants before any text reaches the
+    /// pool, so it is safe to wire the tool against the same pool used
+    /// for ordinary application traffic:
+    ///
+    /// - **SELECT-only on the read path.** Only single-statement
+    ///   `SELECT` / `WITH` / `TABLE` / `VALUES` / `EXPLAIN` queries
+    ///   are accepted; everything else is parsed-and-rejected.
+    /// - **Per-user (`user_id`) scoping by AST rewrite.** Every
+    ///   reference to a personal-data table (`conversations`,
+    ///   `messages`, `knowledge_base`, etc.) has a
+    ///   `<table>.user_id = $N` predicate grafted into its `WHERE`
+    ///   clause, bound to the caller's task-local `UserId`. An
+    ///   LLM-supplied predicate naming a different user_id is AND'd
+    ///   with the grafted one, so the intersection is empty.
+    /// - **Compound statements rejected.** `SELECT 1; DROP TABLE …`
+    ///   produces two statements at parse time and is refused.
+    /// - **Writes confined to scratch.** DDL/DML that names a
+    ///   personal-data table (qualified or otherwise) is rejected; the
+    ///   write path's `search_path TO scratch, public` then carries
+    ///   unqualified writes into the per-database `scratch` schema
+    ///   only, so the LLM can still set up staging tables and
+    ///   intermediate joins.
+    ///
+    /// Pre-#141 this docstring contained a single-line "read-only"
+    /// claim — which the implementation did not enforce. The audit
+    /// test `comment_in_builtin_rs_matches_actual_security_posture`
+    /// in this file pins the wording against that regression.
     pub fn with_database(mut self, query_fn: DbQueryFn) -> Self {
         self.db_query_fn = Some(query_fn);
         self
@@ -849,6 +882,74 @@ fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-#141 docstring on `with_database` claimed "read-only SQL
+    /// access" — which the implementation did not enforce. Comment-vs-
+    /// behaviour drift on a security-relevant surface is a real bug;
+    /// the audit pass in #141 surfaced exactly this kind of drift on
+    /// the `execute_database_query` tool.
+    ///
+    /// This test pins the docstring against the post-#141 contract.
+    /// If you change the wording, update this test in the same commit
+    /// so the assertion still describes what the code actually does.
+    ///
+    /// The check reads the source file at compile time via
+    /// `include_str!` so we're asserting against the *literal* text
+    /// the reviewer will see, not against something the compiler
+    /// could fold away.
+    #[test]
+    fn comment_in_builtin_rs_matches_actual_security_posture() {
+        const SRC: &str = include_str!("builtin.rs");
+
+        // Locate the doc-comment block immediately preceding
+        // `pub fn with_database(`. The block is the contiguous run of
+        // `///` lines above the function signature.
+        let fn_pos = SRC
+            .find("pub fn with_database(")
+            .expect("with_database fn declaration must exist");
+        let preceding = &SRC[..fn_pos];
+        let doc_block: String = preceding
+            .lines()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim_start();
+                t.starts_with("///") || t.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+
+        // Forbidden: the misleading "read-only" claim from before
+        // #141. It's misleading in two ways — the tool *did* allow
+        // writes (to the scratch namespace and, footgun, to qualified
+        // public tables), and even the "read-only" reads were
+        // unscoped across tenants.
+        assert!(
+            !doc_block.contains("read-only sql access"),
+            "with_database docstring still claims `read-only SQL access`; \
+             pre-#141 wording is back. Current block:\n---\n{doc_block}\n---"
+        );
+
+        // Required: the doc must surface the two facts the LLM-
+        // exposed tool actually enforces post-#141 — SELECT-only and
+        // per-user scoping. Word choice is flexible (`scoped` /
+        // `tenant` / `user_id` all read as the same thing); the test
+        // just refuses an empty mention.
+        assert!(
+            doc_block.contains("select"),
+            "with_database docstring must mention SELECT-only enforcement. \
+             Current block:\n---\n{doc_block}\n---"
+        );
+        assert!(
+            doc_block.contains("user_id") || doc_block.contains("per-user")
+                || doc_block.contains("tenant"),
+            "with_database docstring must mention per-user / user_id / tenant scoping. \
+             Current block:\n---\n{doc_block}\n---"
+        );
+    }
 
     #[test]
     fn builtins_expose_expected_tools() {
