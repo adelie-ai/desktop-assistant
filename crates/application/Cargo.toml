@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait.workspace = true
+desktop-assistant-auth-jwt.workspace = true
 desktop-assistant-core.workspace = true
 desktop-assistant-api-model = { path = "../api-model" }
 thiserror.workspace = true

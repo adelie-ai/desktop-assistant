@@ -2,6 +2,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
     Conversation, ConversationId, Message, MessageSummary, Role, ToolCall,
 };
+use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::inbound::ConversationModelSelection;
 use desktop_assistant_core::ports::store::ConversationStore;
 use sqlx::PgPool;
@@ -25,6 +26,7 @@ impl PgConversationStore {
         conversation_id: &ConversationId,
         selection: Option<&ConversationModelSelection>,
     ) -> Result<(), CoreError> {
+        let user_id = current_user_id();
         let json = match selection {
             Some(sel) => Some(
                 serde_json::to_value(sel)
@@ -32,14 +34,21 @@ impl PgConversationStore {
             ),
             None => None,
         };
-        let result =
-            sqlx::query("UPDATE conversations SET last_model_selection = $2 WHERE id = $1")
-                .bind(&conversation_id.0)
-                .bind(json)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let result = sqlx::query(
+            "UPDATE conversations SET last_model_selection = $3 \
+             WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&conversation_id.0)
+        .bind(json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
         if result.rows_affected() == 0 {
+            // Either the conversation id is unknown or it belongs to a
+            // different user. We return `ConversationNotFound` in both
+            // cases so cross-user probes can't distinguish "doesn't
+            // exist" from "not yours" (#105: don't leak existence).
             return Err(CoreError::ConversationNotFound(conversation_id.0.clone()));
         }
         Ok(())
@@ -47,17 +56,22 @@ impl PgConversationStore {
 
     /// Read the stored model selection for a conversation. Returns `None`
     /// when the conversation exists but has no stored selection; returns
-    /// `ConversationNotFound` when the id is unknown.
+    /// `ConversationNotFound` when the id is unknown OR belongs to a
+    /// different user.
     pub async fn get_conversation_model_selection(
         &self,
         conversation_id: &ConversationId,
     ) -> Result<Option<ConversationModelSelection>, CoreError> {
-        let row: Option<(Option<serde_json::Value>,)> =
-            sqlx::query_as("SELECT last_model_selection FROM conversations WHERE id = $1")
-                .bind(&conversation_id.0)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let user_id = current_user_id();
+        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+            "SELECT last_model_selection FROM conversations \
+             WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&conversation_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         let row = row.ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
         let Some(json) = row.0 else {
@@ -91,6 +105,7 @@ fn str_to_role(s: &str) -> Role {
 
 impl ConversationStore for PgConversationStore {
     async fn create(&self, conv: Conversation) -> Result<(), CoreError> {
+        let user_id = current_user_id();
         let mut tx = self
             .pool
             .begin()
@@ -98,10 +113,13 @@ impl ConversationStore for PgConversationStore {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO conversations (id, title, created_at, updated_at, context_summary, compacted_through, archived_at, active_task)
-             VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5, $6, $7, $8)"
+            "INSERT INTO conversations \
+                (id, user_id, title, created_at, updated_at, context_summary, \
+                 compacted_through, archived_at, active_task) \
+             VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6, $7, $8, $9)",
         )
         .bind(&conv.id.0)
+        .bind(user_id.as_str())
         .bind(&conv.title)
         .bind(parse_timestamp(&conv.created_at))
         .bind(parse_timestamp(&conv.updated_at))
@@ -114,7 +132,7 @@ impl ConversationStore for PgConversationStore {
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         for (ordinal, msg) in conv.messages.iter().enumerate() {
-            insert_message(&mut tx, &conv.id.0, ordinal, msg).await?;
+            insert_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
         }
 
         tx.commit()
@@ -124,10 +142,13 @@ impl ConversationStore for PgConversationStore {
     }
 
     async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+        let user_id = current_user_id();
         let row: Option<ConvRow> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at, active_task
-             FROM conversations WHERE id = $1",
+            "SELECT id, title, created_at, updated_at, context_summary, \
+                    compacted_through, archived_at, active_task \
+             FROM conversations WHERE user_id = $1 AND id = $2",
         )
+        .bind(user_id.as_str())
         .bind(&id.0)
         .fetch_optional(&self.pool)
         .await
@@ -136,9 +157,12 @@ impl ConversationStore for PgConversationStore {
         let row = row.ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
 
         let msg_rows: Vec<MsgRow> = sqlx::query_as(
-            "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id
-             FROM messages WHERE conversation_id = $1 ORDER BY ordinal",
+            "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id \
+             FROM messages \
+             WHERE user_id = $1 AND conversation_id = $2 \
+             ORDER BY ordinal",
         )
+        .bind(user_id.as_str())
         .bind(&id.0)
         .fetch_all(&self.pool)
         .await
@@ -147,9 +171,12 @@ impl ConversationStore for PgConversationStore {
         let messages = msg_rows.into_iter().map(msg_from_row).collect();
 
         let summary_rows: Vec<SummaryRow> = sqlx::query_as(
-            "SELECT id, summary
-             FROM message_summaries WHERE conversation_id = $1 ORDER BY start_ordinal",
+            "SELECT id, summary \
+             FROM message_summaries \
+             WHERE user_id = $1 AND conversation_id = $2 \
+             ORDER BY start_ordinal",
         )
+        .bind(user_id.as_str())
         .bind(&id.0)
         .fetch_all(&self.pool)
         .await
@@ -178,10 +205,15 @@ impl ConversationStore for PgConversationStore {
     }
 
     async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+        let user_id = current_user_id();
         let rows: Vec<ConvRow> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, context_summary, compacted_through, archived_at, active_task
-             FROM conversations ORDER BY updated_at DESC",
+            "SELECT id, title, created_at, updated_at, context_summary, \
+                    compacted_through, archived_at, active_task \
+             FROM conversations \
+             WHERE user_id = $1 \
+             ORDER BY updated_at DESC",
         )
+        .bind(user_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -189,9 +221,12 @@ impl ConversationStore for PgConversationStore {
         let mut conversations = Vec::with_capacity(rows.len());
         for row in rows {
             let msg_rows: Vec<MsgRow> = sqlx::query_as(
-                "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id
-                 FROM messages WHERE conversation_id = $1 ORDER BY ordinal",
+                "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id \
+                 FROM messages \
+                 WHERE user_id = $1 AND conversation_id = $2 \
+                 ORDER BY ordinal",
             )
+            .bind(user_id.as_str())
             .bind(&row.id)
             .fetch_all(&self.pool)
             .await
@@ -200,9 +235,12 @@ impl ConversationStore for PgConversationStore {
             let messages = msg_rows.into_iter().map(msg_from_row).collect();
 
             let summary_rows: Vec<SummaryRow> = sqlx::query_as(
-                "SELECT id, summary
-                 FROM message_summaries WHERE conversation_id = $1 ORDER BY start_ordinal",
+                "SELECT id, summary \
+                 FROM message_summaries \
+                 WHERE user_id = $1 AND conversation_id = $2 \
+                 ORDER BY start_ordinal",
             )
+            .bind(user_id.as_str())
             .bind(&row.id)
             .fetch_all(&self.pool)
             .await
@@ -234,6 +272,7 @@ impl ConversationStore for PgConversationStore {
     }
 
     async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
+        let user_id = current_user_id();
         let mut tx = self
             .pool
             .begin()
@@ -241,10 +280,12 @@ impl ConversationStore for PgConversationStore {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         let result = sqlx::query(
-            "UPDATE conversations SET title = $2, updated_at = $3::timestamptz,
-                    context_summary = $4, compacted_through = $5, active_task = $6
-             WHERE id = $1",
+            "UPDATE conversations \
+             SET title = $3, updated_at = $4::timestamptz, \
+                 context_summary = $5, compacted_through = $6, active_task = $7 \
+             WHERE user_id = $1 AND id = $2",
         )
+        .bind(user_id.as_str())
         .bind(&conv.id.0)
         .bind(&conv.title)
         .bind(parse_timestamp(&conv.updated_at))
@@ -259,15 +300,20 @@ impl ConversationStore for PgConversationStore {
             return Err(CoreError::ConversationNotFound(conv.id.0.clone()));
         }
 
-        // Replace all messages: delete existing, re-insert
-        sqlx::query("DELETE FROM messages WHERE conversation_id = $1")
-            .bind(&conv.id.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        // Replace all messages: delete existing, re-insert. Scoped by
+        // user_id as defense-in-depth — the UPDATE above already
+        // proved the conversation belongs to this user.
+        sqlx::query(
+            "DELETE FROM messages WHERE user_id = $1 AND conversation_id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&conv.id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         for (ordinal, msg) in conv.messages.iter().enumerate() {
-            insert_message(&mut tx, &conv.id.0, ordinal, msg).await?;
+            insert_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
         }
 
         tx.commit()
@@ -277,11 +323,15 @@ impl ConversationStore for PgConversationStore {
     }
 
     async fn delete(&self, id: &ConversationId) -> Result<(), CoreError> {
-        let result = sqlx::query("DELETE FROM conversations WHERE id = $1")
-            .bind(&id.0)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let user_id = current_user_id();
+        let result = sqlx::query(
+            "DELETE FROM conversations WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(CoreError::ConversationNotFound(id.0.clone()));
@@ -290,22 +340,30 @@ impl ConversationStore for PgConversationStore {
     }
 
     async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+        let user_id = current_user_id();
         let result = sqlx::query(
-            "UPDATE conversations SET archived_at = NOW() WHERE id = $1 AND archived_at IS NULL",
+            "UPDATE conversations SET archived_at = NOW() \
+             WHERE user_id = $1 AND id = $2 AND archived_at IS NULL",
         )
+        .bind(user_id.as_str())
         .bind(&id.0)
         .execute(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
-            // Either not found or already archived — check which.
-            let exists: Option<(i64,)> =
-                sqlx::query_as("SELECT 1 FROM conversations WHERE id = $1")
-                    .bind(&id.0)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| CoreError::Storage(e.to_string()))?;
+            // Either not found, already archived, or owned by a
+            // different user — `SELECT 1 …` distinguishes. The
+            // existence probe is itself user-scoped so a cross-user
+            // lookup still returns "not found" without leaking.
+            let exists: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM conversations WHERE user_id = $1 AND id = $2",
+            )
+            .bind(user_id.as_str())
+            .bind(&id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
             if exists.is_none() {
                 return Err(CoreError::ConversationNotFound(id.0.clone()));
             }
@@ -314,11 +372,16 @@ impl ConversationStore for PgConversationStore {
     }
 
     async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
-        let result = sqlx::query("UPDATE conversations SET archived_at = NULL WHERE id = $1")
-            .bind(&id.0)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let user_id = current_user_id();
+        let result = sqlx::query(
+            "UPDATE conversations SET archived_at = NULL \
+             WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(CoreError::ConversationNotFound(id.0.clone()));
@@ -333,6 +396,7 @@ impl ConversationStore for PgConversationStore {
         start_ordinal: usize,
         end_ordinal: usize,
     ) -> Result<String, CoreError> {
+        let user_id = current_user_id();
         let id = uuid::Uuid::now_v7().to_string();
         let mut tx = self
             .pool
@@ -341,10 +405,12 @@ impl ConversationStore for PgConversationStore {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO message_summaries (id, conversation_id, summary, start_ordinal, end_ordinal)
-             VALUES ($1, $2, $3, $4, $5)"
+            "INSERT INTO message_summaries \
+                (id, user_id, conversation_id, summary, start_ordinal, end_ordinal) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(&id)
+        .bind(user_id.as_str())
         .bind(&conversation_id.0)
         .bind(&summary)
         .bind(start_ordinal as i32)
@@ -354,11 +420,12 @@ impl ConversationStore for PgConversationStore {
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         sqlx::query(
-            "UPDATE messages SET summary_id = $1
-             WHERE conversation_id = $2 AND ordinal BETWEEN $3 AND $4",
+            "UPDATE messages SET summary_id = $3 \
+             WHERE user_id = $1 AND conversation_id = $2 AND ordinal BETWEEN $4 AND $5",
         )
-        .bind(&id)
+        .bind(user_id.as_str())
         .bind(&conversation_id.0)
+        .bind(&id)
         .bind(start_ordinal as i32)
         .bind(end_ordinal as i32)
         .execute(&mut *tx)
@@ -372,18 +439,23 @@ impl ConversationStore for PgConversationStore {
     }
 
     async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+        let user_id = current_user_id();
         // ON DELETE SET NULL on messages.summary_id handles clearing the references.
-        sqlx::query("DELETE FROM message_summaries WHERE id = $1")
-            .bind(summary_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query(
+            "DELETE FROM message_summaries WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(summary_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(())
     }
 }
 
 async fn insert_message(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
     conversation_id: &str,
     ordinal: usize,
     msg: &Message,
@@ -395,10 +467,13 @@ async fn insert_message(
     };
 
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, ordinal, role, content, tool_calls, tool_call_id, summary_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        "INSERT INTO messages \
+            (id, user_id, conversation_id, ordinal, role, content, \
+             tool_calls, tool_call_id, summary_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(uuid::Uuid::now_v7().to_string())
+    .bind(user_id)
     .bind(conversation_id)
     .bind(ordinal as i32)
     .bind(role_to_str(&msg.role))

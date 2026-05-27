@@ -16,7 +16,7 @@ uuid = { version = "1", features = ["v4"] }
 
 desktop-assistant-api-model = { path = "../api-model" }
 desktop-assistant-application = { path = "../application" }
+desktop-assistant-core.workspace = true
 
 [dev-dependencies]
-desktop-assistant-core = { path = "../core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -48,17 +49,50 @@ pub async fn run_consolidation_phase(
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
 ) -> Result<ConsolidationStats, String> {
-    let focals = load_entries_needing_review(pool).await?;
-    if focals.is_empty() {
+    // Load focals across all users, grouped by user. The cross-user
+    // scan is audit-allowlisted (background-worker entry point); from
+    // here on every per-user batch installs a `with_user_id` scope so
+    // all sub-queries land in the right partition.
+    let focals_by_user = load_entries_needing_review_by_user(pool).await?;
+    if focals_by_user.is_empty() {
         tracing::debug!("dreaming: no entries needing review");
         return Ok(ConsolidationStats::default());
     }
-    tracing::info!(
-        "dreaming: consolidation reviewing {} focal entr{}",
-        focals.len(),
-        if focals.len() == 1 { "y" } else { "ies" }
-    );
 
+    let mut total = ConsolidationStats::default();
+
+    for (user_id_str, focals) in focals_by_user {
+        if focals.is_empty() {
+            continue;
+        }
+        tracing::info!(
+            "dreaming: consolidation reviewing {} focal entr{} for user {user_id_str}",
+            focals.len(),
+            if focals.len() == 1 { "y" } else { "ies" }
+        );
+
+        let stats = with_user_id(UserId::new(user_id_str.clone()), async {
+            consolidate_user_focals(pool, llm_fn, embed_fn, embedding_model, focals).await
+        })
+        .await?;
+
+        total.reviewed += stats.reviewed;
+        total.merged_clusters += stats.merged_clusters;
+        total.updated += stats.updated;
+        total.scope_added += stats.scope_added;
+        total.soft_deleted += stats.soft_deleted;
+    }
+
+    Ok(total)
+}
+
+async fn consolidate_user_focals(
+    pool: &PgPool,
+    llm_fn: &DreamingLlmFn,
+    embed_fn: &BackfillEmbedFn,
+    embedding_model: &str,
+    focals: Vec<KbRow>,
+) -> Result<ConsolidationStats, String> {
     let mut buffer = OpBuffer::new();
 
     for focal in &focals {
@@ -136,16 +170,60 @@ pub async fn run_consolidation_phase(
     Ok(stats)
 }
 
-async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, String> {
-    let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, content, tags, metadata
-         FROM knowledge_base
-         WHERE reviewed_at IS NULL
-           AND deleted_at IS NULL
-           AND review_generation < $1
-         ORDER BY created_at ASC
+async fn load_entries_needing_review_by_user(
+    pool: &PgPool,
+) -> Result<Vec<(String, Vec<KbRow>)>, String> {
+    // Audit-allowlisted: cross-user scan in the dreaming background
+    // worker. The caller groups by user_id and installs a per-user
+    // task-local scope before doing anything else with each row.
+    let rows: Vec<(String, String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT user_id, id, content, tags, metadata \
+         FROM knowledge_base \
+         WHERE reviewed_at IS NULL \
+           AND deleted_at IS NULL \
+           AND review_generation < $1 \
+         ORDER BY user_id, created_at ASC \
          LIMIT $2",
     )
+    .bind(MAX_REVIEW_GENERATION)
+    .bind(MAX_REVIEWS_PER_CYCLE)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("dreaming: load focals failed: {e}"))?;
+
+    let mut grouped: BTreeMap<String, Vec<KbRow>> = BTreeMap::new();
+    for (user_id, id, content, tags, metadata_json) in rows {
+        grouped
+            .entry(user_id)
+            .or_default()
+            .push(KbRow {
+                id,
+                content,
+                tags,
+                metadata: KbMetadata::from_json(&metadata_json),
+                distance: f64::NAN,
+            });
+    }
+    Ok(grouped.into_iter().collect())
+}
+
+/// Legacy helper kept for symmetry; tests still construct KbRows with
+/// the same factory shape.
+#[cfg(test)]
+#[allow(dead_code)]
+async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, String> {
+    let user_id = current_user_id();
+    let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, content, tags, metadata \
+         FROM knowledge_base \
+         WHERE user_id = $1 \
+           AND reviewed_at IS NULL \
+           AND deleted_at IS NULL \
+           AND review_generation < $2 \
+         ORDER BY created_at ASC \
+         LIMIT $3",
+    )
+    .bind(user_id.as_str())
     .bind(MAX_REVIEW_GENERATION)
     .bind(MAX_REVIEWS_PER_CYCLE)
     .fetch_all(pool)
@@ -165,13 +243,16 @@ async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, String
 }
 
 async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, String> {
+    let user_id = current_user_id();
     // Pull the focal's first embedding chunk to use as the similarity probe.
-    let focal_chunk: Option<(Vec<Vector>,)> =
-        sqlx::query_as("SELECT embedding FROM knowledge_base WHERE id = $1")
-            .bind(&focal.id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("dreaming: load focal embedding failed: {e}"))?;
+    let focal_chunk: Option<(Vec<Vector>,)> = sqlx::query_as(
+        "SELECT embedding FROM knowledge_base WHERE user_id = $1 AND id = $2",
+    )
+    .bind(user_id.as_str())
+    .bind(&focal.id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("dreaming: load focal embedding failed: {e}"))?;
 
     let probe = match focal_chunk.and_then(|(v,)| v.into_iter().next()) {
         Some(v) => v,
@@ -183,25 +264,28 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
 
     let mut by_id: BTreeMap<String, KbRow> = BTreeMap::new();
 
-    // Tag-overlap search.
+    // Tag-overlap search. Scoped to the same user — candidates from
+    // other users' KBs must never reach the LLM's review window.
     if !focal.tags.is_empty() {
         let tag_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> =
             sqlx::query_as(
-                "SELECT kb.id, kb.content, kb.tags, kb.metadata,
-                        COALESCE(MIN(u.chunk <=> $1), 2.0) AS distance
-                 FROM knowledge_base kb
-                 LEFT JOIN LATERAL unnest(kb.embedding) AS u(chunk) ON true
-                 WHERE kb.id != $2
-                   AND kb.deleted_at IS NULL
-                   AND kb.tags && $3
-                 GROUP BY kb.id, kb.content, kb.tags, kb.metadata
-                 ORDER BY distance ASC
+                "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
+                        COALESCE(MIN(u.chunk <=> $1), 2.0) AS distance \
+                 FROM knowledge_base kb \
+                 LEFT JOIN LATERAL unnest(kb.embedding) AS u(chunk) ON true \
+                 WHERE kb.user_id = $5 \
+                   AND kb.id != $2 \
+                   AND kb.deleted_at IS NULL \
+                   AND kb.tags && $3 \
+                 GROUP BY kb.id, kb.content, kb.tags, kb.metadata \
+                 ORDER BY distance ASC \
                  LIMIT $4",
             )
             .bind(&probe)
             .bind(&focal.id)
             .bind(&focal.tags)
             .bind(MAX_REVIEW_CANDIDATES)
+            .bind(user_id.as_str())
             .fetch_all(pool)
             .await
             .map_err(|e| format!("dreaming: tag-overlap retrieve failed: {e}"))?;
@@ -220,24 +304,26 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
         }
     }
 
-    // Embedding-similarity search (catches related-by-content entries that
-    // don't share tags).
+    // Embedding-similarity search (catches related-by-content entries
+    // that don't share tags). Scoped to the same user.
     let emb_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> =
         sqlx::query_as(
-            "SELECT kb.id, kb.content, kb.tags, kb.metadata,
-                    MIN(u.chunk <=> $1) AS distance
-             FROM knowledge_base kb,
-                  LATERAL unnest(kb.embedding) AS u(chunk)
-             WHERE kb.id != $2
-               AND kb.deleted_at IS NULL
-               AND kb.embedding IS NOT NULL
-             GROUP BY kb.id, kb.content, kb.tags, kb.metadata
-             ORDER BY distance ASC
+            "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
+                    MIN(u.chunk <=> $1) AS distance \
+             FROM knowledge_base kb, \
+                  LATERAL unnest(kb.embedding) AS u(chunk) \
+             WHERE kb.user_id = $4 \
+               AND kb.id != $2 \
+               AND kb.deleted_at IS NULL \
+               AND kb.embedding IS NOT NULL \
+             GROUP BY kb.id, kb.content, kb.tags, kb.metadata \
+             ORDER BY distance ASC \
              LIMIT $3",
         )
         .bind(&probe)
         .bind(&focal.id)
         .bind(MAX_REVIEW_CANDIDATES)
+        .bind(user_id.as_str())
         .fetch_all(pool)
         .await
         .map_err(|e| format!("dreaming: embedding retrieve failed: {e}"))?;
@@ -274,16 +360,19 @@ async fn retrieve_by_tags_only(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow
     if focal.tags.is_empty() {
         return Ok(Vec::new());
     }
+    let user_id = current_user_id();
     let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, content, tags, metadata
-         FROM knowledge_base
-         WHERE id != $1 AND deleted_at IS NULL AND tags && $2
-         ORDER BY updated_at DESC
+        "SELECT id, content, tags, metadata \
+         FROM knowledge_base \
+         WHERE user_id = $4 \
+           AND id != $1 AND deleted_at IS NULL AND tags && $2 \
+         ORDER BY updated_at DESC \
          LIMIT $3",
     )
     .bind(&focal.id)
     .bind(&focal.tags)
     .bind(MAX_REVIEW_CANDIDATES)
+    .bind(user_id.as_str())
     .fetch_all(pool)
     .await
     .map_err(|e| format!("dreaming: tag-only retrieve failed: {e}"))?;
@@ -652,11 +741,13 @@ async fn load_cluster_members(
         }
     }
     if !missing.is_empty() {
+        let user_id = current_user_id();
         type KbRowTuple = (String, String, Vec<String>, serde_json::Value);
         let rows: Result<Vec<KbRowTuple>, _> = sqlx::query_as(
-            "SELECT id, content, tags, metadata FROM knowledge_base
-             WHERE id = ANY($1) AND deleted_at IS NULL",
+            "SELECT id, content, tags, metadata FROM knowledge_base \
+             WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
         )
+        .bind(user_id.as_str())
         .bind(&missing)
         .fetch_all(pool)
         .await;

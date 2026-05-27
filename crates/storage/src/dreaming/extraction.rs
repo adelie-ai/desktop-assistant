@@ -18,6 +18,7 @@
 use std::collections::BTreeSet;
 
 use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
+use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -48,64 +49,106 @@ pub async fn run_extraction_phase(
         conversations.len()
     );
 
+    let mut total_written = 0usize;
+
+    for (conv_id, user_id_str, watermark, context_summary) in conversations {
+        // Install the conversation's owning user as the request-scoped
+        // identity for the duration of this conversation's processing.
+        // Every sub-query (`tag_registry::list_active_tags`,
+        // `get_max_ordinal`, `load_new_transcript`, `update_watermark`,
+        // `write_extracted_fact`) reads `current_user_id()` at SQL
+        // composition time and lands inside this user's partition.
+        let written_this_conv = with_user_id(UserId::new(user_id_str.clone()), async {
+            process_one_conversation_for_extraction(
+                pool,
+                llm_fn,
+                embed_fn,
+                embedding_model,
+                &conv_id,
+                watermark,
+                &context_summary,
+            )
+            .await
+        })
+        .await;
+
+        match written_this_conv {
+            Ok(n) => {
+                total_written += n;
+                tracing::info!(
+                    "dreaming: conversation {conv_id} (user {user_id_str}) wrote {n} fact(s)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "dreaming: extraction for conversation {conv_id} (user {user_id_str}) failed: {e}"
+            ),
+        }
+    }
+
+    Ok(total_written)
+}
+
+/// Per-conversation extraction body. Runs inside a `with_user_id` scope
+/// installed by [`run_extraction_phase`]; all helpers read the scope.
+async fn process_one_conversation_for_extraction(
+    pool: &PgPool,
+    llm_fn: &DreamingLlmFn,
+    embed_fn: &BackfillEmbedFn,
+    embedding_model: &str,
+    conv_id: &str,
+    watermark: i32,
+    context_summary: &str,
+) -> Result<usize, String> {
+    // Tag registry is per-user (#102 PK is `(user_id, name)`); the
+    // task-local scope already picks the right partition.
     let registry = tag_registry::list_active_tags(pool).await?;
     let registry_names: BTreeSet<String> =
         registry.iter().map(|t| t.name.clone()).collect();
 
-    let mut total_written = 0usize;
-
-    for (conv_id, watermark, context_summary) in conversations {
-        let max_ordinal = get_max_ordinal(pool, &conv_id).await?;
-        if max_ordinal <= watermark {
-            continue;
-        }
-
-        let transcript = load_new_transcript(pool, &conv_id, watermark).await?;
-        if transcript.is_empty() {
-            update_watermark(pool, &conv_id, max_ordinal).await?;
-            continue;
-        }
-
-        let system_prompt = build_extraction_system_prompt(&registry);
-        let user_prompt = build_extraction_user_prompt(&context_summary, &transcript);
-
-        let response = match llm_fn(system_prompt, user_prompt).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("dreaming: extraction LLM call failed for {conv_id}: {e}");
-                continue;
-            }
-        };
-
-        let proposals = parse_extraction_response(&response);
-
-        let mut written_this_conv = 0usize;
-        for proposal in proposals {
-            match write_extracted_fact(
-                pool,
-                embed_fn,
-                embedding_model,
-                &conv_id,
-                proposal,
-                &registry_names,
-            )
-            .await
-            {
-                Ok(true) => written_this_conv += 1,
-                Ok(false) => {}
-                Err(e) => tracing::warn!("dreaming: write_extracted_fact failed: {e}"),
-            }
-        }
-
-        update_watermark(pool, &conv_id, max_ordinal).await?;
-        total_written += written_this_conv;
-
-        tracing::info!(
-            "dreaming: conversation {conv_id} wrote {written_this_conv} fact(s)"
-        );
+    let max_ordinal = get_max_ordinal(pool, conv_id).await?;
+    if max_ordinal <= watermark {
+        return Ok(0);
     }
 
-    Ok(total_written)
+    let transcript = load_new_transcript(pool, conv_id, watermark).await?;
+    if transcript.is_empty() {
+        update_watermark(pool, conv_id, max_ordinal).await?;
+        return Ok(0);
+    }
+
+    let system_prompt = build_extraction_system_prompt(&registry);
+    let user_prompt = build_extraction_user_prompt(context_summary, &transcript);
+
+    let response = match llm_fn(system_prompt, user_prompt).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("dreaming: extraction LLM call failed for {conv_id}: {e}");
+            return Ok(0);
+        }
+    };
+
+    let proposals = parse_extraction_response(&response);
+
+    let mut written = 0usize;
+    for proposal in proposals {
+        match write_extracted_fact(
+            pool,
+            embed_fn,
+            embedding_model,
+            conv_id,
+            proposal,
+            &registry_names,
+        )
+        .await
+        {
+            Ok(true) => written += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("dreaming: write_extracted_fact failed: {e}"),
+        }
+    }
+
+    update_watermark(pool, conv_id, max_ordinal).await?;
+    Ok(written)
 }
 
 /// One fact as proposed by the LLM, before tag resolution.
@@ -294,13 +337,15 @@ async fn write_extracted_fact(
 
     let id = uuid::Uuid::now_v7().to_string();
     let tags_vec: Vec<String> = final_tags.into_iter().collect();
+    let user_id = current_user_id();
 
     sqlx::query(
-        "INSERT INTO knowledge_base
-            (id, content, tags, metadata, embedding, embedding_model)
-         VALUES ($1, $2, $3, $4, $5::vector[], $6)",
+        "INSERT INTO knowledge_base \
+            (id, user_id, content, tags, metadata, embedding, embedding_model) \
+         VALUES ($1, $2, $3, $4, $5, $6::vector[], $7)",
     )
     .bind(&id)
+    .bind(user_id.as_str())
     .bind(&proposal.content)
     .bind(&tags_vec)
     .bind(metadata.to_json())

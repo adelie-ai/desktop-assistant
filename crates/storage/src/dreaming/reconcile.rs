@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
+use desktop_assistant_core::ports::auth::current_user_id;
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -199,6 +200,7 @@ pub async fn apply_ops(
     synthesized: &[SynthesizedMerge],
     soft_delete_ttl_days: i32,
 ) -> Result<ConsolidationStats, String> {
+    let user_id = current_user_id();
     let mut stats = ConsolidationStats::default();
 
     let mut tx = pool
@@ -207,13 +209,17 @@ pub async fn apply_ops(
         .map_err(|e| format!("dreaming: begin tx failed: {e}"))?;
 
     // First, reap any soft-deleted entries past their TTL. Cheap, and
-    // happens in the same tx so a single cycle stays atomic.
+    // happens in the same tx so a single cycle stays atomic. Scoped to
+    // the current user — TTL reaping for other users happens when
+    // their own consolidation cycles run.
     sqlx::query(
-        "DELETE FROM knowledge_base
-         WHERE deleted_at IS NOT NULL
+        "DELETE FROM knowledge_base \
+         WHERE user_id = $2 \
+           AND deleted_at IS NOT NULL \
            AND deleted_at < NOW() - make_interval(days => $1)",
     )
     .bind(soft_delete_ttl_days)
+    .bind(user_id.as_str())
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("dreaming: TTL reap failed: {e}"))?;
@@ -235,8 +241,9 @@ pub async fn apply_ops(
         // Preserve source_conversation_id of the canonical row but apply
         // the new scope.
         let existing_metadata: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT metadata FROM knowledge_base WHERE id = $1",
+            "SELECT metadata FROM knowledge_base WHERE user_id = $1 AND id = $2",
         )
+        .bind(user_id.as_str())
         .bind(&merge.canonical_id)
         .fetch_optional(&mut *tx)
         .await
@@ -248,12 +255,12 @@ pub async fn apply_ops(
         metadata.scope = merge.new_scope.clone();
 
         sqlx::query(
-            "UPDATE knowledge_base
-             SET content = $1, metadata = $2, embedding = $3::vector[],
-                 embedding_model = $4, updated_at = NOW(),
-                 reviewed_at = NOW(),
-                 review_generation = LEAST(review_generation + 1, $5)
-             WHERE id = $6",
+            "UPDATE knowledge_base \
+             SET content = $1, metadata = $2, embedding = $3::vector[], \
+                 embedding_model = $4, updated_at = NOW(), \
+                 reviewed_at = NOW(), \
+                 review_generation = LEAST(review_generation + 1, $5) \
+             WHERE user_id = $7 AND id = $6",
         )
         .bind(&merge.new_content)
         .bind(metadata.to_json())
@@ -261,6 +268,7 @@ pub async fn apply_ops(
         .bind(embedding_model)
         .bind(MAX_REVIEW_GENERATION)
         .bind(&merge.canonical_id)
+        .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("dreaming: merge canonical update failed: {e}"))?;
@@ -274,11 +282,12 @@ pub async fn apply_ops(
             .collect();
         if !to_delete.is_empty() {
             sqlx::query(
-                "UPDATE knowledge_base
-                 SET deleted_at = NOW(), reviewed_at = NOW()
-                 WHERE id = ANY($1) AND deleted_at IS NULL",
+                "UPDATE knowledge_base \
+                 SET deleted_at = NOW(), reviewed_at = NOW() \
+                 WHERE user_id = $2 AND id = ANY($1) AND deleted_at IS NULL",
             )
             .bind(&to_delete)
+            .bind(user_id.as_str())
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("dreaming: cluster soft-delete failed: {e}"))?;
@@ -299,18 +308,19 @@ pub async fn apply_ops(
             embeddings.into_iter().map(Vector::from).collect();
 
         sqlx::query(
-            "UPDATE knowledge_base
-             SET content = $1, embedding = $2::vector[], embedding_model = $3,
-                 updated_at = NOW(),
-                 reviewed_at = NOW(),
-                 review_generation = LEAST(review_generation + 1, $4)
-             WHERE id = $5",
+            "UPDATE knowledge_base \
+             SET content = $1, embedding = $2::vector[], embedding_model = $3, \
+                 updated_at = NOW(), \
+                 reviewed_at = NOW(), \
+                 review_generation = LEAST(review_generation + 1, $4) \
+             WHERE user_id = $6 AND id = $5",
         )
         .bind(&new_content)
         .bind(&embedding_vecs)
         .bind(embedding_model)
         .bind(MAX_REVIEW_GENERATION)
         .bind(&id)
+        .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("dreaming: update failed: {e}"))?;
@@ -320,8 +330,9 @@ pub async fn apply_ops(
     // Standalone scope additions.
     for (id, scope) in buffer.standalone_scope_adds() {
         let existing: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT metadata FROM knowledge_base WHERE id = $1",
+            "SELECT metadata FROM knowledge_base WHERE user_id = $1 AND id = $2",
         )
+        .bind(user_id.as_str())
         .bind(&id)
         .fetch_optional(&mut *tx)
         .await
@@ -331,12 +342,13 @@ pub async fn apply_ops(
             let mut metadata = KbMetadata::from_json(&value);
             metadata.scope = Some(scope);
             sqlx::query(
-                "UPDATE knowledge_base
-                 SET metadata = $1, updated_at = NOW(), reviewed_at = NOW()
-                 WHERE id = $2",
+                "UPDATE knowledge_base \
+                 SET metadata = $1, updated_at = NOW(), reviewed_at = NOW() \
+                 WHERE user_id = $3 AND id = $2",
             )
             .bind(metadata.to_json())
             .bind(&id)
+            .bind(user_id.as_str())
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("dreaming: scope-add update failed: {e}"))?;
@@ -347,11 +359,12 @@ pub async fn apply_ops(
     // Standalone soft-deletes.
     for (id, _reason) in buffer.standalone_deletes() {
         sqlx::query(
-            "UPDATE knowledge_base
-             SET deleted_at = NOW(), reviewed_at = NOW()
-             WHERE id = $1 AND deleted_at IS NULL",
+            "UPDATE knowledge_base \
+             SET deleted_at = NOW(), reviewed_at = NOW() \
+             WHERE user_id = $2 AND id = $1 AND deleted_at IS NULL",
         )
         .bind(&id)
+        .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("dreaming: soft-delete failed: {e}"))?;
@@ -363,11 +376,12 @@ pub async fn apply_ops(
     let touched: Vec<String> = buffer.all_reviewed_ids().iter().cloned().collect();
     if !touched.is_empty() {
         sqlx::query(
-            "UPDATE knowledge_base
-             SET reviewed_at = COALESCE(reviewed_at, NOW())
-             WHERE id = ANY($1)",
+            "UPDATE knowledge_base \
+             SET reviewed_at = COALESCE(reviewed_at, NOW()) \
+             WHERE user_id = $2 AND id = ANY($1)",
         )
         .bind(&touched)
+        .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("dreaming: reviewed_at update failed: {e}"))?;

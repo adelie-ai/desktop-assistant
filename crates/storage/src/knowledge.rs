@@ -1,5 +1,6 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -21,22 +22,33 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         embedding: Option<Vec<Vec<f32>>>,
         embedding_model: Option<String>,
     ) -> Result<KnowledgeEntry, CoreError> {
+        let user_id = current_user_id();
         let embedding_vecs: Option<Vec<Vector>> =
             embedding.map(|chunks| chunks.into_iter().map(Vector::from).collect());
 
+        // ON CONFLICT (id) inherently respects the schema's unique
+        // constraint on `id`; since the KB id is a UUID we don't expect
+        // collisions across users in practice. The upsert path still
+        // refuses to leak rows: a writer can only land in the user's
+        // own partition because the WHERE filter on the conflict update
+        // matches only their row, and the insert path stamps user_id
+        // from the current request.
         let row: KbRow = sqlx::query_as(
-            "INSERT INTO knowledge_base (id, content, tags, metadata, embedding, embedding_model)
-             VALUES ($1, $2, $3, $4, $5::vector[], $6)
-             ON CONFLICT (id) DO UPDATE
-                SET content = EXCLUDED.content,
-                    tags = EXCLUDED.tags,
-                    metadata = EXCLUDED.metadata,
-                    embedding = EXCLUDED.embedding,
-                    embedding_model = EXCLUDED.embedding_model,
-                    updated_at = NOW()
+            "INSERT INTO knowledge_base \
+                (id, user_id, content, tags, metadata, embedding, embedding_model) \
+             VALUES ($1, $2, $3, $4, $5, $6::vector[], $7) \
+             ON CONFLICT (id) DO UPDATE \
+                SET content = EXCLUDED.content, \
+                    tags = EXCLUDED.tags, \
+                    metadata = EXCLUDED.metadata, \
+                    embedding = EXCLUDED.embedding, \
+                    embedding_model = EXCLUDED.embedding_model, \
+                    updated_at = NOW() \
+                WHERE knowledge_base.user_id = $2 \
              RETURNING id, content, tags, metadata, created_at, updated_at",
         )
         .bind(&entry.id)
+        .bind(user_id.as_str())
         .bind(&entry.content)
         .bind(&entry.tags)
         .bind(&entry.metadata)
@@ -56,6 +68,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         tags: Option<Vec<String>>,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let user_id = current_user_id();
         let embedding_vec = Vector::from(query_embedding);
         let fetch_limit = (limit * 2) as i64;
         let result_limit = limit as i64;
@@ -65,7 +78,8 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                 SELECT id, content, tags, metadata, created_at, updated_at,
                        MIN(chunk <=> $1) AS min_distance
                 FROM knowledge_base, unnest(embedding) AS chunk
-                WHERE ($2::text[] IS NULL OR tags && $2)
+                WHERE user_id = $6
+                  AND ($2::text[] IS NULL OR tags && $2)
                   AND embedding IS NOT NULL
                 GROUP BY id, content, tags, metadata, created_at, updated_at
             ),
@@ -79,7 +93,8 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                 SELECT id, content, tags, metadata, created_at, updated_at,
                        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
                 FROM knowledge_base, plainto_tsquery('english', $4) query
-                WHERE ($2::text[] IS NULL OR tags && $2)
+                WHERE user_id = $6
+                  AND ($2::text[] IS NULL OR tags && $2)
                   AND tsv @@ query
                 ORDER BY ts_rank_cd(tsv, query) DESC
                 LIMIT $3
@@ -104,6 +119,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(fetch_limit)
         .bind(query)
         .bind(result_limit)
+        .bind(user_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -117,12 +133,14 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         tags: Option<Vec<String>>,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let user_id = current_user_id();
         let result_limit = limit as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
             "WITH q AS (SELECT plainto_tsquery('english', $1) AS query)
              SELECT id, content, tags, metadata, created_at, updated_at
              FROM knowledge_base
-             WHERE tsv @@ (SELECT query FROM q)
+             WHERE user_id = $4
+               AND tsv @@ (SELECT query FROM q)
                AND ($2::text[] IS NULL OR tags && $2)
              ORDER BY ts_rank_cd(tsv, (SELECT query FROM q)) DESC,
                       updated_at DESC
@@ -131,6 +149,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(query)
         .bind(&tags)
         .bind(result_limit)
+        .bind(user_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -144,18 +163,21 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         offset: usize,
         tag_filter: Option<Vec<String>>,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let user_id = current_user_id();
         let limit_i64 = limit as i64;
         let offset_i64 = offset as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
             "SELECT id, content, tags, metadata, created_at, updated_at
              FROM knowledge_base
-             WHERE ($1::text[] IS NULL OR tags && $1)
+             WHERE user_id = $4
+               AND ($1::text[] IS NULL OR tags && $1)
              ORDER BY updated_at DESC, id
              LIMIT $2 OFFSET $3",
         )
         .bind(&tag_filter)
         .bind(limit_i64)
         .bind(offset_i64)
+        .bind(user_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -164,19 +186,25 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
     }
 
     async fn delete(&self, id: &str) -> Result<(), CoreError> {
-        sqlx::query("DELETE FROM knowledge_base WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let user_id = current_user_id();
+        sqlx::query(
+            "DELETE FROM knowledge_base WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(())
     }
 
     async fn get(&self, id: &str) -> Result<Option<KnowledgeEntry>, CoreError> {
+        let user_id = current_user_id();
         let row: Option<KbRow> = sqlx::query_as(
             "SELECT id, content, tags, metadata, created_at, updated_at
-             FROM knowledge_base WHERE id = $1",
+             FROM knowledge_base WHERE user_id = $1 AND id = $2",
         )
+        .bind(user_id.as_str())
         .bind(id)
         .fetch_optional(&self.pool)
         .await

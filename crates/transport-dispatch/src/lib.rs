@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
+use desktop_assistant_core::ports::auth::{UserId, with_user_id};
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
@@ -122,11 +123,13 @@ pub async fn dispatch_loop<R, W>(
         }
     });
 
-    // `auth` is stable for the connection; clone into spawned tasks so
-    // #105 (per-user state) can dispatch via the same identity. Today
-    // only the user_id is read; keeping the full context flowing means
-    // we won't have to plumb it later.
-    let _ = auth;
+    // `auth` is stable for the connection; we clone the user id into
+    // every handler invocation so the per-task `with_user_id` scope
+    // (#105) is established before any storage call. Spawned
+    // `SendMessage` tasks get their own clone so the scope still
+    // applies after the spawn boundary (`task_local` doesn't inherit
+    // across `tokio::spawn`).
+    let user_id = UserId::new(auth.user_id.clone());
 
     while let Some(item) = inbound.next().await {
         let req = match item {
@@ -162,23 +165,33 @@ pub async fn dispatch_loop<R, W>(
                 }
 
                 let handler = Arc::clone(&handler);
+                let user_id_for_task = user_id.clone();
                 tokio::spawn(async move {
-                    let _ = handler
-                        .handle_send_message_with_override(
+                    // Re-install the per-connection user id inside the
+                    // spawned task — `task_local` scopes do not inherit
+                    // across `tokio::spawn`. Without this, the streaming
+                    // path would resolve to `UserId::default` and write
+                    // messages under the sentinel partition.
+                    let _ = with_user_id(
+                        user_id_for_task,
+                        handler.handle_send_message_with_override(
                             conversation_id,
                             content,
                             override_selection,
                             request_id,
                             sink,
-                        )
-                        .await;
+                        ),
+                    )
+                    .await;
                 });
             }
 
             api::Command::SetConfig { changes } => {
-                let res = handler
-                    .handle_command(api::Command::SetConfig { changes })
-                    .await;
+                let res = with_user_id(
+                    user_id.clone(),
+                    handler.handle_command(api::Command::SetConfig { changes }),
+                )
+                .await;
                 match res {
                     Ok(api::CommandResult::Config(config)) => {
                         if out_tx
@@ -238,7 +251,8 @@ pub async fn dispatch_loop<R, W>(
             }
 
             other => {
-                let res = handler.handle_command(other).await;
+                let res =
+                    with_user_id(user_id.clone(), handler.handle_command(other)).await;
                 match res {
                     Ok(result) => {
                         if out_tx

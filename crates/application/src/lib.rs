@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
+pub use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
     ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
@@ -26,13 +28,87 @@ pub enum ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// Per-request context threaded from the transport layer through the
+/// handler into core services (#105).
+///
+/// Carries the authenticated `user_id` extracted from the JWT — the
+/// daemon's stateless contract (`docs/architecture-evolution.md` rule
+/// #1) keeps all request-scoped state here rather than in any handler
+/// or service object. Additional per-request fields (request id,
+/// tracing context, cancellation token, ...) can be added without
+/// changing the handler trait's method signatures.
+///
+/// Construction:
+/// - From a validated JWT: `RequestContext::from(&claims)`.
+/// - For a local-dev / single-tenant fallback path: `RequestContext::default()`,
+///   which resolves to `UserId::default()` (the schema sentinel
+///   `"default"`).
+#[derive(Debug, Clone, Default)]
+pub struct RequestContext {
+    /// The authenticated user_id for this request. Sourced from the
+    /// validated JWT's `sub` claim per #105's mapping rule.
+    pub user_id: UserId,
+}
+
+impl RequestContext {
+    /// Build a context with the given user id explicitly. Used by
+    /// transport adapters that don't have direct access to a `Claims`
+    /// (e.g. they resolved the user id through a different path) and
+    /// by tests that need to pin a known identity.
+    pub fn for_user(user_id: UserId) -> Self {
+        Self { user_id }
+    }
+}
+
+impl From<&desktop_assistant_auth_jwt::Claims> for RequestContext {
+    /// Build a `RequestContext` from a validated JWT claim set. The
+    /// `sub` field is mapped to `user_id` verbatim per the phase-1
+    /// rule in #105 — future revisions may consult an alternative
+    /// claim, but until then `sub` IS the identity.
+    fn from(claims: &desktop_assistant_auth_jwt::Claims) -> Self {
+        Self {
+            user_id: UserId::from(claims),
+        }
+    }
+}
+
+impl From<UserId> for RequestContext {
+    fn from(user_id: UserId) -> Self {
+        Self::for_user(user_id)
+    }
+}
+
 /// Protocol-neutral handler for the assistant API.
 ///
 /// Adapters (D-Bus, WebSocket, etc.) should depend on this trait rather than
 /// reaching into core services directly.
+///
+/// ## Threading the request context
+///
+/// Each method has a companion `*_for(ctx, …)` form that takes a
+/// [`RequestContext`]. Transport adapters extract the user identity
+/// from the validated JWT, build a `RequestContext`, and call the
+/// context-aware form. The non-`_for` methods remain as backward-
+/// compatible entry points: they delegate to the `_for` form with
+/// `RequestContext::default()`, which collapses to the schema
+/// sentinel `"default"`. Single-tenant deployments and tests that
+/// don't care about user identity continue to work unchanged (#105).
 #[async_trait::async_trait]
 pub trait AssistantApiHandler: Send + Sync {
     async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult>;
+
+    /// Context-aware variant of [`Self::handle_command`]. The default
+    /// implementation installs the request's user id via
+    /// [`with_user_id`] and forwards to `handle_command`. Concrete
+    /// handlers don't need to override this unless they want to
+    /// observe context fields beyond the user id.
+    async fn handle_command_for(
+        &self,
+        ctx: RequestContext,
+        cmd: api::Command,
+    ) -> ApiResult<api::CommandResult> {
+        with_user_id(ctx.user_id, self.handle_command(cmd)).await
+    }
 
     /// Handle a streaming command.
     ///
@@ -44,6 +120,24 @@ pub trait AssistantApiHandler: Send + Sync {
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()>;
+
+    /// Context-aware variant of [`Self::handle_send_message`]. The
+    /// default implementation installs the request's user id via
+    /// [`with_user_id`] and forwards to `handle_send_message`.
+    async fn handle_send_message_for(
+        &self,
+        ctx: RequestContext,
+        conversation_id: String,
+        content: String,
+        request_id: String,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        with_user_id(
+            ctx.user_id,
+            self.handle_send_message(conversation_id, content, request_id, sink),
+        )
+        .await
+    }
 
     /// Handle a streaming `SendMessage` with an optional per-send model
     /// override. The default implementation ignores the override and
@@ -60,6 +154,29 @@ pub trait AssistantApiHandler: Send + Sync {
         let _ = override_selection;
         self.handle_send_message(conversation_id, content, request_id, sink)
             .await
+    }
+
+    /// Context-aware variant of [`Self::handle_send_message_with_override`].
+    async fn handle_send_message_with_override_for(
+        &self,
+        ctx: RequestContext,
+        conversation_id: String,
+        content: String,
+        override_selection: Option<api::SendPromptOverride>,
+        request_id: String,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        with_user_id(
+            ctx.user_id,
+            self.handle_send_message_with_override(
+                conversation_id,
+                content,
+                override_selection,
+                request_id,
+                sink,
+            ),
+        )
+        .await
     }
 }
 
@@ -1756,5 +1873,152 @@ mod tests {
         assert_eq!(config.embeddings.model, "text-embedding-3-large");
         assert_eq!(config.persistence.remote_name, "upstream");
         assert!(!config.persistence.push_on_update);
+    }
+
+    // ---- RequestContext tests (issue #105) -----------------------------
+
+    #[test]
+    fn request_context_default_resolves_to_sentinel_user() {
+        // Single-tenant deploys and unauthenticated paths default to
+        // the schema sentinel so storage continues to resolve.
+        let ctx = RequestContext::default();
+        assert_eq!(ctx.user_id, UserId::default());
+        assert_eq!(ctx.user_id.as_str(), "default");
+    }
+
+    #[test]
+    fn request_context_from_claims_uses_sub_as_user_id() {
+        // Phase-1 mapping rule: the JWT `sub` is the user_id verbatim.
+        let claims = desktop_assistant_auth_jwt::Claims {
+            iss: "test-iss".into(),
+            sub: "alice".into(),
+            aud: "test-aud".into(),
+            exp: 0,
+            iat: 0,
+            nbf: 0,
+            jti: "jti".into(),
+        };
+        let ctx = RequestContext::from(&claims);
+        assert_eq!(ctx.user_id, UserId::new("alice"));
+    }
+
+    #[test]
+    fn request_context_for_user_pins_explicit_identity() {
+        let ctx = RequestContext::for_user(UserId::new("dave"));
+        assert_eq!(ctx.user_id.as_str(), "dave");
+    }
+
+    #[tokio::test]
+    async fn handle_command_for_installs_user_id_in_task_local() {
+        use desktop_assistant_core::ports::auth::current_user_id;
+
+        // A handler that records the user_id observed during dispatch.
+        struct Observer {
+            seen: Arc<Mutex<Option<UserId>>>,
+        }
+        #[async_trait::async_trait]
+        impl AssistantApiHandler for Observer {
+            async fn handle_command(
+                &self,
+                _cmd: api::Command,
+            ) -> ApiResult<api::CommandResult> {
+                let observed = current_user_id();
+                *self.seen.lock().unwrap() = Some(observed);
+                Ok(api::CommandResult::Ack)
+            }
+            async fn handle_send_message(
+                &self,
+                _conversation_id: String,
+                _content: String,
+                _request_id: String,
+                _sink: Arc<dyn EventSink>,
+            ) -> ApiResult<()> {
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let observer = Observer {
+            seen: Arc::clone(&seen),
+        };
+
+        let ctx = RequestContext::for_user(UserId::new("alice"));
+        let _ = observer
+            .handle_command_for(ctx, api::Command::Ping)
+            .await
+            .unwrap();
+
+        assert_eq!(seen.lock().unwrap().clone(), Some(UserId::new("alice")));
+    }
+
+    #[tokio::test]
+    async fn handle_command_for_with_default_context_resolves_to_sentinel() {
+        use desktop_assistant_core::ports::auth::current_user_id;
+
+        struct Observer {
+            seen: Arc<Mutex<Option<UserId>>>,
+        }
+        #[async_trait::async_trait]
+        impl AssistantApiHandler for Observer {
+            async fn handle_command(
+                &self,
+                _cmd: api::Command,
+            ) -> ApiResult<api::CommandResult> {
+                let observed = current_user_id();
+                *self.seen.lock().unwrap() = Some(observed);
+                Ok(api::CommandResult::Ack)
+            }
+            async fn handle_send_message(
+                &self,
+                _conversation_id: String,
+                _content: String,
+                _request_id: String,
+                _sink: Arc<dyn EventSink>,
+            ) -> ApiResult<()> {
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let observer = Observer {
+            seen: Arc::clone(&seen),
+        };
+
+        // Boundary: a request with no explicit user context succeeds
+        // and resolves to the sentinel. This is the single-tenant
+        // contract — independently shippable without #103 or any
+        // co-dependent PR.
+        let _ = observer
+            .handle_command_for(RequestContext::default(), api::Command::Ping)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(UserId::default()),
+            "default RequestContext must resolve to the schema sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_command_uninstrumented_path_still_resolves_to_default() {
+        // The non-`_for` entry point continues to work without any
+        // user context — backward-compat for existing callers and
+        // tests, and the dual-mode contract for single-tenant
+        // deploys (no JWT path required to keep things working).
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+        let res = h.handle_command(api::Command::Ping).await.unwrap();
+        assert_eq!(
+            res,
+            api::CommandResult::Pong {
+                value: "pong".into()
+            }
+        );
     }
 }

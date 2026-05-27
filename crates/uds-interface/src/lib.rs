@@ -65,11 +65,23 @@ pub trait UdsAuthValidator: Send + Sync {
     /// Validate a bearer token. Returning `true` enters the dispatcher
     /// loop; returning `false` causes the listener to write an error
     /// frame and close.
-    ///
-    /// Returning the subject would let the dispatcher attach a real
-    /// `user_id` to the connection (#105); for now a bool keeps this
-    /// crate's surface aligned with `ws-interface::WsAuthValidator`.
     async fn validate_bearer_token(&self, token: &str) -> bool;
+
+    /// Extract the user id ([JWT `sub`]) from a bearer token that
+    /// [`Self::validate_bearer_token`] already accepted (#105).
+    ///
+    /// Default returns `None`, which collapses the connection to the
+    /// schema sentinel `UserId::default()`. Single-tenant desktop
+    /// installs that don't care about identity can keep the default;
+    /// multi-tenant or multi-user-host deploys override this method
+    /// to return the JWT subject so storage queries scope per-user.
+    async fn extract_user_id(
+        &self,
+        token: &str,
+    ) -> Option<desktop_assistant_application::UserId> {
+        let _ = token;
+        None
+    }
 }
 
 /// Convenience JWT validator: holds the signing key + expected
@@ -327,6 +339,12 @@ async fn handle_connection(
         return Ok(());
     }
 
+    // Identity (#105): the validator either returns the `sub` (multi-
+    // tenant deploys) or `None` (single-tenant fallback, mapped to
+    // the schema sentinel). The dispatcher installs this into the
+    // per-task task-local before each command runs.
+    let user_id = auth.extract_user_id(&token).await.unwrap_or_default();
+
     // Auth passed; enter the shared dispatcher.
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<anyhow::Result<WsRequest>>(16);
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<WsFrame>(64);
@@ -383,10 +401,10 @@ async fn handle_connection(
 
     let sink = PollSender::new(outbound_tx.clone());
 
-    // We have a validated bearer token; we don't yet have the decoded
-    // claims at the trait boundary (#105 will fix this — the trait
-    // returns the subject). Use the token-derived placeholder for now.
-    let auth_ctx = AuthContext::new("uds-user");
+    // Per-connection identity resolved above (#105). The dispatcher
+    // installs this into the `with_user_id` task-local around each
+    // command so storage queries scope to the right partition.
+    let auth_ctx = AuthContext::new(user_id.into_inner());
 
     dispatch_loop(handler, auth_ctx, inbound, sink).await;
 

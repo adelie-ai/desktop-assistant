@@ -55,6 +55,18 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
             .await
             .unwrap_or(false)
     }
+
+    async fn extract_user_id(
+        &self,
+        token: &str,
+    ) -> Option<desktop_assistant_application::UserId> {
+        // #105 mapping rule: JWT `sub` → `UserId`. Returns `None` for
+        // tokens this validator would reject; the ws-interface
+        // handler then falls back to `UserId::default` (the schema
+        // sentinel) so a single-tenant deploy without identity
+        // information still resolves correctly.
+        config::ws_jwt_sub(token).map(desktop_assistant_application::UserId::from)
+    }
 }
 
 /// Auth validator that tries the local HS256 JWT first, then falls back to OIDC RS256.
@@ -72,6 +84,22 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
         }
         // Fall back to OIDC RS256 validation
         self.oidc_validator.validate_token(token)
+    }
+
+    async fn extract_user_id(
+        &self,
+        token: &str,
+    ) -> Option<desktop_assistant_application::UserId> {
+        // Resolution order mirrors `validate_bearer_token`: prefer the
+        // local HS256 mint (single-tenant desktop primary path), then
+        // fall through to OIDC RS256 (multi-tenant deploys). Whichever
+        // one accepts the token also yields its `sub`.
+        if let Some(uid) = self.local.extract_user_id(token).await {
+            return Some(uid);
+        }
+        self.oidc_validator
+            .extract_sub(token)
+            .map(desktop_assistant_application::UserId::from)
     }
 }
 
@@ -105,6 +133,17 @@ impl WsAsUdsAuth {
 impl uds::UdsAuthValidator for WsAsUdsAuth {
     async fn validate_bearer_token(&self, token: &str) -> bool {
         self.validator.validate_bearer_token(token).await
+    }
+
+    async fn extract_user_id(
+        &self,
+        token: &str,
+    ) -> Option<desktop_assistant_application::UserId> {
+        // Delegate to the same WS validator so UDS and WS share the
+        // JWT-to-user_id mapping. The bridge above already enforces
+        // uniform validation; #105's identity extraction follows the
+        // same path.
+        self.validator.extract_user_id(token).await
     }
 }
 

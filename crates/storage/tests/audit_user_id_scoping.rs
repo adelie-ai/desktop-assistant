@@ -113,6 +113,38 @@ const ALLOWED_CROSS_USER_QUERIES: &[AllowedCrossUserQuery] = &[
                     worker; it iterates all rows by design and \
                     preserves the existing user_id on each row.",
     },
+    // Dreaming archival, when invoked without a per-user task-local
+    // scope, archives across all users (single-tenant degenerate
+    // case). When called from within a per-user consolidation cycle
+    // it takes the scoped branch which DOES filter by user_id; the
+    // unscoped branch lives next to it in the same file.
+    AllowedCrossUserQuery {
+        file: "src/dreaming/archival.rs",
+        line_hint: 0,
+        rationale: "archival sweep with no per-user scope installed; \
+                    single-tenant fallback that archives across the \
+                    sentinel user_id partition. A scoped branch \
+                    immediately follows.",
+    },
+    // Dreaming background-worker cross-user scans. These are the only
+    // queries in the worker that intentionally cross tenancy — the
+    // worker groups results by user_id and installs a per-user
+    // task-local scope before any subsequent SQL.
+    AllowedCrossUserQuery {
+        file: "src/dreaming/common.rs",
+        line_hint: 0,
+        rationale: "find_conversations_with_new_messages: dreaming \
+                    worker entry point. Returns rows including user_id \
+                    so the worker can install a per-user scope.",
+    },
+    AllowedCrossUserQuery {
+        file: "src/dreaming/consolidation.rs",
+        line_hint: 0,
+        rationale: "load_entries_needing_review_by_user: dreaming \
+                    consolidation entry point. Returns rows grouped \
+                    by user_id; the worker installs a per-user \
+                    scope before processing each group.",
+    },
 ];
 
 /// Result of scanning a single SQL fragment.

@@ -31,6 +31,9 @@ pub mod database;
 /// Conversation search port — outbound trait for full-text search over past messages.
 pub mod conversation_search;
 
+/// Request-scoped auth context — task-local `UserId` for SQL scoping (#105).
+pub mod auth;
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -1141,6 +1141,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "desktop-assistant-api-model",
+ "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
  "serde_json",
  "thiserror 2.0.18",
@@ -1186,6 +1187,7 @@ dependencies = [
  "async-trait",
  "backon",
  "chrono",
+ "desktop-assistant-auth-jwt",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1372,6 +1374,7 @@ name = "desktop-assistant-storage"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
  "pgvector",
  "serde",

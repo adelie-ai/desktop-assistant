@@ -10,6 +10,13 @@ pub mod pool;
 pub mod tag_registry;
 pub mod tool_registry;
 
+/// Re-export the request-scoped user-id task-local API so storage call
+/// sites can resolve `current_user_id()` without depending directly on
+/// `desktop_assistant_core::ports::auth`. The actual storage adapters
+/// in this crate use this helper at SQL composition time (issue #105).
+pub use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
+pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};
+
 pub use conversation::PgConversationStore;
 pub use conversation_search::PgConversationSearchStore;
 pub use database::execute_database_query;

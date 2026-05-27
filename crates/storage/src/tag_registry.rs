@@ -12,6 +12,7 @@
 //! `name + description` for similarity dedup, and a `deprecated_for_tag`
 //! chain so a retired tag can point at its replacement.
 
+use desktop_assistant_core::ports::auth::current_user_id;
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -53,13 +54,21 @@ pub enum CreateTagOutcome {
 }
 
 /// Load all active (non-deprecated) tags ordered by name.
+///
+/// The tag registry is per-user (#102 moved the PK to `(user_id, name)`)
+/// so the scope reads the task-local user identity. Dreaming, which is
+/// the primary consumer, runs per conversation and inherits each
+/// conversation's `user_id` via [`with_user_id`] — see #105 for the
+/// threading contract.
 pub async fn list_active_tags(pool: &PgPool) -> Result<Vec<TagRecord>, String> {
+    let user_id = current_user_id();
     let rows: Vec<(String, String, serde_json::Value, Vec<String>)> = sqlx::query_as(
-        "SELECT name, description, examples, distinguish_from
-         FROM tag_registry
-         WHERE deprecated_for_tag IS NULL
+        "SELECT name, description, examples, distinguish_from \
+         FROM tag_registry \
+         WHERE user_id = $1 AND deprecated_for_tag IS NULL \
          ORDER BY name ASC",
     )
+    .bind(user_id.as_str())
     .fetch_all(pool)
     .await
     .map_err(|e| format!("tag_registry: list failed: {e}"))?;
@@ -67,12 +76,15 @@ pub async fn list_active_tags(pool: &PgPool) -> Result<Vec<TagRecord>, String> {
     Ok(rows.into_iter().map(row_to_record).collect())
 }
 
-/// Look up a single tag by name (active or deprecated).
+/// Look up a single tag by name (active or deprecated). Scoped to the
+/// current task-local user.
 pub async fn get_tag(pool: &PgPool, name: &str) -> Result<Option<TagRecord>, String> {
+    let user_id = current_user_id();
     let row: Option<(String, String, serde_json::Value, Vec<String>)> = sqlx::query_as(
-        "SELECT name, description, examples, distinguish_from
-         FROM tag_registry WHERE name = $1",
+        "SELECT name, description, examples, distinguish_from \
+         FROM tag_registry WHERE user_id = $1 AND name = $2",
     )
+    .bind(user_id.as_str())
     .bind(name)
     .fetch_optional(pool)
     .await
@@ -85,15 +97,21 @@ pub async fn get_tag(pool: &PgPool, name: &str) -> Result<Option<TagRecord>, Str
 ///
 /// Returns the input name if it isn't deprecated. Returns `None` if the chain
 /// terminates at a missing tag (shouldn't happen given the FK, but graceful).
+/// The chain is followed within a single user's tag partition; cross-user
+/// pointers are forbidden by the FK in #102's migration.
 pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<String>, String> {
+    let user_id = current_user_id();
     let mut current = name.to_string();
     for _ in 0..16 {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT deprecated_for_tag FROM tag_registry WHERE name = $1")
-                .bind(&current)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| format!("tag_registry: resolve failed: {e}"))?;
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT deprecated_for_tag FROM tag_registry \
+             WHERE user_id = $1 AND name = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&current)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("tag_registry: resolve failed: {e}"))?;
         match row {
             None => return Ok(None),
             Some((None,)) => return Ok(Some(current)),
@@ -118,6 +136,7 @@ pub async fn create_or_match_tag(
     embedding_model: &str,
     proposal: TagProposal,
 ) -> Result<CreateTagOutcome, String> {
+    let user_id = current_user_id();
     let normalized = normalize_tag_name(&proposal.name);
 
     if let Some(existing) = get_tag(pool, &normalized).await? {
@@ -137,13 +156,14 @@ pub async fn create_or_match_tag(
     let query_vec = Vector::from(vector);
 
     let nearest: Option<(String, String, serde_json::Value, Vec<String>, f64)> = sqlx::query_as(
-        "SELECT name, description, examples, distinguish_from, (embedding <=> $1) AS distance
-         FROM tag_registry
-         WHERE deprecated_for_tag IS NULL AND embedding IS NOT NULL
-         ORDER BY embedding <=> $1
+        "SELECT name, description, examples, distinguish_from, (embedding <=> $1) AS distance \
+         FROM tag_registry \
+         WHERE user_id = $2 AND deprecated_for_tag IS NULL AND embedding IS NOT NULL \
+         ORDER BY embedding <=> $1 \
          LIMIT 1",
     )
     .bind(&query_vec)
+    .bind(user_id.as_str())
     .fetch_optional(pool)
     .await
     .map_err(|e| format!("tag_registry: nearest search failed: {e}"))?;
@@ -167,10 +187,11 @@ pub async fn create_or_match_tag(
     );
 
     sqlx::query(
-        "INSERT INTO tag_registry
-            (name, description, examples, distinguish_from, embedding, embedding_model)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO tag_registry \
+            (user_id, name, description, examples, distinguish_from, embedding, embedding_model) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
+    .bind(user_id.as_str())
     .bind(&normalized)
     .bind(&proposal.description)
     .bind(&examples_json)

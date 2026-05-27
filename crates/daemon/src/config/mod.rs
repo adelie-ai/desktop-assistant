@@ -28,7 +28,7 @@ pub use views::{
 // Re-export the JWT + OIDC public API at the `config::` path so existing
 // callers (`config::generate_ws_jwt`, `config::OidcValidator`, etc.)
 // keep working unchanged.
-pub use jwt::{current_username, generate_ws_jwt, validate_ws_jwt};
+pub use jwt::{current_username, generate_ws_jwt, validate_ws_jwt, ws_jwt_sub};
 pub use oidc::OidcValidator;
 
 // Resolution helpers — public API stays at `config::` for callers in
