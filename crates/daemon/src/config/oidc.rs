@@ -188,6 +188,45 @@ impl OidcValidator {
         })
     }
 
+    /// Decode and validate `token`, then return the `sub` claim from
+    /// it. Returns `None` for tokens this validator would reject.
+    /// Mirrors [`Self::validate_token`]'s kid/kidless resolution order
+    /// so a token that validates here will also validate there, and a
+    /// successfully-decoded payload yields its `sub` string.
+    ///
+    /// Used by the WS auth path (#105) to map a validated OIDC bearer
+    /// token to the `user_id` that scopes storage queries.
+    pub fn extract_sub(&self, token: &str) -> Option<String> {
+        let header_kid = decode_header(token).ok().and_then(|h| h.kid);
+
+        if let Some(kid) = header_kid.as_deref()
+            && let Some(key) = self.keys_by_kid.get(kid)
+        {
+            if let Ok(data) =
+                jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation)
+            {
+                return data
+                    .claims
+                    .get("sub")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+        }
+
+        for key in &self.kidless_keys {
+            if let Ok(data) =
+                jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation)
+            {
+                return data
+                    .claims
+                    .get("sub")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+        }
+        None
+    }
+
     pub fn validate_token(&self, token: &str) -> bool {
         // Resolution order:
         //

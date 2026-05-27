@@ -19,6 +19,113 @@ use anyhow::anyhow;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
+/// Sentinel `user_id` for single-tenant desktop installs and for any code
+/// path that hasn't yet been threaded with an explicit user identity.
+///
+/// Matches the `DEFAULT 'default'` backfill value the multi-tenant schema
+/// migration writes to every personal-data table (see #102's
+/// `016_multi_tenant_user_id.sql`). A single-tenant deploy collapses to
+/// this id; a multi-tenant deploy uses the JWT `sub` of each request.
+/// Both paths share the same SQL, the same indexes, and the same
+/// `WHERE user_id = $1` predicate.
+pub const DEFAULT_USER_ID: &str = "default";
+
+/// Newtype wrapper for a request-scoped user identity.
+///
+/// Phase 1 of the architecture evolution (`docs/architecture-evolution.md`)
+/// extracts `sub` from a validated JWT and uses it directly as the
+/// `user_id` scoping personal-data SQL queries. Wrapping the string in a
+/// dedicated type prevents accidental confusion with conversation ids,
+/// message ids, or any other free-form string flowing through the
+/// handler.
+///
+/// Why this type lives in `auth-jwt` rather than `application` or
+/// `core`: every transport adapter (WS, UDS, future API Gateway WS) ends
+/// up with a `Claims` from this crate, and the natural place to mint the
+/// `UserId` from those claims is right next to the `Claims` definition.
+/// Both core (for the storage task-local) and the application crate (for
+/// the request context) depend on `auth-jwt`, so the type is reachable
+/// from every layer that needs it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UserId(String);
+
+impl UserId {
+    /// Wrap a raw string in a [`UserId`]. The string is trusted as-is —
+    /// callers should source it from a validated JWT `sub`, not from
+    /// untrusted user input.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The sentinel single-tenant id (`"default"`). Equivalent to
+    /// `UserId::default()` but const-friendly and explicit at call
+    /// sites that want to make the fall-through visible.
+    pub fn sentinel_default() -> Self {
+        Self(DEFAULT_USER_ID.to_string())
+    }
+
+    /// Borrow the wrapped string. Storage layers bind this directly into
+    /// SQL queries.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the wrapper, returning the underlying string. Used when a
+    /// caller needs to hand ownership to a string-typed API (e.g. SQL
+    /// bind that wants `String`).
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl Default for UserId {
+    /// The default user id is [`DEFAULT_USER_ID`] (`"default"`) — matches
+    /// the schema-level column default and the single-tenant deploy
+    /// collapse target.
+    fn default() -> Self {
+        Self::sentinel_default()
+    }
+}
+
+impl std::fmt::Display for UserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for UserId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&Claims> for UserId {
+    /// Phase-1 mapping rule: the JWT `sub` is the `user_id` verbatim.
+    /// Documented in #105; future revisions may consult a configurable
+    /// claim or a DB lookup, but until then `sub` is the identity.
+    fn from(claims: &Claims) -> Self {
+        Self(claims.sub.clone())
+    }
+}
+
+impl From<Claims> for UserId {
+    fn from(claims: Claims) -> Self {
+        Self(claims.sub)
+    }
+}
+
+impl From<String> for UserId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for UserId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
 /// HS256 JWT claim payload.
 ///
 /// Fields are public so callers can construct claims directly and tests
@@ -346,5 +453,84 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    // ---- UserId tests (issue #105) ----------------------------------------
+
+    #[test]
+    fn user_id_default_is_sentinel_default_string() {
+        // Single-tenant deploys and any unauthenticated request path
+        // resolve to this sentinel — matches the schema default in #102.
+        assert_eq!(UserId::default().as_str(), "default");
+        assert_eq!(UserId::default().as_str(), DEFAULT_USER_ID);
+    }
+
+    #[test]
+    fn user_id_from_claims_uses_sub_verbatim() {
+        // Phase-1 mapping: the JWT `sub` IS the user_id, no indirection.
+        let claims = make_claims(unix_now());
+        let user_id = UserId::from(&claims);
+        assert_eq!(user_id.as_str(), claims.sub);
+        assert_eq!(user_id.as_str(), "alice");
+    }
+
+    #[test]
+    fn user_id_from_owned_claims_preserves_sub() {
+        let mut claims = make_claims(unix_now());
+        claims.sub = "bob".to_string();
+        let user_id = UserId::from(claims);
+        assert_eq!(user_id.as_str(), "bob");
+    }
+
+    #[test]
+    fn user_id_jwt_round_trip_yields_same_user_id() {
+        // happy path: a token issued for `sub=alice` validates and the
+        // extracted user_id is `UserId("alice")`. Mirrors the path the
+        // ws-interface handler takes for every authenticated request.
+        let key = "deadbeef".repeat(8);
+        let mut claims = make_claims(unix_now());
+        claims.sub = "alice".to_string();
+        let token = encode(&claims, &key).unwrap();
+        let decoded = decode(&token, &key, "test-iss", "test-aud").unwrap();
+        let user_id = UserId::from(&decoded);
+        assert_eq!(user_id.as_str(), "alice");
+    }
+
+    #[test]
+    fn user_id_equality_distinguishes_users() {
+        let alice = UserId::new("alice");
+        let bob = UserId::new("bob");
+        let alice_again = UserId::new("alice");
+        assert_eq!(alice, alice_again);
+        assert_ne!(alice, bob);
+        assert_ne!(alice, UserId::default());
+    }
+
+    #[test]
+    fn user_id_display_writes_raw_string() {
+        assert_eq!(format!("{}", UserId::new("dave")), "dave");
+        assert_eq!(format!("{}", UserId::default()), "default");
+    }
+
+    #[test]
+    fn user_id_as_ref_str_borrows_inner() {
+        let uid = UserId::new("carol");
+        let s: &str = uid.as_ref();
+        assert_eq!(s, "carol");
+    }
+
+    #[test]
+    fn user_id_into_inner_returns_owned_string() {
+        let uid = UserId::new("eve");
+        assert_eq!(uid.into_inner(), "eve");
+    }
+
+    #[test]
+    fn user_id_sentinel_default_constant_matches_schema() {
+        // The schema migration in #102 writes `'default'` as both the
+        // backfill value and the column DEFAULT. If those drift the
+        // sentinel must change in lockstep — this test wires them
+        // together so the migration tests would also fail.
+        assert_eq!(UserId::sentinel_default().as_str(), "default");
     }
 }

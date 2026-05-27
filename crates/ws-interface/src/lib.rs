@@ -11,7 +11,7 @@ use axum::{
 };
 use base64::Engine;
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::AssistantApiHandler;
+use desktop_assistant_application::{AssistantApiHandler, UserId};
 use desktop_assistant_transport_dispatch::{AuthContext, dispatch_loop};
 use futures::{SinkExt, StreamExt};
 use tracing::{debug, warn};
@@ -30,6 +30,24 @@ pub struct WsServerState {
 #[async_trait::async_trait]
 pub trait WsAuthValidator: Send + Sync {
     async fn validate_bearer_token(&self, token: &str) -> bool;
+
+    /// Extract the user id ([JWT `sub`]) from a bearer token that
+    /// [`Self::validate_bearer_token`] already accepted (#105).
+    ///
+    /// The default returns `None` — meaning "validator opted out of
+    /// identity extraction"; the WS handler then falls back to
+    /// [`UserId::default`] (the schema sentinel `"default"`). That
+    /// covers single-tenant deploys that don't need multi-tenancy
+    /// without forcing every existing validator implementation to
+    /// change.
+    ///
+    /// Multi-tenant correctness REQUIRES returning `Some(user_id)`.
+    /// The current mapping rule is `sub` → `user_id` verbatim;
+    /// future revisions may consult a different claim.
+    async fn extract_user_id(&self, token: &str) -> Option<UserId> {
+        let _ = token;
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -161,7 +179,19 @@ async fn ws_handler(
         return (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Resolve the per-connection user identity once at upgrade time
+    // (#105). The validator returns `Some(sub)` for multi-tenant
+    // tokens; in the single-tenant fallback path it returns `None`
+    // and we collapse to the schema sentinel `"default"`. Identity
+    // is per-connection: one WS upgrade carries one bearer token,
+    // so every command on this socket runs as the same user.
+    let user_id = state
+        .auth_validator
+        .extract_user_id(&token)
+        .await
+        .unwrap_or_default();
+
+    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -226,7 +256,7 @@ async fn auth_config_handler(State(state): State<WsServerState>) -> impl IntoRes
 /// `WsFrame` values into `Message::Text`. A `tokio_util::PollSender`
 /// gives us a `Sink<WsFrame>` over the mpsc so the dispatcher's
 /// generic bound is satisfied without a hand-rolled adapter.
-async fn handle_socket(socket: WebSocket, state: WsServerState) {
+async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId) {
     use tokio::sync::mpsc;
     use tokio_util::sync::PollSender;
 
@@ -266,11 +296,12 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
 
     let sink = PollSender::new(outbound_tx.clone());
 
-    // The current bearer-token validator only returns `bool`. #105 will
-    // plumb the JWT claim subject through to here; today we use a
-    // stable placeholder so the dispatcher signature already requires
-    // an `AuthContext`.
-    let auth = AuthContext::new("ws-user");
+    // Per-connection identity resolved in `ws_handler` (#105): the
+    // bearer token's `sub` if the validator extracted one, otherwise
+    // the schema sentinel for single-tenant fallback. The dispatcher
+    // installs this into the per-task task-local on every dispatched
+    // command so storage queries scope correctly.
+    let auth = AuthContext::new(user_id.into_inner());
 
     dispatch_loop(Arc::clone(&state.handler), auth, inbound, sink).await;
 

@@ -1,5 +1,6 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::Role;
+use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::conversation_search::{ConversationSearchStore, MessageHit};
 use sqlx::PgPool;
 
@@ -59,6 +60,7 @@ impl ConversationSearchStore for PgConversationSearchStore {
         limit: usize,
         role_filter: Option<Role>,
     ) -> Result<Vec<MessageHit>, CoreError> {
+        let user_id = current_user_id();
         let role_db = role_filter.map(role_to_db);
         let limit_i64 = limit as i64;
 
@@ -67,6 +69,11 @@ impl ConversationSearchStore for PgConversationSearchStore {
         // by conversation tsv. Snippet runs over message content so the
         // tool result has something concrete to show even when the
         // match was on title/summary (an empty `ts_headline` is fine).
+        //
+        // Scoping is double-applied (on `m.user_id` AND `c.user_id`)
+        // as defense-in-depth — the JOIN guarantees they're equal in
+        // a well-formed schema, but a corrupted row would still be
+        // hidden from the wrong user.
         let rows: Vec<MessageHitRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT plainto_tsquery('english', $1) AS query
@@ -90,8 +97,10 @@ impl ConversationSearchStore for PgConversationSearchStore {
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id
              WHERE
-                 (m.tsv @@ (SELECT query FROM q)
-                  OR c.tsv @@ (SELECT query FROM q))
+                 m.user_id = $4
+                 AND c.user_id = $4
+                 AND (m.tsv @@ (SELECT query FROM q)
+                      OR c.tsv @@ (SELECT query FROM q))
                  AND ($2::text IS NULL OR m.role = $2)
              ORDER BY rank DESC, c.updated_at DESC, m.ordinal ASC
              LIMIT $3",
@@ -99,6 +108,7 @@ impl ConversationSearchStore for PgConversationSearchStore {
         .bind(query)
         .bind(role_db)
         .bind(limit_i64)
+        .bind(user_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
