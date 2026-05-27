@@ -75,6 +75,26 @@ tokio::task_local! {
     /// at the boundary that actually needs cancellation (the streaming
     /// loop) instead of every wrapper / decorator on the chain.
     static CANCELLATION_TOKEN: CancellationToken;
+
+    /// Per-turn tool allowlist (issues #112 / #113).
+    ///
+    /// When set, only tool names in the list may be exposed to the LLM
+    /// for this turn — every other tool is hidden from the dispatch
+    /// path. When unset, all available tools are exposed (the pre-#112
+    /// behaviour). An empty allowlist means "no tools allowed for this
+    /// turn" — useful for safety-critical agent runs that should never
+    /// take tool actions.
+    ///
+    /// Both `spawn_subagent` (#112) and `SpawnStandaloneAgent` (#113)
+    /// install this task-local from their respective `tools` field, so
+    /// the actual gating implementation can live in a single place
+    /// (tool-selection in the dispatch loop) and serve both call sites.
+    ///
+    /// Why a task-local: mirrors the other per-turn task-locals in this
+    /// module so the dispatch loop can read it without a signature
+    /// change on `ConversationService::send_prompt_with_override` or
+    /// the connector traits.
+    static TOOL_ALLOWLIST: Vec<String>;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -188,6 +208,32 @@ where
 /// wrapper retain the pre-#109 behaviour.
 pub fn current_cancellation_token() -> Option<CancellationToken> {
     CANCELLATION_TOKEN.try_with(|t| t.clone()).ok()
+}
+
+/// Run `fut` with `tools` installed as the current task-local tool
+/// allowlist. Used by the `SpawnStandaloneAgent` (#113) handler and the
+/// `spawn_subagent` builtin tool (#112) so the spawned task body can
+/// restrict the LLM's tool surface for the duration of that run.
+///
+/// See [`TOOL_ALLOWLIST`] for the read side and the semantic contract.
+pub async fn with_tool_allowlist<F, T>(tools: Vec<String>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TOOL_ALLOWLIST.scope(tools, fut).await
+}
+
+/// Returns the current task-local tool allowlist, or `None` when no
+/// allowlist has been installed.
+///
+/// Resolution rules:
+/// - `None` — no restriction; expose every available tool. Pre-#112
+///   behaviour for callers that don't spawn through the helpers.
+/// - `Some(vec)` — only tool names in `vec` may be exposed to the LLM
+///   for this turn. An empty vec means "no tools at all", which is
+///   distinct from `None` and the dispatch path must honour it.
+pub fn current_tool_allowlist() -> Option<Vec<String>> {
+    TOOL_ALLOWLIST.try_with(|t| t.clone()).ok()
 }
 
 /// Reasoning / extended-thinking level for a single LLM turn.
@@ -1272,6 +1318,51 @@ mod tests {
         })
         .await;
         assert_eq!(observed, Some(inner_budget));
+    }
+
+    // --- TOOL_ALLOWLIST tests (issues #112 / #113) ----------------------
+
+    #[tokio::test]
+    async fn current_tool_allowlist_is_none_outside_scope() {
+        // Callers that don't install a scope (legacy paths, tests, the
+        // foreground send path) observe `None`, meaning "no
+        // restriction" — exposes every tool, matching pre-#112
+        // behaviour.
+        assert_eq!(current_tool_allowlist(), None);
+    }
+
+    #[tokio::test]
+    async fn current_tool_allowlist_observes_installed_scope() {
+        let observed = with_tool_allowlist(vec!["search".into(), "fetch".into()], async {
+            current_tool_allowlist()
+        })
+        .await;
+        assert_eq!(
+            observed,
+            Some(vec!["search".to_string(), "fetch".to_string()])
+        );
+        // After the scope exits the task-local is unset again.
+        assert_eq!(current_tool_allowlist(), None);
+    }
+
+    #[tokio::test]
+    async fn empty_tool_allowlist_is_distinct_from_none() {
+        // An explicit empty allowlist means "no tools at all". The
+        // dispatch path must NOT collapse it to "expose everything";
+        // this test pins the distinction down so a future refactor
+        // can't silently merge the two.
+        let observed = with_tool_allowlist(vec![], async { current_tool_allowlist() }).await;
+        assert_eq!(observed, Some(vec![]));
+        assert_ne!(observed, None);
+    }
+
+    #[tokio::test]
+    async fn nested_tool_allowlist_shadows_outer() {
+        let observed = with_tool_allowlist(vec!["outer".into()], async {
+            with_tool_allowlist(vec!["inner".into()], async { current_tool_allowlist() }).await
+        })
+        .await;
+        assert_eq!(observed, Some(vec!["inner".to_string()]));
     }
 
     // --- ToolCallAccumulator (#45) ----------------------------------------
