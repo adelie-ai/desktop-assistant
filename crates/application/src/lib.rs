@@ -960,18 +960,67 @@ where
             // Streamed commands are handled elsewhere.
             api::Command::SendMessage { .. } => Err(ApiError::Unsupported),
 
-            // Background-task commands (issue #110) are protocol-level only
-            // in this slice. The registry that backs them lands in #111/#112
-            // /#113; until then the dispatcher rejects them so the workspace
-            // still type-checks. Each arm is listed explicitly (no wildcard)
-            // so the registry PR cannot silently miss one.
+            // Background-task commands (issue #110) for which the
+            // registry-side wiring lands in a later issue (ws-interface
+            // hookup is #114). Each arm is listed explicitly (no
+            // wildcard) so a future PR can't silently miss one.
             api::Command::ListBackgroundTasks { .. }
             | api::Command::GetBackgroundTask { .. }
             | api::Command::CancelBackgroundTask { .. }
             | api::Command::GetBackgroundTaskLogs { .. }
             | api::Command::SubscribeBackgroundTasks
-            | api::Command::UnsubscribeBackgroundTasks
-            | api::Command::SpawnStandaloneAgent { .. } => Err(ApiError::Unsupported),
+            | api::Command::UnsubscribeBackgroundTasks => Err(ApiError::Unsupported),
+
+            // Standalone agent spawn (issue #113). Creates a fresh
+            // conversation scoped to the calling user, registers a
+            // task in the in-memory registry, and returns its id
+            // synchronously — the LLM call runs in the background.
+            api::Command::SpawnStandaloneAgent {
+                name,
+                initial_prompt,
+                override_selection,
+                tools,
+            } => {
+                let registry = self.registry.clone().ok_or_else(|| {
+                    ApiError::Core(
+                        "background task registry not attached to handler".to_string(),
+                    )
+                })?;
+                let user_id = desktop_assistant_core::ports::auth::current_user_id();
+
+                // Create the conversation first so the TaskKind can
+                // carry a real conversation_id. The service runs under
+                // the same task-local user scope `handle_command_for`
+                // installed, so the new row is owned by the requesting
+                // user (#105 contract).
+                let title = format!("Standalone: {name}");
+                let conv = self
+                    .conversations
+                    .create_conversation(title.clone())
+                    .await
+                    .map_err(Self::map_core_err)?;
+                let conversation_id = conv.id.0.clone();
+
+                let name_for_kind = name.clone();
+                let task_id = spawn_agent_conversation(
+                    registry,
+                    Arc::clone(&self.conversations),
+                    AgentConversationSpec {
+                        user_id,
+                        name,
+                        title,
+                        initial_prompt,
+                        override_selection,
+                        tools,
+                        conversation_id,
+                    },
+                    move |conversation_id| api::TaskKind::Standalone {
+                        name: name_for_kind,
+                        conversation_id,
+                    },
+                );
+                Ok(api::CommandResult::BackgroundTaskSpawned { id: task_id.0 })
+            }
 
             // Client-side tool execution (issue #107). The default
             // handler doesn't carry a `ClientToolCoordinator`; a
@@ -1114,6 +1163,139 @@ where
         // happy-path / error-path branching.
         Ok(())
     }
+}
+
+/// Shared spawn primitive used by both `SpawnStandaloneAgent` (#113)
+/// and the `spawn_subagent` builtin tool (#112).
+///
+/// Both call sites do the same three things in the same order:
+/// 1. Create a fresh conversation under the requesting user's scope so
+///    the new row carries the right `user_id`.
+/// 2. Register a task in the registry with a kind built from the new
+///    conversation id, so the foreground UI can show, cancel, and
+///    follow logs for the spawned agent.
+/// 3. Drive that conversation through `send_prompt_with_override`
+///    inside the task body, threading through the per-turn cancellation
+///    token, the per-turn user scope, and the per-turn tool allowlist.
+///
+/// Returns the new `TaskId` synchronously — the body runs on the
+/// current tokio runtime and the caller does NOT await its completion.
+/// This is the contract the protocol relies on for `BackgroundTaskSpawned`.
+///
+/// The `kind_factory` lets each call site construct its own
+/// `TaskKind` variant (`Standalone` vs `Subagent`) once the conversation
+/// id is known. The helper deliberately doesn't take a `TaskKind`
+/// directly so we can't construct one with a stale or empty
+/// `conversation_id`.
+/// Bundle of arguments for [`spawn_agent_conversation`]. Grouping them
+/// in a struct keeps the helper's call sites readable and dodges the
+/// `clippy::too_many_arguments` lint without sacrificing the
+/// field-by-field documentation the call sites benefit from.
+pub(crate) struct AgentConversationSpec {
+    pub user_id: UserId,
+    /// Display name for the agent; used to derive the run's log lines.
+    pub name: String,
+    /// Title for the registry's `TaskView`. Distinct from `name` so the
+    /// caller can prepend a type tag like "Standalone: …".
+    pub title: String,
+    /// The user-visible first turn for this conversation.
+    pub initial_prompt: String,
+    /// Optional per-send override of connection + model + effort.
+    pub override_selection: Option<api::SendPromptOverride>,
+    /// Optional tool allowlist for this run; installed as the task-local
+    /// [`desktop_assistant_core::ports::llm::current_tool_allowlist`].
+    pub tools: Option<Vec<String>>,
+    /// Conversation id created beforehand by the caller — the helper
+    /// needs it both to construct the task kind and to send the prompt.
+    pub conversation_id: String,
+}
+
+pub(crate) fn spawn_agent_conversation<C>(
+    registry: Arc<BackgroundTaskRegistry>,
+    conversations: Arc<C>,
+    spec: AgentConversationSpec,
+    kind_factory: impl FnOnce(String) -> api::TaskKind,
+) -> api::TaskId
+where
+    C: ConversationService + Send + Sync + 'static,
+{
+    let AgentConversationSpec {
+        user_id,
+        name,
+        title,
+        initial_prompt,
+        override_selection,
+        tools,
+        conversation_id,
+    } = spec;
+
+    let kind = kind_factory(conversation_id.clone());
+    let agent_name = name;
+
+    registry.spawn(user_id.clone(), kind, title, move |ctx| async move {
+        ctx.logs.append(
+            api::LogLevel::Info,
+            api::LogCategory::Status,
+            format!("agent '{agent_name}' starting prompt"),
+            None,
+        );
+
+        let override_for_core = override_selection.map(|o| PromptSelectionOverride {
+            connection_id: o.connection_id,
+            model_id: o.model_id,
+            effort: o.effort,
+        });
+
+        // Drop callbacks — standalone / subagent runs emit progress
+        // through the registry's per-task log ring and broadcast
+        // channel, not through the streaming `SendMessage` chunk path.
+        // The chunk and status callbacks are required by the trait, so
+        // we wire no-op closures.
+        let on_chunk: desktop_assistant_core::ports::llm::ChunkCallback =
+            Box::new(|_chunk| true);
+        let on_status: desktop_assistant_core::ports::llm::StatusCallback =
+            Box::new(|_msg| {});
+
+        // Install the tool allowlist (if any) and the requesting user's
+        // identity so the inner `send_prompt_with_override` call (and
+        // any storage queries it triggers) observe the same scope the
+        // foreground send path uses.
+        let conv_id_for_send = conversation_id.clone();
+        let token = ctx.token.clone();
+        let inner = async move {
+            conversations
+                .send_prompt_with_override(
+                    &desktop_assistant_core::domain::ConversationId::from(
+                        conv_id_for_send.as_str(),
+                    ),
+                    initial_prompt,
+                    override_for_core,
+                    on_chunk,
+                    on_status,
+                    token,
+                )
+                .await
+        };
+        let result = if let Some(tools) = tools {
+            desktop_assistant_core::ports::auth::with_user_id(
+                user_id.clone(),
+                desktop_assistant_core::ports::llm::with_tool_allowlist(tools, inner),
+            )
+            .await
+        } else {
+            desktop_assistant_core::ports::auth::with_user_id(user_id.clone(), inner).await
+        };
+
+        match result {
+            Ok(_outcome) => Ok(()),
+            // `Cancelled` propagated up from the cooperative core path
+            // — let the registry record this as `Cancelled` via the
+            // token state rather than tacking on a misleading "failed"
+            // string.
+            Err(desktop_assistant_core::CoreError::Cancelled) => Ok(()),
+            Err(other) => Err(anyhow::Error::new(other)),
+        }
+    })
 }
 
 /// Inline turn body, shared between the registry-aware and the

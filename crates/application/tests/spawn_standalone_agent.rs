@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{
-    AssistantApiHandler, DefaultAssistantApiHandler, EventSink, RequestContext, UserId,
+    AssistantApiHandler, DefaultAssistantApiHandler, RequestContext, UserId,
     background_tasks::BackgroundTaskRegistry,
 };
 use desktop_assistant_core::CoreError;
@@ -313,6 +313,11 @@ struct SendCall {
     prompt: String,
     override_selection: Option<PromptSelectionOverride>,
     tool_allowlist: Option<Vec<String>>,
+    /// Recorded so the multi-tenant / scope tests can sanity-check that
+    /// `with_user_id` was actually installed before the inner call —
+    /// even though the registry-side isolation tests assert this
+    /// indirectly through `registry.get(&other_user, ...)`.
+    #[allow(dead_code)]
     user_id_observed: UserId,
 }
 
@@ -474,17 +479,6 @@ impl ConversationService for RecordingConversations {
             }
             Behavior::Fail { error } => Err(CoreError::Llm(error.clone())),
         }
-    }
-}
-
-// ----- Sinks ---------------------------------------------------------------
-
-struct CollectSink(tokio::sync::Mutex<Vec<api::Event>>);
-#[async_trait::async_trait]
-impl EventSink for CollectSink {
-    async fn emit(&self, event: api::Event) -> bool {
-        self.0.lock().await.push(event);
-        true
     }
 }
 
