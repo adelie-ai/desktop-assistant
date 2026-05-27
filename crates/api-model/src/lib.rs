@@ -876,4 +876,399 @@ mod tests {
         let back: ConnectionAvailability = serde_json::from_str(&json2).unwrap();
         assert_eq!(un, back);
     }
+
+    // ---- #110: background task variants -----------------------------------
+    //
+    // Tests below are the spec-driven acceptance criteria from issue #110.
+    // They are intentionally written before the corresponding types are
+    // introduced (TDD): they will fail to compile / fail equality until the
+    // protocol shape is added.
+
+    fn sample_task_view() -> TaskView {
+        TaskView {
+            id: TaskId("task-1".into()),
+            kind: TaskKind::Subagent {
+                parent_task_id: TaskId("parent".into()),
+                conversation_id: "conv-9".into(),
+                name: "researcher".into(),
+            },
+            status: TaskStatus::Running,
+            started_at: 1_700_000_000,
+            ended_at: Some(1_700_000_500),
+            last_error: None,
+            parent: Some(TaskId("parent".into())),
+            children: vec![TaskId("child-a".into()), TaskId("child-b".into())],
+            title: "Researching subagent".into(),
+            progress_hint: Some("step 2/4".into()),
+        }
+    }
+
+    fn sample_log_entry() -> TaskLogEntry {
+        TaskLogEntry {
+            seq: 7,
+            timestamp: 1_700_000_123,
+            level: LogLevel::Info,
+            category: LogCategory::ToolCall,
+            message: "calling tool".into(),
+            data: Some(serde_json::json!({"tool": "search"})),
+        }
+    }
+
+    #[test]
+    fn task_view_round_trips_via_serde_json() {
+        // TaskId
+        let id = TaskId("abc".into());
+        let json = serde_json::to_string(&id).unwrap();
+        let back: TaskId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+
+        // TaskKind — all three variants.
+        for kind in [
+            TaskKind::Conversation {
+                conversation_id: "c1".into(),
+            },
+            TaskKind::Subagent {
+                parent_task_id: TaskId("p1".into()),
+                conversation_id: "c2".into(),
+                name: "child".into(),
+            },
+            TaskKind::Standalone {
+                name: "agent".into(),
+                conversation_id: "c3".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: TaskKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back);
+        }
+
+        // TaskStatus — every variant.
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: TaskStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, back);
+        }
+
+        // LogLevel
+        for level in [LogLevel::Info, LogLevel::Warn, LogLevel::Error] {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: LogLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(level, back);
+        }
+
+        // LogCategory
+        for cat in [
+            LogCategory::ModelTurn,
+            LogCategory::ToolCall,
+            LogCategory::ToolResult,
+            LogCategory::Status,
+            LogCategory::Lifecycle,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            let back: LogCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(cat, back);
+        }
+
+        // TaskView
+        let view = sample_task_view();
+        let json = serde_json::to_string(&view).unwrap();
+        let back: TaskView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
+
+        // TaskLogEntry
+        let entry = sample_log_entry();
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: TaskLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn task_status_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
+    }
+
+    #[test]
+    fn log_enums_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LogLevel::Info).unwrap(),
+            "\"info\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogLevel::Warn).unwrap(),
+            "\"warn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogLevel::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogCategory::ModelTurn).unwrap(),
+            "\"model_turn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogCategory::ToolCall).unwrap(),
+            "\"tool_call\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogCategory::ToolResult).unwrap(),
+            "\"tool_result\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogCategory::Status).unwrap(),
+            "\"status\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogCategory::Lifecycle).unwrap(),
+            "\"lifecycle\""
+        );
+    }
+
+    #[test]
+    fn command_variants_match_documented_snake_case() {
+        // ListBackgroundTasks
+        let cmd = Command::ListBackgroundTasks {
+            include_finished: true,
+            limit: Some(50),
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"list_background_tasks":{"include_finished":true,"limit":50}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+
+        // GetBackgroundTask
+        let cmd = Command::GetBackgroundTask { id: "t-1".into() };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"get_background_task":{"id":"t-1"}}"#).unwrap();
+        assert_eq!(v, expected);
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+
+        // CancelBackgroundTask
+        let cmd = Command::CancelBackgroundTask { id: "t-2".into() };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"cancel_background_task":{"id":"t-2"}}"#).unwrap();
+        assert_eq!(v, expected);
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+
+        // GetBackgroundTaskLogs
+        let cmd = Command::GetBackgroundTaskLogs {
+            id: "t-3".into(),
+            after_seq: Some(42),
+            limit: Some(100),
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"get_background_task_logs":{"id":"t-3","after_seq":42,"limit":100}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+
+        // SubscribeBackgroundTasks (unit variant — serialized as a bare string)
+        let cmd = Command::SubscribeBackgroundTasks;
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v, serde_json::json!("subscribe_background_tasks"));
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+
+        // UnsubscribeBackgroundTasks
+        let cmd = Command::UnsubscribeBackgroundTasks;
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v, serde_json::json!("unsubscribe_background_tasks"));
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+
+        // SpawnStandaloneAgent
+        let cmd = Command::SpawnStandaloneAgent {
+            name: "researcher".into(),
+            initial_prompt: "go".into(),
+            override_selection: Some(SendPromptOverride {
+                connection_id: "aws".into(),
+                model_id: "claude-sonnet-4".into(),
+                effort: Some(EffortLevel::High),
+            }),
+            tools: Some(vec!["search".into(), "fetch".into()]),
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"spawn_standalone_agent":{"name":"researcher","initial_prompt":"go","override_selection":{"connection_id":"aws","model_id":"claude-sonnet-4","effort":"high"},"tools":["search","fetch"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn command_result_background_task_variants_round_trip() {
+        // BackgroundTasks
+        let res = CommandResult::BackgroundTasks(vec![sample_task_view()]);
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        assert!(v.get("background_tasks").is_some());
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+
+        // BackgroundTask
+        let res = CommandResult::BackgroundTask(sample_task_view());
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        assert!(v.get("background_task").is_some());
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+
+        // BackgroundTaskLogs
+        let res = CommandResult::BackgroundTaskLogs {
+            entries: vec![sample_log_entry()],
+            next_seq: 8,
+        };
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let logs = v
+            .get("background_task_logs")
+            .expect("background_task_logs key");
+        assert_eq!(logs.get("next_seq"), Some(&serde_json::json!(8)));
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+
+        // BackgroundTaskSpawned
+        let res = CommandResult::BackgroundTaskSpawned { id: "t-new".into() };
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"background_task_spawned":{"id":"t-new"}}"#).unwrap();
+        assert_eq!(v, expected);
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn send_message_ack_carries_task_id() {
+        // Golden-file test for the new SendMessageAck shape: callers must be
+        // able to correlate the ack to the registered background task.
+        let res = CommandResult::SendMessageAck {
+            task_id: "task-abc".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"send_message_ack":{"task_id":"task-abc"}}"#).unwrap();
+        assert_eq!(v, expected);
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn event_variants_match_documented_snake_case() {
+        // TaskStarted
+        let ev = Event::TaskStarted {
+            task: sample_task_view(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let started = v.get("task_started").expect("task_started key");
+        assert!(started.get("task").is_some());
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert_eq!(ev, back);
+
+        // TaskProgress
+        let ev = Event::TaskProgress {
+            id: "t-1".into(),
+            progress_hint: Some("step 3/5".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"task_progress":{"id":"t-1","progress_hint":"step 3/5"}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert_eq!(ev, back);
+
+        // TaskLogAppended
+        let ev = Event::TaskLogAppended {
+            id: "t-1".into(),
+            entry: sample_log_entry(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let appended = v.get("task_log_appended").expect("task_log_appended key");
+        assert_eq!(appended.get("id"), Some(&serde_json::json!("t-1")));
+        assert!(appended.get("entry").is_some());
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert_eq!(ev, back);
+
+        // TaskCompleted
+        let ev = Event::TaskCompleted {
+            id: "t-1".into(),
+            status: TaskStatus::Failed,
+            last_error: Some("nope".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"task_completed":{"id":"t-1","status":"failed","last_error":"nope"}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    /// Compile-time check that `TaskId` is a distinct type from `String` for
+    /// typed APIs — callers cannot silently pass a `String` where a `TaskId`
+    /// is expected. This is the in-tree replacement for the trybuild test
+    /// named in #110 (we deliberately do not pull `trybuild` into the
+    /// workspace).
+    ///
+    /// ```compile_fail
+    /// use desktop_assistant_api_model::TaskId;
+    /// fn takes_task_id(_: TaskId) {}
+    /// // A bare String must NOT coerce to TaskId.
+    /// takes_task_id(String::from("not-a-task-id"));
+    /// ```
+    ///
+    /// And the inverse direction:
+    ///
+    /// ```compile_fail
+    /// use desktop_assistant_api_model::TaskId;
+    /// fn takes_string(_: String) {}
+    /// // A TaskId must NOT coerce to String.
+    /// takes_string(TaskId("x".into()));
+    /// ```
+    ///
+    /// A correct call site explicitly wraps/unwraps:
+    ///
+    /// ```
+    /// use desktop_assistant_api_model::TaskId;
+    /// fn takes_task_id(_: TaskId) {}
+    /// takes_task_id(TaskId(String::from("ok")));
+    /// ```
+    #[allow(dead_code)]
+    fn task_id_is_distinct_from_string_for_typed_apis() {}
 }
