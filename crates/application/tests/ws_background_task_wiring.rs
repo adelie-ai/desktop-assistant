@@ -313,6 +313,7 @@ impl SettingsService for FakeSettings {
 
 #[derive(Debug, Clone)]
 struct SendCall {
+    #[allow(dead_code)]
     conversation_id: String,
     prompt: String,
 }

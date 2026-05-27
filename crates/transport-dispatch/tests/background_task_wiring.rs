@@ -203,12 +203,10 @@ async fn try_next_frame(rx: &mut mpsc::Receiver<WsFrame>) -> Option<WsFrame> {
 /// loop alive across multiple sends so we can trigger registry events
 /// out-of-band. Returns `'static`-friendly types so the resulting future
 /// can be `tokio::spawn`ed.
-fn open_inbound() -> (
-    mpsc::Sender<anyhow::Result<WsRequest>>,
-    std::pin::Pin<
-        Box<dyn futures::Stream<Item = anyhow::Result<WsRequest>> + Send + 'static>,
-    >,
-) {
+type InboundStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<WsRequest>> + Send + 'static>>;
+
+fn open_inbound() -> (mpsc::Sender<anyhow::Result<WsRequest>>, InboundStream) {
     let (tx, rx) = mpsc::channel::<anyhow::Result<WsRequest>>(8);
     let stream = futures::stream::unfold(rx, |mut rx| async move {
         use futures::StreamExt;
@@ -265,18 +263,16 @@ async fn subscribe_then_registry_event_streams_to_connection() {
     // connection.
     let mut saw_task_event = false;
     for _ in 0..10 {
-        if let Some(frame) = try_next_frame(&mut out_rx).await {
-            if let WsFrame::Event { event } = frame {
-                if matches!(
-                    event,
-                    api::Event::TaskStarted { .. }
-                        | api::Event::TaskCompleted { .. }
-                        | api::Event::TaskLogAppended { .. }
-                ) {
-                    saw_task_event = true;
-                    break;
-                }
-            }
+        if let Some(WsFrame::Event { event }) = try_next_frame(&mut out_rx).await
+            && matches!(
+                event,
+                api::Event::TaskStarted { .. }
+                    | api::Event::TaskCompleted { .. }
+                    | api::Event::TaskLogAppended { .. }
+            )
+        {
+            saw_task_event = true;
+            break;
         }
     }
     assert!(saw_task_event, "expected a Task* event on the connection");
@@ -339,18 +335,16 @@ async fn unsubscribe_stops_event_stream() {
 
     // Poll for a window — there should be no Task* events.
     for _ in 0..10 {
-        if let Some(frame) = try_next_frame(&mut out_rx).await {
-            if let WsFrame::Event { event } = frame {
-                assert!(
-                    !matches!(
-                        event,
-                        api::Event::TaskStarted { .. }
-                            | api::Event::TaskCompleted { .. }
-                            | api::Event::TaskLogAppended { .. }
-                    ),
-                    "no Task* event should arrive after Unsubscribe; got {event:?}"
-                );
-            }
+        if let Some(WsFrame::Event { event }) = try_next_frame(&mut out_rx).await {
+            assert!(
+                !matches!(
+                    event,
+                    api::Event::TaskStarted { .. }
+                        | api::Event::TaskCompleted { .. }
+                        | api::Event::TaskLogAppended { .. }
+                ),
+                "no Task* event should arrive after Unsubscribe; got {event:?}"
+            );
         }
     }
 

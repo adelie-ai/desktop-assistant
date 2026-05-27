@@ -21,7 +21,7 @@ use desktop_assistant_core::ports::inbound::{
 use thiserror::Error;
 use tracing::warn;
 
-use crate::background_tasks::BackgroundTaskRegistry;
+use crate::background_tasks::{BackgroundTaskRegistry, TaskError};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -30,6 +30,23 @@ pub enum ApiError {
 
     #[error("unsupported command")]
     Unsupported,
+
+    /// The targeted entity is unknown to the caller. Used by background-
+    /// task arms to surface both "id never existed" and "id belongs to
+    /// another user" (the existence-hiding rule from #105) under a
+    /// single, intentionally opaque variant. Renders to "not found" so
+    /// adapters can forward the message verbatim without leaking the
+    /// distinction.
+    #[error("not found")]
+    NotFound,
+
+    /// The targeted task is already in a terminal state — e.g. a
+    /// `Cancel` on a task the registry already marked `Failed` after
+    /// the cold-restart sweep (#115). Distinct from `NotFound` so
+    /// transport adapters can return a clean 409-style error to the
+    /// client instead of pretending the operation succeeded.
+    #[error("task is already terminal")]
+    AlreadyTerminal,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -183,6 +200,57 @@ pub trait AssistantApiHandler: Send + Sync {
             ),
         )
         .await
+    }
+
+    /// Subscribe to background-task events for the current task-local
+    /// user id (#114). Returning `Some(receiver)` lets the transport
+    /// layer spawn a forwarder that pumps `Event::Task*` frames out to
+    /// a single connection until the connection drops or
+    /// `UnsubscribeBackgroundTasks` arrives.
+    ///
+    /// The default implementation returns `None`, which tells the
+    /// dispatcher to surface `SubscribeBackgroundTasks` as a clean
+    /// error frame instead of acking and then never streaming
+    /// anything. Handlers that wrap a `BackgroundTaskRegistry`
+    /// override this method to return a real receiver.
+    ///
+    /// Contract: callers MUST install the per-request user id via
+    /// `with_user_id` before invoking this method. The dispatcher does
+    /// that as part of its per-request scope-installation discipline
+    /// (#105) — handlers that read `current_user_id()` here can rely
+    /// on it being set.
+    async fn subscribe_user_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<api::Event>> {
+        None
+    }
+
+    /// Register a `SendMessage` request as a background task and
+    /// return the new task id synchronously. The body runs in the
+    /// background; events stream through `sink` as before.
+    ///
+    /// Returning `Some(task_id)` tells the dispatcher to reply with
+    /// `CommandResult::SendMessageAck { task_id }`. Returning `None`
+    /// (the default) tells the dispatcher to fall back to the legacy
+    /// bare-Ack flow and dispatch `handle_send_message_with_override`
+    /// directly — used by tests and single-tenant deploys that don't
+    /// attach a registry to the handler.
+    async fn start_send_message(
+        &self,
+        conversation_id: String,
+        content: String,
+        override_selection: Option<api::SendPromptOverride>,
+        request_id: String,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<Option<api::TaskId>> {
+        let _ = (
+            conversation_id,
+            content,
+            override_selection,
+            request_id,
+            sink,
+        );
+        Ok(None)
     }
 }
 
@@ -961,16 +1029,83 @@ where
             // Streamed commands are handled elsewhere.
             api::Command::SendMessage { .. } => Err(ApiError::Unsupported),
 
-            // Background-task commands (issue #110) for which the
-            // registry-side wiring lands in a later issue (ws-interface
-            // hookup is #114). Each arm is listed explicitly (no
-            // wildcard) so a future PR can't silently miss one.
-            api::Command::ListBackgroundTasks { .. }
-            | api::Command::GetBackgroundTask { .. }
-            | api::Command::CancelBackgroundTask { .. }
-            | api::Command::GetBackgroundTaskLogs { .. }
-            | api::Command::SubscribeBackgroundTasks
-            | api::Command::UnsubscribeBackgroundTasks => Err(ApiError::Unsupported),
+            // Background-task commands (#114) — read-side arms that
+            // dispatch through the in-memory registry attached to the
+            // handler. Subscribe/Unsubscribe Ack here at the
+            // protocol level; the transport-side forwarder that
+            // actually pushes `Event::Task*` to the connection is
+            // hooked up by `dispatch_loop` via
+            // [`Self::subscribe_user_events`] (transport-dispatch).
+            api::Command::ListBackgroundTasks {
+                include_finished,
+                limit,
+            } => {
+                let registry = self.registry.as_ref().ok_or_else(|| {
+                    ApiError::Core(
+                        "background task registry not attached to handler".to_string(),
+                    )
+                })?;
+                let user_id = desktop_assistant_core::ports::auth::current_user_id();
+                Ok(api::CommandResult::BackgroundTasks(
+                    registry.list(&user_id, include_finished, limit),
+                ))
+            }
+            api::Command::GetBackgroundTask { id } => {
+                let registry = self.registry.as_ref().ok_or_else(|| {
+                    ApiError::Core(
+                        "background task registry not attached to handler".to_string(),
+                    )
+                })?;
+                let user_id = desktop_assistant_core::ports::auth::current_user_id();
+                registry
+                    .get(&user_id, &api::TaskId(id))
+                    .map(api::CommandResult::BackgroundTask)
+                    .ok_or(ApiError::NotFound)
+            }
+            api::Command::CancelBackgroundTask { id } => {
+                let registry = self.registry.as_ref().ok_or_else(|| {
+                    ApiError::Core(
+                        "background task registry not attached to handler".to_string(),
+                    )
+                })?;
+                let user_id = desktop_assistant_core::ports::auth::current_user_id();
+                match registry.cancel(&user_id, &api::TaskId(id)) {
+                    Ok(()) => Ok(api::CommandResult::Ack),
+                    Err(TaskError::NotFound) => Err(ApiError::NotFound),
+                    Err(TaskError::AlreadyTerminal) => Err(ApiError::AlreadyTerminal),
+                }
+            }
+            api::Command::GetBackgroundTaskLogs {
+                id,
+                after_seq,
+                limit,
+            } => {
+                let registry = self.registry.as_ref().ok_or_else(|| {
+                    ApiError::Core(
+                        "background task registry not attached to handler".to_string(),
+                    )
+                })?;
+                let user_id = desktop_assistant_core::ports::auth::current_user_id();
+                match registry.logs(
+                    &user_id,
+                    &api::TaskId(id),
+                    after_seq.unwrap_or(0),
+                    limit.unwrap_or(200),
+                ) {
+                    Ok((entries, next_seq)) => Ok(api::CommandResult::BackgroundTaskLogs {
+                        entries,
+                        next_seq,
+                    }),
+                    Err(TaskError::NotFound) => Err(ApiError::NotFound),
+                    Err(TaskError::AlreadyTerminal) => Err(ApiError::AlreadyTerminal),
+                }
+            }
+            // Subscribe / Unsubscribe Ack at the handler level. The
+            // dispatcher inspects [`Self::subscribe_user_events`] to
+            // spawn (or tear down) the forwarder that actually streams
+            // `Event::Task*` frames to the connection.
+            api::Command::SubscribeBackgroundTasks => Ok(api::CommandResult::Ack),
+            api::Command::UnsubscribeBackgroundTasks => Ok(api::CommandResult::Ack),
 
             // Standalone agent spawn (issue #113). Creates a fresh
             // conversation scoped to the calling user, registers a
@@ -1090,6 +1225,80 @@ where
             .await
             .map_err(Self::map_core_err)
         }
+    }
+
+    /// Register a `SendMessage` with the attached registry so the
+    /// dispatcher can return `SendMessageAck { task_id }` synchronously
+    /// while the body still runs in the background (#114). The body
+    /// holds the same `sink`, so streaming chunks reach the connection
+    /// exactly as before — only the wire-level ack changes shape.
+    ///
+    /// Returns `None` when no registry is attached so callers
+    /// (transport-dispatch) can fall back to the legacy
+    /// `handle_send_message_with_override` + bare-`Ack` flow.
+    async fn start_send_message(
+        &self,
+        conversation_id: String,
+        content: String,
+        override_selection: Option<api::SendPromptOverride>,
+        request_id: String,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<Option<api::TaskId>> {
+        let Some(registry) = self.registry.clone() else {
+            return Ok(None);
+        };
+        let user_id = desktop_assistant_core::ports::auth::current_user_id();
+        let conversations = Arc::clone(&self.conversations);
+        let kind = api::TaskKind::Conversation {
+            conversation_id: conversation_id.clone(),
+        };
+        let title = format!("Conversation: {conversation_id}");
+
+        let conv_id_for_body = conversation_id.clone();
+        let request_id_for_body = request_id.clone();
+        let sink_for_body = Arc::clone(&sink);
+
+        // `registry.spawn` is sync; the body runs on its own
+        // `tokio::spawn` so we can return the new task id immediately.
+        let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
+            ctx.logs.append(
+                api::LogLevel::Info,
+                api::LogCategory::Status,
+                format!("send_prompt conversation_id={conv_id_for_body}"),
+                None,
+            );
+
+            let result = run_send_turn(
+                conversations,
+                conv_id_for_body,
+                content,
+                override_selection,
+                request_id_for_body,
+                sink_for_body,
+                ctx.token.clone(),
+            )
+            .await;
+
+            match result {
+                Ok(()) => Ok(()),
+                Err(desktop_assistant_core::CoreError::Cancelled) => Ok(()),
+                Err(other) => Err(anyhow::Error::new(other)),
+            }
+        });
+
+        Ok(Some(task_id))
+    }
+
+    /// Hand the dispatcher (or any transport-level forwarder) a
+    /// `broadcast::Receiver` so it can fan `Event::Task*` frames out
+    /// to a single connection. Reads the per-request user id from the
+    /// task-local installed by [`handle_command_for`] (#105).
+    async fn subscribe_user_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<api::Event>> {
+        let registry = self.registry.as_ref()?;
+        let user_id = desktop_assistant_core::ports::auth::current_user_id();
+        Some(registry.subscribe(&user_id))
     }
 }
 

@@ -268,12 +268,18 @@ impl WsClient {
                 override_selection,
             })
             .await?;
-        let api::CommandResult::Ack = result else {
-            return Err(anyhow!("unexpected websocket response for send_prompt"));
-        };
-
-        // WS send-message ack does not include request id; first stream event carries it.
-        Ok(String::new())
+        // Post-#114 the daemon returns `SendMessageAck { task_id }`
+        // when its handler is wired with a `BackgroundTaskRegistry`;
+        // older / test daemons may still return the legacy bare `Ack`.
+        // Both are valid wire-level acks for this call site — the
+        // task id is surfaced via streaming events, not the ack.
+        match result {
+            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
+            api::CommandResult::Ack => Ok(String::new()),
+            other => Err(anyhow!(
+                "unexpected websocket response for send_prompt: {other:?}"
+            )),
+        }
     }
 
     /// List models across every healthy connection. Pass `connection_id =
