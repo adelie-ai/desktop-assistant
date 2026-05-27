@@ -5,6 +5,7 @@
 
 pub mod background_tasks;
 pub mod client_tools;
+pub mod subagent_tools;
 
 use std::sync::Arc;
 

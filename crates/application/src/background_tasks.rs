@@ -55,6 +55,30 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
+tokio::task_local! {
+    /// The id of the currently-executing background task.
+    ///
+    /// Installed by [`BackgroundTaskRegistry::spawn`] around the task
+    /// body so nested code (LLM tool dispatch, in particular) can read
+    /// "what task am I running under?" without threading the id through
+    /// every signature. This is the parent-link for `spawn_subagent`
+    /// (#112): the child registers `TaskKind::Subagent { parent_task_id,
+    /// ... }` by reading this value at tool-dispatch time.
+    ///
+    /// When unset — tests that don't go through `spawn`, dreaming jobs,
+    /// any code that runs outside a registered task — [`current_task_id`]
+    /// returns `None`. Callers that depend on the value must handle the
+    /// absence path explicitly.
+    static CURRENT_TASK_ID: api::TaskId;
+}
+
+/// Returns the id of the task currently executing, when the call site
+/// is inside a [`BackgroundTaskRegistry::spawn`] body. Returns `None`
+/// outside any registered task body — see [`CURRENT_TASK_ID`].
+pub fn current_task_id() -> Option<api::TaskId> {
+    CURRENT_TASK_ID.try_with(|id| id.clone()).ok()
+}
+
 /// Configuration knobs for the registry.
 ///
 /// Daemon-level config can override these via [`BackgroundTaskRegistry::with_config`];
@@ -349,6 +373,7 @@ impl BackgroundTaskRegistry {
         let user_id_for_body = user_id.clone();
         let ctx_for_body = ctx.clone();
         let view_for_persist = view.clone();
+        let task_id_for_scope = task_id.clone();
         tokio::spawn(async move {
             // Mirror the in-memory row to the persistence store BEFORE
             // running the user body. The await happens inside the spawned
@@ -360,11 +385,18 @@ impl BackgroundTaskRegistry {
             // anyway; the user-visible task continues to work.
             inner.persist_create(&task_id_for_body, &user_id_for_body, &view_for_persist).await;
 
-            // Run the body. We always finalize, even on panic, via a
-            // drop-guard so the registry never gets stuck with a row
-            // in `Running` after the task disappears.
-            let result = body(ctx_for_body).await;
-            inner.finalize(&task_id_for_body, &user_id_for_body, result).await;
+            // Run the body inside a `CURRENT_TASK_ID` task-local scope so
+            // nested tool dispatches (the `spawn_subagent` builtin, in
+            // particular) can read the running task's id without threading
+            // it through every signature. We always finalize, even on
+            // panic, so the registry never gets stuck with a row in
+            // `Running` after the task disappears.
+            let result = CURRENT_TASK_ID
+                .scope(task_id_for_scope, body(ctx_for_body))
+                .await;
+            inner
+                .finalize(&task_id_for_body, &user_id_for_body, result)
+                .await;
         });
 
         task_id
