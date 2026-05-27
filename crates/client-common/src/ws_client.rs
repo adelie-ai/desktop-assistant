@@ -480,15 +480,26 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             conversation_id,
             warning,
         }),
-        // Background-task events (issue #110) are not yet mapped onto the
-        // legacy SignalEvent stream; the process-manager UIs subscribe
-        // directly to Task* events via a dedicated channel introduced
-        // alongside the registry (see #111/#112/#113). Each arm is listed
-        // explicitly so future variants force a deliberate decision.
-        api::Event::TaskStarted { .. }
-        | api::Event::TaskProgress { .. }
-        | api::Event::TaskLogAppended { .. }
-        | api::Event::TaskCompleted { .. } => None,
+        // Background-task events (issue #110) — surfaced verbatim on the
+        // signal channel so process-manager UIs (adele-tui#45, adele-gtk
+        // follow-up) can react. The TaskView/TaskLogEntry types are
+        // re-exported from `api-model`; clients consume them directly.
+        api::Event::TaskStarted { task } => Some(SignalEvent::TaskStarted { task }),
+        api::Event::TaskProgress { id, progress_hint } => {
+            Some(SignalEvent::TaskProgress { id, progress_hint })
+        }
+        api::Event::TaskLogAppended { id, entry } => {
+            Some(SignalEvent::TaskLogAppended { id, entry })
+        }
+        api::Event::TaskCompleted {
+            id,
+            status,
+            last_error,
+        } => Some(SignalEvent::TaskCompleted {
+            id,
+            status,
+            last_error,
+        }),
         // Client-side tool execution (#107): handled by clients that
         // implement the client-tool protocol directly; the legacy
         // `SignalEvent` stream is for the GTK desktop UI and does not
