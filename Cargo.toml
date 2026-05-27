@@ -53,4 +53,4 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = "0.26"
 chrono = { version = "0.4", features = ["clock"] }
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
