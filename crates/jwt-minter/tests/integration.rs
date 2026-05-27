@@ -7,9 +7,7 @@ use desktop_assistant_auth_jwt as auth_jwt;
 use desktop_assistant_jwt_minter::config::{
     MAX_TTL_SECS, MIN_TTL_SECS, MintConfig,
 };
-use desktop_assistant_jwt_minter::group::{
-    self, GroupGate, uid_in_groups,
-};
+use desktop_assistant_jwt_minter::group::{self, uid_in_groups};
 use desktop_assistant_jwt_minter::peer::{self, PeerIdentity};
 use desktop_assistant_jwt_minter::request::{MintResponse, handle_request};
 use desktop_assistant_jwt_minter::server::{ServerOptions, serve};
