@@ -1,211 +1,146 @@
-# Adelie Linux AI Platform
+# Adelie AI Platform
 
-An API-first AI platform for Linux desktops and applications, with full-featured D-Bus and Websocket API
+An API-first AI platform for Linux desktops, deployable as a single-tenant systemd
+user service today and intended to scale to multi-tenant server deployments
+(k8s, Knative, Lambda) without forking the code path.
 
-Provides the **Adele** desktop assistant.
+The platform ships the **Adele** assistant persona. This repository is the
+daemon and its workspace; the chat clients live in their own repos.
 
-## Features
-
-- Automated knowledge base maintenance and the ability to introspect memory
-- Dream cycle to consolidate knowledge base and learn from conversations
-- Support for long tool lists with a vectorized tool search.
-- Storage in Postgres, with vectorized knowledge base and tool search using `pgvector`
-- Use different connectors and models for primary interactions, backend tasks, and search vectorization
-
-## Integrations
-- Multiple LLM backends (`ollama`, `openai`, `anthropic`, `aws bedrock`)
-- MCP tool integration over stdio with several MCP servers provided by the `adelie-mcp` project
-- D-Bus and WebSocket APIs for client integration
+> **Experimental.** Most of this codebase is AI-generated and has not been
+> exhaustively reviewed. It's useful in practice, but use accordingly.
 
 ## Clients
 
-Clients have been extracted to their own repositories:
+The chat clients are separate repositories, each with their own install steps:
 
-- [adele-tui](https://github.com/adelie-ai/adele-tui) — Terminal UI client (`adele` binary)
-- [adele-gtk](https://github.com/adelie-ai/adele-gtk) — GTK4 desktop client (`adele-gtk` binary)
-- [adele-kde](https://github.com/adelie-ai/adele-kde) — KDE Plasma widgets and System Settings module
+- [adele-tui](https://github.com/adelie-ai/adele-tui) — terminal UI (`adele`)
+- [adele-gtk](https://github.com/adelie-ai/adele-gtk) — GTK4 desktop client
+- [adele-kde](https://github.com/adelie-ai/adele-kde) — Plasma 6 widgets + KCM
 
-## Project Status
+## What it does today
 
-**Much of this codebase is currently AI-generated**, and it has not yet been comprehensively reviewed by humans. It appears to work well in practice, but it should still be treated as **EXPERIMENTAL**.
+- **Streaming chat** against `ollama`, `openai`, `anthropic`, and `aws-bedrock`,
+  with per-conversation model overrides and per-purpose (chat / background /
+  vector) routing. Streams are cancellable end-to-end — cancelling a turn tears
+  down the in-flight LLM request immediately.
+- **Built-in tools** (always available): hybrid vector + full-text knowledge
+  base (`builtin_knowledge_base_*`), semantic tool discovery
+  (`builtin_tool_search`), and system context (`builtin_sys_props`).
+- **MCP tool integration** over stdio for the heavy lifting. Companion servers
+  developed for this platform include `fileio-mcp`, `terminal-mcp`,
+  `tasks-mcp`, `timeclock-mcp`, `skills-mcp`, and `calendar-mcp`. See
+  [docs/mcp-services.md](docs/mcp-services.md).
+- **Client-side tool execution.** Tools marked client-local suspend the
+  conversation turn to DB, emit `Event::ClientToolCall` to the chat client,
+  and resume on `Command::ClientToolResult`. The turn state machine
+  (`crates/storage/migrations/017_turn_state.sql`) is the persistence shape
+  Lambda would need.
+- **Background tasks.** Long-running work (foreground turns, subagents, future
+  standalone agents) is tracked in `BackgroundTaskRegistry`, cancellable,
+  log-streaming, and durable across daemon restarts
+  (`crates/storage/migrations/018_background_tasks.sql`). Clients subscribe via
+  `Command::SubscribeBackgroundTasks` and receive `Event::Task*` deltas; every
+  `SendMessage` now returns `SendMessageAck { task_id }`.
+- **Dream cycle** for knowledge-base consolidation.
+- **PostgreSQL + `pgvector`** for conversation history, knowledge base, and
+  tool embeddings.
 
-The current phase of the project is focused on mapping the landscape and getting core functionality in place as quickly as possible, so this experimental status is expected to remain for a while. It's already extremely capable and useful, especially coupled with the MCP servers from the project, but please be careful with it.
+## Transports and auth
 
-Community feedback and contributions are very welcome as the platform matures.
+The application layer is transport-agnostic
+(`crates/transport-dispatch`). Three transports speak the same API:
 
-## The Name
+- **WebSocket** (`crates/ws-interface`) — primary remote transport; HS256 JWT in
+  the auth handshake.
+- **UDS** (`crates/uds-interface`) — local-only transport with `SO_PEERCRED`
+  and a HS256 JWT handshake. Pair it with the local minter for desktop apps
+  that don't want to manage credentials.
+- **D-Bus** (`crates/dbus-bridge`) — a standalone `adelie-dbus-bridge` binary
+  that fronts the daemon for legacy session-bus consumers. The daemon also
+  still hosts an in-process D-Bus interface for coexistence; the bridge is the
+  forward direction.
 
-The core platform is called the **Adelie** AI platform. The assistant persona implemented on it is named **Adele**.
+Auth is **JWT-only on the request path** (HS256, shared via `crates/auth-jwt`).
+The `adelie-mint` binary (`crates/jwt-minter`) is a local UDS minter that
+authenticates the OS user with `SO_PEERCRED` and an optional Unix-group gate,
+then issues a short-lived JWT for the daemon. Production deployments are
+expected to use an external IdP (Cognito, Authentik, Keycloak, …); see
+[docs/architecture-evolution.md](docs/architecture-evolution.md).
 
-This branding is fairly superficial and isn't extensively reflected in code at this point, but once it settles, that will probably change. 
+## Multi-tenant by construction
 
-## Current AI Connectors
-
-The project currently can use AWS Bedrock, Ollama, OpenAI, and Anthropic APIs.
-
-## Configuration Recommendations
-
-Configuration is a personal thing. You'll want to experiment. Note that there are differences between the connectors in terms of how they do token caching (if they do it at all), and there are connector-specific instructions which help to fine-tune how the model behaves. So they're not all created equally. Try them out if you don't have a hard requirement, and see what works best for you.
-
-### My Setup
-
-I personally configure Adelie with **AWS Bedrock** using the **Anthropic Sonnet and Haiku models** for primary and backend work respectively, and have it use **local ollama** for knowledge base and tool search vectorization. I just find the Anthropic models are better for the type of tasks I give it. Local Ollama for vectorization is great because the models and search requests are small, and much of it happens in the background where the user doesn't know about it.
-
-AWS Bedrock gives me "better" privacy, is faster than Anthropic and OpenAI's APIs, and I don't need to subscribe to another service. I don't have a decent GPU, so local work is mostly out of the question for me, and I can pay for Bedrock for years before I break even buying GPUs. AWS Bedrock DOES carry the risk of costing yourself some cash if something starts looping, but AWS also puts consumption limits that you'll hit by default unless you want to raise them (via AWS support request), so it's not entirely unmanaged risk.
-
-### OpenAI
-
-I initially used the OpenAI connector with GPT 5.3, which worked great. I liked the ability to pay as I go and constrain cost if something ran amuck. I'd just add 10 bucks at a time and know I couldn't accidentally cost myself 1000 bucks if Adelie went haywire. It saved me a couple times early on while I was building the event loops! This is still a good approach to consider. I found that 5.3 worked better than 5.4 for my tasks, but your mileage may vary. 
-
-OpenAI's automatic token caching seems to work really well, but I was not able to get their built-in dynamic tool search working properly. I'm sure it's something silly, but I've punted it for now. 
-
-### Anthropic
-
-The Anthropic connector works, but for some reason seems to burn a lot of tokens and hit daily limits very quickly. I do use the Anthropic models, but via AWS Bedrock. Anthropic's caching doesn't work the same way as OpenAI's, and I think with the dynamic tool lists, it keeps getting invalidated. I wasn't able to get their built-in tool search working (nor for Open AI, for that matter). I've punted these issues for now.
-
-## Integration Model
-
-- This project is intended to be an AI platform with integration points for desktop environments and applications, not only a standalone desktop assistant.
-- The platform exposes extensive D-Bus- and Web-socket-based APIs for integration with desktop environments and applications.
-- The platform makes extensive use of MCP services for pluggable (and un-pluggable) functionality, and can even write its own MCP servers.
-
-> **MCP servers are essential for real-world usefulness.** Without configured MCP servers, the assistant can hold conversations but cannot take actions (file I/O, task management, time tracking, shell execution, etc.). The built-in memory tools are always present, but meaningful capability comes from external MCP servers.
->
-> Companion servers developed for this platform include `fileio-mcp`, `terminal-mcp`, `tasks-mcp`, `timeclock-mcp`, `skills-mcp`, and `calendar-mcp`. See [docs/mcp-services.md](docs/mcp-services.md) for the full list and configuration.
-
-## Privacy and Connectivity
-
-The system is designed for privacy first, while still offering cloud LLM connectors as a pragmatic option. As always, privacy is a choose-your-own-adventure.
-
-If you use Ollama, the assistant can run entirely offline, preserving privacy. In practice, strong offline quality usually requires larger models and suitable hardware.
-
-If local hardware is limited, cloud services may currently provide better results when that tradeoff is acceptable to you. Nothing in the assistant architecture inherently requires cloud services, and as hardware becomes cheaper over time, fully local operation is expected to become the default for more users. 
-
-**Adelie Platform uses API calls to the cloud AI providers. By and large, cloud AI providers do NOT use API call data for training purposes, but you are responsible for understanding the privacy implications of your chosen provider.**
-
-Quick provider privacy + setup links: [docs/cloud-providers.md](docs/cloud-providers.md)
+Every personal-data table carries `user_id`; queries are extracted from the
+JWT `sub` claim and scoped at the storage layer. A static audit test rejects
+unscoped queries at build time. Single-tenant desktop installs collapse to a
+fixed default user; multi-tenant servers run the same daemon with a real IdP
+in front of it. See [docs/architecture-evolution.md](docs/architecture-evolution.md)
+for the target shape and design rules.
 
 ## Requirements
 
 - Rust (stable, edition 2024)
-- Linux session D-Bus (`DBUS_SESSION_BUS_ADDRESS` available) for desktop integrations, but service can run websocket-only.
-- PostgreSQL with the `pgvector` extension (see below)
-- For cloud connectors, connector credentials (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or AWS credentials for Bedrock)
-- Optional MCP servers (for tools)
+- PostgreSQL with the `pgvector` extension
+- Linux session D-Bus, if you want the D-Bus bridge or in-process D-Bus
+- Cloud provider credentials, if you're not running fully on Ollama
+- One or more MCP servers, if you want the assistant to do anything beyond chat
 
 ### PostgreSQL setup
-
-The daemon requires a PostgreSQL database for knowledge base storage, tool registry, and conversation history. The `pgvector` extension is required for embedding-based search.
-
-1. Install PostgreSQL and pgvector:
 
 ```bash
 # Debian/Ubuntu
 sudo apt install postgresql postgresql-contrib postgresql-16-pgvector
-
 # Fedora
 sudo dnf install postgresql-server postgresql-contrib pgvector_16
-
 # Arch
 sudo pacman -S postgresql postgresql-libs
-yay -S pgvector  # or install from AUR
+yay -S pgvector  # or AUR
 ```
-
-2. Create a database and user:
 
 ```sql
 CREATE USER desktop_assistant WITH PASSWORD 'your_password_here';
 CREATE DATABASE desktop_assistant OWNER desktop_assistant;
-```
-
-3. Enable the vector extension in the database:
-
-```sql
 \c desktop_assistant
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-4. Configure the connection in `daemon.toml`:
-
 ```toml
+# daemon.toml
 [database]
 url = "postgres://desktop_assistant:your_password_here@localhost/desktop_assistant"
 ```
 
-The daemon runs migrations automatically on startup.
+Migrations run automatically on startup.
 
-## Quick Start
-
-### 1) Build
+## Quick start
 
 ```bash
+# Build
 cargo build --workspace
-```
 
-### 2) Configure connector
-
-Default connector is `openai`.
-Default OpenAI model is `gpt-5.4`.
-
-To opt into local Ollama instead, set `llm.connector = "ollama"` in your daemon config (`$XDG_CONFIG_HOME/desktop-assistant/daemon.toml`, or `~/.config/desktop-assistant/daemon.toml`).
-
-For cloud connectors, set credentials for the connector you use:
-
-```bash
+# Configure a connector — default is OpenAI / gpt-5.4
 export OPENAI_API_KEY=your_key_here
-export ANTHROPIC_API_KEY=your_key_here
-export AWS_REGION=us-east-1
+# or set llm.connector = "ollama" / "anthropic" / "bedrock" in daemon.toml
 
-# optional connector overrides:
-export OPENAI_MODEL=gpt-5.4
-export OPENAI_BASE_URL=https://api.openai.com/v1
-
-# optional Bedrock API key field format accepted by this daemon:
-# export AWS_BEDROCK_API_KEY=ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]
+# Run
+cargo run -p desktop-assistant-daemon
 ```
 
-Bedrock notes:
-- Set `llm.connector = "bedrock"` (or `"aws-bedrock"`).
-- `llm.base_url` is interpreted as AWS region by default (for example `us-east-1`).
-- You can also use a Bedrock runtime endpoint URL (for example `https://bedrock-runtime.us-east-1.amazonaws.com`).
-- Credentials resolve via the standard AWS SDK credential provider chain (for example `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, shared AWS CLI config from `aws configure`, SSO profiles, or IAM role credentials).
-- If you are running locally, configure AWS CLI/profile first (`aws configure` or `aws configure sso`) and ensure the selected profile has Bedrock permissions in the target region.
-- Optional connector key format `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]` is supported for parity with single-field API key flows.
+Connector credentials default to an `auto` secret backend: local file store
+first (`$XDG_DATA_HOME/desktop-assistant/secrets/<connector>_api_key`), then
+systemd `LoadCredential=`, then desktop keyrings (`libsecret`/`kwallet`), then
+environment variables. KDE Wallet remains supported via
+`llm.secret.backend = "kwallet"`.
 
-Connector key naming convention is generic:
-- Secret backend account key defaults to `<connector>_api_key`.
-- Environment fallback defaults to `<CONNECTOR>_API_KEY`.
-- Connector names are normalized to alphanumeric/underscore (for example, `aws-bedrock` → `aws_bedrock_api_key` and `AWS_BEDROCK_API_KEY`).
+Bedrock follows the standard AWS credential provider chain (env vars, shared
+config, SSO, IAM role). `llm.base_url` is interpreted as a region by default
+(e.g. `us-east-1`), or as a full Bedrock runtime endpoint URL.
 
-Secret backend default is `auto`:
+### MCP servers
 
-- `SetApiKey` writes to a DE-agnostic local file store: `$XDG_DATA_HOME/desktop-assistant/secrets/<connector>_api_key` (or `~/.local/share/desktop-assistant/secrets/...`).
-- Reads check that file store first.
-- If missing there, reads try systemd credentials (`$CREDENTIALS_DIRECTORY`).
-- If still missing, reads fall back to desktop keyring backends (`libsecret`/`kwallet`).
-- Environment variables remain the final fallback.
-
-To provide desktop-agnostic secrets with systemd user services, add a drop-in override:
-
-```bash
-mkdir -p ~/.config/systemd/user/desktop-assistant-daemon.service.d
-cat > ~/.config/systemd/user/desktop-assistant-daemon.service.d/credentials.conf <<'EOF'
-[Service]
-# one file per connector account key
-LoadCredential=openai_api_key:%h/.config/desktop-assistant/credentials/openai_api_key
-LoadCredential=anthropic_api_key:%h/.config/desktop-assistant/credentials/anthropic_api_key
-EOF
-systemctl --user daemon-reload
-systemctl --user restart desktop-assistant-daemon
-```
-
-For development service use the same pattern with `desktop-assistant-daemon-dev.service.d`.
-
-### 3) Configure MCP servers
-
-> **Recommended.** MCP servers provide the tools (file I/O, task management, shell execution, etc.) that make the assistant genuinely useful. See [docs/mcp-services.md](docs/mcp-services.md) for the full list of available servers and their configuration options.
-
-Create `~/.config/desktop-assistant/mcp_servers.toml` (or under `$XDG_CONFIG_HOME`):
+Without configured MCP servers the assistant can chat but can't take actions
+beyond the built-in tools (knowledge base, tool search, system properties).
+Create `~/.config/desktop-assistant/mcp_servers.toml`:
 
 ```toml
 [[servers]]
@@ -217,179 +152,69 @@ args    = ["serve", "--mode", "stdio"]
 name    = "terminal"
 command = "terminal-mcp"
 args    = ["serve", "--mode", "stdio"]
-
-[[servers]]
-name    = "tasks"
-command = "tasks-mcp"
-args    = ["serve", "--mode", "stdio"]
 ```
 
-Each `[[servers]]` entry requires a `name` (used in logs) and a `command` (must be on `$PATH`). `args` is optional.
+See [docs/mcp-services.md](docs/mcp-services.md) for the full list.
 
-See [docs/mcp-services.md](docs/mcp-services.md) for the full server list and configuration reference.
-
-### 4) Run daemon
+## systemd user service
 
 ```bash
-cargo run -p desktop-assistant-daemon
+just install-service        # install unit + D-Bus activation mapping
+just backend-enable         # auto-start on login (optional)
+just backend-status         # status / restart / logs
 ```
 
-### 5) Run a client (separate terminal)
+A parallel dev daemon (separate D-Bus name) is available via `just dev-backend`
+or as a dedicated user service (`just install-service-dev`).
 
-See the [Clients](#clients) section above for available clients and their repositories.
+If D-Bus calls return "The name is not activatable", re-run
+`just install-service` / `just install-service-dev` and reload the user manager
+(`systemctl --user daemon-reload`).
 
-## Service Setup (systemd user + just)
-
-Install the user service unit + D-Bus activation mapping and reload systemd:
-
-```bash
-just install-service
-```
-
-With that installed, any client D-Bus method call to `org.desktopAssistant` can auto-start the daemon.
-
-Enable and start backend on login:
+## Core commands
 
 ```bash
-just backend-enable
-```
-
-If you only want on-demand startup (no login auto-start), skip `backend-enable`.
-
-Common service operations:
-
-```bash
-just backend-status
-just backend-restart
-just backend-logs
-```
-
-Run a development daemon in parallel with the regular user service (separate D-Bus name):
-
-```bash
-just dev-backend
-```
-
-Or install a dedicated user systemd service for development mode (plus activation mapping):
-
-```bash
-just install-service-dev
-just backend-dev-enable
-```
-
-Common dev service operations:
-
-```bash
-just backend-dev-status
-just backend-dev-restart
-just backend-dev-logs
-```
-
-### Activation Troubleshooting
-
-If D-Bus calls return "The name is not activatable":
-
-```bash
-just install-service
-just install-service-dev
-```
-
-Check that session bus activation entries exist:
-
-```bash
-gdbus call --session \
-	--dest org.freedesktop.DBus \
-	--object-path /org/freedesktop/DBus \
-	--method org.freedesktop.DBus.ListActivatableNames \
-	| grep -Eo 'org\.desktopAssistant(\.Dev)?' | sort -u
-```
-
-Expected output includes:
-
-- `org.desktopAssistant`
-- `org.desktopAssistant.Dev`
-
-Force a clean activation test (service should transition from inactive to active after the call):
-
-```bash
-systemctl --user stop desktop-assistant-daemon
-echo before=$(systemctl --user is-active desktop-assistant-daemon 2>/dev/null || true)
-gdbus call --session --dest org.desktopAssistant --object-path /org/desktopAssistant/Settings --method org.desktopAssistant.Settings.GetLlmSettings
-echo after=$(systemctl --user is-active desktop-assistant-daemon 2>/dev/null || true)
-```
-
-If activatable names still do not appear, reload both managers and re-check:
-
-```bash
-systemctl --user daemon-reload
-gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.ReloadConfig
-```
-
-## Core Commands
-
-```bash
-# format
 cargo fmt
-
-# tests
-cargo test --workspace
-
-# strict linting
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 ## Packaging
 
 ```bash
-# Docker-friendly package builds (deb, rpm, flatpak)
-just package-all-docker
-
-# Snap package build (run on host with snapd/core24 available)
-just package-snap
+just package-all-docker     # deb, rpm, flatpak (Docker-friendly)
+just package-snap           # run on host with snapd/core24
 ```
-
-Note: `package-all-docker` intentionally excludes Snap because Snap builds for `base: core24`
-require a working `snapd`/`core24` runtime that is not reliable inside Docker/Podman container builds.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Architecture evolution](docs/architecture-evolution.md) — target shape, design rules
+- [API transport](docs/API_TRANSPORT.md)
+- [WebSocket API](docs/WEBSOCKET_API.md)
 - [D-Bus API](docs/dbus-api.md)
-- [Adding MCP Services](docs/mcp-services.md)
-- [MCP Integration internals](docs/mcp-integration.md)
-- [Development Guide](docs/development.md)
-- [Cloud Providers](docs/cloud-providers.md)
+- [MCP services](docs/mcp-services.md) — adding and configuring MCP servers
+- [MCP integration internals](docs/mcp-integration.md)
+- [Development guide](docs/development.md)
+- [Cloud providers](docs/cloud-providers.md)
 
-## Built-in Tools
+## What's not done yet
 
-The daemon includes built-in tools that are always available, even without external MCP servers:
+The multi-agent / multi-transport foundation is in; several wiring follow-ups
+are tracked and unfinished:
 
-- **Knowledge base** (unified storage for preferences, memories, and project context):
-	- `builtin_knowledge_base_write` — store or update an entry
-	- `builtin_knowledge_base_search` — hybrid vector + full-text search
-	- `builtin_knowledge_base_delete` — remove an entry by ID
-- **Tool discovery**:
-	- `builtin_tool_search` — search for additional tools by description; matched tools are automatically activated for the conversation
-- **System context**:
-	- `builtin_sys_props` — returns date/time, user, hostname, OS, and directory info
-
-Knowledge base data is stored in PostgreSQL (requires database configuration, see [PostgreSQL setup](#postgresql-setup) above). Tool embeddings enable semantic search over both knowledge entries and registered tool descriptions.
-
-## Notes
-
-- If a cloud connector is selected and its API key is missing, daemon still starts but prompt calls fail at runtime.
-- If MCP config is missing, daemon runs with no external tools.
-- Daemon LLM settings are read from:
-	- `$XDG_CONFIG_HOME/desktop-assistant/daemon.toml`, or
-	- `~/.config/desktop-assistant/daemon.toml` if `XDG_CONFIG_HOME` is unset.
-- Secret backend default is `auto` (local file store first, then systemd credentials, then keyrings).
-- KDE Wallet remains supported via `llm.secret.backend = "kwallet"` in `daemon.toml`.
-- Conversations, knowledge base entries, and tool registry data persist in PostgreSQL across daemon restarts.
+- `#128` — wire `ClientToolCoordinator` into `daemon::main` (turn-state
+  resume on reconnect).
+- `#129` — real cold-restart resume for suspended turns. Today, foreground
+  and subagent tasks are marked `Failed` on restart; standalone agents are
+  marked `Failed` pending real resume.
+- `#133` — dispatch-side enforcement of the `TOOL_ALLOWLIST` task-local.
+- `#134` — wire `SubagentTools` (`spawn_subagent`, `get_subagent_status`)
+  into the `McpToolExecutor` dispatch path. The tools exist but are not yet
+  reachable from a conversation.
+- `#135` — first-class `system_prompt` field on `Conversation`.
 
 ## License
 
-Desktop Assistant is licensed under **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`).
-See the [LICENSE](LICENSE) file for the full text.
-
-There are tons of commercial implementations which do not impose FOSS stipulations. This is the open-source alternative. Let's keep it that way.
-
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`). See
+[LICENSE](LICENSE).
