@@ -474,6 +474,15 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             conversation_id,
             warning,
         }),
+        // Background-task events (issue #110) are not yet mapped onto the
+        // legacy SignalEvent stream; the process-manager UIs subscribe
+        // directly to Task* events via a dedicated channel introduced
+        // alongside the registry (see #111/#112/#113). Each arm is listed
+        // explicitly so future variants force a deliberate decision.
+        api::Event::TaskStarted { .. }
+        | api::Event::TaskProgress { .. }
+        | api::Event::TaskLogAppended { .. }
+        | api::Event::TaskCompleted { .. } => None,
     }
 }
 

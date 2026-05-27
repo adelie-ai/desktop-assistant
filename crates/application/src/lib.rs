@@ -811,6 +811,19 @@ where
 
             // Streamed commands are handled elsewhere.
             api::Command::SendMessage { .. } => Err(ApiError::Unsupported),
+
+            // Background-task commands (issue #110) are protocol-level only
+            // in this slice. The registry that backs them lands in #111/#112
+            // /#113; until then the dispatcher rejects them so the workspace
+            // still type-checks. Each arm is listed explicitly (no wildcard)
+            // so the registry PR cannot silently miss one.
+            api::Command::ListBackgroundTasks { .. }
+            | api::Command::GetBackgroundTask { .. }
+            | api::Command::CancelBackgroundTask { .. }
+            | api::Command::GetBackgroundTaskLogs { .. }
+            | api::Command::SubscribeBackgroundTasks
+            | api::Command::UnsubscribeBackgroundTasks
+            | api::Command::SpawnStandaloneAgent { .. } => Err(ApiError::Unsupported),
         }
     }
 

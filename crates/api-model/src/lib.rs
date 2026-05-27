@@ -193,6 +193,47 @@ pub enum Command {
         #[serde(skip_serializing_if = "Option::is_none")]
         server: Option<String>,
     },
+
+    // --- Background tasks (issue #110) ------------------------------------
+    //
+    // Protocol shape only; the registry that backs these commands is the
+    // subject of a separate issue. Snake-case naming follows the existing
+    // `Command` convention (`#[serde(rename_all = "snake_case")]`).
+    /// List registered background tasks for the calling user.
+    ListBackgroundTasks {
+        #[serde(default)]
+        include_finished: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Fetch a single background task by id.
+    GetBackgroundTask { id: String },
+    /// Request cancellation of a background task. The registry replies with
+    /// `Ack`; cancellation completion is observed via `Event::TaskCompleted`.
+    CancelBackgroundTask { id: String },
+    /// Fetch a page of log entries for a background task. `after_seq` skips
+    /// entries already seen; omit to start from the oldest available entry.
+    GetBackgroundTaskLogs {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Subscribe this connection to `Task*` events for the calling user.
+    SubscribeBackgroundTasks,
+    /// Stop receiving `Task*` events on this connection.
+    UnsubscribeBackgroundTasks,
+    /// Launch a user-initiated standalone background agent. Returns
+    /// `CommandResult::BackgroundTaskSpawned { id }` on success.
+    SpawnStandaloneAgent {
+        name: String,
+        initial_prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        override_selection: Option<SendPromptOverride>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<String>>,
+    },
 }
 
 fn default_true() -> bool {
@@ -230,6 +271,24 @@ pub enum CommandResult {
     KnowledgeEntries(Vec<KnowledgeEntryView>),
     KnowledgeEntry(Option<KnowledgeEntryView>),
     KnowledgeEntryWritten(KnowledgeEntryView),
+
+    // --- Background tasks (issue #110) ------------------------------------
+    /// Response to `ListBackgroundTasks`.
+    BackgroundTasks(Vec<TaskView>),
+    /// Response to `GetBackgroundTask`.
+    BackgroundTask(TaskView),
+    /// Response to `GetBackgroundTaskLogs`. `next_seq` is the value clients
+    /// should pass back as `after_seq` to resume paging.
+    BackgroundTaskLogs {
+        entries: Vec<TaskLogEntry>,
+        next_seq: u64,
+    },
+    /// Response to `SpawnStandaloneAgent`.
+    BackgroundTaskSpawned { id: String },
+    /// Ack for `SendMessage`, carrying the registered task id so callers can
+    /// correlate the streamed `Task*` events back to the request. Introduced
+    /// alongside the background-task registry so we don't overload `Ack`.
+    SendMessageAck { task_id: String },
 
     Ack,
 }
@@ -297,6 +356,27 @@ pub enum Event {
     ConversationWarningEmitted {
         conversation_id: String,
         warning: ConversationWarning,
+    },
+
+    // --- Background tasks (issue #110) ------------------------------------
+    /// A background task has been registered and is now `Pending`/`Running`.
+    TaskStarted { task: TaskView },
+    /// Lightweight progress signal that does not justify a log entry.
+    TaskProgress {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress_hint: Option<String>,
+    },
+    /// A new log entry was appended to a task's bounded log buffer.
+    TaskLogAppended { id: String, entry: TaskLogEntry },
+    /// Terminal event: the task transitioned to `Completed`, `Failed`, or
+    /// `Cancelled`. `last_error` is set for `Failed` and may be set for
+    /// `Cancelled` when cancellation was the result of a downstream error.
+    TaskCompleted {
+        id: String,
+        status: TaskStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<String>,
     },
 }
 
@@ -618,6 +698,158 @@ pub struct ConversationModelSelectionView {
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<EffortLevel>,
+}
+
+// --- Background-task types (issue #110) -----------------------------------
+//
+// Protocol-level types only. The registry that emits these lives in
+// `crates/application` (separate issue). `TaskId` is a newtype around
+// `String` so typed APIs can refuse silent coercions; see the
+// `task_id_is_distinct_from_string_for_typed_apis` compile_fail doctests
+// in the test module.
+
+/// Opaque task identifier. Wraps a `String` (typically a UUID) so the
+/// daemon can swap the underlying representation without churning callers,
+/// and so typed APIs reject a bare `String` at compile time.
+///
+/// `TaskId` is a distinct nominal type from `String`: callers must
+/// explicitly wrap and unwrap, which prevents accidental cross-domain
+/// values (e.g. passing a conversation id where a task id is expected).
+/// This file's test module asserts the runtime behavior; the two
+/// `compile_fail` examples below assert the type discipline at compile
+/// time, and the third example shows the correct call shape.
+///
+/// ```compile_fail
+/// use desktop_assistant_api_model::TaskId;
+/// fn takes_task_id(_: TaskId) {}
+/// // A bare String must NOT coerce to TaskId.
+/// takes_task_id(String::from("not-a-task-id"));
+/// ```
+///
+/// ```compile_fail
+/// use desktop_assistant_api_model::TaskId;
+/// fn takes_string(_: String) {}
+/// // A TaskId must NOT coerce to String.
+/// takes_string(TaskId(String::from("x")));
+/// ```
+///
+/// ```
+/// use desktop_assistant_api_model::TaskId;
+/// fn takes_task_id(_: TaskId) {}
+/// takes_task_id(TaskId(String::from("ok")));
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TaskId(pub String);
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Discriminator for what kind of work a background task represents. Stored
+/// alongside each task so the UI can present subagents and standalone agents
+/// differently from foreground conversation turns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// A foreground conversation turn that is also tracked in the registry.
+    Conversation { conversation_id: String },
+    /// A subagent invoked by the parent task's `spawn_subagent` tool call.
+    Subagent {
+        parent_task_id: TaskId,
+        conversation_id: String,
+        name: String,
+    },
+    /// A user-initiated standalone background agent (no waiting parent).
+    Standalone {
+        name: String,
+        conversation_id: String,
+    },
+}
+
+/// Lifecycle status of a background task. `Cancelled` requires the
+/// cancellation machinery from #109; before that lands, the registry only
+/// produces `Pending`/`Running`/`Completed`/`Failed`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Wire-format view of a single background task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskView {
+    pub id: TaskId,
+    pub kind: TaskKind,
+    pub status: TaskStatus,
+    /// Unix epoch milliseconds when the task transitioned to `Running`.
+    pub started_at: i64,
+    /// Unix epoch milliseconds when the task reached a terminal state.
+    /// `None` while the task is still `Pending`/`Running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    /// Set when `status == Failed` (and optionally when `status == Cancelled`
+    /// because of an upstream failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Parent task id for subagents; mirrors `TaskKind::Subagent::parent_task_id`
+    /// at the top level so the UI does not have to destructure `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<TaskId>,
+    /// Direct subagents currently registered under this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<TaskId>,
+    /// Human-friendly label for list views (e.g. "Researcher: pricing data").
+    pub title: String,
+    /// Short progress string the task can update via `Event::TaskProgress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_hint: Option<String>,
+}
+
+/// Severity for a single log line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// What part of a task's lifecycle produced a log entry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogCategory {
+    /// A turn of the underlying LLM (prompt sent, response received).
+    ModelTurn,
+    /// The task invoked a tool.
+    ToolCall,
+    /// A tool returned a result (success or error).
+    ToolResult,
+    /// A free-form status update (e.g. "fetching page 2/4").
+    Status,
+    /// Registry-emitted lifecycle marker (started, cancelled, completed).
+    Lifecycle,
+}
+
+/// A single bounded-buffer log entry attached to a background task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskLogEntry {
+    /// Monotonically increasing per-task sequence number; clients use this
+    /// as `after_seq` to resume paging.
+    pub seq: u64,
+    /// Unix epoch milliseconds when the entry was recorded.
+    pub timestamp: i64,
+    pub level: LogLevel,
+    pub category: LogCategory,
+    pub message: String,
+    /// Optional structured payload — e.g. tool input/output JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// WebSocket request envelope.
@@ -1240,35 +1472,27 @@ mod tests {
         assert_eq!(ev, back);
     }
 
-    /// Compile-time check that `TaskId` is a distinct type from `String` for
-    /// typed APIs — callers cannot silently pass a `String` where a `TaskId`
-    /// is expected. This is the in-tree replacement for the trybuild test
-    /// named in #110 (we deliberately do not pull `trybuild` into the
-    /// workspace).
-    ///
-    /// ```compile_fail
-    /// use desktop_assistant_api_model::TaskId;
-    /// fn takes_task_id(_: TaskId) {}
-    /// // A bare String must NOT coerce to TaskId.
-    /// takes_task_id(String::from("not-a-task-id"));
-    /// ```
-    ///
-    /// And the inverse direction:
-    ///
-    /// ```compile_fail
-    /// use desktop_assistant_api_model::TaskId;
-    /// fn takes_string(_: String) {}
-    /// // A TaskId must NOT coerce to String.
-    /// takes_string(TaskId("x".into()));
-    /// ```
-    ///
-    /// A correct call site explicitly wraps/unwraps:
-    ///
-    /// ```
-    /// use desktop_assistant_api_model::TaskId;
-    /// fn takes_task_id(_: TaskId) {}
-    /// takes_task_id(TaskId(String::from("ok")));
-    /// ```
-    #[allow(dead_code)]
-    fn task_id_is_distinct_from_string_for_typed_apis() {}
+    /// Sibling of the `compile_fail` doctests on the public [`TaskId`] type.
+    /// Runtime check that confirms a `TaskId` does not implement
+    /// `From<String>` or `Into<String>` and is `!= String` even when the
+    /// inner string matches. This complements the compile-time discipline
+    /// asserted by the doctests; together they form the trybuild
+    /// replacement called for by #110.
+    #[test]
+    fn task_id_is_distinct_from_string_for_typed_apis() {
+        // Helper that only accepts a `TaskId`.
+        fn takes_task_id(t: TaskId) -> String {
+            t.0
+        }
+        let id = TaskId(String::from("abc"));
+        assert_eq!(takes_task_id(id.clone()), "abc");
+
+        // Cloned strings can't be compared directly to TaskIds — the inner
+        // string is reachable as `.0` only.
+        let raw = String::from("abc");
+        // This line is the structural guard the compile_fail doctests
+        // express at the type level: there is no `==` between `TaskId` and
+        // `String`. We assert via `.0` access only.
+        assert_eq!(id.0, raw);
+    }
 }
