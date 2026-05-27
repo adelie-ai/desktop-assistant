@@ -79,7 +79,7 @@ impl Fixture {
             .connect(&url)
             .await
             .expect("connect to TEST_DATABASE_URL");
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
             .execute(&admin)
             .await
             .expect("create test schema");
@@ -104,7 +104,7 @@ impl Fixture {
                 let schema = Arc::clone(&schema_for_hook);
                 Box::pin(async move {
                     let sql = format!("SET search_path TO \"{schema}\", public");
-                    sqlx::query(&sql).execute(conn).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
                     Ok(())
                 })
             })
@@ -130,7 +130,7 @@ impl Fixture {
             .connect(&self.admin_url)
             .await
         {
-            let _ = sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{}\" CASCADE", self.schema)))
                 .execute(&admin)
                 .await;
             admin.close().await;

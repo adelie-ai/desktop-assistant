@@ -58,7 +58,7 @@ impl SchemaFixture {
             .connect(&url)
             .await
             .expect("connect to TEST_DATABASE_URL");
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
             .execute(&admin)
             .await
             .expect("create test schema");
@@ -75,7 +75,7 @@ impl SchemaFixture {
                 let schema = Arc::clone(&schema_for_hook);
                 Box::pin(async move {
                     let sql = format!("SET search_path TO \"{schema}\", public");
-                    sqlx::query(&sql).execute(conn).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
                     Ok(())
                 })
             })
@@ -111,7 +111,7 @@ impl SchemaFixture {
                 return;
             }
         };
-        if let Err(e) = sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{}\" CASCADE", self.schema)))
             .execute(&admin)
             .await
         {
@@ -505,7 +505,7 @@ async fn run_pre_multitenant_migrations(pool: &PgPool) {
         include_str!("../migrations/015_knowledge_base_review_columns.sql"),
     ];
     for sql in migrations {
-        sqlx::raw_sql(sql)
+        sqlx::raw_sql(*sql)
             .execute(pool)
             .await
             .expect("pre-multi-tenant migration step succeeds");
