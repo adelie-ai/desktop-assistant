@@ -1,0 +1,27 @@
+[package]
+name = "desktop-assistant-uds"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures = "0.3"
+tokio.workspace = true
+tokio-util = "0.7"
+
+desktop-assistant-api-model = { path = "../api-model" }
+desktop-assistant-application = { path = "../application" }
+desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
+
+[dev-dependencies]
+desktop-assistant-core = { path = "../core" }
+desktop-assistant-auth-jwt.workspace = true
+desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }

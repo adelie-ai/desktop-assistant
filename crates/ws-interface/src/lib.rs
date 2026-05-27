@@ -11,12 +11,10 @@ use axum::{
 };
 use base64::Engine;
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
-use futures::{sink::SinkExt, stream::StreamExt};
-use tokio::sync::mpsc;
+use desktop_assistant_application::AssistantApiHandler;
+use desktop_assistant_transport_dispatch::{AuthContext, dispatch_loop};
+use futures::{SinkExt, StreamExt};
 use tracing::{debug, warn};
-
-const WS_OUTBOUND_BUFFER: usize = 64;
 
 pub use api::{WsFrame, WsRequest};
 
@@ -221,26 +219,24 @@ async fn auth_config_handler(State(state): State<WsServerState>) -> impl IntoRes
     }
 }
 
-struct ChannelSink {
-    tx: mpsc::Sender<WsFrame>,
-}
-
-#[async_trait::async_trait]
-impl EventSink for ChannelSink {
-    async fn emit(&self, event: api::Event) -> bool {
-        self.tx.send(WsFrame::Event { event }).await.is_ok()
-    }
-}
-
+/// Adapts axum's `WebSocket` into the transport-neutral stream + sink
+/// pair expected by [`dispatch_loop`]. The receive half is filtered to
+/// `Message::Text` frames parsed into `WsRequest`; the send half is
+/// driven from an mpsc by a small writer task that serializes
+/// `WsFrame` values into `Message::Text`. A `tokio_util::PollSender`
+/// gives us a `Sink<WsFrame>` over the mpsc so the dispatcher's
+/// generic bound is satisfied without a hand-rolled adapter.
 async fn handle_socket(socket: WebSocket, state: WsServerState) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    use tokio::sync::mpsc;
+    use tokio_util::sync::PollSender;
 
-    // Channel for outbound frames (results + events)
-    let (out_tx, mut out_rx) = mpsc::channel::<WsFrame>(WS_OUTBOUND_BUFFER);
+    let (mut ws_tx, ws_rx) = socket.split();
 
-    // Writer task: serialize WsFrame -> ws text message
+    // Outbound: writer task owns the WS sender and serializes
+    // `WsFrame` values pulled from a channel into `Message::Text`.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsFrame>(64);
     let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
+        while let Some(frame) = outbound_rx.recv().await {
             let Ok(text) = serde_json::to_string(&frame) else {
                 continue;
             };
@@ -250,163 +246,40 @@ async fn handle_socket(socket: WebSocket, state: WsServerState) {
         }
     });
 
-    // Reader loop: handle inbound requests
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        match msg {
-            Message::Text(text) => {
-                let req: WsRequest = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("invalid ws json: {e}");
-                        continue;
-                    }
-                };
-
-                debug!(id = %req.id, "ws command received");
-
-                match req.command {
-                    api::Command::SendMessage {
-                        conversation_id,
-                        content,
-                        override_selection,
-                    } => {
-                        // Stream via events; acknowledge immediately.
-                        let request_id = uuid::Uuid::new_v4().to_string();
-                        let sink = Arc::new(ChannelSink { tx: out_tx.clone() });
-
-                        if out_tx
-                            .send(WsFrame::Result {
-                                id: req.id.clone(),
-                                result: api::CommandResult::Ack,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-
-                        let handler = Arc::clone(&state.handler);
-                        tokio::spawn(async move {
-                            let _ = handler
-                                .handle_send_message_with_override(
-                                    conversation_id,
-                                    content,
-                                    override_selection,
-                                    request_id,
-                                    sink,
-                                )
-                                .await;
-                        });
-                    }
-
-                    api::Command::SetConfig { changes } => {
-                        let res = state
-                            .handler
-                            .handle_command(api::Command::SetConfig { changes })
-                            .await;
-                        match res {
-                            Ok(api::CommandResult::Config(config)) => {
-                                if out_tx
-                                    .send(WsFrame::Result {
-                                        id: req.id.clone(),
-                                        result: api::CommandResult::Config(config.clone()),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                if out_tx
-                                    .send(WsFrame::Event {
-                                        event: api::Event::ConfigChanged { config },
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Ok(result) => {
-                                if out_tx
-                                    .send(WsFrame::Result { id: req.id, result })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(ApiError::Core(e)) => {
-                                if out_tx
-                                    .send(WsFrame::Error {
-                                        id: req.id,
-                                        error: e,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                if out_tx
-                                    .send(WsFrame::Error {
-                                        id: req.id,
-                                        error: e.to_string(),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    other => {
-                        let res = state.handler.handle_command(other).await;
-                        match res {
-                            Ok(result) => {
-                                if out_tx
-                                    .send(WsFrame::Result { id: req.id, result })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(ApiError::Core(e)) => {
-                                if out_tx
-                                    .send(WsFrame::Error {
-                                        id: req.id,
-                                        error: e,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                if out_tx
-                                    .send(WsFrame::Error {
-                                        id: req.id,
-                                        error: e.to_string(),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+    // Inbound: axum's `Message` stream down to text frames parsed as
+    // `WsRequest`. Close frames terminate the stream; ping / pong /
+    // binary frames are silently dropped (matches pre-refactor).
+    let inbound = ws_rx.filter_map(|item| async move {
+        match item {
+            Ok(Message::Text(text)) => match serde_json::from_str::<WsRequest>(&text) {
+                Ok(req) => Some(Ok::<_, anyhow::Error>(req)),
+                Err(e) => {
+                    warn!("invalid ws json: {e}");
+                    None
                 }
-            }
-            Message::Close(_) => break,
-            _ => {}
+            },
+            Ok(Message::Close(_)) | Err(_) => None,
+            Ok(_) => None,
         }
-    }
+    });
+    futures::pin_mut!(inbound);
 
+    let sink = PollSender::new(outbound_tx.clone());
+
+    // The current bearer-token validator only returns `bool`. #105 will
+    // plumb the JWT claim subject through to here; today we use a
+    // stable placeholder so the dispatcher signature already requires
+    // an `AuthContext`.
+    let auth = AuthContext::new("ws-user");
+
+    dispatch_loop(Arc::clone(&state.handler), auth, inbound, sink).await;
+
+    // Mirror the pre-refactor cleanup: kill the writer when the
+    // dispatcher returns so any in-flight `SendMessage` task observes
+    // a closed channel on its next `emit` and shuts down. This is the
+    // cancellation path exercised by
+    // `ws_send_message_cancels_when_client_disconnects`.
+    drop(outbound_tx);
     writer.abort();
 }
 

@@ -1211,6 +1211,7 @@ dependencies = [
  "desktop-assistant-llm-openai",
  "desktop-assistant-mcp-client",
  "desktop-assistant-storage",
+ "desktop-assistant-uds",
  "desktop-assistant-ws",
  "httpmock",
  "indexmap",
@@ -1382,6 +1383,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-transport-dispatch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "desktop-assistant-api-model",
+ "desktop-assistant-application",
+ "desktop-assistant-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "desktop-assistant-uds"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "desktop-assistant-api-model",
+ "desktop-assistant-application",
+ "desktop-assistant-auth-jwt",
+ "desktop-assistant-core",
+ "desktop-assistant-transport-dispatch",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "desktop-assistant-ws"
 version = "0.1.0"
 dependencies = [
@@ -1392,6 +1431,7 @@ dependencies = [
  "desktop-assistant-api-model",
  "desktop-assistant-application",
  "desktop-assistant-core",
+ "desktop-assistant-transport-dispatch",
  "futures",
  "futures-util",
  "hyper 1.9.0",
@@ -1401,6 +1441,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-tungstenite",
+ "tokio-util",
  "tower",
  "tracing",
  "uuid",

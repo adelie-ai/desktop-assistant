@@ -17,6 +17,8 @@ members = [
     "crates/storage",
     "crates/client-common",
     "crates/jwt-minter",
+    "crates/transport-dispatch",
+    "crates/uds-interface",
 ]
 
 [workspace.dependencies]
@@ -41,6 +43,8 @@ desktop-assistant-llm-http = { path = "crates/llm-http" }
 desktop-assistant-mcp-client = { path = "crates/mcp-client" }
 desktop-assistant-storage = { path = "crates/storage" }
 desktop-assistant-client-common = { path = "crates/client-common" }
+desktop-assistant-transport-dispatch = { path = "crates/transport-dispatch" }
+desktop-assistant-uds = { path = "crates/uds-interface" }
 serde_json = "1"
 toml = "1"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }

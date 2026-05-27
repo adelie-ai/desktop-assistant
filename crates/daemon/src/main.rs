@@ -32,6 +32,7 @@ use desktop_assistant_dbus::conversation::DbusConversationAdapter;
 use desktop_assistant_dbus::settings::DbusSettingsAdapter;
 use desktop_assistant_mcp_client::config as mcp_config;
 use desktop_assistant_mcp_client::executor::{BuiltinToolService, McpToolExecutor};
+use desktop_assistant_uds as uds;
 use desktop_assistant_ws as ws;
 use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
@@ -85,6 +86,37 @@ impl ws::WsAuthDiscovery for WsAuthDiscoveryProvider {
         serde_json::to_value(&self.discovery)
             .unwrap_or_else(|_| serde_json::json!({ "methods": ["password"] }))
     }
+}
+
+/// Adapter: reuses the WS bearer-token validator for UDS connections so
+/// both transports honor the same JWT policy (local HS256 + OIDC RS256
+/// fallback) per `architecture-evolution.md` rule #2 (uniform JWT auth).
+struct WsAsUdsAuth {
+    validator: Arc<dyn ws::WsAuthValidator>,
+}
+
+impl WsAsUdsAuth {
+    fn new(validator: Arc<dyn ws::WsAuthValidator>) -> Self {
+        Self { validator }
+    }
+}
+
+#[async_trait]
+impl uds::UdsAuthValidator for WsAsUdsAuth {
+    async fn validate_bearer_token(&self, token: &str) -> bool {
+        self.validator.validate_bearer_token(token).await
+    }
+}
+
+fn resolve_uds_socket_path() -> Option<std::path::PathBuf> {
+    if let Some(explicit) = std::env::var_os("DESKTOP_ASSISTANT_UDS_SOCKET") {
+        let s = explicit.to_string_lossy().trim().to_string();
+        if s.is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(s));
+    }
+    uds::default_desktop_socket_path()
 }
 
 struct WsBasicLogin<S: SettingsService + 'static> {
@@ -1520,40 +1552,80 @@ async fn main() -> Result<()> {
     };
 
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let ws_task = tokio::spawn(async move {
-        let shutdown = async {
-            let _ = ws_shutdown_rx.await;
-        };
-        let result = if let Some(acceptor) = tls_acceptor {
-            tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
-            ws::serve_full_tls(
-                api_handler,
-                ws_auth,
-                ws_login_service,
-                auth_discovery,
-                allowed_origins,
-                acceptor,
-                ws_addr,
-                shutdown,
-            )
-            .await
-        } else {
-            tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
-            ws::serve_full(
-                api_handler,
-                ws_auth,
-                ws_login_service,
-                auth_discovery,
-                allowed_origins,
-                ws_addr,
-                shutdown,
-            )
-            .await
-        };
-        if let Err(e) = result {
-            tracing::error!("WebSocket server error: {e}");
+    let ws_task = {
+        let api_handler = Arc::clone(&api_handler);
+        let ws_auth = Arc::clone(&ws_auth);
+        tokio::spawn(async move {
+            let shutdown = async {
+                let _ = ws_shutdown_rx.await;
+            };
+            let result = if let Some(acceptor) = tls_acceptor {
+                tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
+                ws::serve_full_tls(
+                    api_handler,
+                    ws_auth,
+                    ws_login_service,
+                    auth_discovery,
+                    allowed_origins,
+                    acceptor,
+                    ws_addr,
+                    shutdown,
+                )
+                .await
+            } else {
+                tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
+                ws::serve_full(
+                    api_handler,
+                    ws_auth,
+                    ws_login_service,
+                    auth_discovery,
+                    allowed_origins,
+                    ws_addr,
+                    shutdown,
+                )
+                .await
+            };
+            if let Err(e) = result {
+                tracing::error!("WebSocket server error: {e}");
+            }
+        })
+    };
+
+    // UDS frontend (#103). Local clients (D-Bus bridge, CLI, future
+    // minter shim) connect over the same JSON wire format. On by default
+    // for Unix targets; suppress via DESKTOP_ASSISTANT_UDS_ENABLED=false
+    // or by setting DESKTOP_ASSISTANT_UDS_SOCKET to empty.
+    let uds_enabled = env_bool("DESKTOP_ASSISTANT_UDS_ENABLED", cfg!(unix));
+    let uds_path = if uds_enabled {
+        resolve_uds_socket_path()
+    } else {
+        None
+    };
+    let (uds_shutdown_tx, uds_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let uds_task = match uds_path {
+        Some(path) => {
+            let api_handler = Arc::clone(&api_handler);
+            let ws_auth_for_uds = Arc::clone(&ws_auth);
+            tracing::info!("UDS listening on {}", path.display());
+            Some(tokio::spawn(async move {
+                let auth: Arc<dyn uds::UdsAuthValidator> =
+                    Arc::new(WsAsUdsAuth::new(ws_auth_for_uds));
+                let config = uds::UdsServerConfig::new(path);
+                let server = uds::UdsServer::new(api_handler, auth, config);
+                let shutdown = async {
+                    let _ = uds_shutdown_rx.await;
+                };
+                if let Err(e) = server.serve_with_shutdown(shutdown).await {
+                    tracing::error!("UDS server error: {e}");
+                }
+            }))
         }
-    });
+        None => {
+            tracing::info!("UDS frontend disabled");
+            drop(uds_shutdown_rx);
+            None
+        }
+    };
 
     // Run until stopped.
     shutdown_signal().await;
@@ -1576,6 +1648,13 @@ async fn main() -> Result<()> {
     let _ = ws_shutdown_tx.send(());
     if let Err(e) = ws_task.await {
         tracing::warn!("WebSocket task join error during shutdown: {e}");
+    }
+
+    let _ = uds_shutdown_tx.send(());
+    if let Some(task) = uds_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("UDS task join error during shutdown: {e}");
     }
 
     drop(dbus_connection);
