@@ -1270,6 +1270,7 @@ dependencies = [
  "desktop-assistant-api-model",
  "desktop-assistant-auth-jwt",
  "futures",
+ "futures-util",
  "serde",
  "serde_json",
  "tempfile",

@@ -22,12 +22,14 @@
 //! themselves don't emit those — they only emit the synchronous
 //! reply.
 
+pub mod background_tasks;
 pub mod connections;
 pub mod conversations;
 pub mod event_forwarder;
 pub mod knowledge;
 pub mod settings;
 
+pub use background_tasks::DbusBackgroundTasksAdapter;
 pub use connections::DbusConnectionsAdapter;
 pub use conversations::DbusConversationsAdapter;
 pub use knowledge::DbusKnowledgeAdapter;
@@ -47,4 +49,5 @@ pub mod paths {
     pub const SETTINGS: &str = "/org/desktopAssistant/Settings";
     pub const CONNECTIONS: &str = "/org/desktopAssistant/Connections";
     pub const KNOWLEDGE: &str = "/org/desktopAssistant/Knowledge";
+    pub const BACKGROUND_TASKS: &str = "/org/desktopAssistant/BackgroundTasks";
 }

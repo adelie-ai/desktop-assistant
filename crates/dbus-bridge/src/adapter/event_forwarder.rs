@@ -5,13 +5,17 @@
 //! Translation mirrors the in-process daemon's signal vocabulary
 //! one-for-one:
 //!
-//! | Wire event                              | D-Bus signal                                  |
-//! | --------------------------------------- | --------------------------------------------- |
-//! | `AssistantDelta`                        | `Conversations.ResponseChunk`                 |
-//! | `AssistantCompleted`                    | `Conversations.ResponseComplete`              |
-//! | `AssistantError`                        | `Conversations.ResponseError`                 |
-//! | `ConfigChanged`                         | `Settings.ConfigChanged`                      |
-//! | other (`Task*`, `AssistantStatus`, ...) | dropped — out of scope for #106               |
+//! | Wire event              | D-Bus signal                                  |
+//! | ----------------------- | --------------------------------------------- |
+//! | `AssistantDelta`        | `Conversations.ResponseChunk`                 |
+//! | `AssistantCompleted`    | `Conversations.ResponseComplete`              |
+//! | `AssistantError`        | `Conversations.ResponseError`                 |
+//! | `ConfigChanged`         | `Settings.ConfigChanged`                      |
+//! | `TaskStarted`           | `BackgroundTasks.TaskStarted` (#116)          |
+//! | `TaskProgress`          | `BackgroundTasks.TaskProgress` (#116)         |
+//! | `TaskLogAppended`       | `BackgroundTasks.TaskLogAppended` (#116)      |
+//! | `TaskCompleted`         | `BackgroundTasks.TaskCompleted` (#116)        |
+//! | other (`AssistantStatus`, ...) | dropped                                |
 //!
 //! Returned future runs until the inbound channel closes or
 //! `shutdown` resolves.
@@ -28,11 +32,17 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 use zbus::Connection;
 
+use std::collections::HashMap;
+
+use zbus::zvariant::OwnedValue;
+
+use super::background_tasks::{log_entry_to_dict, task_view_to_dict};
 use super::paths;
 use super::settings::{ConfigData, config_data_from_event};
 
 const CONV_INTERFACE: &str = "org.desktopAssistant.Conversations";
 const SETTINGS_INTERFACE: &str = "org.desktopAssistant.Settings";
+const BG_INTERFACE: &str = "org.desktopAssistant.BackgroundTasks";
 
 /// Map a single wire event onto its D-Bus signal. Public so tests can
 /// drive it without a live zbus connection — the `ForwardAction` enum
@@ -56,6 +66,31 @@ pub enum ForwardAction {
     },
     ConfigChanged {
         config: ConfigData,
+    },
+    /// Task is now `Pending`/`Running`. `task` is the JSON-keyed
+    /// `TaskView` encoded as `a{sv}`.
+    TaskStarted {
+        id: String,
+        task: HashMap<String, OwnedValue>,
+    },
+    /// Lightweight progress hint between log entries. `hint` is `""`
+    /// when the wire event carried `None`.
+    TaskProgress {
+        id: String,
+        hint: String,
+    },
+    /// A new log entry was appended to the task's bounded buffer.
+    /// `entry` is the JSON-keyed `TaskLogEntry` encoded as `a{sv}`.
+    TaskLogAppended {
+        id: String,
+        entry: HashMap<String, OwnedValue>,
+    },
+    /// Terminal event: `status` is the snake_case `TaskStatus`;
+    /// `last_error` is `""` when none.
+    TaskCompleted {
+        id: String,
+        status: String,
+        last_error: String,
     },
     /// Event has no matching D-Bus signal in this bridge. Recorded so
     /// tests can assert "we deliberately ignored X" without that being
@@ -108,17 +143,27 @@ pub fn translate(event: api::Event) -> ForwardAction {
         api::Event::ConversationWarningEmitted { .. } => ForwardAction::Ignored {
             kind: "conversation_warning_emitted",
         },
-        api::Event::TaskStarted { .. } => ForwardAction::Ignored {
-            kind: "task_started",
+        api::Event::TaskStarted { task } => {
+            let id = task.id.0.clone();
+            let dict = task_view_to_dict(&task);
+            ForwardAction::TaskStarted { id, task: dict }
+        }
+        api::Event::TaskProgress { id, progress_hint } => ForwardAction::TaskProgress {
+            id,
+            hint: progress_hint.unwrap_or_default(),
         },
-        api::Event::TaskProgress { .. } => ForwardAction::Ignored {
-            kind: "task_progress",
-        },
-        api::Event::TaskLogAppended { .. } => ForwardAction::Ignored {
-            kind: "task_log_appended",
-        },
-        api::Event::TaskCompleted { .. } => ForwardAction::Ignored {
-            kind: "task_completed",
+        api::Event::TaskLogAppended { id, entry } => {
+            let dict = log_entry_to_dict(&entry);
+            ForwardAction::TaskLogAppended { id, entry: dict }
+        }
+        api::Event::TaskCompleted {
+            id,
+            status,
+            last_error,
+        } => ForwardAction::TaskCompleted {
+            id,
+            status: task_status_str(status).to_string(),
+            last_error: last_error.unwrap_or_default(),
         },
         // Client-side tool execution (issue #107): the bridge does not
         // forward `ClientToolCall` to D-Bus subscribers because client-
@@ -239,8 +284,85 @@ async fn emit(connection: &Connection, action: ForwardAction) {
                 warn!("config_changed emit failed: {e}");
             }
         }
+        ForwardAction::TaskStarted { id, task } => {
+            let body = (id, task);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    None,
+                    paths::BACKGROUND_TASKS,
+                    BG_INTERFACE,
+                    "TaskStarted",
+                    &body,
+                )
+                .await
+            {
+                warn!("task_started emit failed: {e}");
+            }
+        }
+        ForwardAction::TaskProgress { id, hint } => {
+            let body = (id, hint);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    None,
+                    paths::BACKGROUND_TASKS,
+                    BG_INTERFACE,
+                    "TaskProgress",
+                    &body,
+                )
+                .await
+            {
+                warn!("task_progress emit failed: {e}");
+            }
+        }
+        ForwardAction::TaskLogAppended { id, entry } => {
+            let body = (id, entry);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    None,
+                    paths::BACKGROUND_TASKS,
+                    BG_INTERFACE,
+                    "TaskLogAppended",
+                    &body,
+                )
+                .await
+            {
+                warn!("task_log_appended emit failed: {e}");
+            }
+        }
+        ForwardAction::TaskCompleted {
+            id,
+            status,
+            last_error,
+        } => {
+            let body = (id, status, last_error);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    None,
+                    paths::BACKGROUND_TASKS,
+                    BG_INTERFACE,
+                    "TaskCompleted",
+                    &body,
+                )
+                .await
+            {
+                warn!("task_completed emit failed: {e}");
+            }
+        }
         ForwardAction::Ignored { kind } => {
             debug!("event forwarder ignoring kind={kind}");
         }
+    }
+}
+
+/// Snake-case wire string for `api::TaskStatus`. Mirrors the
+/// `#[serde(rename_all = "snake_case")]` attribute on the enum so
+/// D-Bus clients see the same wire vocabulary as the JSON/WS surface.
+fn task_status_str(status: api::TaskStatus) -> &'static str {
+    match status {
+        api::TaskStatus::Pending => "pending",
+        api::TaskStatus::Running => "running",
+        api::TaskStatus::Completed => "completed",
+        api::TaskStatus::Failed => "failed",
+        api::TaskStatus::Cancelled => "cancelled",
     }
 }
