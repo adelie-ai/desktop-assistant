@@ -65,13 +65,12 @@ FNV-1a is used to generate log fingerprints for secrets. FNV is not collision-re
 
 ---
 
-### 7. No Explicit WebSocket Message Size Limit (LOW)
+### 7. No Explicit WebSocket Message Size Limit (RESOLVED — 2026-05-27)
 
 **File:** `crates/ws-interface/src/lib.rs`
 
-WebSocket frame size relies on Axum defaults rather than an explicit configuration.
-
-**Recommendation:** Set an explicit max frame size via `WebSocketUpgrade::max_frame_size()`.
+**Status:** Resolved by #142 (`feat/issue-142-ws-msg-size`).
+The `WebSocketUpgrade` now sets both `.max_message_size(4 << 20)` and `.max_frame_size(4 << 20)` (4 MiB), matching the UDS frame cap in `crates/uds-interface/src/lib.rs` and the D-Bus bridge cap in `crates/dbus-bridge/src/transport.rs`. The handler emits a clean RFC 6455 close (code 1009, "Message Too Big") when the cap is exceeded rather than dropping the TCP connection silently. See `docs/API_TRANSPORT.md` for the cross-transport summary.
 
 ---
 

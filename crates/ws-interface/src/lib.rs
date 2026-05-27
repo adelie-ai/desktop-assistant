@@ -13,12 +13,24 @@ use base64::Engine;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{AssistantApiHandler, UserId};
 use desktop_assistant_transport_dispatch::{AuthContext, dispatch_loop};
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
 #[cfg(feature = "tls")]
 use tracing::debug;
 use tracing::warn;
 
 pub use api::{WsFrame, WsRequest};
+
+/// Inbound WebSocket message / frame size cap. Mirrors the
+/// length-prefixed frame caps in `crates/uds-interface/src/lib.rs` and
+/// `crates/dbus-bridge/src/transport.rs` so every transport into the
+/// daemon has the same `4 * 1024 * 1024 == 4_194_304`-byte ceiling.
+///
+/// We cap *both* `max_message_size` and `max_frame_size`: the former
+/// keeps an attacker from assembling a giant message out of many
+/// in-cap fragments, and the latter rejects an oversize single frame
+/// before its body is even allocated. Without these, axum defaults to
+/// a 64 MiB message limit (closes SECURITY_AUDIT.md #7).
+pub const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct WsServerState {
@@ -193,7 +205,9 @@ async fn ws_handler(
         .await
         .unwrap_or_default();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, user_id))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -259,44 +273,117 @@ async fn auth_config_handler(State(state): State<WsServerState>) -> impl IntoRes
 /// gives us a `Sink<WsFrame>` over the mpsc so the dispatcher's
 /// generic bound is satisfied without a hand-rolled adapter.
 async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId) {
+    use axum::extract::ws::CloseFrame;
+    use futures::stream::StreamExt;
     use tokio::sync::mpsc;
     use tokio_util::sync::PollSender;
 
     let (mut ws_tx, ws_rx) = socket.split();
 
-    // Outbound: writer task owns the WS sender and serializes
-    // `WsFrame` values pulled from a channel into `Message::Text`.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsFrame>(64);
+    // Outbound items: either a dispatcher-produced application frame
+    // (the common case — serialized to text) or a server-initiated
+    // close (used when the inbound stream errors, most notably for the
+    // 4 MiB message-size cap). Keeping both kinds on one channel lets
+    // the writer task own `ws_tx` as before without an extra mutex.
+    // `WsFrame` is comparatively large (a few hundred bytes), so we
+    // box it to keep the enum compact.
+    enum Outbound {
+        Frame(Box<WsFrame>),
+        Close(CloseFrame),
+    }
+
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(64);
     let writer = tokio::spawn(async move {
-        while let Some(frame) = outbound_rx.recv().await {
-            let Ok(text) = serde_json::to_string(&frame) else {
-                continue;
-            };
-            if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                break;
+        while let Some(item) = outbound_rx.recv().await {
+            match item {
+                Outbound::Frame(frame) => {
+                    let Ok(text) = serde_json::to_string(&*frame) else {
+                        continue;
+                    };
+                    if ws_tx.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Outbound::Close(close) => {
+                    // Best-effort: any send error means the peer is
+                    // gone, so we just exit.
+                    let _ = ws_tx.send(Message::Close(Some(close))).await;
+                    break;
+                }
             }
         }
     });
 
-    // Inbound: axum's `Message` stream down to text frames parsed as
-    // `WsRequest`. Close frames terminate the stream; ping / pong /
-    // binary frames are silently dropped (matches pre-refactor).
-    let inbound = ws_rx.filter_map(|item| async move {
-        match item {
-            Ok(Message::Text(text)) => match serde_json::from_str::<WsRequest>(&text) {
-                Ok(req) => Some(Ok::<_, anyhow::Error>(req)),
+    // Inbound: walk the axum `Message` stream in a side task, parse
+    // text frames into `WsRequest`, and push them onto an mpsc for the
+    // dispatcher. The two termination paths worth distinguishing:
+    //
+    //   - Peer closed gracefully (`Ok(Message::Close(_))`) or the
+    //     stream simply ended — drop the channel, dispatcher sees the
+    //     stream end.
+    //   - Inbound `Err(_)` — most commonly tungstenite's
+    //     `Capacity(MessageTooLong)` from our 4 MiB cap; the message
+    //     was never delivered to user code, so we owe the client an
+    //     explicit close. We send RFC 6455 code 1009 ("Message Too
+    //     Big") so well-behaved clients can surface the reason instead
+    //     of guessing from a bare TCP RST.
+    let close_tx = outbound_tx.clone();
+    let (inbound_tx, inbound_rx) =
+        mpsc::channel::<anyhow::Result<WsRequest>>(16);
+    let reader = tokio::spawn(async move {
+        let mut ws_rx = ws_rx;
+        while let Some(item) = ws_rx.next().await {
+            match item {
+                Ok(Message::Text(text)) => match serde_json::from_str::<WsRequest>(&text) {
+                    Ok(req) => {
+                        if inbound_tx.send(Ok(req)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => warn!("invalid ws json: {e}"),
+                },
+                Ok(Message::Close(_)) => break,
+                Ok(_) => {}
                 Err(e) => {
-                    warn!("invalid ws json: {e}");
-                    None
+                    let reason = format!("{e}");
+                    warn!("ws inbound error, closing: {reason}");
+                    // RFC 6455 §7.4.1: 1009 = "Message Too Big". We
+                    // use it for any inbound error because in practice
+                    // the only error tungstenite surfaces here is the
+                    // capacity overrun from our cap.
+                    let _ = close_tx
+                        .send(Outbound::Close(CloseFrame {
+                            code: 1009,
+                            reason: "message exceeds 4 MiB cap".into(),
+                        }))
+                        .await;
+                    break;
                 }
-            },
-            Ok(Message::Close(_)) | Err(_) => None,
-            Ok(_) => None,
+            }
         }
+    });
+    let inbound = futures::stream::unfold(inbound_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
     });
     futures::pin_mut!(inbound);
 
-    let sink = PollSender::new(outbound_tx.clone());
+    // The dispatcher writes `WsFrame` values; wrap them into our
+    // `Outbound` enum at the sink boundary so the writer task can
+    // continue to own the WS sender.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<WsFrame>(64);
+    let frame_bridge_tx = outbound_tx.clone();
+    let bridge = tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            if frame_bridge_tx
+                .send(Outbound::Frame(Box::new(frame)))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let sink = PollSender::new(frame_tx);
 
     // Per-connection identity resolved in `ws_handler` (#105): the
     // bearer token's `sub` if the validator extracted one, otherwise
@@ -312,7 +399,15 @@ async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId)
     // a closed channel on its next `emit` and shuts down. This is the
     // cancellation path exercised by
     // `ws_send_message_cancels_when_client_disconnects`.
+    //
+    // Drop our local outbound handle and tear down the helper tasks.
+    // The reader owns its own `close_tx` clone, but `reader.abort()`
+    // forces it to drop. The bridge task owns the dispatcher-facing
+    // `frame_bridge_tx`; aborting it likewise lets the writer observe
+    // a closed channel.
     drop(outbound_tx);
+    bridge.abort();
+    reader.abort();
     writer.abort();
 }
 
