@@ -23,9 +23,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use desktop_assistant_api_model as api;
 use desktop_assistant_dbus_bridge::adapter::{
-    DBUS_SERVICE_NAME, DbusConnectionsAdapter, DbusConversationsAdapter, DbusKnowledgeAdapter,
-    DbusSettingsAdapter, event_forwarder, paths,
+    DBUS_SERVICE_NAME, DbusBackgroundTasksAdapter, DbusConnectionsAdapter,
+    DbusConversationsAdapter, DbusKnowledgeAdapter, DbusSettingsAdapter, event_forwarder, paths,
 };
 use desktop_assistant_dbus_bridge::minter::{MintRequest, default_minter_socket_path, fetch_jwt};
 use desktop_assistant_dbus_bridge::transport::{
@@ -137,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
     let settings = DbusSettingsAdapter::new(Arc::clone(&transport));
     let connections = DbusConnectionsAdapter::new(Arc::clone(&transport));
     let knowledge = DbusKnowledgeAdapter::new(Arc::clone(&transport));
+    let background_tasks = DbusBackgroundTasksAdapter::new(Arc::clone(&transport));
 
     let connection = zbus::connection::Builder::session()
         .context("failed to connect to D-Bus session bus")?
@@ -145,10 +147,25 @@ async fn main() -> anyhow::Result<()> {
         .serve_at(paths::SETTINGS, settings)?
         .serve_at(paths::CONNECTIONS, connections)?
         .serve_at(paths::KNOWLEDGE, knowledge)?
+        .serve_at(paths::BACKGROUND_TASKS, background_tasks)?
         .build()
         .await
         .context("failed to build D-Bus connection")?;
     tracing::info!(name = %cli.name, "D-Bus bridge ready");
+
+    // Subscribe to background-task events so the forwarder can fan
+    // them out as `BackgroundTasks.*` signals. Best-effort: a
+    // failed subscription is logged but does not abort startup —
+    // older daemons may not implement the command, and the rest of
+    // the bridge stays functional.
+    match transport.request(api::Command::SubscribeBackgroundTasks).await {
+        Ok(_) => tracing::info!("subscribed to background-task events"),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to subscribe to background-task events; \
+             BackgroundTasks signals will not fire"
+        ),
+    }
 
     // 4. Event forwarder.
     let events = transport.subscribe_events();
