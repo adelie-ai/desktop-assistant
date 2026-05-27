@@ -9,6 +9,13 @@ async-trait.workspace = true
 desktop-assistant-auth-jwt.workspace = true
 desktop-assistant-core.workspace = true
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "json", "chrono", "uuid"] }
+# AST-based SQL validation/rewriting for the LLM-exposed
+# `execute_database_query` tool (#141). PostgreSQL dialect, used to:
+# - confirm a single statement,
+# - enforce SELECT-only on the read path,
+# - graft `WHERE user_id = $N` onto references to personal-data tables,
+# - reject writes that name personal-data tables qualified or otherwise.
+sqlparser = "0.62"
 pgvector = { version = "0.4", features = ["sqlx"] }
 serde.workspace = true
 serde_json = "1"
@@ -19,3 +26,8 @@ uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# Integration tests for the `execute_database_query` security contract
+# (#141) wire the closure exactly as `crates/daemon/src/main.rs` does,
+# then invoke it through `BuiltinToolService::execute_tool` so the
+# end-to-end LLM-driven path is exercised verbatim.
+desktop-assistant-mcp-client.workspace = true
