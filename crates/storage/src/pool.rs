@@ -141,5 +141,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Background tasks (issue #115) — persistent mirror of the in-memory
+    // `BackgroundTaskRegistry`. On daemon restart the cold-restart sweep
+    // reads this table to surface tasks that were running when the
+    // previous daemon died.
+    sqlx::raw_sql(include_str!("../migrations/018_background_tasks.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }

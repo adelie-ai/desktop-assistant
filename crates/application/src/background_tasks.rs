@@ -47,9 +47,13 @@ use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_auth_jwt::UserId;
+use desktop_assistant_core::ports::store::{
+    BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStore,
+};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::{error, warn};
 
 /// Configuration knobs for the registry.
 ///
@@ -87,6 +91,14 @@ pub enum TaskError {
     /// would break the user-isolation contract (#105).
     #[error("task not found")]
     NotFound,
+
+    /// The task is already in a terminal state — typically a `Failed`
+    /// row that survived a daemon restart. `cancel` on such a row would
+    /// otherwise look like a silent no-op; surfacing this distinct
+    /// variant lets transport adapters return a clean 409-style error
+    /// to the client instead of pretending the cancel succeeded (#115).
+    #[error("task is already terminal")]
+    AlreadyTerminal,
 }
 
 /// Per-task event sink for log lines emitted by a running task body.
@@ -211,8 +223,34 @@ impl BackgroundTaskRegistry {
                 tasks: Mutex::new(HashMap::new()),
                 user_channels: Mutex::new(HashMap::new()),
                 completion_notify: Mutex::new(HashMap::new()),
+                store: None,
             }),
         }
+    }
+
+    /// Attach a [`BackgroundTaskStore`] so spawned rows are mirrored to
+    /// the database and survive a daemon restart (#115).
+    ///
+    /// When no store is attached the registry behaves as a pure in-memory
+    /// cache — every existing single-tenant test path takes this branch.
+    /// When a store is attached, `spawn` writes a row before the body
+    /// starts, finalize updates that row with the terminal status, and
+    /// the daemon-startup hook `sweep_non_terminal_on_startup` marks
+    /// every row left behind by a previous incarnation as `Failed`.
+    ///
+    /// The store is held behind a `dyn` trait object because the daemon's
+    /// `main.rs` may want to test with an in-memory mock without
+    /// monomorphizing the registry against the storage crate. The trait
+    /// is `Send + Sync` so cloning the registry across tokio tasks
+    /// works without extra boxing.
+    pub fn with_store(mut self, store: Arc<dyn BackgroundTaskStore>) -> Self {
+        // Mutate via Arc::get_mut: cheap, panics if any other clone
+        // exists (which would be a programming error — the store is
+        // attached at construction time, before any clone goes out).
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_store called after the registry was cloned");
+        inner.store = Some(store);
+        self
     }
 
     /// Spawn a new background task under `user_id`.
@@ -310,12 +348,23 @@ impl BackgroundTaskRegistry {
         let task_id_for_body = task_id.clone();
         let user_id_for_body = user_id.clone();
         let ctx_for_body = ctx.clone();
+        let view_for_persist = view.clone();
         tokio::spawn(async move {
+            // Mirror the in-memory row to the persistence store BEFORE
+            // running the user body. The await happens inside the spawned
+            // task (spawn() itself is non-async by design) so the registry's
+            // public API stays unchanged. If the write fails we log and
+            // keep going — losing durability is a strictly worse outcome
+            // than refusing to run the work, so we degrade rather than
+            // abort. The cold-restart sweep would only miss this row
+            // anyway; the user-visible task continues to work.
+            inner.persist_create(&task_id_for_body, &user_id_for_body, &view_for_persist).await;
+
             // Run the body. We always finalize, even on panic, via a
             // drop-guard so the registry never gets stuck with a row
             // in `Running` after the task disappears.
             let result = body(ctx_for_body).await;
-            inner.finalize(&task_id_for_body, &user_id_for_body, result);
+            inner.finalize(&task_id_for_body, &user_id_for_body, result).await;
         });
 
         task_id
@@ -323,6 +372,18 @@ impl BackgroundTaskRegistry {
 
     /// Request cancellation of `id` owned by `user_id`. Cooperative — the
     /// running future is responsible for noticing.
+    ///
+    /// Returns:
+    /// - `Err(TaskError::NotFound)` when the id is unknown or owned by
+    ///   another user (the #105 opacity rule conflates the two).
+    /// - `Err(TaskError::AlreadyTerminal)` when the row exists and
+    ///   belongs to the caller but is in a terminal state — typically a
+    ///   row that survived a daemon restart and was marked `Failed` by
+    ///   the cold-restart sweep. The distinct variant prevents silent
+    ///   no-ops and lets transport adapters return a clean error to the
+    ///   client (#115).
+    /// - `Ok(())` after tripping the cancellation token; the task body
+    ///   is responsible for noticing and yielding.
     pub fn cancel(&self, user_id: &UserId, id: &api::TaskId) -> Result<(), TaskError> {
         let tasks = self.inner.tasks.lock().expect("tasks poisoned");
         let Some(state) = tasks.get(id) else {
@@ -331,6 +392,12 @@ impl BackgroundTaskRegistry {
         if &state.owner != user_id {
             // Existence-hiding: pretend it doesn't exist (#105 contract).
             return Err(TaskError::NotFound);
+        }
+        if matches!(
+            state.view.status,
+            api::TaskStatus::Completed | api::TaskStatus::Failed | api::TaskStatus::Cancelled
+        ) {
+            return Err(TaskError::AlreadyTerminal);
         }
         state.token.cancel();
         Ok(())
@@ -424,6 +491,190 @@ impl BackgroundTaskRegistry {
         sender.subscribe()
     }
 
+    /// Cold-restart sweep (#115): mark every persisted, non-terminal
+    /// task row as `Failed` and surface it in the in-memory registry so
+    /// `list`/`get`/`logs` see the leftovers from the previous daemon
+    /// incarnation.
+    ///
+    /// Best-effort resume policy until #129 lands:
+    ///
+    /// - `TaskKind::Conversation` and `TaskKind::Subagent` — marked
+    ///   `Failed { last_error: "daemon restarted mid-turn" }`. The
+    ///   conversation history is intact in `conversations`/`messages`;
+    ///   the user re-prompts to continue.
+    /// - `TaskKind::Standalone` — marked `Failed { last_error:
+    ///   "daemon restarted; resume not yet implemented" }`. #129
+    ///   replaces this branch with a real resume from persisted turn
+    ///   state.
+    ///
+    /// Persisted log replay is OUT of scope. The in-memory log for a
+    /// resumed row starts fresh, prefixed with a single `Lifecycle`
+    /// entry summarising the outcome.
+    ///
+    /// Returns the number of rows surfaced. Errors short-circuit so a
+    /// transient DB failure doesn't leave the registry half-populated.
+    pub async fn sweep_non_terminal_on_startup(&self) -> Result<u32, anyhow::Error> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(0);
+        };
+        let mut rows = store.scan_non_terminal().await?;
+        // Sort so rows without a parent come first: this guarantees a
+        // parent is in the in-memory map before we try to register a
+        // child under it, regardless of the order the DB returns them
+        // in (sqlx makes no ordering guarantees). A child whose parent
+        // is itself missing (e.g. parent finished but child still
+        // pending) keeps its `parent` field but the parent's
+        // `children` vector won't gain the entry — same policy as
+        // in-memory dropped parents.
+        rows.sort_by_key(|r| r.parent_task_id.is_some());
+        let mut count = 0u32;
+        for row in rows {
+            // Parse the kind so we can branch on the resume policy.
+            let kind: api::TaskKind = match serde_json::from_value(row.kind_json.clone()) {
+                Ok(k) => k,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        task_id = %row.id,
+                        "parse kind_json during cold-restart sweep; skipping",
+                    );
+                    continue;
+                }
+            };
+            let last_error = match &kind {
+                api::TaskKind::Conversation { .. } | api::TaskKind::Subagent { .. } => {
+                    "daemon restarted mid-turn"
+                }
+                api::TaskKind::Standalone { .. } => {
+                    // Until #129 lands, standalone tasks can't resume —
+                    // we mark them Failed but emit a distinct error
+                    // message so the UI can surface the "we lost it"
+                    // case differently from a genuine error.
+                    "daemon restarted; resume not yet implemented"
+                }
+            };
+            let now = now_ms();
+            // Persist the terminal transition first so a second crash
+            // doesn't re-surface the row endlessly.
+            //
+            // The store's `update_task` reads `current_user_id()` from
+            // the task-local. The sweep runs at daemon boot before any
+            // request scope is installed, so we wrap the call in a
+            // `with_user_id` set to the row's owner. This mirrors the
+            // discipline used elsewhere in the application layer when a
+            // system task touches user-scoped storage.
+            let owner = UserId::new(row.user_id.clone());
+            let store_for_call = Arc::clone(store);
+            let row_id_for_call = row.id.clone();
+            let progress_for_call = row.progress_hint.clone();
+            if let Err(e) = desktop_assistant_core::ports::auth::with_user_id(owner, async move {
+                store_for_call
+                    .update_task(
+                        &row_id_for_call,
+                        BackgroundTaskStatus::Failed,
+                        Some(last_error),
+                        progress_for_call.as_deref(),
+                        Some(now),
+                    )
+                    .await
+            })
+            .await
+            {
+                warn!(error = %e, task_id = %row.id, "sweep update_task failed; skipping in-memory surface");
+                continue;
+            }
+
+            // Surface the row in the in-memory registry so `list`/`get`
+            // see it. Marked `completed = true` so `wait` returns
+            // immediately and `cancel` rejects with `AlreadyTerminal`.
+            let owner = UserId::new(row.user_id.clone());
+            let view = api::TaskView {
+                id: api::TaskId(row.id.clone()),
+                kind: kind.clone(),
+                status: api::TaskStatus::Failed,
+                started_at: row.started_at,
+                ended_at: Some(now),
+                last_error: Some(last_error.to_string()),
+                parent: row.parent_task_id.clone().map(api::TaskId),
+                children: Vec::new(),
+                title: row.title.clone(),
+                progress_hint: row.progress_hint.clone(),
+            };
+            {
+                let mut tasks = self.inner.tasks.lock().expect("tasks poisoned");
+                tasks.insert(
+                    view.id.clone(),
+                    TaskState {
+                        owner: owner.clone(),
+                        view: view.clone(),
+                        // The token is already inert; cancelling a
+                        // terminal task is a programmer error caught
+                        // upstream by `AlreadyTerminal`.
+                        token: CancellationToken::new(),
+                        logs: VecDeque::with_capacity(2),
+                        next_seq: 1,
+                        completed: true,
+                    },
+                );
+            }
+
+            // Emit a single lifecycle log so the UI sees a "we lost it"
+            // marker when it inspects the task. We append directly into
+            // the just-inserted state rather than going through the
+            // `TaskLogSink` because the latter has no context to know
+            // we want a specific message rather than the generic
+            // "task started" line.
+            {
+                let mut tasks = self.inner.tasks.lock().expect("tasks poisoned");
+                if let Some(state) = tasks.get_mut(&view.id) {
+                    let entry = api::TaskLogEntry {
+                        seq: state.next_seq,
+                        timestamp: now,
+                        level: api::LogLevel::Warn,
+                        category: api::LogCategory::Lifecycle,
+                        message: last_error.to_string(),
+                        data: None,
+                    };
+                    state.next_seq += 1;
+                    state.logs.push_back(entry);
+                }
+            }
+
+            // Re-link the child to its parent if the parent also
+            // surfaced via this sweep. We only walk in the inserted
+            // direction; orphaned children (parent terminal already)
+            // keep their `parent` field but the parent's `children`
+            // vector won't contain them — that matches the policy
+            // applied to in-memory dropped parents.
+            if let Some(parent_id) = &view.parent {
+                let mut tasks = self.inner.tasks.lock().expect("tasks poisoned");
+                if let Some(parent_state) = tasks.get_mut(parent_id) {
+                    parent_state.view.children.push(view.id.clone());
+                }
+            }
+
+            // Broadcast TaskStarted then TaskCompleted so a UI that
+            // subscribes immediately after restart still observes the
+            // lifecycle. This mirrors what a real spawn+finalize would
+            // have emitted.
+            self.inner.broadcast(
+                &owner,
+                api::Event::TaskStarted { task: view.clone() },
+            );
+            self.inner.broadcast(
+                &owner,
+                api::Event::TaskCompleted {
+                    id: view.id.0.clone(),
+                    status: api::TaskStatus::Failed,
+                    last_error: Some(last_error.to_string()),
+                },
+            );
+
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
     /// Resolve when `id`'s task reaches a terminal state. Used by the
     /// foreground send-message wrapper to keep the old "await until
     /// done" contract while still routing through the registry.
@@ -505,6 +756,10 @@ struct Inner {
     user_channels: Mutex<HashMap<UserId, broadcast::Sender<api::Event>>>,
     /// Per-task completion notifies, lazily created by `wait`.
     completion_notify: Mutex<HashMap<api::TaskId, Arc<tokio::sync::Notify>>>,
+    /// Optional persistence layer (#115). When attached, spawned tasks
+    /// are mirrored to the DB so a daemon restart can sweep abandoned
+    /// rows. `None` keeps the registry purely in-memory (the default).
+    store: Option<Arc<dyn BackgroundTaskStore>>,
 }
 
 impl Inner {
@@ -517,10 +772,99 @@ impl Inner {
         }
     }
 
+    /// Mirror a newly-spawned task to the persistence store. Logs and
+    /// continues on failure — see the call site comment in `spawn` for
+    /// the rationale.
+    async fn persist_create(
+        self: &Arc<Self>,
+        task_id: &api::TaskId,
+        user_id: &UserId,
+        view: &api::TaskView,
+    ) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let kind_json = match serde_json::to_value(&view.kind) {
+            Ok(v) => v,
+            Err(e) => {
+                // Serialization failure is a code bug — log loudly so
+                // tests catch it but keep the task running.
+                error!(
+                    error = %e,
+                    task_id = %task_id.0,
+                    "serialize TaskKind for persistence",
+                );
+                return;
+            }
+        };
+        let row = BackgroundTaskRow {
+            id: task_id.0.clone(),
+            user_id: user_id.as_str().to_string(),
+            kind_json,
+            status: api_status_to_db(view.status),
+            parent_task_id: view.parent.as_ref().map(|p| p.0.clone()),
+            title: view.title.clone(),
+            last_error: view.last_error.clone(),
+            progress_hint: view.progress_hint.clone(),
+            started_at: view.started_at,
+            ended_at: view.ended_at,
+        };
+        if let Err(e) = store.create_task(row).await {
+            warn!(
+                error = %e,
+                task_id = %task_id.0,
+                "persist background task on spawn",
+            );
+        }
+    }
+
+    /// Persist the terminal state of `task_id` to the store. Called from
+    /// `finalize` once the in-memory transition is committed.
+    async fn persist_update(
+        self: &Arc<Self>,
+        task_id: &api::TaskId,
+        user_id: &UserId,
+        status: BackgroundTaskStatus,
+        last_error: Option<&str>,
+        progress_hint: Option<&str>,
+        ended_at: Option<i64>,
+    ) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        // The store's `update_task` is scoped to `current_user_id()`.
+        // The registry's task body runs without an installed user-id
+        // task-local, so we wrap the call to ensure the WHERE clause
+        // sees the right scope. This mirrors the discipline applied
+        // by other application-layer call sites that bridge between
+        // a registry's owned `UserId` and the storage layer's
+        // task-local.
+        let store = Arc::clone(store);
+        let owner = user_id.clone();
+        let task_id = task_id.0.clone();
+        let last_error = last_error.map(String::from);
+        let progress_hint = progress_hint.map(String::from);
+        let result = desktop_assistant_core::ports::auth::with_user_id(owner, async move {
+            store
+                .update_task(
+                    &task_id,
+                    status,
+                    last_error.as_deref(),
+                    progress_hint.as_deref(),
+                    ended_at,
+                )
+                .await
+        })
+        .await;
+        if let Err(e) = result {
+            warn!(error = %e, "persist background task on update");
+        }
+    }
+
     /// Transition `task_id` to a terminal state based on `result` and
     /// the cancellation-token state, broadcast `TaskCompleted`, and wake
     /// any waiters. Called from the `tokio::spawn` task wrapper.
-    fn finalize(
+    async fn finalize(
         self: &Arc<Self>,
         task_id: &api::TaskId,
         user_id: &UserId,
@@ -582,9 +926,33 @@ impl Inner {
             api::Event::TaskCompleted {
                 id: task_id.0.clone(),
                 status,
-                last_error,
+                last_error: last_error.clone(),
             },
         );
+
+        // Persist the terminal state. The in-memory broadcast happens
+        // first because subscribers don't care about durability — they
+        // care about the lifecycle event. Persistence happens after so
+        // a slow DB doesn't gate the wake. The progress_hint snapshot
+        // is read under a tiny critical section, decoupled from the
+        // broadcast above.
+        let (progress_hint, ended_at) = {
+            let tasks = self.tasks.lock().expect("tasks poisoned");
+            let view = tasks.get(task_id).map(|s| s.view.clone());
+            (
+                view.as_ref().and_then(|v| v.progress_hint.clone()),
+                view.and_then(|v| v.ended_at),
+            )
+        };
+        self.persist_update(
+            task_id,
+            user_id,
+            api_status_to_db(status),
+            last_error.as_deref(),
+            progress_hint.as_deref(),
+            ended_at,
+        )
+        .await;
 
         // Wake waiters.
         let waiter = {
@@ -597,6 +965,31 @@ impl Inner {
         if let Some(notify) = waiter {
             notify.notify_waiters();
         }
+    }
+}
+
+fn api_status_to_db(s: api::TaskStatus) -> BackgroundTaskStatus {
+    match s {
+        api::TaskStatus::Pending => BackgroundTaskStatus::Pending,
+        api::TaskStatus::Running => BackgroundTaskStatus::Running,
+        api::TaskStatus::Completed => BackgroundTaskStatus::Completed,
+        api::TaskStatus::Failed => BackgroundTaskStatus::Failed,
+        api::TaskStatus::Cancelled => BackgroundTaskStatus::Cancelled,
+    }
+}
+
+/// Inverse of [`api_status_to_db`]. Currently used by sweep tests and
+/// by callers that observe a `BackgroundTaskRow` (e.g. a future
+/// "list across all daemons" command). Kept alongside the forward
+/// mapping so the two stay symmetric.
+#[allow(dead_code)]
+fn db_status_to_api(s: BackgroundTaskStatus) -> api::TaskStatus {
+    match s {
+        BackgroundTaskStatus::Pending => api::TaskStatus::Pending,
+        BackgroundTaskStatus::Running => api::TaskStatus::Running,
+        BackgroundTaskStatus::Completed => api::TaskStatus::Completed,
+        BackgroundTaskStatus::Failed => api::TaskStatus::Failed,
+        BackgroundTaskStatus::Cancelled => api::TaskStatus::Cancelled,
     }
 }
 
