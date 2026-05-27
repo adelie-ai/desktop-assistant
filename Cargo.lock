@@ -1256,6 +1256,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-dbus-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "desktop-assistant-api-model",
+ "desktop-assistant-auth-jwt",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zbus",
+]
+
+[[package]]
 name = "desktop-assistant-jwt-minter"
 version = "0.1.0"
 dependencies = [

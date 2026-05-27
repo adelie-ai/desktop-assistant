@@ -1,0 +1,23 @@
+[Unit]
+Description=Adelie D-Bus bridge (per-user)
+# The bridge fetches a JWT from adelie-mint, then opens a UDS connection
+# to the daemon. Both must be reachable at startup.
+After=adelie-mint.service
+After=default.target
+PartOf=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/adelie-dbus-bridge
+Restart=on-failure
+RestartSec=2
+# Default well-known name is `org.desktopAssistant.Bridge` so the
+# bridge can run alongside the daemon's in-process D-Bus surface
+# during the Option-A transition (see PR #106). Flip to
+# `org.desktopAssistant` once the daemon's in-process surface is
+# removed.
+Environment=ADELIE_BRIDGE_NAME=org.desktopAssistant.Bridge
+Environment=RUST_LOG=info,desktop_assistant_dbus_bridge=debug
+
+[Install]
+WantedBy=default.target

@@ -19,6 +19,7 @@ members = [
     "crates/jwt-minter",
     "crates/transport-dispatch",
     "crates/uds-interface",
+    "crates/dbus-bridge",
 ]
 
 [workspace.dependencies]
