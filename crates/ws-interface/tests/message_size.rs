@@ -671,7 +671,7 @@ async fn ws_frame_size_cap_enforced_on_fragmented_messages() {
         .await
         .expect("server should accept the header bytes");
     // One real payload byte just to push the server's reader along.
-    let _ = stream.write_all(&[b'x']).await;
+    let _ = stream.write_all(b"x").await;
     let _ = stream.flush().await;
 
     // Read with a tight bound. The cap is enforced synchronously
@@ -690,7 +690,7 @@ async fn ws_frame_size_cap_enforced_on_fragmented_messages() {
                     // Stop once we have at least one complete control
                     // frame's worth — control frames are <=125 bytes
                     // and start with 0x88 for a server-side close.
-                    if all.iter().any(|b| *b == 0x88) {
+                    if all.contains(&0x88) {
                         return Ok(all);
                     }
                 }
@@ -711,7 +711,7 @@ async fn ws_frame_size_cap_enforced_on_fragmented_messages() {
             // drop the TCP connection. Either is acceptable; what isn't
             // acceptable is a text-opcode reply or no reaction at all.
             assert!(
-                !bytes.iter().any(|b| *b == 0x81),
+                !bytes.contains(&0x81),
                 "server emitted a final text frame (opcode 0x81) in response \
                  to an oversize fragment — frame cap is not enforced"
             );
