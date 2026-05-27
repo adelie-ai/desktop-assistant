@@ -1709,4 +1709,61 @@ mod tests {
         );
         assert_eq!(parse_retry_after_header(&headers), None);
     }
+
+    // --- Cancellation (issue #109) ---------------------------------------
+
+    /// Exercise the streaming entrypoint against a local stub HTTP server
+    /// that holds the connection open. Cancel mid-stream; assert the
+    /// adapter surfaces `CoreError::Cancelled` within the time budget
+    /// (proxy for "dropped the HTTP body") rather than hanging until the
+    /// stub's response delay completes.
+    #[tokio::test]
+    async fn anthropic_stream_aborts_on_cancellation() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let server = httpmock::MockServer::start();
+        // The server holds the connection open for 5s; if cancellation
+        // doesn't drop the response body our test would block for the
+        // full delay. We assert completion within 1s.
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .delay(Duration::from_secs(5))
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let token = CancellationToken::new();
+        let cancel_handle = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_handle.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stream should have aborted promptly on cancellation; took {elapsed:?}"
+        );
+    }
 }

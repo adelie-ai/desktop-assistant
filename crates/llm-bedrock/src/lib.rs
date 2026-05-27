@@ -2297,4 +2297,58 @@ mod tests {
             serde_json::json!(["a", serde_json::Value::Null])
         );
     }
+
+    // --- Cancellation (issue #109) ---------------------------------------
+
+    /// The Bedrock adapter routes through the AWS SDK, which is not
+    /// trivially mockable at the HTTP level the way `httpmock` lets us
+    /// stub the other adapters. The contract we verify here is the one
+    /// the cancellation work introduces at the connector boundary:
+    /// when the task-local `CANCELLATION_TOKEN` is already tripped on
+    /// entry to `stream_completion`, the adapter returns
+    /// `CoreError::Cancelled` without dispatching any AWS request.
+    ///
+    /// The mid-stream `tokio::select!` against `token.cancelled()` is
+    /// covered indirectly by the core-level test
+    /// `send_prompt_returns_cancelled_when_token_fires_mid_stream`,
+    /// which drives a `SlowStreamLlm` modelled on the same shape the
+    /// real connector uses.
+    #[tokio::test]
+    async fn bedrock_stream_aborts_on_cancellation() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use tokio_util::sync::CancellationToken;
+
+        // Use a fake API key and no real credentials. The point is the
+        // entry-check: cancellation pre-empts the request before the
+        // SDK is invoked, so missing credentials never matter.
+        let client = BedrockClient::new("fake".into()).with_model("anthropic.claude-sonnet-4-6");
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        // The check must run *before* the SDK reaches the network. AWS
+        // credential resolution alone can take many ms; 1s is generous.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "pre-cancelled token should short-circuit before AWS dispatch; took {elapsed:?}"
+        );
+    }
 }

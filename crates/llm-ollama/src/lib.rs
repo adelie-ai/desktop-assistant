@@ -1719,4 +1719,62 @@ mod tests {
             "503 should map to RateLimited; got {err:?}"
         );
     }
+
+    // --- Cancellation (issue #109) ---------------------------------------
+
+    /// Drive the streaming entrypoint against a local stub that hangs;
+    /// cancellation must surface `CoreError::Cancelled` and unblock well
+    /// before the stub's delay completes.
+    #[tokio::test]
+    async fn ollama_stream_aborts_on_cancellation() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start();
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let _chat = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .delay(Duration::from_secs(5))
+                .body("{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"done\":true}\n");
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let token = CancellationToken::new();
+        let cancel_handle = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_handle.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stream should abort promptly on cancellation; took {elapsed:?}"
+        );
+    }
 }

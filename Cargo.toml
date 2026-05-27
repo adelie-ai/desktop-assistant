@@ -21,6 +21,7 @@ members = [
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 thiserror = "2"
 anyhow = "1"
