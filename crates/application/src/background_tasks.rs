@@ -523,6 +523,61 @@ impl BackgroundTaskRegistry {
         sender.subscribe()
     }
 
+    /// Append a log entry to `id`'s log ring from outside the task's
+    /// body. Used by callers that produce events on behalf of a task
+    /// they don't own the body of — for example, the `spawn_subagent`
+    /// tool body (#112) appends a `ToolCall` entry to the *parent*
+    /// task's log carrying the child task / conversation ids so the
+    /// UI can render the spawn as a tool-call row that links to the
+    /// child's panel.
+    ///
+    /// Cross-user safety: an attempt by a different user, or against
+    /// an unknown id, is a silent no-op — same opacity rule as
+    /// [`Self::get`] / [`Self::logs`], and consistent with
+    /// [`TaskLogSink::append`]'s behaviour for an already-removed
+    /// task. Callers should treat logging as best-effort and never
+    /// observe a logging error.
+    pub fn append_log(
+        &self,
+        user_id: &UserId,
+        id: &api::TaskId,
+        level: api::LogLevel,
+        category: api::LogCategory,
+        message: String,
+        data: Option<serde_json::Value>,
+    ) {
+        let mut tasks = self.inner.tasks.lock().expect("tasks poisoned");
+        let Some(state) = tasks.get_mut(id) else {
+            return;
+        };
+        if &state.owner != user_id {
+            return;
+        }
+        let entry = api::TaskLogEntry {
+            seq: state.next_seq,
+            timestamp: now_ms(),
+            level,
+            category,
+            message,
+            data,
+        };
+        state.next_seq += 1;
+        if state.logs.len() == self.inner.config.log_ring_capacity {
+            state.logs.pop_front();
+        }
+        state.logs.push_back(entry.clone());
+        let owner = state.owner.clone();
+        let task_id = id.clone();
+        drop(tasks);
+        self.inner.broadcast(
+            &owner,
+            api::Event::TaskLogAppended {
+                id: task_id.0,
+                entry,
+            },
+        );
+    }
+
     /// Cold-restart sweep (#115): mark every persisted, non-terminal
     /// task row as `Failed` and surface it in the in-memory registry so
     /// `list`/`get`/`logs` see the leftovers from the previous daemon

@@ -1014,6 +1014,10 @@ where
                         override_selection,
                         tools,
                         conversation_id,
+                        // Standalone runs are fire-and-forget at the
+                        // protocol level — only `spawn_subagent` (#112)
+                        // wires a sink to pull the final text back.
+                        result_sink: None,
                     },
                     move |conversation_id| api::TaskKind::Standalone {
                         name: name_for_kind,
@@ -1188,6 +1192,13 @@ where
 /// id is known. The helper deliberately doesn't take a `TaskKind`
 /// directly so we can't construct one with a stale or empty
 /// `conversation_id`.
+/// Result slot for [`AgentConversationSpec::result_sink`]. The helper
+/// writes `Ok(response)` on success, `Err("cancelled")` on cooperative
+/// cancellation, and `Err(detail)` on failure — the `spawn_subagent`
+/// tool body (#112) reads it to surface the child's final answer to a
+/// `wait=true` caller.
+pub(crate) type AgentResultSink = Arc<tokio::sync::Mutex<Option<Result<String, String>>>>;
+
 /// Bundle of arguments for [`spawn_agent_conversation`]. Grouping them
 /// in a struct keeps the helper's call sites readable and dodges the
 /// `clippy::too_many_arguments` lint without sacrificing the
@@ -1209,6 +1220,14 @@ pub(crate) struct AgentConversationSpec {
     /// Conversation id created beforehand by the caller — the helper
     /// needs it both to construct the task kind and to send the prompt.
     pub conversation_id: String,
+    /// Optional sink for the run's final assistant text. When `Some`,
+    /// the helper stashes `Ok(response)` on success, `Err("cancelled")`
+    /// on cooperative cancellation, and `Err(detail)` on failure. The
+    /// `spawn_subagent` tool body (#112) uses this so a `wait=true`
+    /// parent can pull the child's final answer out of the registry
+    /// task; `SpawnStandaloneAgent` (#113) leaves it `None` because the
+    /// agent run is fire-and-forget at the protocol level.
+    pub result_sink: Option<AgentResultSink>,
 }
 
 pub(crate) fn spawn_agent_conversation<C>(
@@ -1228,6 +1247,7 @@ where
         override_selection,
         tools,
         conversation_id,
+        result_sink,
     } = spec;
 
     let kind = kind_factory(conversation_id.clone());
@@ -1288,13 +1308,29 @@ where
         };
 
         match result {
-            Ok(_outcome) => Ok(()),
+            Ok(outcome) => {
+                if let Some(sink) = result_sink {
+                    *sink.lock().await = Some(Ok(outcome.response));
+                }
+                Ok(())
+            }
             // `Cancelled` propagated up from the cooperative core path
             // — let the registry record this as `Cancelled` via the
             // token state rather than tacking on a misleading "failed"
             // string.
-            Err(desktop_assistant_core::CoreError::Cancelled) => Ok(()),
-            Err(other) => Err(anyhow::Error::new(other)),
+            Err(desktop_assistant_core::CoreError::Cancelled) => {
+                if let Some(sink) = result_sink {
+                    *sink.lock().await = Some(Err("cancelled".to_string()));
+                }
+                Ok(())
+            }
+            Err(other) => {
+                let detail = other.to_string();
+                if let Some(sink) = result_sink {
+                    *sink.lock().await = Some(Err(detail.clone()));
+                }
+                Err(anyhow::Error::new(other))
+            }
         }
     })
 }
