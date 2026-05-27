@@ -536,6 +536,93 @@ mod tests {
     }
 
     #[test]
+    fn maps_task_started_event() {
+        let task = api::TaskView {
+            id: api::TaskId("t-1".into()),
+            kind: api::TaskKind::Standalone {
+                name: "researcher".into(),
+                conversation_id: "c-1".into(),
+            },
+            status: api::TaskStatus::Running,
+            started_at: 1,
+            ended_at: None,
+            last_error: None,
+            parent: None,
+            children: Vec::new(),
+            title: "Researcher: pricing data".into(),
+            progress_hint: None,
+        };
+        let signal = map_event_to_signal(api::Event::TaskStarted { task });
+        match signal {
+            Some(SignalEvent::TaskStarted { task }) => {
+                assert_eq!(task.id, api::TaskId("t-1".into()));
+                assert_eq!(task.title, "Researcher: pricing data");
+            }
+            other => panic!("expected SignalEvent::TaskStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_task_progress_event() {
+        let signal = map_event_to_signal(api::Event::TaskProgress {
+            id: "t-1".into(),
+            progress_hint: Some("step 2/5".into()),
+        });
+        match signal {
+            Some(SignalEvent::TaskProgress { id, progress_hint }) => {
+                assert_eq!(id, "t-1");
+                assert_eq!(progress_hint.as_deref(), Some("step 2/5"));
+            }
+            other => panic!("expected SignalEvent::TaskProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_task_log_appended_event() {
+        let entry = api::TaskLogEntry {
+            seq: 7,
+            timestamp: 1_700_000_000,
+            level: api::LogLevel::Info,
+            category: api::LogCategory::Status,
+            message: "fetching".into(),
+            data: None,
+        };
+        let signal = map_event_to_signal(api::Event::TaskLogAppended {
+            id: "t-1".into(),
+            entry,
+        });
+        match signal {
+            Some(SignalEvent::TaskLogAppended { id, entry }) => {
+                assert_eq!(id, "t-1");
+                assert_eq!(entry.seq, 7);
+                assert_eq!(entry.message, "fetching");
+            }
+            other => panic!("expected SignalEvent::TaskLogAppended, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_task_completed_event() {
+        let signal = map_event_to_signal(api::Event::TaskCompleted {
+            id: "t-1".into(),
+            status: api::TaskStatus::Failed,
+            last_error: Some("LLM rate limit".into()),
+        });
+        match signal {
+            Some(SignalEvent::TaskCompleted {
+                id,
+                status,
+                last_error,
+            }) => {
+                assert_eq!(id, "t-1");
+                assert!(matches!(status, api::TaskStatus::Failed));
+                assert_eq!(last_error.as_deref(), Some("LLM rate limit"));
+            }
+            other => panic!("expected SignalEvent::TaskCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn ignores_non_stream_config_events() {
         let event = map_event_to_signal(api::Event::ConfigChanged {
             config: api::Config {
