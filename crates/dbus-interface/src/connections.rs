@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use desktop_assistant_api_model::{self as api};
-use desktop_assistant_application::AssistantApiHandler;
+use desktop_assistant_application::{AssistantApiHandler, RequestContext};
 use zbus::{fdo, interface};
+
+use crate::resolve_dbus_user_id;
 
 fn to_fdo_error<E: std::fmt::Display>(error: E) -> fdo::Error {
     fdo::Error::Failed(error.to_string())
@@ -27,8 +29,16 @@ impl DbusConnectionsAdapter {
     }
 
     async fn dispatch(&self, cmd: api::Command) -> fdo::Result<api::CommandResult> {
+        // #156: install the per-user scope at the D-Bus dispatch
+        // boundary so the inbound handler (and storage queries it
+        // composes downstream) see the local OS user instead of the
+        // `"default"` sentinel. `handle_command_for` is the
+        // context-aware entry point the WS and UDS adapters already
+        // use; routing through it keeps the auth wiring identical
+        // across transports.
+        let ctx = RequestContext::for_user(resolve_dbus_user_id());
         self.handler
-            .handle_command(cmd)
+            .handle_command_for(ctx, cmd)
             .await
             .map_err(|e| fdo::Error::Failed(format!("{e:?}")))
     }
@@ -217,22 +227,12 @@ mod tests {
         let handler = RecordingHandler::new();
         let adapter = DbusConnectionsAdapter::new(handler.clone() as Arc<dyn AssistantApiHandler>);
 
-        let saved = std::env::var("USER").ok();
-        unsafe {
-            std::env::set_var("USER", "alice-conn");
-        }
+        let _guard = crate::testing::UserEnvGuard::set("alice-conn");
 
         let _ = adapter.list_connections().await;
         let _ = adapter.list_available_models("", false).await;
         let _ = adapter.get_purposes().await;
         let _ = adapter.delete_connection("c", false).await;
-
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("USER", v),
-                None => std::env::remove_var("USER"),
-            }
-        }
 
         let observed = handler.observed();
         assert!(!observed.is_empty());

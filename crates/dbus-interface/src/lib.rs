@@ -30,6 +30,66 @@ pub fn resolve_dbus_user_id() -> UserId {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod testing {
+    //! Test-only helpers shared across the per-module test suites.
+    //!
+    //! `$USER` is a process-global env var; the recording-fake tests
+    //! that simulate the D-Bus user_id resolution all touch it, so
+    //! they must serialize through this mutex to avoid trampling
+    //! each other under `cargo test`'s default parallel runner.
+
+    use std::sync::Mutex;
+
+    pub(crate) static USER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard: lock the env, set `USER` to `value`, restore on
+    /// drop (or remove if it wasn't set). Use this at the top of any
+    /// test that calls `crate::resolve_dbus_user_id()` so concurrent
+    /// tests don't observe each other's mutations.
+    pub(crate) struct UserEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl UserEnvGuard {
+        pub(crate) fn set(value: &str) -> Self {
+            let lock = USER_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var("USER").ok();
+            // SAFETY: env access is process-global; the lock above
+            // serializes every test that touches `$USER`.
+            unsafe {
+                std::env::set_var("USER", value);
+            }
+            Self { _lock: lock, prev }
+        }
+
+        pub(crate) fn unset() -> Self {
+            let lock = USER_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var("USER").ok();
+            unsafe {
+                std::env::remove_var("USER");
+            }
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for UserEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("USER", v),
+                    None => std::env::remove_var("USER"),
+                }
+            }
+        }
+    }
+}
+
 /// D-Bus adapter that exposes an `AssistantService` over the session bus.
 pub struct DbusAssistantAdapter<S: AssistantService> {
     service: S,

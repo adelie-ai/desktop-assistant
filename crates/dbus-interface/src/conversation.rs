@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use desktop_assistant_core::domain::ConversationId;
+use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 use desktop_assistant_core::ports::inbound::ConversationService;
 use tokio::sync::mpsc;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
+
+use crate::resolve_dbus_user_id;
 
 /// D-Bus adapter for the ConversationService.
 ///
@@ -76,10 +79,13 @@ pub(crate) async fn run_send_prompt_llm_task<S>(
 /// Schedule the LLM-call body on a fresh tokio task.
 ///
 /// `tokio::spawn` does not propagate task-locals, so this helper is
-/// the single fix surface for #156: the spawned future must
-/// re-install the `with_user_id` scope captured at the call site,
-/// otherwise the storage queries inside the LLM turn fall through to
-/// the `"default"` sentinel and miss rows owned by the real user.
+/// the single fix surface for #156: it captures `current_user_id()`
+/// at the call site (which the outer D-Bus method has installed via
+/// [`with_user_id`]) and re-installs that scope inside the spawned
+/// future. Without that wrap, storage queries inside the LLM turn
+/// fall through to the `"default"` sentinel and miss rows owned by
+/// the real user — the exact failure mode the analogous WS fix in
+/// #155 addressed.
 pub(crate) fn spawn_send_prompt_llm_task<S>(
     service: Arc<S>,
     conversation_id: String,
@@ -89,11 +95,10 @@ pub(crate) fn spawn_send_prompt_llm_task<S>(
 where
     S: ConversationService + 'static,
 {
-    tokio::spawn(run_send_prompt_llm_task(
-        service,
-        conversation_id,
-        prompt,
-        tx,
+    let user_id_for_body = current_user_id();
+    tokio::spawn(with_user_id(
+        user_id_for_body,
+        run_send_prompt_llm_task(service, conversation_id, prompt, tx),
     ))
 }
 
@@ -101,12 +106,15 @@ where
 impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
     /// Create a new conversation and return its ID.
     async fn create_conversation(&self, title: &str) -> fdo::Result<String> {
-        let conv = self
-            .service
-            .create_conversation(title.to_string())
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-        Ok(conv.id.0)
+        with_user_id(resolve_dbus_user_id(), async {
+            let conv = self
+                .service
+                .create_conversation(title.to_string())
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            Ok(conv.id.0)
+        })
+        .await
     }
 
     /// List conversations as an array of (id, title, message_count, updated_at, archived),
@@ -116,40 +124,49 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         max_age_days: i32,
         include_archived: bool,
     ) -> fdo::Result<Vec<(String, String, u32, String, bool)>> {
-        let max_age = u32::try_from(max_age_days).ok().filter(|days| *days > 0);
-        let summaries = self
-            .service
-            .list_conversations(max_age, include_archived)
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-        Ok(summaries
-            .into_iter()
-            .map(|s| {
-                (
-                    s.id.0,
-                    s.title,
-                    s.message_count as u32,
-                    s.updated_at,
-                    s.archived,
-                )
-            })
-            .collect())
+        with_user_id(resolve_dbus_user_id(), async {
+            let max_age = u32::try_from(max_age_days).ok().filter(|days| *days > 0);
+            let summaries = self
+                .service
+                .list_conversations(max_age, include_archived)
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            Ok(summaries
+                .into_iter()
+                .map(|s| {
+                    (
+                        s.id.0,
+                        s.title,
+                        s.message_count as u32,
+                        s.updated_at,
+                        s.archived,
+                    )
+                })
+                .collect())
+        })
+        .await
     }
 
     /// Archive a conversation by ID.
     async fn archive_conversation(&self, id: &str) -> fdo::Result<()> {
-        self.service
-            .archive_conversation(&ConversationId::from(id))
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .archive_conversation(&ConversationId::from(id))
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))
+        })
+        .await
     }
 
     /// Unarchive a conversation by ID.
     async fn unarchive_conversation(&self, id: &str) -> fdo::Result<()> {
-        self.service
-            .unarchive_conversation(&ConversationId::from(id))
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .unarchive_conversation(&ConversationId::from(id))
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))
+        })
+        .await
     }
 
     /// Get a conversation by ID, returns (id, title, messages) where
@@ -158,25 +175,28 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         &self,
         id: &str,
     ) -> fdo::Result<(String, String, Vec<(String, String)>)> {
-        let conv = self
-            .service
-            .get_conversation(&ConversationId::from(id))
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-        let messages: Vec<(String, String)> = conv
-            .messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    desktop_assistant_core::domain::Role::User => "user",
-                    desktop_assistant_core::domain::Role::Assistant => "assistant",
-                    desktop_assistant_core::domain::Role::System => "system",
-                    desktop_assistant_core::domain::Role::Tool => "tool",
-                };
-                (role.to_string(), m.content.clone())
-            })
-            .collect();
-        Ok((conv.id.0, conv.title, messages))
+        with_user_id(resolve_dbus_user_id(), async {
+            let conv = self
+                .service
+                .get_conversation(&ConversationId::from(id))
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            let messages: Vec<(String, String)> = conv
+                .messages
+                .iter()
+                .map(|m| {
+                    let role = match m.role {
+                        desktop_assistant_core::domain::Role::User => "user",
+                        desktop_assistant_core::domain::Role::Assistant => "assistant",
+                        desktop_assistant_core::domain::Role::System => "system",
+                        desktop_assistant_core::domain::Role::Tool => "tool",
+                    };
+                    (role.to_string(), m.content.clone())
+                })
+                .collect();
+            Ok((conv.id.0, conv.title, messages))
+        })
+        .await
     }
 
     /// Get messages from a conversation with optional pagination and role filtering.
@@ -197,76 +217,89 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         after_count: i32,
         include_roles: Vec<String>,
     ) -> fdo::Result<(u32, bool, Vec<(String, String)>)> {
-        let conv = self
-            .service
-            .get_conversation(&ConversationId::from(id))
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let conv = self
+                .service
+                .get_conversation(&ConversationId::from(id))
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))?;
 
-        let total = conv.messages.len() as u32;
+            let total = conv.messages.len() as u32;
 
-        let all: Vec<(String, String)> = conv
-            .messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    desktop_assistant_core::domain::Role::User => "user",
-                    desktop_assistant_core::domain::Role::Assistant => "assistant",
-                    desktop_assistant_core::domain::Role::System => "system",
-                    desktop_assistant_core::domain::Role::Tool => "tool",
+            let all: Vec<(String, String)> = conv
+                .messages
+                .iter()
+                .map(|m| {
+                    let role = match m.role {
+                        desktop_assistant_core::domain::Role::User => "user",
+                        desktop_assistant_core::domain::Role::Assistant => "assistant",
+                        desktop_assistant_core::domain::Role::System => "system",
+                        desktop_assistant_core::domain::Role::Tool => "tool",
+                    };
+                    (role.to_string(), m.content.clone())
+                })
+                .collect();
+
+            // Slice by raw position first so after_count is always a stable index.
+            let use_after = after_count >= 0;
+            let sliced: Vec<(String, String)> = if use_after {
+                let start = (after_count as usize).min(all.len());
+                all[start..].to_vec()
+            } else {
+                all
+            };
+
+            // Apply role allowlist (empty = no filtering).
+            let filtered: Vec<(String, String)> = sliced
+                .into_iter()
+                .filter(|(role, _)| include_roles.is_empty() || include_roles.contains(role))
+                .collect();
+
+            // Apply tail limit to the filtered set (tail mode only).
+            let (truncated, messages) =
+                if !use_after && tail > 0 && filtered.len() > tail as usize {
+                    let start = filtered.len() - tail as usize;
+                    (true, filtered[start..].to_vec())
+                } else {
+                    (false, filtered)
                 };
-                (role.to_string(), m.content.clone())
-            })
-            .collect();
 
-        // Slice by raw position first so after_count is always a stable index.
-        let use_after = after_count >= 0;
-        let sliced: Vec<(String, String)> = if use_after {
-            let start = (after_count as usize).min(all.len());
-            all[start..].to_vec()
-        } else {
-            all
-        };
-
-        // Apply role allowlist (empty = no filtering).
-        let filtered: Vec<(String, String)> = sliced
-            .into_iter()
-            .filter(|(role, _)| include_roles.is_empty() || include_roles.contains(role))
-            .collect();
-
-        // Apply tail limit to the filtered set (tail mode only).
-        let (truncated, messages) = if !use_after && tail > 0 && filtered.len() > tail as usize {
-            let start = filtered.len() - tail as usize;
-            (true, filtered[start..].to_vec())
-        } else {
-            (false, filtered)
-        };
-
-        Ok((total, truncated, messages))
+            Ok((total, truncated, messages))
+        })
+        .await
     }
 
     /// Delete a conversation by ID.
     async fn delete_conversation(&self, id: &str) -> fdo::Result<()> {
-        self.service
-            .delete_conversation(&ConversationId::from(id))
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .delete_conversation(&ConversationId::from(id))
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))
+        })
+        .await
     }
 
     /// Rename a conversation.
     async fn rename_conversation(&self, id: &str, title: &str) -> fdo::Result<()> {
-        self.service
-            .rename_conversation(&ConversationId::from(id), title.to_string())
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .rename_conversation(&ConversationId::from(id), title.to_string())
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))
+        })
+        .await
     }
 
     /// Delete every conversation and return how many were removed.
     async fn clear_all_history(&self) -> fdo::Result<u32> {
-        self.service
-            .clear_all_history()
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .clear_all_history()
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))
+        })
+        .await
     }
 
     /// Send a prompt and stream the response via signals.
@@ -285,21 +318,22 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
-        // Spawn the LLM call task. The body delegates to
-        // `spawn_send_prompt_llm_task` so the spawn-body user_id
-        // wrap (#156) can be unit-tested independently of the bus.
-        // We drop the returned `JoinHandle` deliberately — the signal
-        // emitter task below drains the channel until the LLM task
-        // closes it.
+        // Install the D-Bus user_id scope before spawning the LLM
+        // task so `spawn_send_prompt_llm_task` captures the right id
+        // for the in-spawn `with_user_id` wrap (#156).
         let llm_conv_id = conv_id.clone();
-        drop(spawn_send_prompt_llm_task(
-            service,
-            llm_conv_id,
-            prompt,
-            tx,
-        ));
+        with_user_id(resolve_dbus_user_id(), async {
+            drop(spawn_send_prompt_llm_task(
+                service,
+                llm_conv_id,
+                prompt,
+                tx,
+            ));
+        })
+        .await;
 
-        // Spawn the signal emitter task
+        // Spawn the signal emitter task. Signal emission does not
+        // touch per-user storage, so it doesn't need the scope.
         let emitter = emitter.to_owned();
         let signal_conv_id = conv_id.clone();
         let signal_req_id = req_id.clone();
@@ -470,37 +504,15 @@ mod tests {
     /// policy so a reviewer can challenge it.
     #[test]
     fn resolve_dbus_user_id_uses_user_env_var() {
-        // Safety: env access is process-global. The test sets a unique
-        // value, asserts, then restores. We don't run this in parallel
-        // with the fallback test because both touch the same env var.
-        let saved = std::env::var("USER").ok();
-        // SAFETY: tests in this binary do not race on env reads with
-        // production code; the value is restored before the test ends.
-        unsafe {
-            std::env::set_var("USER", "alice-from-env");
-        }
+        let _guard = crate::testing::UserEnvGuard::set("alice-from-env");
         let resolved = crate::resolve_dbus_user_id();
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("USER", v),
-                None => std::env::remove_var("USER"),
-            }
-        }
         assert_eq!(resolved, UserId::new("alice-from-env"));
     }
 
     #[test]
     fn resolve_dbus_user_id_falls_back_to_default_when_user_env_missing() {
-        let saved = std::env::var("USER").ok();
-        unsafe {
-            std::env::remove_var("USER");
-        }
+        let _guard = crate::testing::UserEnvGuard::unset();
         let resolved = crate::resolve_dbus_user_id();
-        unsafe {
-            if let Some(v) = saved {
-                std::env::set_var("USER", v);
-            }
-        }
         assert_eq!(resolved, UserId::default());
         assert_eq!(resolved.as_str(), "default");
     }
@@ -519,10 +531,7 @@ mod tests {
         let service = Arc::new(RecordingConversationService::new());
         let adapter = DbusConversationAdapter::new(Arc::clone(&service));
 
-        let saved = std::env::var("USER").ok();
-        unsafe {
-            std::env::set_var("USER", "alice-dbus");
-        }
+        let _guard = crate::testing::UserEnvGuard::set("alice-dbus");
 
         // Exercise every non-streaming D-Bus interface method. These
         // are the ones called by adele-kde for conversation listing,
@@ -536,13 +545,6 @@ mod tests {
         adapter.rename_conversation("c", "x").await.unwrap();
         adapter.delete_conversation("c").await.unwrap();
         let _count = adapter.clear_all_history().await.unwrap();
-
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("USER", v),
-                None => std::env::remove_var("USER"),
-            }
-        }
 
         let observed = service.observed();
         assert!(

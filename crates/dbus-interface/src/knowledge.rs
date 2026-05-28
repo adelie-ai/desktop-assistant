@@ -10,8 +10,10 @@
 use std::sync::Arc;
 
 use desktop_assistant_api_model::{self as api};
-use desktop_assistant_application::AssistantApiHandler;
+use desktop_assistant_application::{AssistantApiHandler, RequestContext};
 use zbus::{fdo, interface};
+
+use crate::resolve_dbus_user_id;
 
 fn to_fdo_error<E: std::fmt::Display>(error: E) -> fdo::Error {
     fdo::Error::Failed(error.to_string())
@@ -27,8 +29,14 @@ impl DbusKnowledgeAdapter {
     }
 
     async fn dispatch(&self, cmd: api::Command) -> fdo::Result<api::CommandResult> {
+        // #156: install the per-user scope at the D-Bus dispatch
+        // boundary. Without this, per-user-scoped storage queries
+        // (`WHERE user_id = $1`) inside the handler see the
+        // `"default"` sentinel and miss every row owned by the
+        // local user.
+        let ctx = RequestContext::for_user(resolve_dbus_user_id());
         self.handler
-            .handle_command(cmd)
+            .handle_command_for(ctx, cmd)
             .await
             .map_err(|e| fdo::Error::Failed(format!("{e:?}")))
     }
@@ -309,10 +317,7 @@ mod tests {
         let handler = RecordingHandler::new();
         let adapter = DbusKnowledgeAdapter::new(handler.clone() as Arc<dyn AssistantApiHandler>);
 
-        let saved = std::env::var("USER").ok();
-        unsafe {
-            std::env::set_var("USER", "alice-kb");
-        }
+        let _guard = crate::testing::UserEnvGuard::set("alice-kb");
 
         let _ = adapter.list_entries(10, 0, "").await;
         let _ = adapter.get_entry("kb-1").await;
@@ -320,13 +325,6 @@ mod tests {
         let _ = adapter.create_entry("c", "", "").await;
         let _ = adapter.update_entry("kb-1", "c2", "", "").await;
         let _ = adapter.delete_entry("kb-1").await;
-
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("USER", v),
-                None => std::env::remove_var("USER"),
-            }
-        }
 
         let observed = handler.observed();
         assert!(!observed.is_empty());
