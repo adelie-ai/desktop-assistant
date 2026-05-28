@@ -1201,6 +1201,7 @@ dependencies = [
 name = "desktop-assistant-dbus"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "desktop-assistant-api-model",
  "desktop-assistant-application",
  "desktop-assistant-core",

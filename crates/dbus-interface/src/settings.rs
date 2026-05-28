@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::inbound::SettingsService;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
+
+use crate::resolve_dbus_user_id;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
 pub struct ConfigData {
@@ -315,22 +318,25 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     async fn get_llm_settings(
         &self,
     ) -> fdo::Result<(String, String, String, bool, f64, f64, u32, i32)> {
-        let settings = self
-            .service
-            .get_llm_settings()
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let settings = self
+                .service
+                .get_llm_settings()
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok((
-            settings.connector,
-            settings.model,
-            settings.base_url,
-            settings.has_api_key,
-            settings.temperature.unwrap_or(-1.0),
-            settings.top_p.unwrap_or(-1.0),
-            settings.max_tokens.unwrap_or(0),
-            settings.hosted_tool_search.map(|v| v as i32).unwrap_or(-1),
-        ))
+            Ok((
+                settings.connector,
+                settings.model,
+                settings.base_url,
+                settings.has_api_key,
+                settings.temperature.unwrap_or(-1.0),
+                settings.top_p.unwrap_or(-1.0),
+                settings.max_tokens.unwrap_or(0),
+                settings.hosted_tool_search.map(|v| v as i32).unwrap_or(-1),
+            ))
+        })
+        .await
     }
 
     /// Update non-sensitive LLM settings.
@@ -340,56 +346,65 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         model: &str,
         base_url: &str,
     ) -> fdo::Result<()> {
-        let model = if model.trim().is_empty() {
-            None
-        } else {
-            Some(model.to_string())
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let model = if model.trim().is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            };
 
-        let base_url = if base_url.trim().is_empty() {
-            None
-        } else {
-            Some(base_url.to_string())
-        };
+            let base_url = if base_url.trim().is_empty() {
+                None
+            } else {
+                Some(base_url.to_string())
+            };
 
-        self.service
-            .set_llm_settings(
-                connector.to_string(),
-                model,
-                base_url,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .map_err(to_fdo_error)
+            self.service
+                .set_llm_settings(
+                    connector.to_string(),
+                    model,
+                    base_url,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Write API key to configured secret backend.
     ///
     /// This is intentionally write-only; there is no D-Bus method to read back secrets.
     async fn set_api_key(&self, api_key: &str) -> fdo::Result<()> {
-        self.service
-            .set_api_key(api_key.to_string())
-            .await
-            .map_err(to_fdo_error)
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .set_api_key(api_key.to_string())
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Generate a signed WS JWT for connection authentication.
     ///
     /// Returns the token string. Subject defaults to `desktop-client` when blank.
     async fn generate_ws_jwt(&self, subject: &str) -> fdo::Result<String> {
-        let subject = if subject.trim().is_empty() {
-            None
-        } else {
-            Some(subject.to_string())
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let subject = if subject.trim().is_empty() {
+                None
+            } else {
+                Some(subject.to_string())
+            };
 
-        self.service
-            .generate_ws_jwt(subject)
-            .await
-            .map_err(to_fdo_error)
+            self.service
+                .generate_ws_jwt(subject)
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Return resolved embeddings settings.
@@ -398,20 +413,23 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     async fn get_embeddings_settings(
         &self,
     ) -> fdo::Result<(String, String, String, bool, bool, bool)> {
-        let settings = self
-            .service
-            .get_embeddings_settings()
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let settings = self
+                .service
+                .get_embeddings_settings()
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok((
-            settings.connector,
-            settings.model,
-            settings.base_url,
-            settings.has_api_key,
-            settings.available,
-            settings.is_default,
-        ))
+            Ok((
+                settings.connector,
+                settings.model,
+                settings.base_url,
+                settings.has_api_key,
+                settings.available,
+                settings.is_default,
+            ))
+        })
+        .await
     }
 
     /// Update embeddings settings. Empty connector clears override (reverts to LLM default).
@@ -421,28 +439,31 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         model: &str,
         base_url: &str,
     ) -> fdo::Result<()> {
-        let connector = if connector.trim().is_empty() {
-            None
-        } else {
-            Some(connector.to_string())
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let connector = if connector.trim().is_empty() {
+                None
+            } else {
+                Some(connector.to_string())
+            };
 
-        let model = if model.trim().is_empty() {
-            None
-        } else {
-            Some(model.to_string())
-        };
+            let model = if model.trim().is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            };
 
-        let base_url = if base_url.trim().is_empty() {
-            None
-        } else {
-            Some(base_url.to_string())
-        };
+            let base_url = if base_url.trim().is_empty() {
+                None
+            } else {
+                Some(base_url.to_string())
+            };
 
-        self.service
-            .set_embeddings_settings(connector, model, base_url)
-            .await
-            .map_err(to_fdo_error)
+            self.service
+                .set_embeddings_settings(connector, model, base_url)
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Return connector defaults.
@@ -452,39 +473,45 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         &self,
         connector: &str,
     ) -> fdo::Result<(String, String, String, String, bool, bool, String)> {
-        let defaults = self
-            .service
-            .get_connector_defaults(connector.to_string())
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let defaults = self
+                .service
+                .get_connector_defaults(connector.to_string())
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok((
-            defaults.llm_model,
-            defaults.llm_base_url,
-            defaults.embeddings_model,
-            defaults.embeddings_base_url,
-            defaults.embeddings_available,
-            defaults.hosted_tool_search_available,
-            defaults.backend_llm_model,
-        ))
+            Ok((
+                defaults.llm_model,
+                defaults.llm_base_url,
+                defaults.embeddings_model,
+                defaults.embeddings_base_url,
+                defaults.embeddings_available,
+                defaults.hosted_tool_search_available,
+                defaults.backend_llm_model,
+            ))
+        })
+        .await
     }
 
     /// Return git persistence settings.
     ///
     /// Returns: (enabled, remote_url, remote_name, push_on_update)
     async fn get_persistence_settings(&self) -> fdo::Result<(bool, String, String, bool)> {
-        let settings = self
-            .service
-            .get_persistence_settings()
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let settings = self
+                .service
+                .get_persistence_settings()
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok((
-            settings.enabled,
-            settings.remote_url,
-            settings.remote_name,
-            settings.push_on_update,
-        ))
+            Ok((
+                settings.enabled,
+                settings.remote_url,
+                settings.remote_name,
+                settings.push_on_update,
+            ))
+        })
+        .await
     }
 
     /// Update git persistence settings.
@@ -495,49 +522,58 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         remote_name: &str,
         push_on_update: bool,
     ) -> fdo::Result<()> {
-        let remote_url = if remote_url.trim().is_empty() {
-            None
-        } else {
-            Some(remote_url.to_string())
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let remote_url = if remote_url.trim().is_empty() {
+                None
+            } else {
+                Some(remote_url.to_string())
+            };
 
-        let remote_name = if remote_name.trim().is_empty() {
-            None
-        } else {
-            Some(remote_name.to_string())
-        };
+            let remote_name = if remote_name.trim().is_empty() {
+                None
+            } else {
+                Some(remote_name.to_string())
+            };
 
-        self.service
-            .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
-            .await
-            .map_err(to_fdo_error)
+            self.service
+                .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Return database settings.
     ///
     /// Returns: (url, max_connections)
     async fn get_database_settings(&self) -> fdo::Result<(String, u32)> {
-        let settings = self
-            .service
-            .get_database_settings()
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let settings = self
+                .service
+                .get_database_settings()
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok((settings.url, settings.max_connections))
+            Ok((settings.url, settings.max_connections))
+        })
+        .await
     }
 
     /// Update database settings. Empty url clears it.
     async fn set_database_settings(&self, url: &str, max_connections: u32) -> fdo::Result<()> {
-        let url = if url.trim().is_empty() {
-            None
-        } else {
-            Some(url.to_string())
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let url = if url.trim().is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            };
 
-        self.service
-            .set_database_settings(url, max_connections)
-            .await
-            .map_err(to_fdo_error)
+            self.service
+                .set_database_settings(url, max_connections)
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Return aggregate config tuple:
@@ -545,7 +581,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     ///  embeddings_connector, embeddings_model, embeddings_base_url, embeddings_has_api_key, embeddings_available, embeddings_is_default,
     ///  persistence_enabled, persistence_remote_url, persistence_remote_name, persistence_push_on_update)
     async fn get_config(&self) -> fdo::Result<ConfigData> {
-        self.get_config_tuple().await
+        with_user_id(resolve_dbus_user_id(), self.get_config_tuple()).await
     }
 
     /// Apply a partial aggregate config update and emit `ConfigChanged`.
@@ -557,7 +593,10 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         changes: ConfigPatchArgs,
     ) -> fdo::Result<ConfigData> {
-        let ConfigPatchArgs {
+        let user_id = resolve_dbus_user_id();
+        let emitter = emitter.to_owned();
+        let updated = with_user_id(user_id, async move {
+            let ConfigPatchArgs {
             set_llm_connector,
             llm_connector,
             set_llm_model,
@@ -590,8 +629,7 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             llm_hosted_tool_search,
         } = changes;
 
-        let updated = self
-            .apply_config_patch(ConfigPatch {
+            self.apply_config_patch(ConfigPatch {
                 llm_connector: set_llm_connector.then_some(llm_connector),
                 llm_model: set_llm_model.then_some(llm_model),
                 llm_base_url: set_llm_base_url.then_some(llm_base_url),
@@ -612,9 +650,10 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 llm_hosted_tool_search: set_llm_hosted_tool_search
                     .then_some(llm_hosted_tool_search == 1),
             })
-            .await?;
+            .await
+        })
+        .await?;
 
-        let emitter = emitter.to_owned();
         Self::config_changed(&emitter, &updated)
             .await
             .map_err(to_fdo_error)?;
@@ -628,21 +667,24 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     async fn get_backend_tasks_settings(
         &self,
     ) -> fdo::Result<(bool, String, String, String, bool, u64, u32)> {
-        let settings = self
-            .service
-            .get_backend_tasks_settings()
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let settings = self
+                .service
+                .get_backend_tasks_settings()
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok((
-            settings.has_separate_llm,
-            settings.llm_connector,
-            settings.llm_model,
-            settings.llm_base_url,
-            settings.dreaming_enabled,
-            settings.dreaming_interval_secs,
-            settings.archive_after_days,
-        ))
+            Ok((
+                settings.has_separate_llm,
+                settings.llm_connector,
+                settings.llm_model,
+                settings.llm_base_url,
+                settings.dreaming_enabled,
+                settings.dreaming_interval_secs,
+                settings.archive_after_days,
+            ))
+        })
+        .await
     }
 
     /// Update backend-tasks settings. Empty llm_connector clears the LLM override.
@@ -655,51 +697,57 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         dreaming_interval_secs: u64,
         archive_after_days: u32,
     ) -> fdo::Result<()> {
-        let llm_connector = if llm_connector.trim().is_empty() {
-            None
-        } else {
-            Some(llm_connector.to_string())
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let llm_connector = if llm_connector.trim().is_empty() {
+                None
+            } else {
+                Some(llm_connector.to_string())
+            };
 
-        let llm_model = if llm_model.trim().is_empty() {
-            None
-        } else {
-            Some(llm_model.to_string())
-        };
+            let llm_model = if llm_model.trim().is_empty() {
+                None
+            } else {
+                Some(llm_model.to_string())
+            };
 
-        let llm_base_url = if llm_base_url.trim().is_empty() {
-            None
-        } else {
-            Some(llm_base_url.to_string())
-        };
+            let llm_base_url = if llm_base_url.trim().is_empty() {
+                None
+            } else {
+                Some(llm_base_url.to_string())
+            };
 
-        self.service
-            .set_backend_tasks_settings(
-                llm_connector,
-                llm_model,
-                llm_base_url,
-                dreaming_enabled,
-                dreaming_interval_secs,
-                archive_after_days,
-            )
-            .await
-            .map_err(to_fdo_error)
+            self.service
+                .set_backend_tasks_settings(
+                    llm_connector,
+                    llm_model,
+                    llm_base_url,
+                    dreaming_enabled,
+                    dreaming_interval_secs,
+                    archive_after_days,
+                )
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// List configured MCP servers with status.
     ///
     /// Returns: Vec<(name, command, enabled, status, tool_count)>
     async fn list_mcp_servers(&self) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
-        let servers = self
-            .service
-            .list_mcp_servers()
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let servers = self
+                .service
+                .list_mcp_servers()
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok(servers
-            .into_iter()
-            .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
-            .collect())
+            Ok(servers
+                .into_iter()
+                .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
+                .collect())
+        })
+        .await
     }
 
     /// Add a new MCP server.
@@ -711,44 +759,53 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         namespace: &str,
         enabled: bool,
     ) -> fdo::Result<()> {
-        let args: Vec<String> = if args.trim().is_empty() {
-            vec![]
-        } else {
-            args.split_whitespace().map(|s| s.to_string()).collect()
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let args: Vec<String> = if args.trim().is_empty() {
+                vec![]
+            } else {
+                args.split_whitespace().map(|s| s.to_string()).collect()
+            };
 
-        let namespace = if namespace.trim().is_empty() {
-            None
-        } else {
-            Some(namespace.to_string())
-        };
+            let namespace = if namespace.trim().is_empty() {
+                None
+            } else {
+                Some(namespace.to_string())
+            };
 
-        self.service
-            .add_mcp_server(
-                name.to_string(),
-                command.to_string(),
-                args,
-                namespace,
-                enabled,
-            )
-            .await
-            .map_err(to_fdo_error)
+            self.service
+                .add_mcp_server(
+                    name.to_string(),
+                    command.to_string(),
+                    args,
+                    namespace,
+                    enabled,
+                )
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Remove an MCP server by name.
     async fn remove_mcp_server(&self, name: &str) -> fdo::Result<()> {
-        self.service
-            .remove_mcp_server(name.to_string())
-            .await
-            .map_err(to_fdo_error)
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .remove_mcp_server(name.to_string())
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Enable or disable an MCP server.
     async fn set_mcp_server_enabled(&self, name: &str, enabled: bool) -> fdo::Result<()> {
-        self.service
-            .set_mcp_server_enabled(name.to_string(), enabled)
-            .await
-            .map_err(to_fdo_error)
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .set_mcp_server_enabled(name.to_string(), enabled)
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Perform an action (status/start/stop/restart) on MCP server(s).
@@ -759,22 +816,25 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         action: &str,
         server: &str,
     ) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
-        let server = if server.trim().is_empty() {
-            None
-        } else {
-            Some(server.to_string())
-        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let server = if server.trim().is_empty() {
+                None
+            } else {
+                Some(server.to_string())
+            };
 
-        let servers = self
-            .service
-            .mcp_server_action(action.to_string(), server)
-            .await
-            .map_err(to_fdo_error)?;
+            let servers = self
+                .service
+                .mcp_server_action(action.to_string(), server)
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok(servers
-            .into_iter()
-            .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
-            .collect())
+            Ok(servers
+                .into_iter()
+                .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
+                .collect())
+        })
+        .await
     }
 
     /// Return WebSocket auth settings.
@@ -783,20 +843,23 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
     async fn get_ws_auth_settings(
         &self,
     ) -> fdo::Result<(Vec<String>, String, String, String, String, String)> {
-        let settings = self
-            .service
-            .get_ws_auth_settings()
-            .await
-            .map_err(to_fdo_error)?;
+        with_user_id(resolve_dbus_user_id(), async {
+            let settings = self
+                .service
+                .get_ws_auth_settings()
+                .await
+                .map_err(to_fdo_error)?;
 
-        Ok((
-            settings.methods,
-            settings.oidc_issuer,
-            settings.oidc_auth_endpoint,
-            settings.oidc_token_endpoint,
-            settings.oidc_client_id,
-            settings.oidc_scopes,
-        ))
+            Ok((
+                settings.methods,
+                settings.oidc_issuer,
+                settings.oidc_auth_endpoint,
+                settings.oidc_token_endpoint,
+                settings.oidc_client_id,
+                settings.oidc_scopes,
+            ))
+        })
+        .await
     }
 
     /// Update WebSocket auth settings.
@@ -809,17 +872,20 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         oidc_client_id: &str,
         oidc_scopes: &str,
     ) -> fdo::Result<()> {
-        self.service
-            .set_ws_auth_settings(
-                methods,
-                oidc_issuer.to_string(),
-                oidc_auth_endpoint.to_string(),
-                oidc_token_endpoint.to_string(),
-                oidc_client_id.to_string(),
-                oidc_scopes.to_string(),
-            )
-            .await
-            .map_err(to_fdo_error)
+        with_user_id(resolve_dbus_user_id(), async {
+            self.service
+                .set_ws_auth_settings(
+                    methods,
+                    oidc_issuer.to_string(),
+                    oidc_auth_endpoint.to_string(),
+                    oidc_token_endpoint.to_string(),
+                    oidc_client_id.to_string(),
+                    oidc_scopes.to_string(),
+                )
+                .await
+                .map_err(to_fdo_error)
+        })
+        .await
     }
 
     /// Signal emitted after a successful aggregate config update.
@@ -1167,5 +1233,269 @@ mod tests {
 
         let token = adapter.generate_ws_jwt("tui").await.unwrap();
         assert_eq!(token, "jwt-for-tui");
+    }
+
+    /// Issue #156: settings methods that touch per-user storage must
+    /// scope to the local OS user, not the `"default"` sentinel. The
+    /// recording fake captures `current_user_id()` at the inbound call
+    /// site so we can assert the D-Bus method entry installed the
+    /// scope before calling into the service.
+    #[tokio::test]
+    async fn dbus_settings_methods_install_user_id_scope_at_method_entry() {
+        use desktop_assistant_core::ports::auth::{UserId, current_user_id};
+        use std::sync::Mutex;
+
+        struct RecordingSettings {
+            seen: Mutex<Vec<String>>,
+        }
+
+        impl RecordingSettings {
+            fn new() -> Self {
+                Self {
+                    seen: Mutex::new(Vec::new()),
+                }
+            }
+            fn record(&self) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(current_user_id().as_str().to_string());
+            }
+            fn observed(&self) -> Vec<String> {
+                self.seen.lock().unwrap().clone()
+            }
+        }
+
+        impl SettingsService for RecordingSettings {
+            async fn get_llm_settings(&self) -> Result<LlmSettingsView, CoreError> {
+                self.record();
+                Ok(LlmSettingsView {
+                    connector: "x".into(),
+                    model: "y".into(),
+                    base_url: "z".into(),
+                    has_api_key: false,
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
+                    hosted_tool_search: None,
+                })
+            }
+            async fn set_llm_settings(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<f64>,
+                _: Option<f64>,
+                _: Option<u32>,
+                _: Option<bool>,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn set_api_key(&self, _: String) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn generate_ws_jwt(&self, _: Option<String>) -> Result<String, CoreError> {
+                self.record();
+                Ok("t".into())
+            }
+            async fn validate_ws_jwt(&self, _: String) -> Result<bool, CoreError> {
+                self.record();
+                Ok(true)
+            }
+            async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
+                self.record();
+                Ok(EmbeddingsSettingsView {
+                    connector: "x".into(),
+                    model: "y".into(),
+                    base_url: "z".into(),
+                    has_api_key: false,
+                    available: true,
+                    is_default: true,
+                })
+            }
+            async fn set_embeddings_settings(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn get_connector_defaults(
+                &self,
+                _: String,
+            ) -> Result<ConnectorDefaultsView, CoreError> {
+                self.record();
+                Ok(ConnectorDefaultsView {
+                    llm_model: "m".into(),
+                    llm_base_url: "u".into(),
+                    backend_llm_model: "bm".into(),
+                    embeddings_model: "em".into(),
+                    embeddings_base_url: "eu".into(),
+                    embeddings_available: false,
+                    hosted_tool_search_available: false,
+                })
+            }
+            async fn get_persistence_settings(
+                &self,
+            ) -> Result<PersistenceSettingsView, CoreError> {
+                self.record();
+                Ok(PersistenceSettingsView {
+                    enabled: false,
+                    remote_url: String::new(),
+                    remote_name: "origin".into(),
+                    push_on_update: false,
+                })
+            }
+            async fn set_persistence_settings(
+                &self,
+                _: bool,
+                _: Option<String>,
+                _: Option<String>,
+                _: bool,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+                self.record();
+                Ok(DatabaseSettingsView {
+                    url: String::new(),
+                    max_connections: 5,
+                })
+            }
+            async fn set_database_settings(
+                &self,
+                _: Option<String>,
+                _: u32,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn get_backend_tasks_settings(
+                &self,
+            ) -> Result<BackendTasksSettingsView, CoreError> {
+                self.record();
+                Ok(BackendTasksSettingsView {
+                    has_separate_llm: false,
+                    llm_connector: "x".into(),
+                    llm_model: "y".into(),
+                    llm_base_url: "z".into(),
+                    dreaming_enabled: false,
+                    dreaming_interval_secs: 0,
+                    archive_after_days: 0,
+                })
+            }
+            async fn set_backend_tasks_settings(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+                _: bool,
+                _: u64,
+                _: u32,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn list_mcp_servers(
+                &self,
+            ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError>
+            {
+                self.record();
+                Ok(vec![])
+            }
+            async fn add_mcp_server(
+                &self,
+                _: String,
+                _: String,
+                _: Vec<String>,
+                _: Option<String>,
+                _: bool,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn remove_mcp_server(&self, _: String) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn set_mcp_server_enabled(
+                &self,
+                _: String,
+                _: bool,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn mcp_server_action(
+                &self,
+                _: String,
+                _: Option<String>,
+            ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError>
+            {
+                self.record();
+                Ok(vec![])
+            }
+            async fn get_ws_auth_settings(&self) -> Result<WsAuthSettingsView, CoreError> {
+                self.record();
+                Ok(WsAuthSettingsView {
+                    methods: vec![],
+                    oidc_issuer: String::new(),
+                    oidc_auth_endpoint: String::new(),
+                    oidc_token_endpoint: String::new(),
+                    oidc_client_id: String::new(),
+                    oidc_scopes: String::new(),
+                })
+            }
+            async fn set_ws_auth_settings(
+                &self,
+                _: Vec<String>,
+                _: String,
+                _: String,
+                _: String,
+                _: String,
+                _: String,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+        }
+
+        let service = Arc::new(RecordingSettings::new());
+        let adapter = DbusSettingsAdapter::new(Arc::clone(&service));
+
+        let _guard = crate::testing::UserEnvGuard::set("alice-settings");
+
+        // Exercise representative methods: read-paths, write-paths, JWT.
+        // We don't need to call every method — one per dispatcher style
+        // is enough to pin the contract.
+        let _llm = adapter.get_llm_settings().await.unwrap();
+        adapter
+            .set_llm_settings("openai", "gpt-5.4", "https://api")
+            .await
+            .unwrap();
+        adapter.set_api_key("k").await.unwrap();
+        let _jwt = adapter.generate_ws_jwt("tui").await.unwrap();
+        let _emb = adapter.get_embeddings_settings().await.unwrap();
+        let _persist = adapter.get_persistence_settings().await.unwrap();
+        let _db = adapter.get_database_settings().await.unwrap();
+        let _bt = adapter.get_backend_tasks_settings().await.unwrap();
+        let _mcp = adapter.list_mcp_servers().await.unwrap();
+        let _ws = adapter.get_ws_auth_settings().await.unwrap();
+
+        let observed = service.observed();
+        assert!(!observed.is_empty());
+        for seen in observed {
+            assert_eq!(
+                seen,
+                UserId::new("alice-settings").as_str(),
+                "every D-Bus settings method must scope storage to the resolved local user"
+            );
+        }
     }
 }
