@@ -232,4 +232,109 @@ mod tests {
             serde_json::json!({"k": 1})
         );
     }
+
+    /// Issue #156: every knowledge D-Bus method must dispatch through
+    /// `handle_command_for(RequestContext::for_user(...))` so the
+    /// per-user scope is installed before the handler runs. Without
+    /// this, the storage layer's `WHERE user_id = $1` filter sees the
+    /// `"default"` sentinel and adele-kde's knowledge browser sees no
+    /// rows.
+    #[tokio::test]
+    async fn dbus_knowledge_methods_install_user_id_scope() {
+        use desktop_assistant_application::ApiResult;
+        use desktop_assistant_core::ports::auth::current_user_id;
+        use std::sync::Mutex;
+
+        struct RecordingHandler {
+            seen: Mutex<Vec<String>>,
+        }
+        impl RecordingHandler {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    seen: Mutex::new(Vec::new()),
+                })
+            }
+            fn observed(&self) -> Vec<String> {
+                self.seen.lock().unwrap().clone()
+            }
+        }
+        #[async_trait::async_trait]
+        impl AssistantApiHandler for RecordingHandler {
+            async fn handle_command(
+                &self,
+                cmd: api::Command,
+            ) -> ApiResult<api::CommandResult> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(current_user_id().as_str().to_string());
+                // Return a shape compatible with the adapter's
+                // result-matcher so the method returns Ok.
+                Ok(match cmd {
+                    api::Command::ListKnowledgeEntries { .. }
+                    | api::Command::SearchKnowledgeEntries { .. } => {
+                        api::CommandResult::KnowledgeEntries(vec![])
+                    }
+                    api::Command::GetKnowledgeEntry { .. } => {
+                        api::CommandResult::KnowledgeEntry(None)
+                    }
+                    api::Command::CreateKnowledgeEntry { .. }
+                    | api::Command::UpdateKnowledgeEntry { .. } => {
+                        api::CommandResult::KnowledgeEntryWritten(
+                            api::KnowledgeEntryView {
+                                id: "kb".into(),
+                                content: "".into(),
+                                tags: vec![],
+                                metadata: serde_json::Value::Null,
+                                created_at: "2026-05-27T00:00:00Z".into(),
+                                updated_at: "2026-05-27T00:00:00Z".into(),
+                            },
+                        )
+                    }
+                    api::Command::DeleteKnowledgeEntry { .. } => api::CommandResult::Ack,
+                    _ => api::CommandResult::Ack,
+                })
+            }
+            async fn handle_send_message(
+                &self,
+                _conversation_id: String,
+                _content: String,
+                _request_id: String,
+                _sink: Arc<dyn desktop_assistant_application::EventSink>,
+            ) -> ApiResult<()> {
+                Ok(())
+            }
+        }
+
+        let handler = RecordingHandler::new();
+        let adapter = DbusKnowledgeAdapter::new(handler.clone() as Arc<dyn AssistantApiHandler>);
+
+        let saved = std::env::var("USER").ok();
+        unsafe {
+            std::env::set_var("USER", "alice-kb");
+        }
+
+        let _ = adapter.list_entries(10, 0, "").await;
+        let _ = adapter.get_entry("kb-1").await;
+        let _ = adapter.search_entries("q", "", 5).await;
+        let _ = adapter.create_entry("c", "", "").await;
+        let _ = adapter.update_entry("kb-1", "c2", "", "").await;
+        let _ = adapter.delete_entry("kb-1").await;
+
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+
+        let observed = handler.observed();
+        assert!(!observed.is_empty());
+        for seen in observed {
+            assert_eq!(
+                seen, "alice-kb",
+                "every knowledge D-Bus method must install with_user_id at the method boundary"
+            );
+        }
+    }
 }

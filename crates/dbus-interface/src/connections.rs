@@ -162,3 +162,85 @@ impl DbusConnectionsAdapter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use desktop_assistant_application::ApiResult;
+    use desktop_assistant_core::ports::auth::current_user_id;
+    use std::sync::Mutex;
+
+    /// Recording fake `AssistantApiHandler` that captures
+    /// `current_user_id()` at command-dispatch time. Used to assert
+    /// that the D-Bus connections adapter installs the per-user scope
+    /// at the method-entry boundary before calling into the handler.
+    struct RecordingHandler {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl RecordingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+        fn observed(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AssistantApiHandler for RecordingHandler {
+        async fn handle_command(&self, _cmd: api::Command) -> ApiResult<api::CommandResult> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(current_user_id().as_str().to_string());
+            Ok(api::CommandResult::Ack)
+        }
+        async fn handle_send_message(
+            &self,
+            _conversation_id: String,
+            _content: String,
+            _request_id: String,
+            _sink: Arc<dyn desktop_assistant_application::EventSink>,
+        ) -> ApiResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #156: every connections D-Bus method must dispatch
+    /// through `handle_command_for(RequestContext::for_user(...))`
+    /// so the per-user scope is installed before the handler runs.
+    #[tokio::test]
+    async fn dbus_connections_methods_install_user_id_scope() {
+        let handler = RecordingHandler::new();
+        let adapter = DbusConnectionsAdapter::new(handler.clone() as Arc<dyn AssistantApiHandler>);
+
+        let saved = std::env::var("USER").ok();
+        unsafe {
+            std::env::set_var("USER", "alice-conn");
+        }
+
+        let _ = adapter.list_connections().await;
+        let _ = adapter.list_available_models("", false).await;
+        let _ = adapter.get_purposes().await;
+        let _ = adapter.delete_connection("c", false).await;
+
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+
+        let observed = handler.observed();
+        assert!(!observed.is_empty());
+        for seen in observed {
+            assert_eq!(
+                seen, "alice-conn",
+                "every connections D-Bus method must install with_user_id at the method boundary"
+            );
+        }
+    }
+}

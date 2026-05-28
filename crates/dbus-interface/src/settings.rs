@@ -1168,4 +1168,278 @@ mod tests {
         let token = adapter.generate_ws_jwt("tui").await.unwrap();
         assert_eq!(token, "jwt-for-tui");
     }
+
+    /// Issue #156: settings methods that touch per-user storage must
+    /// scope to the local OS user, not the `"default"` sentinel. The
+    /// recording fake captures `current_user_id()` at the inbound call
+    /// site so we can assert the D-Bus method entry installed the
+    /// scope before calling into the service.
+    #[tokio::test]
+    async fn dbus_settings_methods_install_user_id_scope_at_method_entry() {
+        use desktop_assistant_core::ports::auth::{UserId, current_user_id};
+        use std::sync::Mutex;
+
+        struct RecordingSettings {
+            seen: Mutex<Vec<String>>,
+        }
+
+        impl RecordingSettings {
+            fn new() -> Self {
+                Self {
+                    seen: Mutex::new(Vec::new()),
+                }
+            }
+            fn record(&self) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(current_user_id().as_str().to_string());
+            }
+            fn observed(&self) -> Vec<String> {
+                self.seen.lock().unwrap().clone()
+            }
+        }
+
+        impl SettingsService for RecordingSettings {
+            async fn get_llm_settings(&self) -> Result<LlmSettingsView, CoreError> {
+                self.record();
+                Ok(LlmSettingsView {
+                    connector: "x".into(),
+                    model: "y".into(),
+                    base_url: "z".into(),
+                    has_api_key: false,
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
+                    hosted_tool_search: None,
+                })
+            }
+            async fn set_llm_settings(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<f64>,
+                _: Option<f64>,
+                _: Option<u32>,
+                _: Option<bool>,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn set_api_key(&self, _: String) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn generate_ws_jwt(&self, _: Option<String>) -> Result<String, CoreError> {
+                self.record();
+                Ok("t".into())
+            }
+            async fn validate_ws_jwt(&self, _: String) -> Result<bool, CoreError> {
+                self.record();
+                Ok(true)
+            }
+            async fn get_embeddings_settings(&self) -> Result<EmbeddingsSettingsView, CoreError> {
+                self.record();
+                Ok(EmbeddingsSettingsView {
+                    connector: "x".into(),
+                    model: "y".into(),
+                    base_url: "z".into(),
+                    has_api_key: false,
+                    available: true,
+                    is_default: true,
+                })
+            }
+            async fn set_embeddings_settings(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn get_connector_defaults(
+                &self,
+                _: String,
+            ) -> Result<ConnectorDefaultsView, CoreError> {
+                self.record();
+                Ok(ConnectorDefaultsView {
+                    llm_model: "m".into(),
+                    llm_base_url: "u".into(),
+                    backend_llm_model: "bm".into(),
+                    embeddings_model: "em".into(),
+                    embeddings_base_url: "eu".into(),
+                    embeddings_available: false,
+                    hosted_tool_search_available: false,
+                })
+            }
+            async fn get_persistence_settings(
+                &self,
+            ) -> Result<PersistenceSettingsView, CoreError> {
+                self.record();
+                Ok(PersistenceSettingsView {
+                    enabled: false,
+                    remote_url: String::new(),
+                    remote_name: "origin".into(),
+                    push_on_update: false,
+                })
+            }
+            async fn set_persistence_settings(
+                &self,
+                _: bool,
+                _: Option<String>,
+                _: Option<String>,
+                _: bool,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
+                self.record();
+                Ok(DatabaseSettingsView {
+                    url: String::new(),
+                    max_connections: 5,
+                })
+            }
+            async fn set_database_settings(
+                &self,
+                _: Option<String>,
+                _: u32,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn get_backend_tasks_settings(
+                &self,
+            ) -> Result<BackendTasksSettingsView, CoreError> {
+                self.record();
+                Ok(BackendTasksSettingsView {
+                    has_separate_llm: false,
+                    llm_connector: "x".into(),
+                    llm_model: "y".into(),
+                    llm_base_url: "z".into(),
+                    dreaming_enabled: false,
+                    dreaming_interval_secs: 0,
+                    archive_after_days: 0,
+                })
+            }
+            async fn set_backend_tasks_settings(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+                _: bool,
+                _: u64,
+                _: u32,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn list_mcp_servers(
+                &self,
+            ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError>
+            {
+                self.record();
+                Ok(vec![])
+            }
+            async fn add_mcp_server(
+                &self,
+                _: String,
+                _: String,
+                _: Vec<String>,
+                _: Option<String>,
+                _: bool,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn remove_mcp_server(&self, _: String) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn set_mcp_server_enabled(
+                &self,
+                _: String,
+                _: bool,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+            async fn mcp_server_action(
+                &self,
+                _: String,
+                _: Option<String>,
+            ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError>
+            {
+                self.record();
+                Ok(vec![])
+            }
+            async fn get_ws_auth_settings(&self) -> Result<WsAuthSettingsView, CoreError> {
+                self.record();
+                Ok(WsAuthSettingsView {
+                    methods: vec![],
+                    oidc_issuer: String::new(),
+                    oidc_auth_endpoint: String::new(),
+                    oidc_token_endpoint: String::new(),
+                    oidc_client_id: String::new(),
+                    oidc_scopes: String::new(),
+                })
+            }
+            async fn set_ws_auth_settings(
+                &self,
+                _: Vec<String>,
+                _: String,
+                _: String,
+                _: String,
+                _: String,
+                _: String,
+            ) -> Result<(), CoreError> {
+                self.record();
+                Ok(())
+            }
+        }
+
+        let service = Arc::new(RecordingSettings::new());
+        let adapter = DbusSettingsAdapter::new(Arc::clone(&service));
+
+        let saved = std::env::var("USER").ok();
+        unsafe {
+            std::env::set_var("USER", "alice-settings");
+        }
+
+        // Exercise representative methods: read-paths, write-paths, JWT.
+        // We don't need to call every method — one per dispatcher style
+        // is enough to pin the contract.
+        let _llm = adapter.get_llm_settings().await.unwrap();
+        adapter
+            .set_llm_settings("openai", "gpt-5.4", "https://api")
+            .await
+            .unwrap();
+        adapter.set_api_key("k").await.unwrap();
+        let _jwt = adapter.generate_ws_jwt("tui").await.unwrap();
+        let _emb = adapter.get_embeddings_settings().await.unwrap();
+        let _persist = adapter.get_persistence_settings().await.unwrap();
+        let _db = adapter.get_database_settings().await.unwrap();
+        let _bt = adapter.get_backend_tasks_settings().await.unwrap();
+        let _mcp = adapter.list_mcp_servers().await.unwrap();
+        let _ws = adapter.get_ws_auth_settings().await.unwrap();
+
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+
+        let observed = service.observed();
+        assert!(!observed.is_empty());
+        for seen in observed {
+            assert_eq!(
+                seen,
+                UserId::new("alice-settings").as_str(),
+                "every D-Bus settings method must scope storage to the resolved local user"
+            );
+        }
+    }
 }
