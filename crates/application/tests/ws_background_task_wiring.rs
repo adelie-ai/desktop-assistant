@@ -316,6 +316,10 @@ struct SendCall {
     #[allow(dead_code)]
     conversation_id: String,
     prompt: String,
+    /// `current_user_id()` observed inside `send_prompt_with_override`.
+    /// Used by #154 to assert that the registry-spawned send body
+    /// inherits the caller's user_id scope.
+    seen_user_id: String,
 }
 
 struct RecordingConversations {
@@ -336,6 +340,15 @@ impl RecordingConversations {
             cancelled: Arc::new(AtomicBool::new(false)),
             block_until: Mutex::new(None),
         }
+    }
+
+    fn seen_user_ids(&self) -> Vec<String> {
+        self.sends
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.seen_user_id.clone())
+            .collect()
     }
 
     fn block_on(&self, n: Arc<Notify>) {
@@ -407,6 +420,7 @@ impl ConversationService for RecordingConversations {
         self.sends.lock().unwrap().push(SendCall {
             conversation_id: conversation_id.as_str().to_string(),
             prompt: prompt.clone(),
+            seen_user_id: current_user_id().as_str().to_string(),
         });
         let block = self.block_until.lock().unwrap().clone();
         if let Some(block) = block {
@@ -912,6 +926,82 @@ async fn start_send_message_returns_task_id_that_appears_in_listing() {
     assert!(tasks.iter().any(|t| t.id == task_id));
 
     registry.wait(&task_id).await;
+}
+
+/// Issue #154: the registry-spawned `SendMessage` body must observe the
+/// caller's user_id scope. `tokio::spawn` doesn't propagate task-locals,
+/// so the body has to re-install `with_user_id`. Without that, storage
+/// queries inside the body see the `"default"` sentinel and a
+/// per-user-scoped `WHERE user_id = $1` lookup misses the row, surfacing
+/// as `ConversationNotFound` to the user.
+#[tokio::test]
+async fn start_send_message_propagates_user_id_to_spawned_body() {
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let convs = Arc::new(RecordingConversations::new());
+    let handler = make_handler(Arc::clone(&convs), Arc::clone(&registry));
+
+    let user = unique_user("alice");
+    let sink: Arc<dyn desktop_assistant_application::EventSink> = Arc::new(NoopSink);
+
+    let task_id = with_user_id(user.clone(), async {
+        handler
+            .start_send_message(
+                "conv-x".into(),
+                "hello".into(),
+                None,
+                "req-1".into(),
+                Arc::clone(&sink),
+            )
+            .await
+    })
+    .await
+    .expect("start_send_message ok")
+    .expect("registry attached, expected Some(task_id)");
+
+    registry.wait(&task_id).await;
+
+    let seen = convs.seen_user_ids();
+    assert_eq!(
+        seen,
+        vec![user.as_str().to_string()],
+        "spawned body must observe the caller's user_id, not the default sentinel"
+    );
+}
+
+/// Issue #154 sibling: the same scope requirement applies to
+/// `handle_send_message_with_override`, which routes through
+/// `send_message_via_registry` when a registry is attached. This path
+/// is exercised by the legacy bare-Ack transport adapters and must stay
+/// in sync with the `start_send_message` path.
+#[tokio::test]
+async fn handle_send_message_with_override_propagates_user_id_to_spawned_body() {
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let convs = Arc::new(RecordingConversations::new());
+    let handler = make_handler(Arc::clone(&convs), Arc::clone(&registry));
+
+    let user = unique_user("alice");
+    let sink: Arc<dyn desktop_assistant_application::EventSink> = Arc::new(NoopSink);
+
+    with_user_id(user.clone(), async {
+        handler
+            .handle_send_message_with_override(
+                "conv-y".into(),
+                "hello".into(),
+                None,
+                "req-2".into(),
+                sink,
+            )
+            .await
+    })
+    .await
+    .expect("handle_send_message_with_override ok");
+
+    let seen = convs.seen_user_ids();
+    assert_eq!(
+        seen,
+        vec![user.as_str().to_string()],
+        "spawned body must observe the caller's user_id, not the default sentinel"
+    );
 }
 
 /// Without a registry the handler's `start_send_message` returns `None`

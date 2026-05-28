@@ -1257,9 +1257,13 @@ where
         let conv_id_for_body = conversation_id.clone();
         let request_id_for_body = request_id.clone();
         let sink_for_body = Arc::clone(&sink);
+        let user_id_for_body = user_id.clone();
 
         // `registry.spawn` is sync; the body runs on its own
         // `tokio::spawn` so we can return the new task id immediately.
+        // `tokio::spawn` does not propagate task-locals, so the body
+        // must re-install `with_user_id` for storage queries inside
+        // `run_send_turn` to scope to the right user (#154).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             ctx.logs.append(
                 api::LogLevel::Info,
@@ -1268,14 +1272,17 @@ where
                 None,
             );
 
-            let result = run_send_turn(
-                conversations,
-                conv_id_for_body,
-                content,
-                override_selection,
-                request_id_for_body,
-                sink_for_body,
-                ctx.token.clone(),
+            let result = with_user_id(
+                user_id_for_body,
+                run_send_turn(
+                    conversations,
+                    conv_id_for_body,
+                    content,
+                    override_selection,
+                    request_id_for_body,
+                    sink_for_body,
+                    ctx.token.clone(),
+                ),
             )
             .await;
 
@@ -1335,7 +1342,11 @@ where
         let conv_id_for_body = conversation_id.clone();
         let request_id_for_body = request_id.clone();
         let sink_for_body = Arc::clone(&sink);
+        let user_id_for_body = user_id.clone();
 
+        // `tokio::spawn` does not propagate task-locals, so the body
+        // must re-install `with_user_id` for storage queries inside
+        // `run_send_turn` to scope to the right user (#154).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             // Lifecycle log so the UI knows the foreground turn is
             // tracked — Status category keeps it distinct from the
@@ -1347,14 +1358,17 @@ where
                 None,
             );
 
-            let result = run_send_turn(
-                conversations,
-                conv_id_for_body,
-                content,
-                override_selection,
-                request_id_for_body,
-                sink_for_body,
-                ctx.token.clone(),
+            let result = with_user_id(
+                user_id_for_body,
+                run_send_turn(
+                    conversations,
+                    conv_id_for_body,
+                    content,
+                    override_selection,
+                    request_id_for_body,
+                    sink_for_body,
+                    ctx.token.clone(),
+                ),
             )
             .await;
 
