@@ -691,14 +691,16 @@ async fn execute_read(
 
     // When the user query lacks a LIMIT clause, wrap it in a subquery with a
     // parameterised limit to avoid string-formatting user SQL.
+    // AssertSqlSafe: `sql` is the post-rewrite output of `prepare_select_for_user`,
+    // which AST-validates SELECT-only and grafts `WHERE user_id = $N` (#141).
     let rows: Vec<PgRow> = if has_limit {
-        sqlx::query(sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?
     } else {
         let wrapped = format!("SELECT * FROM ({sql}) AS _limited LIMIT $1");
-        sqlx::query(&wrapped)
+        sqlx::query(sqlx::AssertSqlSafe(wrapped))
             .bind(limit as i64)
             .fetch_all(&mut *tx)
             .await
@@ -739,8 +741,9 @@ async fn execute_write(
     // If the statement contains RETURNING it will produce rows.
     let has_returning = upper.contains("RETURNING");
 
+    // AssertSqlSafe: `sql` has passed `validate_write_statement` AST checks (#141).
     if has_returning {
-        let rows: Vec<PgRow> = sqlx::query(sql)
+        let rows: Vec<PgRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?;
@@ -751,7 +754,7 @@ async fn execute_write(
 
         rows_to_json(&rows)
     } else {
-        let result = sqlx::query(sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::ToolExecution(format!("query error: {e}")))?;
