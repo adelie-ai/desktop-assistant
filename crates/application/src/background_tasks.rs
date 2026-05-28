@@ -1087,9 +1087,12 @@ mod tests {
     #[tokio::test]
     async fn finalize_sets_failed_on_error() {
         // Internal contract: an Err from the body and a non-cancelled
-        // token yields TaskStatus::Failed with the error message.
+        // token yields TaskStatus::Failed with the error message in the
+        // TaskCompleted event. The entry is evicted immediately, so we
+        // observe status via subscribe rather than `get`.
         let registry = BackgroundTaskRegistry::new();
         let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
         let id = registry.spawn(
             user.clone(),
             api::TaskKind::Conversation {
@@ -1098,10 +1101,98 @@ mod tests {
             "failer".into(),
             |_ctx| async move { Err(anyhow::anyhow!("boom")) },
         );
+        let want = id.0.clone();
+        let (status, last_error) = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(api::Event::TaskCompleted { id, status, last_error })) if id == want => {
+                    break (status, last_error);
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+                Err(_) => panic!("timed out waiting for TaskCompleted"),
+            }
+        };
+        assert_eq!(status, api::TaskStatus::Failed);
+        assert_eq!(last_error.as_deref(), Some("boom"));
+        assert!(registry.get(&user, &id).is_none(), "terminal task must be evicted");
+    }
+
+    #[tokio::test]
+    async fn terminal_task_evicted_on_completion() {
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let id = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "ok".into(),
+            |_ctx| async move { Ok(()) },
+        );
         registry.wait(&id).await;
-        let view = registry.get(&user, &id).expect("present");
-        assert_eq!(view.status, api::TaskStatus::Failed);
-        assert_eq!(view.last_error.as_deref(), Some("boom"));
+        assert!(registry.get(&user, &id).is_none());
+        assert!(registry.list(&user, true, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_task_evicted_on_cancellation() {
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let id = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "cancellable".into(),
+            |ctx| async move {
+                ctx.token.cancelled().await;
+                Ok(())
+            },
+        );
+        registry.cancel(&user, &id).expect("cancel");
+        registry.wait(&id).await;
+        assert!(registry.get(&user, &id).is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_subagent_unlinked_from_parent_children() {
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let parent_release = Arc::new(tokio::sync::Notify::new());
+        let parent_release_for_task = Arc::clone(&parent_release);
+        let parent = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "parent".into(),
+            move |_ctx| async move {
+                parent_release_for_task.notified().await;
+                Ok(())
+            },
+        );
+        let child = registry.spawn(
+            user.clone(),
+            api::TaskKind::Subagent {
+                parent_task_id: parent.clone(),
+                conversation_id: "c-child".into(),
+                name: "sub".into(),
+            },
+            "child".into(),
+            |_ctx| async move { Ok(()) },
+        );
+        registry.wait(&child).await;
+
+        let parent_view = registry.get(&user, &parent).expect("parent still running");
+        assert!(
+            !parent_view.children.contains(&child),
+            "evicted child should be unlinked from parent.children, got {:?}",
+            parent_view.children
+        );
+
+        parent_release.notify_one();
+        registry.wait(&parent).await;
     }
 
     #[tokio::test]
@@ -1140,9 +1231,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_log_entries_emitted_on_start_and_completion() {
+    async fn start_lifecycle_log_entry_is_broadcast_to_subscribers() {
+        // The start-of-task Lifecycle marker is appended via TaskLogSink
+        // and so is broadcast to subscribers. The completion is signaled
+        // by the TaskCompleted event itself; a separate completion
+        // lifecycle log would only live in state.logs which is wiped on
+        // eviction, so we don't emit one.
         let registry = BackgroundTaskRegistry::new();
         let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
         let id = registry.spawn(
             user.clone(),
             api::TaskKind::Conversation {
@@ -1151,15 +1248,25 @@ mod tests {
             "lifecycle".into(),
             |_ctx| async move { Ok(()) },
         );
-        registry.wait(&id).await;
-        let (entries, _) = registry.logs(&user, &id, 0, 100).unwrap();
-        let categories: Vec<_> = entries.iter().map(|e| e.category).collect();
-        assert!(categories.contains(&api::LogCategory::Lifecycle));
-        // Both start and completion lifecycle markers should be present.
-        let count = categories
-            .iter()
-            .filter(|c| **c == api::LogCategory::Lifecycle)
-            .count();
-        assert_eq!(count, 2, "expected start + completion lifecycle markers");
+        let want = id.0.clone();
+        let mut saw_start_marker = false;
+        let mut saw_completed = false;
+        while !saw_completed {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(api::Event::TaskLogAppended { id, entry }))
+                    if id == want && entry.category == api::LogCategory::Lifecycle =>
+                {
+                    saw_start_marker = true;
+                }
+                Ok(Ok(api::Event::TaskCompleted { id, .. })) if id == want => {
+                    saw_completed = true;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+                Err(_) => panic!("timed out waiting for events"),
+            }
+        }
+        assert!(saw_start_marker, "expected start lifecycle marker");
     }
 }

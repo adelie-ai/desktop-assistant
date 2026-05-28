@@ -49,6 +49,28 @@ async fn wait_until<F: FnMut() -> bool>(mut pred: F, label: &str) {
     panic!("predicate '{label}' never became true within timeout");
 }
 
+/// Drain events for `task_id` from a broadcast receiver until a terminal
+/// `TaskCompleted` arrives, then return its `(status, last_error)`. Used
+/// by tests now that terminal entries are evicted from the registry —
+/// callers can no longer inspect post-completion state via `get`/`list`.
+async fn wait_for_completion(
+    events: &mut tokio::sync::broadcast::Receiver<api::Event>,
+    task_id: &api::TaskId,
+) -> (api::TaskStatus, Option<String>) {
+    let want = task_id.0.clone();
+    loop {
+        match timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted { id, status, last_error })) if id == want => {
+                return (status, last_error);
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed before TaskCompleted: {e:?}"),
+            Err(_) => panic!("timed out waiting for TaskCompleted({})", want),
+        }
+    }
+}
+
 // ----------------------------------------------------------------------
 // 1. Unique task ids
 // ----------------------------------------------------------------------
@@ -72,13 +94,14 @@ async fn registry_spawn_returns_unique_task_id() {
 }
 
 // ----------------------------------------------------------------------
-// 2. include_finished flag controls visibility
+// 2. Terminal tasks are evicted from the registry
 // ----------------------------------------------------------------------
 
 #[tokio::test]
-async fn registry_list_excludes_finished_when_flag_off() {
+async fn registry_evicts_terminal_tasks_so_list_returns_only_in_flight() {
     let registry = BackgroundTaskRegistry::new();
     let user = unique_user("alice");
+    let mut events = registry.subscribe(&user);
 
     // One task that completes immediately.
     let done = registry.spawn(
@@ -101,21 +124,24 @@ async fn registry_list_excludes_finished_when_flag_off() {
         },
     );
 
-    // Wait for the first task to terminate.
-    registry.wait(&done).await;
+    // Observe the completion of `done` via the broadcast channel; the
+    // registry evicts terminal entries, so it's no longer queryable.
+    let (status, _) = wait_for_completion(&mut events, &done).await;
+    assert_eq!(status, api::TaskStatus::Completed);
 
-    let only_active = registry.list(&user, /*include_finished=*/ false, None);
-    assert_eq!(only_active.len(), 1, "{only_active:?}");
-    assert_eq!(only_active[0].id, running);
-
-    let everything = registry.list(&user, /*include_finished=*/ true, None);
-    let ids: HashSet<_> = everything.iter().map(|v| v.id.clone()).collect();
-    assert!(ids.contains(&done));
-    assert!(ids.contains(&running));
+    // Both flag values now return only the in-flight task. The
+    // include_finished flag is retained as a public API but only ever
+    // surfaces sweep-resurrected rows after a daemon restart.
+    for include_finished in [false, true] {
+        let listing = registry.list(&user, include_finished, None);
+        assert_eq!(listing.len(), 1, "include_finished={include_finished} {listing:?}");
+        assert_eq!(listing[0].id, running);
+    }
+    assert!(registry.get(&user, &done).is_none(), "terminal task must be evicted");
 
     // Let the running task complete so the test doesn't leak it.
     release.notify_one();
-    registry.wait(&running).await;
+    let _ = wait_for_completion(&mut events, &running).await;
 }
 
 // ----------------------------------------------------------------------
@@ -230,9 +256,9 @@ async fn registry_cancel_fires_token_and_transitions_status() {
     assert!(saw_cancel_complete, "did not see TaskCompleted{{Cancelled}}");
     assert!(observed_cancel.load(Ordering::SeqCst));
 
-    let view = registry.get(&user, &task_id).expect("task exists");
-    assert_eq!(view.status, api::TaskStatus::Cancelled);
-    assert!(view.ended_at.is_some());
+    // Terminal entries are evicted; the broadcast event above is the
+    // authoritative resolution of the cancel.
+    assert!(registry.get(&user, &task_id).is_none());
 }
 
 // ----------------------------------------------------------------------
@@ -244,6 +270,8 @@ async fn registry_cancel_cross_user_returns_not_found() {
     let registry = BackgroundTaskRegistry::new();
     let alice = unique_user("alice");
     let bob = unique_user("bob");
+
+    let mut alice_events = registry.subscribe(&alice);
 
     let observed_cancel = Arc::new(AtomicBool::new(false));
     let observed_for_task = Arc::clone(&observed_cancel);
@@ -274,14 +302,12 @@ async fn registry_cancel_cross_user_returns_not_found() {
 
     // Alice's task continued — let it complete normally.
     release.notify_one();
-    registry.wait(&task_id).await;
+    let (status, _) = wait_for_completion(&mut alice_events, &task_id).await;
+    assert_eq!(status, api::TaskStatus::Completed);
     assert!(
         !observed_cancel.load(Ordering::SeqCst),
         "token was tripped by cross-user cancel"
     );
-
-    let view = registry.get(&alice, &task_id).expect("alice can see her task");
-    assert_eq!(view.status, api::TaskStatus::Completed);
 }
 
 // ----------------------------------------------------------------------
@@ -874,16 +900,22 @@ mod foreground_send {
         assert!(registry.list(&bob, true, None).is_empty());
         assert!(registry.get(&bob, &task_id).is_none());
 
-        // Let the underlying call finish.
+        // Let the underlying call finish. After completion the task is
+        // evicted from the registry — `list` (either flag) returns it
+        // no longer, and `get` is None.
+        let mut alice_events = registry.subscribe(&alice);
         release.notify_one();
         join.await.expect("join");
-
-        // After completion the task is visible only when include_finished=true.
-        let post = registry.list(&alice, /*include_finished=*/ true, None);
-        let view = post.into_iter().find(|v| v.id == task_id).expect("present");
-        assert_eq!(view.status, api::TaskStatus::Completed);
-        let only_running = registry.list(&alice, /*include_finished=*/ false, None);
-        assert!(only_running.iter().all(|v| v.id != task_id));
+        let (status, _) = wait_for_completion(&mut alice_events, &task_id).await;
+        assert_eq!(status, api::TaskStatus::Completed);
+        for include_finished in [false, true] {
+            let listing = registry.list(&alice, include_finished, None);
+            assert!(
+                listing.iter().all(|v| v.id != task_id),
+                "evicted task surfaced with include_finished={include_finished}: {listing:?}"
+            );
+        }
+        assert!(registry.get(&alice, &task_id).is_none());
     }
 
     #[tokio::test]
@@ -934,6 +966,7 @@ mod foreground_send {
         };
 
         // Cancel via the registry — must trip the token and end the call.
+        let mut alice_events = registry.subscribe(&alice);
         registry.cancel(&alice, &task_id).expect("cancel ok");
         join.await.expect("join");
 
@@ -942,8 +975,11 @@ mod foreground_send {
             "the underlying LLM call did not observe cancellation"
         );
 
-        let view = registry.get(&alice, &task_id).expect("present");
-        assert_eq!(view.status, api::TaskStatus::Cancelled);
+        // Terminal entries are evicted; the broadcast event is the
+        // authoritative status indicator.
+        let (status, _) = wait_for_completion(&mut alice_events, &task_id).await;
+        assert_eq!(status, api::TaskStatus::Cancelled);
+        assert!(registry.get(&alice, &task_id).is_none());
     }
 }
 
@@ -1068,12 +1104,20 @@ async fn concurrent_spawns_under_same_user_are_thread_safe() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
     let user = unique_user("alice");
 
+    // Each task gets its own Notify so we can keep them all in-flight
+    // simultaneously for the visibility check (terminal entries are now
+    // evicted, so a task that returns Ok immediately disappears before
+    // we can list it).
+    let mut releases: Vec<Arc<Notify>> = Vec::with_capacity(100);
     let mut handles = Vec::new();
     for _ in 0..100 {
+        let release = Arc::new(Notify::new());
+        releases.push(Arc::clone(&release));
         let registry = Arc::clone(&registry);
         let user = user.clone();
         handles.push(tokio::spawn(async move {
-            registry.spawn(user, conv_kind("c"), "concurrent".into(), |_| async move {
+            registry.spawn(user, conv_kind("c"), "concurrent".into(), move |_| async move {
+                release.notified().await;
                 Ok(())
             })
         }));
@@ -1085,10 +1129,18 @@ async fn concurrent_spawns_under_same_user_are_thread_safe() {
         assert!(ids.insert(id), "duplicate id under concurrent spawn");
     }
 
-    // All ids visible from `list`.
+    // While all 100 are still running, every id is visible from `list`.
     let listing = registry.list(&user, true, None);
     let listed: HashSet<_> = listing.iter().map(|v| v.id.clone()).collect();
     assert_eq!(listed, ids);
+
+    // Release everything so the runtime tasks exit cleanly.
+    for release in &releases {
+        release.notify_one();
+    }
+    for id in &ids {
+        registry.wait(id).await;
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1135,18 +1187,29 @@ async fn task_view_progress_hint_updates_via_context() {
 // ----------------------------------------------------------------------
 
 #[tokio::test]
-async fn business_outcome_subagent_or_standalone_kinds_compile_but_are_not_used_yet() {
+async fn business_outcome_subagent_or_standalone_kinds_compile_and_are_listable_while_in_flight() {
     let registry = BackgroundTaskRegistry::new();
     let user = unique_user("alice");
 
+    // Subagent needs a parent task that's still in-flight so its parent
+    // id resolves. Block all three on per-task Notifies; inspect kinds
+    // while running, then release so they evict cleanly.
+    let parent_release = Arc::new(Notify::new());
+    let sub_release = Arc::new(Notify::new());
+    let standalone_release = Arc::new(Notify::new());
+
+    let parent_release_for_task = Arc::clone(&parent_release);
     let parent = registry.spawn(
         user.clone(),
         conv_kind("conv-parent"),
         "parent".into(),
-        |_ctx| async move { Ok(()) },
+        move |_ctx| async move {
+            parent_release_for_task.notified().await;
+            Ok(())
+        },
     );
-    registry.wait(&parent).await;
 
+    let sub_release_for_task = Arc::clone(&sub_release);
     let sub = registry.spawn(
         user.clone(),
         api::TaskKind::Subagent {
@@ -1155,8 +1218,12 @@ async fn business_outcome_subagent_or_standalone_kinds_compile_but_are_not_used_
             name: "researcher".into(),
         },
         "subagent".into(),
-        |_ctx| async move { Ok(()) },
+        move |_ctx| async move {
+            sub_release_for_task.notified().await;
+            Ok(())
+        },
     );
+    let standalone_release_for_task = Arc::clone(&standalone_release);
     let standalone = registry.spawn(
         user.clone(),
         api::TaskKind::Standalone {
@@ -1164,11 +1231,11 @@ async fn business_outcome_subagent_or_standalone_kinds_compile_but_are_not_used_
             conversation_id: "conv-standalone".into(),
         },
         "standalone".into(),
-        |_ctx| async move { Ok(()) },
+        move |_ctx| async move {
+            standalone_release_for_task.notified().await;
+            Ok(())
+        },
     );
-
-    registry.wait(&sub).await;
-    registry.wait(&standalone).await;
 
     let everything = registry.list(&user, true, None);
     let kinds: Vec<_> = everything.iter().map(|v| v.kind.clone()).collect();
@@ -1181,4 +1248,13 @@ async fn business_outcome_subagent_or_standalone_kinds_compile_but_are_not_used_
 
     let sub_view = registry.get(&user, &sub).expect("present");
     assert_eq!(sub_view.parent, Some(parent.clone()));
+
+    // Drain: release subs/standalone first (parent still keeps them
+    // parented in `children` until they evict), then parent.
+    sub_release.notify_one();
+    standalone_release.notify_one();
+    registry.wait(&sub).await;
+    registry.wait(&standalone).await;
+    parent_release.notify_one();
+    registry.wait(&parent).await;
 }
