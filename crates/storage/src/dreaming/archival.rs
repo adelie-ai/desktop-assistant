@@ -15,8 +15,8 @@
 
 use sqlx::PgPool;
 
-use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_auth_jwt::DEFAULT_USER_ID;
+use desktop_assistant_core::ports::auth::current_user_id;
 
 /// Archive conversations not touched in `days` days. Returns rows archived.
 ///

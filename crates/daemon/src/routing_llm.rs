@@ -132,7 +132,7 @@ impl RoutingLlmClient {
             unreachable!("resolve_static called on DynamicPurpose mode");
         };
         ACTIVE_CLIENT
-            .try_with(|c| Arc::clone(c))
+            .try_with(Arc::clone)
             .unwrap_or_else(|_| Arc::clone(client))
     }
 }

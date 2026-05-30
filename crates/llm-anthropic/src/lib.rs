@@ -1,3 +1,5 @@
+//! Anthropic Messages API connector implementing the core `LlmClient` port.
+
 use desktop_assistant_core::CoreError;
 #[cfg(test)]
 use desktop_assistant_core::domain::ToolCall;

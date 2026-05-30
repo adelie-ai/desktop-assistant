@@ -137,11 +137,11 @@ pub async fn backfill_knowledge_embeddings(
                 consecutive_failures = 0;
                 // Group embeddings back by row index.
                 let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
-                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings.into_iter()) {
+                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings) {
                     row_embeddings[*row_idx].push(Vector::from(emb));
                 }
 
-                for ((id, _), vecs) in rows.iter().zip(row_embeddings.into_iter()) {
+                for ((id, _), vecs) in rows.iter().zip(row_embeddings) {
                     sqlx::query(
                         "UPDATE knowledge_base
                          SET embedding = $1::vector[], embedding_model = $2
@@ -262,11 +262,11 @@ pub async fn backfill_tool_embeddings(
                 consecutive_failures = 0;
                 // Group embeddings back by row index.
                 let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
-                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings.into_iter()) {
+                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings) {
                     row_embeddings[*row_idx].push(Vector::from(emb));
                 }
 
-                for ((name, _), vecs) in rows.iter().zip(row_embeddings.into_iter()) {
+                for ((name, _), vecs) in rows.iter().zip(row_embeddings) {
                     sqlx::query(
                         "UPDATE tool_definitions
                          SET embedding = $1::vector[], embedding_model = $2

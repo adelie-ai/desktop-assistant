@@ -21,8 +21,7 @@ use tokio::net::UnixStream;
 /// Returns `None` when `XDG_RUNTIME_DIR` is unset; callers should
 /// supply an explicit path in that case (e.g. via CLI flag).
 pub fn default_minter_socket_path() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|p| PathBuf::from(p).join("adelie").join("mint.sock"))
+    std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("adelie").join("mint.sock"))
 }
 
 /// Request payload — both fields optional. The minter clamps `ttl` and

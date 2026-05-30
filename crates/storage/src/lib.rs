@@ -1,3 +1,5 @@
+//! SQLite-backed persistence for conversations, knowledge, and assistant state.
+
 pub mod background_tasks;
 pub mod conversation;
 pub mod conversation_search;
@@ -12,12 +14,12 @@ pub mod tag_registry;
 pub mod tool_registry;
 pub mod turn_state;
 
+pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};
 /// Re-export the request-scoped user-id task-local API so storage call
 /// sites can resolve `current_user_id()` without depending directly on
 /// `desktop_assistant_core::ports::auth`. The actual storage adapters
 /// in this crate use this helper at SQL composition time (issue #105).
 pub use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
-pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};
 
 pub use background_tasks::PgBackgroundTaskStore;
 pub use conversation::PgConversationStore;

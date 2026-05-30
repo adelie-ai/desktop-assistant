@@ -19,22 +19,10 @@ use crate::kb_metadata::{KbMetadata, KbScope};
 /// Operations a per-memory review can propose.
 #[derive(Debug, Clone)]
 pub enum ProposedOp {
-    Update {
-        id: String,
-        new_content: String,
-    },
-    AddScope {
-        id: String,
-        scope: KbScope,
-    },
-    Merge {
-        a: String,
-        b: String,
-    },
-    Delete {
-        id: String,
-        reason: String,
-    },
+    Update { id: String, new_content: String },
+    AddScope { id: String, scope: KbScope },
+    Merge { a: String, b: String },
+    Delete { id: String, reason: String },
 }
 
 /// Synthesized result of merging a cluster, produced by an LLM synthesis call.
@@ -135,10 +123,7 @@ impl OpBuffer {
             groups.entry(root).or_default().insert(id);
         }
 
-        groups
-            .into_values()
-            .filter(|set| set.len() >= 2)
-            .collect()
+        groups.into_values().filter(|set| set.len() >= 2).collect()
     }
 
     /// Canonical id (merge target) for a cluster: the lexicographically lowest.
@@ -235,19 +220,17 @@ pub async fn apply_ops(
             );
             continue;
         }
-        let embedding_vecs: Vec<Vector> =
-            embeddings.into_iter().map(Vector::from).collect();
+        let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
 
         // Preserve source_conversation_id of the canonical row but apply
         // the new scope.
-        let existing_metadata: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT metadata FROM knowledge_base WHERE user_id = $1 AND id = $2",
-        )
-        .bind(user_id.as_str())
-        .bind(&merge.canonical_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| format!("dreaming: metadata fetch failed: {e}"))?;
+        let existing_metadata: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT metadata FROM knowledge_base WHERE user_id = $1 AND id = $2")
+                .bind(user_id.as_str())
+                .bind(&merge.canonical_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| format!("dreaming: metadata fetch failed: {e}"))?;
 
         let mut metadata = existing_metadata
             .map(|(v,)| KbMetadata::from_json(&v))
@@ -304,8 +287,7 @@ pub async fn apply_ops(
         if embeddings.is_empty() {
             continue;
         }
-        let embedding_vecs: Vec<Vector> =
-            embeddings.into_iter().map(Vector::from).collect();
+        let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
 
         sqlx::query(
             "UPDATE knowledge_base \
@@ -329,14 +311,13 @@ pub async fn apply_ops(
 
     // Standalone scope additions.
     for (id, scope) in buffer.standalone_scope_adds() {
-        let existing: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT metadata FROM knowledge_base WHERE user_id = $1 AND id = $2",
-        )
-        .bind(user_id.as_str())
-        .bind(&id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| format!("dreaming: scope-add metadata fetch failed: {e}"))?;
+        let existing: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT metadata FROM knowledge_base WHERE user_id = $1 AND id = $2")
+                .bind(user_id.as_str())
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| format!("dreaming: scope-add metadata fetch failed: {e}"))?;
 
         if let Some((value,)) = existing {
             let mut metadata = KbMetadata::from_json(&value);

@@ -201,16 +201,14 @@ impl OidcValidator {
 
         if let Some(kid) = header_kid.as_deref()
             && let Some(key) = self.keys_by_kid.get(kid)
-        {
-            if let Ok(data) =
+            && let Ok(data) =
                 jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation)
-            {
-                return data
-                    .claims
-                    .get("sub")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
+        {
+            return data
+                .claims
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .map(String::from);
         }
 
         for key in &self.kidless_keys {

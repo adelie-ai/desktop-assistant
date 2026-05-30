@@ -84,10 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_user_id_inside_scope_returns_installed_value() {
-        let observed = with_user_id(UserId::new("alice"), async {
-            current_user_id()
-        })
-        .await;
+        let observed = with_user_id(UserId::new("alice"), async { current_user_id() }).await;
         assert_eq!(observed, UserId::new("alice"));
     }
 
@@ -97,10 +94,7 @@ mod tests {
         // scope restores afterwards. Mirrors how a per-user dreaming
         // worker would loop inside a daemon-wide background task.
         let result = with_user_id(UserId::new("outer"), async {
-            let inner = with_user_id(UserId::new("inner"), async {
-                current_user_id()
-            })
-            .await;
+            let inner = with_user_id(UserId::new("inner"), async { current_user_id() }).await;
             let after = current_user_id();
             (inner, after)
         })
@@ -117,9 +111,7 @@ mod tests {
         // per-user batch. Documenting the contract here keeps callers
         // honest: anything that crosses `tokio::spawn` must
         // re-install before touching storage.
-        let observed = tokio::spawn(async { current_user_id() })
-            .await
-            .unwrap();
+        let observed = tokio::spawn(async { current_user_id() }).await.unwrap();
         assert_eq!(
             observed,
             UserId::default(),

@@ -131,10 +131,7 @@ impl UdsBridgeTransport {
     /// transport ready to dispatch requests. Returns an error when
     /// the socket is missing, the handshake is rejected, or the
     /// framing fails.
-    pub async fn connect(
-        config: UdsBridgeConfig,
-        jwt: &str,
-    ) -> Result<Self, BridgeTransportError> {
+    pub async fn connect(config: UdsBridgeConfig, jwt: &str) -> Result<Self, BridgeTransportError> {
         let stream = UnixStream::connect(&config.socket_path).await?;
         Self::connect_on_stream(stream, jwt, config.event_buffer, config.request_timeout).await
     }
@@ -151,9 +148,8 @@ impl UdsBridgeTransport {
         let (read_half, mut write_half) = stream.into_split();
 
         // Send the handshake: `{"jwt": "<token>"}` length-prefixed.
-        let handshake = serde_json::to_vec(&Handshake { jwt }).map_err(|e| {
-            BridgeTransportError::BadFrame(format!("serialize handshake: {e}"))
-        })?;
+        let handshake = serde_json::to_vec(&Handshake { jwt })
+            .map_err(|e| BridgeTransportError::BadFrame(format!("serialize handshake: {e}")))?;
         write_frame(&mut write_half, &handshake).await?;
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -285,9 +281,8 @@ impl BridgeTransport for UdsBridgeTransport {
             id: id.clone(),
             command,
         };
-        let body = serde_json::to_vec(&envelope).map_err(|e| {
-            BridgeTransportError::BadFrame(format!("serialize request: {e}"))
-        })?;
+        let body = serde_json::to_vec(&envelope)
+            .map_err(|e| BridgeTransportError::BadFrame(format!("serialize request: {e}")))?;
 
         let (tx, rx) = oneshot::channel::<Result<api::CommandResult, String>>();
         self.pending.lock().await.insert(id.clone(), tx);

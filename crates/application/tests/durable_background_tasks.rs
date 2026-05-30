@@ -28,16 +28,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::background_tasks::{
-    BackgroundTaskRegistry, TaskError,
-};
 use desktop_assistant_application::UserId;
+use desktop_assistant_application::background_tasks::{BackgroundTaskRegistry, TaskError};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::store::{
     BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStore,
 };
 use tokio::sync::Notify;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// In-memory `BackgroundTaskStore` for tests. Records SQL-like
 /// invariants the registry depends on:
@@ -201,7 +199,9 @@ async fn standalone_task_status_persists_across_restart() {
 
     // Wait for the body to enter steady state so the persistence write
     // has had a chance to land.
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
     wait_until(
         || {
             store
@@ -271,7 +271,9 @@ async fn conversation_task_marked_failed_on_restart() {
             Ok(())
         },
     );
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
     wait_until(
         || {
             store
@@ -292,10 +294,7 @@ async fn conversation_task_marked_failed_on_restart() {
 
     let row = store.get_raw(&task_id.0).unwrap();
     assert_eq!(row.status, BackgroundTaskStatus::Failed);
-    assert_eq!(
-        row.last_error.as_deref(),
-        Some("daemon restarted mid-turn"),
-    );
+    assert_eq!(row.last_error.as_deref(), Some("daemon restarted mid-turn"),);
 }
 
 #[tokio::test]
@@ -318,7 +317,9 @@ async fn cancelled_tasks_persist_as_cancelled() {
             Ok(())
         },
     );
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
     registry.cancel(&user, &task_id).expect("cancel");
     registry.wait(&task_id).await;
     wait_until(
@@ -422,7 +423,9 @@ async fn task_rows_are_user_id_scoped() {
     );
     // Two parks → two notifies; wait for both.
     for _ in 0..2 {
-        timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+        timeout(Duration::from_secs(2), parked.notified())
+            .await
+            .unwrap();
     }
     wait_until(
         || {
@@ -479,7 +482,9 @@ async fn resumed_standalone_emits_lifecycle_log_until_129_lands() {
             Ok(())
         },
     );
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
     wait_until(
         || {
             store
@@ -544,7 +549,9 @@ async fn parent_child_links_preserved_across_restart() {
             Ok(())
         },
     );
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
 
     let parked_c = Arc::clone(&parked);
     let child_kind = api::TaskKind::Subagent {
@@ -562,18 +569,21 @@ async fn parent_child_links_preserved_across_restart() {
             Ok(())
         },
     );
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
     wait_until(
-        || {
-            store.get_raw(&parent_id.0).is_some() && store.get_raw(&child_id.0).is_some()
-        },
+        || store.get_raw(&parent_id.0).is_some() && store.get_raw(&child_id.0).is_some(),
         "both rows persisted",
     )
     .await;
 
     // The persisted child row carries the parent reference.
     let child_row = store.get_raw(&child_id.0).unwrap();
-    assert_eq!(child_row.parent_task_id.as_deref(), Some(parent_id.0.as_str()));
+    assert_eq!(
+        child_row.parent_task_id.as_deref(),
+        Some(parent_id.0.as_str())
+    );
 
     drop(registry);
     let post_restart = BackgroundTaskRegistry::new().with_store(store.clone());
@@ -585,9 +595,7 @@ async fn parent_child_links_preserved_across_restart() {
     let parent_view = post_restart
         .get(&user, &parent_id)
         .expect("parent surfaces");
-    let child_view = post_restart
-        .get(&user, &child_id)
-        .expect("child surfaces");
+    let child_view = post_restart.get(&user, &child_id).expect("child surfaces");
     assert_eq!(child_view.parent.as_ref(), Some(&parent_id));
     assert!(
         parent_view.children.contains(&child_id),
@@ -615,7 +623,9 @@ async fn cancel_on_post_restart_failed_task_returns_already_terminal() {
             Ok(())
         },
     );
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
     wait_until(
         || {
             store
@@ -736,7 +746,9 @@ async fn business_outcome_user_sees_failed_status_in_list_after_restart() {
             Ok(())
         },
     );
-    timeout(Duration::from_secs(2), parked.notified()).await.unwrap();
+    timeout(Duration::from_secs(2), parked.notified())
+        .await
+        .unwrap();
     wait_until(
         || {
             store

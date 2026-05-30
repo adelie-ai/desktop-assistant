@@ -12,9 +12,7 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::background_tasks::BackgroundTaskRegistry;
-use desktop_assistant_application::{
-    ApiError, ApiResult, AssistantApiHandler, EventSink, UserId,
-};
+use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink, UserId};
 use desktop_assistant_auth_jwt as jwt;
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_uds::{

@@ -197,7 +197,11 @@ pub fn decode(
 pub fn read_signing_key_at(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let trimmed = raw.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Atomically write `value` to `path` with mode 0600 (Unix). The parent
@@ -228,19 +232,15 @@ pub fn write_signing_key_at(path: &Path, value: &str) -> anyhow::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(path)
-            .map_err(|error| {
-                anyhow!("failed to write signing key {}: {error}", path.display())
-            })?;
-        file.write_all(value.as_bytes()).map_err(|error| {
-            anyhow!("failed to write signing key {}: {error}", path.display())
-        })?;
+            .map_err(|error| anyhow!("failed to write signing key {}: {error}", path.display()))?;
+        file.write_all(value.as_bytes())
+            .map_err(|error| anyhow!("failed to write signing key {}: {error}", path.display()))?;
     }
 
     #[cfg(not(unix))]
     {
-        std::fs::write(path, value).map_err(|error| {
-            anyhow!("failed to write signing key {}: {error}", path.display())
-        })?;
+        std::fs::write(path, value)
+            .map_err(|error| anyhow!("failed to write signing key {}: {error}", path.display()))?;
     }
 
     Ok(())

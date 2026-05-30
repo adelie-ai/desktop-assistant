@@ -100,9 +100,12 @@ impl Fixture {
             .connect(&self.admin_url)
             .await
         {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{}\" CASCADE", self.schema)))
-                .execute(&admin)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA \"{}\" CASCADE",
+                self.schema
+            )))
+            .execute(&admin)
+            .await;
             admin.close().await;
         }
     }
@@ -137,37 +140,40 @@ async fn user_a_writes_then_user_b_cannot_list_it() {
     // B's list under their own scope returns nothing. Mirrors the
     // top-level `two_users_concurrent_conversations_isolated` test in
     // the issue brief.
-    with_fixture("user_a_writes_then_user_b_cannot_list_it", |fx| async move {
-        let store = PgConversationStore::new(fx.pool.clone());
+    with_fixture(
+        "user_a_writes_then_user_b_cannot_list_it",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
 
-        // User A: insert a conversation.
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create(make_conversation("conv-a-1", "alice chat"))
+            // User A: insert a conversation.
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create(make_conversation("conv-a-1", "alice chat"))
+                    .await
+                    .expect("alice create");
+            })
+            .await;
+
+            // User B: list — should see nothing.
+            let bobs_list = with_user_id(UserId::new("bob"), async { store.list().await })
                 .await
-                .expect("alice create");
-        })
-        .await;
+                .expect("bob list");
+            assert!(
+                bobs_list.is_empty(),
+                "bob's list must NOT include alice's conversations, got {} row(s)",
+                bobs_list.len()
+            );
 
-        // User B: list — should see nothing.
-        let bobs_list = with_user_id(UserId::new("bob"), async { store.list().await })
-            .await
-            .expect("bob list");
-        assert!(
-            bobs_list.is_empty(),
-            "bob's list must NOT include alice's conversations, got {} row(s)",
-            bobs_list.len()
-        );
+            // User A: list — should see exactly their one row.
+            let alices_list = with_user_id(UserId::new("alice"), async { store.list().await })
+                .await
+                .expect("alice list");
+            assert_eq!(alices_list.len(), 1);
+            assert_eq!(alices_list[0].id.0, "conv-a-1");
 
-        // User A: list — should see exactly their one row.
-        let alices_list = with_user_id(UserId::new("alice"), async { store.list().await })
-            .await
-            .expect("alice list");
-        assert_eq!(alices_list.len(), 1);
-        assert_eq!(alices_list[0].id.0, "conv-a-1");
-
-        fx
-    })
+            fx
+        },
+    )
     .await;
 }
 
@@ -175,27 +181,32 @@ async fn user_a_writes_then_user_b_cannot_list_it() {
 async fn user_b_cannot_read_user_a_conversation_by_id() {
     // Cross-user direct lookup must return NotFound — don't leak the
     // existence of A's conversation to B.
-    with_fixture("user_b_cannot_read_user_a_conversation_by_id", |fx| async move {
-        let store = PgConversationStore::new(fx.pool.clone());
+    with_fixture(
+        "user_b_cannot_read_user_a_conversation_by_id",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create(make_conversation("conv-x", "alice"))
-                .await
-                .expect("alice create");
-        })
-        .await;
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create(make_conversation("conv-x", "alice"))
+                    .await
+                    .expect("alice create");
+            })
+            .await;
 
-        let bob_get =
-            with_user_id(UserId::new("bob"), async { store.get(&ConversationId::from("conv-x")).await }).await;
-        match bob_get {
-            Err(CoreError::ConversationNotFound(id)) => {
-                assert_eq!(id, "conv-x", "bob's NotFound must echo the id he asked for");
+            let bob_get = with_user_id(UserId::new("bob"), async {
+                store.get(&ConversationId::from("conv-x")).await
+            })
+            .await;
+            match bob_get {
+                Err(CoreError::ConversationNotFound(id)) => {
+                    assert_eq!(id, "conv-x", "bob's NotFound must echo the id he asked for");
+                }
+                other => panic!("expected ConversationNotFound, got {other:?}"),
             }
-            other => panic!("expected ConversationNotFound, got {other:?}"),
-        }
-        fx
-    })
+            fx
+        },
+    )
     .await;
 }
 
@@ -203,36 +214,39 @@ async fn user_b_cannot_read_user_a_conversation_by_id() {
 async fn user_b_cannot_delete_user_a_conversation_by_id() {
     // Mutating cross-user attempt also returns NotFound — same don't-
     // leak-existence rule as the read path.
-    with_fixture("user_b_cannot_delete_user_a_conversation_by_id", |fx| async move {
-        let store = PgConversationStore::new(fx.pool.clone());
+    with_fixture(
+        "user_b_cannot_delete_user_a_conversation_by_id",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create(make_conversation("conv-y", "alice"))
-                .await
-                .expect("alice create");
-        })
-        .await;
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create(make_conversation("conv-y", "alice"))
+                    .await
+                    .expect("alice create");
+            })
+            .await;
 
-        let bob_delete = with_user_id(UserId::new("bob"), async {
-            store.delete(&ConversationId::from("conv-y")).await
-        })
-        .await;
-        match bob_delete {
-            Err(CoreError::ConversationNotFound(id)) => {
-                assert_eq!(id, "conv-y");
+            let bob_delete = with_user_id(UserId::new("bob"), async {
+                store.delete(&ConversationId::from("conv-y")).await
+            })
+            .await;
+            match bob_delete {
+                Err(CoreError::ConversationNotFound(id)) => {
+                    assert_eq!(id, "conv-y");
+                }
+                other => panic!("expected ConversationNotFound, got {other:?}"),
             }
-            other => panic!("expected ConversationNotFound, got {other:?}"),
-        }
 
-        // Alice's row is still intact.
-        let alices_get = with_user_id(UserId::new("alice"), async {
-            store.get(&ConversationId::from("conv-y")).await
-        })
-        .await;
-        assert!(alices_get.is_ok(), "alice's row should still be readable");
-        fx
-    })
+            // Alice's row is still intact.
+            let alices_get = with_user_id(UserId::new("alice"), async {
+                store.get(&ConversationId::from("conv-y")).await
+            })
+            .await;
+            assert!(alices_get.is_ok(), "alice's row should still be readable");
+            fx
+        },
+    )
     .await;
 }
 
@@ -241,33 +255,38 @@ async fn two_users_concurrent_conversations_isolated() {
     // tokio::join concurrent writes — neither user sees the other's
     // data afterwards. Direct exercise of the issue's primary
     // acceptance test.
-    with_fixture("two_users_concurrent_conversations_isolated", |fx| async move {
-        let store = Arc::new(PgConversationStore::new(fx.pool.clone()));
+    with_fixture(
+        "two_users_concurrent_conversations_isolated",
+        |fx| async move {
+            let store = Arc::new(PgConversationStore::new(fx.pool.clone()));
 
-        let store_a = Arc::clone(&store);
-        let store_b = Arc::clone(&store);
+            let store_a = Arc::clone(&store);
+            let store_b = Arc::clone(&store);
 
-        let alice = with_user_id(UserId::new("alice"), async move {
-            store_a.create(make_conversation("conv-a", "alice")).await
-        });
-        let bob = with_user_id(UserId::new("bob"), async move {
-            store_b.create(make_conversation("conv-b", "bob")).await
-        });
-        let (a, b) = tokio::join!(alice, bob);
-        a.expect("alice create");
-        b.expect("bob create");
+            let alice = with_user_id(UserId::new("alice"), async move {
+                store_a.create(make_conversation("conv-a", "alice")).await
+            });
+            let bob = with_user_id(UserId::new("bob"), async move {
+                store_b.create(make_conversation("conv-b", "bob")).await
+            });
+            let (a, b) = tokio::join!(alice, bob);
+            a.expect("alice create");
+            b.expect("bob create");
 
-        let alices_list =
-            with_user_id(UserId::new("alice"), async { store.list().await }).await.unwrap();
-        let bobs_list =
-            with_user_id(UserId::new("bob"), async { store.list().await }).await.unwrap();
+            let alices_list = with_user_id(UserId::new("alice"), async { store.list().await })
+                .await
+                .unwrap();
+            let bobs_list = with_user_id(UserId::new("bob"), async { store.list().await })
+                .await
+                .unwrap();
 
-        assert_eq!(alices_list.len(), 1);
-        assert_eq!(alices_list[0].id.0, "conv-a");
-        assert_eq!(bobs_list.len(), 1);
-        assert_eq!(bobs_list[0].id.0, "conv-b");
-        fx
-    })
+            assert_eq!(alices_list.len(), 1);
+            assert_eq!(alices_list[0].id.0, "conv-a");
+            assert_eq!(bobs_list.len(), 1);
+            assert_eq!(bobs_list[0].id.0, "conv-b");
+            fx
+        },
+    )
     .await;
 }
 
@@ -276,27 +295,29 @@ async fn existing_messages_table_inserts_set_user_id() {
     // Regression: prove the message-insert path stamps the
     // task-local user id into messages.user_id (not just
     // conversations.user_id).
-    with_fixture("existing_messages_table_inserts_set_user_id", |fx| async move {
-        let store = PgConversationStore::new(fx.pool.clone());
+    with_fixture(
+        "existing_messages_table_inserts_set_user_id",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create(make_conversation("conv-msg", "alice"))
-                .await
-                .expect("alice create");
-        })
-        .await;
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create(make_conversation("conv-msg", "alice"))
+                    .await
+                    .expect("alice create");
+            })
+            .await;
 
-        let row: (String,) = sqlx::query_as(
-            "SELECT user_id FROM messages WHERE conversation_id = $1 LIMIT 1",
-        )
-        .bind("conv-msg")
-        .fetch_one(&fx.pool)
-        .await
-        .expect("read back message row");
-        assert_eq!(row.0, "alice");
-        fx
-    })
+            let row: (String,) =
+                sqlx::query_as("SELECT user_id FROM messages WHERE conversation_id = $1 LIMIT 1")
+                    .bind("conv-msg")
+                    .fetch_one(&fx.pool)
+                    .await
+                    .expect("read back message row");
+            assert_eq!(row.0, "alice");
+            fx
+        },
+    )
     .await;
 }
 
@@ -321,13 +342,11 @@ async fn request_with_default_user_id_succeeds_in_single_tenant_path() {
             assert_eq!(list[0].id.0, "conv-default");
 
             // The persisted row must carry the sentinel `user_id`.
-            let row: (String,) = sqlx::query_as(
-                "SELECT user_id FROM conversations WHERE id = $1",
-            )
-            .bind("conv-default")
-            .fetch_one(&fx.pool)
-            .await
-            .expect("read back");
+            let row: (String,) = sqlx::query_as("SELECT user_id FROM conversations WHERE id = $1")
+                .bind("conv-default")
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read back");
             assert_eq!(row.0, "default");
             fx
         },
@@ -363,11 +382,9 @@ async fn knowledge_writes_are_isolated_per_user() {
         assert_eq!(alices.len(), 1);
         assert_eq!(alices[0].id, "kb-alice");
 
-        let bobs = with_user_id(UserId::new("bob"), async {
-            store.list(100, 0, None).await
-        })
-        .await
-        .unwrap();
+        let bobs = with_user_id(UserId::new("bob"), async { store.list(100, 0, None).await })
+            .await
+            .unwrap();
         assert_eq!(bobs.len(), 1);
         assert_eq!(bobs[0].id, "kb-bob");
         fx
@@ -380,64 +397,73 @@ async fn knowledge_search_does_not_leak_across_users() {
     // pgvector / FTS path: user A indexes a doc; user B searches the
     // same query and doesn't see it. Mirrors the issue brief's
     // `knowledge_search_does_not_leak_across_users` test.
-    with_fixture("knowledge_search_does_not_leak_across_users", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    with_fixture(
+        "knowledge_search_does_not_leak_across_users",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            let entry = KnowledgeEntry::new(
-                "kb-alice-doc",
-                "Alice's private project notes about widget refactoring",
-                vec!["project".into()],
+            with_user_id(UserId::new("alice"), async {
+                let entry = KnowledgeEntry::new(
+                    "kb-alice-doc",
+                    "Alice's private project notes about widget refactoring",
+                    vec!["project".into()],
+                );
+                store.write(entry, None, None).await.expect("alice index");
+            })
+            .await;
+
+            // FTS-only path (no embedding required).
+            let bob_hits = with_user_id(UserId::new("bob"), async {
+                store.search_text("widget refactoring", None, 10).await
+            })
+            .await
+            .unwrap();
+            assert!(
+                bob_hits.is_empty(),
+                "bob's text search must not see alice's doc, got {} hit(s)",
+                bob_hits.len()
             );
-            store.write(entry, None, None).await.expect("alice index");
-        })
-        .await;
-
-        // FTS-only path (no embedding required).
-        let bob_hits = with_user_id(UserId::new("bob"), async {
-            store.search_text("widget refactoring", None, 10).await
-        })
-        .await
-        .unwrap();
-        assert!(
-            bob_hits.is_empty(),
-            "bob's text search must not see alice's doc, got {} hit(s)",
-            bob_hits.len()
-        );
-        fx
-    })
+            fx
+        },
+    )
     .await;
 }
 
 #[tokio::test]
 async fn knowledge_get_by_id_does_not_leak_across_users() {
-    with_fixture("knowledge_get_by_id_does_not_leak_across_users", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    with_fixture(
+        "knowledge_get_by_id_does_not_leak_across_users",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            let entry =
-                KnowledgeEntry::new("kb-shared-id", "alice content", vec!["pref".into()]);
-            store.write(entry, None, None).await.expect("alice write");
-        })
-        .await;
+            with_user_id(UserId::new("alice"), async {
+                let entry =
+                    KnowledgeEntry::new("kb-shared-id", "alice content", vec!["pref".into()]);
+                store.write(entry, None, None).await.expect("alice write");
+            })
+            .await;
 
-        // Bob tries to fetch by the exact same id — must miss.
-        let bob_fetch = with_user_id(UserId::new("bob"), async { store.get("kb-shared-id").await })
+            // Bob tries to fetch by the exact same id — must miss.
+            let bob_fetch = with_user_id(UserId::new("bob"), async {
+                store.get("kb-shared-id").await
+            })
             .await
             .unwrap();
-        assert!(
-            bob_fetch.is_none(),
-            "bob's get by id must miss when the id belongs to alice"
-        );
+            assert!(
+                bob_fetch.is_none(),
+                "bob's get by id must miss when the id belongs to alice"
+            );
 
-        // Alice still sees it.
-        let alice_fetch =
-            with_user_id(UserId::new("alice"), async { store.get("kb-shared-id").await })
-                .await
-                .unwrap();
-        assert!(alice_fetch.is_some());
-        fx
-    })
+            // Alice still sees it.
+            let alice_fetch = with_user_id(UserId::new("alice"), async {
+                store.get("kb-shared-id").await
+            })
+            .await
+            .unwrap();
+            assert!(alice_fetch.is_some());
+            fx
+        },
+    )
     .await;
 }
 
@@ -464,7 +490,12 @@ async fn turn_state_round_trips_through_postgres() {
 
         with_user_id(UserId::new("alice"), async {
             store
-                .create_turn(turn_row("turn-1", "alice", "conv-1", TurnStatus::PendingLlm))
+                .create_turn(turn_row(
+                    "turn-1",
+                    "alice",
+                    "conv-1",
+                    TurnStatus::PendingLlm,
+                ))
                 .await
                 .expect("create");
 
@@ -508,41 +539,58 @@ async fn turn_state_user_b_cannot_read_user_a_turn() {
     // Cross-user isolation, mirroring the conversation-level test
     // above. Bob's get_turn must return None — not "not found" — and
     // his update_turn must error out for the same opacity reason.
-    with_fixture("turn_state_user_b_cannot_read_user_a_turn", |fx| async move {
-        let store = PgTurnStateStore::new(fx.pool.clone());
+    with_fixture(
+        "turn_state_user_b_cannot_read_user_a_turn",
+        |fx| async move {
+            let store = PgTurnStateStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create_turn(turn_row("turn-x", "alice", "conv-1", TurnStatus::PendingLlm))
-                .await
-                .expect("create");
-        })
-        .await;
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create_turn(turn_row(
+                        "turn-x",
+                        "alice",
+                        "conv-1",
+                        TurnStatus::PendingLlm,
+                    ))
+                    .await
+                    .expect("create");
+            })
+            .await;
 
-        let bob_get = with_user_id(UserId::new("bob"), async { store.get_turn("turn-x").await })
+            let bob_get =
+                with_user_id(UserId::new("bob"), async { store.get_turn("turn-x").await })
+                    .await
+                    .expect("get returns Ok for cross-user");
+            assert!(bob_get.is_none(), "bob must not see alice's turn");
+
+            let bob_update = with_user_id(UserId::new("bob"), async {
+                store
+                    .update_turn(
+                        "turn-x",
+                        TurnStatus::Failed,
+                        &TurnStateJson::default(),
+                        Some("nope"),
+                    )
+                    .await
+            })
+            .await;
+            assert!(
+                bob_update.is_err(),
+                "bob must not be able to mutate alice's turn"
+            );
+
+            // Alice's row is unaffected.
+            let alice_get = with_user_id(UserId::new("alice"), async {
+                store.get_turn("turn-x").await
+            })
             .await
-            .expect("get returns Ok for cross-user");
-        assert!(bob_get.is_none(), "bob must not see alice's turn");
-
-        let bob_update = with_user_id(UserId::new("bob"), async {
-            store
-                .update_turn("turn-x", TurnStatus::Failed, &TurnStateJson::default(), Some("nope"))
-                .await
-        })
-        .await;
-        assert!(bob_update.is_err(), "bob must not be able to mutate alice's turn");
-
-        // Alice's row is unaffected.
-        let alice_get = with_user_id(UserId::new("alice"), async {
-            store.get_turn("turn-x").await
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(alice_get.status, TurnStatus::PendingLlm);
-        assert!(alice_get.last_error.is_none());
-        fx
-    })
+            .unwrap()
+            .unwrap();
+            assert_eq!(alice_get.status, TurnStatus::PendingLlm);
+            assert!(alice_get.last_error.is_none());
+            fx
+        },
+    )
     .await;
 }
 
@@ -551,45 +599,56 @@ async fn turn_state_scan_non_terminal_walks_all_users() {
     // The cold-restart sweep is a system task — it deliberately walks
     // every user's pending rows in a single pass. This pins that
     // contract against the SQL.
-    with_fixture("turn_state_scan_non_terminal_walks_all_users", |fx| async move {
-        let store = PgTurnStateStore::new(fx.pool.clone());
+    with_fixture(
+        "turn_state_scan_non_terminal_walks_all_users",
+        |fx| async move {
+            let store = PgTurnStateStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create_turn(turn_row("t-a-pending", "alice", "c", TurnStatus::PendingLlm))
-                .await
-                .unwrap();
-            store
-                .create_turn(turn_row("t-a-complete", "alice", "c", TurnStatus::Complete))
-                .await
-                .unwrap();
-        })
-        .await;
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create_turn(turn_row(
+                        "t-a-pending",
+                        "alice",
+                        "c",
+                        TurnStatus::PendingLlm,
+                    ))
+                    .await
+                    .unwrap();
+                store
+                    .create_turn(turn_row("t-a-complete", "alice", "c", TurnStatus::Complete))
+                    .await
+                    .unwrap();
+            })
+            .await;
 
-        with_user_id(UserId::new("bob"), async {
-            store
-                .create_turn(turn_row(
-                    "t-b-pending",
-                    "bob",
-                    "c",
-                    TurnStatus::PendingClientTool,
-                ))
-                .await
-                .unwrap();
-            store
-                .create_turn(turn_row("t-b-failed", "bob", "c", TurnStatus::Failed))
-                .await
-                .unwrap();
-        })
-        .await;
+            with_user_id(UserId::new("bob"), async {
+                store
+                    .create_turn(turn_row(
+                        "t-b-pending",
+                        "bob",
+                        "c",
+                        TurnStatus::PendingClientTool,
+                    ))
+                    .await
+                    .unwrap();
+                store
+                    .create_turn(turn_row("t-b-failed", "bob", "c", TurnStatus::Failed))
+                    .await
+                    .unwrap();
+            })
+            .await;
 
-        // Sweep across all users — no scope installed.
-        let mut rows = store.scan_non_terminal().await.expect("scan");
-        rows.sort_by(|a, b| a.id.cmp(&b.id));
-        let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
-        assert_eq!(ids, vec!["t-a-pending".to_string(), "t-b-pending".to_string()]);
-        fx
-    })
+            // Sweep across all users — no scope installed.
+            let mut rows = store.scan_non_terminal().await.expect("scan");
+            rows.sort_by(|a, b| a.id.cmp(&b.id));
+            let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+            assert_eq!(
+                ids,
+                vec!["t-a-pending".to_string(), "t-b-pending".to_string()]
+            );
+            fx
+        },
+    )
     .await;
 }
 
@@ -617,36 +676,39 @@ fn task_row(id: &str, user_id: &str, status: BackgroundTaskStatus) -> Background
 
 #[tokio::test]
 async fn background_task_row_round_trips_through_postgres() {
-    with_fixture("background_task_row_round_trips_through_postgres", |fx| async move {
-        let store = PgBackgroundTaskStore::new(fx.pool.clone());
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create_task(task_row("bt-1", "alice", BackgroundTaskStatus::Running))
-                .await
-                .expect("create");
-            let row = store.get_task("bt-1").await.unwrap().expect("row");
-            assert_eq!(row.status, BackgroundTaskStatus::Running);
-            assert_eq!(row.title, "title for bt-1");
+    with_fixture(
+        "background_task_row_round_trips_through_postgres",
+        |fx| async move {
+            let store = PgBackgroundTaskStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create_task(task_row("bt-1", "alice", BackgroundTaskStatus::Running))
+                    .await
+                    .expect("create");
+                let row = store.get_task("bt-1").await.unwrap().expect("row");
+                assert_eq!(row.status, BackgroundTaskStatus::Running);
+                assert_eq!(row.title, "title for bt-1");
 
-            store
-                .update_task(
-                    "bt-1",
-                    BackgroundTaskStatus::Failed,
-                    Some("daemon restarted mid-turn"),
-                    Some("step 2/4"),
-                    Some(1_700_000_555),
-                )
-                .await
-                .expect("update");
-            let row = store.get_task("bt-1").await.unwrap().unwrap();
-            assert_eq!(row.status, BackgroundTaskStatus::Failed);
-            assert_eq!(row.last_error.as_deref(), Some("daemon restarted mid-turn"));
-            assert_eq!(row.progress_hint.as_deref(), Some("step 2/4"));
-            assert_eq!(row.ended_at, Some(1_700_000_555));
-        })
-        .await;
-        fx
-    })
+                store
+                    .update_task(
+                        "bt-1",
+                        BackgroundTaskStatus::Failed,
+                        Some("daemon restarted mid-turn"),
+                        Some("step 2/4"),
+                        Some(1_700_000_555),
+                    )
+                    .await
+                    .expect("update");
+                let row = store.get_task("bt-1").await.unwrap().unwrap();
+                assert_eq!(row.status, BackgroundTaskStatus::Failed);
+                assert_eq!(row.last_error.as_deref(), Some("daemon restarted mid-turn"));
+                assert_eq!(row.progress_hint.as_deref(), Some("step 2/4"));
+                assert_eq!(row.ended_at, Some(1_700_000_555));
+            })
+            .await;
+            fx
+        },
+    )
     .await;
 }
 
@@ -654,47 +716,51 @@ async fn background_task_row_round_trips_through_postgres() {
 async fn background_task_user_b_cannot_read_user_a_row() {
     // Cross-user isolation: Bob's get_task returns None and his
     // update_task errors — the same opacity rule applied elsewhere.
-    with_fixture("background_task_user_b_cannot_read_user_a_row", |fx| async move {
-        let store = PgBackgroundTaskStore::new(fx.pool.clone());
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create_task(task_row("bt-x", "alice", BackgroundTaskStatus::Running))
-                .await
-                .expect("create");
-        })
-        .await;
+    with_fixture(
+        "background_task_user_b_cannot_read_user_a_row",
+        |fx| async move {
+            let store = PgBackgroundTaskStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create_task(task_row("bt-x", "alice", BackgroundTaskStatus::Running))
+                    .await
+                    .expect("create");
+            })
+            .await;
 
-        let bob_get =
-            with_user_id(UserId::new("bob"), async { store.get_task("bt-x").await })
+            let bob_get = with_user_id(UserId::new("bob"), async { store.get_task("bt-x").await })
                 .await
                 .expect("ok");
-        assert!(bob_get.is_none(), "bob must not see alice's task");
+            assert!(bob_get.is_none(), "bob must not see alice's task");
 
-        let bob_update = with_user_id(UserId::new("bob"), async {
-            store
-                .update_task(
-                    "bt-x",
-                    BackgroundTaskStatus::Failed,
-                    Some("nope"),
-                    None,
-                    Some(1_700_000_999),
-                )
-                .await
-        })
-        .await;
-        assert!(bob_update.is_err(), "bob must not be able to update alice's row");
+            let bob_update = with_user_id(UserId::new("bob"), async {
+                store
+                    .update_task(
+                        "bt-x",
+                        BackgroundTaskStatus::Failed,
+                        Some("nope"),
+                        None,
+                        Some(1_700_000_999),
+                    )
+                    .await
+            })
+            .await;
+            assert!(
+                bob_update.is_err(),
+                "bob must not be able to update alice's row"
+            );
 
-        // Alice's row is unaffected.
-        let alice_get = with_user_id(UserId::new("alice"), async {
-            store.get_task("bt-x").await
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(alice_get.status, BackgroundTaskStatus::Running);
-        assert!(alice_get.last_error.is_none());
-        fx
-    })
+            // Alice's row is unaffected.
+            let alice_get =
+                with_user_id(UserId::new("alice"), async { store.get_task("bt-x").await })
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(alice_get.status, BackgroundTaskStatus::Running);
+            assert!(alice_get.last_error.is_none());
+            fx
+        },
+    )
     .await;
 }
 
@@ -703,42 +769,53 @@ async fn background_task_scan_non_terminal_walks_all_users() {
     // Cold-restart sweep must see every user's non-terminal rows in a
     // single pass — without a JWT scope installed, just like the
     // turn-state sweep does.
-    with_fixture("background_task_scan_non_terminal_walks_all_users", |fx| async move {
-        let store = PgBackgroundTaskStore::new(fx.pool.clone());
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create_task(task_row("a-running", "alice", BackgroundTaskStatus::Running))
-                .await
-                .unwrap();
-            store
-                .create_task(task_row("a-done", "alice", BackgroundTaskStatus::Completed))
-                .await
-                .unwrap();
-        })
-        .await;
-        with_user_id(UserId::new("bob"), async {
-            store
-                .create_task(task_row("b-running", "bob", BackgroundTaskStatus::Running))
-                .await
-                .unwrap();
-            store
-                .create_task(task_row("b-cancelled", "bob", BackgroundTaskStatus::Cancelled))
-                .await
-                .unwrap();
-        })
-        .await;
+    with_fixture(
+        "background_task_scan_non_terminal_walks_all_users",
+        |fx| async move {
+            let store = PgBackgroundTaskStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create_task(task_row(
+                        "a-running",
+                        "alice",
+                        BackgroundTaskStatus::Running,
+                    ))
+                    .await
+                    .unwrap();
+                store
+                    .create_task(task_row("a-done", "alice", BackgroundTaskStatus::Completed))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            with_user_id(UserId::new("bob"), async {
+                store
+                    .create_task(task_row("b-running", "bob", BackgroundTaskStatus::Running))
+                    .await
+                    .unwrap();
+                store
+                    .create_task(task_row(
+                        "b-cancelled",
+                        "bob",
+                        BackgroundTaskStatus::Cancelled,
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await;
 
-        // No scope installed for the sweep call.
-        let mut rows = store.scan_non_terminal().await.expect("scan");
-        rows.sort_by(|a, b| a.id.cmp(&b.id));
-        let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
-        assert_eq!(
-            ids,
-            vec!["a-running".to_string(), "b-running".to_string()],
-            "only non-terminal rows from both users surface"
-        );
-        fx
-    })
+            // No scope installed for the sweep call.
+            let mut rows = store.scan_non_terminal().await.expect("scan");
+            rows.sort_by(|a, b| a.id.cmp(&b.id));
+            let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+            assert_eq!(
+                ids,
+                vec!["a-running".to_string(), "b-running".to_string()],
+                "only non-terminal rows from both users surface"
+            );
+            fx
+        },
+    )
     .await;
 }
 
@@ -748,47 +825,47 @@ async fn background_task_list_for_user_filters_to_owner() {
     // user's rows, in started_at DESC order. This audits the SQL: a
     // missing `WHERE user_id = $1` would let one user see another's
     // tasks.
-    with_fixture("background_task_list_for_user_filters_to_owner", |fx| async move {
-        let store = PgBackgroundTaskStore::new(fx.pool.clone());
-        with_user_id(UserId::new("alice"), async {
-            let mut row1 = task_row("a-1", "alice", BackgroundTaskStatus::Running);
-            row1.started_at = 1_700_000_001;
-            let mut row2 = task_row("a-2", "alice", BackgroundTaskStatus::Completed);
-            row2.started_at = 1_700_000_002;
-            store.create_task(row1).await.unwrap();
-            store.create_task(row2).await.unwrap();
-        })
-        .await;
-        with_user_id(UserId::new("bob"), async {
-            let mut row = task_row("b-1", "bob", BackgroundTaskStatus::Running);
-            row.started_at = 1_700_000_003;
-            store.create_task(row).await.unwrap();
-        })
-        .await;
+    with_fixture(
+        "background_task_list_for_user_filters_to_owner",
+        |fx| async move {
+            let store = PgBackgroundTaskStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                let mut row1 = task_row("a-1", "alice", BackgroundTaskStatus::Running);
+                row1.started_at = 1_700_000_001;
+                let mut row2 = task_row("a-2", "alice", BackgroundTaskStatus::Completed);
+                row2.started_at = 1_700_000_002;
+                store.create_task(row1).await.unwrap();
+                store.create_task(row2).await.unwrap();
+            })
+            .await;
+            with_user_id(UserId::new("bob"), async {
+                let mut row = task_row("b-1", "bob", BackgroundTaskStatus::Running);
+                row.started_at = 1_700_000_003;
+                store.create_task(row).await.unwrap();
+            })
+            .await;
 
-        let alice_list = store
-            .list_tasks_for_user("alice", /*include_finished*/ true, None)
-            .await
-            .unwrap();
-        let alice_ids: Vec<_> = alice_list.iter().map(|r| r.id.clone()).collect();
-        assert_eq!(alice_ids, vec!["a-2".to_string(), "a-1".to_string()]);
+            let alice_list = store
+                .list_tasks_for_user("alice", /*include_finished*/ true, None)
+                .await
+                .unwrap();
+            let alice_ids: Vec<_> = alice_list.iter().map(|r| r.id.clone()).collect();
+            assert_eq!(alice_ids, vec!["a-2".to_string(), "a-1".to_string()]);
 
-        // include_finished=false trims to non-terminal rows.
-        let alice_active = store
-            .list_tasks_for_user("alice", false, None)
-            .await
-            .unwrap();
-        let alice_active_ids: Vec<_> = alice_active.iter().map(|r| r.id.clone()).collect();
-        assert_eq!(alice_active_ids, vec!["a-1".to_string()]);
+            // include_finished=false trims to non-terminal rows.
+            let alice_active = store
+                .list_tasks_for_user("alice", false, None)
+                .await
+                .unwrap();
+            let alice_active_ids: Vec<_> = alice_active.iter().map(|r| r.id.clone()).collect();
+            assert_eq!(alice_active_ids, vec!["a-1".to_string()]);
 
-        let bob_list = store
-            .list_tasks_for_user("bob", true, None)
-            .await
-            .unwrap();
-        let bob_ids: Vec<_> = bob_list.iter().map(|r| r.id.clone()).collect();
-        assert_eq!(bob_ids, vec!["b-1".to_string()]);
-        fx
-    })
+            let bob_list = store.list_tasks_for_user("bob", true, None).await.unwrap();
+            let bob_ids: Vec<_> = bob_list.iter().map(|r| r.id.clone()).collect();
+            assert_eq!(bob_ids, vec!["b-1".to_string()]);
+            fx
+        },
+    )
     .await;
 }
 
@@ -798,28 +875,31 @@ async fn background_task_parent_link_persists_through_postgres() {
     // children join. We don't declare a FK constraint (see migration
     // header), so a parent that was deleted before the child surfaces
     // as a dangling reference rather than a FK violation.
-    with_fixture("background_task_parent_link_persists_through_postgres", |fx| async move {
-        let store = PgBackgroundTaskStore::new(fx.pool.clone());
-        with_user_id(UserId::new("alice"), async {
-            let parent = task_row("parent", "alice", BackgroundTaskStatus::Running);
-            store.create_task(parent).await.unwrap();
+    with_fixture(
+        "background_task_parent_link_persists_through_postgres",
+        |fx| async move {
+            let store = PgBackgroundTaskStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                let parent = task_row("parent", "alice", BackgroundTaskStatus::Running);
+                store.create_task(parent).await.unwrap();
 
-            let mut child = task_row("child", "alice", BackgroundTaskStatus::Running);
-            child.parent_task_id = Some("parent".into());
-            child.kind_json = serde_json::json!({
-                "subagent": {
-                    "parent_task_id": "parent",
-                    "conversation_id": "c",
-                    "name": "ch"
-                }
-            });
-            store.create_task(child).await.unwrap();
+                let mut child = task_row("child", "alice", BackgroundTaskStatus::Running);
+                child.parent_task_id = Some("parent".into());
+                child.kind_json = serde_json::json!({
+                    "subagent": {
+                        "parent_task_id": "parent",
+                        "conversation_id": "c",
+                        "name": "ch"
+                    }
+                });
+                store.create_task(child).await.unwrap();
 
-            let read = store.get_task("child").await.unwrap().unwrap();
-            assert_eq!(read.parent_task_id.as_deref(), Some("parent"));
-        })
-        .await;
-        fx
-    })
+                let read = store.get_task("child").await.unwrap().unwrap();
+                assert_eq!(read.parent_task_id.as_deref(), Some("parent"));
+            })
+            .await;
+            fx
+        },
+    )
     .await;
 }

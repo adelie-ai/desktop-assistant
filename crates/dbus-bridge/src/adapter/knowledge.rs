@@ -66,9 +66,7 @@ impl<T: BridgeTransport + 'static> DbusKnowledgeAdapter<T> {
             .dispatch(api::Command::GetKnowledgeEntry { id: id.to_string() })
             .await?;
         match &result {
-            api::CommandResult::KnowledgeEntry(_) => {
-                serde_json::to_string(&result).map_err(to_fdo)
-            }
+            api::CommandResult::KnowledgeEntry(_) => serde_json::to_string(&result).map_err(to_fdo),
             other => Err(fdo::Error::Failed(format!(
                 "unexpected GetKnowledgeEntry result: {other:?}"
             ))),

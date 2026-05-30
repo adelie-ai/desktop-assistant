@@ -574,10 +574,7 @@ const WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 
 /// Perform a minimal RFC 6455 handshake on a raw TCP stream and return
 /// the still-open stream once the server has answered 101.
-async fn raw_ws_handshake(
-    addr: SocketAddr,
-    bearer: &str,
-) -> std::io::Result<TcpStream> {
+async fn raw_ws_handshake(addr: SocketAddr, bearer: &str) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(addr).await?;
     let req = format!(
         "GET /ws HTTP/1.1\r\n\
@@ -799,10 +796,9 @@ async fn ws_partial_frame_then_close_is_handled_cleanly() {
     // The smoke check is just that the server is still healthy enough
     // to serve a fresh connection.
     let url = format!("ws://{addr}/ws");
-    let (mut ws, _) =
-        tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
-            .await
-            .expect("server should still accept new connections");
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
+        .await
+        .expect("server should still accept new connections");
     let req = WsRequest {
         id: "after-partial".into(),
         command: desktop_assistant_api_model::Command::Ping,
@@ -821,4 +817,3 @@ async fn ws_partial_frame_then_close_is_handled_cleanly() {
 
     server.abort();
 }
-

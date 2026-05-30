@@ -17,6 +17,7 @@
 //!      exists + model is listed).
 //!   2. Persists the override on the conversation row.
 //!   3. Delegates to the inner handler.
+//!
 //!   Stored-but-dangling selections are detected, cleared, and surfaced
 //!   via a one-time [`DispatchWarning::DanglingModelSelection`].
 //!
@@ -835,11 +836,7 @@ where
                 ))
             })?;
             let connector_type = self.registry.connector_type_for(&id).unwrap_or_default();
-            reasoning = Self::apply_effort_mapping(
-                &connector_type,
-                &sel.model_id,
-                sel.effort.map(Effort::from),
-            );
+            reasoning = Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort);
         }
 
         // Resolve the per-turn context budget once at dispatch entry.
@@ -1426,6 +1423,9 @@ mod tests {
             cfg
         }
 
+        // One-off test fixture tuple; a type alias would only add indirection
+        // for a helper used solely within this test module.
+        #[allow(clippy::type_complexity)]
         fn make_handler() -> (
             Arc<RoutingConversationHandler<InMemoryConversationSelectionStore, CapturingInner>>,
             Arc<CapturingInner>,

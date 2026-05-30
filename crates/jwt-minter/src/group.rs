@@ -7,7 +7,7 @@
 
 use std::ffi::{CStr, CString};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
 /// A resolved group entry — name + GID.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +19,7 @@ pub struct GroupGate {
 /// Look up `name` via `getgrnam_r`. Returns `Ok(None)` when no such group
 /// exists; `Err` only when the syscall itself fails.
 pub fn resolve_group(name: &str) -> anyhow::Result<Option<GroupGate>> {
-    let cname = CString::new(name)
-        .context("group name contains an embedded NUL")?;
+    let cname = CString::new(name).context("group name contains an embedded NUL")?;
     let mut buf_size = sysconf_or(libc::_SC_GETGR_R_SIZE_MAX, 1024).max(1024);
     let mut buf: Vec<libc::c_char> = vec![0; buf_size];
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
@@ -71,8 +70,7 @@ pub fn resolve_group(name: &str) -> anyhow::Result<Option<GroupGate>> {
 /// Return the supplementary group list for `username` (plus `primary_gid`)
 /// via `getgrouplist`. Mirrors `id -G <username>`.
 pub fn grouplist_for(username: &str, primary_gid: u32) -> anyhow::Result<Vec<u32>> {
-    let cname = CString::new(username)
-        .context("username contains an embedded NUL")?;
+    let cname = CString::new(username).context("username contains an embedded NUL")?;
     let mut count: libc::c_int = 32;
     loop {
         let mut groups: Vec<libc::gid_t> = vec![0; count as usize];

@@ -273,8 +273,8 @@ fn parse_not_after_expired(der: &[u8]) -> Result<bool, &'static str> {
         let days_in_months: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
         let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
         let mut day_of_year: u32 = 0;
-        for m in 0..(month - 1) as usize {
-            day_of_year += days_in_months[m];
+        for (m, days) in days_in_months.iter().enumerate().take((month - 1) as usize) {
+            day_of_year += days;
             if m == 1 && is_leap {
                 day_of_year += 1;
             }

@@ -1,3 +1,5 @@
+//! OpenAI Responses API connector implementing the core `LlmClient` port.
+
 use desktop_assistant_core::CoreError;
 #[cfg(test)]
 use desktop_assistant_core::domain::ToolCall;
@@ -569,14 +571,14 @@ impl OpenAiClient {
                     }
                 }
                 "response.output_item.added" => {
-                    if let Ok(added) = serde_json::from_str::<OutputItemAdded>(data) {
-                        if added.item.r#type == "function_call" {
-                            tool_acc.start(
-                                added.output_index,
-                                added.item.call_id.unwrap_or_default(),
-                                added.item.name.unwrap_or_default(),
-                            );
-                        }
+                    if let Ok(added) = serde_json::from_str::<OutputItemAdded>(data)
+                        && added.item.r#type == "function_call"
+                    {
+                        tool_acc.start(
+                            added.output_index,
+                            added.item.call_id.unwrap_or_default(),
+                            added.item.name.unwrap_or_default(),
+                        );
                     }
                 }
                 "response.function_call_arguments.delta" => {
@@ -617,14 +619,14 @@ impl OpenAiClient {
                     tracing::warn!("OpenAI stream error: {data}");
                 }
                 "response.completed" => {
-                    if let Ok(rc) = serde_json::from_str::<ResponseCompleted>(data) {
-                        if let Some(u) = rc.response.usage {
-                            token_usage = Some(TokenUsage {
-                                input_tokens: u.input_tokens,
-                                output_tokens: u.output_tokens,
-                                ..Default::default()
-                            });
-                        }
+                    if let Ok(rc) = serde_json::from_str::<ResponseCompleted>(data)
+                        && let Some(u) = rc.response.usage
+                    {
+                        token_usage = Some(TokenUsage {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                            ..Default::default()
+                        });
                     }
                     break;
                 }
@@ -788,9 +790,7 @@ fn model_supports_reasoning(model: &str) -> bool {
 /// the per-model capability gate. Returns `None` for non-reasoning
 /// models (debug-logged) and when no effort is requested.
 fn reasoning_for(model: &str, reasoning: ReasoningConfig) -> Option<ReasoningBlock> {
-    let Some(level) = reasoning.reasoning_effort else {
-        return None;
-    };
+    let level = reasoning.reasoning_effort?;
     if !model_supports_reasoning(model) {
         tracing::debug!(
             model,

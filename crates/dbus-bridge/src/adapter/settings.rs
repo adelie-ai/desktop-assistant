@@ -374,7 +374,11 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
 
 fn normalize(s: &str) -> Option<String> {
     let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 /// Translate an `api::Config` from a `ConfigChanged` wire event into

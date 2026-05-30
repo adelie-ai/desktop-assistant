@@ -237,11 +237,7 @@ struct ScriptedToolExecutor {
 }
 
 impl ScriptedToolExecutor {
-    fn new(
-        tools: Vec<ToolDefinition>,
-        results: HashMap<String, String>,
-        delay: Duration,
-    ) -> Self {
+    fn new(tools: Vec<ToolDefinition>, results: HashMap<String, String>, delay: Duration) -> Self {
         Self {
             tools,
             results: Mutex::new(results),
@@ -337,7 +333,14 @@ async fn send_prompt_returns_cancelled_when_token_fires_between_turns() {
     token.cancel();
 
     let result = handler
-        .send_prompt_with_override(&conv.id, "go".into(), None, noop_chunk(), noop_status(), token)
+        .send_prompt_with_override(
+            &conv.id,
+            "go".into(),
+            None,
+            noop_chunk(),
+            noop_status(),
+            token,
+        )
         .await;
     assert!(
         matches!(result, Err(CoreError::Cancelled)),
@@ -380,7 +383,14 @@ async fn send_prompt_returns_cancelled_when_token_fires_mid_stream() {
     });
 
     let result = handler
-        .send_prompt_with_override(&conv.id, "go".into(), None, noop_chunk(), noop_status(), token)
+        .send_prompt_with_override(
+            &conv.id,
+            "go".into(),
+            None,
+            noop_chunk(),
+            noop_status(),
+            token,
+        )
         .await;
 
     assert!(
@@ -461,7 +471,14 @@ async fn cancellation_during_tool_dispatch_aborts_before_next_llm_call() {
     });
 
     let result = handler
-        .send_prompt_with_override(&conv.id, "go".into(), None, noop_chunk(), noop_status(), token)
+        .send_prompt_with_override(
+            &conv.id,
+            "go".into(),
+            None,
+            noop_chunk(),
+            noop_status(),
+            token,
+        )
         .await;
 
     assert!(

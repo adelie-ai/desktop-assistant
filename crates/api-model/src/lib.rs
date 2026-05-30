@@ -207,10 +207,14 @@ pub enum Command {
         limit: Option<u32>,
     },
     /// Fetch a single background task by id.
-    GetBackgroundTask { id: String },
+    GetBackgroundTask {
+        id: String,
+    },
     /// Request cancellation of a background task. The registry replies with
     /// `Ack`; cancellation completion is observed via `Event::TaskCompleted`.
-    CancelBackgroundTask { id: String },
+    CancelBackgroundTask {
+        id: String,
+    },
     /// Fetch a page of log entries for a background task. `after_seq` skips
     /// entries already seen; omit to start from the oldest available entry.
     GetBackgroundTaskLogs {
@@ -288,16 +292,22 @@ fn default_kb_limit() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandResult {
-    Pong { value: String },
+    Pong {
+        value: String,
+    },
 
     Status(Status),
     Config(Config),
 
-    ConversationId { id: String },
+    ConversationId {
+        id: String,
+    },
     Conversations(Vec<ConversationSummary>),
     Conversation(ConversationView),
     Messages(MessagesView),
-    Cleared { deleted_count: u32 },
+    Cleared {
+        deleted_count: u32,
+    },
 
     EmbeddingsSettings(EmbeddingsSettingsView),
     ConnectorDefaults(ConnectorDefaultsView),
@@ -325,16 +335,22 @@ pub enum CommandResult {
         next_seq: u64,
     },
     /// Response to `SpawnStandaloneAgent`.
-    BackgroundTaskSpawned { id: String },
+    BackgroundTaskSpawned {
+        id: String,
+    },
     /// Ack for `SendMessage`, carrying the registered task id so callers can
     /// correlate the streamed `Task*` events back to the request. Introduced
     /// alongside the background-task registry so we don't overload `Ack`.
-    SendMessageAck { task_id: String },
+    SendMessageAck {
+        task_id: String,
+    },
 
     /// Response to `RegisterClientTools`, carrying the count of tools
     /// accepted by the daemon. Clients use this to verify registration
     /// landed before relying on client-side execution.
-    ClientToolsRegistered { count: u32 },
+    ClientToolsRegistered {
+        count: u32,
+    },
 
     Ack,
 }
@@ -406,7 +422,9 @@ pub enum Event {
 
     // --- Background tasks (issue #110) ------------------------------------
     /// A background task has been registered and is now `Pending`/`Running`.
-    TaskStarted { task: TaskView },
+    TaskStarted {
+        task: TaskView,
+    },
     /// Lightweight progress signal that does not justify a log entry.
     TaskProgress {
         id: String,
@@ -414,7 +432,10 @@ pub enum Event {
         progress_hint: Option<String>,
     },
     /// A new log entry was appended to a task's bounded log buffer.
-    TaskLogAppended { id: String, entry: TaskLogEntry },
+    TaskLogAppended {
+        id: String,
+        entry: TaskLogEntry,
+    },
     /// Terminal event: the task transitioned to `Completed`, `Failed`, or
     /// `Cancelled`. `last_error` is set for `Failed` and may be set for
     /// `Cancelled` when cancellation was the result of a downstream error.
@@ -1307,14 +1328,8 @@ mod tests {
 
     #[test]
     fn log_enums_serialize_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&LogLevel::Info).unwrap(),
-            "\"info\""
-        );
-        assert_eq!(
-            serde_json::to_string(&LogLevel::Warn).unwrap(),
-            "\"warn\""
-        );
+        assert_eq!(serde_json::to_string(&LogLevel::Info).unwrap(), "\"info\"");
+        assert_eq!(serde_json::to_string(&LogLevel::Warn).unwrap(), "\"warn\"");
         assert_eq!(
             serde_json::to_string(&LogLevel::Error).unwrap(),
             "\"error\""
@@ -1497,10 +1512,9 @@ mod tests {
             progress_hint: Some("step 3/5".into()),
         };
         let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
-        let expected: serde_json::Value = serde_json::from_str(
-            r#"{"task_progress":{"id":"t-1","progress_hint":"step 3/5"}}"#,
-        )
-        .unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"task_progress":{"id":"t-1","progress_hint":"step 3/5"}}"#)
+                .unwrap();
         assert_eq!(v, expected);
         let back: Event = serde_json::from_value(v).unwrap();
         assert_eq!(ev, back);
@@ -1677,10 +1691,9 @@ mod tests {
         // only assert the wire shape can round-trip a malformed payload —
         // the rejection lives one layer up so adapters can surface a
         // clean error to the client.
-        let cmd: Command = serde_json::from_str(
-            r#"{"client_tool_result":{"task_id":"t","tool_call_id":"c"}}"#,
-        )
-        .unwrap();
+        let cmd: Command =
+            serde_json::from_str(r#"{"client_tool_result":{"task_id":"t","tool_call_id":"c"}}"#)
+                .unwrap();
         match cmd {
             Command::ClientToolResult { result, error, .. } => {
                 assert!(result.is_none());

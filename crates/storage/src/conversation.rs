@@ -303,14 +303,12 @@ impl ConversationStore for PgConversationStore {
         // Replace all messages: delete existing, re-insert. Scoped by
         // user_id as defense-in-depth — the UPDATE above already
         // proved the conversation belongs to this user.
-        sqlx::query(
-            "DELETE FROM messages WHERE user_id = $1 AND conversation_id = $2",
-        )
-        .bind(user_id.as_str())
-        .bind(&conv.id.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query("DELETE FROM messages WHERE user_id = $1 AND conversation_id = $2")
+            .bind(user_id.as_str())
+            .bind(&conv.id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         for (ordinal, msg) in conv.messages.iter().enumerate() {
             insert_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
@@ -324,14 +322,12 @@ impl ConversationStore for PgConversationStore {
 
     async fn delete(&self, id: &ConversationId) -> Result<(), CoreError> {
         let user_id = current_user_id();
-        let result = sqlx::query(
-            "DELETE FROM conversations WHERE user_id = $1 AND id = $2",
-        )
-        .bind(user_id.as_str())
-        .bind(&id.0)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let result = sqlx::query("DELETE FROM conversations WHERE user_id = $1 AND id = $2")
+            .bind(user_id.as_str())
+            .bind(&id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(CoreError::ConversationNotFound(id.0.clone()));
@@ -356,14 +352,13 @@ impl ConversationStore for PgConversationStore {
             // different user — `SELECT 1 …` distinguishes. The
             // existence probe is itself user-scoped so a cross-user
             // lookup still returns "not found" without leaking.
-            let exists: Option<(i64,)> = sqlx::query_as(
-                "SELECT 1 FROM conversations WHERE user_id = $1 AND id = $2",
-            )
-            .bind(user_id.as_str())
-            .bind(&id.0)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT 1 FROM conversations WHERE user_id = $1 AND id = $2")
+                    .bind(user_id.as_str())
+                    .bind(&id.0)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| CoreError::Storage(e.to_string()))?;
             if exists.is_none() {
                 return Err(CoreError::ConversationNotFound(id.0.clone()));
             }
@@ -441,14 +436,12 @@ impl ConversationStore for PgConversationStore {
     async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
         let user_id = current_user_id();
         // ON DELETE SET NULL on messages.summary_id handles clearing the references.
-        sqlx::query(
-            "DELETE FROM message_summaries WHERE user_id = $1 AND id = $2",
-        )
-        .bind(user_id.as_str())
-        .bind(summary_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query("DELETE FROM message_summaries WHERE user_id = $1 AND id = $2")
+            .bind(user_id.as_str())
+            .bind(summary_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(())
     }
 }

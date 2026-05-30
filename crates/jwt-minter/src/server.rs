@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -36,8 +36,8 @@ pub async fn serve(
     // Load the signing key once at startup — the daemon would do the
     // same. If it doesn't exist yet, generate it; the daemon will pick up
     // the same file on its next startup.
-    let signing_key = auth_jwt::ensure_signing_key_at(&config.signing_key_path)
-        .with_context(|| {
+    let signing_key =
+        auth_jwt::ensure_signing_key_at(&config.signing_key_path).with_context(|| {
             format!(
                 "failed to load signing key from {}",
                 config.signing_key_path.display()
@@ -108,8 +108,8 @@ pub async fn serve_connection(
     signing_key: &str,
     group_gate: Option<&GroupGate>,
 ) -> anyhow::Result<()> {
-    let identity = peer::extract_peer_identity(&stream)
-        .context("failed to extract peer credentials")?;
+    let identity =
+        peer::extract_peer_identity(&stream).context("failed to extract peer credentials")?;
 
     if let Some(gate) = group_gate
         && !is_member(&identity, gate)?
@@ -150,14 +150,12 @@ fn is_member(identity: &PeerIdentity, gate: &GroupGate) -> anyhow::Result<bool> 
 /// file at `path` then binds.
 pub fn bind_unix_listener(path: &Path) -> anyhow::Result<UnixListener> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create socket parent dir {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create socket parent dir {}", parent.display()))?;
     }
     if path.exists() {
-        std::fs::remove_file(path).with_context(|| {
-            format!("failed to remove stale socket {}", path.display())
-        })?;
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
     }
     UnixListener::bind(path).with_context(|| format!("failed to bind {}", path.display()))
 }

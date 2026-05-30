@@ -107,13 +107,19 @@ impl SchemaFixture {
         {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("cleanup: failed to reconnect to drop schema {}: {e}", self.schema);
+                eprintln!(
+                    "cleanup: failed to reconnect to drop schema {}: {e}",
+                    self.schema
+                );
                 return;
             }
         };
-        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{}\" CASCADE", self.schema)))
-            .execute(&admin)
-            .await
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA \"{}\" CASCADE",
+            self.schema
+        )))
+        .execute(&admin)
+        .await
         {
             eprintln!("cleanup: failed to drop schema {}: {e}", self.schema);
         }
@@ -221,12 +227,15 @@ async fn migration_adds_user_id_column_to_conversations() {
 
 #[tokio::test]
 async fn migration_adds_user_id_column_to_messages() {
-    with_fixture("migration_adds_user_id_column_to_messages", |fx| async move {
-        fx.migrate().await;
-        assert!(column_exists(&fx.pool, &fx.schema, "messages", "user_id").await);
-        assert!(column_is_not_null(&fx.pool, &fx.schema, "messages", "user_id").await);
-        fx
-    })
+    with_fixture(
+        "migration_adds_user_id_column_to_messages",
+        |fx| async move {
+            fx.migrate().await;
+            assert!(column_exists(&fx.pool, &fx.schema, "messages", "user_id").await);
+            assert!(column_is_not_null(&fx.pool, &fx.schema, "messages", "user_id").await);
+            fx
+        },
+    )
     .await;
 }
 
@@ -251,9 +260,7 @@ async fn migration_adds_user_id_column_to_message_summaries() {
         |fx| async move {
             fx.migrate().await;
             assert!(column_exists(&fx.pool, &fx.schema, "message_summaries", "user_id").await);
-            assert!(
-                column_is_not_null(&fx.pool, &fx.schema, "message_summaries", "user_id").await
-            );
+            assert!(column_is_not_null(&fx.pool, &fx.schema, "message_summaries", "user_id").await);
             fx
         },
     )
@@ -308,12 +315,10 @@ async fn migration_backfills_existing_conversation_rows_to_default_user() {
             //    `conversations` has no `user_id` column.
             run_pre_multitenant_migrations(&fx.pool).await;
 
-            sqlx::query(
-                "INSERT INTO conversations (id, title) VALUES ('pre-1', 'Legacy Chat')",
-            )
-            .execute(&fx.pool)
-            .await
-            .expect("seed legacy conversation row");
+            sqlx::query("INSERT INTO conversations (id, title) VALUES ('pre-1', 'Legacy Chat')")
+                .execute(&fx.pool)
+                .await
+                .expect("seed legacy conversation row");
 
             // 2. Now run the full migration set — the multi-tenant migration
             //    must backfill the legacy row.
@@ -448,31 +453,34 @@ async fn migrations_are_idempotent() {
 
 #[tokio::test]
 async fn inserting_conversation_without_user_id_fails() {
-    with_fixture("inserting_conversation_without_user_id_fails", |fx| async move {
-        fx.migrate().await;
+    with_fixture(
+        "inserting_conversation_without_user_id_fails",
+        |fx| async move {
+            fx.migrate().await;
 
-        // Drop the default if the migration left one in place — without
-        // this the test would silently pass on the sentinel. Idempotent
-        // and a no-op if no default exists.
-        sqlx::query("ALTER TABLE conversations ALTER COLUMN user_id DROP DEFAULT")
+            // Drop the default if the migration left one in place — without
+            // this the test would silently pass on the sentinel. Idempotent
+            // and a no-op if no default exists.
+            sqlx::query("ALTER TABLE conversations ALTER COLUMN user_id DROP DEFAULT")
+                .execute(&fx.pool)
+                .await
+                .ok();
+
+            let err = sqlx::query(
+                "INSERT INTO conversations (id, title) VALUES ('needs-user', 'should fail')",
+            )
             .execute(&fx.pool)
             .await
-            .ok();
+            .expect_err("insert without user_id should fail under multi-tenant schema");
 
-        let err = sqlx::query(
-            "INSERT INTO conversations (id, title) VALUES ('needs-user', 'should fail')",
-        )
-        .execute(&fx.pool)
-        .await
-        .expect_err("insert without user_id should fail under multi-tenant schema");
-
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("user_id") || msg.contains("not-null") || msg.contains("null value"),
-            "expected a not-null violation on user_id, got: {err}"
-        );
-        fx
-    })
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("user_id") || msg.contains("not-null") || msg.contains("null value"),
+                "expected a not-null violation on user_id, got: {err}"
+            );
+            fx
+        },
+    )
     .await;
 }
 

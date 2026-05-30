@@ -162,15 +162,18 @@ impl<T: BridgeTransport + 'static> DbusBackgroundTasksAdapter<T> {
         let result = self
             .dispatch(api::Command::GetBackgroundTaskLogs {
                 id: id.to_string(),
-                after_seq: if after_seq == 0 { None } else { Some(after_seq) },
+                after_seq: if after_seq == 0 {
+                    None
+                } else {
+                    Some(after_seq)
+                },
                 limit: if limit == 0 { None } else { Some(limit) },
             })
             .await?;
         match result {
-            api::CommandResult::BackgroundTaskLogs { entries, next_seq } => Ok((
-                entries.iter().map(log_entry_to_dict).collect(),
-                next_seq,
-            )),
+            api::CommandResult::BackgroundTaskLogs { entries, next_seq } => {
+                Ok((entries.iter().map(log_entry_to_dict).collect(), next_seq))
+            }
             other => Err(fdo::Error::Failed(format!(
                 "unexpected GetBackgroundTaskLogs result: {other:?}"
             ))),
@@ -219,11 +222,7 @@ impl<T: BridgeTransport + 'static> DbusBackgroundTasksAdapter<T> {
 
     /// Lightweight progress hint emitted between log entries.
     #[zbus(signal)]
-    async fn task_progress(
-        emitter: &SignalEmitter<'_>,
-        id: &str,
-        hint: &str,
-    ) -> zbus::Result<()>;
+    async fn task_progress(emitter: &SignalEmitter<'_>, id: &str, hint: &str) -> zbus::Result<()>;
 
     /// New log entry appended to a task's bounded log buffer.
     #[zbus(signal)]
@@ -384,16 +383,14 @@ mod tests {
 
     #[test]
     fn json_value_to_owned_i64_round_trips() {
-        let ov =
-            json_value_to_owned(JsonValue::Number(serde_json::Number::from(-42_i64))).unwrap();
+        let ov = json_value_to_owned(JsonValue::Number(serde_json::Number::from(-42_i64))).unwrap();
         let back: i64 = ov.try_into().unwrap();
         assert_eq!(back, -42);
     }
 
     #[test]
     fn json_value_to_owned_u64_round_trips() {
-        let ov =
-            json_value_to_owned(JsonValue::Number(serde_json::Number::from(42_u64))).unwrap();
+        let ov = json_value_to_owned(JsonValue::Number(serde_json::Number::from(42_u64))).unwrap();
         let back: u64 = ov.try_into().unwrap();
         assert_eq!(back, 42);
     }

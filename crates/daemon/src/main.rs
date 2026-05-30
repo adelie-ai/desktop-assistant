@@ -1,3 +1,5 @@
+//! Assistant daemon binary: wires the core services to storage, LLM connectors, and transports.
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -56,10 +58,7 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
             .unwrap_or(false)
     }
 
-    async fn extract_user_id(
-        &self,
-        token: &str,
-    ) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
         // #105 mapping rule: JWT `sub` → `UserId`. Returns `None` for
         // tokens this validator would reject; the ws-interface
         // handler then falls back to `UserId::default` (the schema
@@ -86,10 +85,7 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
         self.oidc_validator.validate_token(token)
     }
 
-    async fn extract_user_id(
-        &self,
-        token: &str,
-    ) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
         // Resolution order mirrors `validate_bearer_token`: prefer the
         // local HS256 mint (single-tenant desktop primary path), then
         // fall through to OIDC RS256 (multi-tenant deploys). Whichever
@@ -135,10 +131,7 @@ impl uds::UdsAuthValidator for WsAsUdsAuth {
         self.validator.validate_bearer_token(token).await
     }
 
-    async fn extract_user_id(
-        &self,
-        token: &str,
-    ) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
         // Delegate to the same WS validator so UDS and WS share the
         // JWT-to-user_id mapping. The bridge above already enforces
         // uniform validation; #105's identity extraction follows the
@@ -1194,9 +1187,9 @@ async fn main() -> Result<()> {
                         Ok(n) => tracing::info!(
                             "dreaming: scan cycle finished in {elapsed:.2?}, wrote {n} new fact(s)"
                         ),
-                        Err(e) => tracing::warn!(
-                            "dreaming: scan cycle failed after {elapsed:.2?}: {e}"
-                        ),
+                        Err(e) => {
+                            tracing::warn!("dreaming: scan cycle failed after {elapsed:.2?}: {e}")
+                        }
                     }
 
                     tokio::select! {
@@ -1420,9 +1413,9 @@ async fn main() -> Result<()> {
         if let Some(pool) = &pg_pool {
             let store: std::sync::Arc<
                 dyn desktop_assistant_core::ports::store::BackgroundTaskStore,
-            > = std::sync::Arc::new(
-                desktop_assistant_storage::PgBackgroundTaskStore::new(pool.clone()),
-            );
+            > = std::sync::Arc::new(desktop_assistant_storage::PgBackgroundTaskStore::new(
+                pool.clone(),
+            ));
             let registry = registry.with_store(store);
             if let Err(e) = registry.sweep_non_terminal_on_startup().await {
                 tracing::warn!(
@@ -1435,17 +1428,16 @@ async fn main() -> Result<()> {
             Arc::new(registry)
         }
     };
-    let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
-        Arc::new(
-            DefaultAssistantApiHandler::new(
-                Arc::new(Assistant),
-                Arc::clone(&conversation_service),
-                Arc::clone(&settings_service),
-                Arc::clone(&connections_service),
-                Arc::clone(&knowledge_service),
-            )
-            .with_registry(Arc::clone(&background_task_registry)),
-        );
+    let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> = Arc::new(
+        DefaultAssistantApiHandler::new(
+            Arc::new(Assistant),
+            Arc::clone(&conversation_service),
+            Arc::clone(&settings_service),
+            Arc::clone(&connections_service),
+            Arc::clone(&knowledge_service),
+        )
+        .with_registry(Arc::clone(&background_task_registry)),
+    );
 
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
@@ -1818,12 +1810,12 @@ mod tests {
     #[test]
     fn transport_defaults_are_local_first() {
         // Local-first policy: WebSocket off, D-Bus best-effort (not required),
-        // UDS on (Unix).
-        assert!(!transport_defaults::WS_ENABLED, "WS must default off");
-        assert!(
-            !transport_defaults::DBUS_REQUIRED,
-            "D-Bus must be optional by default"
-        );
+        // UDS on (Unix). Bind to locals so the asserts are runtime checks of
+        // the policy constants rather than constant-folded tautologies.
+        let ws_enabled = transport_defaults::WS_ENABLED;
+        let dbus_required = transport_defaults::DBUS_REQUIRED;
+        assert!(!ws_enabled, "WS must default off");
+        assert!(!dbus_required, "D-Bus must be optional by default");
         assert_eq!(transport_defaults::uds_enabled(), cfg!(unix));
 
         // The env knobs still flip each policy.

@@ -1,3 +1,5 @@
+//! WebSocket frontend for the assistant API (axum-based, with optional TLS).
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{future::Future, future::pending};
@@ -328,8 +330,7 @@ async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId)
     //     Big") so well-behaved clients can surface the reason instead
     //     of guessing from a bare TCP RST.
     let close_tx = outbound_tx.clone();
-    let (inbound_tx, inbound_rx) =
-        mpsc::channel::<anyhow::Result<WsRequest>>(16);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<anyhow::Result<WsRequest>>(16);
     let reader = tokio::spawn(async move {
         let mut ws_rx = ws_rx;
         while let Some(item) = ws_rx.next().await {
@@ -493,6 +494,11 @@ where
     Ok(())
 }
 
+// Server wiring entry point: each argument is a distinct collaborator
+// (handler, validators, origins, TLS acceptor, bind, shutdown). Bundling
+// them into a config struct would be an out-of-scope refactor of the
+// public serve API.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "tls")]
 pub async fn serve_full_tls<F>(
     handler: Arc<dyn AssistantApiHandler>,

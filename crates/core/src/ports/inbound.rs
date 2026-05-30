@@ -476,6 +476,10 @@ pub trait SettingsService: Send + Sync {
         &self,
     ) -> impl std::future::Future<Output = Result<LlmSettingsView, CoreError>> + Send;
 
+    // Each argument is a distinct, independently-optional LLM settings field;
+    // a bundling struct would just mirror this signature and touch every
+    // implementor and call site across layers — an out-of-scope refactor.
+    #[allow(clippy::too_many_arguments)]
     fn set_llm_settings(
         &self,
         connector: String,
