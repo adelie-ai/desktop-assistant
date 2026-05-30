@@ -30,7 +30,12 @@ indexmap = { version = "2", features = ["serde"] }
 chrono.workspace = true
 async-trait.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
-keyring = "3"
+# keyring v4 split the library out into `keyring-core` (the API) plus
+# per-backend store crates. We talk to the system Secret Service in-process
+# via the zbus-based store, matching the daemon's existing zbus/tokio stack
+# (no libdbus C dep) and the `crypto-rust` choice used by the TUI/GTK clients.
+keyring-core = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-tokio-crypto-rust"] }
 jsonwebtoken.workspace = true
 desktop-assistant-auth-jwt.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }

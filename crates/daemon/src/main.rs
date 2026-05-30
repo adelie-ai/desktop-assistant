@@ -581,6 +581,25 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Register the system Secret Service as keyring-core's default credential
+    // store so the `keyring`/`libsecret` secret backend can read and write API
+    // keys in-process (replacing the old `secret-tool` subprocess). Connecting
+    // touches D-Bus via a blocking client, so do it off the async worker. When
+    // there's no Secret Service (e.g. headless), log and continue — the
+    // file/systemd/KWallet backends still work without it.
+    match tokio::task::spawn_blocking(zbus_secret_service_keyring_store::Store::new).await {
+        Ok(Ok(store)) => {
+            keyring_core::set_default_store(store);
+            tracing::info!("registered Secret Service credential store");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("Secret Service unavailable; keyring secret backend disabled: {error}");
+        }
+        Err(error) => {
+            tracing::warn!("Secret Service store init task failed: {error}");
+        }
+    }
+
     // Build the LLM client from daemon.toml + KWallet (fallback to env)
     let config_path = config::default_daemon_config_path();
     let daemon_config = match config::load_daemon_config(&config_path) {
