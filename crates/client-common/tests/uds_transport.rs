@@ -85,10 +85,7 @@ impl UdsAuthValidator for StaticJwtAuth {
     }
 }
 
-fn start_server(
-    socket_path: PathBuf,
-    signing_key: String,
-) -> tokio::sync::oneshot::Sender<()> {
+fn start_server(socket_path: PathBuf, signing_key: String) -> tokio::sync::oneshot::Sender<()> {
     let handler: Arc<dyn AssistantApiHandler> = Arc::new(TestHandler);
     let auth: Arc<dyn UdsAuthValidator> = Arc::new(StaticJwtAuth { signing_key });
     let config = UdsServerConfig::new(socket_path);
@@ -132,9 +129,7 @@ async fn uds_transport_round_trips_commands() {
     wait_for_socket(&path).await;
 
     let config = uds_config(path, mint_test_jwt(&signing_key, "dave"));
-    let (client, _signals) = connect_transport(&config)
-        .await
-        .expect("connect over uds");
+    let (client, _signals) = connect_transport(&config).await.expect("connect over uds");
 
     // Empty-list round-trip: confirms request/response correlation + framing.
     let conversations = timeout(Duration::from_secs(2), client.list_conversations())
