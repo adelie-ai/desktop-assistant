@@ -18,10 +18,22 @@ pub fn default_ca_cert_path() -> PathBuf {
         .join("ca.pem")
 }
 
+/// Default path to the daemon's local Unix domain socket, or `None` when
+/// `XDG_RUNTIME_DIR` is unset (no sensible desktop default). Mirrors the
+/// daemon-side `desktop_assistant_uds::default_desktop_socket_path` so local
+/// clients resolve the same endpoint without linking the server crate.
+pub fn default_desktop_socket_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("adelie").join("sock"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
     Ws,
     Dbus,
+    /// Local Unix domain socket. The concrete path lives on
+    /// [`ConnectionConfig::socket_path`]; `None` there resolves to
+    /// [`default_desktop_socket_path`].
+    Uds,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +48,10 @@ pub struct ConnectionConfig {
     /// Defaults to the daemon's auto-generated CA at
     /// `$XDG_DATA_HOME/desktop-assistant/tls/ca.pem`.
     pub tls_ca_cert: Option<PathBuf>,
+    /// Path to the daemon's local Unix domain socket. Only meaningful when
+    /// `transport_mode == TransportMode::Uds`; `None` resolves to
+    /// [`default_desktop_socket_path`].
+    pub socket_path: Option<PathBuf>,
 }
 
 impl Default for ConnectionConfig {
@@ -48,6 +64,32 @@ impl Default for ConnectionConfig {
             ws_login_password: None,
             ws_subject: DEFAULT_WS_SUBJECT.to_string(),
             tls_ca_cert: Some(default_ca_cert_path()),
+            socket_path: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_uses_ws_and_no_socket_path() {
+        let config = ConnectionConfig::default();
+        assert_eq!(config.transport_mode, TransportMode::Ws);
+        assert!(config.socket_path.is_none());
+    }
+
+    #[test]
+    fn default_socket_path_joins_runtime_dir() {
+        // SAFETY: no other test in this binary reads XDG_RUNTIME_DIR, so the
+        // global mutation is observationally single-threaded here.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+        }
+        assert_eq!(
+            default_desktop_socket_path(),
+            Some(PathBuf::from("/run/user/4242/adelie/sock"))
+        );
     }
 }
