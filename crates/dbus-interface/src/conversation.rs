@@ -256,13 +256,13 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
                 .collect();
 
             // Apply tail limit to the filtered set (tail mode only).
-            let (truncated, messages) =
-                if !use_after && tail > 0 && filtered.len() > tail as usize {
-                    let start = filtered.len() - tail as usize;
-                    (true, filtered[start..].to_vec())
-                } else {
-                    (false, filtered)
-                };
+            let (truncated, messages) = if !use_after && tail > 0 && filtered.len() > tail as usize
+            {
+                let start = filtered.len() - tail as usize;
+                (true, filtered[start..].to_vec())
+            } else {
+                (false, filtered)
+            };
 
             Ok((total, truncated, messages))
         })
@@ -323,12 +323,7 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         // for the in-spawn `with_user_id` wrap (#156).
         let llm_conv_id = conv_id.clone();
         with_user_id(resolve_dbus_user_id(), async {
-            drop(spawn_send_prompt_llm_task(
-                service,
-                llm_conv_id,
-                prompt,
-                tx,
-            ));
+            drop(spawn_send_prompt_llm_task(service, llm_conv_id, prompt, tx));
         })
         .await;
 

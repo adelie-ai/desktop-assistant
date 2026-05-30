@@ -328,8 +328,7 @@ async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId)
     //     Big") so well-behaved clients can surface the reason instead
     //     of guessing from a bare TCP RST.
     let close_tx = outbound_tx.clone();
-    let (inbound_tx, inbound_rx) =
-        mpsc::channel::<anyhow::Result<WsRequest>>(16);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<anyhow::Result<WsRequest>>(16);
     let reader = tokio::spawn(async move {
         let mut ws_rx = ws_rx;
         while let Some(item) = ws_rx.next().await {

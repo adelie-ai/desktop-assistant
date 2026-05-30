@@ -54,9 +54,7 @@ pub(crate) mod testing {
 
     impl UserEnvGuard {
         pub(crate) fn set(value: &str) -> Self {
-            let lock = USER_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let lock = USER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var("USER").ok();
             // SAFETY: env access is process-global; the lock above
             // serializes every test that touches `$USER`.
@@ -67,9 +65,7 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn unset() -> Self {
-            let lock = USER_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let lock = USER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var("USER").ok();
             unsafe {
                 std::env::remove_var("USER");

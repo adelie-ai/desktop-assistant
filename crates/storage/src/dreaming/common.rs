@@ -104,10 +104,7 @@ pub async fn load_new_transcript(
 /// Returns an empty string if the conversation has been hard-deleted —
 /// callers must handle that case (consolidation falls through to KB-only
 /// judgment). Scoped to the task-local user id.
-pub async fn load_full_transcript(
-    pool: &PgPool,
-    conversation_id: &str,
-) -> Result<String, String> {
+pub async fn load_full_transcript(pool: &PgPool, conversation_id: &str) -> Result<String, String> {
     let user_id = current_user_id();
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT role, content FROM messages \

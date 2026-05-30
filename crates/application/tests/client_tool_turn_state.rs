@@ -19,11 +19,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::client_tools::{
-    register_client_tools, resolve_client_tool_result, suspend_for_client_tool,
-    ClientToolCoordinator, ClientToolResolutionError,
-};
 use desktop_assistant_application::EventSink;
+use desktop_assistant_application::client_tools::{
+    ClientToolCoordinator, ClientToolResolutionError, register_client_tools,
+    resolve_client_tool_result, suspend_for_client_tool,
+};
 use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::with_user_id;
@@ -340,7 +340,10 @@ async fn turn_cross_user_isolation_blocks_resume_by_other_user() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, ClientToolResolutionError::TurnNotFound { .. }));
+    assert!(matches!(
+        err,
+        ClientToolResolutionError::TurnNotFound { .. }
+    ));
 
     // Alice's suspension is still pending.
     assert!(!suspended.is_finished());
@@ -470,7 +473,10 @@ async fn resolve_with_no_pending_suspension_is_a_clean_error() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, ClientToolResolutionError::TurnNotFound { .. }));
+    assert!(matches!(
+        err,
+        ClientToolResolutionError::TurnNotFound { .. }
+    ));
 }
 
 /// `unregistered_tool_called_by_llm_is_an_error`: the suspension path
@@ -714,7 +720,10 @@ async fn cancellation_during_client_tool_suspension_returns_cancelled() {
     token_for_cancel.cancel();
 
     let outcome = suspended.await.unwrap();
-    assert!(outcome.is_err(), "cancelled suspension must surface an error");
+    assert!(
+        outcome.is_err(),
+        "cancelled suspension must surface an error"
+    );
     let err = outcome.unwrap_err();
     let s = err.to_string();
     assert!(

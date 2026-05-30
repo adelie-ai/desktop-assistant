@@ -268,10 +268,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl AssistantApiHandler for RecordingHandler {
-            async fn handle_command(
-                &self,
-                cmd: api::Command,
-            ) -> ApiResult<api::CommandResult> {
+            async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult> {
                 self.seen
                     .lock()
                     .unwrap()
@@ -288,16 +285,14 @@ mod tests {
                     }
                     api::Command::CreateKnowledgeEntry { .. }
                     | api::Command::UpdateKnowledgeEntry { .. } => {
-                        api::CommandResult::KnowledgeEntryWritten(
-                            api::KnowledgeEntryView {
-                                id: "kb".into(),
-                                content: "".into(),
-                                tags: vec![],
-                                metadata: serde_json::Value::Null,
-                                created_at: "2026-05-27T00:00:00Z".into(),
-                                updated_at: "2026-05-27T00:00:00Z".into(),
-                            },
-                        )
+                        api::CommandResult::KnowledgeEntryWritten(api::KnowledgeEntryView {
+                            id: "kb".into(),
+                            content: "".into(),
+                            tags: vec![],
+                            metadata: serde_json::Value::Null,
+                            created_at: "2026-05-27T00:00:00Z".into(),
+                            updated_at: "2026-05-27T00:00:00Z".into(),
+                        })
                     }
                     api::Command::DeleteKnowledgeEntry { .. } => api::CommandResult::Ack,
                     _ => api::CommandResult::Ack,

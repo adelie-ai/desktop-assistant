@@ -187,8 +187,7 @@ async fn list_tasks_via_dbus_returns_registered_tasks() {
 async fn list_tasks_treats_limit_zero_as_unbounded() {
     // `limit: 0` from D-Bus is the natural "no cap" sentinel; the
     // wire shape carries Option<u32>, so the adapter maps 0 -> None.
-    let transport =
-        StubTransport::new(vec![Ok(api::CommandResult::BackgroundTasks(Vec::new()))]);
+    let transport = StubTransport::new(vec![Ok(api::CommandResult::BackgroundTasks(Vec::new()))]);
     let adapter = DbusBackgroundTasksAdapter::new(Arc::clone(&transport) as Arc<_>);
     let _ = adapter.list_tasks(false, 0).await;
     let cmds = transport.commands().await;
@@ -225,10 +224,7 @@ async fn get_task_via_dbus_returns_task_dict() {
 async fn cancel_task_via_dbus_propagates_to_daemon() {
     let transport = StubTransport::new(vec![Ok(api::CommandResult::Ack)]);
     let adapter = DbusBackgroundTasksAdapter::new(Arc::clone(&transport) as Arc<_>);
-    adapter
-        .cancel_task("t-7")
-        .await
-        .expect("cancel_task ok");
+    adapter.cancel_task("t-7").await.expect("cancel_task ok");
     let cmds = transport.commands().await;
     match &cmds[0] {
         api::Command::CancelBackgroundTask { id } => assert_eq!(id, "t-7"),
@@ -238,16 +234,17 @@ async fn cancel_task_via_dbus_propagates_to_daemon() {
 
 #[tokio::test]
 async fn get_task_logs_returns_entries_and_next_seq() {
-    let entries = vec![sample_log_entry(1), sample_log_entry(2), sample_log_entry(3)];
+    let entries = vec![
+        sample_log_entry(1),
+        sample_log_entry(2),
+        sample_log_entry(3),
+    ];
     let transport = StubTransport::new(vec![Ok(api::CommandResult::BackgroundTaskLogs {
         entries: entries.clone(),
         next_seq: 4,
     })]);
     let adapter = DbusBackgroundTasksAdapter::new(Arc::clone(&transport) as Arc<_>);
-    let (returned, next_seq) = adapter
-        .get_task_logs("t-7", 0, 200)
-        .await
-        .expect("logs ok");
+    let (returned, next_seq) = adapter.get_task_logs("t-7", 0, 200).await.expect("logs ok");
     assert_eq!(returned.len(), 3);
     assert_eq!(next_seq, 4);
     let seq0: u64 = returned[0]
@@ -497,9 +494,7 @@ async fn event_translator_routes_task_completed_with_no_error() {
     };
     match translate(event) {
         ForwardAction::TaskCompleted {
-            status,
-            last_error,
-            ..
+            status, last_error, ..
         } => {
             assert_eq!(status, "completed");
             assert_eq!(last_error, "");
@@ -783,8 +778,9 @@ impl ZbusPair {
         let client_builder = zbus::connection::Builder::unix_stream(s1).p2p();
         // Both ends handshake against each other; driving them
         // concurrently avoids a build-side deadlock.
-        let (server, client) = futures_util::try_join!(server_builder.build(), client_builder.build())
-            .expect("p2p pair built");
+        let (server, client) =
+            futures_util::try_join!(server_builder.build(), client_builder.build())
+                .expect("p2p pair built");
 
         let adapter = DbusBackgroundTasksAdapter::new(Arc::clone(&transport));
         server

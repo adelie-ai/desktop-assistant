@@ -4,9 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use desktop_assistant_auth_jwt as auth_jwt;
-use desktop_assistant_jwt_minter::config::{
-    MAX_TTL_SECS, MIN_TTL_SECS, MintConfig,
-};
+use desktop_assistant_jwt_minter::config::{MAX_TTL_SECS, MIN_TTL_SECS, MintConfig};
 use desktop_assistant_jwt_minter::group::{self, uid_in_groups};
 use desktop_assistant_jwt_minter::peer::{self, PeerIdentity};
 use desktop_assistant_jwt_minter::request::{MintResponse, handle_request};
@@ -67,13 +65,8 @@ async fn minted_token_round_trips_through_daemon_validator() {
 
     // Independently re-read the key file — same path the daemon uses.
     let key_b = auth_jwt::read_signing_key_at(&cfg.signing_key_path).expect("read key");
-    let claims = auth_jwt::decode(
-        &token,
-        &key_b,
-        &cfg.issuer,
-        &cfg.default_audience,
-    )
-    .expect("daemon-style decode");
+    let claims = auth_jwt::decode(&token, &key_b, &cfg.issuer, &cfg.default_audience)
+        .expect("daemon-style decode");
     assert_eq!(claims.sub, peer.username);
     assert_eq!(claims.iss, cfg.issuer);
     assert_eq!(claims.aud, cfg.default_audience);
@@ -109,8 +102,7 @@ fn malformed_input_returns_error_json_not_panic() {
         "{\"ttl_seconds\": \"not a number\"}",
     ] {
         let raw = handle_request(bad, &peer, &cfg, &signing_key);
-        let resp: MintResponse =
-            serde_json::from_str(&raw).expect("response is valid JSON");
+        let resp: MintResponse = serde_json::from_str(&raw).expect("response is valid JSON");
         assert!(
             resp.error.is_some(),
             "expected error for input {bad:?}, got {raw}"
@@ -215,7 +207,10 @@ fn nonexistent_group_at_startup_is_a_clean_error() {
     // A name astronomically unlikely to exist on any system.
     let name = "adelie-nosuch-group-zzzzzzzzzzzzzzzz";
     let result = group::resolve_group(name).expect("syscall ok");
-    assert!(result.is_none(), "expected no group named {name}, got {result:?}");
+    assert!(
+        result.is_none(),
+        "expected no group named {name}, got {result:?}"
+    );
 }
 
 #[test]
@@ -259,10 +254,7 @@ async fn end_to_end_server_mints_token_for_local_client() {
     }
 
     let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
-    stream
-        .write_all(b"{}\n")
-        .await
-        .expect("write request");
+    stream.write_all(b"{}\n").await.expect("write request");
 
     let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();

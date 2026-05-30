@@ -46,9 +46,7 @@ impl<T: BridgeTransport + 'static> DbusConnectionsAdapter<T> {
     async fn list_connections(&self) -> fdo::Result<String> {
         let result = self.dispatch(api::Command::ListConnections).await?;
         match &result {
-            api::CommandResult::Connections(_) => {
-                serde_json::to_string(&result).map_err(to_fdo)
-            }
+            api::CommandResult::Connections(_) => serde_json::to_string(&result).map_err(to_fdo),
             other => Err(fdo::Error::Failed(format!(
                 "unexpected ListConnections result: {other:?}"
             ))),
@@ -141,8 +139,7 @@ impl<T: BridgeTransport + 'static> DbusConnectionsAdapter<T> {
     async fn set_purpose(&self, purpose: &str, config_json: &str) -> fdo::Result<()> {
         let purpose: api::PurposeKindApi = serde_json::from_str(&format!("\"{purpose}\""))
             .map_err(|e| fdo::Error::Failed(format!("invalid purpose '{purpose}': {e}")))?;
-        let config: api::PurposeConfigView =
-            serde_json::from_str(config_json).map_err(to_fdo)?;
+        let config: api::PurposeConfigView = serde_json::from_str(config_json).map_err(to_fdo)?;
         let result = self
             .dispatch(api::Command::SetPurpose { purpose, config })
             .await?;

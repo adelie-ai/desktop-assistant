@@ -158,8 +158,7 @@ pub async fn dispatch_loop<R, W>(
             } => {
                 // Per-request id for event correlation (matches old WS path).
                 let request_id = uuid::Uuid::new_v4().to_string();
-                let sink: Arc<dyn EventSink> =
-                    Arc::new(ChannelEventSink::new(out_tx.clone()));
+                let sink: Arc<dyn EventSink> = Arc::new(ChannelEventSink::new(out_tx.clone()));
 
                 // Prefer the new `start_send_message` registration
                 // path so the ack can carry the registered task id
@@ -188,9 +187,7 @@ pub async fn dispatch_loop<R, W>(
                         if out_tx
                             .send(WsFrame::Result {
                                 id: req.id.clone(),
-                                result: api::CommandResult::SendMessageAck {
-                                    task_id: id.0,
-                                },
+                                result: api::CommandResult::SendMessageAck { task_id: id.0 },
                             })
                             .await
                             .is_err()
@@ -276,11 +273,7 @@ pub async fn dispatch_loop<R, W>(
                     }
                     continue;
                 }
-                let receiver = with_user_id(
-                    user_id.clone(),
-                    handler.subscribe_user_events(),
-                )
-                .await;
+                let receiver = with_user_id(user_id.clone(), handler.subscribe_user_events()).await;
                 let Some(mut receiver) = receiver else {
                     // No-op handler → no event source. Surface as a
                     // clean error frame so the client knows
@@ -416,8 +409,7 @@ pub async fn dispatch_loop<R, W>(
             }
 
             other => {
-                let res =
-                    with_user_id(user_id.clone(), handler.handle_command(other)).await;
+                let res = with_user_id(user_id.clone(), handler.handle_command(other)).await;
                 match res {
                     Ok(result) => {
                         if out_tx

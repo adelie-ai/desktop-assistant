@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use desktop_assistant_auth_jwt::{self as auth_jwt, Claims};
 use serde::{Deserialize, Serialize};
 

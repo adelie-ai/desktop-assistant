@@ -7,7 +7,7 @@
 
 use std::ffi::CStr;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use tokio::net::UnixStream;
 
 /// The OS identity of a connected peer.
@@ -24,8 +24,8 @@ pub fn extract_peer_identity(stream: &UnixStream) -> anyhow::Result<PeerIdentity
         .peer_cred()
         .context("failed to read SO_PEERCRED from peer socket")?;
     let uid = cred.uid();
-    let username = username_for_uid(uid)?
-        .ok_or_else(|| anyhow!("no passwd entry for uid {uid}"))?;
+    let username =
+        username_for_uid(uid)?.ok_or_else(|| anyhow!("no passwd entry for uid {uid}"))?;
     Ok(PeerIdentity { uid, username })
 }
 

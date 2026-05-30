@@ -130,9 +130,12 @@ impl Fixture {
             .connect(&self.admin_url)
             .await
         {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{}\" CASCADE", self.schema)))
-                .execute(&admin)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA \"{}\" CASCADE",
+                self.schema
+            )))
+            .execute(&admin)
+            .await;
             admin.close().await;
         }
     }
@@ -310,12 +313,8 @@ async fn select_messages_does_not_leak_other_users_content() {
             seed_two_users(&fx.pool).await;
 
             let result = with_user_id(UserId::new("bob"), async {
-                execute_database_query(
-                    &fx.pool,
-                    "SELECT content FROM messages ORDER BY id",
-                    100,
-                )
-                .await
+                execute_database_query(&fx.pool, "SELECT content FROM messages ORDER BY id", 100)
+                    .await
             })
             .await
             .expect("query succeeds");
@@ -360,9 +359,7 @@ async fn business_outcome_llm_cannot_exfiltrate_other_users_messages() {
             let pool = fx.pool.clone();
             let query_fn: DbQueryFn = Arc::new(move |sql, limit| {
                 let pool = pool.clone();
-                Box::pin(async move {
-                    execute_database_query(&pool, &sql, limit).await
-                })
+                Box::pin(async move { execute_database_query(&pool, &sql, limit).await })
             });
 
             let service = BuiltinToolService::new().with_database(query_fn);
@@ -461,12 +458,8 @@ async fn qualified_drop_against_public_is_rejected() {
         |fx| async move {
             seed_two_users(&fx.pool).await;
 
-            let result = execute_database_query(
-                &fx.pool,
-                "DROP TABLE public.conversations",
-                100,
-            )
-            .await;
+            let result =
+                execute_database_query(&fx.pool, "DROP TABLE public.conversations", 100).await;
             assert!(
                 matches!(result, Err(CoreError::ToolExecution(_))),
                 "qualified DROP against public must be rejected, got {result:?}"
@@ -493,12 +486,8 @@ async fn compound_statement_is_rejected() {
     with_fixture("compound_statement_is_rejected", |fx| async move {
         seed_two_users(&fx.pool).await;
 
-        let result = execute_database_query(
-            &fx.pool,
-            "SELECT 1; DROP TABLE conversations",
-            100,
-        )
-        .await;
+        let result =
+            execute_database_query(&fx.pool, "SELECT 1; DROP TABLE conversations", 100).await;
         assert!(
             matches!(result, Err(CoreError::ToolExecution(_))),
             "compound statement must be rejected, got {result:?}"
@@ -508,7 +497,10 @@ async fn compound_statement_is_rejected() {
             .fetch_one(&fx.pool)
             .await
             .expect("count after rejected compound");
-        assert_eq!(count.0, 2, "rejected compound must not have dropped the table");
+        assert_eq!(
+            count.0, 2,
+            "rejected compound must not have dropped the table"
+        );
         fx
     })
     .await;
@@ -554,12 +546,8 @@ async fn non_select_statement_against_personal_data_is_rejected() {
             );
 
             // Qualified DELETE — same.
-            let r = execute_database_query(
-                &fx.pool,
-                "DELETE FROM public.messages WHERE 1=1",
-                100,
-            )
-            .await;
+            let r = execute_database_query(&fx.pool, "DELETE FROM public.messages WHERE 1=1", 100)
+                .await;
             assert!(
                 matches!(r, Err(CoreError::ToolExecution(_))),
                 "qualified DELETE against public.messages must be rejected, got {r:?}"
@@ -597,7 +585,10 @@ async fn select_against_system_catalog_passes_through_ungrafted() {
             .expect("system-catalog read should succeed");
 
             let rows = result["rows"].as_array().expect("rows array");
-            assert!(!rows.is_empty(), "expected at least one row from pg_catalog");
+            assert!(
+                !rows.is_empty(),
+                "expected at least one row from pg_catalog"
+            );
             fx
         },
     )

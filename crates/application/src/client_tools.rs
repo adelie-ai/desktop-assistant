@@ -73,9 +73,7 @@ pub enum ClientToolResolutionError {
     /// `tool_call_id` recorded in the suspended turn's state. Likely a
     /// confused client; the daemon refuses rather than feeding the
     /// LLM a result it didn't ask for.
-    #[error(
-        "tool_call_id mismatch for task_id={task_id}: expected={expected}, got={got}"
-    )]
+    #[error("tool_call_id mismatch for task_id={task_id}: expected={expected}, got={got}")]
     ToolCallIdMismatch {
         task_id: String,
         expected: String,
@@ -230,12 +228,7 @@ pub async fn suspend_for_client_tool(
         pending_client_tool: Some(pending_call.clone()),
     };
     store
-        .update_turn(
-            &task_id.0,
-            TurnStatus::PendingClientTool,
-            &state,
-            None,
-        )
+        .update_turn(&task_id.0, TurnStatus::PendingClientTool, &state, None)
         .await?;
 
     // Step 3: emit the wire event.
@@ -347,11 +340,12 @@ pub async fn resolve_client_tool_result(
     // 2 & 3: look up slot, check user_id + tool_call_id, take the waker.
     let slot = {
         let mut pending = coord.pending.lock().unwrap();
-        let slot = pending.get(&task_id.0).ok_or_else(|| {
-            ClientToolResolutionError::TurnNotFound {
-                task_id: task_id.0.clone(),
-            }
-        })?;
+        let slot =
+            pending
+                .get(&task_id.0)
+                .ok_or_else(|| ClientToolResolutionError::TurnNotFound {
+                    task_id: task_id.0.clone(),
+                })?;
         if slot.user_id != user_id.as_str() {
             // Cross-user probe: claim the row doesn't exist.
             return Err(ClientToolResolutionError::TurnNotFound {

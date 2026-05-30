@@ -243,11 +243,7 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
     /// and the daemon's id is what shows up on the signal — same as
     /// the in-process adapter where the dbus-interface created its
     /// own request id.
-    async fn send_prompt(
-        &self,
-        conversation_id: &str,
-        prompt: &str,
-    ) -> fdo::Result<String> {
+    async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> fdo::Result<String> {
         let result = self
             .dispatch(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),

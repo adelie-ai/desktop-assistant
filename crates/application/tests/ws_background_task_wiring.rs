@@ -194,10 +194,7 @@ impl SettingsService for FakeSettings {
     ) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn get_connector_defaults(
-        &self,
-        _c: String,
-    ) -> Result<ConnectorDefaultsView, CoreError> {
+    async fn get_connector_defaults(&self, _c: String) -> Result<ConnectorDefaultsView, CoreError> {
         Ok(ConnectorDefaultsView {
             llm_model: "m".into(),
             llm_base_url: "u".into(),
@@ -231,11 +228,7 @@ impl SettingsService for FakeSettings {
             max_connections: 5,
         })
     }
-    async fn set_database_settings(
-        &self,
-        _u: Option<String>,
-        _m: u32,
-    ) -> Result<(), CoreError> {
+    async fn set_database_settings(&self, _u: Option<String>, _m: u32) -> Result<(), CoreError> {
         Ok(())
     }
     async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {
@@ -358,10 +351,7 @@ impl RecordingConversations {
 
 impl ConversationService for RecordingConversations {
     async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
-        let id = format!(
-            "conv-{}",
-            self.next_conv_id.fetch_add(1, Ordering::SeqCst)
-        );
+        let id = format!("conv-{}", self.next_conv_id.fetch_add(1, Ordering::SeqCst));
         Ok(Conversation::new(id, title))
     }
     async fn list_conversations(
@@ -383,11 +373,7 @@ impl ConversationService for RecordingConversations {
     async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn rename_conversation(
-        &self,
-        _id: &ConversationId,
-        _t: String,
-    ) -> Result<(), CoreError> {
+    async fn rename_conversation(&self, _id: &ConversationId, _t: String) -> Result<(), CoreError> {
         Ok(())
     }
     async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
@@ -1020,13 +1006,7 @@ async fn start_send_message_returns_none_without_registry() {
 
     let result = with_user_id(user, async {
         handler
-            .start_send_message(
-                "conv-x".into(),
-                "hello".into(),
-                None,
-                "req-1".into(),
-                sink,
-            )
+            .start_send_message("conv-x".into(), "hello".into(), None, "req-1".into(), sink)
             .await
     })
     .await

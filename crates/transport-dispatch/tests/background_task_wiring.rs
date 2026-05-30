@@ -22,9 +22,7 @@ use std::time::Duration;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::background_tasks::BackgroundTaskRegistry;
-use desktop_assistant_application::{
-    ApiError, ApiResult, AssistantApiHandler, EventSink, UserId,
-};
+use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink, UserId};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_transport_dispatch::{AuthContext, WsFrame, WsRequest, dispatch_loop};
 use futures::channel::mpsc;
@@ -86,9 +84,12 @@ impl AssistantApiHandler for RegistryHandler {
                     after_seq.unwrap_or(0),
                     limit.unwrap_or(200),
                 )
-                .map(|(entries, next_seq)| {
-                    api::CommandResult::BackgroundTaskLogs { entries, next_seq }
-                })
+                .map(
+                    |(entries, next_seq)| api::CommandResult::BackgroundTaskLogs {
+                        entries,
+                        next_seq,
+                    },
+                )
                 .map_err(|e| ApiError::Core(e.to_string())),
             api::Command::SubscribeBackgroundTasks => Ok(api::CommandResult::Ack),
             api::Command::UnsubscribeBackgroundTasks => Ok(api::CommandResult::Ack),

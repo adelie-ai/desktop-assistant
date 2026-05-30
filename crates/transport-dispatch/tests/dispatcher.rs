@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink};
-use desktop_assistant_transport_dispatch::{
-    AuthContext, WsFrame, WsRequest, dispatch_loop,
-};
+use desktop_assistant_transport_dispatch::{AuthContext, WsFrame, WsRequest, dispatch_loop};
 use futures::channel::mpsc;
 use futures::stream;
 

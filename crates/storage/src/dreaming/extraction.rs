@@ -28,9 +28,7 @@ use super::common::{
 };
 use super::types::{BackfillEmbedFn, DreamingLlmFn};
 use crate::kb_metadata::{KbMetadata, KbScope};
-use crate::tag_registry::{
-    self, CreateTagOutcome, TagProposal, TagRecord, normalize_tag_name,
-};
+use crate::tag_registry::{self, CreateTagOutcome, TagProposal, TagRecord, normalize_tag_name};
 
 /// Run the extraction phase. Returns the count of new facts written.
 pub async fn run_extraction_phase(
@@ -102,8 +100,7 @@ async fn process_one_conversation_for_extraction(
     // Tag registry is per-user (#102 PK is `(user_id, name)`); the
     // task-local scope already picks the right partition.
     let registry = tag_registry::list_active_tags(pool).await?;
-    let registry_names: BTreeSet<String> =
-        registry.iter().map(|t| t.name.clone()).collect();
+    let registry_names: BTreeSet<String> = registry.iter().map(|t| t.name.clone()).collect();
 
     let max_ordinal = get_max_ordinal(pool, conv_id).await?;
     if max_ordinal <= watermark {
@@ -188,10 +185,7 @@ fn parse_extraction_response(response: &str) -> Vec<ExtractedFactProposal> {
         }
     };
 
-    facts_array
-        .into_iter()
-        .filter_map(parse_one_fact)
-        .collect()
+    facts_array.into_iter().filter_map(parse_one_fact).collect()
 }
 
 fn parse_one_fact(value: serde_json::Value) -> Option<ExtractedFactProposal> {
@@ -245,11 +239,7 @@ fn parse_tag_proposal(value: &serde_json::Value) -> Option<TagProposal> {
     if name.is_empty() {
         return None;
     }
-    let description = obj
-        .get("description")?
-        .as_str()?
-        .trim()
-        .to_string();
+    let description = obj.get("description")?.as_str()?.trim().to_string();
     if description.is_empty() {
         return None;
     }
@@ -306,7 +296,11 @@ async fn write_extracted_fact(
             Ok(CreateTagOutcome::Created(TagRecord { name, .. })) => {
                 final_tags.insert(name);
             }
-            Ok(CreateTagOutcome::RedirectedTo { existing, distance, proposed_name }) => {
+            Ok(CreateTagOutcome::RedirectedTo {
+                existing,
+                distance,
+                proposed_name,
+            }) => {
                 tracing::debug!(
                     "dreaming: tag '{proposed_name}' redirected to '{}' (distance={distance:.3})",
                     existing.name
@@ -410,9 +404,7 @@ fn build_extraction_system_prompt(registry: &[TagRecord]) -> String {
     );
 
     if registry.is_empty() {
-        prompt.push_str(
-            "(registry is empty — propose new_tags freely with clear descriptions)\n",
-        );
+        prompt.push_str("(registry is empty — propose new_tags freely with clear descriptions)\n");
     } else {
         for tag in registry {
             prompt.push_str(&format!("- `{}`: {}", tag.name, tag.description));
@@ -560,14 +552,12 @@ mod tests {
 
     #[test]
     fn prompt_includes_registered_tag_descriptions() {
-        let registry = vec![
-            TagRecord {
-                name: "preference".into(),
-                description: "User preferences for tools or workflows.".into(),
-                examples: vec!["prefers vim".into()],
-                distinguish_from: vec![],
-            },
-        ];
+        let registry = vec![TagRecord {
+            name: "preference".into(),
+            description: "User preferences for tools or workflows.".into(),
+            examples: vec!["prefers vim".into()],
+            distinguish_from: vec![],
+        }];
         let prompt = build_extraction_system_prompt(&registry);
         assert!(prompt.contains("preference"));
         assert!(prompt.contains("User preferences"));

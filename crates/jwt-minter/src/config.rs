@@ -41,9 +41,7 @@ impl MintConfig {
         match requested_seconds {
             None => self.default_ttl,
             Some(secs) => {
-                let secs = secs
-                    .max(self.min_ttl.as_secs())
-                    .min(self.max_ttl.as_secs());
+                let secs = secs.max(self.min_ttl.as_secs()).min(self.max_ttl.as_secs());
                 Duration::from_secs(secs)
             }
         }

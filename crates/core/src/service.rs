@@ -1846,14 +1846,32 @@ mod tests {
         let tool_search_discovery = "builtin_tool_search";
         let skill_search_discovery = "skills_search_skills";
 
-        assert!(instruction.contains(priority_rule), "missing: {priority_rule}");
+        assert!(
+            instruction.contains(priority_rule),
+            "missing: {priority_rule}"
+        );
         assert!(instruction.contains(kb_search), "missing: {kb_search}");
-        assert!(instruction.contains(ambiguity_guard), "missing: {ambiguity_guard}");
+        assert!(
+            instruction.contains(ambiguity_guard),
+            "missing: {ambiguity_guard}"
+        );
         assert!(instruction.contains(no_guessing), "missing: {no_guessing}");
-        assert!(instruction.contains(verify_facts), "missing: {verify_facts}");
-        assert!(instruction.contains(no_fabrication), "missing: {no_fabrication}");
-        assert!(instruction.contains(tool_search_discovery), "missing: {tool_search_discovery}");
-        assert!(instruction.contains(skill_search_discovery), "missing: {skill_search_discovery}");
+        assert!(
+            instruction.contains(verify_facts),
+            "missing: {verify_facts}"
+        );
+        assert!(
+            instruction.contains(no_fabrication),
+            "missing: {no_fabrication}"
+        );
+        assert!(
+            instruction.contains(tool_search_discovery),
+            "missing: {tool_search_discovery}"
+        );
+        assert!(
+            instruction.contains(skill_search_discovery),
+            "missing: {skill_search_discovery}"
+        );
     }
 
     // --- Title generation tests ---

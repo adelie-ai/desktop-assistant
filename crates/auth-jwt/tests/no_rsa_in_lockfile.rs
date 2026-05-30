@@ -58,9 +58,7 @@ fn jsonwebtoken_does_not_depend_on_rsa_in_lockfile() {
         .unwrap_or(rest.len());
     let block = &rest[..block_end];
 
-    let has_rsa_dep = block
-        .lines()
-        .any(|line| line.trim() == "\"rsa\",");
+    let has_rsa_dep = block.lines().any(|line| line.trim() == "\"rsa\",");
 
     assert!(
         !has_rsa_dep,
@@ -97,8 +95,7 @@ fn rsa_crate_absent_from_compiled_workspace_tree() {
     // means `rsa` is absent — the security-relevant property. A present `rsa`
     // would instead print its reverse-dep tree to stdout.
     let absent = stdout.trim().is_empty()
-        && (stderr.contains("nothing to print")
-            || stderr.contains("did not match any packages"));
+        && (stderr.contains("nothing to print") || stderr.contains("did not match any packages"));
 
     assert!(
         absent,

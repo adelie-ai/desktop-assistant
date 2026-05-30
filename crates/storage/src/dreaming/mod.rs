@@ -41,9 +41,7 @@ pub async fn run_dreaming_scan(
         extraction::run_extraction_phase(pool, llm_fn, embed_fn, embedding_model).await?;
 
     tracing::info!("dreaming: phase 2/3 consolidation");
-    match consolidation::run_consolidation_phase(pool, llm_fn, embed_fn, embedding_model)
-        .await
-    {
+    match consolidation::run_consolidation_phase(pool, llm_fn, embed_fn, embedding_model).await {
         Ok(stats) => {
             if stats.merged_clusters > 0
                 || stats.updated > 0

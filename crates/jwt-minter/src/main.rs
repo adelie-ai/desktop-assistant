@@ -10,8 +10,7 @@ use anyhow::{Context, anyhow};
 use clap::Parser;
 use desktop_assistant_auth_jwt as auth_jwt;
 use desktop_assistant_jwt_minter::config::{
-    DEFAULT_AUDIENCE, DEFAULT_ISSUER, DEFAULT_TTL_SECS, MAX_TTL_SECS, MIN_TTL_SECS,
-    MintConfig,
+    DEFAULT_AUDIENCE, DEFAULT_ISSUER, DEFAULT_TTL_SECS, MAX_TTL_SECS, MIN_TTL_SECS, MintConfig,
 };
 use desktop_assistant_jwt_minter::group::resolve_group;
 use desktop_assistant_jwt_minter::server::{ServerOptions, serve};
@@ -22,7 +21,7 @@ use tokio::signal::unix::{SignalKind, signal};
 #[command(
     name = "adelie-mint",
     about = "Mint short-lived HS256 JWTs for local clients identified via SO_PEERCRED.",
-    version,
+    version
 )]
 struct Cli {
     /// Path to the UDS to listen on. Defaults to
@@ -110,8 +109,8 @@ async fn main() -> anyhow::Result<()> {
     let group_gate = match cli.group.as_deref() {
         None => None,
         Some(name) => {
-            let resolved = resolve_group(name)
-                .with_context(|| format!("group lookup for {name:?} failed"))?;
+            let resolved =
+                resolve_group(name).with_context(|| format!("group lookup for {name:?} failed"))?;
             match resolved {
                 Some(gate) => {
                     tracing::info!(group = %gate.name, gid = gate.gid, "group gate active");
@@ -136,12 +135,10 @@ async fn main() -> anyhow::Result<()> {
     serve(options, config, shutdown).await
 }
 
-fn build_shutdown_signal()
--> anyhow::Result<impl std::future::Future<Output = ()> + Send + 'static> {
-    let mut sigterm =
-        signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-    let mut sigint =
-        signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+fn build_shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()> + Send + 'static>
+{
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     Ok(async move {
         tokio::select! {
             _ = sigterm.recv() => {
