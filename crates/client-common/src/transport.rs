@@ -4,6 +4,7 @@ use desktop_assistant_api_model as api;
 use tokio::sync::mpsc;
 
 use crate::auth::resolve_ws_bearer_token;
+use crate::commands::AssistantCommands;
 use crate::config::{ConnectionConfig, TransportMode};
 use crate::signal::SignalEvent;
 use crate::types::{ConversationDetail, ConversationSummary};
