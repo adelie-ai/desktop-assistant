@@ -280,6 +280,9 @@ mod tests {
 
     #[derive(Default)]
     struct InMemoryStore {
+        // Captures the exact arg tuple of `KnowledgeBaseStore::write` for test
+        // assertions; a type alias would just rename the method's own shape.
+        #[allow(clippy::type_complexity)]
         entries: Mutex<Vec<(KnowledgeEntry, Option<Vec<Vec<f32>>>, Option<String>)>>,
     }
 

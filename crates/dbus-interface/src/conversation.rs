@@ -811,7 +811,7 @@ mod tests {
 
         // Simulate GetMessages with include_roles=["user", "assistant"].
         let total = conv.messages.len() as u32;
-        let include = vec!["user".to_string(), "assistant".to_string()];
+        let include = ["user".to_string(), "assistant".to_string()];
         let all: Vec<(String, String)> = conv
             .messages
             .iter()
@@ -896,7 +896,7 @@ mod tests {
             .await
             .unwrap();
         let total = conv.messages.len() as u32; // 4 raw
-        let include = vec!["user".to_string(), "assistant".to_string()];
+        let include = ["user".to_string(), "assistant".to_string()];
         let all: Vec<(String, String)> = conv
             .messages
             .iter()

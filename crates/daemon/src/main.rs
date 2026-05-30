@@ -1,3 +1,5 @@
+//! Assistant daemon binary: wires the core services to storage, LLM connectors, and transports.
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -1808,12 +1810,12 @@ mod tests {
     #[test]
     fn transport_defaults_are_local_first() {
         // Local-first policy: WebSocket off, D-Bus best-effort (not required),
-        // UDS on (Unix).
-        assert!(!transport_defaults::WS_ENABLED, "WS must default off");
-        assert!(
-            !transport_defaults::DBUS_REQUIRED,
-            "D-Bus must be optional by default"
-        );
+        // UDS on (Unix). Bind to locals so the asserts are runtime checks of
+        // the policy constants rather than constant-folded tautologies.
+        let ws_enabled = transport_defaults::WS_ENABLED;
+        let dbus_required = transport_defaults::DBUS_REQUIRED;
+        assert!(!ws_enabled, "WS must default off");
+        assert!(!dbus_required, "D-Bus must be optional by default");
         assert_eq!(transport_defaults::uds_enabled(), cfg!(unix));
 
         // The env knobs still flip each policy.

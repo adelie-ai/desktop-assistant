@@ -311,18 +311,18 @@ impl<L> MaybeProfiled<L> {
         full_content: bool,
     ) -> Self {
         // Env var overrides config entirely (backwards compat).
-        if let Ok(env_path) = std::env::var("LLM_PROFILE_LOG") {
-            if !env_path.is_empty() {
-                let env_full = std::env::var("LLM_PROFILE_FULL")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-                tracing::info!("LLM profiling enabled (env) → {env_path}");
-                return Self::Profiled(ProfilingLlmClient::new(
-                    inner,
-                    PathBuf::from(env_path),
-                    env_full,
-                ));
-            }
+        if let Ok(env_path) = std::env::var("LLM_PROFILE_LOG")
+            && !env_path.is_empty()
+        {
+            let env_full = std::env::var("LLM_PROFILE_FULL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            tracing::info!("LLM profiling enabled (env) → {env_path}");
+            return Self::Profiled(ProfilingLlmClient::new(
+                inner,
+                PathBuf::from(env_path),
+                env_full,
+            ));
         }
 
         if !enabled {
@@ -330,15 +330,15 @@ impl<L> MaybeProfiled<L> {
         }
 
         let resolve_tilde = |p: &str| -> PathBuf {
-            if p.starts_with("~/") {
-                if let Ok(home) = std::env::var("HOME") {
-                    return PathBuf::from(home).join(&p[2..]);
-                }
+            if p.starts_with("~/")
+                && let Ok(home) = std::env::var("HOME")
+            {
+                return PathBuf::from(home).join(&p[2..]);
             }
             PathBuf::from(p)
         };
 
-        let path = log_path.map(|p| resolve_tilde(p)).unwrap_or_else(|| {
+        let path = log_path.map(resolve_tilde).unwrap_or_else(|| {
             let data_dir = std::env::var("XDG_DATA_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {

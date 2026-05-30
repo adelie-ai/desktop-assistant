@@ -1,3 +1,5 @@
+//! D-Bus interface adapters exposing the assistant API over the session bus.
+
 pub mod connections;
 pub mod conversation;
 pub mod knowledge;

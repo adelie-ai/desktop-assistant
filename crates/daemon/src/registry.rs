@@ -420,9 +420,10 @@ mod tests {
         for (id, conn) in pairs {
             raw.insert(id.into_string(), conn);
         }
-        let mut config = DaemonConfig::default();
-        config.connections = raw;
-        config
+        DaemonConfig {
+            connections: raw,
+            ..Default::default()
+        }
     }
 
     fn openai_with_key(key: &str) -> ConnectionConfig {

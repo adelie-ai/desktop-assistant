@@ -1,3 +1,5 @@
+//! Shared client-side transport, config, and command types for the assistant frontends.
+
 pub mod auth;
 pub mod commands;
 pub mod config;

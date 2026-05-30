@@ -1,3 +1,5 @@
+//! Model Context Protocol (MCP) client for discovering and invoking external tool servers.
+
 mod builtin;
 pub mod config;
 pub mod executor;

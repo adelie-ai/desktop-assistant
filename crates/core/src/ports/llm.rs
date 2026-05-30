@@ -698,6 +698,12 @@ impl<K: Ord + Copy> ToolCallAccumulator<K> {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Whether no tool calls have been registered. Test-only.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Decorator that wraps any `LlmClient` and retries on transient rate-limit errors
