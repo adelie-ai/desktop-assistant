@@ -957,7 +957,7 @@ impl Inner {
         user_id: &UserId,
         result: anyhow::Result<()>,
     ) {
-        let (status, last_error) = {
+        let (status, last_error, progress_hint, ended_at, parent_id) = {
             let mut tasks = self.tasks.lock().expect("tasks poisoned");
             let Some(state) = tasks.get_mut(task_id) else {
                 return;
@@ -972,41 +972,20 @@ impl Inner {
                 (Err(e), false) => (api::TaskStatus::Failed, Some(e.to_string())),
             };
             state.view.status = status;
-            state.view.ended_at = Some(now_ms());
+            let ended_at = now_ms();
+            state.view.ended_at = Some(ended_at);
             state.view.last_error = err.clone();
             state.completed = true;
-            (status, err)
+            // Snapshot the fields needed for the post-broadcast persist
+            // and eviction passes; the lock is released at scope end.
+            (
+                status,
+                err,
+                state.view.progress_hint.clone(),
+                ended_at,
+                state.view.parent.clone(),
+            )
         };
-
-        // Emit a lifecycle log line so a late subscriber that only reads
-        // logs still sees the terminal marker.
-        {
-            let mut tasks = self.tasks.lock().expect("tasks poisoned");
-            if let Some(state) = tasks.get_mut(task_id) {
-                let entry = api::TaskLogEntry {
-                    seq: state.next_seq,
-                    timestamp: now_ms(),
-                    level: match status {
-                        api::TaskStatus::Failed => api::LogLevel::Error,
-                        api::TaskStatus::Cancelled => api::LogLevel::Warn,
-                        _ => api::LogLevel::Info,
-                    },
-                    category: api::LogCategory::Lifecycle,
-                    message: match status {
-                        api::TaskStatus::Completed => "task completed".into(),
-                        api::TaskStatus::Cancelled => "task cancelled".into(),
-                        api::TaskStatus::Failed => "task failed".into(),
-                        _ => "task terminated".into(),
-                    },
-                    data: None,
-                };
-                state.next_seq += 1;
-                if state.logs.len() == self.config.log_ring_capacity {
-                    state.logs.pop_front();
-                }
-                state.logs.push_back(entry);
-            }
-        }
 
         self.broadcast(
             user_id,
@@ -1020,26 +999,35 @@ impl Inner {
         // Persist the terminal state. The in-memory broadcast happens
         // first because subscribers don't care about durability — they
         // care about the lifecycle event. Persistence happens after so
-        // a slow DB doesn't gate the wake. The progress_hint snapshot
-        // is read under a tiny critical section, decoupled from the
-        // broadcast above.
-        let (progress_hint, ended_at) = {
-            let tasks = self.tasks.lock().expect("tasks poisoned");
-            let view = tasks.get(task_id).map(|s| s.view.clone());
-            (
-                view.as_ref().and_then(|v| v.progress_hint.clone()),
-                view.and_then(|v| v.ended_at),
-            )
-        };
+        // a slow DB doesn't gate the wake.
         self.persist_update(
             task_id,
             user_id,
             api_status_to_db(status),
             last_error.as_deref(),
             progress_hint.as_deref(),
-            ended_at,
+            Some(ended_at),
         )
         .await;
+
+        // Evict the terminal entry from the in-memory map (#158). The
+        // broadcast has already fired and persistence has completed; a
+        // missed broadcast subscriber can still recover the terminal
+        // state from the persisted row. Holding terminal entries forever
+        // would let the registry grow unbounded over the daemon's
+        // lifetime.
+        //
+        // Done before notify_waiters so that any `wait`er that loops
+        // back into `get`/`list` immediately observes the eviction.
+        {
+            let mut tasks = self.tasks.lock().expect("tasks poisoned");
+            tasks.remove(task_id);
+            if let Some(parent_id) = &parent_id
+                && let Some(parent) = tasks.get_mut(parent_id)
+            {
+                parent.view.children.retain(|c| c != task_id);
+            }
+        }
 
         // Wake waiters.
         let waiter = {
