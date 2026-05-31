@@ -1125,6 +1125,22 @@ mod tests {
         })
     }
 
+    /// Anthropic connection carrying a keyring `secret` reference alongside
+    /// the non-secret `base_url` / `api_key_env`. Used to prove the echoed
+    /// view drops the secret coordinates.
+    fn anthropic_with_secret() -> ConnectionConfig {
+        use crate::config::SecretConfig;
+        ConnectionConfig::Anthropic(crate::connections::AnthropicConnection {
+            base_url: Some("https://api.anthropic.com".into()),
+            api_key_env: Some("ANTHROPIC_WORK_KEY".into()),
+            secret: Some(SecretConfig {
+                account: Some("super-secret-account".into()),
+                entry: Some("super-secret-entry".into()),
+                ..SecretConfig::default()
+            }),
+        })
+    }
+
     fn make_handle_with(cfg: DaemonConfig) -> Arc<RegistryHandle> {
         let registry = build_registry(&cfg);
         Arc::new(RegistryHandle::new(cfg, registry).with_config_path(tmp_config_path()))
@@ -1138,6 +1154,63 @@ mod tests {
         assert_eq!(views.len(), 2);
         assert_eq!(views[0].id, "local");
         assert_eq!(views[1].id, "aws");
+    }
+
+    #[tokio::test]
+    async fn list_connections_echoes_non_secret_config() {
+        let cfg = config_with_connections(&[("aws", bedrock_work())]);
+        let svc = DaemonConnectionsService::new(make_handle_with(cfg));
+        let views = svc.list_connections().await.unwrap();
+        assert_eq!(views.len(), 1);
+
+        let config = views[0]
+            .config
+            .as_ref()
+            .expect("ConnectionView should echo the stored non-secret config");
+        match config {
+            ConnectionConfigPayload::Bedrock {
+                aws_profile,
+                region,
+                base_url,
+            } => {
+                assert_eq!(aws_profile.as_deref(), Some("work"));
+                assert_eq!(region.as_deref(), Some("us-west-2"));
+                assert_eq!(base_url.as_deref(), None);
+            }
+            other => panic!("expected echoed Bedrock config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_connections_echoes_config_without_leaking_secret() {
+        let cfg = config_with_connections(&[("work", anthropic_with_secret())]);
+        let svc = DaemonConnectionsService::new(make_handle_with(cfg));
+        let views = svc.list_connections().await.unwrap();
+        assert_eq!(views.len(), 1);
+
+        let config = views[0]
+            .config
+            .as_ref()
+            .expect("ConnectionView should echo the stored non-secret config");
+        match config {
+            ConnectionConfigPayload::Anthropic {
+                base_url,
+                api_key_env,
+            } => {
+                assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
+                assert_eq!(api_key_env.as_deref(), Some("ANTHROPIC_WORK_KEY"));
+            }
+            other => panic!("expected echoed Anthropic config, got {other:?}"),
+        }
+
+        // The keyring `secret` coordinates (account/entry/etc.) must never
+        // surface in the echoed view. The payload type has no field for them,
+        // so prove it via a full debug-string scan of every view.
+        let dump = format!("{views:?}");
+        assert!(
+            !dump.contains("super-secret-account") && !dump.contains("super-secret-entry"),
+            "echoed ConnectionView leaked secret coordinates: {dump}"
+        );
     }
 
     #[tokio::test]
