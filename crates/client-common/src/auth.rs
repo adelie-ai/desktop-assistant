@@ -151,8 +151,7 @@ mod tests {
     #[test]
     fn derive_login_url_rejects_non_ws_scheme() {
         let error = derive_login_url_from_ws_url("http://example.com/ws")
-            .err()
-            .expect("non-ws scheme should fail");
+            .expect_err("non-ws scheme should fail");
         assert!(error.to_string().contains("ws:// or wss://"));
     }
 }

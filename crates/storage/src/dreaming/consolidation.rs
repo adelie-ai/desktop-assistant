@@ -27,8 +27,8 @@ use sqlx::PgPool;
 use super::common::{extract_json_payload, load_full_transcript};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
-    BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, MAX_REVIEWS_PER_CYCLE,
-    MAX_REVIEW_CANDIDATES, MAX_REVIEW_GENERATION, SOFT_DELETE_TTL_DAYS,
+    BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, MAX_REVIEW_CANDIDATES,
+    MAX_REVIEW_GENERATION, MAX_REVIEWS_PER_CYCLE, SOFT_DELETE_TTL_DAYS,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 
@@ -99,10 +99,7 @@ async fn consolidate_user_focals(
         let candidates = match retrieve_candidates(pool, focal).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
-                    "dreaming: candidate retrieval failed for {}: {e}",
-                    focal.id
-                );
+                tracing::warn!("dreaming: candidate retrieval failed for {}: {e}", focal.id);
                 buffer.mark_reviewed(&focal.id);
                 continue;
             }
@@ -113,8 +110,7 @@ async fn consolidate_user_focals(
         // forever.
         buffer.mark_reviewed(&focal.id);
 
-        let actions = match review_focal(llm_fn, pool, focal, &candidates, false).await
-        {
+        let actions = match review_focal(llm_fn, pool, focal, &candidates, false).await {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!("dreaming: review failed for {}: {e}", focal.id);
@@ -131,8 +127,7 @@ async fn consolidate_user_focals(
 
     // Merge-cluster confirmation + synthesis (outside the apply transaction).
     let clusters = buffer.merge_clusters();
-    let id_to_row: HashMap<String, &KbRow> =
-        focals.iter().map(|r| (r.id.clone(), r)).collect();
+    let id_to_row: HashMap<String, &KbRow> = focals.iter().map(|r| (r.id.clone(), r)).collect();
 
     let mut synthesized: Vec<SynthesizedMerge> = Vec::new();
 
@@ -193,16 +188,13 @@ async fn load_entries_needing_review_by_user(
 
     let mut grouped: BTreeMap<String, Vec<KbRow>> = BTreeMap::new();
     for (user_id, id, content, tags, metadata_json) in rows {
-        grouped
-            .entry(user_id)
-            .or_default()
-            .push(KbRow {
-                id,
-                content,
-                tags,
-                metadata: KbMetadata::from_json(&metadata_json),
-                distance: f64::NAN,
-            });
+        grouped.entry(user_id).or_default().push(KbRow {
+            id,
+            content,
+            tags,
+            metadata: KbMetadata::from_json(&metadata_json),
+            distance: f64::NAN,
+        });
     }
     Ok(grouped.into_iter().collect())
 }
@@ -245,14 +237,13 @@ async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, String
 async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, String> {
     let user_id = current_user_id();
     // Pull the focal's first embedding chunk to use as the similarity probe.
-    let focal_chunk: Option<(Vec<Vector>,)> = sqlx::query_as(
-        "SELECT embedding FROM knowledge_base WHERE user_id = $1 AND id = $2",
-    )
-    .bind(user_id.as_str())
-    .bind(&focal.id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("dreaming: load focal embedding failed: {e}"))?;
+    let focal_chunk: Option<(Vec<Vector>,)> =
+        sqlx::query_as("SELECT embedding FROM knowledge_base WHERE user_id = $1 AND id = $2")
+            .bind(user_id.as_str())
+            .bind(&focal.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("dreaming: load focal embedding failed: {e}"))?;
 
     let probe = match focal_chunk.and_then(|(v,)| v.into_iter().next()) {
         Some(v) => v,
@@ -267,9 +258,8 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
     // Tag-overlap search. Scoped to the same user — candidates from
     // other users' KBs must never reach the LLM's review window.
     if !focal.tags.is_empty() {
-        let tag_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> =
-            sqlx::query_as(
-                "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
+        let tag_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> = sqlx::query_as(
+            "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
                         COALESCE(MIN(u.chunk <=> $1), 2.0) AS distance \
                  FROM knowledge_base kb \
                  LEFT JOIN LATERAL unnest(kb.embedding) AS u(chunk) ON true \
@@ -280,15 +270,15 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
                  GROUP BY kb.id, kb.content, kb.tags, kb.metadata \
                  ORDER BY distance ASC \
                  LIMIT $4",
-            )
-            .bind(&probe)
-            .bind(&focal.id)
-            .bind(&focal.tags)
-            .bind(MAX_REVIEW_CANDIDATES)
-            .bind(user_id.as_str())
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("dreaming: tag-overlap retrieve failed: {e}"))?;
+        )
+        .bind(&probe)
+        .bind(&focal.id)
+        .bind(&focal.tags)
+        .bind(MAX_REVIEW_CANDIDATES)
+        .bind(user_id.as_str())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("dreaming: tag-overlap retrieve failed: {e}"))?;
 
         for (id, content, tags, metadata_json, distance) in tag_rows {
             by_id.insert(
@@ -306,9 +296,8 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
 
     // Embedding-similarity search (catches related-by-content entries
     // that don't share tags). Scoped to the same user.
-    let emb_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> =
-        sqlx::query_as(
-            "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
+    let emb_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> = sqlx::query_as(
+        "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
                     MIN(u.chunk <=> $1) AS distance \
              FROM knowledge_base kb, \
                   LATERAL unnest(kb.embedding) AS u(chunk) \
@@ -319,14 +308,14 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
              GROUP BY kb.id, kb.content, kb.tags, kb.metadata \
              ORDER BY distance ASC \
              LIMIT $3",
-        )
-        .bind(&probe)
-        .bind(&focal.id)
-        .bind(MAX_REVIEW_CANDIDATES)
-        .bind(user_id.as_str())
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("dreaming: embedding retrieve failed: {e}"))?;
+    )
+    .bind(&probe)
+    .bind(&focal.id)
+    .bind(MAX_REVIEW_CANDIDATES)
+    .bind(user_id.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("dreaming: embedding retrieve failed: {e}"))?;
 
     for (id, content, tags, metadata_json, distance) in emb_rows {
         let entry = KbRow {
@@ -445,7 +434,9 @@ async fn review_focal(
         .any(|a| matches!(a, ReviewAction::FetchSource));
     if wants_source && !transcript_included {
         let transcript = if let Some(conv_id) = &focal.metadata.source_conversation_id {
-            load_full_transcript(pool, conv_id).await.unwrap_or_default()
+            load_full_transcript(pool, conv_id)
+                .await
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -596,8 +587,7 @@ fn parse_review_response(response: &str) -> Vec<ReviewAction> {
         },
     };
 
-    let parsed: Vec<ReviewAction> =
-        actions_array.iter().filter_map(parse_one_action).collect();
+    let parsed: Vec<ReviewAction> = actions_array.iter().filter_map(parse_one_action).collect();
     if parsed.is_empty() {
         vec![ReviewAction::Keep]
     } else {
@@ -891,17 +881,14 @@ mod tests {
 
     #[test]
     fn unknown_op_skipped_but_others_kept() {
-        let r = parse_review_response(
-            r#"{"actions":[{"op":"weird"},{"op":"keep"}]}"#,
-        );
+        let r = parse_review_response(r#"{"actions":[{"op":"weird"},{"op":"keep"}]}"#);
         assert_eq!(r.len(), 1);
         assert!(matches!(r[0], ReviewAction::Keep));
     }
 
     #[test]
     fn confirm_ids_filters_to_cluster_membership() {
-        let cluster: BTreeSet<String> =
-            ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let cluster: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let response = r#"{"confirmed": ["a", "b", "d"]}"#;
         let confirmed = parse_confirmed_ids(response, &cluster);
         assert_eq!(confirmed.len(), 2);

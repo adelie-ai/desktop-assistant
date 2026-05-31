@@ -661,7 +661,6 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
 /// it here, because that would force the user to manage two copies of the same
 /// credentials when the common case is "backend tasks share the primary
 /// connector".
-
 pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -686,7 +685,7 @@ pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<
             .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
         file.write_all(content.as_bytes())
             .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]

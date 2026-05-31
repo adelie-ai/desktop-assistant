@@ -1,3 +1,5 @@
+//! AWS Bedrock Converse API connector implementing the core `LlmClient` port.
+
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_bedrock::Client as BedrockControlClient;
@@ -262,10 +264,10 @@ fn aws_profile_exists(name: &str) -> bool {
         (aws_dir.join("config"), config_section.as_str()),
         (aws_dir.join("credentials"), creds_section.as_str()),
     ] {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if contents.contains(needle) {
-                return true;
-            }
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && contents.contains(needle)
+        {
+            return true;
         }
     }
     false
@@ -339,10 +341,9 @@ fn convert_messages(
             }
             Role::User => {
                 // Merge consecutive user messages to maintain alternation.
-                let is_consecutive_user =
-                    api_messages.last().map_or(false, |m: &BedrockMessage| {
-                        m.role() == &ConversationRole::User
-                    });
+                let is_consecutive_user = api_messages
+                    .last()
+                    .is_some_and(|m: &BedrockMessage| m.role() == &ConversationRole::User);
                 if is_consecutive_user {
                     let prev = api_messages.pop().unwrap();
                     let mut builder = BedrockMessage::builder().role(ConversationRole::User);
@@ -1067,11 +1068,11 @@ impl LlmClient for BedrockClient {
                     "skipping ConverseStream: model on the non-streaming-with-tools deny-list"
                 );
             }
-            return self.dispatch_non_streaming(&client, inputs, on_chunk).await;
+            return self.dispatch_non_streaming(client, inputs, on_chunk).await;
         }
 
         match self
-            .dispatch_streaming(&client, &inputs, on_chunk, &cancellation)
+            .dispatch_streaming(client, &inputs, on_chunk, &cancellation)
             .await
         {
             Ok(response) => Ok(response),
@@ -1086,7 +1087,7 @@ impl LlmClient for BedrockClient {
                     .lock()
                     .await
                     .insert(model.clone());
-                self.dispatch_non_streaming(&client, inputs, on_chunk).await
+                self.dispatch_non_streaming(client, inputs, on_chunk).await
             }
             Err(StreamingDispatchError::Other(err)) => Err(err),
         }

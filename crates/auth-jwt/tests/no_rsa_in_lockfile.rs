@@ -58,9 +58,7 @@ fn jsonwebtoken_does_not_depend_on_rsa_in_lockfile() {
         .unwrap_or(rest.len());
     let block = &rest[..block_end];
 
-    let has_rsa_dep = block
-        .lines()
-        .any(|line| line.trim() == "\"rsa\",");
+    let has_rsa_dep = block.lines().any(|line| line.trim() == "\"rsa\",");
 
     assert!(
         !has_rsa_dep,
@@ -90,10 +88,14 @@ fn rsa_crate_absent_from_compiled_workspace_tree() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // `cargo tree` emits "warning: nothing to print." to stderr when
-    // the requested package isn't in the active graph; that's the
-    // success signal here.
-    let absent = stderr.contains("nothing to print") && stdout.trim().is_empty();
+    // Cargo signals "this package isn't in the graph" two different ways
+    // depending on version: older cargo prints "warning: nothing to print."
+    // to stderr (exit 0), while cargo >= 1.x hard-errors with "package ID
+    // specification `rsa` did not match any packages" (exit 101). Either one
+    // means `rsa` is absent — the security-relevant property. A present `rsa`
+    // would instead print its reverse-dep tree to stdout.
+    let absent = stdout.trim().is_empty()
+        && (stderr.contains("nothing to print") || stderr.contains("did not match any packages"));
 
     assert!(
         absent,

@@ -189,10 +189,7 @@ impl SettingsService for FakeSettings {
     ) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn get_connector_defaults(
-        &self,
-        _c: String,
-    ) -> Result<ConnectorDefaultsView, CoreError> {
+    async fn get_connector_defaults(&self, _c: String) -> Result<ConnectorDefaultsView, CoreError> {
         Ok(ConnectorDefaultsView {
             llm_model: "m".into(),
             llm_base_url: "u".into(),
@@ -226,11 +223,7 @@ impl SettingsService for FakeSettings {
             max_connections: 5,
         })
     }
-    async fn set_database_settings(
-        &self,
-        _u: Option<String>,
-        _m: u32,
-    ) -> Result<(), CoreError> {
+    async fn set_database_settings(&self, _u: Option<String>, _m: u32) -> Result<(), CoreError> {
         Ok(())
     }
     async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {
@@ -384,10 +377,7 @@ impl ConversationService for RecordingConversations {
             title: title.clone(),
             user_id_observed: observed,
         });
-        Ok(Conversation::new(
-            self.fixed_conversation_id.clone(),
-            title,
-        ))
+        Ok(Conversation::new(self.fixed_conversation_id.clone(), title))
     }
     async fn list_conversations(
         &self,
@@ -404,18 +394,15 @@ impl ConversationService for RecordingConversations {
         // the last recorded send (if any) and a synthetic response.
         if let Some(last) = self.sends.lock().unwrap().last().cloned() {
             c.messages.push(Message::new(Role::User, last.prompt));
-            c.messages.push(Message::new(Role::Assistant, "ok".to_string()));
+            c.messages
+                .push(Message::new(Role::Assistant, "ok".to_string()));
         }
         Ok(c)
     }
     async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn rename_conversation(
-        &self,
-        _id: &ConversationId,
-        _t: String,
-    ) -> Result<(), CoreError> {
+    async fn rename_conversation(&self, _id: &ConversationId, _t: String) -> Result<(), CoreError> {
         Ok(())
     }
     async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
@@ -615,7 +602,10 @@ async fn standalone_appears_in_registry_with_no_parent() {
     let view = registry.get(&user, &task_id).expect("present");
     assert_eq!(view.parent, None, "standalone tasks have no parent");
     match &view.kind {
-        api::TaskKind::Standalone { name, conversation_id } => {
+        api::TaskKind::Standalone {
+            name,
+            conversation_id,
+        } => {
             assert_eq!(name, "harvester");
             assert!(
                 !conversation_id.is_empty(),

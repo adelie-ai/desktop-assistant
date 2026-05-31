@@ -1,3 +1,5 @@
+//! Assistant daemon binary: wires the core services to storage, LLM connectors, and transports.
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -56,10 +58,7 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
             .unwrap_or(false)
     }
 
-    async fn extract_user_id(
-        &self,
-        token: &str,
-    ) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
         // #105 mapping rule: JWT `sub` → `UserId`. Returns `None` for
         // tokens this validator would reject; the ws-interface
         // handler then falls back to `UserId::default` (the schema
@@ -86,10 +85,7 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
         self.oidc_validator.validate_token(token)
     }
 
-    async fn extract_user_id(
-        &self,
-        token: &str,
-    ) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
         // Resolution order mirrors `validate_bearer_token`: prefer the
         // local HS256 mint (single-tenant desktop primary path), then
         // fall through to OIDC RS256 (multi-tenant deploys). Whichever
@@ -135,10 +131,7 @@ impl uds::UdsAuthValidator for WsAsUdsAuth {
         self.validator.validate_bearer_token(token).await
     }
 
-    async fn extract_user_id(
-        &self,
-        token: &str,
-    ) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
         // Delegate to the same WS validator so UDS and WS share the
         // JWT-to-user_id mapping. The bridge above already enforces
         // uniform validation; #105's identity extraction follows the
@@ -217,13 +210,37 @@ impl<S: SettingsService + 'static> ws::WsLoginService for WsBasicLogin<S> {
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+    parse_env_bool(std::env::var(name).ok().as_deref(), default)
+}
+
+/// Pure parser behind [`env_bool`], split out so the flag semantics are
+/// unit-testable without touching the process environment. `None` (unset) and
+/// unrecognized values fall back to `default`.
+fn parse_env_bool(value: Option<&str>, default: bool) -> bool {
+    match value {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => true,
             "0" | "false" | "no" | "off" => false,
             _ => default,
         },
-        Err(_) => default,
+        None => default,
+    }
+}
+
+/// Local-first transport defaults. Out of the box the daemon serves the local
+/// transports (the D-Bus minter + UDS) and leaves the remote WebSocket
+/// endpoint off until explicitly enabled. Each is overridable via the matching
+/// `DESKTOP_ASSISTANT_*` env var; centralized here so the policy is documented
+/// and pinned by tests.
+mod transport_defaults {
+    /// WebSocket listener is OFF by default (`DESKTOP_ASSISTANT_WS_ENABLED`).
+    pub const WS_ENABLED: bool = false;
+    /// D-Bus is best-effort by default — a missing/unavailable bus logs and
+    /// the daemon continues (`DESKTOP_ASSISTANT_DBUS_REQUIRED`).
+    pub const DBUS_REQUIRED: bool = false;
+    /// UDS is ON by default on Unix targets (`DESKTOP_ASSISTANT_UDS_ENABLED`).
+    pub fn uds_enabled() -> bool {
+        cfg!(unix)
     }
 }
 
@@ -562,6 +579,25 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!(
             "failed to install rustls aws_lc_rs crypto provider"
         ));
+    }
+
+    // Register the system Secret Service as keyring-core's default credential
+    // store so the `keyring`/`libsecret` secret backend can read and write API
+    // keys in-process (replacing the old `secret-tool` subprocess). Connecting
+    // touches D-Bus via a blocking client, so do it off the async worker. When
+    // there's no Secret Service (e.g. headless), log and continue — the
+    // file/systemd/KWallet backends still work without it.
+    match tokio::task::spawn_blocking(zbus_secret_service_keyring_store::Store::new).await {
+        Ok(Ok(store)) => {
+            keyring_core::set_default_store(store);
+            tracing::info!("registered Secret Service credential store");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("Secret Service unavailable; keyring secret backend disabled: {error}");
+        }
+        Err(error) => {
+            tracing::warn!("Secret Service store init task failed: {error}");
+        }
     }
 
     // Build the LLM client from daemon.toml + KWallet (fallback to env)
@@ -1170,9 +1206,9 @@ async fn main() -> Result<()> {
                         Ok(n) => tracing::info!(
                             "dreaming: scan cycle finished in {elapsed:.2?}, wrote {n} new fact(s)"
                         ),
-                        Err(e) => tracing::warn!(
-                            "dreaming: scan cycle failed after {elapsed:.2?}: {e}"
-                        ),
+                        Err(e) => {
+                            tracing::warn!("dreaming: scan cycle failed after {elapsed:.2?}: {e}")
+                        }
                     }
 
                     tokio::select! {
@@ -1396,9 +1432,9 @@ async fn main() -> Result<()> {
         if let Some(pool) = &pg_pool {
             let store: std::sync::Arc<
                 dyn desktop_assistant_core::ports::store::BackgroundTaskStore,
-            > = std::sync::Arc::new(
-                desktop_assistant_storage::PgBackgroundTaskStore::new(pool.clone()),
-            );
+            > = std::sync::Arc::new(desktop_assistant_storage::PgBackgroundTaskStore::new(
+                pool.clone(),
+            ));
             let registry = registry.with_store(store);
             if let Err(e) = registry.sweep_non_terminal_on_startup().await {
                 tracing::warn!(
@@ -1411,24 +1447,26 @@ async fn main() -> Result<()> {
             Arc::new(registry)
         }
     };
-    let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
-        Arc::new(
-            DefaultAssistantApiHandler::new(
-                Arc::new(Assistant),
-                Arc::clone(&conversation_service),
-                Arc::clone(&settings_service),
-                Arc::clone(&connections_service),
-                Arc::clone(&knowledge_service),
-            )
-            .with_registry(Arc::clone(&background_task_registry)),
-        );
+    let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> = Arc::new(
+        DefaultAssistantApiHandler::new(
+            Arc::new(Assistant),
+            Arc::clone(&conversation_service),
+            Arc::clone(&settings_service),
+            Arc::clone(&connections_service),
+            Arc::clone(&knowledge_service),
+        )
+        .with_registry(Arc::clone(&background_task_registry)),
+    );
 
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "org.desktopAssistant".to_string());
-    let dbus_required = env_bool("DESKTOP_ASSISTANT_DBUS_REQUIRED", true);
+    let dbus_required = env_bool(
+        "DESKTOP_ASSISTANT_DBUS_REQUIRED",
+        transport_defaults::DBUS_REQUIRED,
+    );
     tracing::info!("D-Bus well-known name={dbus_service_name}");
     tracing::info!("D-Bus required={dbus_required}");
 
@@ -1504,18 +1542,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    // WebSocket API (remote-friendly). Defaults to localhost only.
-    let ws_bind = std::env::var("DESKTOP_ASSISTANT_WS_BIND")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "127.0.0.1:11339".to_string());
-
-    let ws_addr: std::net::SocketAddr = ws_bind
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid DESKTOP_ASSISTANT_WS_BIND '{ws_bind}': {e}"))?;
-
-    // Build auth validator: OIDC-aware if configured, otherwise local-only
+    // Auth validator: OIDC-aware if configured, otherwise local-only. Built
+    // unconditionally because the UDS frontend reuses it even when the
+    // WebSocket listener is disabled.
     let ws_auth_config = config::get_ws_auth_settings(&config_path).ok();
     let oidc_config = ws_auth_config
         .as_ref()
@@ -1547,133 +1576,163 @@ async fn main() -> Result<()> {
         Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)))
     };
 
-    // Build auth discovery provider
-    let auth_discovery: Option<Arc<dyn ws::WsAuthDiscovery>> =
-        match config::get_ws_auth_discovery(&config_path) {
-            Ok(discovery) => {
-                tracing::info!("auth discovery: methods={:?}", discovery.methods);
-                Some(Arc::new(WsAuthDiscoveryProvider { discovery }))
+    // WebSocket API (remote-friendly). OFF by default: the daemon is
+    // local-first (D-Bus minter + UDS), so the remote WebSocket endpoint —
+    // and its TLS/login/origin machinery — is opt-in via
+    // DESKTOP_ASSISTANT_WS_ENABLED=true.
+    let ws_enabled = env_bool(
+        "DESKTOP_ASSISTANT_WS_ENABLED",
+        transport_defaults::WS_ENABLED,
+    );
+    let (ws_shutdown_tx, ws_task) = if ws_enabled {
+        let ws_bind = std::env::var("DESKTOP_ASSISTANT_WS_BIND")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "127.0.0.1:11339".to_string());
+        let ws_addr: std::net::SocketAddr = ws_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid DESKTOP_ASSISTANT_WS_BIND '{ws_bind}': {e}"))?;
+
+        // Build auth discovery provider
+        let auth_discovery: Option<Arc<dyn ws::WsAuthDiscovery>> =
+            match config::get_ws_auth_discovery(&config_path) {
+                Ok(discovery) => {
+                    tracing::info!("auth discovery: methods={:?}", discovery.methods);
+                    Some(Arc::new(WsAuthDiscoveryProvider { discovery }))
+                }
+                Err(e) => {
+                    tracing::warn!("failed to load auth discovery config: {e}");
+                    None
+                }
+            };
+
+        let ws_login_service: Option<Arc<dyn ws::WsLoginService>> =
+            resolve_ws_login_mode().map(|(username, mode)| {
+                match &mode {
+                    WsLoginMode::StaticPassword(_) => {
+                        tracing::info!(
+                            "Web login enabled (env-password mode) for username={username}"
+                        );
+                    }
+                    WsLoginMode::SystemPassword => {
+                        tracing::info!(
+                            "Web login enabled (local system-password mode) for username={username}"
+                        );
+                    }
+                }
+
+                Arc::new(WsBasicLogin::new(
+                    Arc::clone(&settings_service),
+                    username,
+                    mode,
+                )) as Arc<dyn ws::WsLoginService>
+            });
+        if ws_login_service.is_none() {
+            tracing::warn!(
+                "Web login disabled: set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD or enable local auth via DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true"
+            );
+        }
+
+        let allowed_origins = ws_auth_config
+            .as_ref()
+            .map(|c| c.allowed_origins.clone())
+            .unwrap_or_default();
+        if allowed_origins.is_empty() {
+            tracing::info!(
+                "WebSocket origin policy: browser clients blocked (no allowed_origins configured)"
+            );
+        } else {
+            tracing::info!("WebSocket allowed origins: {allowed_origins:?}");
+        }
+
+        // TLS configuration
+        let tls_config = daemon_config
+            .as_ref()
+            .map(|c| c.tls.clone())
+            .unwrap_or_default();
+        let tls_env_override = std::env::var("DESKTOP_ASSISTANT_WS_TLS")
+            .ok()
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"));
+        let tls_enabled = tls_env_override.unwrap_or(tls_config.enabled);
+
+        let tls_acceptor = if tls_enabled {
+            match tls::setup(
+                tls_config.cert_file.as_deref(),
+                tls_config.key_file.as_deref(),
+            ) {
+                Ok(server_config) => {
+                    tracing::info!(
+                        "TLS enabled; CA cert at {}",
+                        tls::default_ca_cert_path().display()
+                    );
+                    Some(tokio_rustls::TlsAcceptor::from(server_config))
+                }
+                Err(e) => {
+                    tracing::error!("TLS setup failed: {e:#}; falling back to plain ws://");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("failed to load auth discovery config: {e}");
-                None
-            }
+        } else {
+            tracing::info!("TLS disabled; serving plain ws://");
+            None
         };
 
-    let ws_login_service: Option<Arc<dyn ws::WsLoginService>> =
-        resolve_ws_login_mode().map(|(username, mode)| {
-            match &mode {
-                WsLoginMode::StaticPassword(_) => {
-                    tracing::info!("Web login enabled (env-password mode) for username={username}");
+        let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let ws_task = {
+            let api_handler = Arc::clone(&api_handler);
+            let ws_auth = Arc::clone(&ws_auth);
+            tokio::spawn(async move {
+                let shutdown = async {
+                    let _ = ws_shutdown_rx.await;
+                };
+                let result = if let Some(acceptor) = tls_acceptor {
+                    tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
+                    ws::serve_full_tls(
+                        api_handler,
+                        ws_auth,
+                        ws_login_service,
+                        auth_discovery,
+                        allowed_origins,
+                        acceptor,
+                        ws_addr,
+                        shutdown,
+                    )
+                    .await
+                } else {
+                    tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
+                    ws::serve_full(
+                        api_handler,
+                        ws_auth,
+                        ws_login_service,
+                        auth_discovery,
+                        allowed_origins,
+                        ws_addr,
+                        shutdown,
+                    )
+                    .await
+                };
+                if let Err(e) = result {
+                    tracing::error!("WebSocket server error: {e}");
                 }
-                WsLoginMode::SystemPassword => {
-                    tracing::info!(
-                        "Web login enabled (local system-password mode) for username={username}"
-                    );
-                }
-            }
-
-            Arc::new(WsBasicLogin::new(
-                Arc::clone(&settings_service),
-                username,
-                mode,
-            )) as Arc<dyn ws::WsLoginService>
-        });
-    if ws_login_service.is_none() {
-        tracing::warn!(
-            "Web login disabled: set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD or enable local auth via DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true"
-        );
-    }
-
-    let allowed_origins = ws_auth_config
-        .as_ref()
-        .map(|c| c.allowed_origins.clone())
-        .unwrap_or_default();
-    if allowed_origins.is_empty() {
+            })
+        };
+        (Some(ws_shutdown_tx), Some(ws_task))
+    } else {
         tracing::info!(
-            "WebSocket origin policy: browser clients blocked (no allowed_origins configured)"
+            "WebSocket frontend disabled (set DESKTOP_ASSISTANT_WS_ENABLED=true to expose the remote WebSocket API)"
         );
-    } else {
-        tracing::info!("WebSocket allowed origins: {allowed_origins:?}");
-    }
-
-    // TLS configuration
-    let tls_config = daemon_config
-        .as_ref()
-        .map(|c| c.tls.clone())
-        .unwrap_or_default();
-    let tls_env_override = std::env::var("DESKTOP_ASSISTANT_WS_TLS")
-        .ok()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"));
-    let tls_enabled = tls_env_override.unwrap_or(tls_config.enabled);
-
-    let tls_acceptor = if tls_enabled {
-        match tls::setup(
-            tls_config.cert_file.as_deref(),
-            tls_config.key_file.as_deref(),
-        ) {
-            Ok(server_config) => {
-                tracing::info!(
-                    "TLS enabled; CA cert at {}",
-                    tls::default_ca_cert_path().display()
-                );
-                Some(tokio_rustls::TlsAcceptor::from(server_config))
-            }
-            Err(e) => {
-                tracing::error!("TLS setup failed: {e:#}; falling back to plain ws://");
-                None
-            }
-        }
-    } else {
-        tracing::info!("TLS disabled; serving plain ws://");
-        None
-    };
-
-    let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let ws_task = {
-        let api_handler = Arc::clone(&api_handler);
-        let ws_auth = Arc::clone(&ws_auth);
-        tokio::spawn(async move {
-            let shutdown = async {
-                let _ = ws_shutdown_rx.await;
-            };
-            let result = if let Some(acceptor) = tls_acceptor {
-                tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
-                ws::serve_full_tls(
-                    api_handler,
-                    ws_auth,
-                    ws_login_service,
-                    auth_discovery,
-                    allowed_origins,
-                    acceptor,
-                    ws_addr,
-                    shutdown,
-                )
-                .await
-            } else {
-                tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
-                ws::serve_full(
-                    api_handler,
-                    ws_auth,
-                    ws_login_service,
-                    auth_discovery,
-                    allowed_origins,
-                    ws_addr,
-                    shutdown,
-                )
-                .await
-            };
-            if let Err(e) = result {
-                tracing::error!("WebSocket server error: {e}");
-            }
-        })
+        (None, None)
     };
 
     // UDS frontend (#103). Local clients (D-Bus bridge, CLI, future
     // minter shim) connect over the same JSON wire format. On by default
     // for Unix targets; suppress via DESKTOP_ASSISTANT_UDS_ENABLED=false
     // or by setting DESKTOP_ASSISTANT_UDS_SOCKET to empty.
-    let uds_enabled = env_bool("DESKTOP_ASSISTANT_UDS_ENABLED", cfg!(unix));
+    let uds_enabled = env_bool(
+        "DESKTOP_ASSISTANT_UDS_ENABLED",
+        transport_defaults::uds_enabled(),
+    );
     let uds_path = if uds_enabled {
         resolve_uds_socket_path()
     } else {
@@ -1723,8 +1782,12 @@ async fn main() -> Result<()> {
         tracing::warn!("dreaming task join error during shutdown: {e}");
     }
 
-    let _ = ws_shutdown_tx.send(());
-    if let Err(e) = ws_task.await {
+    if let Some(tx) = ws_shutdown_tx {
+        let _ = tx.send(());
+    }
+    if let Some(task) = ws_task
+        && let Err(e) = task.await
+    {
         tracing::warn!("WebSocket task join error during shutdown: {e}");
     }
 
@@ -1742,7 +1805,49 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WsLoginMode, resolve_ws_login_mode_decision};
+    use super::{WsLoginMode, parse_env_bool, resolve_ws_login_mode_decision, transport_defaults};
+
+    #[test]
+    fn parse_env_bool_recognizes_truthy_and_falsy() {
+        for v in ["1", "true", "TRUE", "Yes", " on "] {
+            assert!(parse_env_bool(Some(v), false), "{v:?} should parse true");
+        }
+        for v in ["0", "false", "No", "off"] {
+            assert!(!parse_env_bool(Some(v), true), "{v:?} should parse false");
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_falls_back_to_default() {
+        assert!(parse_env_bool(None, true));
+        assert!(!parse_env_bool(None, false));
+        // Unrecognized values fall through to the supplied default.
+        assert!(parse_env_bool(Some("maybe"), true));
+        assert!(!parse_env_bool(Some("maybe"), false));
+    }
+
+    #[test]
+    fn transport_defaults_are_local_first() {
+        // Local-first policy: WebSocket off, D-Bus best-effort (not required),
+        // UDS on (Unix). Bind to locals so the asserts are runtime checks of
+        // the policy constants rather than constant-folded tautologies.
+        let ws_enabled = transport_defaults::WS_ENABLED;
+        let dbus_required = transport_defaults::DBUS_REQUIRED;
+        assert!(!ws_enabled, "WS must default off");
+        assert!(!dbus_required, "D-Bus must be optional by default");
+        assert_eq!(transport_defaults::uds_enabled(), cfg!(unix));
+
+        // The env knobs still flip each policy.
+        assert!(parse_env_bool(Some("true"), transport_defaults::WS_ENABLED));
+        assert!(parse_env_bool(
+            Some("true"),
+            transport_defaults::DBUS_REQUIRED
+        ));
+        assert!(!parse_env_bool(
+            Some("false"),
+            transport_defaults::uds_enabled()
+        ));
+    }
 
     #[test]
     fn static_password_mode_uses_configured_username() {

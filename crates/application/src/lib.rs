@@ -219,9 +219,7 @@ pub trait AssistantApiHandler: Send + Sync {
     /// that as part of its per-request scope-installation discipline
     /// (#105) — handlers that read `current_user_id()` here can rely
     /// on it being set.
-    async fn subscribe_user_events(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<api::Event>> {
+    async fn subscribe_user_events(&self) -> Option<tokio::sync::broadcast::Receiver<api::Event>> {
         None
     }
 
@@ -479,6 +477,40 @@ fn api_connection_config_to_core(c: api::ConnectionConfigView) -> ConnectionConf
     }
 }
 
+/// Inverse of [`api_connection_config_to_core`]: map the non-secret core
+/// payload to its wire view. No variant of either type carries a raw secret,
+/// so this conversion cannot leak one.
+fn core_connection_config_to_api(c: ConnectionConfigPayload) -> api::ConnectionConfigView {
+    match c {
+        ConnectionConfigPayload::Anthropic {
+            base_url,
+            api_key_env,
+        } => api::ConnectionConfigView::Anthropic {
+            base_url,
+            api_key_env,
+        },
+        ConnectionConfigPayload::OpenAi {
+            base_url,
+            api_key_env,
+        } => api::ConnectionConfigView::OpenAi {
+            base_url,
+            api_key_env,
+        },
+        ConnectionConfigPayload::Bedrock {
+            aws_profile,
+            region,
+            base_url,
+        } => api::ConnectionConfigView::Bedrock {
+            aws_profile,
+            region,
+            base_url,
+        },
+        ConnectionConfigPayload::Ollama { base_url } => {
+            api::ConnectionConfigView::Ollama { base_url }
+        }
+    }
+}
+
 fn core_connection_to_api_view(
     v: desktop_assistant_core::ports::inbound::ConnectionView,
 ) -> api::ConnectionView {
@@ -493,6 +525,7 @@ fn core_connection_to_api_view(
             }
         },
         has_credentials: v.has_credentials,
+        config: v.config.map(core_connection_config_to_api),
     }
 }
 
@@ -1041,20 +1074,18 @@ where
                 limit,
             } => {
                 let registry = self.registry.as_ref().ok_or_else(|| {
-                    ApiError::Core(
-                        "background task registry not attached to handler".to_string(),
-                    )
+                    ApiError::Core("background task registry not attached to handler".to_string())
                 })?;
                 let user_id = desktop_assistant_core::ports::auth::current_user_id();
-                Ok(api::CommandResult::BackgroundTasks(
-                    registry.list(&user_id, include_finished, limit),
-                ))
+                Ok(api::CommandResult::BackgroundTasks(registry.list(
+                    &user_id,
+                    include_finished,
+                    limit,
+                )))
             }
             api::Command::GetBackgroundTask { id } => {
                 let registry = self.registry.as_ref().ok_or_else(|| {
-                    ApiError::Core(
-                        "background task registry not attached to handler".to_string(),
-                    )
+                    ApiError::Core("background task registry not attached to handler".to_string())
                 })?;
                 let user_id = desktop_assistant_core::ports::auth::current_user_id();
                 registry
@@ -1064,9 +1095,7 @@ where
             }
             api::Command::CancelBackgroundTask { id } => {
                 let registry = self.registry.as_ref().ok_or_else(|| {
-                    ApiError::Core(
-                        "background task registry not attached to handler".to_string(),
-                    )
+                    ApiError::Core("background task registry not attached to handler".to_string())
                 })?;
                 let user_id = desktop_assistant_core::ports::auth::current_user_id();
                 match registry.cancel(&user_id, &api::TaskId(id)) {
@@ -1081,9 +1110,7 @@ where
                 limit,
             } => {
                 let registry = self.registry.as_ref().ok_or_else(|| {
-                    ApiError::Core(
-                        "background task registry not attached to handler".to_string(),
-                    )
+                    ApiError::Core("background task registry not attached to handler".to_string())
                 })?;
                 let user_id = desktop_assistant_core::ports::auth::current_user_id();
                 match registry.logs(
@@ -1092,10 +1119,9 @@ where
                     after_seq.unwrap_or(0),
                     limit.unwrap_or(200),
                 ) {
-                    Ok((entries, next_seq)) => Ok(api::CommandResult::BackgroundTaskLogs {
-                        entries,
-                        next_seq,
-                    }),
+                    Ok((entries, next_seq)) => {
+                        Ok(api::CommandResult::BackgroundTaskLogs { entries, next_seq })
+                    }
                     Err(TaskError::NotFound) => Err(ApiError::NotFound),
                     Err(TaskError::AlreadyTerminal) => Err(ApiError::AlreadyTerminal),
                 }
@@ -1118,9 +1144,7 @@ where
                 tools,
             } => {
                 let registry = self.registry.clone().ok_or_else(|| {
-                    ApiError::Core(
-                        "background task registry not attached to handler".to_string(),
-                    )
+                    ApiError::Core("background task registry not attached to handler".to_string())
                 })?;
                 let user_id = desktop_assistant_core::ports::auth::current_user_id();
 
@@ -1300,9 +1324,7 @@ where
     /// `broadcast::Receiver` so it can fan `Event::Task*` frames out
     /// to a single connection. Reads the per-request user id from the
     /// task-local installed by [`handle_command_for`] (#105).
-    async fn subscribe_user_events(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<api::Event>> {
+    async fn subscribe_user_events(&self) -> Option<tokio::sync::broadcast::Receiver<api::Event>> {
         let registry = self.registry.as_ref()?;
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
         Some(registry.subscribe(&user_id))
@@ -1495,10 +1517,8 @@ where
         // channel, not through the streaming `SendMessage` chunk path.
         // The chunk and status callbacks are required by the trait, so
         // we wire no-op closures.
-        let on_chunk: desktop_assistant_core::ports::llm::ChunkCallback =
-            Box::new(|_chunk| true);
-        let on_status: desktop_assistant_core::ports::llm::StatusCallback =
-            Box::new(|_msg| {});
+        let on_chunk: desktop_assistant_core::ports::llm::ChunkCallback = Box::new(|_chunk| true);
+        let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(|_msg| {});
 
         // Install the tool allowlist (if any) and the requesting user's
         // identity so the inner `send_prompt_with_override` call (and
@@ -2513,10 +2533,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl AssistantApiHandler for Observer {
-            async fn handle_command(
-                &self,
-                _cmd: api::Command,
-            ) -> ApiResult<api::CommandResult> {
+            async fn handle_command(&self, _cmd: api::Command) -> ApiResult<api::CommandResult> {
                 let observed = current_user_id();
                 *self.seen.lock().unwrap() = Some(observed);
                 Ok(api::CommandResult::Ack)
@@ -2555,10 +2572,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl AssistantApiHandler for Observer {
-            async fn handle_command(
-                &self,
-                _cmd: api::Command,
-            ) -> ApiResult<api::CommandResult> {
+            async fn handle_command(&self, _cmd: api::Command) -> ApiResult<api::CommandResult> {
                 let observed = current_user_id();
                 *self.seen.lock().unwrap() = Some(observed);
                 Ok(api::CommandResult::Ack)

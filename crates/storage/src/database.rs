@@ -227,10 +227,7 @@ fn personal_table_match(name: &ObjectName) -> Option<&'static str> {
     }
     let last = parts.last()?.as_ident()?;
     let lower = last.value.to_ascii_lowercase();
-    PERSONAL_DATA_TABLES
-        .iter()
-        .copied()
-        .find(|t| *t == lower)
+    PERSONAL_DATA_TABLES.iter().copied().find(|t| *t == lower)
 }
 
 /// Walks a `Statement` looking for the *first* personal-data table
@@ -541,7 +538,6 @@ fn make_user_id_predicate(qualifier: Ident, user_id: &str) -> Expr {
         right: Box::new(literal),
     }
 }
-
 
 /// Execute an LLM-supplied SQL query and return results as JSON.
 ///
@@ -1003,8 +999,7 @@ mod tests {
 
     #[test]
     fn rewrite_grafts_user_id_into_bare_select() {
-        let rewritten =
-            rewrite_select("SELECT id FROM conversations", "alice").expect("rewrite");
+        let rewritten = rewrite_select("SELECT id FROM conversations", "alice").expect("rewrite");
         // The rewriter must inject a parameterised user_id filter
         // qualified by the `conversations` alias so it survives joins
         // against tables that also happen to have a `user_id` column.
@@ -1021,18 +1016,26 @@ mod tests {
 
     #[test]
     fn rewrite_ands_into_existing_where() {
-        let rewritten =
-            rewrite_select("SELECT id FROM conversations WHERE id = 'x'", "alice")
-                .expect("rewrite");
+        let rewritten = rewrite_select("SELECT id FROM conversations WHERE id = 'x'", "alice")
+            .expect("rewrite");
         let lower = rewritten.to_ascii_lowercase();
         // Both predicates must survive — the original (id = 'x') and
         // the grafted (user_id = …).
-        assert!(lower.contains("id = 'x'"), "original predicate dropped: {rewritten}");
-        assert!(lower.contains("user_id ="), "user_id predicate missing: {rewritten}");
+        assert!(
+            lower.contains("id = 'x'"),
+            "original predicate dropped: {rewritten}"
+        );
+        assert!(
+            lower.contains("user_id ="),
+            "user_id predicate missing: {rewritten}"
+        );
         // And there must be an explicit AND joining them, not an OR
         // or a comma — OR would weaken the guard, comma would mean
         // "SELECT a, b FROM …" which makes no sense in WHERE.
-        assert!(lower.contains(" and "), "predicates must be AND'd, got: {rewritten}");
+        assert!(
+            lower.contains(" and "),
+            "predicates must be AND'd, got: {rewritten}"
+        );
     }
 
     #[test]
@@ -1040,18 +1043,15 @@ mod tests {
         // System catalogs and `tool_definitions` (the system-wide tool
         // registry from #105's allowlist) have no user_id column, so
         // the rewriter must NOT graft anything onto them.
-        let rewritten = rewrite_select(
-            "SELECT table_name FROM information_schema.tables",
-            "alice",
-        )
-        .expect("rewrite");
+        let rewritten = rewrite_select("SELECT table_name FROM information_schema.tables", "alice")
+            .expect("rewrite");
         assert!(
             !rewritten.to_ascii_lowercase().contains("user_id"),
             "must not graft user_id onto information_schema, got: {rewritten}"
         );
 
-        let rewritten = rewrite_select("SELECT name FROM tool_definitions", "alice")
-            .expect("rewrite");
+        let rewritten =
+            rewrite_select("SELECT name FROM tool_definitions", "alice").expect("rewrite");
         assert!(
             !rewritten.to_ascii_lowercase().contains("user_id"),
             "must not graft user_id onto tool_definitions, got: {rewritten}"

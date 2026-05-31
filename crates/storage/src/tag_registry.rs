@@ -222,9 +222,7 @@ pub fn normalize_tag_name(raw: &str) -> String {
         .to_string()
 }
 
-fn row_to_record(
-    row: (String, String, serde_json::Value, Vec<String>),
-) -> TagRecord {
+fn row_to_record(row: (String, String, serde_json::Value, Vec<String>)) -> TagRecord {
     let (name, description, examples, distinguish_from) = row;
     let examples: Vec<String> = examples
         .as_array()
@@ -252,7 +250,10 @@ mod tests {
         assert_eq!(normalize_tag_name("user_preference"), "user-preference");
         assert_eq!(normalize_tag_name("  Architecture  "), "architecture");
         assert_eq!(normalize_tag_name("multi word tag"), "multi-word-tag");
-        assert_eq!(normalize_tag_name("--leading-trailing--"), "leading-trailing");
+        assert_eq!(
+            normalize_tag_name("--leading-trailing--"),
+            "leading-trailing"
+        );
         assert_eq!(normalize_tag_name("weird!chars@here"), "weirdcharshere");
     }
 }

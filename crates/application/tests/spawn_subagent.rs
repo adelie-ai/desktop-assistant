@@ -12,9 +12,7 @@ use std::time::Duration;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::UserId;
-use desktop_assistant_application::background_tasks::{
-    BackgroundTaskRegistry, current_task_id,
-};
+use desktop_assistant_application::background_tasks::{BackgroundTaskRegistry, current_task_id};
 use desktop_assistant_application::subagent_tools::{
     SubagentTools, TOOL_GET_SUBAGENT_STATUS, TOOL_SPAWN_SUBAGENT, tool_definitions,
 };
@@ -48,8 +46,7 @@ struct RecordedTurn {
 /// turn can spawn its own subagent before returning text.
 type BoxedResult =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send>>;
-type TurnBehaviour =
-    Arc<dyn Fn(String, String) -> BoxedResult + Send + Sync>;
+type TurnBehaviour = Arc<dyn Fn(String, String) -> BoxedResult + Send + Sync>;
 
 #[derive(Default)]
 struct FakeConvState {
@@ -68,11 +65,10 @@ struct FakeConversations {
 impl FakeConversations {
     fn new(default_text: &str) -> Self {
         let text = default_text.to_string();
-        let default_behaviour: TurnBehaviour =
-            Arc::new(move |_cid, _prompt| {
-                let t = text.clone();
-                Box::pin(async move { Ok(t) })
-            });
+        let default_behaviour: TurnBehaviour = Arc::new(move |_cid, _prompt| {
+            let t = text.clone();
+            Box::pin(async move { Ok(t) })
+        });
         Self {
             state: Arc::new(Mutex::new(FakeConvState::default())),
             default_behaviour,
@@ -132,10 +128,7 @@ impl ConversationService for FakeConversations {
             .get(id.as_str())
             .cloned()
             .ok_or_else(|| {
-                CoreError::ConversationNotFound(format!(
-                    "conversation {} not found",
-                    id.as_str()
-                ))
+                CoreError::ConversationNotFound(format!("conversation {} not found", id.as_str()))
             })
     }
 
@@ -201,25 +194,27 @@ impl ConversationService for FakeConversations {
             state.turns.push(turn);
             // Track the prompt as a user message for inspection.
             if let Some(conv) = state.conversations.get_mut(&cid) {
-                conv.messages
-                    .push(Message::new(desktop_assistant_core::domain::Role::User, &prompt));
+                conv.messages.push(Message::new(
+                    desktop_assistant_core::domain::Role::User,
+                    &prompt,
+                ));
             }
         }
 
         // Pick behaviour: per-conversation override, else default.
         let behaviour = {
             let per = self.per_conv_behaviour.lock().unwrap();
-            per.get(&cid).cloned().unwrap_or_else(|| self.default_behaviour.clone())
+            per.get(&cid)
+                .cloned()
+                .unwrap_or_else(|| self.default_behaviour.clone())
         };
 
         // Install the cancellation token for the duration of the call,
         // mirroring how the real `send_prompt_with_override` works.
         let inner = behaviour(cid.clone(), prompt);
-        let result = desktop_assistant_core::ports::llm::with_cancellation_token(
-            cancellation,
-            inner,
-        )
-        .await?;
+        let result =
+            desktop_assistant_core::ports::llm::with_cancellation_token(cancellation, inner)
+                .await?;
 
         // Record assistant message in the conversation history.
         {
@@ -276,17 +271,19 @@ where
             // Install the per-turn cancellation token the same way
             // `send_prompt_with_override` would. Tool bodies read this
             // to propagate cancellation into child registry tasks.
-            let value = desktop_assistant_core::ports::llm::with_cancellation_token(
-                token,
-                body(parent_id),
-            )
-            .await;
+            let value =
+                desktop_assistant_core::ports::llm::with_cancellation_token(token, body(parent_id))
+                    .await;
             *result_slot_inner.lock().unwrap() = Some(value);
             Ok(())
         },
     );
     registry.wait(&parent_id).await;
-    let value = result_slot.lock().unwrap().take().expect("body produced a value");
+    let value = result_slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("body produced a value");
     (parent_id, value)
 }
 
@@ -303,26 +300,27 @@ async fn spawn_subagent_with_wait_true_returns_child_final_message() {
 
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
-    let (_parent_id, result) = under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
-        let tools = tools_for_body;
-        let user = user_for_body;
-        async move {
-            with_user_id(user, async move {
-                tools
-                    .execute_tool(
-                        TOOL_SPAWN_SUBAGENT,
-                        serde_json::json!({
-                            "name": "researcher",
-                            "prompt": "say hello",
-                            "wait": true,
-                        }),
-                    )
-                    .await
-            })
-            .await
-        }
-    })
-    .await;
+    let (_parent_id, result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            async move {
+                with_user_id(user, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "researcher",
+                                "prompt": "say hello",
+                                "wait": true,
+                            }),
+                        )
+                        .await
+                })
+                .await
+            }
+        })
+        .await;
 
     let response = result.expect("tool returned Ok");
     // The tool returns the child's final assistant text directly (per
@@ -339,61 +337,62 @@ async fn spawn_subagent_with_wait_false_returns_task_id_immediately() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
     let release = Arc::new(Notify::new());
     let release_for_conv = Arc::clone(&release);
-    let conversations = Arc::new(
-        FakeConversations::new("slow-default")
-            .with_behaviour("conv-0", move |_cid, _p| {
-                let r = Arc::clone(&release_for_conv);
-                async move {
-                    r.notified().await;
-                    Ok("eventual".to_string())
-                }
-            }),
-    );
+    let conversations = Arc::new(FakeConversations::new("slow-default").with_behaviour(
+        "conv-0",
+        move |_cid, _p| {
+            let r = Arc::clone(&release_for_conv);
+            async move {
+                r.notified().await;
+                Ok("eventual".to_string())
+            }
+        },
+    ));
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let user = unique_user("alice");
 
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
     let registry_for_body = Arc::clone(&registry);
-    let (_parent_id, result) = under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
-        let tools = tools_for_body;
-        let user = user_for_body;
-        let registry = registry_for_body;
-        async move {
-            let r = timeout(
-                Duration::from_millis(500),
-                with_user_id(user.clone(), async move {
-                    tools
-                        .execute_tool(
-                            TOOL_SPAWN_SUBAGENT,
-                            serde_json::json!({
-                                "name": "researcher",
-                                "prompt": "do something slow",
-                                "wait": false,
-                            }),
-                        )
-                        .await
-                }),
-            )
-            .await
-            .expect("wait=false must return within timeout")
-            .expect("tool succeeded");
+    let (_parent_id, result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            let registry = registry_for_body;
+            async move {
+                let r = timeout(
+                    Duration::from_millis(500),
+                    with_user_id(user.clone(), async move {
+                        tools
+                            .execute_tool(
+                                TOOL_SPAWN_SUBAGENT,
+                                serde_json::json!({
+                                    "name": "researcher",
+                                    "prompt": "do something slow",
+                                    "wait": false,
+                                }),
+                            )
+                            .await
+                    }),
+                )
+                .await
+                .expect("wait=false must return within timeout")
+                .expect("tool succeeded");
 
-            // The result is a JSON object with child_task_id.
-            let parsed: serde_json::Value = serde_json::from_str(&r).unwrap();
-            let child_task_id = parsed["child_task_id"].as_str().unwrap().to_string();
-            assert!(parsed["child_conversation_id"].as_str().is_some());
+                // The result is a JSON object with child_task_id.
+                let parsed: serde_json::Value = serde_json::from_str(&r).unwrap();
+                let child_task_id = parsed["child_task_id"].as_str().unwrap().to_string();
+                assert!(parsed["child_conversation_id"].as_str().is_some());
 
-            // The child should still be Running until we release it.
-            let view = registry
-                .get(&user, &api::TaskId(child_task_id.clone()))
-                .expect("child registered");
-            assert_eq!(view.status, api::TaskStatus::Running);
+                // The child should still be Running until we release it.
+                let view = registry
+                    .get(&user, &api::TaskId(child_task_id.clone()))
+                    .expect("child registered");
+                assert_eq!(view.status, api::TaskStatus::Running);
 
-            child_task_id
-        }
-    })
-    .await;
+                child_task_id
+            }
+        })
+        .await;
 
     // Now release the child and let it finish.
     release.notify_one();
@@ -417,26 +416,27 @@ async fn subagent_appears_in_registry_with_parent_link() {
 
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
-    let (parent_id, _result) = under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
-        let tools = tools_for_body;
-        let user = user_for_body;
-        async move {
-            with_user_id(user, async move {
-                tools
-                    .execute_tool(
-                        TOOL_SPAWN_SUBAGENT,
-                        serde_json::json!({
-                            "name": "researcher",
-                            "prompt": "go",
-                            "wait": true,
-                        }),
-                    )
-                    .await
-            })
-            .await
-        }
-    })
-    .await;
+    let (parent_id, _result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            async move {
+                with_user_id(user, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "researcher",
+                                "prompt": "go",
+                                "wait": true,
+                            }),
+                        )
+                        .await
+                })
+                .await
+            }
+        })
+        .await;
 
     // List, find the subagent with kind=Subagent and parent_task_id=parent_id.
     let tasks = registry.list(&user, true, None);
@@ -444,7 +444,12 @@ async fn subagent_appears_in_registry_with_parent_link() {
         .iter()
         .find(|t| matches!(t.kind, api::TaskKind::Subagent { .. }))
         .expect("subagent registered");
-    let api::TaskKind::Subagent { parent_task_id, name, .. } = &subagent.kind else {
+    let api::TaskKind::Subagent {
+        parent_task_id,
+        name,
+        ..
+    } = &subagent.kind
+    else {
         unreachable!()
     };
     assert_eq!(parent_task_id, &parent_id);
@@ -465,26 +470,27 @@ async fn parent_log_records_subagent_tool_call_with_child_ids() {
 
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
-    let (parent_id, _result) = under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
-        let tools = tools_for_body;
-        let user = user_for_body;
-        async move {
-            with_user_id(user, async move {
-                tools
-                    .execute_tool(
-                        TOOL_SPAWN_SUBAGENT,
-                        serde_json::json!({
-                            "name": "researcher",
-                            "prompt": "go",
-                            "wait": true,
-                        }),
-                    )
-                    .await
-            })
-            .await
-        }
-    })
-    .await;
+    let (parent_id, _result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            async move {
+                with_user_id(user, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "researcher",
+                                "prompt": "go",
+                                "wait": true,
+                            }),
+                        )
+                        .await
+                })
+                .await
+            }
+        })
+        .await;
 
     // Parent's log must contain a ToolCall entry with child_task_id +
     // child_conversation_id in `data`.
@@ -609,7 +615,9 @@ async fn cancelling_parent_cancels_subagents_recursively() {
         .expect("grandchild started");
 
     // Cancel the parent.
-    registry.cancel(&user, &parent_id).expect("parent cancellable");
+    registry
+        .cancel(&user, &parent_id)
+        .expect("parent cancellable");
 
     // Wait for all three to wind down.
     timeout(Duration::from_secs(5), registry.wait(&parent_id))
@@ -879,34 +887,32 @@ async fn spawn_subagent_records_task_kind_subagent_with_correct_link() {
 #[tokio::test]
 async fn business_outcome_subagent_result_contains_actual_assistant_text() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
-    let conversations =
-        Arc::new(FakeConversations::new("the price of tea in china is $42"));
+    let conversations = Arc::new(FakeConversations::new("the price of tea in china is $42"));
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let user = unique_user("alice");
 
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
-    let (_pid, result) =
-        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
-            let tools = tools_for_body;
-            let user = user_for_body;
-            async move {
-                with_user_id(user, async move {
-                    tools
-                        .execute_tool(
-                            TOOL_SPAWN_SUBAGENT,
-                            serde_json::json!({
-                                "name": "tea-researcher",
-                                "prompt": "look up tea prices",
-                                "wait": true,
-                            }),
-                        )
-                        .await
-                })
-                .await
-            }
-        })
-        .await;
+    let (_pid, result) = under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+        let tools = tools_for_body;
+        let user = user_for_body;
+        async move {
+            with_user_id(user, async move {
+                tools
+                    .execute_tool(
+                        TOOL_SPAWN_SUBAGENT,
+                        serde_json::json!({
+                            "name": "tea-researcher",
+                            "prompt": "look up tea prices",
+                            "wait": true,
+                        }),
+                    )
+                    .await
+            })
+            .await
+        }
+    })
+    .await;
 
     let text = result.expect("ok");
     // Business outcome: not a placeholder, but the actual child text.
@@ -927,10 +933,7 @@ async fn tool_definitions_publish_expected_schema() {
     assert!(names.contains(&TOOL_SPAWN_SUBAGENT.to_string()));
     assert!(names.contains(&TOOL_GET_SUBAGENT_STATUS.to_string()));
 
-    let spawn = defs
-        .iter()
-        .find(|t| t.name == TOOL_SPAWN_SUBAGENT)
-        .unwrap();
+    let spawn = defs.iter().find(|t| t.name == TOOL_SPAWN_SUBAGENT).unwrap();
     let required = spawn.parameters["required"].as_array().unwrap();
     let required_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
     assert!(required_names.contains(&"name"));

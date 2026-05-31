@@ -187,14 +187,12 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
 
     async fn delete(&self, id: &str) -> Result<(), CoreError> {
         let user_id = current_user_id();
-        sqlx::query(
-            "DELETE FROM knowledge_base WHERE user_id = $1 AND id = $2",
-        )
-        .bind(user_id.as_str())
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query("DELETE FROM knowledge_base WHERE user_id = $1 AND id = $2")
+            .bind(user_id.as_str())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(())
     }
 

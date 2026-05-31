@@ -141,13 +141,9 @@ async fn minter_hang_triggers_timeout() {
     let dir = tempdir();
     let socket = unique_socket_path(dir.path(), "mint");
     let (_received, _stop) = spawn_stub_minter(&socket, MinterScript::HangForever).await;
-    let err = fetch_jwt(
-        &socket,
-        MintRequest::default(),
-        Duration::from_millis(200),
-    )
-    .await
-    .expect_err("hang fails");
+    let err = fetch_jwt(&socket, MintRequest::default(), Duration::from_millis(200))
+        .await
+        .expect_err("hang fails");
     assert!(
         format!("{err}").contains("timed out"),
         "error must say timed out; got {err}"
@@ -288,9 +284,7 @@ async fn uds_event_translates_to_dbus_signal() {
     let mut events = transport.subscribe_events();
     // Drive a request so the daemon emits its queued events.
     let _ = transport
-        .request(api::Command::CreateConversation {
-            title: "x".into(),
-        })
+        .request(api::Command::CreateConversation { title: "x".into() })
         .await;
 
     let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
@@ -332,9 +326,7 @@ async fn bridge_request_to_disconnected_daemon_fails_fast() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let err = transport
-        .request(api::Command::CreateConversation {
-            title: "x".into(),
-        })
+        .request(api::Command::CreateConversation { title: "x".into() })
         .await
         .expect_err("disconnected request fails");
     match err {
@@ -370,9 +362,7 @@ async fn bridge_handshake_rejection_surfaces_daemon_error() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let err = transport
-        .request(api::Command::CreateConversation {
-            title: "x".into(),
-        })
+        .request(api::Command::CreateConversation { title: "x".into() })
         .await
         .expect_err("auth-rejected request fails");
     let msg = format!("{err}");

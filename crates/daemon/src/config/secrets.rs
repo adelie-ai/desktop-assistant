@@ -3,18 +3,25 @@
 //! Extracted from `config.rs` (#41). Each backend reads + writes a
 //! single string value keyed by `(service, account)`. The `auto`
 //! backend tries the file store first (cheapest), then systemd
-//! credentials, then libsecret/keyring, then KWallet.
+//! credentials, then the system Secret Service, then KWallet.
+//!
+//! The Secret Service backend talks D-Bus in-process via keyring-core's
+//! zbus store (registered at daemon startup). Older daemons shelled out to
+//! the `secret-tool` CLI, which keyed items by the `account` attribute;
+//! keyring-core keys by `username`, so reads transparently migrate any
+//! legacy `account`-keyed items to the current scheme.
 //!
 //! Schema-side helpers (`SecretConfig`, `default_secret_account`,
 //! `resolve_secret_account`, etc.) stay in `super` because they are
 //! also called from settings setters and views unrelated to the
 //! backend I/O. This module reaches them via `super::…`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::anyhow;
-use keyring::Entry;
+use keyring_core::Entry;
 
 use super::SecretConfig;
 
@@ -71,13 +78,68 @@ fn read_keyring_secret(secret: &SecretConfig, connector: &str) -> Option<String>
         .unwrap_or_else(super::default_secret_service);
     let account = super::resolve_secret_account(secret, connector);
 
-    if let Some(value) = read_secret_tool_secret(&service, &account) {
-        return Some(value);
+    run_keyring_blocking(|| {
+        // Fast path: the current scheme stores the account under the Secret
+        // Service `username` attribute (keyring-core's `user` parameter).
+        match Entry::new(&service, &account).and_then(|entry| entry.get_password()) {
+            Ok(value) => return sanitize_secret_value(&value),
+            Err(keyring_core::Error::NoEntry) => {} // fall through to the legacy lookup
+            Err(keyring_core::Error::NoDefaultStore) => return None, // headless: no Secret Service
+            Err(error) => {
+                tracing::debug!("keyring read failed: {error}");
+                return None;
+            }
+        }
+
+        // Back-compat: secrets written by older daemons (via `secret-tool`)
+        // live under the `account` attribute. Read them, then migrate to the
+        // current scheme so this slower path runs at most once per secret.
+        read_and_migrate_legacy_secret(&service, &account)
+    })
+}
+
+/// Read a secret stored under the legacy `secret-tool` attribute scheme
+/// (`service` + `account`) and, on success, rewrite it under the current
+/// scheme (`service` + `username`) so subsequent reads hit the fast path.
+/// The rewrite/cleanup is best-effort — the caller still gets the value even
+/// if migration fails.
+///
+/// Note: this path can only be exercised against a real Secret Service. The
+/// in-memory mock store used by unit tests has no attributes, so `search`
+/// finds nothing there and this returns `None`.
+fn read_and_migrate_legacy_secret(service: &str, account: &str) -> Option<String> {
+    let spec = HashMap::from([("service", service), ("account", account)]);
+    let legacy = Entry::search(&spec).ok()?.into_iter().next()?;
+    let value = sanitize_secret_value(&legacy.get_password().ok()?)?;
+
+    match Entry::new(service, account) {
+        Ok(entry) if entry.set_password(&value).is_ok() => {
+            if let Err(error) = legacy.delete_credential() {
+                tracing::debug!("failed to delete migrated legacy keyring secret: {error}");
+            }
+        }
+        Ok(_) => tracing::debug!("failed to migrate legacy keyring secret to current scheme"),
+        Err(error) => tracing::debug!("failed to build entry for legacy migration: {error}"),
     }
 
-    let entry = Entry::new(&service, &account).ok()?;
-    let value = entry.get_password().ok()?;
-    sanitize_secret_value(&value)
+    Some(value)
+}
+
+/// Run a blocking Secret Service operation without starving the async runtime.
+///
+/// keyring-core's Secret Service store drives D-Bus over zbus's *blocking*
+/// API, which must not run on an async worker thread (it can stall the
+/// runtime). On the daemon's multi-threaded runtime we hand the work to
+/// `block_in_place`, which relocates other tasks onto a sibling worker; off a
+/// runtime (sync tests) or on a current-thread runtime we just run inline.
+fn run_keyring_blocking<T>(operation: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(operation)
+        }
+        _ => operation(),
+    }
 }
 
 pub(super) fn write_secret_to_backend(
@@ -152,43 +214,17 @@ fn write_keyring_secret(secret: &SecretConfig, value: &str, connector: &str) -> 
         .unwrap_or_else(super::default_secret_service);
     let account = super::resolve_secret_account(secret, connector);
 
-    if command_exists("secret-tool") {
-        write_secret_tool_secret(&service, &account, value)?;
-        return Ok(());
-    }
-
-    let entry = Entry::new(&service, &account)
-        .map_err(|error| anyhow!("failed to initialize keyring entry: {error}"))?;
-    entry
-        .set_password(value)
-        .map_err(|error| anyhow!("failed to write keyring secret: {error}"))
-}
-
-fn command_exists(command: &str) -> bool {
-    Command::new(command)
-        .arg("--help")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-}
-
-fn read_secret_tool_secret(service: &str, account: &str) -> Option<String> {
-    let output = Command::new("secret-tool")
-        .arg("lookup")
-        .arg("service")
-        .arg(service)
-        .arg("account")
-        .arg(account)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let value = String::from_utf8_lossy(&output.stdout);
-    sanitize_secret_value(value.as_ref())
+    run_keyring_blocking(|| {
+        // Stores under the current scheme (Secret Service `username` attribute).
+        // Any legacy `account`-keyed item is cleaned up the next time the secret
+        // is read (see `read_and_migrate_legacy_secret`); the daemon reads every
+        // configured secret at startup, so that happens before user-driven writes.
+        let entry = Entry::new(&service, &account)
+            .map_err(|error| anyhow!("failed to initialize keyring entry: {error}"))?;
+        entry
+            .set_password(value)
+            .map_err(|error| anyhow!("failed to write keyring secret: {error}"))
+    })
 }
 
 pub(super) fn sanitize_secret_value(value: &str) -> Option<String> {
@@ -238,51 +274,6 @@ pub(super) fn redacted_secret_audit(value: &str) -> (usize, String) {
     }
 
     (trimmed.len(), format!("fnv1a64:{hash:016x}"))
-}
-
-fn write_secret_tool_secret(service: &str, account: &str, value: &str) -> anyhow::Result<()> {
-    let mut child = Command::new("secret-tool")
-        .arg("store")
-        .arg("--label")
-        .arg("Desktop Assistant API Key")
-        .arg("service")
-        .arg(service)
-        .arg("account")
-        .arg(account)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| anyhow!("failed to invoke secret-tool: {error}"))?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        use std::io::Write as _;
-        stdin
-            .write_all(value.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .map_err(|error| anyhow!("failed to write secret-tool stdin: {error}"))?;
-    } else {
-        return Err(anyhow!("failed to open secret-tool stdin"));
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|error| anyhow!("failed waiting for secret-tool: {error}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            "secret-tool returned non-zero exit status".to_string()
-        };
-        Err(anyhow!("failed to write secret-tool secret: {detail}"))
-    }
 }
 
 fn write_kwallet_secret(secret: &SecretConfig, value: &str, connector: &str) -> anyhow::Result<()> {
@@ -350,4 +341,191 @@ fn read_kwallet_secret(secret: &SecretConfig, connector: &str) -> Option<String>
 
     let value = String::from_utf8_lossy(&output.stdout);
     sanitize_secret_value(value.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // keyring-core's default store is process-global, so register the in-memory
+    // mock store once for the whole test binary. Each test uses a unique service
+    // name so the shared store can't cross-contaminate across parallel tests.
+    //
+    // These cover the current-scheme wiring (build/set/get via the
+    // `keyring`/`libsecret` backend). The legacy `account`-attribute migration
+    // in `read_and_migrate_legacy_secret` can only be exercised against a real
+    // Secret Service: the mock store has no attributes, so its `search` cannot
+    // model a `secret-tool`-written item.
+    fn with_mock_store() {
+        use std::sync::Once;
+        static MOCK_STORE: Once = Once::new();
+        MOCK_STORE.call_once(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+    }
+
+    fn keyring_config(service: &str) -> SecretConfig {
+        SecretConfig {
+            backend: "keyring".to_string(),
+            service: Some(service.to_string()),
+            account: Some("api_key".to_string()),
+            wallet: "kdewallet".to_string(),
+            folder: "desktop-assistant".to_string(),
+            entry: None,
+        }
+    }
+
+    #[test]
+    fn keyring_backend_round_trips_secret() {
+        with_mock_store();
+        let secret = keyring_config("test-roundtrip.desktopAssistant");
+        write_secret_to_backend(&secret, "sk-live-roundtrip", "openai").unwrap();
+        assert_eq!(
+            read_secret_from_backend(&secret, "openai"),
+            Some("sk-live-roundtrip".to_string())
+        );
+    }
+
+    #[test]
+    fn keyring_backend_returns_none_when_absent() {
+        with_mock_store();
+        let secret = keyring_config("test-absent.desktopAssistant");
+        assert_eq!(read_secret_from_backend(&secret, "openai"), None);
+    }
+
+    #[test]
+    fn keyring_backend_read_rejects_placeholder_value() {
+        with_mock_store();
+        // A placeholder that slipped past the UI must be filtered on read by
+        // sanitize_secret_value rather than handed back as a real key.
+        let secret = keyring_config("test-placeholder.desktopAssistant");
+        write_secret_to_backend(&secret, "file-store-openai-key", "openai").unwrap();
+        assert_eq!(read_secret_from_backend(&secret, "openai"), None);
+    }
+}
+
+#[cfg(test)]
+mod integration {
+    //! Real-Secret-Service integration tests. Ignored by default — they need a
+    //! live session bus and `secret-tool`, and they mutate the keyring (under a
+    //! namespaced service, cleaned up afterwards). Run via `just test-integration`.
+    //!
+    //! This covers what the mock store cannot: the legacy `secret-tool`
+    //! `account`→`username` migrate-on-read path against a real backend (the
+    //! mock has no attributes, so `Entry::search` finds nothing there).
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::sync::Once;
+
+    static REAL_STORE: Once = Once::new();
+
+    /// Register the real Secret Service store once, or return false (with a
+    /// skip note) when the environment can't support these tests.
+    fn real_store_ready() -> bool {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            eprintln!("SKIP: no DBUS_SESSION_BUS_ADDRESS (no session bus)");
+            return false;
+        }
+        if !command_present("secret-tool") {
+            eprintln!("SKIP: secret-tool not installed");
+            return false;
+        }
+        REAL_STORE.call_once(|| match zbus_secret_service_keyring_store::Store::new() {
+            Ok(store) => keyring_core::set_default_store(store),
+            Err(error) => eprintln!("WARN: could not connect to Secret Service: {error}"),
+        });
+        // If Store::new failed above, Entry::new reports NoDefaultStore — skip.
+        match Entry::new("adelie-it-probe", "probe").and_then(|e| e.get_password()) {
+            Ok(_) | Err(keyring_core::Error::NoEntry) => true,
+            Err(error) => {
+                eprintln!("SKIP: Secret Service unavailable: {error}");
+                false
+            }
+        }
+    }
+
+    fn command_present(bin: &str) -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {bin}"))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn secret_tool_store(attrs: &[(&str, &str)], value: &str) {
+        let mut cmd = Command::new("secret-tool");
+        cmd.arg("store")
+            .arg("--label")
+            .arg("adelie integration test");
+        for (key, val) in attrs {
+            cmd.arg(key).arg(val);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn secret-tool");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(value.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "secret-tool store failed");
+    }
+
+    fn secret_tool_clear(attrs: &[(&str, &str)]) {
+        let mut cmd = Command::new("secret-tool");
+        cmd.arg("clear");
+        for (key, val) in attrs {
+            cmd.arg(key).arg(val);
+        }
+        let _ = cmd.output();
+    }
+
+    #[test]
+    #[ignore = "needs a real Secret Service; run via `just test-integration`"]
+    fn legacy_secret_tool_item_migrates_on_read() {
+        if !real_store_ready() {
+            return;
+        }
+        let service = "adelie-it-daemon-legacy";
+        let account = "api_key";
+        let value = "sk-legacy-integration";
+
+        // Start clean, then plant a legacy {service, account} item the way an
+        // old daemon's `secret-tool store` did.
+        secret_tool_clear(&[("service", service), ("account", account)]);
+        let _ = Entry::new(service, account).and_then(|e| e.delete_credential());
+        secret_tool_store(&[("service", service), ("account", account)], value);
+
+        // Act: the daemon's migrate-on-read path.
+        let got = read_and_migrate_legacy_secret(service, account);
+        assert_eq!(got.as_deref(), Some(value), "should read the legacy value");
+
+        // The legacy item is gone and the value now lives under the new
+        // `username` scheme.
+        let legacy_left =
+            Entry::search(&HashMap::from([("service", service), ("account", account)]))
+                .map(|items| items.len())
+                .unwrap_or(0);
+        assert_eq!(
+            legacy_left, 0,
+            "legacy item should be deleted after migration"
+        );
+        assert_eq!(
+            Entry::new(service, account)
+                .unwrap()
+                .get_password()
+                .ok()
+                .as_deref(),
+            Some(value),
+            "migrated value should be readable under the new scheme"
+        );
+
+        // Cleanup.
+        let _ = Entry::new(service, account).unwrap().delete_credential();
+    }
 }

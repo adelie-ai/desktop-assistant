@@ -40,7 +40,7 @@ const DEFAULT_BRIDGE_NAME: &str = "org.desktopAssistant.Bridge";
 #[command(
     name = "adelie-dbus-bridge",
     about = "Per-user D-Bus bridge: translates org.desktopAssistant calls into UDS+JWT requests to the daemon.",
-    version,
+    version
 )]
 struct Cli {
     /// Path to the local JWT minter socket. Defaults to
@@ -158,7 +158,10 @@ async fn main() -> anyhow::Result<()> {
     // failed subscription is logged but does not abort startup —
     // older daemons may not implement the command, and the rest of
     // the bridge stays functional.
-    match transport.request(api::Command::SubscribeBackgroundTasks).await {
+    match transport
+        .request(api::Command::SubscribeBackgroundTasks)
+        .await
+    {
         Ok(_) => tracing::info!("subscribed to background-task events"),
         Err(e) => tracing::warn!(
             error = %e,
@@ -189,12 +192,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_shutdown_signal()
--> anyhow::Result<impl std::future::Future<Output = ()> + Send + 'static> {
-    let mut sigterm =
-        signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-    let mut sigint =
-        signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+fn build_shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()> + Send + 'static>
+{
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     Ok(async move {
         tokio::select! {
             _ = sigterm.recv() => {

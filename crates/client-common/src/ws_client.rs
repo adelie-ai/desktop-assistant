@@ -4,16 +4,15 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use api::{WsFrame, WsRequest};
+use async_trait::async_trait;
 use desktop_assistant_api_model as api;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+use crate::commands::{AssistantCommands, PendingResult};
 use crate::signal::SignalEvent;
-use crate::types::{ConversationDetail, ConversationSummary};
-
-type PendingResult = Result<api::CommandResult, String>;
 
 pub struct WsClient {
     outbound_tx: mpsc::UnboundedSender<Message>,
@@ -105,7 +104,47 @@ impl WsClient {
         ))
     }
 
-    pub async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
+    /// Send a prompt with an optional per-message model/connection override.
+    ///
+    /// Backward-compatibility shim: the implementation now lives on the
+    /// transport-agnostic [`AssistantCommands`] trait (so `UdsClient` gets it
+    /// too — adele-gtk#49). This inherent delegator is kept so existing
+    /// `ws.send_prompt_with_override(...)` call sites in downstream repos
+    /// (adele-tui, adele-kde) keep compiling whether or not they have the
+    /// trait in scope.
+    pub async fn send_prompt_with_override(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        override_selection: Option<api::SendPromptOverride>,
+    ) -> Result<String> {
+        AssistantCommands::send_prompt_with_override(
+            self,
+            conversation_id,
+            prompt,
+            override_selection,
+        )
+        .await
+    }
+
+    /// List models across every healthy connection. Pass `connection_id =
+    /// Some(_)` to scope to a single connection. `refresh = true` bypasses
+    /// connector caches (e.g. Bedrock).
+    ///
+    /// Backward-compatibility shim delegating to the [`AssistantCommands`]
+    /// trait default (see `send_prompt_with_override` above).
+    pub async fn list_available_models(
+        &self,
+        connection_id: Option<&str>,
+        refresh: bool,
+    ) -> Result<Vec<api::ModelListing>> {
+        AssistantCommands::list_available_models(self, connection_id, refresh).await
+    }
+}
+
+#[async_trait]
+impl AssistantCommands for WsClient {
+    async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
         let id = uuid::Uuid::new_v4().to_string();
         let request = WsRequest {
             id: id.clone(),
@@ -130,290 +169,6 @@ impl WsClient {
             Ok(Err(error)) => Err(anyhow!(error)),
             Err(_closed) => Err(anyhow!("websocket response channel closed")),
         }
-    }
-
-    pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
-        let result = self
-            .send_command(api::Command::ListConversations {
-                max_age_days: None,
-                include_archived: false,
-            })
-            .await?;
-
-        let api::CommandResult::Conversations(items) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for list_conversations"
-            ));
-        };
-
-        Ok(items.into_iter().map(ConversationSummary::from).collect())
-    }
-
-    pub async fn list_conversations_with_archived(&self) -> Result<Vec<ConversationSummary>> {
-        let result = self
-            .send_command(api::Command::ListConversations {
-                max_age_days: None,
-                include_archived: true,
-            })
-            .await?;
-
-        let api::CommandResult::Conversations(items) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for list_conversations"
-            ));
-        };
-
-        Ok(items.into_iter().map(ConversationSummary::from).collect())
-    }
-
-    pub async fn archive_conversation(&self, id: &str) -> Result<()> {
-        let result = self
-            .send_command(api::Command::ArchiveConversation { id: id.to_string() })
-            .await?;
-
-        let api::CommandResult::Ack = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for archive_conversation"
-            ));
-        };
-
-        Ok(())
-    }
-
-    pub async fn unarchive_conversation(&self, id: &str) -> Result<()> {
-        let result = self
-            .send_command(api::Command::UnarchiveConversation { id: id.to_string() })
-            .await?;
-
-        let api::CommandResult::Ack = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for unarchive_conversation"
-            ));
-        };
-
-        Ok(())
-    }
-
-    pub async fn get_conversation(&self, id: &str) -> Result<ConversationDetail> {
-        let result = self
-            .send_command(api::Command::GetConversation { id: id.to_string() })
-            .await?;
-
-        let api::CommandResult::Conversation(conversation) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for get_conversation"
-            ));
-        };
-
-        Ok(ConversationDetail::from(conversation))
-    }
-
-    pub async fn create_conversation(&self, title: &str) -> Result<String> {
-        let result = self
-            .send_command(api::Command::CreateConversation {
-                title: title.to_string(),
-            })
-            .await?;
-
-        let api::CommandResult::ConversationId { id } = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for create_conversation"
-            ));
-        };
-        Ok(id)
-    }
-
-    pub async fn delete_conversation(&self, id: &str) -> Result<()> {
-        let result = self
-            .send_command(api::Command::DeleteConversation { id: id.to_string() })
-            .await?;
-        let api::CommandResult::Ack = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for delete_conversation"
-            ));
-        };
-        Ok(())
-    }
-
-    pub async fn rename_conversation(&self, id: &str, title: &str) -> Result<()> {
-        let result = self
-            .send_command(api::Command::RenameConversation {
-                id: id.to_string(),
-                title: title.to_string(),
-            })
-            .await?;
-        let api::CommandResult::Ack = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for rename_conversation"
-            ));
-        };
-        Ok(())
-    }
-
-    pub async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String> {
-        self.send_prompt_with_override(conversation_id, prompt, None)
-            .await
-    }
-
-    pub async fn send_prompt_with_override(
-        &self,
-        conversation_id: &str,
-        prompt: &str,
-        override_selection: Option<api::SendPromptOverride>,
-    ) -> Result<String> {
-        let result = self
-            .send_command(api::Command::SendMessage {
-                conversation_id: conversation_id.to_string(),
-                content: prompt.to_string(),
-                override_selection,
-            })
-            .await?;
-        // Post-#114 the daemon returns `SendMessageAck { task_id }`
-        // when its handler is wired with a `BackgroundTaskRegistry`;
-        // older / test daemons may still return the legacy bare `Ack`.
-        // Both are valid wire-level acks for this call site — the
-        // task id is surfaced via streaming events, not the ack.
-        match result {
-            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
-            api::CommandResult::Ack => Ok(String::new()),
-            other => Err(anyhow!(
-                "unexpected websocket response for send_prompt: {other:?}"
-            )),
-        }
-    }
-
-    /// List models across every healthy connection. Pass `connection_id =
-    /// Some(_)` to scope to a single connection. `refresh = true` bypasses
-    /// connector caches (e.g. Bedrock).
-    pub async fn list_available_models(
-        &self,
-        connection_id: Option<&str>,
-        refresh: bool,
-    ) -> Result<Vec<api::ModelListing>> {
-        let result = self
-            .send_command(api::Command::ListAvailableModels {
-                connection_id: connection_id.map(str::to_string),
-                refresh,
-            })
-            .await?;
-        let api::CommandResult::Models(items) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for list_available_models"
-            ));
-        };
-        Ok(items)
-    }
-
-    // --- Knowledge management (issue #73) -------------------------------
-
-    pub async fn list_knowledge_entries(
-        &self,
-        limit: u32,
-        offset: u32,
-        tag_filter: Option<Vec<String>>,
-    ) -> Result<Vec<api::KnowledgeEntryView>> {
-        let result = self
-            .send_command(api::Command::ListKnowledgeEntries {
-                limit,
-                offset,
-                tag_filter,
-            })
-            .await?;
-        let api::CommandResult::KnowledgeEntries(items) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for list_knowledge_entries"
-            ));
-        };
-        Ok(items)
-    }
-
-    pub async fn get_knowledge_entry(&self, id: &str) -> Result<Option<api::KnowledgeEntryView>> {
-        let result = self
-            .send_command(api::Command::GetKnowledgeEntry { id: id.to_string() })
-            .await?;
-        let api::CommandResult::KnowledgeEntry(entry) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for get_knowledge_entry"
-            ));
-        };
-        Ok(entry)
-    }
-
-    pub async fn search_knowledge_entries(
-        &self,
-        query: &str,
-        tag_filter: Option<Vec<String>>,
-        limit: u32,
-    ) -> Result<Vec<api::KnowledgeEntryView>> {
-        let result = self
-            .send_command(api::Command::SearchKnowledgeEntries {
-                query: query.to_string(),
-                tag_filter,
-                limit,
-            })
-            .await?;
-        let api::CommandResult::KnowledgeEntries(items) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for search_knowledge_entries"
-            ));
-        };
-        Ok(items)
-    }
-
-    pub async fn create_knowledge_entry(
-        &self,
-        content: &str,
-        tags: Vec<String>,
-        metadata: serde_json::Value,
-    ) -> Result<api::KnowledgeEntryView> {
-        let result = self
-            .send_command(api::Command::CreateKnowledgeEntry {
-                content: content.to_string(),
-                tags,
-                metadata,
-            })
-            .await?;
-        let api::CommandResult::KnowledgeEntryWritten(entry) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for create_knowledge_entry"
-            ));
-        };
-        Ok(entry)
-    }
-
-    pub async fn update_knowledge_entry(
-        &self,
-        id: &str,
-        content: &str,
-        tags: Vec<String>,
-        metadata: serde_json::Value,
-    ) -> Result<api::KnowledgeEntryView> {
-        let result = self
-            .send_command(api::Command::UpdateKnowledgeEntry {
-                id: id.to_string(),
-                content: content.to_string(),
-                tags,
-                metadata,
-            })
-            .await?;
-        let api::CommandResult::KnowledgeEntryWritten(entry) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for update_knowledge_entry"
-            ));
-        };
-        Ok(entry)
-    }
-
-    pub async fn delete_knowledge_entry(&self, id: &str) -> Result<()> {
-        let result = self
-            .send_command(api::Command::DeleteKnowledgeEntry { id: id.to_string() })
-            .await?;
-        let api::CommandResult::Ack = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for delete_knowledge_entry"
-            ));
-        };
-        Ok(())
     }
 }
 

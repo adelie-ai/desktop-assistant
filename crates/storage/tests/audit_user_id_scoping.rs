@@ -297,8 +297,7 @@ fn extract_query_sites(content: &str) -> Vec<QuerySite> {
 
 fn skip_whitespace(s: &str, mut i: usize) -> usize {
     let bytes = s.as_bytes();
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\t')
-    {
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\t') {
         i += 1;
     }
     i
@@ -356,7 +355,9 @@ fn extract_string_literal(content: &str, start: usize) -> Option<String> {
 }
 
 fn line_of(content: &str, byte_offset: usize) -> usize {
-    1 + content[..byte_offset.min(content.len())].matches('\n').count()
+    1 + content[..byte_offset.min(content.len())]
+        .matches('\n')
+        .count()
 }
 
 /// Return the personal-data tables that the SQL fragment references.

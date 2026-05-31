@@ -1,3 +1,5 @@
+//! Ollama connector implementing the core `LlmClient` and `EmbeddingClient` ports.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

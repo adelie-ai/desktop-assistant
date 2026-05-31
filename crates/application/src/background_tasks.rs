@@ -271,8 +271,8 @@ impl BackgroundTaskRegistry {
         // Mutate via Arc::get_mut: cheap, panics if any other clone
         // exists (which would be a programming error — the store is
         // attached at construction time, before any clone goes out).
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("with_store called after the registry was cloned");
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("with_store called after the registry was cloned");
         inner.store = Some(store);
         self
     }
@@ -322,9 +322,7 @@ impl BackgroundTaskRegistry {
                     owner: user_id.clone(),
                     view: view.clone(),
                     token: token.clone(),
-                    logs: VecDeque::with_capacity(
-                        self.inner.config.log_ring_capacity.min(64),
-                    ),
+                    logs: VecDeque::with_capacity(self.inner.config.log_ring_capacity.min(64)),
                     // Seq numbers start at 1 so callers can pass
                     // `after_seq=0` to mean "I've seen nothing yet" —
                     // the filter in [`BackgroundTaskRegistry::logs`] is
@@ -334,17 +332,14 @@ impl BackgroundTaskRegistry {
                 },
             );
             if let Some(parent_id) = &parent
-                && let Some(parent_state) = tasks.get_mut(parent_id) {
-                    parent_state.view.children.push(task_id.clone());
-                }
+                && let Some(parent_state) = tasks.get_mut(parent_id)
+            {
+                parent_state.view.children.push(task_id.clone());
+            }
         }
 
-        self.inner.broadcast(
-            &user_id,
-            api::Event::TaskStarted {
-                task: view.clone(),
-            },
-        );
+        self.inner
+            .broadcast(&user_id, api::Event::TaskStarted { task: view.clone() });
 
         let logs_sink = TaskLogSink {
             inner: Arc::clone(&self.inner),
@@ -383,7 +378,9 @@ impl BackgroundTaskRegistry {
             // than refusing to run the work, so we degrade rather than
             // abort. The cold-restart sweep would only miss this row
             // anyway; the user-visible task continues to work.
-            inner.persist_create(&task_id_for_body, &user_id_for_body, &view_for_persist).await;
+            inner
+                .persist_create(&task_id_for_body, &user_id_for_body, &view_for_persist)
+                .await;
 
             // Run the body inside a `CURRENT_TASK_ID` task-local scope so
             // nested tool dispatches (the `spawn_subagent` builtin, in
@@ -505,10 +502,7 @@ impl BackgroundTaskRegistry {
             .take(limit as usize)
             .cloned()
             .collect();
-        let next_seq = entries
-            .last()
-            .map(|e| e.seq + 1)
-            .unwrap_or(state.next_seq);
+        let next_seq = entries.last().map(|e| e.seq + 1).unwrap_or(state.next_seq);
         Ok((entries, next_seq))
     }
 
@@ -517,9 +511,9 @@ impl BackgroundTaskRegistry {
     /// applies back-pressure to task bodies.
     pub fn subscribe(&self, user_id: &UserId) -> broadcast::Receiver<api::Event> {
         let mut channels = self.inner.user_channels.lock().expect("channels poisoned");
-        let sender = channels.entry(user_id.clone()).or_insert_with(|| {
-            broadcast::channel(self.inner.config.broadcast_capacity).0
-        });
+        let sender = channels
+            .entry(user_id.clone())
+            .or_insert_with(|| broadcast::channel(self.inner.config.broadcast_capacity).0);
         sender.subscribe()
     }
 
@@ -744,10 +738,8 @@ impl BackgroundTaskRegistry {
             // subscribes immediately after restart still observes the
             // lifecycle. This mirrors what a real spawn+finalize would
             // have emitted.
-            self.inner.broadcast(
-                &owner,
-                api::Event::TaskStarted { task: view.clone() },
-            );
+            self.inner
+                .broadcast(&owner, api::Event::TaskStarted { task: view.clone() });
             self.inner.broadcast(
                 &owner,
                 api::Event::TaskCompleted {
@@ -1031,10 +1023,7 @@ impl Inner {
 
         // Wake waiters.
         let waiter = {
-            let mut map = self
-                .completion_notify
-                .lock()
-                .expect("completion poisoned");
+            let mut map = self.completion_notify.lock().expect("completion poisoned");
             map.remove(task_id)
         };
         if let Some(notify) = waiter {
@@ -1187,9 +1176,7 @@ mod tests {
     async fn wait_on_unknown_id_returns_immediately() {
         let registry = BackgroundTaskRegistry::new();
         // No-op fast-path: must not hang or panic.
-        registry
-            .wait(&api::TaskId("does-not-exist".into()))
-            .await;
+        registry.wait(&api::TaskId("does-not-exist".into())).await;
     }
 
     #[tokio::test]

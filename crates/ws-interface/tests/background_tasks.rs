@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::background_tasks::BackgroundTaskRegistry;
-use desktop_assistant_application::{
-    ApiError, ApiResult, AssistantApiHandler, EventSink, UserId,
-};
+use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink, UserId};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_ws::{WsAuthValidator, WsFrame, WsRequest, router};
 use futures_util::{SinkExt, StreamExt};
@@ -82,7 +80,9 @@ fn ws_request(
     request
 }
 
-async fn start_server(handler: Arc<dyn AssistantApiHandler>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn start_server(
+    handler: Arc<dyn AssistantApiHandler>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let app = router(handler, Arc::new(StaticJwtAuth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -215,9 +215,7 @@ async fn ws_subscribe_streams_task_events() {
             continue;
         };
         let frame: WsFrame = match msg {
-            tokio_tungstenite::tungstenite::Message::Text(t) => {
-                serde_json::from_str(&t).unwrap()
-            }
+            tokio_tungstenite::tungstenite::Message::Text(t) => serde_json::from_str(&t).unwrap(),
             _ => continue,
         };
         if let WsFrame::Event {

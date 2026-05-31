@@ -41,6 +41,10 @@ pub fn get_llm_settings_view(path: &Path) -> anyhow::Result<LlmSettingsView> {
     })
 }
 
+// Mirrors the `SettingsService::set_llm_settings` signature one-to-one; each
+// argument is a distinct optional settings field. A bundling struct would just
+// duplicate this shape across the layer boundary — out-of-scope refactor.
+#[allow(clippy::too_many_arguments)]
 pub fn set_llm_settings(
     path: &Path,
     connector: &str,

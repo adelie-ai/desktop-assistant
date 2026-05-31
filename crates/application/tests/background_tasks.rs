@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use desktop_assistant_api_model as api;
+use desktop_assistant_application::UserId;
 use desktop_assistant_application::background_tasks::{
     BackgroundTaskRegistry, RegistryConfig, TaskError,
 };
-use desktop_assistant_application::UserId;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
@@ -162,20 +162,35 @@ async fn registry_user_scope_isolates_listings() {
     let r_b1 = Arc::new(Notify::new());
 
     let r_a1_t = Arc::clone(&r_a1);
-    let a1 = registry.spawn(alice.clone(), conv_kind("c1"), "a1".into(), move |_| async move {
-        r_a1_t.notified().await;
-        Ok(())
-    });
+    let a1 = registry.spawn(
+        alice.clone(),
+        conv_kind("c1"),
+        "a1".into(),
+        move |_| async move {
+            r_a1_t.notified().await;
+            Ok(())
+        },
+    );
     let r_a2_t = Arc::clone(&r_a2);
-    let a2 = registry.spawn(alice.clone(), conv_kind("c2"), "a2".into(), move |_| async move {
-        r_a2_t.notified().await;
-        Ok(())
-    });
+    let a2 = registry.spawn(
+        alice.clone(),
+        conv_kind("c2"),
+        "a2".into(),
+        move |_| async move {
+            r_a2_t.notified().await;
+            Ok(())
+        },
+    );
     let r_b1_t = Arc::clone(&r_b1);
-    let b1 = registry.spawn(bob.clone(), conv_kind("c3"), "b1".into(), move |_| async move {
-        r_b1_t.notified().await;
-        Ok(())
-    });
+    let b1 = registry.spawn(
+        bob.clone(),
+        conv_kind("c3"),
+        "b1".into(),
+        move |_| async move {
+            r_b1_t.notified().await;
+            Ok(())
+        },
+    );
 
     let alice_view = registry.list(&alice, true, None);
     let alice_ids: HashSet<_> = alice_view.iter().map(|v| v.id.clone()).collect();
@@ -253,7 +268,10 @@ async fn registry_cancel_fires_token_and_transitions_status() {
             break;
         }
     }
-    assert!(saw_cancel_complete, "did not see TaskCompleted{{Cancelled}}");
+    assert!(
+        saw_cancel_complete,
+        "did not see TaskCompleted{{Cancelled}}"
+    );
     assert!(observed_cancel.load(Ordering::SeqCst));
 
     // Terminal entries are evicted; the broadcast event above is the
@@ -441,8 +459,9 @@ mod foreground_send {
         AssistantService, BackendTasksSettingsView, ConnectionConfigPayload, ConnectionsService,
         ConnectorDefaultsView, ConversationService, DatabaseSettingsView, EmbeddingsSettingsView,
         KnowledgeService, LlmSettingsView, ModelListing as CoreModelListing,
-        PersistenceSettingsView, PromptDispatchOutcome, PromptSelectionOverride, PurposeConfigPayload,
-        PurposeKind, PurposesView as CorePurposesView, SettingsService, WsAuthSettingsView,
+        PersistenceSettingsView, PromptDispatchOutcome, PromptSelectionOverride,
+        PurposeConfigPayload, PurposeKind, PurposesView as CorePurposesView, SettingsService,
+        WsAuthSettingsView,
     };
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 
@@ -500,7 +519,8 @@ mod foreground_send {
     impl ConnectionsService for FakeConnections {
         async fn list_connections(
             &self,
-        ) -> Result<Vec<desktop_assistant_core::ports::inbound::ConnectionView>, CoreError> {
+        ) -> Result<Vec<desktop_assistant_core::ports::inbound::ConnectionView>, CoreError>
+        {
             Ok(vec![])
         }
         async fn create_connection(
@@ -1074,8 +1094,7 @@ async fn log_sink_emits_log_appended_event() {
     for _ in 0..50 {
         match timeout(Duration::from_millis(200), events.recv()).await {
             Ok(Ok(api::Event::TaskLogAppended { id, entry }))
-                if id == task_id.0
-                    && entry.category == api::LogCategory::ToolResult =>
+                if id == task_id.0 && entry.category == api::LogCategory::ToolResult =>
             {
                 assert_eq!(entry.level, api::LogLevel::Warn);
                 assert_eq!(entry.message, "tool finished");
@@ -1239,12 +1258,16 @@ async fn business_outcome_subagent_or_standalone_kinds_compile_and_are_listable_
 
     let everything = registry.list(&user, true, None);
     let kinds: Vec<_> = everything.iter().map(|v| v.kind.clone()).collect();
-    assert!(kinds
-        .iter()
-        .any(|k| matches!(k, api::TaskKind::Subagent { name, .. } if name == "researcher")));
-    assert!(kinds
-        .iter()
-        .any(|k| matches!(k, api::TaskKind::Standalone { name, .. } if name == "harvester")));
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, api::TaskKind::Subagent { name, .. } if name == "researcher"))
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, api::TaskKind::Standalone { name, .. } if name == "harvester"))
+    );
 
     let sub_view = registry.get(&user, &sub).expect("present");
     assert_eq!(sub_view.parent, Some(parent.clone()));

@@ -110,7 +110,10 @@ mod tests {
         let json = m.to_json();
         let back = KbMetadata::from_json(&json);
         let scope = back.effective_scope().expect("scope should be present");
-        assert_eq!(scope.0.get("project").map(String::as_str), Some("adelie-ai"));
+        assert_eq!(
+            scope.0.get("project").map(String::as_str),
+            Some("adelie-ai")
+        );
     }
 
     #[test]

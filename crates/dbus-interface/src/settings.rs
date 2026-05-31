@@ -597,37 +597,37 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
         let emitter = emitter.to_owned();
         let updated = with_user_id(user_id, async move {
             let ConfigPatchArgs {
-            set_llm_connector,
-            llm_connector,
-            set_llm_model,
-            llm_model,
-            set_llm_base_url,
-            llm_base_url,
-            set_llm_api_key,
-            llm_api_key,
-            set_embeddings_connector,
-            embeddings_connector,
-            set_embeddings_model,
-            embeddings_model,
-            set_embeddings_base_url,
-            embeddings_base_url,
-            set_persistence_enabled,
-            persistence_enabled,
-            set_persistence_remote_url,
-            persistence_remote_url,
-            set_persistence_remote_name,
-            persistence_remote_name,
-            set_persistence_push_on_update,
-            persistence_push_on_update,
-            set_llm_temperature,
-            llm_temperature,
-            set_llm_top_p,
-            llm_top_p,
-            set_llm_max_tokens,
-            llm_max_tokens,
-            set_llm_hosted_tool_search,
-            llm_hosted_tool_search,
-        } = changes;
+                set_llm_connector,
+                llm_connector,
+                set_llm_model,
+                llm_model,
+                set_llm_base_url,
+                llm_base_url,
+                set_llm_api_key,
+                llm_api_key,
+                set_embeddings_connector,
+                embeddings_connector,
+                set_embeddings_model,
+                embeddings_model,
+                set_embeddings_base_url,
+                embeddings_base_url,
+                set_persistence_enabled,
+                persistence_enabled,
+                set_persistence_remote_url,
+                persistence_remote_url,
+                set_persistence_remote_name,
+                persistence_remote_name,
+                set_persistence_push_on_update,
+                persistence_push_on_update,
+                set_llm_temperature,
+                llm_temperature,
+                set_llm_top_p,
+                llm_top_p,
+                set_llm_max_tokens,
+                llm_max_tokens,
+                set_llm_hosted_tool_search,
+                llm_hosted_tool_search,
+            } = changes;
 
             self.apply_config_patch(ConfigPatch {
                 llm_connector: set_llm_connector.then_some(llm_connector),
@@ -1340,9 +1340,7 @@ mod tests {
                     hosted_tool_search_available: false,
                 })
             }
-            async fn get_persistence_settings(
-                &self,
-            ) -> Result<PersistenceSettingsView, CoreError> {
+            async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
                 self.record();
                 Ok(PersistenceSettingsView {
                     enabled: false,
@@ -1424,11 +1422,7 @@ mod tests {
                 self.record();
                 Ok(())
             }
-            async fn set_mcp_server_enabled(
-                &self,
-                _: String,
-                _: bool,
-            ) -> Result<(), CoreError> {
+            async fn set_mcp_server_enabled(&self, _: String, _: bool) -> Result<(), CoreError> {
                 self.record();
                 Ok(())
             }

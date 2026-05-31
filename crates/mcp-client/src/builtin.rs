@@ -944,7 +944,8 @@ mod tests {
              Current block:\n---\n{doc_block}\n---"
         );
         assert!(
-            doc_block.contains("user_id") || doc_block.contains("per-user")
+            doc_block.contains("user_id")
+                || doc_block.contains("per-user")
                 || doc_block.contains("tenant"),
             "with_database docstring must mention per-user / user_id / tenant scoping. \
              Current block:\n---\n{doc_block}\n---"

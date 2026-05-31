@@ -75,10 +75,7 @@ pub trait UdsAuthValidator: Send + Sync {
     /// installs that don't care about identity can keep the default;
     /// multi-tenant or multi-user-host deploys override this method
     /// to return the JWT subject so storage queries scope per-user.
-    async fn extract_user_id(
-        &self,
-        token: &str,
-    ) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
         let _ = token;
         None
     }
@@ -92,7 +89,8 @@ pub struct JwtUdsAuth<F>
 where
     F: for<'a> Fn(
             &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
         + Send
         + Sync,
 {
@@ -103,7 +101,8 @@ impl<F> JwtUdsAuth<F>
 where
     F: for<'a> Fn(
             &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
         + Send
         + Sync,
 {
@@ -117,7 +116,8 @@ impl<F> UdsAuthValidator for JwtUdsAuth<F>
 where
     F: for<'a> Fn(
             &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
         + Send
         + Sync,
 {
@@ -186,19 +186,13 @@ impl UdsServer {
         // Unix so other users on the host can't even stat the socket.
         if let Some(parent) = self.config.socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to create uds parent dir {}: {e}",
-                    parent.display()
-                )
+                anyhow::anyhow!("failed to create uds parent dir {}: {e}", parent.display())
             })?;
 
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    parent,
-                    std::fs::Permissions::from_mode(0o700),
-                );
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
         }
 
@@ -310,12 +304,7 @@ async fn handle_connection(
         Err(e) => {
             // Surface the parse error to the client before closing so a
             // misconfigured client doesn't silently hang.
-            let _ = write_error(
-                &mut write_half,
-                "",
-                &format!("invalid handshake json: {e}"),
-            )
-            .await;
+            let _ = write_error(&mut write_half, "", &format!("invalid handshake json: {e}")).await;
             return Ok(());
         }
     };
@@ -433,7 +422,6 @@ where
     Ok(())
 }
 
-
 /// Read one length-prefixed frame.
 ///
 /// The header is a 4-byte little-endian `u32` length. We `read_exact`
@@ -473,4 +461,3 @@ where
     write_half.flush().await?;
     Ok(())
 }
-
