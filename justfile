@@ -37,6 +37,44 @@ dev-backend:
 build:
     cargo build --workspace
 
+# --- Local verification ("local CI") -----------------------------------------
+# We run these locally instead of GitHub Actions. `install-hooks` wires `check`
+# into a git pre-push hook so it runs automatically before every push.
+
+# Full local gate: formatting, lints, build, tests (on the pinned toolchain)
+check: fmt-check lint build test
+
+# Verify formatting without modifying files
+fmt-check:
+    cargo fmt --all --check
+
+# Apply formatting
+fmt:
+    cargo fmt --all
+
+# Clippy across the workspace; warnings are errors
+lint:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Run the workspace test suite (excludes #[ignore] integration tests)
+test:
+    cargo test --workspace
+
+# Real-Secret-Service integration tests (needs a live session bus; mutates + cleans keyring)
+test-integration:
+    cargo test --workspace -- --ignored
+
+# Rebase onto latest origin/main then run the gate (catches clean-rebase-but-broken-build)
+premerge:
+    git fetch origin
+    git rebase origin/main
+    just check
+
+# Install git hooks (pre-push runs `just check`). Local config; run once per clone.
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "pre-push hook active — bypass once with: git push --no-verify"
+
 # Install user service file and reload systemd user manager
 install-service:
     [ -f "{{service_src}}" ] || (echo "Missing service file: {{service_src}}" >&2; exit 1)
