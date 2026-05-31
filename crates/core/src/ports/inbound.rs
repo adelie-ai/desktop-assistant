@@ -326,6 +326,13 @@ pub struct ConnectionView {
     pub display_label: String,
     pub availability: ConnectionAvailability,
     pub has_credentials: bool,
+    /// Echoed non-secret config (endpoint/profile/region and the env-var
+    /// *name* that holds the credential), so clients can pre-fill an edit
+    /// dialog without re-deriving it. Carries the same shape as the
+    /// create/update input ([`ConnectionConfigPayload`]); raw secret values
+    /// and keyring coordinates are never represented in this type.
+    /// `None` only if the connection has no stored config entry.
+    pub config: Option<ConnectionConfigPayload>,
 }
 
 /// A model enumerated under a connection.

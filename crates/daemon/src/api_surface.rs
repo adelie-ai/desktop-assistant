@@ -86,6 +86,14 @@ impl RegistryHandle {
             .into_iter()
             .map(|st| {
                 let healthy = matches!(st.health, ConnectionHealth::Ok);
+                // Echo the stored non-secret config so clients can pre-fill an
+                // edit dialog. `connection_to_payload` drops the keyring
+                // `secret` coordinates; the payload type has no field for them.
+                let config = state
+                    .config
+                    .connections
+                    .get(st.id.as_str())
+                    .map(connection_to_payload);
                 CoreConnectionView {
                     id: st.id.as_str().to_string(),
                     connector_type: st.connector_type.clone(),
@@ -97,6 +105,7 @@ impl RegistryHandle {
                         }
                     },
                     has_credentials: healthy,
+                    config,
                 }
             })
             .collect()
@@ -988,6 +997,38 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
     }
 }
 
+/// Inverse of [`payload_to_connection`]: project a stored [`ConnectionConfig`]
+/// down to the protocol-neutral, **non-secret** [`ConnectionConfigPayload`]
+/// echoed back through `ConnectionView`.
+///
+/// Only endpoint/profile/region fields and the credential *env-var name*
+/// (`api_key_env`) cross this boundary. The keyring `secret` coordinates on
+/// the Anthropic/OpenAI variants are deliberately dropped — the payload type
+/// has no field for them, so a raw secret can never be reconstructed from the
+/// echoed value.
+fn connection_to_payload(conn: &ConnectionConfig) -> ConnectionConfigPayload {
+    match conn {
+        ConnectionConfig::Anthropic(c) => ConnectionConfigPayload::Anthropic {
+            base_url: c.base_url.clone(),
+            api_key_env: c.api_key_env.clone(),
+            // `c.secret` (keyring coordinates) intentionally not echoed.
+        },
+        ConnectionConfig::OpenAi(c) => ConnectionConfigPayload::OpenAi {
+            base_url: c.base_url.clone(),
+            api_key_env: c.api_key_env.clone(),
+            // `c.secret` (keyring coordinates) intentionally not echoed.
+        },
+        ConnectionConfig::Bedrock(c) => ConnectionConfigPayload::Bedrock {
+            aws_profile: c.aws_profile.clone(),
+            region: c.region.clone(),
+            base_url: c.base_url.clone(),
+        },
+        ConnectionConfig::Ollama(c) => ConnectionConfigPayload::Ollama {
+            base_url: c.base_url.clone(),
+        },
+    }
+}
+
 fn purpose_to_payload(p: &PurposeConfig) -> PurposeConfigPayload {
     PurposeConfigPayload {
         connection: match &p.connection {
@@ -1125,6 +1166,22 @@ mod tests {
         })
     }
 
+    /// Anthropic connection carrying a keyring `secret` reference alongside
+    /// the non-secret `base_url` / `api_key_env`. Used to prove the echoed
+    /// view drops the secret coordinates.
+    fn anthropic_with_secret() -> ConnectionConfig {
+        use crate::config::SecretConfig;
+        ConnectionConfig::Anthropic(crate::connections::AnthropicConnection {
+            base_url: Some("https://api.anthropic.com".into()),
+            api_key_env: Some("ANTHROPIC_WORK_KEY".into()),
+            secret: Some(SecretConfig {
+                account: Some("super-secret-account".into()),
+                entry: Some("super-secret-entry".into()),
+                ..SecretConfig::default()
+            }),
+        })
+    }
+
     fn make_handle_with(cfg: DaemonConfig) -> Arc<RegistryHandle> {
         let registry = build_registry(&cfg);
         Arc::new(RegistryHandle::new(cfg, registry).with_config_path(tmp_config_path()))
@@ -1138,6 +1195,63 @@ mod tests {
         assert_eq!(views.len(), 2);
         assert_eq!(views[0].id, "local");
         assert_eq!(views[1].id, "aws");
+    }
+
+    #[tokio::test]
+    async fn list_connections_echoes_non_secret_config() {
+        let cfg = config_with_connections(&[("aws", bedrock_work())]);
+        let svc = DaemonConnectionsService::new(make_handle_with(cfg));
+        let views = svc.list_connections().await.unwrap();
+        assert_eq!(views.len(), 1);
+
+        let config = views[0]
+            .config
+            .as_ref()
+            .expect("ConnectionView should echo the stored non-secret config");
+        match config {
+            ConnectionConfigPayload::Bedrock {
+                aws_profile,
+                region,
+                base_url,
+            } => {
+                assert_eq!(aws_profile.as_deref(), Some("work"));
+                assert_eq!(region.as_deref(), Some("us-west-2"));
+                assert_eq!(base_url.as_deref(), None);
+            }
+            other => panic!("expected echoed Bedrock config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_connections_echoes_config_without_leaking_secret() {
+        let cfg = config_with_connections(&[("work", anthropic_with_secret())]);
+        let svc = DaemonConnectionsService::new(make_handle_with(cfg));
+        let views = svc.list_connections().await.unwrap();
+        assert_eq!(views.len(), 1);
+
+        let config = views[0]
+            .config
+            .as_ref()
+            .expect("ConnectionView should echo the stored non-secret config");
+        match config {
+            ConnectionConfigPayload::Anthropic {
+                base_url,
+                api_key_env,
+            } => {
+                assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
+                assert_eq!(api_key_env.as_deref(), Some("ANTHROPIC_WORK_KEY"));
+            }
+            other => panic!("expected echoed Anthropic config, got {other:?}"),
+        }
+
+        // The keyring `secret` coordinates (account/entry/etc.) must never
+        // surface in the echoed view. The payload type has no field for them,
+        // so prove it via a full debug-string scan of every view.
+        let dump = format!("{views:?}");
+        assert!(
+            !dump.contains("super-secret-account") && !dump.contains("super-secret-entry"),
+            "echoed ConnectionView leaked secret coordinates: {dump}"
+        );
     }
 
     #[tokio::test]

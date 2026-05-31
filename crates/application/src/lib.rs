@@ -477,6 +477,40 @@ fn api_connection_config_to_core(c: api::ConnectionConfigView) -> ConnectionConf
     }
 }
 
+/// Inverse of [`api_connection_config_to_core`]: map the non-secret core
+/// payload to its wire view. No variant of either type carries a raw secret,
+/// so this conversion cannot leak one.
+fn core_connection_config_to_api(c: ConnectionConfigPayload) -> api::ConnectionConfigView {
+    match c {
+        ConnectionConfigPayload::Anthropic {
+            base_url,
+            api_key_env,
+        } => api::ConnectionConfigView::Anthropic {
+            base_url,
+            api_key_env,
+        },
+        ConnectionConfigPayload::OpenAi {
+            base_url,
+            api_key_env,
+        } => api::ConnectionConfigView::OpenAi {
+            base_url,
+            api_key_env,
+        },
+        ConnectionConfigPayload::Bedrock {
+            aws_profile,
+            region,
+            base_url,
+        } => api::ConnectionConfigView::Bedrock {
+            aws_profile,
+            region,
+            base_url,
+        },
+        ConnectionConfigPayload::Ollama { base_url } => {
+            api::ConnectionConfigView::Ollama { base_url }
+        }
+    }
+}
+
 fn core_connection_to_api_view(
     v: desktop_assistant_core::ports::inbound::ConnectionView,
 ) -> api::ConnectionView {
@@ -491,6 +525,7 @@ fn core_connection_to_api_view(
             }
         },
         has_credentials: v.has_credentials,
+        config: v.config.map(core_connection_config_to_api),
     }
 }
 
