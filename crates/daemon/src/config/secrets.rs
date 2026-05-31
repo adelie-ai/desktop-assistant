@@ -403,3 +403,129 @@ mod tests {
         assert_eq!(read_secret_from_backend(&secret, "openai"), None);
     }
 }
+
+#[cfg(test)]
+mod integration {
+    //! Real-Secret-Service integration tests. Ignored by default — they need a
+    //! live session bus and `secret-tool`, and they mutate the keyring (under a
+    //! namespaced service, cleaned up afterwards). Run via `just test-integration`.
+    //!
+    //! This covers what the mock store cannot: the legacy `secret-tool`
+    //! `account`→`username` migrate-on-read path against a real backend (the
+    //! mock has no attributes, so `Entry::search` finds nothing there).
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::sync::Once;
+
+    static REAL_STORE: Once = Once::new();
+
+    /// Register the real Secret Service store once, or return false (with a
+    /// skip note) when the environment can't support these tests.
+    fn real_store_ready() -> bool {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            eprintln!("SKIP: no DBUS_SESSION_BUS_ADDRESS (no session bus)");
+            return false;
+        }
+        if !command_present("secret-tool") {
+            eprintln!("SKIP: secret-tool not installed");
+            return false;
+        }
+        REAL_STORE.call_once(|| match zbus_secret_service_keyring_store::Store::new() {
+            Ok(store) => keyring_core::set_default_store(store),
+            Err(error) => eprintln!("WARN: could not connect to Secret Service: {error}"),
+        });
+        // If Store::new failed above, Entry::new reports NoDefaultStore — skip.
+        match Entry::new("adelie-it-probe", "probe").and_then(|e| e.get_password()) {
+            Ok(_) | Err(keyring_core::Error::NoEntry) => true,
+            Err(error) => {
+                eprintln!("SKIP: Secret Service unavailable: {error}");
+                false
+            }
+        }
+    }
+
+    fn command_present(bin: &str) -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {bin}"))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn secret_tool_store(attrs: &[(&str, &str)], value: &str) {
+        let mut cmd = Command::new("secret-tool");
+        cmd.arg("store")
+            .arg("--label")
+            .arg("adelie integration test");
+        for (key, val) in attrs {
+            cmd.arg(key).arg(val);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn secret-tool");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(value.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "secret-tool store failed");
+    }
+
+    fn secret_tool_clear(attrs: &[(&str, &str)]) {
+        let mut cmd = Command::new("secret-tool");
+        cmd.arg("clear");
+        for (key, val) in attrs {
+            cmd.arg(key).arg(val);
+        }
+        let _ = cmd.output();
+    }
+
+    #[test]
+    #[ignore = "needs a real Secret Service; run via `just test-integration`"]
+    fn legacy_secret_tool_item_migrates_on_read() {
+        if !real_store_ready() {
+            return;
+        }
+        let service = "adelie-it-daemon-legacy";
+        let account = "api_key";
+        let value = "sk-legacy-integration";
+
+        // Start clean, then plant a legacy {service, account} item the way an
+        // old daemon's `secret-tool store` did.
+        secret_tool_clear(&[("service", service), ("account", account)]);
+        let _ = Entry::new(service, account).and_then(|e| e.delete_credential());
+        secret_tool_store(&[("service", service), ("account", account)], value);
+
+        // Act: the daemon's migrate-on-read path.
+        let got = read_and_migrate_legacy_secret(service, account);
+        assert_eq!(got.as_deref(), Some(value), "should read the legacy value");
+
+        // The legacy item is gone and the value now lives under the new
+        // `username` scheme.
+        let legacy_left =
+            Entry::search(&HashMap::from([("service", service), ("account", account)]))
+                .map(|items| items.len())
+                .unwrap_or(0);
+        assert_eq!(
+            legacy_left, 0,
+            "legacy item should be deleted after migration"
+        );
+        assert_eq!(
+            Entry::new(service, account)
+                .unwrap()
+                .get_password()
+                .ok()
+                .as_deref(),
+            Some(value),
+            "migrated value should be readable under the new scheme"
+        );
+
+        // Cleanup.
+        let _ = Entry::new(service, account).unwrap().delete_credential();
+    }
+}

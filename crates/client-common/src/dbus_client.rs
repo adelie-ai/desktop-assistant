@@ -46,6 +46,14 @@ const DBUS_CONVERSATIONS_PATH: &str = "/org/desktopAssistant/Conversations";
 const DBUS_SETTINGS_PATH: &str = "/org/desktopAssistant/Settings";
 const DBUS_KNOWLEDGE_PATH: &str = "/org/desktopAssistant/Knowledge";
 
+/// Wire shape of a `list_conversations` row: `(id, title, message_count,
+/// updated_at, archived)` — mirrors the D-Bus `a(ssusb)` reply.
+type DbusConversationSummary = (String, String, u32, String, bool);
+
+/// Wire shape of `get_conversation`: `(id, title, messages)` where each message
+/// is `(role, content)` — mirrors the D-Bus `(ssa(ss))` reply.
+type DbusConversationDetail = (String, String, Vec<(String, String)>);
+
 #[zbus::proxy(interface = "org.desktopAssistant.Conversations")]
 trait Conversations {
     async fn create_conversation(&self, title: &str) -> zbus::fdo::Result<String>;
@@ -54,16 +62,13 @@ trait Conversations {
         &self,
         max_age_days: i32,
         include_archived: bool,
-    ) -> zbus::fdo::Result<Vec<(String, String, u32, String, bool)>>;
+    ) -> zbus::fdo::Result<Vec<DbusConversationSummary>>;
 
     async fn archive_conversation(&self, id: &str) -> zbus::fdo::Result<()>;
 
     async fn unarchive_conversation(&self, id: &str) -> zbus::fdo::Result<()>;
 
-    async fn get_conversation(
-        &self,
-        id: &str,
-    ) -> zbus::fdo::Result<(String, String, Vec<(String, String)>)>;
+    async fn get_conversation(&self, id: &str) -> zbus::fdo::Result<DbusConversationDetail>;
 
     async fn delete_conversation(&self, id: &str) -> zbus::fdo::Result<()>;
 
