@@ -86,6 +86,14 @@ impl RegistryHandle {
             .into_iter()
             .map(|st| {
                 let healthy = matches!(st.health, ConnectionHealth::Ok);
+                // Echo the stored non-secret config so clients can pre-fill an
+                // edit dialog. `connection_to_payload` drops the keyring
+                // `secret` coordinates; the payload type has no field for them.
+                let config = state
+                    .config
+                    .connections
+                    .get(st.id.as_str())
+                    .map(connection_to_payload);
                 CoreConnectionView {
                     id: st.id.as_str().to_string(),
                     connector_type: st.connector_type.clone(),
@@ -97,6 +105,7 @@ impl RegistryHandle {
                         }
                     },
                     has_credentials: healthy,
+                    config,
                 }
             })
             .collect()
@@ -985,6 +994,38 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
         ConnectionConfigPayload::Ollama { base_url } => {
             ConnectionConfig::Ollama(OllamaConnection { base_url })
         }
+    }
+}
+
+/// Inverse of [`payload_to_connection`]: project a stored [`ConnectionConfig`]
+/// down to the protocol-neutral, **non-secret** [`ConnectionConfigPayload`]
+/// echoed back through `ConnectionView`.
+///
+/// Only endpoint/profile/region fields and the credential *env-var name*
+/// (`api_key_env`) cross this boundary. The keyring `secret` coordinates on
+/// the Anthropic/OpenAI variants are deliberately dropped — the payload type
+/// has no field for them, so a raw secret can never be reconstructed from the
+/// echoed value.
+fn connection_to_payload(conn: &ConnectionConfig) -> ConnectionConfigPayload {
+    match conn {
+        ConnectionConfig::Anthropic(c) => ConnectionConfigPayload::Anthropic {
+            base_url: c.base_url.clone(),
+            api_key_env: c.api_key_env.clone(),
+            // `c.secret` (keyring coordinates) intentionally not echoed.
+        },
+        ConnectionConfig::OpenAi(c) => ConnectionConfigPayload::OpenAi {
+            base_url: c.base_url.clone(),
+            api_key_env: c.api_key_env.clone(),
+            // `c.secret` (keyring coordinates) intentionally not echoed.
+        },
+        ConnectionConfig::Bedrock(c) => ConnectionConfigPayload::Bedrock {
+            aws_profile: c.aws_profile.clone(),
+            region: c.region.clone(),
+            base_url: c.base_url.clone(),
+        },
+        ConnectionConfig::Ollama(c) => ConnectionConfigPayload::Ollama {
+            base_url: c.base_url.clone(),
+        },
     }
 }
 

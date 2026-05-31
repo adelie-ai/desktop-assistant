@@ -662,6 +662,17 @@ pub struct ConnectionView {
     /// check (env var present, keyring lookup succeeded, or Bedrock/Ollama
     /// which auth via ambient credentials / none).
     pub has_credentials: bool,
+    /// Echoed non-secret config, so a client can pre-fill an edit dialog
+    /// without losing the stored endpoint/profile/region or the credential
+    /// env-var *name*. Reuses the create/update input type
+    /// [`ConnectionConfigView`], which has no variant capable of carrying a
+    /// raw secret value — so no secret is ever serialized here. `None` only
+    /// when the daemon has no stored config for the connection.
+    ///
+    /// Added after the initial `ConnectionView` shipped; `#[serde(default)]`
+    /// keeps older daemons (which omit it) deserializable on newer clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ConnectionConfigView>,
 }
 
 /// A single model enumerated across one or all connections. Mirrors the
