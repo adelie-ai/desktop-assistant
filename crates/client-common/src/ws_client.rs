@@ -104,53 +104,41 @@ impl WsClient {
         ))
     }
 
+    /// Send a prompt with an optional per-message model/connection override.
+    ///
+    /// Backward-compatibility shim: the implementation now lives on the
+    /// transport-agnostic [`AssistantCommands`] trait (so `UdsClient` gets it
+    /// too — adele-gtk#49). This inherent delegator is kept so existing
+    /// `ws.send_prompt_with_override(...)` call sites in downstream repos
+    /// (adele-tui, adele-kde) keep compiling whether or not they have the
+    /// trait in scope.
     pub async fn send_prompt_with_override(
         &self,
         conversation_id: &str,
         prompt: &str,
         override_selection: Option<api::SendPromptOverride>,
     ) -> Result<String> {
-        let result = self
-            .send_command(api::Command::SendMessage {
-                conversation_id: conversation_id.to_string(),
-                content: prompt.to_string(),
-                override_selection,
-            })
-            .await?;
-        // Post-#114 the daemon returns `SendMessageAck { task_id }`
-        // when its handler is wired with a `BackgroundTaskRegistry`;
-        // older / test daemons may still return the legacy bare `Ack`.
-        // Both are valid wire-level acks for this call site — the
-        // task id is surfaced via streaming events, not the ack.
-        match result {
-            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
-            api::CommandResult::Ack => Ok(String::new()),
-            other => Err(anyhow!(
-                "unexpected websocket response for send_prompt: {other:?}"
-            )),
-        }
+        AssistantCommands::send_prompt_with_override(
+            self,
+            conversation_id,
+            prompt,
+            override_selection,
+        )
+        .await
     }
 
     /// List models across every healthy connection. Pass `connection_id =
     /// Some(_)` to scope to a single connection. `refresh = true` bypasses
     /// connector caches (e.g. Bedrock).
+    ///
+    /// Backward-compatibility shim delegating to the [`AssistantCommands`]
+    /// trait default (see `send_prompt_with_override` above).
     pub async fn list_available_models(
         &self,
         connection_id: Option<&str>,
         refresh: bool,
     ) -> Result<Vec<api::ModelListing>> {
-        let result = self
-            .send_command(api::Command::ListAvailableModels {
-                connection_id: connection_id.map(str::to_string),
-                refresh,
-            })
-            .await?;
-        let api::CommandResult::Models(items) = result else {
-            return Err(anyhow!(
-                "unexpected websocket response for list_available_models"
-            ));
-        };
-        Ok(items)
+        AssistantCommands::list_available_models(self, connection_id, refresh).await
     }
 }
 

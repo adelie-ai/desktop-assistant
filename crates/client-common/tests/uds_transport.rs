@@ -58,6 +58,7 @@ impl AssistantApiHandler for TestHandler {
             api::Command::CreateConversation { title } => Ok(api::CommandResult::ConversationId {
                 id: format!("id-for-{title}"),
             }),
+            api::Command::ListAvailableModels { .. } => Ok(api::CommandResult::Models(Vec::new())),
             _ => Err(ApiError::Unsupported),
         }
     }
@@ -144,6 +145,57 @@ async fn uds_transport_round_trips_commands() {
         .expect("no response within 2s")
         .expect("create_conversation over uds");
     assert_eq!(id, "id-for-hello");
+
+    let _ = shutdown.send(());
+}
+
+/// adele-gtk#49: the generic command channel must be reachable over the
+/// local UDS transport, not only WebSocket. `TransportClient::as_commands`
+/// must yield `Some(&dyn AssistantCommands)` for a UDS client, and the two
+/// methods that were previously WebSocket-only inherent methods
+/// (`send_prompt_with_override`, `list_available_models`) must round-trip
+/// through it.
+#[tokio::test]
+async fn uds_transport_exposes_command_channel_via_as_commands() {
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    let path = dir.path().join("adelie.sock");
+    let shutdown = start_server(path.clone(), signing_key.clone());
+    wait_for_socket(&path).await;
+
+    let config = uds_config(path, mint_test_jwt(&signing_key, "dave"));
+    let (client, _signals) = connect_transport(&config).await.expect("connect over uds");
+
+    let commands = client
+        .as_commands()
+        .expect("as_commands must be Some for a UDS transport");
+
+    // Per-conversation model override over UDS. The TestHandler uses the
+    // legacy `Ack` send path, so the returned task id is empty — the point is
+    // that the command reaches the daemon over the local socket at all.
+    let override_selection = Some(api::SendPromptOverride {
+        connection_id: "conn-1".to_string(),
+        model_id: "model-1".to_string(),
+        effort: None,
+    });
+    let task_id = timeout(
+        Duration::from_secs(2),
+        commands.send_prompt_with_override("conv-1", "hi", override_selection),
+    )
+    .await
+    .expect("no response within 2s")
+    .expect("send_prompt_with_override over uds");
+    assert_eq!(task_id, String::new());
+
+    // Model listing over UDS.
+    let models = timeout(
+        Duration::from_secs(2),
+        commands.list_available_models(None, false),
+    )
+    .await
+    .expect("no response within 2s")
+    .expect("list_available_models over uds");
+    assert!(models.is_empty());
 
     let _ = shutdown.send(());
 }

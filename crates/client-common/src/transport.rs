@@ -72,6 +72,26 @@ impl TransportClient {
             Self::Uds(_) => None,
         }
     }
+
+    /// Access the transport-agnostic command channel, so callers can issue
+    /// commands that aren't exposed on the high-level [`AssistantClient`]
+    /// facade (config Settings, per-conversation model override, background
+    /// tasks) over *any* socket transport — WebSocket or local UDS.
+    ///
+    /// Returns `Some` for the `Ws` and `Uds` variants, which both speak the
+    /// shared `WsRequest`/`WsFrame` protocol via [`AssistantCommands`], and
+    /// `None` for `Dbus`, which talks a separate typed zbus interface and so
+    /// does not implement that trait. This supersedes [`as_ws`](Self::as_ws)
+    /// for command-channel access (adele-gtk#49); `as_ws` is retained until
+    /// downstream callers migrate.
+    pub fn as_commands(&self) -> Option<&(dyn AssistantCommands + '_)> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(_) => None,
+            Self::Ws(client) => Some(client),
+            Self::Uds(client) => Some(client),
+        }
+    }
 }
 
 #[async_trait]
