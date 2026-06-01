@@ -278,13 +278,89 @@ where
             Ok(())
         },
     );
-    registry.wait(&parent_id).await;
+    timeout(Duration::from_secs(5), registry.wait(&parent_id))
+        .await
+        .expect("parent task must finish, not hang");
     let value = result_slot
         .lock()
         .unwrap()
         .take()
         .expect("body produced a value");
     (parent_id, value)
+}
+
+/// Like [`under_parent_task`] but the parent body does NOT return until
+/// the caller fires the returned release `Notify`. The body runs `body`,
+/// publishes its produced value, then parks — so the parent (and any
+/// `wait=false` child it left running) stay live in the registry while
+/// the test inspects them. Terminal entries are evicted immediately on
+/// finalize (#158), so live inspection requires the producing task to
+/// still be running. Returns the parent id, the body's value, and the
+/// release handle; the test must fire it (and drain) to avoid leaks.
+async fn under_live_parent_task<F, Fut, T>(
+    registry: &BackgroundTaskRegistry,
+    user: UserId,
+    parent_conv: &str,
+    body: F,
+) -> (api::TaskId, T, Arc<Notify>)
+where
+    F: FnOnce(api::TaskId) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let release = Arc::new(Notify::new());
+    let release_for_task = Arc::clone(&release);
+    let (value_tx, value_rx) = tokio::sync::oneshot::channel::<T>();
+    let parent_id = registry.spawn(
+        user,
+        api::TaskKind::Conversation {
+            conversation_id: parent_conv.into(),
+        },
+        "parent".into(),
+        move |ctx| async move {
+            let parent_id = ctx.task_id.clone();
+            let token = ctx.token.clone();
+            // Install the per-turn cancellation token the same way
+            // `send_prompt_with_override` would.
+            let value =
+                desktop_assistant_core::ports::llm::with_cancellation_token(token, body(parent_id))
+                    .await;
+            // Publish the value, then park so the parent (and any live
+            // child) remain registered for the test to inspect.
+            let _ = value_tx.send(value);
+            release_for_task.notified().await;
+            Ok(())
+        },
+    );
+    let value = timeout(Duration::from_secs(5), value_rx)
+        .await
+        .expect("parent body must publish its value, not hang")
+        .expect("parent body produced a value");
+    (parent_id, value, release)
+}
+
+/// Drain `events` until a terminal `TaskCompleted` for `task_id` arrives,
+/// returning its `(status, last_error)`. Used by tests that inspect
+/// terminal status now that finalize evicts the entry from `list`/`get`
+/// (#158) — the broadcast event is the surviving record.
+async fn wait_for_completion(
+    events: &mut tokio::sync::broadcast::Receiver<api::Event>,
+    task_id: &api::TaskId,
+) -> (api::TaskStatus, Option<String>) {
+    let want = task_id.0.clone();
+    loop {
+        match timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted {
+                id,
+                status,
+                last_error,
+            })) if id == want => return (status, last_error),
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed before TaskCompleted: {e:?}"),
+            Err(_) => panic!("timed out waiting for TaskCompleted({want})"),
+        }
+    }
 }
 
 // --------------------------------------------------------------------
@@ -350,11 +426,18 @@ async fn spawn_subagent_with_wait_false_returns_task_id_immediately() {
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let user = unique_user("alice");
 
+    // Subscribe before anything spawns so we never miss the child's
+    // terminal event — finalize evicts the entry (#158), so the broadcast
+    // is the authoritative post-completion status.
+    let mut events = registry.subscribe(&user);
+
+    // Keep the parent live (it returns wait=false immediately, but we need
+    // the child still in-flight so we can observe its Running status).
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
     let registry_for_body = Arc::clone(&registry);
-    let (_parent_id, result) =
-        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+    let (_parent_id, child_task_id, parent_release) =
+        under_live_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
             let tools = tools_for_body;
             let user = user_for_body;
             let registry = registry_for_body;
@@ -383,7 +466,8 @@ async fn spawn_subagent_with_wait_false_returns_task_id_immediately() {
                 let child_task_id = parsed["child_task_id"].as_str().unwrap().to_string();
                 assert!(parsed["child_conversation_id"].as_str().is_some());
 
-                // The child should still be Running until we release it.
+                // The child is still Running until we release it — it's
+                // visible because it hasn't reached a terminal state.
                 let view = registry
                     .get(&user, &api::TaskId(child_task_id.clone()))
                     .expect("child registered");
@@ -394,13 +478,19 @@ async fn spawn_subagent_with_wait_false_returns_task_id_immediately() {
         })
         .await;
 
-    // Now release the child and let it finish.
+    // Now release the child and observe it complete via the broadcast
+    // stream (the entry is evicted on finalize, so we can't `get` it).
     release.notify_one();
-    // Drain so the child completes before assertions.
-    let child_id = api::TaskId(result);
-    registry.wait(&child_id).await;
-    let view = registry.get(&user, &child_id).unwrap();
-    assert_eq!(view.status, api::TaskStatus::Completed);
+    let child_id = api::TaskId(child_task_id);
+    let (status, _) = wait_for_completion(&mut events, &child_id).await;
+    assert_eq!(status, api::TaskStatus::Completed);
+    assert!(
+        registry.get(&user, &child_id).is_none(),
+        "completed child must be evicted"
+    );
+
+    // Drain the parent so the test doesn't leak it.
+    parent_release.notify_one();
 }
 
 // --------------------------------------------------------------------
@@ -410,30 +500,49 @@ async fn spawn_subagent_with_wait_false_returns_task_id_immediately() {
 #[tokio::test]
 async fn subagent_appears_in_registry_with_parent_link() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
-    let conversations = Arc::new(FakeConversations::new("ok"));
+    // The child conversation (conv-0) blocks so the child stays Running
+    // and remains visible in the registry while we inspect it (terminal
+    // tasks are evicted on finalize, #158).
+    let release = Arc::new(Notify::new());
+    let release_for_conv = Arc::clone(&release);
+    let conversations = Arc::new(FakeConversations::new("ok").with_behaviour(
+        "conv-0",
+        move |_cid, _p| {
+            let r = Arc::clone(&release_for_conv);
+            async move {
+                r.notified().await;
+                Ok("done".to_string())
+            }
+        },
+    ));
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let user = unique_user("alice");
 
+    // Spawn the child wait=false and keep the parent live so both stay in
+    // the registry for inspection.
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
-    let (parent_id, _result) =
-        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+    let (parent_id, _child_id, parent_release) =
+        under_live_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
             let tools = tools_for_body;
             let user = user_for_body;
             async move {
-                with_user_id(user, async move {
+                let r = with_user_id(user, async move {
                     tools
                         .execute_tool(
                             TOOL_SPAWN_SUBAGENT,
                             serde_json::json!({
                                 "name": "researcher",
                                 "prompt": "go",
-                                "wait": true,
+                                "wait": false,
                             }),
                         )
                         .await
+                        .expect("spawn ok")
                 })
-                .await
+                .await;
+                let parsed: serde_json::Value = serde_json::from_str(&r).unwrap();
+                parsed["child_task_id"].as_str().unwrap().to_string()
             }
         })
         .await;
@@ -455,6 +564,10 @@ async fn subagent_appears_in_registry_with_parent_link() {
     assert_eq!(parent_task_id, &parent_id);
     assert_eq!(name, "researcher");
     assert_eq!(subagent.parent.as_ref(), Some(&parent_id));
+
+    // Release the child and parent so the test doesn't leak.
+    release.notify_one();
+    parent_release.notify_one();
 }
 
 // --------------------------------------------------------------------
@@ -468,26 +581,34 @@ async fn parent_log_records_subagent_tool_call_with_child_ids() {
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let user = unique_user("alice");
 
+    // Keep the parent live so its log buffer survives for inspection —
+    // finalize evicts the entry (and its logs) immediately (#158). The
+    // spawn_subagent tool appends the ToolCall log to the parent
+    // regardless of wait, so wait=false (child completes on its own) is
+    // sufficient and keeps the test simple.
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
-    let (parent_id, _result) =
-        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+    let (parent_id, _child_id, parent_release) =
+        under_live_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
             let tools = tools_for_body;
             let user = user_for_body;
             async move {
-                with_user_id(user, async move {
+                let r = with_user_id(user, async move {
                     tools
                         .execute_tool(
                             TOOL_SPAWN_SUBAGENT,
                             serde_json::json!({
                                 "name": "researcher",
                                 "prompt": "go",
-                                "wait": true,
+                                "wait": false,
                             }),
                         )
                         .await
+                        .expect("spawn ok")
                 })
-                .await
+                .await;
+                let parsed: serde_json::Value = serde_json::from_str(&r).unwrap();
+                parsed["child_task_id"].as_str().unwrap().to_string()
             }
         })
         .await;
@@ -508,6 +629,9 @@ async fn parent_log_records_subagent_tool_call_with_child_ids() {
         data["child_conversation_id"].is_string(),
         "data has child_conversation_id"
     );
+
+    // Drain the parent so the test doesn't leak.
+    parent_release.notify_one();
 }
 
 // --------------------------------------------------------------------
@@ -574,6 +698,12 @@ async fn cancelling_parent_cancels_subagents_recursively() {
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conv));
     let user = unique_user("alice");
 
+    // Subscribe before spawning so we observe every TaskCompleted —
+    // terminal entries are evicted on finalize (#158), so `list` can no
+    // longer enumerate the cancelled generations; the broadcast stream is
+    // the surviving record of all three reaching Cancelled.
+    let mut events = registry.subscribe(&user);
+
     // Spawn the parent and have it spawn a (waiting) child.
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
@@ -619,23 +749,42 @@ async fn cancelling_parent_cancels_subagents_recursively() {
         .cancel(&user, &parent_id)
         .expect("parent cancellable");
 
-    // Wait for all three to wind down.
+    // Wait for the parent to wind down (its `wait` resolving implies the
+    // child it blocked on, and the grandchild that child blocked on, have
+    // all reached a terminal state).
     timeout(Duration::from_secs(5), registry.wait(&parent_id))
         .await
         .expect("parent terminates");
 
-    // All three tasks must be Cancelled.
-    let tasks = registry.list(&user, true, None);
-    assert_eq!(tasks.len(), 3, "parent + child + grandchild registered");
-    for t in tasks {
-        assert_eq!(
-            t.status,
-            api::TaskStatus::Cancelled,
-            "task {} ({:?}) must be cancelled",
-            t.id.0,
-            t.kind
-        );
+    // All three generations (parent + child + grandchild) must reach
+    // Cancelled. We collect the three TaskCompleted events from the
+    // broadcast stream rather than `list()`, because finalize evicts each
+    // terminal entry immediately (#158).
+    let mut cancelled_count = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while cancelled_count < 3 {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("timed out collecting 3 TaskCompleted events");
+        match timeout(remaining, events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted { id, status, .. })) => {
+                assert_eq!(
+                    status,
+                    api::TaskStatus::Cancelled,
+                    "task {id} completed with {status:?}, expected Cancelled"
+                );
+                cancelled_count += 1;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed before 3 TaskCompleted: {e:?}"),
+            Err(_) => panic!("timed out collecting 3 TaskCompleted events"),
+        }
     }
+    assert_eq!(
+        cancelled_count, 3,
+        "parent + child + grandchild must each reach Cancelled"
+    );
 }
 
 // --------------------------------------------------------------------
@@ -723,51 +872,77 @@ async fn get_subagent_status_for_unknown_id_returns_not_found() {
 #[tokio::test]
 async fn get_subagent_status_for_other_users_task_returns_not_found() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
-    let conversations = Arc::new(FakeConversations::new("ok"));
+    // Alice's subagent blocks (conv-0) so it stays RUNNING while Bob
+    // probes — this proves the `not_found` Bob sees is genuine cross-user
+    // opacity (#105), not just the post-completion eviction (#158).
+    let release = Arc::new(Notify::new());
+    let release_for_conv = Arc::clone(&release);
+    let conversations = Arc::new(FakeConversations::new("ok").with_behaviour(
+        "conv-0",
+        move |_cid, _p| {
+            let r = Arc::clone(&release_for_conv);
+            async move {
+                r.notified().await;
+                Ok("done".to_string())
+            }
+        },
+    ));
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let alice = unique_user("alice");
     let bob = unique_user("bob");
 
-    // Alice spawns a real subagent that completes immediately.
+    // Alice spawns a subagent that stays in-flight; keep her parent live
+    // so we can capture the (still-Running) child id.
     let alice_for_body = alice.clone();
     let tools_for_body = tools.clone();
     let registry_for_body = Arc::clone(&registry);
-    let (_pid, child_id) = under_parent_task(&registry, alice.clone(), "alice-conv", move |_pid| {
-        let tools = tools_for_body;
-        let user = alice_for_body;
-        let registry = registry_for_body;
-        async move {
-            with_user_id(user.clone(), async move {
-                let _ = tools
-                    .execute_tool(
-                        TOOL_SPAWN_SUBAGENT,
-                        serde_json::json!({
-                            "name": "child",
-                            "prompt": "go",
-                            "wait": true,
-                        }),
-                    )
-                    .await
-                    .unwrap();
-            })
-            .await;
-            // Find the registered subagent id.
-            let tasks = registry.list(&alice, true, None);
-            tasks
-                .iter()
-                .find(|t| matches!(t.kind, api::TaskKind::Subagent { .. }))
-                .map(|t| t.id.clone())
-                .unwrap()
-        }
-    })
-    .await;
+    let alice_for_capture = alice.clone();
+    let (_pid, child_id, parent_release) =
+        under_live_parent_task(&registry, alice.clone(), "alice-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = alice_for_body;
+            let registry = registry_for_body;
+            let alice = alice_for_capture;
+            async move {
+                with_user_id(user.clone(), async move {
+                    let _ = tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "child",
+                                "prompt": "go",
+                                "wait": false,
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                })
+                .await;
+                // Find the still-Running subagent id.
+                let tasks = registry.list(&alice, true, None);
+                tasks
+                    .iter()
+                    .find(|t| matches!(t.kind, api::TaskKind::Subagent { .. }))
+                    .map(|t| t.id.clone())
+                    .expect("subagent registered")
+            }
+        })
+        .await;
 
-    // Bob asks about Alice's child task: must come back as not_found.
+    // Sanity: the child genuinely exists for Alice right now.
+    assert!(
+        registry.get(&alice, &child_id).is_some(),
+        "child must be live so the probe tests opacity, not eviction"
+    );
+
+    // Bob asks about Alice's (live) child task: must come back as
+    // not_found — existence must not leak.
+    let child_id_for_bob = child_id.0.clone();
     let result = with_user_id(bob, async {
         tools
             .execute_tool(
                 TOOL_GET_SUBAGENT_STATUS,
-                serde_json::json!({"task_id": child_id.0}),
+                serde_json::json!({"task_id": child_id_for_bob}),
             )
             .await
             .unwrap()
@@ -775,6 +950,13 @@ async fn get_subagent_status_for_other_users_task_returns_not_found() {
     .await;
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["error"], "not_found");
+
+    // Clean up: release the child and parent so the test doesn't leak.
+    release.notify_one();
+    timeout(Duration::from_secs(5), registry.wait(&child_id))
+        .await
+        .expect("child completes");
+    parent_release.notify_one();
 }
 
 // --------------------------------------------------------------------
@@ -784,33 +966,49 @@ async fn get_subagent_status_for_other_users_task_returns_not_found() {
 #[tokio::test]
 async fn spawn_subagent_inherits_parent_user_id() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
-    let conversations = Arc::new(FakeConversations::new("ok"));
+    // The child blocks (conv-0) so it stays Running and visible while we
+    // assert ownership — terminal tasks are evicted on finalize (#158).
+    let release = Arc::new(Notify::new());
+    let release_for_conv = Arc::clone(&release);
+    let conversations = Arc::new(FakeConversations::new("ok").with_behaviour(
+        "conv-0",
+        move |_cid, _p| {
+            let r = Arc::clone(&release_for_conv);
+            async move {
+                r.notified().await;
+                Ok("done".to_string())
+            }
+        },
+    ));
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let alice = unique_user("alice");
 
     let alice_for_body = alice.clone();
     let tools_for_body = tools.clone();
-    let (_pid, _result) = under_parent_task(&registry, alice.clone(), "parent-conv", move |_pid| {
-        let tools = tools_for_body;
-        let user = alice_for_body;
-        async move {
-            with_user_id(user, async move {
-                tools
-                    .execute_tool(
-                        TOOL_SPAWN_SUBAGENT,
-                        serde_json::json!({
-                            "name": "child",
-                            "prompt": "go",
-                            "wait": true,
-                        }),
-                    )
-                    .await
-                    .unwrap()
-            })
-            .await
-        }
-    })
-    .await;
+    let (_pid, _child_id, parent_release) =
+        under_live_parent_task(&registry, alice.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = alice_for_body;
+            async move {
+                let r = with_user_id(user, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "child",
+                                "prompt": "go",
+                                "wait": false,
+                            }),
+                        )
+                        .await
+                        .unwrap()
+                })
+                .await;
+                let parsed: serde_json::Value = serde_json::from_str(&r).unwrap();
+                parsed["child_task_id"].as_str().unwrap().to_string()
+            }
+        })
+        .await;
 
     // The child task must be owned by Alice, not by the default sentinel.
     let alice_tasks = registry.list(&alice, true, None);
@@ -822,6 +1020,10 @@ async fn spawn_subagent_inherits_parent_user_id() {
     let bob = unique_user("bob");
     let bob_view = registry.get(&bob, &subagent.id);
     assert!(bob_view.is_none(), "bob must not see alice's child");
+
+    // Release the child and parent so the test doesn't leak.
+    release.notify_one();
+    parent_release.notify_one();
 }
 
 // --------------------------------------------------------------------
@@ -831,31 +1033,46 @@ async fn spawn_subagent_inherits_parent_user_id() {
 #[tokio::test]
 async fn spawn_subagent_records_task_kind_subagent_with_correct_link() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
-    let conversations = Arc::new(FakeConversations::new("ok"));
+    // The child blocks (conv-0) so it stays Running and visible while we
+    // inspect its kind — terminal tasks are evicted on finalize (#158).
+    let release = Arc::new(Notify::new());
+    let release_for_conv = Arc::clone(&release);
+    let conversations = Arc::new(FakeConversations::new("ok").with_behaviour(
+        "conv-0",
+        move |_cid, _p| {
+            let r = Arc::clone(&release_for_conv);
+            async move {
+                r.notified().await;
+                Ok("done".to_string())
+            }
+        },
+    ));
     let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
     let user = unique_user("alice");
 
     let user_for_body = user.clone();
     let tools_for_body = tools.clone();
-    let (parent_id, _result) =
-        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+    let (parent_id, _child_id, parent_release) =
+        under_live_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
             let tools = tools_for_body;
             let user = user_for_body;
             async move {
-                with_user_id(user, async move {
+                let r = with_user_id(user, async move {
                     tools
                         .execute_tool(
                             TOOL_SPAWN_SUBAGENT,
                             serde_json::json!({
                                 "name": "fred",
                                 "prompt": "go",
-                                "wait": true,
+                                "wait": false,
                             }),
                         )
                         .await
                         .unwrap()
                 })
-                .await
+                .await;
+                let parsed: serde_json::Value = serde_json::from_str(&r).unwrap();
+                parsed["child_task_id"].as_str().unwrap().to_string()
             }
         })
         .await;
@@ -878,6 +1095,10 @@ async fn spawn_subagent_records_task_kind_subagent_with_correct_link() {
     // The conversation_id must match a freshly-created conversation.
     assert!(!conversation_id.is_empty());
     assert_ne!(conversation_id, "parent-conv");
+
+    // Release the child and parent so the test doesn't leak.
+    release.notify_one();
+    parent_release.notify_one();
 }
 
 // --------------------------------------------------------------------
@@ -978,6 +1199,8 @@ async fn current_task_id_outside_registry_is_none_inside_is_some() {
             Ok(())
         },
     );
-    registry.wait(&id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
     assert!(seen.load(Ordering::SeqCst));
 }

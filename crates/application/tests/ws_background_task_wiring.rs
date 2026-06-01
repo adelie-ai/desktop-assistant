@@ -620,10 +620,14 @@ async fn cancel_background_task_propagates_to_registry() {
         .expect("cancel ok");
     assert!(matches!(result, api::CommandResult::Ack));
 
-    registry.wait(&id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
     loop {
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Ok(api::Event::TaskCompleted { id: ev_id, status, .. })) if ev_id == id.0 => {
+            Ok(Ok(api::Event::TaskCompleted {
+                id: ev_id, status, ..
+            })) if ev_id == id.0 => {
                 assert_eq!(status, api::TaskStatus::Cancelled);
                 break;
             }
@@ -651,7 +655,9 @@ async fn cancel_completed_task_returns_structured_error() {
 
     let user = unique_user("alice");
     let id = spawn_completing_task(&registry, &user, "done");
-    registry.wait(&id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     let result = handler
         .handle_command_for(
@@ -775,7 +781,9 @@ async fn task_log_pagination_works_via_after_seq() {
     assert_eq!(entries2.len(), 20);
 
     release.notify_one();
-    registry.wait(&id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 /// Default limits: when `after_seq` and `limit` are omitted the daemon
@@ -788,8 +796,11 @@ async fn task_log_defaults_apply_when_optional_fields_omitted() {
     let handler = make_handler(convs, Arc::clone(&registry));
 
     let user = unique_user("alice");
-    let id = spawn_completing_task(&registry, &user, "tiny");
-    registry.wait(&id).await;
+    // Query a still-running task: terminal tasks are evicted on finalize
+    // (#158), so their logs would no longer be reachable. A live task
+    // already carries the "task started" lifecycle marker in its log, so
+    // the default-limits query returns a non-empty recent slice.
+    let id = spawn_dummy_task(&registry, &user, "tiny");
 
     let result = handler
         .handle_command_for(
@@ -804,7 +815,7 @@ async fn task_log_defaults_apply_when_optional_fields_omitted() {
         .expect("logs ok");
     match result {
         api::CommandResult::BackgroundTaskLogs { entries, .. } => {
-            // start + completion lifecycle markers.
+            // The "task started" lifecycle marker is present.
             assert!(!entries.is_empty(), "expected lifecycle entries");
         }
         other => panic!("unexpected result: {other:?}"),
@@ -936,7 +947,9 @@ async fn start_send_message_returns_task_id_that_appears_in_listing() {
     assert!(tasks.iter().any(|t| t.id == task_id));
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 /// Issue #154: the registry-spawned `SendMessage` body must observe the
@@ -969,7 +982,9 @@ async fn start_send_message_propagates_user_id_to_spawned_body() {
     .expect("start_send_message ok")
     .expect("registry attached, expected Some(task_id)");
 
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     let seen = convs.seen_user_ids();
     assert_eq!(
@@ -1094,7 +1109,9 @@ async fn business_outcome_user_can_list_their_running_standalone_agent() {
     assert!(me.title.contains("researcher"), "title: {}", me.title);
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 struct NoopSink;
