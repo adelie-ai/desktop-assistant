@@ -60,7 +60,11 @@ async fn wait_for_completion(
     let want = task_id.0.clone();
     loop {
         match timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Ok(api::Event::TaskCompleted { id, status, last_error })) if id == want => {
+            Ok(Ok(api::Event::TaskCompleted {
+                id,
+                status,
+                last_error,
+            })) if id == want => {
                 return (status, last_error);
             }
             Ok(Ok(_)) => continue,
@@ -134,10 +138,17 @@ async fn registry_evicts_terminal_tasks_so_list_returns_only_in_flight() {
     // surfaces sweep-resurrected rows after a daemon restart.
     for include_finished in [false, true] {
         let listing = registry.list(&user, include_finished, None);
-        assert_eq!(listing.len(), 1, "include_finished={include_finished} {listing:?}");
+        assert_eq!(
+            listing.len(),
+            1,
+            "include_finished={include_finished} {listing:?}"
+        );
         assert_eq!(listing[0].id, running);
     }
-    assert!(registry.get(&user, &done).is_none(), "terminal task must be evicted");
+    assert!(
+        registry.get(&user, &done).is_none(),
+        "terminal task must be evicted"
+    );
 
     // Let the running task complete so the test doesn't leak it.
     release.notify_one();
@@ -212,9 +223,15 @@ async fn registry_user_scope_isolates_listings() {
     r_a1.notify_one();
     r_a2.notify_one();
     r_b1.notify_one();
-    registry.wait(&a1).await;
-    registry.wait(&a2).await;
-    registry.wait(&b1).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&a1))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&a2))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&b1))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 // ----------------------------------------------------------------------
@@ -401,7 +418,9 @@ async fn registry_log_ring_drops_oldest_when_bounded() {
     assert_eq!(next_resumed, last_seq + 1);
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 // ----------------------------------------------------------------------
@@ -1033,7 +1052,9 @@ async fn slow_subscriber_does_not_block_other_subscribers() {
     }
     // Let all of them complete so events flush through.
     for id in &ids {
-        registry.wait(id).await;
+        tokio::time::timeout(Duration::from_secs(5), registry.wait(id))
+            .await
+            .expect("wait() must resolve once the task finalizes, not hang");
     }
 
     // The fast subscriber must still receive at least one event despite
@@ -1111,7 +1132,9 @@ async fn log_sink_emits_log_appended_event() {
     assert!(saw, "no TaskLogAppended event received");
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 // ----------------------------------------------------------------------
@@ -1135,10 +1158,15 @@ async fn concurrent_spawns_under_same_user_are_thread_safe() {
         let registry = Arc::clone(&registry);
         let user = user.clone();
         handles.push(tokio::spawn(async move {
-            registry.spawn(user, conv_kind("c"), "concurrent".into(), move |_| async move {
-                release.notified().await;
-                Ok(())
-            })
+            registry.spawn(
+                user,
+                conv_kind("c"),
+                "concurrent".into(),
+                move |_| async move {
+                    release.notified().await;
+                    Ok(())
+                },
+            )
         }));
     }
 
@@ -1158,7 +1186,9 @@ async fn concurrent_spawns_under_same_user_are_thread_safe() {
         release.notify_one();
     }
     for id in &ids {
-        registry.wait(id).await;
+        tokio::time::timeout(Duration::from_secs(5), registry.wait(id))
+            .await
+            .expect("wait() must resolve once the task finalizes, not hang");
     }
 }
 
@@ -1198,7 +1228,9 @@ async fn task_view_progress_hint_updates_via_context() {
     .await;
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 // ----------------------------------------------------------------------
@@ -1276,8 +1308,14 @@ async fn business_outcome_subagent_or_standalone_kinds_compile_and_are_listable_
     // parented in `children` until they evict), then parent.
     sub_release.notify_one();
     standalone_release.notify_one();
-    registry.wait(&sub).await;
-    registry.wait(&standalone).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&sub))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&standalone))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
     parent_release.notify_one();
-    registry.wait(&parent).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&parent))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }

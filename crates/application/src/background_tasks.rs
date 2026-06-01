@@ -1098,7 +1098,11 @@ mod tests {
         let want = id.0.clone();
         let (status, last_error) = loop {
             match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
-                Ok(Ok(api::Event::TaskCompleted { id, status, last_error })) if id == want => {
+                Ok(Ok(api::Event::TaskCompleted {
+                    id,
+                    status,
+                    last_error,
+                })) if id == want => {
                     break (status, last_error);
                 }
                 Ok(Ok(_)) => continue,
@@ -1109,7 +1113,10 @@ mod tests {
         };
         assert_eq!(status, api::TaskStatus::Failed);
         assert_eq!(last_error.as_deref(), Some("boom"));
-        assert!(registry.get(&user, &id).is_none(), "terminal task must be evicted");
+        assert!(
+            registry.get(&user, &id).is_none(),
+            "terminal task must be evicted"
+        );
     }
 
     #[tokio::test]
