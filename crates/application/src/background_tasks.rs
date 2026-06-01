@@ -385,12 +385,29 @@ impl BackgroundTaskRegistry {
             // Run the body inside a `CURRENT_TASK_ID` task-local scope so
             // nested tool dispatches (the `spawn_subagent` builtin, in
             // particular) can read the running task's id without threading
-            // it through every signature. We always finalize, even on
-            // panic, so the registry never gets stuck with a row in
-            // `Running` after the task disappears.
-            let result = CURRENT_TASK_ID
-                .scope(task_id_for_scope, body(ctx_for_body))
-                .await;
+            // it through every signature.
+            //
+            // The body runs in a *child* task so that a panic surfaces as a
+            // `JoinError` we can finalize on, instead of unwinding this
+            // finalizer task. If a panicking body skipped `finalize`, the
+            // row would be stuck `Running` forever — never broadcast, never
+            // evicted — and every `wait()` on it would hang (#171). A panic
+            // is recorded as a terminal `Failed`.
+            let body_task =
+                tokio::spawn(CURRENT_TASK_ID.scope(task_id_for_scope, body(ctx_for_body)));
+            let result = match body_task.await {
+                Ok(outcome) => outcome,
+                Err(join_err) if join_err.is_panic() => {
+                    let payload = join_err.into_panic();
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "task body panicked".to_string());
+                    Err(anyhow::anyhow!("task body panicked: {msg}"))
+                }
+                Err(join_err) => Err(anyhow::anyhow!("task body aborted: {join_err}")),
+            };
             inner
                 .finalize(&task_id_for_body, &user_id_for_body, result)
                 .await;
@@ -1093,6 +1110,60 @@ mod tests {
         assert_eq!(status, api::TaskStatus::Failed);
         assert_eq!(last_error.as_deref(), Some("boom"));
         assert!(registry.get(&user, &id).is_none(), "terminal task must be evicted");
+    }
+
+    #[tokio::test]
+    async fn panicking_body_finalizes_as_failed_and_wakes_waiters() {
+        // #171: a body that panics must still finalize (as Failed) rather
+        // than leaving the row stuck `Running` and hanging every waiter
+        // forever. The `tokio::time::timeout` around `wait()` is the
+        // hang-detector: if this regresses, `wait()` never resolves and the
+        // test fails fast instead of hanging the whole suite.
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
+        let id = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "panicker".into(),
+            |_ctx| async move {
+                panic!("kaboom");
+            },
+        );
+
+        // The bug: this `wait()` hung indefinitely. It must now resolve.
+        tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(&id))
+            .await
+            .expect("wait() on a panicked task must resolve, not hang");
+
+        let want = id.0.clone();
+        let (status, last_error) = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(api::Event::TaskCompleted {
+                    id,
+                    status,
+                    last_error,
+                })) if id == want => break (status, last_error),
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+                Err(_) => panic!("timed out waiting for TaskCompleted"),
+            }
+        };
+        assert_eq!(status, api::TaskStatus::Failed);
+        assert!(
+            last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("panicked"),
+            "last_error should note the panic, got {last_error:?}"
+        );
+        assert!(
+            registry.get(&user, &id).is_none(),
+            "panicked task must be evicted like any terminal task"
+        );
     }
 
     #[tokio::test]
