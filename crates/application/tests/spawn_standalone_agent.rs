@@ -572,7 +572,9 @@ async fn spawn_standalone_returns_task_id_synchronously() {
 
     // Release the LLM so the task wraps up and the test doesn't leak.
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 /// Acceptance: a standalone task appears in the registry's listing for
@@ -616,7 +618,9 @@ async fn standalone_appears_in_registry_with_no_parent() {
     }
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 /// Acceptance: `override_selection.connection_id` is threaded into the
@@ -646,7 +650,9 @@ async fn standalone_runs_initial_prompt_against_chosen_connection() {
         .await
         .expect("ok");
     let task_id = task_id_from(result);
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     let calls = convs.sends.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "exactly one send_prompt call");
@@ -738,7 +744,9 @@ async fn standalone_tool_allowlist_enforced() {
         .await
         .expect("ok");
     let task_id = task_id_from(result);
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     let calls = convs.sends.lock().unwrap().clone();
     assert_eq!(calls.len(), 1);
@@ -781,7 +789,9 @@ async fn standalone_under_user_a_invisible_to_user_b() {
     assert!(registry.list(&bob, true, None).is_empty());
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 /// Acceptance: tripping the registry's cancel for a running standalone
@@ -817,15 +827,30 @@ async fn cancelling_standalone_aborts_the_turn() {
     )
     .await;
 
+    // Subscribe BEFORE cancel so we observe the TaskCompleted event —
+    // terminal entries are evicted from the registry on finalize (#158).
+    let mut events = registry.subscribe(&user);
     registry.cancel(&user, &task_id).expect("cancel ok");
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     assert!(
         cancelled_flag.load(Ordering::SeqCst),
         "underlying LLM call did not observe cancellation"
     );
-    let view = registry.get(&user, &task_id).expect("present");
-    assert_eq!(view.status, api::TaskStatus::Cancelled);
+    let want = task_id.0.clone();
+    let status = loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted { id, status, .. })) if id == want => break status,
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+            Err(_) => panic!("timed out waiting for TaskCompleted"),
+        }
+    };
+    assert_eq!(status, api::TaskStatus::Cancelled);
+    assert!(registry.get(&user, &task_id).is_none());
 }
 
 /// Acceptance: if the underlying dispatch fails (e.g. invalid
@@ -848,6 +873,13 @@ async fn standalone_with_invalid_connection_returns_clean_error_in_task_status()
         model_id: "anything".into(),
         effort: None,
     };
+
+    // Subscribe BEFORE spawning so we can't possibly miss the
+    // TaskCompleted event — terminal entries are evicted from the
+    // registry on finalize (#158), so the broadcast is the only way to
+    // observe the failure status post-completion.
+    let mut events = registry.subscribe(&user);
+
     let result = handler
         .handle_command_for(
             RequestContext::for_user(user.clone()),
@@ -857,11 +889,24 @@ async fn standalone_with_invalid_connection_returns_clean_error_in_task_status()
         .expect("handler must not surface the LLM error synchronously");
     let task_id = task_id_from(result);
 
-    registry.wait(&task_id).await;
-    let view = registry.get(&user, &task_id).expect("present");
-    assert_eq!(view.status, api::TaskStatus::Failed);
-    let err = view
-        .last_error
+    let want = task_id.0.clone();
+    let (status, last_error) = loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted {
+                id,
+                status,
+                last_error,
+            })) if id == want => {
+                break (status, last_error);
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+            Err(_) => panic!("timed out waiting for TaskCompleted"),
+        }
+    };
+    assert_eq!(status, api::TaskStatus::Failed);
+    let err = last_error
         .as_deref()
         .expect("Failed task must record last_error");
     assert!(
@@ -891,7 +936,9 @@ async fn spawn_standalone_creates_new_conversation_scoped_to_user_id() {
         .await
         .expect("ok");
     let task_id = task_id_from(result);
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     let creates = convs.creates.lock().unwrap().clone();
     assert_eq!(creates.len(), 1, "exactly one conversation created");
@@ -932,7 +979,9 @@ async fn business_outcome_standalone_conversation_contains_initial_prompt_then_r
         .await
         .expect("ok");
     let task_id = task_id_from(result);
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     // The send actually ran with the user's prompt.
     let sends = convs.sends.lock().unwrap().clone();

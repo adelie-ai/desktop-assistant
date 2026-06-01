@@ -606,6 +606,11 @@ async fn cancel_background_task_propagates_to_registry() {
     );
     started.notified().await;
 
+    // Subscribe BEFORE cancel so we don't race the TaskCompleted event —
+    // terminal entries are evicted from the registry, so a missed event
+    // would leave us with no way to observe the terminal status.
+    let mut events = registry.subscribe(&user);
+
     let result = handler
         .handle_command_for(
             RequestContext::for_user(user.clone()),
@@ -615,24 +620,44 @@ async fn cancel_background_task_propagates_to_registry() {
         .expect("cancel ok");
     assert!(matches!(result, api::CommandResult::Ack));
 
-    registry.wait(&id).await;
-    let view = registry.get(&user, &id).expect("present");
-    assert_eq!(view.status, api::TaskStatus::Cancelled);
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted {
+                id: ev_id, status, ..
+            })) if ev_id == id.0 => {
+                assert_eq!(status, api::TaskStatus::Cancelled);
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+            Err(_) => panic!("timed out waiting for TaskCompleted"),
+        }
+    }
+    assert!(registry.get(&user, &id).is_none());
 }
 
-/// Unhappy: cancelling a task that's already in a terminal state surfaces
-/// an error frame instead of pretending the cancel succeeded. This is the
-/// `AlreadyTerminal` rule from #115 — without it, "cancel" on a Failed
-/// row would look like a silent no-op.
+/// Unhappy: cancelling a task that has already completed surfaces an
+/// error frame instead of pretending the cancel succeeded — without it,
+/// "cancel" on a finished row would look like a silent no-op. Since
+/// terminal entries are evicted from the registry on finalize (#158),
+/// the underlying error is now `NotFound` (existence-hiding contract
+/// from #105) rather than `AlreadyTerminal`. The user-visible outcome —
+/// an error rather than a silent success — is unchanged.
 #[tokio::test]
-async fn cancel_already_terminal_task_returns_structured_error() {
+async fn cancel_completed_task_returns_structured_error() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
     let convs = Arc::new(RecordingConversations::new());
     let handler = make_handler(convs, Arc::clone(&registry));
 
     let user = unique_user("alice");
     let id = spawn_completing_task(&registry, &user, "done");
-    registry.wait(&id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     let result = handler
         .handle_command_for(
@@ -642,7 +667,7 @@ async fn cancel_already_terminal_task_returns_structured_error() {
         .await;
     assert!(
         result.is_err(),
-        "cancelling a terminal task must be an error, got {result:?}"
+        "cancelling a completed task must be an error, got {result:?}"
     );
 }
 
@@ -756,7 +781,9 @@ async fn task_log_pagination_works_via_after_seq() {
     assert_eq!(entries2.len(), 20);
 
     release.notify_one();
-    registry.wait(&id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 /// Default limits: when `after_seq` and `limit` are omitted the daemon
@@ -769,8 +796,11 @@ async fn task_log_defaults_apply_when_optional_fields_omitted() {
     let handler = make_handler(convs, Arc::clone(&registry));
 
     let user = unique_user("alice");
-    let id = spawn_completing_task(&registry, &user, "tiny");
-    registry.wait(&id).await;
+    // Query a still-running task: terminal tasks are evicted on finalize
+    // (#158), so their logs would no longer be reachable. A live task
+    // already carries the "task started" lifecycle marker in its log, so
+    // the default-limits query returns a non-empty recent slice.
+    let id = spawn_dummy_task(&registry, &user, "tiny");
 
     let result = handler
         .handle_command_for(
@@ -785,7 +815,7 @@ async fn task_log_defaults_apply_when_optional_fields_omitted() {
         .expect("logs ok");
     match result {
         api::CommandResult::BackgroundTaskLogs { entries, .. } => {
-            // start + completion lifecycle markers.
+            // The "task started" lifecycle marker is present.
             assert!(!entries.is_empty(), "expected lifecycle entries");
         }
         other => panic!("unexpected result: {other:?}"),
@@ -874,6 +904,11 @@ async fn handler_returns_none_receiver_when_registry_not_attached() {
 async fn start_send_message_returns_task_id_that_appears_in_listing() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
     let convs = Arc::new(RecordingConversations::new());
+    // Block the underlying send so the task stays Running long enough to
+    // appear in the list. Terminal entries are evicted from the registry,
+    // so without the block the task can complete before we list it.
+    let release = Arc::new(Notify::new());
+    convs.block_on(Arc::clone(&release));
     let handler = make_handler(convs, Arc::clone(&registry));
 
     let user = unique_user("alice");
@@ -894,12 +929,12 @@ async fn start_send_message_returns_task_id_that_appears_in_listing() {
     .expect("start_send_message ok");
     let task_id = task_id.expect("registry attached, expected Some(task_id)");
 
-    // The new id is visible to the same user via List.
+    // The new id is visible to the same user via List while it's running.
     let list = handler
         .handle_command_for(
             RequestContext::for_user(user.clone()),
             api::Command::ListBackgroundTasks {
-                include_finished: true,
+                include_finished: false,
                 limit: None,
             },
         )
@@ -911,7 +946,10 @@ async fn start_send_message_returns_task_id_that_appears_in_listing() {
     };
     assert!(tasks.iter().any(|t| t.id == task_id));
 
-    registry.wait(&task_id).await;
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 /// Issue #154: the registry-spawned `SendMessage` body must observe the
@@ -944,7 +982,9 @@ async fn start_send_message_propagates_user_id_to_spawned_body() {
     .expect("start_send_message ok")
     .expect("registry attached, expected Some(task_id)");
 
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 
     let seen = convs.seen_user_ids();
     assert_eq!(
@@ -1069,7 +1109,9 @@ async fn business_outcome_user_can_list_their_running_standalone_agent() {
     assert!(me.title.contains("researcher"), "title: {}", me.title);
 
     release.notify_one();
-    registry.wait(&task_id).await;
+    tokio::time::timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
 }
 
 struct NoopSink;

@@ -385,12 +385,29 @@ impl BackgroundTaskRegistry {
             // Run the body inside a `CURRENT_TASK_ID` task-local scope so
             // nested tool dispatches (the `spawn_subagent` builtin, in
             // particular) can read the running task's id without threading
-            // it through every signature. We always finalize, even on
-            // panic, so the registry never gets stuck with a row in
-            // `Running` after the task disappears.
-            let result = CURRENT_TASK_ID
-                .scope(task_id_for_scope, body(ctx_for_body))
-                .await;
+            // it through every signature.
+            //
+            // The body runs in a *child* task so that a panic surfaces as a
+            // `JoinError` we can finalize on, instead of unwinding this
+            // finalizer task. If a panicking body skipped `finalize`, the
+            // row would be stuck `Running` forever — never broadcast, never
+            // evicted — and every `wait()` on it would hang (#171). A panic
+            // is recorded as a terminal `Failed`.
+            let body_task =
+                tokio::spawn(CURRENT_TASK_ID.scope(task_id_for_scope, body(ctx_for_body)));
+            let result = match body_task.await {
+                Ok(outcome) => outcome,
+                Err(join_err) if join_err.is_panic() => {
+                    let payload = join_err.into_panic();
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "task body panicked".to_string());
+                    Err(anyhow::anyhow!("task body panicked: {msg}"))
+                }
+                Err(join_err) => Err(anyhow::anyhow!("task body aborted: {join_err}")),
+            };
             inner
                 .finalize(&task_id_for_body, &user_id_for_body, result)
                 .await;
@@ -949,7 +966,7 @@ impl Inner {
         user_id: &UserId,
         result: anyhow::Result<()>,
     ) {
-        let (status, last_error) = {
+        let (status, last_error, progress_hint, ended_at, parent_id) = {
             let mut tasks = self.tasks.lock().expect("tasks poisoned");
             let Some(state) = tasks.get_mut(task_id) else {
                 return;
@@ -964,41 +981,20 @@ impl Inner {
                 (Err(e), false) => (api::TaskStatus::Failed, Some(e.to_string())),
             };
             state.view.status = status;
-            state.view.ended_at = Some(now_ms());
+            let ended_at = now_ms();
+            state.view.ended_at = Some(ended_at);
             state.view.last_error = err.clone();
             state.completed = true;
-            (status, err)
+            // Snapshot the fields needed for the post-broadcast persist
+            // and eviction passes; the lock is released at scope end.
+            (
+                status,
+                err,
+                state.view.progress_hint.clone(),
+                ended_at,
+                state.view.parent.clone(),
+            )
         };
-
-        // Emit a lifecycle log line so a late subscriber that only reads
-        // logs still sees the terminal marker.
-        {
-            let mut tasks = self.tasks.lock().expect("tasks poisoned");
-            if let Some(state) = tasks.get_mut(task_id) {
-                let entry = api::TaskLogEntry {
-                    seq: state.next_seq,
-                    timestamp: now_ms(),
-                    level: match status {
-                        api::TaskStatus::Failed => api::LogLevel::Error,
-                        api::TaskStatus::Cancelled => api::LogLevel::Warn,
-                        _ => api::LogLevel::Info,
-                    },
-                    category: api::LogCategory::Lifecycle,
-                    message: match status {
-                        api::TaskStatus::Completed => "task completed".into(),
-                        api::TaskStatus::Cancelled => "task cancelled".into(),
-                        api::TaskStatus::Failed => "task failed".into(),
-                        _ => "task terminated".into(),
-                    },
-                    data: None,
-                };
-                state.next_seq += 1;
-                if state.logs.len() == self.config.log_ring_capacity {
-                    state.logs.pop_front();
-                }
-                state.logs.push_back(entry);
-            }
-        }
 
         self.broadcast(
             user_id,
@@ -1012,26 +1008,35 @@ impl Inner {
         // Persist the terminal state. The in-memory broadcast happens
         // first because subscribers don't care about durability — they
         // care about the lifecycle event. Persistence happens after so
-        // a slow DB doesn't gate the wake. The progress_hint snapshot
-        // is read under a tiny critical section, decoupled from the
-        // broadcast above.
-        let (progress_hint, ended_at) = {
-            let tasks = self.tasks.lock().expect("tasks poisoned");
-            let view = tasks.get(task_id).map(|s| s.view.clone());
-            (
-                view.as_ref().and_then(|v| v.progress_hint.clone()),
-                view.and_then(|v| v.ended_at),
-            )
-        };
+        // a slow DB doesn't gate the wake.
         self.persist_update(
             task_id,
             user_id,
             api_status_to_db(status),
             last_error.as_deref(),
             progress_hint.as_deref(),
-            ended_at,
+            Some(ended_at),
         )
         .await;
+
+        // Evict the terminal entry from the in-memory map (#158). The
+        // broadcast has already fired and persistence has completed; a
+        // missed broadcast subscriber can still recover the terminal
+        // state from the persisted row. Holding terminal entries forever
+        // would let the registry grow unbounded over the daemon's
+        // lifetime.
+        //
+        // Done before notify_waiters so that any `wait`er that loops
+        // back into `get`/`list` immediately observes the eviction.
+        {
+            let mut tasks = self.tasks.lock().expect("tasks poisoned");
+            tasks.remove(task_id);
+            if let Some(parent_id) = &parent_id
+                && let Some(parent) = tasks.get_mut(parent_id)
+            {
+                parent.view.children.retain(|c| c != task_id);
+            }
+        }
 
         // Wake waiters.
         let waiter = {
@@ -1076,9 +1081,12 @@ mod tests {
     #[tokio::test]
     async fn finalize_sets_failed_on_error() {
         // Internal contract: an Err from the body and a non-cancelled
-        // token yields TaskStatus::Failed with the error message.
+        // token yields TaskStatus::Failed with the error message in the
+        // TaskCompleted event. The entry is evicted immediately, so we
+        // observe status via subscribe rather than `get`.
         let registry = BackgroundTaskRegistry::new();
         let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
         let id = registry.spawn(
             user.clone(),
             api::TaskKind::Conversation {
@@ -1087,10 +1095,159 @@ mod tests {
             "failer".into(),
             |_ctx| async move { Err(anyhow::anyhow!("boom")) },
         );
+        let want = id.0.clone();
+        let (status, last_error) = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(api::Event::TaskCompleted {
+                    id,
+                    status,
+                    last_error,
+                })) if id == want => {
+                    break (status, last_error);
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+                Err(_) => panic!("timed out waiting for TaskCompleted"),
+            }
+        };
+        assert_eq!(status, api::TaskStatus::Failed);
+        assert_eq!(last_error.as_deref(), Some("boom"));
+        assert!(
+            registry.get(&user, &id).is_none(),
+            "terminal task must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_body_finalizes_as_failed_and_wakes_waiters() {
+        // #171: a body that panics must still finalize (as Failed) rather
+        // than leaving the row stuck `Running` and hanging every waiter
+        // forever. The `tokio::time::timeout` around `wait()` is the
+        // hang-detector: if this regresses, `wait()` never resolves and the
+        // test fails fast instead of hanging the whole suite.
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
+        let id = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "panicker".into(),
+            |_ctx| async move {
+                panic!("kaboom");
+            },
+        );
+
+        // The bug: this `wait()` hung indefinitely. It must now resolve.
+        tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(&id))
+            .await
+            .expect("wait() on a panicked task must resolve, not hang");
+
+        let want = id.0.clone();
+        let (status, last_error) = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(api::Event::TaskCompleted {
+                    id,
+                    status,
+                    last_error,
+                })) if id == want => break (status, last_error),
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+                Err(_) => panic!("timed out waiting for TaskCompleted"),
+            }
+        };
+        assert_eq!(status, api::TaskStatus::Failed);
+        assert!(
+            last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("panicked"),
+            "last_error should note the panic, got {last_error:?}"
+        );
+        assert!(
+            registry.get(&user, &id).is_none(),
+            "panicked task must be evicted like any terminal task"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_task_evicted_on_completion() {
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let id = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "ok".into(),
+            |_ctx| async move { Ok(()) },
+        );
         registry.wait(&id).await;
-        let view = registry.get(&user, &id).expect("present");
-        assert_eq!(view.status, api::TaskStatus::Failed);
-        assert_eq!(view.last_error.as_deref(), Some("boom"));
+        assert!(registry.get(&user, &id).is_none());
+        assert!(registry.list(&user, true, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_task_evicted_on_cancellation() {
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let id = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "cancellable".into(),
+            |ctx| async move {
+                ctx.token.cancelled().await;
+                Ok(())
+            },
+        );
+        registry.cancel(&user, &id).expect("cancel");
+        registry.wait(&id).await;
+        assert!(registry.get(&user, &id).is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_subagent_unlinked_from_parent_children() {
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let parent_release = Arc::new(tokio::sync::Notify::new());
+        let parent_release_for_task = Arc::clone(&parent_release);
+        let parent = registry.spawn(
+            user.clone(),
+            api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            },
+            "parent".into(),
+            move |_ctx| async move {
+                parent_release_for_task.notified().await;
+                Ok(())
+            },
+        );
+        let child = registry.spawn(
+            user.clone(),
+            api::TaskKind::Subagent {
+                parent_task_id: parent.clone(),
+                conversation_id: "c-child".into(),
+                name: "sub".into(),
+            },
+            "child".into(),
+            |_ctx| async move { Ok(()) },
+        );
+        registry.wait(&child).await;
+
+        let parent_view = registry.get(&user, &parent).expect("parent still running");
+        assert!(
+            !parent_view.children.contains(&child),
+            "evicted child should be unlinked from parent.children, got {:?}",
+            parent_view.children
+        );
+
+        parent_release.notify_one();
+        registry.wait(&parent).await;
     }
 
     #[tokio::test]
@@ -1127,9 +1284,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_log_entries_emitted_on_start_and_completion() {
+    async fn start_lifecycle_log_entry_is_broadcast_to_subscribers() {
+        // The start-of-task Lifecycle marker is appended via TaskLogSink
+        // and so is broadcast to subscribers. The completion is signaled
+        // by the TaskCompleted event itself; a separate completion
+        // lifecycle log would only live in state.logs which is wiped on
+        // eviction, so we don't emit one.
         let registry = BackgroundTaskRegistry::new();
         let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
         let id = registry.spawn(
             user.clone(),
             api::TaskKind::Conversation {
@@ -1138,15 +1301,25 @@ mod tests {
             "lifecycle".into(),
             |_ctx| async move { Ok(()) },
         );
-        registry.wait(&id).await;
-        let (entries, _) = registry.logs(&user, &id, 0, 100).unwrap();
-        let categories: Vec<_> = entries.iter().map(|e| e.category).collect();
-        assert!(categories.contains(&api::LogCategory::Lifecycle));
-        // Both start and completion lifecycle markers should be present.
-        let count = categories
-            .iter()
-            .filter(|c| **c == api::LogCategory::Lifecycle)
-            .count();
-        assert_eq!(count, 2, "expected start + completion lifecycle markers");
+        let want = id.0.clone();
+        let mut saw_start_marker = false;
+        let mut saw_completed = false;
+        while !saw_completed {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(api::Event::TaskLogAppended { id, entry }))
+                    if id == want && entry.category == api::LogCategory::Lifecycle =>
+                {
+                    saw_start_marker = true;
+                }
+                Ok(Ok(api::Event::TaskCompleted { id, .. })) if id == want => {
+                    saw_completed = true;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(e)) => panic!("event channel closed: {e:?}"),
+                Err(_) => panic!("timed out waiting for events"),
+            }
+        }
+        assert!(saw_start_marker, "expected start lifecycle marker");
     }
 }

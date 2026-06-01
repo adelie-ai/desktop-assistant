@@ -128,8 +128,15 @@ impl AssistantApiHandler for RegistryHandler {
                 conversation_id: conversation_id.clone(),
             },
             format!("Conversation: {conversation_id}"),
-            move |_ctx| async move {
+            move |ctx| async move {
                 let _ = content;
+                // Stay Running until cancelled: terminal tasks are evicted
+                // from the registry on finalize (#158), so a body that
+                // returned immediately would race its own eviction against
+                // the SendMessageAck assertion that the id points to a
+                // live row. Nothing cancels it; the task is torn down with
+                // the test runtime.
+                ctx.token.cancelled().await;
                 Ok(())
             },
         );

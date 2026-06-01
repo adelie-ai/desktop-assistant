@@ -321,7 +321,9 @@ async fn cancelled_tasks_persist_as_cancelled() {
         .await
         .unwrap();
     registry.cancel(&user, &task_id).expect("cancel");
-    registry.wait(&task_id).await;
+    timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the cancelled task finalizes, not hang");
     wait_until(
         || {
             store
@@ -363,7 +365,9 @@ async fn completed_tasks_persist_as_completed() {
         "stan".into(),
         move |_ctx| async move { Ok(()) },
     );
-    registry.wait(&task_id).await;
+    timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes, not hang");
     wait_until(
         || {
             store
