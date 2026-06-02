@@ -1604,8 +1604,33 @@ mod tests {
 
     #[test]
     fn context_limit_unknown_model_returns_none() {
-        assert_eq!(context_limit_for_model("amazon.nova-pro-v1:0"), None);
         assert_eq!(context_limit_for_model("meta.llama3-70b"), None);
+        assert_eq!(context_limit_for_model("mistral.mistral-large-2407-v1:0"), None);
+    }
+
+    #[test]
+    fn context_limit_gpt_oss() {
+        // 131,072 is authoritative — the exact window Bedrock reports in its
+        // overflow error for this family.
+        assert_eq!(
+            context_limit_for_model("openai.gpt-oss-120b-1:0"),
+            Some(131_072)
+        );
+        assert_eq!(
+            context_limit_for_model("openai.gpt-oss-20b-1:0"),
+            Some(131_072)
+        );
+    }
+
+    #[test]
+    fn context_limit_gpt_oss_cross_region() {
+        for id in [
+            "us.openai.gpt-oss-120b-1:0",
+            "eu.openai.gpt-oss-120b-1:0",
+            "apac.openai.gpt-oss-20b-1:0",
+        ] {
+            assert_eq!(context_limit_for_model(id), Some(131_072), "{id}");
+        }
     }
 
     #[test]
