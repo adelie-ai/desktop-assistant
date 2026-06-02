@@ -1,7 +1,8 @@
 use crate::CoreError;
 use crate::context::{
-    COMPACTION_TOKEN_RATIO, MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES,
-    compaction_range, generate_context_summary, llm_messages_for_turn, recover_from_overflow,
+    COMPACTION_TOKEN_RATIO, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
+    MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, cap_tool_result, compaction_range,
+    generate_context_summary, llm_messages_for_turn, recover_from_overflow,
 };
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition, ToolNamespace,
@@ -163,6 +164,11 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// windowing/compaction. `None` (the default) preserves the prior
     /// verbatim-prompt-only anchor behaviour.
     scratchpad_goal_read: Option<ScratchpadGetManyFn>,
+    /// Maximum byte length a single tool result may occupy before it is
+    /// truncated at ingestion (issue #174). Defaults to
+    /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
+    /// [`Self::with_max_tool_result_bytes`].
+    max_tool_result_bytes: usize,
 }
 
 impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
@@ -175,6 +181,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             scratchpad_goal_read: None,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
         }
     }
 }
@@ -194,6 +201,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             scratchpad_goal_read: None,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
         }
     }
 
@@ -211,6 +219,14 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// evolving goal keeps showing up even after history is compacted away.
     pub fn with_scratchpad_goal(mut self, goal_read: ScratchpadGetManyFn) -> Self {
         self.scratchpad_goal_read = Some(goal_read);
+        self
+    }
+
+    /// Override the per-tool-result ingestion cap (issue #174). Results
+    /// larger than this are truncated with a notice before being stored so a
+    /// single runaway tool call can't wedge the conversation or the database.
+    pub fn with_max_tool_result_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_tool_result_bytes = max_bytes;
         self
     }
 }
@@ -796,8 +812,26 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     }
                 }
 
+                // Cap the result at ingestion (issue #174): a runaway tool can
+                // return a multi-megabyte payload that, stored verbatim, wedges
+                // the conversation against the model's context window on every
+                // later turn and stalls the messages INSERT. Truncate with a
+                // notice so the model still sees what ran and how to narrow it.
+                let stored = match cap_tool_result(&result, self.max_tool_result_bytes) {
+                    Some(truncated) => {
+                        tracing::warn!(
+                            tool = %tool_call.name,
+                            original_bytes = result.len(),
+                            kept_bytes = truncated.len(),
+                            cap_bytes = self.max_tool_result_bytes,
+                            "tool result exceeded the ingestion cap — truncated"
+                        );
+                        truncated
+                    }
+                    None => result,
+                };
                 conv.messages
-                    .push(Message::tool_result(&tool_call.id, &result));
+                    .push(Message::tool_result(&tool_call.id, &stored));
             }
 
             // Create a new noop callback for subsequent rounds
@@ -1359,6 +1393,40 @@ mod tests {
             updated.messages[3].content,
             "The file contains: hello world"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_result_is_truncated_at_ingestion_and_stays_paired() {
+        // Issue #174: a tool returning a huge payload must be truncated before
+        // it is stored, so it can't wedge the conversation on later turns. The
+        // tool_call_id pairing must survive truncation.
+        let tool_def = ToolDefinition::new("dump", "Dumps a lot", serde_json::json!({}));
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "dump", "{}")]),
+            LlmResponse::text("ok"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("dump".to_string(), "A".repeat(5_000));
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results)
+            .with_max_tool_result_bytes(1_024);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        handler
+            .send_prompt(&conv.id, "dump it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let tool_msg = &updated.messages[2];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call-1"));
+        assert!(
+            tool_msg.content.len() <= 1_024,
+            "stored tool result {} exceeds cap",
+            tool_msg.content.len()
+        );
+        assert!(tool_msg.content.contains("truncated"));
+        assert!(tool_msg.content.starts_with("AAAA"));
     }
 
     #[tokio::test]

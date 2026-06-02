@@ -93,9 +93,28 @@ pub(crate) fn tool_result_truncation_notice(original_bytes: usize) -> String {
 /// [`tool_result_truncation_notice`], stays within `max_bytes`. Truncation
 /// always lands on a `char` boundary so the result is valid UTF-8.
 pub(crate) fn cap_tool_result(content: &str, max_bytes: usize) -> Option<String> {
-    // Stub (issue #174): real truncation lands in the follow-up commit.
-    let _ = (max_bytes, tool_result_truncation_notice(content.len()));
-    None
+    if content.len() <= max_bytes {
+        return None;
+    }
+
+    let notice = tool_result_truncation_notice(content.len());
+    // Reserve room for the notice. If the cap is so small the notice alone
+    // would not fit, keep no prefix — the notice still tells the model what
+    // happened (a pathological case; real caps dwarf the notice).
+    let body_budget = max_bytes.saturating_sub(notice.len());
+
+    // Largest char boundary at or below the body budget. `is_char_boundary`
+    // is O(1) and at most three steps back from any byte index, so this is
+    // cheap even for a multi-megabyte payload.
+    let mut cut = body_budget.min(content.len());
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+
+    let mut truncated = String::with_capacity(cut + notice.len());
+    truncated.push_str(&content[..cut]);
+    truncated.push_str(&notice);
+    Some(truncated)
 }
 
 /// Fraction of the prompt-token budget the system instruction (static
@@ -1078,9 +1097,16 @@ mod tests {
     fn cap_tool_result_truncates_when_over_cap_with_notice() {
         let content = "x".repeat(10_000);
         let out = cap_tool_result(&content, 1024).expect("over-cap result must truncate");
-        assert!(out.len() <= 1024, "truncated result {} > cap 1024", out.len());
+        assert!(
+            out.len() <= 1024,
+            "truncated result {} > cap 1024",
+            out.len()
+        );
         assert!(out.contains("truncated"), "notice must explain truncation");
-        assert!(out.contains("10000 bytes"), "notice must cite the original size");
+        assert!(
+            out.contains("10000 bytes"),
+            "notice must cite the original size"
+        );
         // The kept prefix is from the original content.
         assert!(out.starts_with("xxxx"));
     }
@@ -1090,7 +1116,11 @@ mod tests {
         for cap in [512usize, 1024, 4096, 50_000] {
             let content = "y".repeat(cap * 4);
             let out = cap_tool_result(&content, cap).expect("over-cap must truncate");
-            assert!(out.len() <= cap, "cap {cap}: result {} exceeds cap", out.len());
+            assert!(
+                out.len() <= cap,
+                "cap {cap}: result {} exceeds cap",
+                out.len()
+            );
         }
     }
 
