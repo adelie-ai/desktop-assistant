@@ -2,7 +2,7 @@
 //!
 //! Migration 013 added a generated `tsv` column over the full message
 //! content. A multi-megabyte / high-entropy message could exceed Postgres's
-//! hard 1 MB tsvector limit and abort the INSERT. Migration 019 stops
+//! hard 1 MB tsvector limit and abort the INSERT. Migration 021 stops
 //! FTS-indexing `tool`-role rows and bounds the indexed input for other roles,
 //! so a large message can always be stored while normal full-text search keeps
 //! working.
@@ -102,7 +102,7 @@ async fn large_message_insert_succeeds_and_fts_still_works() {
 
     run_migrations(&fixture.pool)
         .await
-        .expect("migrations (incl. 019) apply against the test schema");
+        .expect("migrations (incl. 021) apply against the test schema");
 
     // A parent conversation (all NOT NULL columns supplied).
     sqlx::query(
@@ -126,7 +126,7 @@ async fn large_message_insert_succeeds_and_fts_still_works() {
     .await;
     assert!(
         big_tool.is_ok(),
-        "large tool-result INSERT must succeed post-019, got {big_tool:?}"
+        "large tool-result INSERT must succeed post-021, got {big_tool:?}"
     );
 
     // The same oversized payload as a non-tool role must also store (the
@@ -138,7 +138,7 @@ async fn large_message_insert_succeeds_and_fts_still_works() {
     )
     .execute(&fixture.pool)
     .await
-    .expect("large user-message INSERT must succeed post-019");
+    .expect("large user-message INSERT must succeed post-021");
 
     // A normal message must remain full-text searchable.
     sqlx::query(
