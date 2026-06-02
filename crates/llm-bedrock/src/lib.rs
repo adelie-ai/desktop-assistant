@@ -667,6 +667,20 @@ pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
         return Some(200_000);
     }
 
+    // OpenAI gpt-oss on Bedrock (120b and 20b): 131,072-token window. This
+    // value is authoritative — it's exactly what Bedrock reports in its
+    // overflow error ("... maximum context length (131072)"). Without it the
+    // budget falls to the 200K universal fallback and overshoots the real
+    // window, which is the root of issue #176.
+    if base.starts_with("openai.gpt-oss") {
+        return Some(131_072);
+    }
+
+    // Other families (Amazon Nova, Meta Llama, Mistral, Cohere, DeepSeek) are
+    // intentionally left to the universal fallback for now rather than guessed
+    // here: over-stating a window makes the model hard-reject requests (the
+    // exact failure this issue fixes), so new entries should be added only
+    // with a verified per-model number. Tracked under epic #178.
     None
 }
 
@@ -1605,7 +1619,10 @@ mod tests {
     #[test]
     fn context_limit_unknown_model_returns_none() {
         assert_eq!(context_limit_for_model("meta.llama3-70b"), None);
-        assert_eq!(context_limit_for_model("mistral.mistral-large-2407-v1:0"), None);
+        assert_eq!(
+            context_limit_for_model("mistral.mistral-large-2407-v1:0"),
+            None
+        );
     }
 
     #[test]
