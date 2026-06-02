@@ -108,9 +108,96 @@ pub fn cause_to_core_error(cause: NormalizedCause, detail: String) -> Option<Cor
 /// tiers (learned cache, LLM) to take over, and the safe default that leaves
 /// behavior unchanged.
 pub fn classify_builtin(ctx: &ErrorContext) -> NormalizedCause {
-    // Stub (issue #178, slice 5a): real matchers land in the follow-up commit.
-    let _ = ctx;
+    let lower = ctx.message.to_ascii_lowercase();
+
+    // Context overflow — connector-agnostic phrasing across providers.
+    if lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || lower.contains("maximum context length")
+        || (lower.contains("context length") && lower.contains("exceed"))
+        || lower.contains("too many tokens")
+    {
+        let (prompt_tokens, max_tokens) = first_two_numbers(ctx.message);
+        return NormalizedCause::ContextOverflow {
+            prompt_tokens,
+            max_tokens,
+        };
+    }
+
+    // Billing / quota — TERMINAL, and checked *before* rate-limit because some
+    // providers return quota exhaustion with HTTP 429 (e.g. OpenAI
+    // insufficient_quota). Misreading that as a retryable rate-limit would
+    // loop and burn money.
+    if lower.contains("quota")
+        || lower.contains("billing")
+        || lower.contains("insufficient_quota")
+        || lower.contains("payment")
+        || lower.contains("credit balance")
+    {
+        return NormalizedCause::BillingFatal;
+    }
+
+    // Auth — TERMINAL.
+    if ctx.http_status == Some(401)
+        || ctx.http_status == Some(403)
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("invalid api key")
+        || lower.contains("access denied")
+        || lower.contains("not authorized")
+    {
+        return NormalizedCause::Auth;
+    }
+
+    // Rate limit / throttling.
+    if ctx.http_status == Some(429)
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("throttl")
+    {
+        return NormalizedCause::RateLimited;
+    }
+
+    // Model loading / warming up.
+    if lower.contains("loading") || lower.contains("warming up") || lower.contains("not ready") {
+        return NormalizedCause::ModelLoading;
+    }
+
+    // Tool use unsupported by the model/endpoint.
+    if lower.contains("tools are not supported")
+        || (lower.contains("tool use")
+            && (lower.contains("not support")
+                || lower.contains("doesn't support")
+                || lower.contains("does not support")))
+    {
+        return NormalizedCause::ToolsUnsupported;
+    }
+
+    // Transient server-side failures.
+    if matches!(ctx.http_status, Some(500..=599))
+        || lower.contains("internal server error")
+        || lower.contains("service unavailable")
+        || lower.contains("overloaded")
+    {
+        return NormalizedCause::Transient;
+    }
+
     NormalizedCause::Unknown
+}
+
+/// Extract the first two base-10 integers from `s`, in order. Across the
+/// recognized overflow phrasings the counts appear as `(prompt, max)`; fewer
+/// than two means the provider stated the overflow without numbers.
+fn first_two_numbers(s: &str) -> (Option<u64>, Option<u64>) {
+    let nums: Vec<u64> = s
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| t.parse::<u64>().ok())
+        .collect();
+    match nums.as_slice() {
+        [prompt, max, ..] => (Some(*prompt), Some(*max)),
+        _ => (None, None),
+    }
 }
 
 #[cfg(test)]
