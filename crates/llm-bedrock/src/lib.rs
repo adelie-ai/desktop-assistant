@@ -563,9 +563,30 @@ pub struct ContextOverflowInfo {
 /// summarise-and-shrink) fire and retry, instead of surfacing a hard failure
 /// and losing the turn.
 pub fn parse_context_overflow(message: &str) -> Option<ContextOverflowInfo> {
-    // Stub (issue #175): real detection lands in the follow-up commit.
-    let _ = message;
-    None
+    let lower = message.to_ascii_lowercase();
+    let is_overflow = lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || (lower.contains("exceeds") && lower.contains("context length"));
+    if !is_overflow {
+        return None;
+    }
+
+    // Pull the first two integers, if any. Across the recognized shapes the
+    // counts appear as (prompt, max) in that order; fewer than two means the
+    // message stated the overflow without numbers, which is still actionable.
+    let nums: Vec<u64> = message
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    let (prompt_tokens, max_tokens) = match nums.as_slice() {
+        [prompt, max, ..] => (Some(*prompt), Some(*max)),
+        _ => (None, None),
+    };
+    Some(ContextOverflowInfo {
+        prompt_tokens,
+        max_tokens,
+    })
 }
 
 /// Map a Bedrock `converse_stream` SDK error to the equivalent
