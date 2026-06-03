@@ -949,6 +949,13 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Reader for the reserved scratchpad `goal` note, wired into the
+    // conversation handler below so the evolving goal is surfaced as the task
+    // anchor each turn. Populated only when a Postgres pool is available.
+    let mut scratchpad_goal_fn: Option<
+        desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn,
+    > = None;
+
     if let Some(pool) = &pg_pool {
         tracing::info!("wiring database query into builtin tools");
         let pool_for_db = pool.clone();
@@ -970,6 +977,53 @@ async fn main() -> Result<()> {
                 let store = Arc::clone(&cs_store);
                 Box::pin(async move { store.search_messages(&query, limit, role_filter).await })
             }));
+
+        // Issue #184: wire the per-conversation scratchpad store.
+        use desktop_assistant_core::ports::scratchpad::ScratchpadStore;
+        let sp_store = Arc::new(desktop_assistant_storage::PgScratchpadStore::new(pool.clone()));
+        tracing::info!("wiring scratchpad store into builtin tools");
+        let (sp_w, sp_g, sp_l, sp_s, sp_d, sp_c) = (
+            Arc::clone(&sp_store),
+            Arc::clone(&sp_store),
+            Arc::clone(&sp_store),
+            Arc::clone(&sp_store),
+            Arc::clone(&sp_store),
+            Arc::clone(&sp_store),
+        );
+        builtin_tools = builtin_tools.with_scratchpad(
+            Arc::new(move |conv, notes| {
+                let store = Arc::clone(&sp_w);
+                Box::pin(async move { store.write(&conv, &notes).await })
+            }),
+            Arc::new(move |conv, keys, limit| {
+                let store = Arc::clone(&sp_g);
+                Box::pin(async move { store.get_many(&conv, &keys, limit).await })
+            }),
+            Arc::new(move |conv, limit| {
+                let store = Arc::clone(&sp_l);
+                Box::pin(async move { store.list(&conv, limit).await })
+            }),
+            Arc::new(move |conv, query, limit| {
+                let store = Arc::clone(&sp_s);
+                Box::pin(async move { store.search(&conv, &query, limit).await })
+            }),
+            Arc::new(move |conv, keys| {
+                let store = Arc::clone(&sp_d);
+                Box::pin(async move { store.delete_many(&conv, &keys).await })
+            }),
+            Arc::new(move |conv| {
+                let store = Arc::clone(&sp_c);
+                Box::pin(async move { store.clear(&conv).await })
+            }),
+        );
+
+        // Reader for the reserved goal note (a bounded single-key fetch),
+        // consumed by `ConversationHandler::with_scratchpad_goal` below.
+        let sp_goal = Arc::clone(&sp_store);
+        scratchpad_goal_fn = Some(Arc::new(move |conv, keys, limit| {
+            let store = Arc::clone(&sp_goal);
+            Box::pin(async move { store.get_many(&conv, &keys, limit).await })
+        }));
     }
 
     if let Some(tr) = &tool_registry_store {
@@ -1365,6 +1419,12 @@ async fn main() -> Result<()> {
             );
             handler = handler.with_backend_llm(bt_llm);
         }
+    }
+
+    // Surface the evolving scratchpad `goal` note as the per-turn task anchor
+    // (#184). No-op when no Postgres pool is available.
+    if let Some(goal_fn) = scratchpad_goal_fn {
+        handler = handler.with_scratchpad_goal(goal_fn);
     }
 
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters

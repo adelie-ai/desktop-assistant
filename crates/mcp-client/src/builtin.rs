@@ -5,11 +5,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{Local, SecondsFormat, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Role, ToolDefinition};
+use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{
     KnowledgeDeleteFn, KnowledgeSearchFn, KnowledgeWriteFn,
+};
+use desktop_assistant_core::ports::scratchpad::{
+    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_RESULTS_CEILING,
+    RESPONSE_BYTE_BUDGET, ScratchpadClearFn, ScratchpadDeleteManyFn, ScratchpadGetManyFn,
+    ScratchpadListFn, ScratchpadSearchFn, ScratchpadWriteFn,
 };
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
 
@@ -23,6 +29,9 @@ const TOOL_SYS_PROPS: &str = "builtin_sys_props";
 const TOOL_DB_QUERY: &str = "builtin_db_query";
 const TOOL_MCP_CONTROL: &str = "builtin_mcp_control";
 const TOOL_CONV_SEARCH: &str = "builtin_conversation_search";
+const TOOL_SCRATCHPAD_WRITE: &str = "builtin_scratchpad_write";
+const TOOL_SCRATCHPAD_SEARCH: &str = "builtin_scratchpad_search";
+const TOOL_SCRATCHPAD_DELETE: &str = "builtin_scratchpad_delete";
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -42,6 +51,12 @@ pub struct BuiltinToolService {
     db_query_fn: Option<DbQueryFn>,
     mcp_handle: Option<McpControlHandle>,
     conversation_search_fn: Option<ConversationSearchFn>,
+    scratchpad_write_fn: Option<ScratchpadWriteFn>,
+    scratchpad_get_many_fn: Option<ScratchpadGetManyFn>,
+    scratchpad_list_fn: Option<ScratchpadListFn>,
+    scratchpad_search_fn: Option<ScratchpadSearchFn>,
+    scratchpad_delete_many_fn: Option<ScratchpadDeleteManyFn>,
+    scratchpad_clear_fn: Option<ScratchpadClearFn>,
 }
 
 impl Default for BuiltinToolService {
@@ -64,6 +79,12 @@ impl BuiltinToolService {
             db_query_fn: None,
             mcp_handle: None,
             conversation_search_fn: None,
+            scratchpad_write_fn: None,
+            scratchpad_get_many_fn: None,
+            scratchpad_list_fn: None,
+            scratchpad_search_fn: None,
+            scratchpad_delete_many_fn: None,
+            scratchpad_clear_fn: None,
         }
     }
 
@@ -141,6 +162,29 @@ impl BuiltinToolService {
     /// rather than silently no-op-ing.
     pub fn with_conversation_search(mut self, search_fn: ConversationSearchFn) -> Self {
         self.conversation_search_fn = Some(search_fn);
+        self
+    }
+
+    /// Configure the per-conversation scratchpad store closures (#184). The
+    /// builtin tools resolve the active conversation from the task-local
+    /// installed by the service dispatch loop; these closures forward to the
+    /// store. When unset, the scratchpad tools return a clear error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_scratchpad(
+        mut self,
+        write_fn: ScratchpadWriteFn,
+        get_many_fn: ScratchpadGetManyFn,
+        list_fn: ScratchpadListFn,
+        search_fn: ScratchpadSearchFn,
+        delete_many_fn: ScratchpadDeleteManyFn,
+        clear_fn: ScratchpadClearFn,
+    ) -> Self {
+        self.scratchpad_write_fn = Some(write_fn);
+        self.scratchpad_get_many_fn = Some(get_many_fn);
+        self.scratchpad_list_fn = Some(list_fn);
+        self.scratchpad_search_fn = Some(search_fn);
+        self.scratchpad_delete_many_fn = Some(delete_many_fn);
+        self.scratchpad_clear_fn = Some(clear_fn);
         self
     }
 
@@ -336,6 +380,83 @@ impl BuiltinToolService {
                     "required": ["action"]
                 }),
             ),
+            ToolDefinition::new(
+                TOOL_SCRATCHPAD_WRITE,
+                "Add or update notes in this conversation's scratchpad — an ephemeral, \
+                 per-conversation working store for facts you want to keep high in context \
+                 right now (an evolving plan, open questions, a working set of IDs). Notes are \
+                 keyed; writing the same key again replaces it. Pass `notes` to upsert several \
+                 at once. Use the reserved key 'goal' for the current objective: it is \
+                 auto-surfaced as your task anchor every turn (so it survives compaction), and \
+                 you should evolve it as the goal shifts and delete it when done. The scratchpad \
+                 is discarded when the conversation is deleted and is NOT durable across \
+                 conversations — promote anything worth keeping to the knowledge base with \
+                 builtin_knowledge_base_write, then delete the note here.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "notes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "key": {"type": "string", "description": "Short handle for the note; upserts by key."},
+                                    "content": {"type": "string", "description": "The note body (keep it small and high-signal)."}
+                                },
+                                "required": ["key", "content"]
+                            },
+                            "description": "One or more notes to add/update in a single call."
+                        },
+                        "key": {"type": "string", "description": "Single-note convenience: the note key (use with `content`)."},
+                        "content": {"type": "string", "description": "Single-note convenience: the note body (use with `key`)."}
+                    }
+                }),
+            ),
+            ToolDefinition::new(
+                TOOL_SCRATCHPAD_SEARCH,
+                "Read this conversation's scratchpad. Omit `query` and `keys` to list all notes \
+                 newest-first; pass `query` for a full-text search over note keys and content; \
+                 pass `keys` to fetch specific notes. `max_results` is required. Results are \
+                 bounded — if the response is truncated you'll get `truncated: true` and should \
+                 narrow with a `query` or a smaller key set.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Full-text query over note keys + content. Omit to list all notes."},
+                        "keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Fetch specific notes by key. Takes precedence over `query`."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum notes to return (required; clamped to 100)."
+                        }
+                    },
+                    "required": ["max_results"]
+                }),
+            ),
+            ToolDefinition::new(
+                TOOL_SCRATCHPAD_DELETE,
+                "Delete notes from this conversation's scratchpad. Pass `keys` to delete \
+                 specific notes, or `all: true` to clear the whole pad. Exactly one of the two \
+                 must be supplied.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Keys of notes to delete."
+                        },
+                        "all": {
+                            "type": "boolean",
+                            "description": "Delete every note in this scratchpad. Mutually exclusive with `keys`."
+                        }
+                    }
+                }),
+            ),
         ]
     }
 
@@ -350,6 +471,9 @@ impl BuiltinToolService {
                 | TOOL_DB_QUERY
                 | TOOL_MCP_CONTROL
                 | TOOL_CONV_SEARCH
+                | TOOL_SCRATCHPAD_WRITE
+                | TOOL_SCRATCHPAD_SEARCH
+                | TOOL_SCRATCHPAD_DELETE
         )
     }
 
@@ -367,6 +491,9 @@ impl BuiltinToolService {
             TOOL_DB_QUERY => self.db_query(arguments).await,
             TOOL_MCP_CONTROL => self.mcp_control(arguments).await,
             TOOL_CONV_SEARCH => self.conversation_search(arguments).await,
+            TOOL_SCRATCHPAD_WRITE => self.scratchpad_write(arguments).await,
+            TOOL_SCRATCHPAD_SEARCH => self.scratchpad_search(arguments).await,
+            TOOL_SCRATCHPAD_DELETE => self.scratchpad_delete(arguments).await,
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
@@ -684,6 +811,238 @@ impl BuiltinToolService {
         }
     }
 
+    /// Resolve the conversation the scratchpad tools operate on from the
+    /// task-local installed by the service dispatch loop. Errors clearly when
+    /// no conversation scope is active (e.g. a non-conversation tool call).
+    fn scratchpad_conversation() -> Result<String, CoreError> {
+        current_conversation_id().map(|c| c.0).ok_or_else(|| {
+            CoreError::ToolExecution("scratchpad requires an active conversation".to_string())
+        })
+    }
+
+    async fn scratchpad_write(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let conversation_id = Self::scratchpad_conversation()?;
+        let write_fn = self.scratchpad_write_fn.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution("scratchpad not configured".to_string())
+        })?;
+
+        // Accept either a `notes` array or a single `key`+`content`.
+        let raw: Vec<(String, String)> = if let Some(arr) =
+            arguments.get("notes").and_then(serde_json::Value::as_array)
+        {
+            arr.iter()
+                .filter_map(|n| {
+                    let key = n.get("key").and_then(serde_json::Value::as_str)?;
+                    let content = n.get("content").and_then(serde_json::Value::as_str)?;
+                    Some((key.trim().to_string(), content.to_string()))
+                })
+                .collect()
+        } else if let (Some(key), Some(content)) = (
+            arguments.get("key").and_then(serde_json::Value::as_str),
+            arguments.get("content").and_then(serde_json::Value::as_str),
+        ) {
+            vec![(key.trim().to_string(), content.to_string())]
+        } else {
+            return Err(CoreError::ToolExecution(
+                "scratchpad_write requires `notes: [{key, content}]` or a single `key` + `content`"
+                    .to_string(),
+            ));
+        };
+
+        if raw.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "scratchpad_write: no notes provided".to_string(),
+            ));
+        }
+
+        // Validate each note, then dedupe repeated keys last-wins (a single
+        // INSERT can't carry a duplicate ON CONFLICT target). Invalid notes
+        // are reported individually rather than failing the whole call.
+        let mut rejected: Vec<serde_json::Value> = Vec::new();
+        let mut accepted: Vec<(String, String)> = Vec::new();
+        for (key, content) in raw {
+            if key.is_empty() {
+                rejected.push(serde_json::json!({"key": key, "reason": "empty key"}));
+                continue;
+            }
+            if content.len() > MAX_NOTE_BYTES {
+                rejected.push(serde_json::json!({
+                    "key": key,
+                    "reason": format!("content exceeds {MAX_NOTE_BYTES} bytes")
+                }));
+                continue;
+            }
+            if let Some(existing) = accepted.iter_mut().find(|(k, _)| *k == key) {
+                existing.1 = content;
+            } else {
+                accepted.push((key, content));
+            }
+        }
+
+        // Bound the batch: anything past the per-call cap is reported as skipped.
+        let mut truncated = false;
+        let mut skipped: Vec<String> = Vec::new();
+        if accepted.len() > MAX_NOTES_PER_WRITE {
+            truncated = true;
+            skipped = accepted
+                .split_off(MAX_NOTES_PER_WRITE)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+        }
+
+        let saved = if accepted.is_empty() {
+            Vec::new()
+        } else {
+            write_fn(conversation_id, accepted).await?
+        };
+
+        let written: Vec<serde_json::Value> = saved
+            .iter()
+            .map(|n| serde_json::json!({"key": n.key, "id": n.id, "updated_at": n.updated_at}))
+            .collect();
+
+        let mut response = serde_json::json!({"ok": true, "written": written});
+        if !rejected.is_empty() {
+            response["rejected"] = serde_json::Value::Array(rejected);
+        }
+        if truncated {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["skipped"] = serde_json::json!(skipped);
+            response["message"] = serde_json::json!(format!(
+                "only the first {MAX_NOTES_PER_WRITE} notes were written; call again with the rest"
+            ));
+        }
+        Ok(response.to_string())
+    }
+
+    async fn scratchpad_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let conversation_id = Self::scratchpad_conversation()?;
+
+        // `max_results` is required and clamped so a single read is bounded.
+        let max_results = arguments
+            .get("max_results")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                CoreError::ToolExecution(
+                    "scratchpad_search requires `max_results`".to_string(),
+                )
+            })? as usize;
+        let limit = max_results.clamp(1, MAX_RESULTS_CEILING);
+
+        let keys = optional_string_array(&arguments, "keys");
+        let query = optional_string(&arguments, "query");
+
+        // Mode precedence: keys -> query -> list-all. Each path is bounded.
+        let mut keys_truncated = false;
+        let results = if !keys.is_empty() {
+            let get_many = self.scratchpad_get_many_fn.as_ref().ok_or_else(|| {
+                CoreError::ToolExecution("scratchpad not configured".to_string())
+            })?;
+            let mut keys = keys;
+            if keys.len() > MAX_KEYS_PER_CALL {
+                keys_truncated = true;
+                keys.truncate(MAX_KEYS_PER_CALL);
+            }
+            get_many(conversation_id, keys, limit).await?
+        } else if let Some(query) = query {
+            let search = self.scratchpad_search_fn.as_ref().ok_or_else(|| {
+                CoreError::ToolExecution("scratchpad not configured".to_string())
+            })?;
+            search(conversation_id, query, limit).await?
+        } else {
+            let list = self.scratchpad_list_fn.as_ref().ok_or_else(|| {
+                CoreError::ToolExecution("scratchpad not configured".to_string())
+            })?;
+            list(conversation_id, limit).await?
+        };
+
+        let hit_limit = results.len() >= limit;
+
+        // Enforce the response byte budget so one read can't blow out context.
+        // Always include at least one entry even if it alone is large.
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut bytes = 0usize;
+        let mut budget_truncated = false;
+        for note in &results {
+            let entry = serde_json::json!({
+                "key": note.key,
+                "content": note.content,
+                "updated_at": note.updated_at,
+            });
+            let size = entry.to_string().len();
+            if !items.is_empty() && bytes + size > RESPONSE_BYTE_BUDGET {
+                budget_truncated = true;
+                break;
+            }
+            bytes += size;
+            items.push(entry);
+        }
+
+        let truncated = keys_truncated || budget_truncated || hit_limit;
+        let mut response =
+            serde_json::json!({"ok": true, "results": items.clone(), "returned": items.len()});
+        if truncated {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(
+                "results were truncated; narrow with a `query`, fewer `keys`, or a smaller scope"
+            );
+        }
+        Ok(response.to_string())
+    }
+
+    async fn scratchpad_delete(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let conversation_id = Self::scratchpad_conversation()?;
+
+        let all = arguments
+            .get("all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let keys = optional_string_array(&arguments, "keys");
+
+        // Exactly one mode: refuse both/neither so a stray arg can't mass-delete.
+        if all && !keys.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "scratchpad_delete: pass either `keys` or `all`, not both".to_string(),
+            ));
+        }
+        if !all && keys.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "scratchpad_delete requires `keys: [...]` or `all: true`".to_string(),
+            ));
+        }
+
+        if all {
+            let clear = self.scratchpad_clear_fn.as_ref().ok_or_else(|| {
+                CoreError::ToolExecution("scratchpad not configured".to_string())
+            })?;
+            let deleted = clear(conversation_id).await?;
+            return Ok(serde_json::json!({"ok": true, "deleted": deleted}).to_string());
+        }
+
+        let delete_many = self.scratchpad_delete_many_fn.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution("scratchpad not configured".to_string())
+        })?;
+        let requested = keys.len();
+        let mut keys = keys;
+        let mut truncated = false;
+        if keys.len() > MAX_KEYS_PER_CALL {
+            truncated = true;
+            keys.truncate(MAX_KEYS_PER_CALL);
+        }
+        let deleted = delete_many(conversation_id, keys).await?;
+
+        let mut response =
+            serde_json::json!({"ok": true, "deleted": deleted, "requested": requested});
+        if truncated {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(format!(
+                "only the first {MAX_KEYS_PER_CALL} keys were processed; call again for the rest"
+            ));
+        }
+        Ok(response.to_string())
+    }
+
     /// Embed a single text string, returning None if embeddings are unavailable.
     /// Used for search queries which are always short and don't need chunking.
     async fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
@@ -968,6 +1327,336 @@ mod tests {
         assert!(names.contains(&TOOL_DB_QUERY.to_string()));
         assert!(names.contains(&TOOL_MCP_CONTROL.to_string()));
         assert!(names.contains(&TOOL_CONV_SEARCH.to_string()));
+        assert!(names.contains(&TOOL_SCRATCHPAD_WRITE.to_string()));
+        assert!(names.contains(&TOOL_SCRATCHPAD_SEARCH.to_string()));
+        assert!(names.contains(&TOOL_SCRATCHPAD_DELETE.to_string()));
+    }
+
+    // --- Scratchpad tools (#184) ---
+
+    use std::sync::Arc;
+
+    use desktop_assistant_core::domain::{ConversationId, ScratchpadNote};
+    use desktop_assistant_core::ports::conversation_ctx::with_conversation_id;
+
+    /// Build a BuiltinToolService whose scratchpad closures share one
+    /// in-memory note store, so write/search/delete round-trips are testable
+    /// without Postgres. Returns the service and a handle to the store.
+    fn scratchpad_service() -> (BuiltinToolService, Arc<std::sync::Mutex<Vec<ScratchpadNote>>>) {
+        use std::pin::Pin;
+        let store: Arc<std::sync::Mutex<Vec<ScratchpadNote>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let w = Arc::clone(&store);
+        let write_fn: ScratchpadWriteFn = Arc::new(move |conv: String, notes: Vec<(String, String)>| {
+            let store = Arc::clone(&w);
+            Box::pin(async move {
+                let mut guard = store.lock().unwrap();
+                let mut saved = Vec::new();
+                for (i, (key, content)) in notes.into_iter().enumerate() {
+                    if let Some(existing) =
+                        guard.iter_mut().find(|n| n.conversation_id == conv && n.key == key)
+                    {
+                        existing.content = content;
+                        existing.updated_at = "t1".into();
+                        saved.push(existing.clone());
+                    } else {
+                        let mut n = ScratchpadNote::new(format!("id-{i}-{key}"), &conv, &key, &content);
+                        n.updated_at = "t0".into();
+                        guard.push(n.clone());
+                        saved.push(n);
+                    }
+                }
+                Ok(saved)
+            }) as Pin<Box<dyn std::future::Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send>>
+        });
+
+        let g = Arc::clone(&store);
+        let get_many_fn: ScratchpadGetManyFn =
+            Arc::new(move |conv: String, keys: Vec<String>, limit: usize| {
+                let store = Arc::clone(&g);
+                Box::pin(async move {
+                    let guard = store.lock().unwrap();
+                    Ok(guard
+                        .iter()
+                        .filter(|n| n.conversation_id == conv && keys.contains(&n.key))
+                        .take(limit)
+                        .cloned()
+                        .collect())
+                })
+            });
+
+        let l = Arc::clone(&store);
+        let list_fn: ScratchpadListFn = Arc::new(move |conv: String, limit: usize| {
+            let store = Arc::clone(&l);
+            Box::pin(async move {
+                let guard = store.lock().unwrap();
+                Ok(guard
+                    .iter()
+                    .filter(|n| n.conversation_id == conv)
+                    .take(limit)
+                    .cloned()
+                    .collect())
+            })
+        });
+
+        let s = Arc::clone(&store);
+        let search_fn: ScratchpadSearchFn =
+            Arc::new(move |conv: String, query: String, limit: usize| {
+                let store = Arc::clone(&s);
+                Box::pin(async move {
+                    let guard = store.lock().unwrap();
+                    Ok(guard
+                        .iter()
+                        .filter(|n| {
+                            n.conversation_id == conv
+                                && (n.content.contains(&query) || n.key.contains(&query))
+                        })
+                        .take(limit)
+                        .cloned()
+                        .collect())
+                })
+            });
+
+        let d = Arc::clone(&store);
+        let delete_many_fn: ScratchpadDeleteManyFn =
+            Arc::new(move |conv: String, keys: Vec<String>| {
+                let store = Arc::clone(&d);
+                Box::pin(async move {
+                    let mut guard = store.lock().unwrap();
+                    let before = guard.len();
+                    guard.retain(|n| !(n.conversation_id == conv && keys.contains(&n.key)));
+                    Ok((before - guard.len()) as u64)
+                })
+            });
+
+        let c = Arc::clone(&store);
+        let clear_fn: ScratchpadClearFn = Arc::new(move |conv: String| {
+            let store = Arc::clone(&c);
+            Box::pin(async move {
+                let mut guard = store.lock().unwrap();
+                let before = guard.len();
+                guard.retain(|n| n.conversation_id != conv);
+                Ok((before - guard.len()) as u64)
+            })
+        });
+
+        let service = BuiltinToolService::new().with_scratchpad(
+            write_fn,
+            get_many_fn,
+            list_fn,
+            search_fn,
+            delete_many_fn,
+            clear_fn,
+        );
+        (service, store)
+    }
+
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scratchpad_requires_active_conversation() {
+        // Closures configured, but no conversation scope installed.
+        let (service, _store) = scratchpad_service();
+        for (tool, args) in [
+            (TOOL_SCRATCHPAD_WRITE, serde_json::json!({"key": "k", "content": "v"})),
+            (TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 10})),
+            (TOOL_SCRATCHPAD_DELETE, serde_json::json!({"all": true})),
+        ] {
+            let result = service.execute_tool(tool, args).await;
+            assert!(
+                matches!(&result, Err(CoreError::ToolExecution(m)) if m.contains("active conversation")),
+                "{tool} must require an active conversation, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_search_delete_roundtrip() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            // Batch write two notes.
+            let written = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"notes": [
+                        {"key": "goal", "content": "ship the scratchpad"},
+                        {"key": "q", "content": "which database to use"}
+                    ]}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(parse(&written)["written"].as_array().unwrap().len(), 2);
+
+            // List (no query) returns both.
+            let listed = service
+                .execute_tool(TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 10}))
+                .await
+                .unwrap();
+            assert_eq!(parse(&listed)["results"].as_array().unwrap().len(), 2);
+
+            // Search by query matches one.
+            let hit = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"query": "database", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+            let results = parse(&hit);
+            assert_eq!(results["results"].as_array().unwrap().len(), 1);
+            assert_eq!(results["results"][0]["key"], "q");
+
+            // Fetch by keys.
+            let by_key = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"keys": ["goal"], "max_results": 10}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(parse(&by_key)["results"][0]["key"], "goal");
+
+            // Upsert by key updates content, not count.
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"key": "goal", "content": "ship it well"}),
+                )
+                .await
+                .unwrap();
+            let after = service
+                .execute_tool(TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 10}))
+                .await
+                .unwrap();
+            assert_eq!(parse(&after)["results"].as_array().unwrap().len(), 2);
+
+            // Delete one key.
+            let del = service
+                .execute_tool(TOOL_SCRATCHPAD_DELETE, serde_json::json!({"keys": ["q"]}))
+                .await
+                .unwrap();
+            assert_eq!(parse(&del)["deleted"], 1);
+
+            // Delete all.
+            let cleared = service
+                .execute_tool(TOOL_SCRATCHPAD_DELETE, serde_json::json!({"all": true}))
+                .await
+                .unwrap();
+            assert_eq!(parse(&cleared)["deleted"], 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_rejects_empty_key_and_oversize_content() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            let huge = "x".repeat(MAX_NOTE_BYTES + 1);
+            let result = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"notes": [
+                        {"key": "", "content": "no key"},
+                        {"key": "big", "content": huge},
+                        {"key": "ok", "content": "fine"}
+                    ]}),
+                )
+                .await
+                .unwrap();
+            let json = parse(&result);
+            assert_eq!(json["written"].as_array().unwrap().len(), 1, "only the valid note is written");
+            assert_eq!(json["written"][0]["key"], "ok");
+            assert_eq!(json["rejected"].as_array().unwrap().len(), 2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_truncates_over_cap() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            let notes: Vec<serde_json::Value> = (0..MAX_NOTES_PER_WRITE + 5)
+                .map(|i| serde_json::json!({"key": format!("k{i}"), "content": "v"}))
+                .collect();
+            let result = service
+                .execute_tool(TOOL_SCRATCHPAD_WRITE, serde_json::json!({"notes": notes}))
+                .await
+                .unwrap();
+            let json = parse(&result);
+            assert_eq!(json["truncated"], true);
+            assert_eq!(json["written"].as_array().unwrap().len(), MAX_NOTES_PER_WRITE);
+            assert_eq!(json["skipped"].as_array().unwrap().len(), 5);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scratchpad_search_requires_max_results() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            let result = service
+                .execute_tool(TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"query": "x"}))
+                .await;
+            assert!(
+                matches!(&result, Err(CoreError::ToolExecution(m)) if m.contains("max_results")),
+                "search must require max_results, got {result:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scratchpad_delete_requires_exactly_one_mode() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            // Neither.
+            let neither = service
+                .execute_tool(TOOL_SCRATCHPAD_DELETE, serde_json::json!({}))
+                .await;
+            assert!(matches!(neither, Err(CoreError::ToolExecution(_))));
+            // Both.
+            let both = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_DELETE,
+                    serde_json::json!({"keys": ["a"], "all": true}),
+                )
+                .await;
+            assert!(matches!(both, Err(CoreError::ToolExecution(_))));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scratchpad_search_byte_budget_truncates() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            // Write enough near-max notes that the serialized list exceeds the
+            // response byte budget, forcing truncation.
+            let big = "y".repeat(MAX_NOTE_BYTES - 100);
+            let count = (RESPONSE_BYTE_BUDGET / MAX_NOTE_BYTES) + 3;
+            let notes: Vec<serde_json::Value> = (0..count)
+                .map(|i| serde_json::json!({"key": format!("k{i}"), "content": big}))
+                .collect();
+            // Cap is MAX_NOTES_PER_WRITE; write in chunks if needed. count is
+            // small (< cap for 20KB/8KB), so a single call suffices.
+            service
+                .execute_tool(TOOL_SCRATCHPAD_WRITE, serde_json::json!({"notes": notes}))
+                .await
+                .unwrap();
+
+            let listed = service
+                .execute_tool(TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 100}))
+                .await
+                .unwrap();
+            let json = parse(&listed);
+            assert_eq!(json["truncated"], true, "oversized list must signal truncation");
+            let returned = json["results"].as_array().unwrap().len();
+            assert!(returned < count, "fewer than all notes are returned under the byte budget");
+        })
+        .await;
     }
 
     #[tokio::test]
