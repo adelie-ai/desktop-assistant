@@ -59,18 +59,20 @@ mod tests {
 
     #[tokio::test]
     async fn current_conversation_id_inside_scope_returns_installed_value() {
-        let observed =
-            with_conversation_id(ConversationId::from("conv-1"), async { current_conversation_id() })
-                .await;
+        let observed = with_conversation_id(ConversationId::from("conv-1"), async {
+            current_conversation_id()
+        })
+        .await;
         assert_eq!(observed, Some(ConversationId::from("conv-1")));
     }
 
     #[tokio::test]
     async fn nested_scopes_override_then_restore() {
         let result = with_conversation_id(ConversationId::from("outer"), async {
-            let inner =
-                with_conversation_id(ConversationId::from("inner"), async { current_conversation_id() })
-                    .await;
+            let inner = with_conversation_id(ConversationId::from("inner"), async {
+                current_conversation_id()
+            })
+            .await;
             let after = current_conversation_id();
             (inner, after)
         })

@@ -1,8 +1,8 @@
 //! Integration tests for the per-conversation scratchpad store (#184).
 //!
 //! Exercises `PgScratchpadStore` end-to-end against a real Postgres with the
-//! migration applied, proving: batch upsert by key, `get_many`, list ordering
-//! + limit, FTS search, `delete_many`/`clear` counts, cascade-delete with the
+//! migration applied, proving batch upsert by key, `get_many`, ordered/limited
+//! listing, FTS search, `delete_many`/`clear` counts, cascade-delete with the
 //! parent conversation, and cross-user isolation.
 //!
 //! ## Running locally
@@ -67,7 +67,9 @@ impl Fixture {
             .await
             .expect("connect per-test pool");
 
-        run_migrations(&pool).await.expect("run_migrations succeeds");
+        run_migrations(&pool)
+            .await
+            .expect("run_migrations succeeds");
 
         Some(Self {
             pool,
@@ -126,7 +128,10 @@ async fn write_upserts_and_list_returns_all() {
         let pad = PgScratchpadStore::new(fx.pool.clone());
 
         with_user_id(UserId::new("alice"), async {
-            convs.create(make_conversation("c1")).await.expect("create conv");
+            convs
+                .create(make_conversation("c1"))
+                .await
+                .expect("create conv");
 
             let saved = pad
                 .write("c1", &[note("goal", "ship it"), note("q", "which db")])
@@ -159,7 +164,10 @@ async fn get_many_fetches_requested_keys() {
         let pad = PgScratchpadStore::new(fx.pool.clone());
 
         with_user_id(UserId::new("alice"), async {
-            convs.create(make_conversation("c1")).await.expect("create conv");
+            convs
+                .create(make_conversation("c1"))
+                .await
+                .expect("create conv");
             pad.write(
                 "c1",
                 &[note("a", "alpha"), note("b", "bravo"), note("c", "charlie")],
@@ -188,7 +196,10 @@ async fn search_matches_full_text() {
         let pad = PgScratchpadStore::new(fx.pool.clone());
 
         with_user_id(UserId::new("alice"), async {
-            convs.create(make_conversation("c1")).await.expect("create conv");
+            convs
+                .create(make_conversation("c1"))
+                .await
+                .expect("create conv");
             pad.write(
                 "c1",
                 &[
@@ -219,7 +230,10 @@ async fn delete_many_and_clear_return_counts() {
         let pad = PgScratchpadStore::new(fx.pool.clone());
 
         with_user_id(UserId::new("alice"), async {
-            convs.create(make_conversation("c1")).await.expect("create conv");
+            convs
+                .create(make_conversation("c1"))
+                .await
+                .expect("create conv");
             pad.write("c1", &[note("a", "x"), note("b", "y"), note("c", "z")])
                 .await
                 .expect("write");
@@ -248,7 +262,10 @@ async fn deleting_conversation_cascades_to_notes() {
         let pad = PgScratchpadStore::new(fx.pool.clone());
 
         with_user_id(UserId::new("alice"), async {
-            convs.create(make_conversation("c1")).await.expect("create conv");
+            convs
+                .create(make_conversation("c1"))
+                .await
+                .expect("create conv");
             pad.write("c1", &[note("goal", "ship it")])
                 .await
                 .expect("write");
@@ -278,7 +295,10 @@ async fn cross_user_isolation() {
 
         // Alice owns the conversation and writes a note.
         with_user_id(UserId::new("alice"), async {
-            convs.create(make_conversation("c1")).await.expect("alice conv");
+            convs
+                .create(make_conversation("c1"))
+                .await
+                .expect("alice conv");
             pad.write("c1", &[note("goal", "alice secret")])
                 .await
                 .expect("alice write");

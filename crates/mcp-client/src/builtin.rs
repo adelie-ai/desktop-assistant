@@ -822,32 +822,32 @@ impl BuiltinToolService {
 
     async fn scratchpad_write(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let conversation_id = Self::scratchpad_conversation()?;
-        let write_fn = self.scratchpad_write_fn.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("scratchpad not configured".to_string())
-        })?;
+        let write_fn = self
+            .scratchpad_write_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("scratchpad not configured".to_string()))?;
 
         // Accept either a `notes` array or a single `key`+`content`.
-        let raw: Vec<(String, String)> = if let Some(arr) =
-            arguments.get("notes").and_then(serde_json::Value::as_array)
-        {
-            arr.iter()
-                .filter_map(|n| {
-                    let key = n.get("key").and_then(serde_json::Value::as_str)?;
-                    let content = n.get("content").and_then(serde_json::Value::as_str)?;
-                    Some((key.trim().to_string(), content.to_string()))
-                })
-                .collect()
-        } else if let (Some(key), Some(content)) = (
-            arguments.get("key").and_then(serde_json::Value::as_str),
-            arguments.get("content").and_then(serde_json::Value::as_str),
-        ) {
-            vec![(key.trim().to_string(), content.to_string())]
-        } else {
-            return Err(CoreError::ToolExecution(
+        let raw: Vec<(String, String)> =
+            if let Some(arr) = arguments.get("notes").and_then(serde_json::Value::as_array) {
+                arr.iter()
+                    .filter_map(|n| {
+                        let key = n.get("key").and_then(serde_json::Value::as_str)?;
+                        let content = n.get("content").and_then(serde_json::Value::as_str)?;
+                        Some((key.trim().to_string(), content.to_string()))
+                    })
+                    .collect()
+            } else if let (Some(key), Some(content)) = (
+                arguments.get("key").and_then(serde_json::Value::as_str),
+                arguments.get("content").and_then(serde_json::Value::as_str),
+            ) {
+                vec![(key.trim().to_string(), content.to_string())]
+            } else {
+                return Err(CoreError::ToolExecution(
                 "scratchpad_write requires `notes: [{key, content}]` or a single `key` + `content`"
                     .to_string(),
             ));
-        };
+            };
 
         if raw.is_empty() {
             return Err(CoreError::ToolExecution(
@@ -924,9 +924,7 @@ impl BuiltinToolService {
             .get("max_results")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| {
-                CoreError::ToolExecution(
-                    "scratchpad_search requires `max_results`".to_string(),
-                )
+                CoreError::ToolExecution("scratchpad_search requires `max_results`".to_string())
             })? as usize;
         let limit = max_results.clamp(1, MAX_RESULTS_CEILING);
 
@@ -935,27 +933,28 @@ impl BuiltinToolService {
 
         // Mode precedence: keys -> query -> list-all. Each path is bounded.
         let mut keys_truncated = false;
-        let results = if !keys.is_empty() {
-            let get_many = self.scratchpad_get_many_fn.as_ref().ok_or_else(|| {
-                CoreError::ToolExecution("scratchpad not configured".to_string())
-            })?;
-            let mut keys = keys;
-            if keys.len() > MAX_KEYS_PER_CALL {
-                keys_truncated = true;
-                keys.truncate(MAX_KEYS_PER_CALL);
-            }
-            get_many(conversation_id, keys, limit).await?
-        } else if let Some(query) = query {
-            let search = self.scratchpad_search_fn.as_ref().ok_or_else(|| {
-                CoreError::ToolExecution("scratchpad not configured".to_string())
-            })?;
-            search(conversation_id, query, limit).await?
-        } else {
-            let list = self.scratchpad_list_fn.as_ref().ok_or_else(|| {
-                CoreError::ToolExecution("scratchpad not configured".to_string())
-            })?;
-            list(conversation_id, limit).await?
-        };
+        let results =
+            if !keys.is_empty() {
+                let get_many = self.scratchpad_get_many_fn.as_ref().ok_or_else(|| {
+                    CoreError::ToolExecution("scratchpad not configured".to_string())
+                })?;
+                let mut keys = keys;
+                if keys.len() > MAX_KEYS_PER_CALL {
+                    keys_truncated = true;
+                    keys.truncate(MAX_KEYS_PER_CALL);
+                }
+                get_many(conversation_id, keys, limit).await?
+            } else if let Some(query) = query {
+                let search = self.scratchpad_search_fn.as_ref().ok_or_else(|| {
+                    CoreError::ToolExecution("scratchpad not configured".to_string())
+                })?;
+                search(conversation_id, query, limit).await?
+            } else {
+                let list = self.scratchpad_list_fn.as_ref().ok_or_else(|| {
+                    CoreError::ToolExecution("scratchpad not configured".to_string())
+                })?;
+                list(conversation_id, limit).await?
+            };
 
         let hit_limit = results.len() >= limit;
 
@@ -1013,16 +1012,18 @@ impl BuiltinToolService {
         }
 
         if all {
-            let clear = self.scratchpad_clear_fn.as_ref().ok_or_else(|| {
-                CoreError::ToolExecution("scratchpad not configured".to_string())
-            })?;
+            let clear = self
+                .scratchpad_clear_fn
+                .as_ref()
+                .ok_or_else(|| CoreError::ToolExecution("scratchpad not configured".to_string()))?;
             let deleted = clear(conversation_id).await?;
             return Ok(serde_json::json!({"ok": true, "deleted": deleted}).to_string());
         }
 
-        let delete_many = self.scratchpad_delete_many_fn.as_ref().ok_or_else(|| {
-            CoreError::ToolExecution("scratchpad not configured".to_string())
-        })?;
+        let delete_many = self
+            .scratchpad_delete_many_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("scratchpad not configured".to_string()))?;
         let requested = keys.len();
         let mut keys = keys;
         let mut truncated = false;
@@ -1342,34 +1343,46 @@ mod tests {
     /// Build a BuiltinToolService whose scratchpad closures share one
     /// in-memory note store, so write/search/delete round-trips are testable
     /// without Postgres. Returns the service and a handle to the store.
-    fn scratchpad_service() -> (BuiltinToolService, Arc<std::sync::Mutex<Vec<ScratchpadNote>>>) {
+    fn scratchpad_service() -> (
+        BuiltinToolService,
+        Arc<std::sync::Mutex<Vec<ScratchpadNote>>>,
+    ) {
         use std::pin::Pin;
         let store: Arc<std::sync::Mutex<Vec<ScratchpadNote>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let w = Arc::clone(&store);
-        let write_fn: ScratchpadWriteFn = Arc::new(move |conv: String, notes: Vec<(String, String)>| {
-            let store = Arc::clone(&w);
-            Box::pin(async move {
-                let mut guard = store.lock().unwrap();
-                let mut saved = Vec::new();
-                for (i, (key, content)) in notes.into_iter().enumerate() {
-                    if let Some(existing) =
-                        guard.iter_mut().find(|n| n.conversation_id == conv && n.key == key)
-                    {
-                        existing.content = content;
-                        existing.updated_at = "t1".into();
-                        saved.push(existing.clone());
-                    } else {
-                        let mut n = ScratchpadNote::new(format!("id-{i}-{key}"), &conv, &key, &content);
-                        n.updated_at = "t0".into();
-                        guard.push(n.clone());
-                        saved.push(n);
+        let write_fn: ScratchpadWriteFn =
+            Arc::new(move |conv: String, notes: Vec<(String, String)>| {
+                let store = Arc::clone(&w);
+                Box::pin(async move {
+                    let mut guard = store.lock().unwrap();
+                    let mut saved = Vec::new();
+                    for (i, (key, content)) in notes.into_iter().enumerate() {
+                        if let Some(existing) = guard
+                            .iter_mut()
+                            .find(|n| n.conversation_id == conv && n.key == key)
+                        {
+                            existing.content = content;
+                            existing.updated_at = "t1".into();
+                            saved.push(existing.clone());
+                        } else {
+                            let mut n =
+                                ScratchpadNote::new(format!("id-{i}-{key}"), &conv, &key, &content);
+                            n.updated_at = "t0".into();
+                            guard.push(n.clone());
+                            saved.push(n);
+                        }
                     }
-                }
-                Ok(saved)
-            }) as Pin<Box<dyn std::future::Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send>>
-        });
+                    Ok(saved)
+                })
+                    as Pin<
+                        Box<
+                            dyn std::future::Future<Output = Result<Vec<ScratchpadNote>, CoreError>>
+                                + Send,
+                        >,
+                    >
+            });
 
         let g = Arc::clone(&store);
         let get_many_fn: ScratchpadGetManyFn =
@@ -1461,8 +1474,14 @@ mod tests {
         // Closures configured, but no conversation scope installed.
         let (service, _store) = scratchpad_service();
         for (tool, args) in [
-            (TOOL_SCRATCHPAD_WRITE, serde_json::json!({"key": "k", "content": "v"})),
-            (TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 10})),
+            (
+                TOOL_SCRATCHPAD_WRITE,
+                serde_json::json!({"key": "k", "content": "v"}),
+            ),
+            (
+                TOOL_SCRATCHPAD_SEARCH,
+                serde_json::json!({"max_results": 10}),
+            ),
             (TOOL_SCRATCHPAD_DELETE, serde_json::json!({"all": true})),
         ] {
             let result = service.execute_tool(tool, args).await;
@@ -1492,7 +1511,10 @@ mod tests {
 
             // List (no query) returns both.
             let listed = service
-                .execute_tool(TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 10}))
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"max_results": 10}),
+                )
                 .await
                 .unwrap();
             assert_eq!(parse(&listed)["results"].as_array().unwrap().len(), 2);
@@ -1528,7 +1550,10 @@ mod tests {
                 .await
                 .unwrap();
             let after = service
-                .execute_tool(TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 10}))
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"max_results": 10}),
+                )
                 .await
                 .unwrap();
             assert_eq!(parse(&after)["results"].as_array().unwrap().len(), 2);
@@ -1567,7 +1592,11 @@ mod tests {
                 .await
                 .unwrap();
             let json = parse(&result);
-            assert_eq!(json["written"].as_array().unwrap().len(), 1, "only the valid note is written");
+            assert_eq!(
+                json["written"].as_array().unwrap().len(),
+                1,
+                "only the valid note is written"
+            );
             assert_eq!(json["written"][0]["key"], "ok");
             assert_eq!(json["rejected"].as_array().unwrap().len(), 2);
         })
@@ -1587,7 +1616,10 @@ mod tests {
                 .unwrap();
             let json = parse(&result);
             assert_eq!(json["truncated"], true);
-            assert_eq!(json["written"].as_array().unwrap().len(), MAX_NOTES_PER_WRITE);
+            assert_eq!(
+                json["written"].as_array().unwrap().len(),
+                MAX_NOTES_PER_WRITE
+            );
             assert_eq!(json["skipped"].as_array().unwrap().len(), 5);
         })
         .await;
@@ -1648,13 +1680,22 @@ mod tests {
                 .unwrap();
 
             let listed = service
-                .execute_tool(TOOL_SCRATCHPAD_SEARCH, serde_json::json!({"max_results": 100}))
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"max_results": 100}),
+                )
                 .await
                 .unwrap();
             let json = parse(&listed);
-            assert_eq!(json["truncated"], true, "oversized list must signal truncation");
+            assert_eq!(
+                json["truncated"], true,
+                "oversized list must signal truncation"
+            );
             let returned = json["results"].as_array().unwrap().len();
-            assert!(returned < count, "fewer than all notes are returned under the byte budget");
+            assert!(
+                returned < count,
+                "fewer than all notes are returned under the byte budget"
+            );
         })
         .await;
     }

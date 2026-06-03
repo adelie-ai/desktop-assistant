@@ -3213,7 +3213,12 @@ mod tests {
 
         let conv = handler.create_conversation("t".into()).await.unwrap();
         handler
-            .send_prompt(&conv.id, "what next?".into(), noop_callback(), noop_status())
+            .send_prompt(
+                &conv.id,
+                "what next?".into(),
+                noop_callback(),
+                noop_status(),
+            )
             .await
             .unwrap();
 

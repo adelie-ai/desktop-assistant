@@ -86,10 +86,7 @@ pub trait ScratchpadStore: Send + Sync {
     ) -> impl Future<Output = Result<u64, CoreError>> + Send;
 
     /// Delete every note for a conversation. Returns the number deleted.
-    fn clear(
-        &self,
-        conversation_id: &str,
-    ) -> impl Future<Output = Result<u64, CoreError>> + Send;
+    fn clear(&self, conversation_id: &str) -> impl Future<Output = Result<u64, CoreError>> + Send;
 }
 
 /// Boxed async closure for batch-upserting scratchpad notes through
@@ -137,10 +134,7 @@ pub type ScratchpadSearchFn = Arc<
 
 /// Boxed async closure for deleting notes by key. Returns the count deleted.
 pub type ScratchpadDeleteManyFn = Arc<
-    dyn Fn(
-            String,
-            Vec<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
+    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
         + Send
         + Sync,
 >;

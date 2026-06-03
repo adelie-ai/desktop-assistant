@@ -980,7 +980,9 @@ async fn main() -> Result<()> {
 
         // Issue #184: wire the per-conversation scratchpad store.
         use desktop_assistant_core::ports::scratchpad::ScratchpadStore;
-        let sp_store = Arc::new(desktop_assistant_storage::PgScratchpadStore::new(pool.clone()));
+        let sp_store = Arc::new(desktop_assistant_storage::PgScratchpadStore::new(
+            pool.clone(),
+        ));
         tracing::info!("wiring scratchpad store into builtin tools");
         let (sp_w, sp_g, sp_l, sp_s, sp_d, sp_c) = (
             Arc::clone(&sp_store),

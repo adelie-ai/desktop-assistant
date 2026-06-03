@@ -165,11 +165,7 @@ impl ScratchpadStore for PgScratchpadStore {
         Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 
-    async fn delete_many(
-        &self,
-        conversation_id: &str,
-        keys: &[String],
-    ) -> Result<u64, CoreError> {
+    async fn delete_many(&self, conversation_id: &str, keys: &[String]) -> Result<u64, CoreError> {
         if keys.is_empty() {
             return Ok(0);
         }
