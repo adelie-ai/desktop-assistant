@@ -66,6 +66,9 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // by per-user code paths.
     "background_tasks",
     "turn_state",
+    // 019 — per-conversation scratchpad notes carry `user_id` and must be
+    // scoped so LLM-supplied SQL can't read another user's notes.
+    "scratchpads",
 ];
 
 /// Output of `prepare_select_for_user` — the rewritten SELECT plus the
@@ -1011,6 +1014,31 @@ mod tests {
         assert!(
             lower.contains("$1") || lower.contains("'alice'"),
             "rewritten SQL must bind/quote the caller user_id, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_grafts_user_id_into_scratchpads_select() {
+        // #184: scratchpads is personal data — a SELECT against it via the
+        // db_query tool must be user-scoped so the LLM can't read another
+        // user's notes.
+        let rewritten =
+            rewrite_select("SELECT note_key FROM scratchpads", "alice").expect("rewrite");
+        let lower = rewritten.to_ascii_lowercase();
+        assert!(
+            lower.contains("user_id ="),
+            "scratchpads SELECT must be user-scoped, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn write_to_scratchpads_is_refused() {
+        // A qualified write to scratchpads via db_query must be rejected like
+        // any other personal-data table.
+        let result = validate_write("UPDATE public.scratchpads SET content = 'x'");
+        assert!(
+            result.is_err(),
+            "writes to the scratchpads personal-data table must be refused"
         );
     }
 

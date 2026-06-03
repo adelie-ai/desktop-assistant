@@ -71,6 +71,8 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     "message_summaries",
     "dreaming_watermarks",
     "tag_registry",
+    // 019 — per-conversation scratchpad notes (#184).
+    "scratchpads",
 ];
 
 /// Allowlist for queries that legitimately span multiple users.
