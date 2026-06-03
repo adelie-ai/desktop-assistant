@@ -10,6 +10,7 @@ pub mod kb_metadata;
 pub mod knowledge;
 pub mod migrate_json;
 pub mod pool;
+pub mod scratchpad;
 pub mod tag_registry;
 pub mod tool_registry;
 pub mod turn_state;
@@ -31,5 +32,6 @@ pub use migrate_json::{
     migrate_knowledge,
 };
 pub use pool::{create_pool, run_migrations};
+pub use scratchpad::PgScratchpadStore;
 pub use tool_registry::PgToolRegistryStore;
 pub use turn_state::PgTurnStateStore;
