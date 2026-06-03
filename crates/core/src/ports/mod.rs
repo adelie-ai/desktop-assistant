@@ -22,6 +22,9 @@ pub mod tools;
 /// Knowledge base store port — outbound trait for unified knowledge persistence.
 pub mod knowledge;
 
+/// Scratchpad store port — outbound trait for ephemeral per-conversation notes.
+pub mod scratchpad;
+
 /// Tool registry store port — outbound trait for tool definition persistence and search.
 pub mod tool_registry;
 
@@ -33,6 +36,10 @@ pub mod conversation_search;
 
 /// Request-scoped auth context — task-local `UserId` for SQL scoping (#105).
 pub mod auth;
+
+/// Request-scoped conversation context — task-local `ConversationId` so tool
+/// executors can scope per-conversation side state (e.g. the scratchpad).
+pub mod conversation_ctx;
 
 #[cfg(test)]
 mod tests {
@@ -47,6 +54,7 @@ mod tests {
         fn _assert_tools_exists<T: super::tools::ToolExecutor>() {}
         fn _assert_embedding_exists<T: super::embedding::EmbeddingClient>() {}
         fn _assert_knowledge_exists<T: super::knowledge::KnowledgeBaseStore>() {}
+        fn _assert_scratchpad_exists<T: super::scratchpad::ScratchpadStore>() {}
         fn _assert_tool_registry_exists<T: super::tool_registry::ToolRegistryStore>() {}
     }
 }
