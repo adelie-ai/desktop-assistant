@@ -24,6 +24,7 @@
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
+use desktop_assistant_core::error_classify::{ErrorContext, cause_to_core_error, classify_builtin};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig,
 };
@@ -52,10 +53,28 @@ impl<L> ClassifyingLlmClient<L> {
         &self,
         result: Result<LlmResponse, CoreError>,
     ) -> Result<LlmResponse, CoreError> {
-        // Stub (issue #178, slice 5a): real reclassification lands in the
-        // follow-up commit.
-        let _ = &self.connector;
-        result
+        match result {
+            Err(CoreError::Llm(detail)) => {
+                let cause = classify_builtin(&ErrorContext {
+                    connector: &self.connector,
+                    http_status: None,
+                    provider_code: None,
+                    message: &detail,
+                });
+                match cause_to_core_error(cause, detail.clone()) {
+                    Some(mapped) => {
+                        tracing::info!(
+                            connector = %self.connector,
+                            ?cause,
+                            "classified opaque LLM error into a structured cause"
+                        );
+                        Err(mapped)
+                    }
+                    None => Err(CoreError::Llm(detail)),
+                }
+            }
+            other => other,
+        }
     }
 }
 
