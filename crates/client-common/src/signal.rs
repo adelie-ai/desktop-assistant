@@ -54,6 +54,13 @@ pub enum SignalEvent {
         status: api::TaskStatus,
         last_error: Option<String>,
     },
+    /// A conversation's scratchpad changed (note written or deleted), by the
+    /// LLM's tools or a client command. Delivered on connections subscribed via
+    /// `Command::SubscribeBackgroundTasks`; carries only the `conversation_id`
+    /// so the client re-reads via `get_conversation_scratchpad` (issue #190).
+    ScratchpadChanged {
+        conversation_id: String,
+    },
     Disconnected {
         reason: String,
     },

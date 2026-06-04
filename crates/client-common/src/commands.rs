@@ -288,6 +288,76 @@ pub trait AssistantCommands: Send + Sync {
         };
         Ok(())
     }
+
+    // --- Conversation scratchpad (issue #190) -----------------------------
+
+    /// Read a conversation's scratchpad notes (ordered by type then sequence).
+    async fn get_conversation_scratchpad(
+        &self,
+        conversation_id: &str,
+        max_results: Option<u32>,
+    ) -> Result<Vec<api::ScratchpadNoteView>> {
+        let result = self
+            .send_command(api::Command::GetConversationScratchpad {
+                conversation_id: conversation_id.to_string(),
+                max_results,
+            })
+            .await?;
+        let api::CommandResult::Scratchpad(items) = result else {
+            return Err(anyhow!(
+                "unexpected response for get_conversation_scratchpad"
+            ));
+        };
+        Ok(items)
+    }
+
+    /// Upsert a single scratchpad note (re-writing a key replaces its fields —
+    /// e.g. set `done` to check a todo off). Returns the saved note(s).
+    #[allow(clippy::too_many_arguments)]
+    async fn set_scratchpad_note(
+        &self,
+        conversation_id: &str,
+        key: &str,
+        content: &str,
+        note_type: &str,
+        sequence: Option<i32>,
+        done: bool,
+    ) -> Result<Vec<api::ScratchpadNoteView>> {
+        let result = self
+            .send_command(api::Command::SetScratchpadNote {
+                conversation_id: conversation_id.to_string(),
+                key: key.to_string(),
+                content: content.to_string(),
+                note_type: note_type.to_string(),
+                sequence,
+                done,
+            })
+            .await?;
+        let api::CommandResult::Scratchpad(items) = result else {
+            return Err(anyhow!("unexpected response for set_scratchpad_note"));
+        };
+        Ok(items)
+    }
+
+    /// Delete scratchpad notes by key, or clear the whole pad with `all: true`.
+    async fn delete_scratchpad_notes(
+        &self,
+        conversation_id: &str,
+        keys: Vec<String>,
+        all: bool,
+    ) -> Result<()> {
+        let result = self
+            .send_command(api::Command::DeleteScratchpadNotes {
+                conversation_id: conversation_id.to_string(),
+                keys,
+                all,
+            })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!("unexpected response for delete_scratchpad_notes"));
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -421,5 +491,84 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn get_conversation_scratchpad_emits_command_and_unwraps_notes() {
+        let client = RecordingClient::new(api::CommandResult::Scratchpad(vec![
+            api::ScratchpadNoteView {
+                id: "sp-1".into(),
+                key: "goal".into(),
+                content: "ship it".into(),
+                note_type: "note".into(),
+                sequence: None,
+                done: false,
+                updated_at: "t".into(),
+            },
+        ]));
+        let notes = client
+            .get_conversation_scratchpad("conv-1", Some(20))
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].key, "goal");
+        match client.last() {
+            api::Command::GetConversationScratchpad {
+                conversation_id,
+                max_results,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(max_results, Some(20));
+            }
+            other => panic!("expected GetConversationScratchpad, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_scratchpad_note_emits_command() {
+        let client = RecordingClient::new(api::CommandResult::Scratchpad(vec![]));
+        client
+            .set_scratchpad_note("conv-1", "t1", "wire it", "todo", Some(2), true)
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::SetScratchpadNote {
+                conversation_id,
+                key,
+                content,
+                note_type,
+                sequence,
+                done,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(key, "t1");
+                assert_eq!(content, "wire it");
+                assert_eq!(note_type, "todo");
+                assert_eq!(sequence, Some(2));
+                assert!(done);
+            }
+            other => panic!("expected SetScratchpadNote, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_scratchpad_notes_emits_command() {
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        client
+            .delete_scratchpad_notes("conv-1", vec!["t1".into()], false)
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::DeleteScratchpadNotes {
+                conversation_id,
+                keys,
+                all,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(keys, vec!["t1".to_string()]);
+                assert!(!all);
+            }
+            other => panic!("expected DeleteScratchpadNotes, got {other:?}"),
+        }
     }
 }

@@ -239,6 +239,45 @@ pub enum Command {
         tools: Option<Vec<String>>,
     },
 
+    // --- Conversation scratchpad (issue #190) -----------------------------
+    //
+    // Client-facing read/write/delete for a conversation's scratchpad — the
+    // same per-conversation notes the LLM manages via builtin tools, exposed
+    // so a client (e.g. the adele-gtk side pane) can display and edit them.
+    // All three are user-scoped by the dispatcher's `with_user_id`, like every
+    // other command.
+    /// Read a conversation's scratchpad notes, ordered by type then sequence.
+    /// Returns `CommandResult::Scratchpad`.
+    GetConversationScratchpad {
+        conversation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_results: Option<u32>,
+    },
+    /// Upsert a single scratchpad note (keyed within the conversation).
+    /// Re-writing an existing key replaces its content/type/sequence/done —
+    /// this is how a client checks a todo off (`done: true`). Returns the saved
+    /// note(s) as `CommandResult::Scratchpad`.
+    SetScratchpadNote {
+        conversation_id: String,
+        key: String,
+        content: String,
+        #[serde(default)]
+        note_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<i32>,
+        #[serde(default)]
+        done: bool,
+    },
+    /// Delete scratchpad notes by key, or clear the whole pad with `all: true`.
+    /// Returns `CommandResult::Ack`.
+    DeleteScratchpadNotes {
+        conversation_id: String,
+        #[serde(default)]
+        keys: Vec<String>,
+        #[serde(default)]
+        all: bool,
+    },
+
     // --- Client-side tool execution (issue #107) ---------------------------
     //
     // Phase-2 architecture (rule #8) executes client-local MCPs on the
@@ -323,6 +362,10 @@ pub enum CommandResult {
     KnowledgeEntry(Option<KnowledgeEntryView>),
     KnowledgeEntryWritten(KnowledgeEntryView),
 
+    /// Response to `GetConversationScratchpad` / `SetScratchpadNote` — the
+    /// requested (or just-saved) scratchpad notes for the conversation.
+    Scratchpad(Vec<ScratchpadNoteView>),
+
     // --- Background tasks (issue #110) ------------------------------------
     /// Response to `ListBackgroundTasks`.
     BackgroundTasks(Vec<TaskView>),
@@ -366,6 +409,27 @@ pub struct KnowledgeEntryView {
     #[serde(default)]
     pub metadata: serde_json::Value,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Wire-format view of a scratchpad note. Mirrors
+/// `desktop_assistant_core::domain::ScratchpadNote` (minus the internal
+/// `conversation_id`/`created_at`) but lives here so transports and clients
+/// depend only on `api-model`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScratchpadNoteView {
+    pub id: String,
+    pub key: String,
+    pub content: String,
+    /// Free-text category (e.g. `todo`/`note`/`other`); defaults to `note`.
+    #[serde(default)]
+    pub note_type: String,
+    /// Optional ordering hint within a `note_type` (ascending, nulls last).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<i32>,
+    /// Whether the note (e.g. a todo) is checked off.
+    #[serde(default)]
+    pub done: bool,
     pub updated_at: String,
 }
 
@@ -444,6 +508,15 @@ pub enum Event {
         status: TaskStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_error: Option<String>,
+    },
+
+    // --- Conversation scratchpad (issue #190) -----------------------------
+    /// A conversation's scratchpad changed (a note was written or deleted),
+    /// whether by the LLM's builtin tools or by a client command. Delivered to
+    /// connections subscribed via `SubscribeBackgroundTasks`. Carries only the
+    /// `conversation_id`; clients re-read via `GetConversationScratchpad`.
+    ScratchpadChanged {
+        conversation_id: String,
     },
 
     // --- Client-side tool execution (issue #107) --------------------------
@@ -1503,6 +1576,78 @@ mod tests {
         assert_eq!(v, expected);
         let back: CommandResult = serde_json::from_value(v).unwrap();
         assert_eq!(res, back);
+    }
+
+    #[test]
+    fn scratchpad_commands_match_documented_snake_case() {
+        // GetConversationScratchpad
+        let cmd = Command::GetConversationScratchpad {
+            conversation_id: "c-1".into(),
+            max_results: Some(20),
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"get_conversation_scratchpad":{"conversation_id":"c-1","max_results":20}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+
+        // SetScratchpadNote
+        let cmd = Command::SetScratchpadNote {
+            conversation_id: "c-1".into(),
+            key: "t1".into(),
+            content: "wire it".into(),
+            note_type: "todo".into(),
+            sequence: Some(2),
+            done: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"set_scratchpad_note":{"conversation_id":"c-1","key":"t1","content":"wire it","note_type":"todo","sequence":2,"done":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+
+        // DeleteScratchpadNotes (clear-all form)
+        let cmd = Command::DeleteScratchpadNotes {
+            conversation_id: "c-1".into(),
+            keys: vec![],
+            all: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"delete_scratchpad_notes":{"conversation_id":"c-1","keys":[],"all":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+    }
+
+    #[test]
+    fn scratchpad_result_and_event_roundtrip() {
+        let res = CommandResult::Scratchpad(vec![ScratchpadNoteView {
+            id: "sp-1".into(),
+            key: "t1".into(),
+            content: "wire it".into(),
+            note_type: "todo".into(),
+            sequence: Some(1),
+            done: false,
+            updated_at: "2026-06-04 00:00:00".into(),
+        }]);
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        assert!(v.get("scratchpad").is_some());
+        assert_eq!(res, serde_json::from_value(v).unwrap());
+
+        let ev = Event::ScratchpadChanged {
+            conversation_id: "c-1".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"scratchpad_changed":{"conversation_id":"c-1"}}"#).unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(ev, serde_json::from_value(v).unwrap());
     }
 
     #[test]

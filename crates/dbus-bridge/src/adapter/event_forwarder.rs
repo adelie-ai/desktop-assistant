@@ -165,6 +165,13 @@ pub fn translate(event: api::Event) -> ForwardAction {
             status: task_status_str(status).to_string(),
             last_error: last_error.unwrap_or_default(),
         },
+        // Conversation scratchpad (issue #190): not forwarded over D-Bus —
+        // the scratchpad side pane is a WebSocket/UDS-protocol concern
+        // (adele-gtk subscribes via the command channel). A D-Bus client that
+        // wants live scratchpad updates would need its own forwarding arm.
+        api::Event::ScratchpadChanged { .. } => ForwardAction::Ignored {
+            kind: "scratchpad_changed",
+        },
         // Client-side tool execution (issue #107): the bridge does not
         // forward `ClientToolCall` to D-Bus subscribers because client-
         // side execution is a WebSocket-protocol concern. The D-Bus
