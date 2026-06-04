@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 mod api_surface;
 mod app;
 mod backend_reasoning;
+mod classifying_llm;
 mod config;
 mod connections;
 mod knowledge_service;
