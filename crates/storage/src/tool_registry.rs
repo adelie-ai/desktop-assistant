@@ -91,6 +91,26 @@ impl ToolRegistryStore for PgToolRegistryStore {
         query_embedding: Vec<f32>,
         limit: usize,
     ) -> Result<Vec<ToolDefinition>, CoreError> {
+        // No query embedding (e.g. the embedding backend timed out — see
+        // `EMBED_TIMEOUT` in mcp-client): the hybrid query's vector branch
+        // (`chunk <=> $1`) would error on a 0-dimension vector, so fall back to
+        // full-text search only.
+        if query_embedding.is_empty() {
+            let rows: Vec<ToolSearchRow> = sqlx::query_as(
+                "SELECT name, description, parameters, \
+                        ts_rank_cd(tsv, query)::FLOAT8 AS rrf_score \
+                 FROM tool_definitions, plainto_tsquery('english', $1) query \
+                 WHERE tsv @@ query \
+                 ORDER BY rrf_score DESC LIMIT $2",
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+            return Ok(rows.into_iter().map(|r| r.into_definition()).collect());
+        }
+
         let embedding_vec = Vector::from(query_embedding);
         let fetch_limit = (limit * 2) as i64;
         let result_limit = limit as i64;

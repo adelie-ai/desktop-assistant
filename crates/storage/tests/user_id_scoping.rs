@@ -430,6 +430,50 @@ async fn knowledge_search_does_not_leak_across_users() {
 }
 
 #[tokio::test]
+async fn knowledge_search_with_empty_embedding_falls_back_to_fts() {
+    // #194: when the embedding backend times out, the search runs with an empty
+    // query embedding. The hybrid query's vector branch (`chunk <=> $1`) would
+    // error on a 0-dimension vector against rows that DO have embeddings, so the
+    // store must skip straight to FTS. Index a doc WITH an embedding, then
+    // search with an empty embedding and require an FTS hit (and no error).
+    with_fixture(
+        "knowledge_search_with_empty_embedding_falls_back_to_fts",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                let entry = KnowledgeEntry::new(
+                    "kb-forecast-doc",
+                    "Quarterly forecast planning for the widget team",
+                    vec!["project".into()],
+                );
+                store
+                    .write(
+                        entry,
+                        Some(vec![vec![0.1_f32, 0.2, 0.3, 0.4]]),
+                        Some("test-model".into()),
+                    )
+                    .await
+                    .expect("write with embedding");
+
+                let hits = store
+                    .search("forecast planning", Vec::new(), None, 10)
+                    .await
+                    .expect("empty-embedding search must fall back to FTS, not error");
+                assert!(
+                    hits.iter().any(|e| e.id == "kb-forecast-doc"),
+                    "FTS fallback must find the indexed doc, got {} hit(s)",
+                    hits.len()
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn knowledge_get_by_id_does_not_leak_across_users() {
     with_fixture(
         "knowledge_get_by_id_does_not_leak_across_users",
