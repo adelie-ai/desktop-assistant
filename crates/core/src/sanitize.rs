@@ -92,3 +92,84 @@ fn trailing_tag_prefix_len(text: &str, tag: &str) -> usize {
     }
     0
 }
+
+/// Redact substrings that look like credentials before an error message is
+/// sent to the (possibly remote) classification LLM (epic #178).
+///
+/// Conservative by design: over-redaction is fine — the goal is to never
+/// exfiltrate a secret in a backend error string (which can embed request
+/// headers, API keys, or signed URLs). Secret-looking tokens are replaced with
+/// `[REDACTED]`. Whitespace is normalized to single spaces, which is harmless
+/// here: the result is only used to build the classifier prompt, never to
+/// match learned signatures (those run against the original message).
+pub fn redact_secrets(text: &str) -> String {
+    text.split_whitespace()
+        .map(redact_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_token(token: &str) -> String {
+    let core = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if core.is_empty() || !looks_like_secret(core) {
+        return token.to_string();
+    }
+    token.replace(core, "[REDACTED]")
+}
+
+/// Heuristic: known credential prefixes, or a long high-entropy run that mixes
+/// letters and digits. Requiring both letters and digits avoids redacting long
+/// English words or all-digit numbers (e.g. overflow token counts).
+fn looks_like_secret(core: &str) -> bool {
+    const PREFIXES: [&str; 8] = [
+        "AKIA",
+        "ASIA",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "ghp_",
+        "github_pat_",
+        "AIza",
+    ];
+    if PREFIXES.iter().any(|p| core.starts_with(p)) {
+        return true;
+    }
+    if core.len() >= 20 {
+        let all_secret_charset = core
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+/_=-.".contains(c));
+        let has_digit = core.chars().any(|c| c.is_ascii_digit());
+        let has_alpha = core.chars().any(|c| c.is_ascii_alphabetic());
+        if all_secret_charset && has_digit && has_alpha {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_secrets;
+
+    #[test]
+    fn redacts_aws_key_and_long_token_keeps_prose() {
+        let msg = "AccessDenied for AKIAIOSFODNN7EXAMPLE using token \
+                   ghp_aB3dE5fG7hI9kL1mN3pQ5rS7tU9vW1xY3zA — try again";
+        let out = redact_secrets(msg);
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!out.contains("ghp_aB3dE5fG7hI9kL1mN3pQ5rS7tU9vW1xY3zA"));
+        // Ordinary words survive.
+        assert!(out.contains("AccessDenied"));
+        assert!(out.contains("try again"));
+    }
+
+    #[test]
+    fn keeps_overflow_numbers_and_short_words() {
+        let msg = "Input length (479258) exceeds maximum context length (131072).";
+        let out = redact_secrets(msg);
+        assert!(out.contains("479258"));
+        assert!(out.contains("131072"));
+        assert!(!out.contains("[REDACTED]"));
+    }
+}

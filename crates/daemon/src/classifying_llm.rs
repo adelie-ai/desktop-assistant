@@ -1,12 +1,15 @@
 //! Decorator that normalizes opaque backend LLM errors into structured
-//! [`CoreError`] variants (epic #178, slice 5a).
+//! [`CoreError`] variants (epic #178).
 //!
 //! Connectors surface unrecognized provider failures as `CoreError::Llm(_)` —
-//! a bare string the dispatch loop can't act on. This wrapper runs the
-//! deterministic tier-1 matchers from [`desktop_assistant_core::error_classify`]
-//! over that string and, when they recognize it, swaps in the structured
-//! variant (`ContextOverflow`, `RateLimited`, `QuotaExceeded`, …) that the
-//! core recovery ladder and `RetryingLlmClient` already know how to handle.
+//! a bare string the dispatch loop can't act on. This wrapper turns that into
+//! the structured variant (`ContextOverflow`, `RateLimited`, `QuotaExceeded`,
+//! …) the core recovery ladder and `RetryingLlmClient` already handle, via
+//! three tiers:
+//!   1. deterministic built-in matchers ([`classify_builtin`]) — pure, no I/O;
+//!   2. a learned cache ([`ErrorClassificationStore`]) — local lookup;
+//!   3. a cheap classifier LLM that labels genuinely novel errors and persists
+//!      the result so tier 2 catches it next time.
 //!
 //! ## Placement & loop-safety
 //! It wraps the **raw connector** (innermost, in `registry::build_llm_client`),
@@ -14,23 +17,65 @@
 //! Putting it *inside* `RetryingLlmClient` is deliberate: `is_retryable_error`
 //! retries only `RateLimited`, so a billing error mapped to `QuotaExceeded`
 //! (terminal) is never retried, and `ContextOverflow` flows to the bounded
-//! recovery ladder — no new loop is introduced.
+//! recovery ladder.
 //!
-//! The reclassification is **pure, single-shot, and non-recursive**: it
-//! transforms an already-returned error once and returns; it never retries,
-//! re-enters, or calls an LLM (tier 1 has no I/O). The reentrancy guard the
-//! loop-safety contract calls for becomes relevant only when the LLM-backed
-//! tier 3 lands — there is nothing here that can loop.
+//! The classifier never loops:
+//! - tier 1 is pure and single-shot;
+//! - tiers 2/3 run at most once per error and are skipped entirely while a
+//!   classification call is in flight ([`is_classification_in_progress`]), so
+//!   the tier-3 LLM call's own errors can't recurse back into classification;
+//! - tier 3 is time-bounded ([`CLASSIFY_TIMEOUT`]) and best-effort — any
+//!   failure, timeout, or unusable answer falls back to the original error.
+
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
-use desktop_assistant_core::error_classify::{ErrorContext, cause_to_core_error, classify_builtin};
+use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
+use desktop_assistant_core::error_classify::{
+    ErrorContext, NormalizedCause, cause_to_core_error, classify_builtin,
+};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig,
+    is_classification_in_progress, with_classification_in_progress,
 };
+use desktop_assistant_core::ports::store::ErrorClassificationStore;
+use desktop_assistant_core::sanitize::redact_secrets;
+
+/// Per-process dependencies for the learned (tier 2) and LLM (tier 3) tiers.
+/// Installed once at daemon startup via [`install_classification_deps`];
+/// absent in tests and when no database is configured, in which case only the
+/// deterministic tier-1 matchers run.
+pub struct ClassificationDeps {
+    /// Learned-classification cache (tier 2).
+    pub store: Arc<dyn ErrorClassificationStore>,
+    /// Cheap LLM used to classify genuinely novel errors (tier 3). `None`
+    /// disables tier 3 (tier 2 still runs).
+    pub classifier: Option<Arc<dyn LlmClient>>,
+}
+
+static CLASSIFICATION_DEPS: OnceLock<ClassificationDeps> = OnceLock::new();
+
+/// Install the process-wide classification deps. The first call wins; a later
+/// one is ignored with a warning.
+pub fn install_classification_deps(deps: ClassificationDeps) {
+    if CLASSIFICATION_DEPS.set(deps).is_err() {
+        tracing::warn!("classification deps already installed; ignoring duplicate");
+    }
+}
+
+/// Time budget for a single tier-3 classification call. Mirrors the
+/// embeddings-timeout philosophy (#195): never hang the user's turn on a
+/// best-effort side path — fall back to the original error instead.
+const CLASSIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Minimum length for a learned signature. Below this a substring is too
+/// generic to key future errors on, so tier 3 rejects it and the original
+/// error surfaces.
+const MIN_SIGNATURE_LEN: usize = 8;
 
 /// Wraps an [`LlmClient`] and remaps opaque `CoreError::Llm` errors into the
-/// structured variant the built-in matchers recognize. See module docs.
+/// structured variant the classifier recognizes. See module docs.
 #[derive(Clone)]
 pub struct ClassifyingLlmClient<L> {
     inner: L,
@@ -45,34 +90,176 @@ impl<L> ClassifyingLlmClient<L> {
         }
     }
 
-    /// Remap an opaque `CoreError::Llm` into a structured variant when the
-    /// tier-1 matchers recognize it. `Ok` and already-structured errors pass
-    /// through untouched, and an unrecognized `Llm` error is returned
-    /// verbatim — so behavior is unchanged on a miss.
-    fn reclassify(&self, result: Result<LlmResponse, CoreError>) -> Result<LlmResponse, CoreError> {
-        match result {
-            Err(CoreError::Llm(detail)) => {
-                let cause = classify_builtin(&ErrorContext {
-                    connector: &self.connector,
-                    http_status: None,
-                    provider_code: None,
-                    message: &detail,
-                });
-                match cause_to_core_error(cause, detail.clone()) {
-                    Some(mapped) => {
-                        tracing::info!(
-                            connector = %self.connector,
-                            ?cause,
-                            "classified opaque LLM error into a structured cause"
-                        );
-                        Err(mapped)
-                    }
-                    None => Err(CoreError::Llm(detail)),
-                }
-            }
-            other => other,
+    fn ctx<'a>(&'a self, message: &'a str) -> ErrorContext<'a> {
+        ErrorContext {
+            connector: &self.connector,
+            http_status: None,
+            provider_code: None,
+            message,
         }
     }
+
+    /// Map a recognized cause onto the structured `CoreError`, or surface the
+    /// original opaque error when there is no dedicated variant.
+    fn apply(&self, cause: NormalizedCause, detail: String) -> Result<LlmResponse, CoreError> {
+        match cause_to_core_error(cause, detail.clone()) {
+            Some(mapped) => Err(mapped),
+            None => Err(CoreError::Llm(detail)),
+        }
+    }
+
+    /// Production entry point: reclassify using the process-wide deps.
+    async fn reclassify(
+        &self,
+        result: Result<LlmResponse, CoreError>,
+    ) -> Result<LlmResponse, CoreError> {
+        self.reclassify_with(result, CLASSIFICATION_DEPS.get())
+            .await
+    }
+
+    /// Reclassification with deps injected explicitly (so tests don't touch the
+    /// global `OnceLock`). Tier 1 is pure; tiers 2/3 run only when `deps` is
+    /// present and we're not already inside a classification call.
+    async fn reclassify_with(
+        &self,
+        result: Result<LlmResponse, CoreError>,
+        deps: Option<&ClassificationDeps>,
+    ) -> Result<LlmResponse, CoreError> {
+        let detail = match result {
+            Err(CoreError::Llm(detail)) => detail,
+            other => return other,
+        };
+
+        // Tier 1: deterministic, pure — always safe.
+        let cause = classify_builtin(&self.ctx(&detail));
+        if !matches!(cause, NormalizedCause::Unknown) {
+            return self.apply(cause, detail);
+        }
+
+        // Tiers 2/3 need deps and must not run while we're already classifying
+        // (reentrancy guard) — otherwise the classifier LLM's own errors would
+        // recurse back into classification.
+        if is_classification_in_progress() {
+            return Err(CoreError::Llm(detail));
+        }
+        let Some(deps) = deps else {
+            return Err(CoreError::Llm(detail));
+        };
+
+        // Tier 2: learned cache.
+        if let Ok(Some(learned)) = deps.store.lookup(&self.connector, &detail).await
+            && let Some(c) = NormalizedCause::from_key(&learned.cause)
+        {
+            tracing::info!(
+                connector = %self.connector,
+                cause = %learned.cause,
+                "matched learned error classification (tier 2)"
+            );
+            return self.apply(c, detail);
+        }
+
+        // Tier 3: cheap-LLM classification, then persist for next time.
+        if let Some(classifier) = deps.classifier.as_deref()
+            && let Some((cause, signature)) = self.classify_via_llm(classifier, &detail).await
+        {
+            if let Err(e) = deps
+                .store
+                .record(&self.connector, &signature, cause.as_key())
+                .await
+            {
+                tracing::warn!(error = %e, "failed to persist learned classification");
+            }
+            tracing::info!(
+                connector = %self.connector,
+                ?cause,
+                "classified opaque LLM error via the LLM tier (tier 3)"
+            );
+            return self.apply(cause, detail);
+        }
+
+        Err(CoreError::Llm(detail))
+    }
+
+    /// Tier 3: ask the cheap classifier LLM to label this error. Best-effort:
+    /// secret-scrubbed, time-bounded, and wrapped in the reentrancy guard so
+    /// the classifier's own errors can't recurse. Returns the cause plus a
+    /// signature substring (validated to occur in the original message), or
+    /// `None` on any failure / unusable answer.
+    async fn classify_via_llm(
+        &self,
+        classifier: &dyn LlmClient,
+        detail: &str,
+    ) -> Option<(NormalizedCause, String)> {
+        let prompt = build_classifier_prompt(&self.connector, &redact_secrets(detail));
+        let call = with_classification_in_progress(classifier.stream_completion(
+            vec![Message::new(Role::User, prompt)],
+            &[],
+            ReasoningConfig::default(),
+            Box::new(|_| true),
+        ));
+        let resp = match tokio::time::timeout(CLASSIFY_TIMEOUT, call).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "tier-3 classification LLM call failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!("tier-3 classification timed out");
+                return None;
+            }
+        };
+        parse_classifier_response(&resp.text, detail)
+    }
+}
+
+/// Build the tier-3 classifier prompt. `message` must already be
+/// secret-scrubbed.
+fn build_classifier_prompt(connector: &str, message: &str) -> String {
+    format!(
+        "You classify errors returned by the \"{connector}\" LLM backend so an automated \
+         system can react. Reply with ONLY a JSON object and nothing else:\n\
+         {{\"cause\": \"<one of: context_overflow, rate_limited, billing_fatal, auth, \
+         model_loading, tools_unsupported, transient, unknown>\", \
+         \"signature\": \"<a short distinctive substring copied verbatim from the error that \
+         identifies this class of error>\"}}\n\
+         Use \"billing_fatal\" for quota/billing/credit exhaustion, \"auth\" for \
+         authentication or permission failures, and \"unknown\" if unsure. The signature must \
+         be an exact substring of the error and must not contain secrets.\n\n\
+         Error: {message}"
+    )
+}
+
+/// Parse the tier-3 response into `(cause, signature)`. Rejects `unknown`, a
+/// too-short signature, or a signature that doesn't actually occur in the
+/// original (unredacted) message — which would make the learned entry
+/// unmatchable and risks the LLM inventing an over-broad pattern.
+fn parse_classifier_response(text: &str, original: &str) -> Option<(NormalizedCause, String)> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end < start {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Parsed {
+        cause: String,
+        signature: String,
+    }
+    let parsed: Parsed = serde_json::from_str(text.get(start..=end)?).ok()?;
+
+    let cause = NormalizedCause::from_key(parsed.cause.trim())?;
+    if matches!(cause, NormalizedCause::Unknown) {
+        return None;
+    }
+    let signature = parsed.signature.trim();
+    if signature.len() < MIN_SIGNATURE_LEN
+        || !original
+            .to_ascii_lowercase()
+            .contains(&signature.to_ascii_lowercase())
+    {
+        return None;
+    }
+    Some((cause, signature.to_string()))
 }
 
 #[async_trait::async_trait]
@@ -125,7 +312,7 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
             .inner
             .stream_completion(messages, tools, reasoning, on_chunk)
             .await;
-        self.reclassify(result)
+        self.reclassify(result).await
     }
 
     async fn stream_completion_with_namespaces(
@@ -142,14 +329,14 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
                 messages, core_tools, namespaces, reasoning, on_chunk,
             )
             .await;
-        self.reclassify(result)
+        self.reclassify(result).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use desktop_assistant_core::domain::Role;
+    use desktop_assistant_core::ports::store::LearnedClassification;
     use std::sync::Mutex;
 
     enum Behavior {
@@ -218,6 +405,101 @@ mod tests {
         }
     }
 
+    /// Tier-3 classifier double: returns canned text and counts calls.
+    struct MockClassifier {
+        text: String,
+        ok: bool,
+        calls: Mutex<u32>,
+    }
+    impl MockClassifier {
+        fn ok(text: &str) -> Self {
+            Self {
+                text: text.into(),
+                ok: true,
+                calls: Mutex::new(0),
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                text: String::new(),
+                ok: false,
+                calls: Mutex::new(0),
+            }
+        }
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for MockClassifier {
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+            Ok(vec![])
+        }
+        async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+            Ok(vec![])
+        }
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            *self.calls.lock().unwrap() += 1;
+            if self.ok {
+                Ok(LlmResponse {
+                    text: self.text.clone(),
+                    tool_calls: vec![],
+                    usage: None,
+                })
+            } else {
+                Err(CoreError::Llm("classifier exploded".into()))
+            }
+        }
+        fn supports_hosted_tool_search(&self) -> bool {
+            false
+        }
+    }
+
+    /// Tier-2 store double: a single canned lookup result + a record log.
+    struct MockStore {
+        lookup: Option<LearnedClassification>,
+        recorded: Mutex<Vec<(String, String, String)>>,
+    }
+    impl MockStore {
+        fn new(lookup: Option<LearnedClassification>) -> Self {
+            Self {
+                lookup,
+                recorded: Mutex::new(vec![]),
+            }
+        }
+        fn recorded(&self) -> Vec<(String, String, String)> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl ErrorClassificationStore for MockStore {
+        async fn lookup(
+            &self,
+            _connector: &str,
+            _message: &str,
+        ) -> Result<Option<LearnedClassification>, CoreError> {
+            Ok(self.lookup.clone())
+        }
+        async fn record(
+            &self,
+            connector: &str,
+            signature: &str,
+            cause: &str,
+        ) -> Result<(), CoreError> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push((connector.into(), signature.into(), cause.into()));
+            Ok(())
+        }
+    }
+
     fn wrapped(behavior: Behavior) -> ClassifyingLlmClient<StubClient> {
         ClassifyingLlmClient::new(StubClient::new(behavior), "bedrock")
     }
@@ -231,6 +513,8 @@ mod tests {
         )
         .await
     }
+
+    // --- Tier 1 (no deps) ---
 
     #[tokio::test]
     async fn opaque_overflow_error_is_reclassified() {
@@ -281,8 +565,6 @@ mod tests {
 
     #[tokio::test]
     async fn reclassification_is_single_shot_no_loop() {
-        // The decorator transforms the error once and returns — it must never
-        // re-invoke the inner client (which would risk a loop).
         let c = wrapped(Behavior::ErrLlm(
             "Input length (479258) exceeds model's maximum context length (131072).".into(),
         ));
@@ -296,9 +578,140 @@ mod tests {
 
     #[test]
     fn delegates_max_context_tokens_to_inner() {
-        // Critical: the decorator wraps the connector innermost, so it must
-        // not mask the connector's curated context window (issue #176).
         let c = wrapped(Behavior::Ok);
         assert_eq!(c.max_context_tokens(), Some(131_072));
+    }
+
+    // --- Tier 2 (learned cache) ---
+
+    #[tokio::test]
+    async fn tier2_learned_cache_hit_is_applied() {
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(Some(LearnedClassification {
+                signature: "kaboom".into(),
+                cause: "billing_fatal".into(),
+            }))),
+            classifier: None,
+        };
+        let c = wrapped(Behavior::Ok);
+        let err = c
+            .reclassify_with(
+                Err(CoreError::Llm("novel kaboom happened".into())),
+                Some(&deps),
+            )
+            .await
+            .expect_err("must be an error");
+        assert!(
+            matches!(err, CoreError::QuotaExceeded { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // --- Tier 3 (LLM) ---
+
+    #[tokio::test]
+    async fn tier3_llm_classifies_and_persists() {
+        let classifier = Arc::new(MockClassifier::ok(
+            "{\"cause\": \"billing_fatal\", \"signature\": \"dunning notice\"}",
+        ));
+        let store = Arc::new(MockStore::new(None));
+        let deps = ClassificationDeps {
+            store: store.clone(),
+            classifier: Some(classifier.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let err = c
+            .reclassify_with(
+                Err(CoreError::Llm(
+                    "a mysterious dunning notice from the provider".into(),
+                )),
+                Some(&deps),
+            )
+            .await
+            .expect_err("must be an error");
+        assert!(
+            matches!(err, CoreError::QuotaExceeded { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(classifier.calls(), 1);
+        assert_eq!(
+            store.recorded(),
+            vec![(
+                "bedrock".into(),
+                "dunning notice".into(),
+                "billing_fatal".into()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn tier3_rejects_signature_absent_from_message() {
+        // The LLM hallucinates a signature not present in the error; we must
+        // reject it (no remap, nothing persisted).
+        let classifier = Arc::new(MockClassifier::ok(
+            "{\"cause\": \"billing_fatal\", \"signature\": \"not in the message\"}",
+        ));
+        let store = Arc::new(MockStore::new(None));
+        let deps = ClassificationDeps {
+            store: store.clone(),
+            classifier: Some(classifier.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let err = c
+            .reclassify_with(
+                Err(CoreError::Llm("some opaque failure".into())),
+                Some(&deps),
+            )
+            .await
+            .expect_err("must be an error");
+        assert!(matches!(err, CoreError::Llm(_)), "got {err:?}");
+        assert!(store.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tier3_classifier_failure_surfaces_original_no_loop() {
+        let classifier = Arc::new(MockClassifier::failing());
+        let store = Arc::new(MockStore::new(None));
+        let deps = ClassificationDeps {
+            store: store.clone(),
+            classifier: Some(classifier.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let err = c
+            .reclassify_with(Err(CoreError::Llm("opaque boom".into())), Some(&deps))
+            .await
+            .expect_err("must be an error");
+        match err {
+            CoreError::Llm(s) => assert_eq!(s, "opaque boom"),
+            other => panic!("expected original error, got {other:?}"),
+        }
+        assert_eq!(classifier.calls(), 1, "classifier tried exactly once");
+        assert!(store.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reentrancy_guard_skips_tiers_2_and_3() {
+        // While a classification is in progress, an opaque error must NOT
+        // trigger another cache lookup or LLM call — that is the loop break.
+        let classifier = Arc::new(MockClassifier::ok(
+            "{\"cause\": \"billing_fatal\", \"signature\": \"dunning notice\"}",
+        ));
+        let store = Arc::new(MockStore::new(Some(LearnedClassification {
+            signature: "boom".into(),
+            cause: "billing_fatal".into(),
+        })));
+        let deps = ClassificationDeps {
+            store: store.clone(),
+            classifier: Some(classifier.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let err = with_classification_in_progress(
+            c.reclassify_with(Err(CoreError::Llm("opaque boom".into())), Some(&deps)),
+        )
+        .await
+        .expect_err("must be an error");
+        assert!(matches!(err, CoreError::Llm(_)), "got {err:?}");
+        assert_eq!(classifier.calls(), 0, "tier 3 must be skipped");
+        assert!(store.recorded().is_empty());
     }
 }

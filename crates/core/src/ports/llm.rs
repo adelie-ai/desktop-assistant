@@ -95,6 +95,17 @@ tokio::task_local! {
     /// change on `ConversationService::send_prompt_with_override` or
     /// the connector traits.
     static TOOL_ALLOWLIST: Vec<String>;
+
+    /// Reentrancy guard for the backend-error classifier (epic #178, tier 3).
+    ///
+    /// The classifier's LLM tier calls the cheap task LLM to classify an
+    /// opaque error. That LLM client is itself wrapped by the classifying
+    /// decorator, so if *its* call errors the error would be classified —
+    /// calling the LLM again, and so on. The decorator installs this
+    /// task-local around the classification call; any decorator that sees it
+    /// set skips the learned-cache and LLM tiers (tier 1 still runs), which
+    /// breaks the recursion regardless of how the LLM handles are wired.
+    static CLASSIFICATION_IN_PROGRESS: ();
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -234,6 +245,25 @@ where
 ///   distinct from `None` and the dispatch path must honour it.
 pub fn current_tool_allowlist() -> Option<Vec<String>> {
     TOOL_ALLOWLIST.try_with(|t| t.clone()).ok()
+}
+
+/// Run `fut` with the classification reentrancy guard installed. See
+/// [`CLASSIFICATION_IN_PROGRESS`]. Used by the classifier's LLM tier to wrap
+/// its own LLM call so the result can't be recursively classified.
+pub async fn with_classification_in_progress<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CLASSIFICATION_IN_PROGRESS.scope((), fut).await
+}
+
+/// Whether the current task is already inside a classification LLM call.
+/// Decorators consult this and skip the learned-cache/LLM tiers when set,
+/// so a classification call's own errors never trigger another round.
+pub fn is_classification_in_progress() -> bool {
+    CLASSIFICATION_IN_PROGRESS
+        .try_with(|_| true)
+        .unwrap_or(false)
 }
 
 /// Reasoning / extended-thinking level for a single LLM turn.
