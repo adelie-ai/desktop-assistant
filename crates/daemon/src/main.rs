@@ -949,12 +949,51 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Background-task registry (#111/#115). Constructed BEFORE the scratchpad
+    // wiring below so the scratchpad mutating closures can notify subscribed
+    // connections via `Event::ScratchpadChanged` (#190). Attaches a Postgres-
+    // backed store when a pool is available, then runs the cold-restart sweep
+    // (marks non-terminal rows `Failed` so the user observes them via `list`).
+    let background_task_registry = {
+        let registry =
+            desktop_assistant_application::background_tasks::BackgroundTaskRegistry::new();
+        if let Some(pool) = &pg_pool {
+            let store: std::sync::Arc<
+                dyn desktop_assistant_core::ports::store::BackgroundTaskStore,
+            > = std::sync::Arc::new(desktop_assistant_storage::PgBackgroundTaskStore::new(
+                pool.clone(),
+            ));
+            let registry = registry.with_store(store);
+            if let Err(e) = registry.sweep_non_terminal_on_startup().await {
+                tracing::warn!(
+                    error = %e,
+                    "cold-restart sweep of background tasks failed; continuing",
+                );
+            }
+            Arc::new(registry)
+        } else {
+            Arc::new(registry)
+        }
+    };
+
     // Reader for the reserved scratchpad `goal` note, wired into the
     // conversation handler below so the evolving goal is surfaced as the task
     // anchor each turn. Populated only when a Postgres pool is available.
     let mut scratchpad_goal_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn,
     > = None;
+
+    // Per-conversation scratchpad command closures (#190) for the API handler,
+    // populated alongside the builtin-tool wiring below. The same emit-wrapped
+    // closures the builtin tools get, so a mutation via either path notifies.
+    type SpHandlerFns = (
+        desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn,
+        desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn,
+        desktop_assistant_core::ports::scratchpad::ScratchpadListFn,
+        desktop_assistant_core::ports::scratchpad::ScratchpadDeleteManyFn,
+        desktop_assistant_core::ports::scratchpad::ScratchpadClearFn,
+    );
+    let mut scratchpad_handler_fns: Option<SpHandlerFns> = None;
 
     if let Some(pool) = &pg_pool {
         tracing::info!("wiring database query into builtin tools");
@@ -984,27 +1023,43 @@ async fn main() -> Result<()> {
             pool.clone(),
         ));
         tracing::info!("wiring scratchpad store into builtin tools");
-        let (sp_w, sp_g, sp_l, sp_s, sp_d, sp_c) = (
-            Arc::clone(&sp_store),
-            Arc::clone(&sp_store),
-            Arc::clone(&sp_store),
-            Arc::clone(&sp_store),
-            Arc::clone(&sp_store),
-            Arc::clone(&sp_store),
-        );
-        builtin_tools = builtin_tools.with_scratchpad(
-            Arc::new(move |conv, notes| {
-                let store = Arc::clone(&sp_w);
-                Box::pin(async move { store.write(&conv, &notes).await })
-            }),
-            Arc::new(move |conv, keys, limit| {
-                let store = Arc::clone(&sp_g);
-                Box::pin(async move { store.get_many(&conv, &keys, limit).await })
-            }),
-            Arc::new(move |conv, note_type: Option<String>, limit| {
-                let store = Arc::clone(&sp_l);
-                Box::pin(async move { store.list(&conv, note_type.as_deref(), limit).await })
-            }),
+        use desktop_assistant_core::ports::auth::current_user_id;
+        use desktop_assistant_core::ports::scratchpad::{
+            ScratchpadClearFn, ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn,
+            ScratchpadSearchFn, ScratchpadWriteFn,
+        };
+
+        // The mutating closures (write / delete_many / clear) notify subscribed
+        // connections after a successful change via `Event::ScratchpadChanged`,
+        // reading the per-turn / per-command `current_user_id()`. The SAME
+        // closures back both the builtin tools (Adele's writes) and the API
+        // handler (client writes), so a change from either path emits once.
+        let sp_w = Arc::clone(&sp_store);
+        let reg_w = Arc::clone(&background_task_registry);
+        let write_fn: ScratchpadWriteFn = Arc::new(move |conv: String, notes| {
+            let store = Arc::clone(&sp_w);
+            let reg = Arc::clone(&reg_w);
+            Box::pin(async move {
+                let saved = store.write(&conv, &notes).await?;
+                reg.notify_scratchpad_changed(&current_user_id(), conv);
+                Ok(saved)
+            })
+        });
+
+        let sp_g = Arc::clone(&sp_store);
+        let get_many_fn: ScratchpadGetManyFn = Arc::new(move |conv, keys, limit| {
+            let store = Arc::clone(&sp_g);
+            Box::pin(async move { store.get_many(&conv, &keys, limit).await })
+        });
+
+        let sp_l = Arc::clone(&sp_store);
+        let list_fn: ScratchpadListFn = Arc::new(move |conv, note_type: Option<String>, limit| {
+            let store = Arc::clone(&sp_l);
+            Box::pin(async move { store.list(&conv, note_type.as_deref(), limit).await })
+        });
+
+        let sp_s = Arc::clone(&sp_store);
+        let search_fn: ScratchpadSearchFn =
             Arc::new(move |conv, query, note_type: Option<String>, limit| {
                 let store = Arc::clone(&sp_s);
                 Box::pin(async move {
@@ -1012,24 +1067,54 @@ async fn main() -> Result<()> {
                         .search(&conv, &query, note_type.as_deref(), limit)
                         .await
                 })
-            }),
-            Arc::new(move |conv, keys| {
-                let store = Arc::clone(&sp_d);
-                Box::pin(async move { store.delete_many(&conv, &keys).await })
-            }),
-            Arc::new(move |conv| {
-                let store = Arc::clone(&sp_c);
-                Box::pin(async move { store.clear(&conv).await })
-            }),
+            });
+
+        let sp_d = Arc::clone(&sp_store);
+        let reg_d = Arc::clone(&background_task_registry);
+        let delete_many_fn: ScratchpadDeleteManyFn = Arc::new(move |conv: String, keys| {
+            let store = Arc::clone(&sp_d);
+            let reg = Arc::clone(&reg_d);
+            Box::pin(async move {
+                let deleted = store.delete_many(&conv, &keys).await?;
+                reg.notify_scratchpad_changed(&current_user_id(), conv);
+                Ok(deleted)
+            })
+        });
+
+        let sp_c = Arc::clone(&sp_store);
+        let reg_c = Arc::clone(&background_task_registry);
+        let clear_fn: ScratchpadClearFn = Arc::new(move |conv: String| {
+            let store = Arc::clone(&sp_c);
+            let reg = Arc::clone(&reg_c);
+            Box::pin(async move {
+                let deleted = store.clear(&conv).await?;
+                reg.notify_scratchpad_changed(&current_user_id(), conv);
+                Ok(deleted)
+            })
+        });
+
+        builtin_tools = builtin_tools.with_scratchpad(
+            Arc::clone(&write_fn),
+            Arc::clone(&get_many_fn),
+            Arc::clone(&list_fn),
+            search_fn,
+            Arc::clone(&delete_many_fn),
+            Arc::clone(&clear_fn),
         );
+
+        // Hand the same (emit-wrapped) closures to the API handler so clients
+        // can read/write/delete the scratchpad over the command channel (#190).
+        scratchpad_handler_fns = Some((
+            write_fn,
+            Arc::clone(&get_many_fn),
+            list_fn,
+            delete_many_fn,
+            clear_fn,
+        ));
 
         // Reader for the reserved goal note (a bounded single-key fetch),
         // consumed by `ConversationHandler::with_scratchpad_goal` below.
-        let sp_goal = Arc::clone(&sp_store);
-        scratchpad_goal_fn = Some(Arc::new(move |conv, keys, limit| {
-            let store = Arc::clone(&sp_goal);
-            Box::pin(async move { store.get_many(&conv, &keys, limit).await })
-        }));
+        scratchpad_goal_fn = Some(get_many_fn);
     }
 
     if let Some(tr) = &tool_registry_store {
@@ -1478,51 +1563,25 @@ async fn main() -> Result<()> {
     // adapters can share it (the multi-connection D-Bus interface dispatches
     // through this handler, mirroring the WS adapter).
     //
-    // The handler is wired with a shared [`BackgroundTaskRegistry`] so
-    // foreground turns register as `TaskKind::Conversation` tasks
-    // (#111). #114 will surface the same registry through the
-    // ListBackgroundTasks / CancelBackgroundTask command arms; until
-    // then it powers the existing send path's cancellation hook.
-    //
-    // Issue #115: when a Postgres pool is available, attach a
-    // `PgBackgroundTaskStore` so spawned tasks survive a daemon
-    // restart. The cold-restart sweep marks every non-terminal row
-    // `Failed` immediately after construction so the user observes
-    // them via the existing `list` path instead of silently losing
-    // them. The sweep is best-effort — see the issue body for the
-    // resume policy; #129 will replace the standalone branch with a
-    // real resume.
-    let background_task_registry = {
-        let registry =
-            desktop_assistant_application::background_tasks::BackgroundTaskRegistry::new();
-        if let Some(pool) = &pg_pool {
-            let store: std::sync::Arc<
-                dyn desktop_assistant_core::ports::store::BackgroundTaskStore,
-            > = std::sync::Arc::new(desktop_assistant_storage::PgBackgroundTaskStore::new(
-                pool.clone(),
-            ));
-            let registry = registry.with_store(store);
-            if let Err(e) = registry.sweep_non_terminal_on_startup().await {
-                tracing::warn!(
-                    error = %e,
-                    "cold-restart sweep of background tasks failed; continuing",
-                );
-            }
-            Arc::new(registry)
-        } else {
-            Arc::new(registry)
-        }
-    };
-    let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> = Arc::new(
-        DefaultAssistantApiHandler::new(
-            Arc::new(Assistant),
-            Arc::clone(&conversation_service),
-            Arc::clone(&settings_service),
-            Arc::clone(&connections_service),
-            Arc::clone(&knowledge_service),
-        )
-        .with_registry(Arc::clone(&background_task_registry)),
-    );
+    // The handler is wired with the shared [`BackgroundTaskRegistry`]
+    // (constructed earlier, before the scratchpad wiring) so foreground turns
+    // register as `TaskKind::Conversation` tasks (#111), and — when a Postgres
+    // pool is available — with the per-conversation scratchpad command closures
+    // (#190) so clients can read/write/delete a conversation's notes.
+    let mut api_handler_impl = DefaultAssistantApiHandler::new(
+        Arc::new(Assistant),
+        Arc::clone(&conversation_service),
+        Arc::clone(&settings_service),
+        Arc::clone(&connections_service),
+        Arc::clone(&knowledge_service),
+    )
+    .with_registry(Arc::clone(&background_task_registry));
+    if let Some((write, get_many, list, delete_many, clear)) = scratchpad_handler_fns {
+        api_handler_impl =
+            api_handler_impl.with_scratchpad(write, get_many, list, delete_many, clear);
+    }
+    let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
+        Arc::new(api_handler_impl);
 
     let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()

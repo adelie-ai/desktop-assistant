@@ -534,6 +534,20 @@ impl BackgroundTaskRegistry {
         sender.subscribe()
     }
 
+    /// Notify a user's subscribed connections that a conversation's scratchpad
+    /// changed (#190), reusing the same per-user broadcast the `Task*` events
+    /// ride. Typed so callers (e.g. the daemon's scratchpad closures) don't
+    /// depend on `api-model` to construct the event. Best-effort: dropped if no
+    /// connection for the user is currently subscribed.
+    pub fn notify_scratchpad_changed(&self, user_id: &UserId, conversation_id: impl Into<String>) {
+        self.inner.broadcast(
+            user_id,
+            api::Event::ScratchpadChanged {
+                conversation_id: conversation_id.into(),
+            },
+        );
+    }
+
     /// Append a log entry to `id`'s log ring from outside the task's
     /// body. Used by callers that produce events on behalf of a task
     /// they don't own the body of — for example, the `spawn_subagent`
@@ -1077,6 +1091,45 @@ fn db_status_to_api(s: BackgroundTaskStatus) -> api::TaskStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn notify_scratchpad_changed_reaches_subscribers() {
+        // #190: scratchpad mutations ride the same per-user broadcast as the
+        // Task* events, so a subscribed connection observes the change.
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
+
+        registry.notify_scratchpad_changed(&user, "conv-1");
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::ScratchpadChanged { conversation_id })) => {
+                assert_eq!(conversation_id, "conv-1");
+            }
+            other => panic!("expected ScratchpadChanged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_scratchpad_changed_is_user_scoped() {
+        let registry = BackgroundTaskRegistry::new();
+        let alice = UserId::new("alice");
+        let bob = UserId::new("bob");
+        let mut alice_events = registry.subscribe(&alice);
+        let mut bob_events = registry.subscribe(&bob);
+
+        registry.notify_scratchpad_changed(&alice, "conv-1");
+
+        // Alice receives it; bob's channel has nothing pending.
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), alice_events.recv()).await,
+            Ok(Ok(api::Event::ScratchpadChanged { .. }))
+        ));
+        assert!(
+            bob_events.try_recv().is_err(),
+            "bob must not receive alice's scratchpad event"
+        );
+    }
 
     #[tokio::test]
     async fn finalize_sets_failed_on_error() {

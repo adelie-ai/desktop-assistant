@@ -255,6 +255,9 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             status,
             last_error,
         }),
+        api::Event::ScratchpadChanged { conversation_id } => {
+            Some(SignalEvent::ScratchpadChanged { conversation_id })
+        }
         // Client-side tool execution (#107): handled by clients that
         // implement the client-tool protocol directly; the legacy
         // `SignalEvent` stream is for the GTK desktop UI and does not
@@ -385,6 +388,19 @@ mod tests {
                 assert_eq!(last_error.as_deref(), Some("LLM rate limit"));
             }
             other => panic!("expected SignalEvent::TaskCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_scratchpad_changed_event() {
+        let signal = map_event_to_signal(api::Event::ScratchpadChanged {
+            conversation_id: "c-1".into(),
+        });
+        match signal {
+            Some(SignalEvent::ScratchpadChanged { conversation_id }) => {
+                assert_eq!(conversation_id, "c-1");
+            }
+            other => panic!("expected SignalEvent::ScratchpadChanged, got {other:?}"),
         }
     }
 

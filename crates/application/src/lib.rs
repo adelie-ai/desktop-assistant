@@ -11,12 +11,16 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 pub use desktop_assistant_auth_jwt::UserId;
-use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::domain::{DEFAULT_NOTE_TYPE, KnowledgeEntry, ScratchpadNote};
 use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
     ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
     PromptSelectionOverride, PurposeConfigPayload, SettingsService,
+};
+use desktop_assistant_core::ports::scratchpad::{
+    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
+    ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -285,6 +289,16 @@ where
     /// turn body spawns through the registry so the user has a Cancel
     /// button to trip and the process-manager UI has something to show.
     registry: Option<Arc<BackgroundTaskRegistry>>,
+    /// Optional per-conversation scratchpad closures (#190) so clients can
+    /// read/write/delete a conversation's notes. Threaded as closures (not a
+    /// `dyn ScratchpadStore`, which isn't object-safe). When `None`, the
+    /// scratchpad commands return a clear "not configured" error. The daemon
+    /// wraps the mutating closures so each emits `Event::ScratchpadChanged`.
+    scratchpad_write: Option<ScratchpadWriteFn>,
+    scratchpad_get_many: Option<ScratchpadGetManyFn>,
+    scratchpad_list: Option<ScratchpadListFn>,
+    scratchpad_delete_many: Option<ScratchpadDeleteManyFn>,
+    scratchpad_clear: Option<ScratchpadClearFn>,
 }
 
 impl<A, C, S, N, K> DefaultAssistantApiHandler<A, C, S, N, K>
@@ -309,7 +323,32 @@ where
             connections,
             knowledge,
             registry: None,
+            scratchpad_write: None,
+            scratchpad_get_many: None,
+            scratchpad_list: None,
+            scratchpad_delete_many: None,
+            scratchpad_clear: None,
         }
+    }
+
+    /// Attach the per-conversation scratchpad closures (#190) so the
+    /// `GetConversationScratchpad` / `SetScratchpadNote` / `DeleteScratchpadNotes`
+    /// commands are served. The daemon passes the same store-backed closures the
+    /// builtin tools use (with mutating ones wrapped to emit `ScratchpadChanged`).
+    pub fn with_scratchpad(
+        mut self,
+        write: ScratchpadWriteFn,
+        get_many: ScratchpadGetManyFn,
+        list: ScratchpadListFn,
+        delete_many: ScratchpadDeleteManyFn,
+        clear: ScratchpadClearFn,
+    ) -> Self {
+        self.scratchpad_write = Some(write);
+        self.scratchpad_get_many = Some(get_many);
+        self.scratchpad_list = Some(list);
+        self.scratchpad_delete_many = Some(delete_many);
+        self.scratchpad_clear = Some(clear);
+        self
     }
 
     /// Attach a [`BackgroundTaskRegistry`] so foreground send-message
@@ -603,6 +642,18 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
         metadata: e.metadata,
         created_at: e.created_at,
         updated_at: e.updated_at,
+    }
+}
+
+fn scratchpad_note_to_view(n: ScratchpadNote) -> api::ScratchpadNoteView {
+    api::ScratchpadNoteView {
+        id: n.id,
+        key: n.key,
+        content: n.content,
+        note_type: n.note_type,
+        sequence: n.sequence,
+        done: n.done,
+        updated_at: n.updated_at,
     }
 }
 
@@ -1196,6 +1247,107 @@ where
             // "feature not enabled" instead of silently dropping the
             // command. The wrapping handler in this crate's
             // `client_tools` module is the supported path.
+            // Conversation scratchpad (issue #190). User scope is already
+            // installed by the dispatcher's `with_user_id`, so the closures
+            // (which read `current_user_id()`) are automatically scoped to the
+            // connection's user and the requested conversation — no extra
+            // scoping here. Mutations emit `Event::ScratchpadChanged` from the
+            // daemon-wrapped closures.
+            api::Command::GetConversationScratchpad {
+                conversation_id,
+                max_results,
+            } => {
+                let list = self
+                    .scratchpad_list
+                    .as_ref()
+                    .ok_or_else(|| ApiError::Core("scratchpad not configured".to_string()))?;
+                let limit = max_results
+                    .map(|n| (n as usize).min(MAX_RESULTS_CEILING))
+                    .unwrap_or(MAX_RESULTS_CEILING);
+                let notes = list(conversation_id, None, limit)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Scratchpad(
+                    notes.into_iter().map(scratchpad_note_to_view).collect(),
+                ))
+            }
+            api::Command::SetScratchpadNote {
+                conversation_id,
+                key,
+                content,
+                note_type,
+                sequence,
+                done,
+            } => {
+                let write = self
+                    .scratchpad_write
+                    .as_ref()
+                    .ok_or_else(|| ApiError::Core("scratchpad not configured".to_string()))?;
+                // Bound the write like the builtin tool path: non-empty key,
+                // content within the per-note byte cap — clients must not be
+                // able to write unbounded notes (#190).
+                let key = key.trim().to_string();
+                if key.is_empty() {
+                    return Err(ApiError::Core(
+                        "scratchpad note key must not be empty".to_string(),
+                    ));
+                }
+                if content.len() > MAX_NOTE_BYTES {
+                    return Err(ApiError::Core(format!(
+                        "scratchpad note content exceeds {MAX_NOTE_BYTES} bytes"
+                    )));
+                }
+                let note_type = if note_type.trim().is_empty() {
+                    DEFAULT_NOTE_TYPE.to_string()
+                } else {
+                    note_type
+                };
+                let saved = write(
+                    conversation_id,
+                    vec![NewScratchpadNote {
+                        key,
+                        content,
+                        note_type,
+                        sequence,
+                        done,
+                    }],
+                )
+                .await
+                .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Scratchpad(
+                    saved.into_iter().map(scratchpad_note_to_view).collect(),
+                ))
+            }
+            api::Command::DeleteScratchpadNotes {
+                conversation_id,
+                keys,
+                all,
+            } => {
+                if all {
+                    let clear = self
+                        .scratchpad_clear
+                        .as_ref()
+                        .ok_or_else(|| ApiError::Core("scratchpad not configured".to_string()))?;
+                    clear(conversation_id).await.map_err(Self::map_core_err)?;
+                } else {
+                    // Bound the key list so one command can't issue an
+                    // unbounded delete (#190).
+                    if keys.len() > MAX_KEYS_PER_CALL {
+                        return Err(ApiError::Core(format!(
+                            "too many keys (max {MAX_KEYS_PER_CALL})"
+                        )));
+                    }
+                    let delete_many = self
+                        .scratchpad_delete_many
+                        .as_ref()
+                        .ok_or_else(|| ApiError::Core("scratchpad not configured".to_string()))?;
+                    delete_many(conversation_id, keys)
+                        .await
+                        .map_err(Self::map_core_err)?;
+                }
+                Ok(api::CommandResult::Ack)
+            }
+
             api::Command::RegisterClientTools { .. } | api::Command::ClientToolResult { .. } => {
                 Err(ApiError::Unsupported)
             }
@@ -2393,6 +2545,371 @@ mod tests {
                 value: "pong".into()
             }
         );
+    }
+
+    // --- Conversation scratchpad commands (issue #190) --------------------
+
+    /// In-memory scratchpad behind the five handler closures, scoped by
+    /// `current_user_id()` exactly like the real `PgScratchpadStore`, so the
+    /// command handlers can be exercised (incl. cross-tenant isolation) without
+    /// Postgres. There is no reusable in-memory `ScratchpadStore` to borrow.
+    #[allow(clippy::type_complexity)]
+    fn in_memory_scratchpad() -> (
+        ScratchpadWriteFn,
+        ScratchpadGetManyFn,
+        ScratchpadListFn,
+        ScratchpadDeleteManyFn,
+        ScratchpadClearFn,
+    ) {
+        use desktop_assistant_core::ports::auth::current_user_id;
+        type Store = Arc<Mutex<Vec<(String, ScratchpadNote)>>>;
+        let store: Store = Arc::new(Mutex::new(Vec::new()));
+
+        let w = Arc::clone(&store);
+        let write: ScratchpadWriteFn =
+            Arc::new(move |conv: String, notes: Vec<NewScratchpadNote>| {
+                let store = Arc::clone(&w);
+                Box::pin(async move {
+                    let user = current_user_id().as_str().to_string();
+                    let mut guard = store.lock().unwrap();
+                    let mut saved = Vec::new();
+                    for (i, n) in notes.into_iter().enumerate() {
+                        if let Some((_, existing)) = guard.iter_mut().find(|(u, e)| {
+                            *u == user && e.conversation_id == conv && e.key == n.key
+                        }) {
+                            existing.content = n.content;
+                            existing.note_type = n.note_type;
+                            existing.sequence = n.sequence;
+                            existing.done = n.done;
+                            existing.updated_at = "t".into();
+                            saved.push(existing.clone());
+                        } else {
+                            let mut note =
+                                ScratchpadNote::new(format!("id-{i}"), &conv, &n.key, &n.content);
+                            note.note_type = n.note_type;
+                            note.sequence = n.sequence;
+                            note.done = n.done;
+                            note.updated_at = "t".into();
+                            guard.push((user.clone(), note.clone()));
+                            saved.push(note);
+                        }
+                    }
+                    Ok(saved)
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = Result<Vec<ScratchpadNote>, CoreError>>
+                                + Send,
+                        >,
+                    >
+            });
+
+        let g = Arc::clone(&store);
+        let get_many: ScratchpadGetManyFn =
+            Arc::new(move |conv: String, keys: Vec<String>, limit| {
+                let store = Arc::clone(&g);
+                Box::pin(async move {
+                    let user = current_user_id().as_str().to_string();
+                    let guard = store.lock().unwrap();
+                    Ok(guard
+                        .iter()
+                        .filter(|(u, n)| {
+                            *u == user && n.conversation_id == conv && keys.contains(&n.key)
+                        })
+                        .take(limit)
+                        .map(|(_, n)| n.clone())
+                        .collect())
+                })
+            });
+
+        let l = Arc::clone(&store);
+        let list: ScratchpadListFn =
+            Arc::new(move |conv: String, note_type: Option<String>, limit| {
+                let store = Arc::clone(&l);
+                Box::pin(async move {
+                    let user = current_user_id().as_str().to_string();
+                    let guard = store.lock().unwrap();
+                    Ok(guard
+                        .iter()
+                        .filter(|(u, n)| {
+                            *u == user
+                                && n.conversation_id == conv
+                                && note_type.as_deref().is_none_or(|t| n.note_type == t)
+                        })
+                        .take(limit)
+                        .map(|(_, n)| n.clone())
+                        .collect())
+                })
+            });
+
+        let d = Arc::clone(&store);
+        let delete_many: ScratchpadDeleteManyFn =
+            Arc::new(move |conv: String, keys: Vec<String>| {
+                let store = Arc::clone(&d);
+                Box::pin(async move {
+                    let user = current_user_id().as_str().to_string();
+                    let mut guard = store.lock().unwrap();
+                    let before = guard.len();
+                    guard.retain(|(u, n)| {
+                        !(*u == user && n.conversation_id == conv && keys.contains(&n.key))
+                    });
+                    Ok((before - guard.len()) as u64)
+                })
+            });
+
+        let c = Arc::clone(&store);
+        let clear: ScratchpadClearFn = Arc::new(move |conv: String| {
+            let store = Arc::clone(&c);
+            Box::pin(async move {
+                let user = current_user_id().as_str().to_string();
+                let mut guard = store.lock().unwrap();
+                let before = guard.len();
+                guard.retain(|(u, n)| !(*u == user && n.conversation_id == conv));
+                Ok((before - guard.len()) as u64)
+            })
+        });
+
+        (write, get_many, list, delete_many, clear)
+    }
+
+    fn scratchpad_handler() -> DefaultAssistantApiHandler<
+        FakeAssistant,
+        FakeConversations,
+        FakeSettings,
+        FakeConnections,
+        FakeKnowledge,
+    > {
+        let (write, get_many, list, delete_many, clear) = in_memory_scratchpad();
+        DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_scratchpad(write, get_many, list, delete_many, clear)
+    }
+
+    #[tokio::test]
+    async fn scratchpad_set_get_delete_roundtrip() {
+        let h = scratchpad_handler();
+        let ctx = || RequestContext::from(UserId::new("alice"));
+
+        // Upsert a todo.
+        let res = h
+            .handle_command_for(
+                ctx(),
+                api::Command::SetScratchpadNote {
+                    conversation_id: "c1".into(),
+                    key: "t1".into(),
+                    content: "wire it".into(),
+                    note_type: "todo".into(),
+                    sequence: Some(1),
+                    done: false,
+                },
+            )
+            .await
+            .unwrap();
+        let api::CommandResult::Scratchpad(saved) = res else {
+            panic!("expected Scratchpad");
+        };
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].note_type, "todo");
+        assert_eq!(saved[0].sequence, Some(1));
+
+        // Read it back.
+        let api::CommandResult::Scratchpad(notes) = h
+            .handle_command_for(
+                ctx(),
+                api::Command::GetConversationScratchpad {
+                    conversation_id: "c1".into(),
+                    max_results: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Scratchpad");
+        };
+        assert_eq!(notes.len(), 1);
+        assert!(!notes[0].done);
+
+        // Check it off by re-writing the same key.
+        h.handle_command_for(
+            ctx(),
+            api::Command::SetScratchpadNote {
+                conversation_id: "c1".into(),
+                key: "t1".into(),
+                content: "wire it".into(),
+                note_type: "todo".into(),
+                sequence: Some(1),
+                done: true,
+            },
+        )
+        .await
+        .unwrap();
+        let api::CommandResult::Scratchpad(notes) = h
+            .handle_command_for(
+                ctx(),
+                api::Command::GetConversationScratchpad {
+                    conversation_id: "c1".into(),
+                    max_results: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Scratchpad");
+        };
+        assert_eq!(notes.len(), 1, "re-write upserts, not duplicates");
+        assert!(notes[0].done);
+
+        // Delete it.
+        let res = h
+            .handle_command_for(
+                ctx(),
+                api::Command::DeleteScratchpadNotes {
+                    conversation_id: "c1".into(),
+                    keys: vec!["t1".into()],
+                    all: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res, api::CommandResult::Ack);
+        let api::CommandResult::Scratchpad(notes) = h
+            .handle_command_for(
+                ctx(),
+                api::Command::GetConversationScratchpad {
+                    conversation_id: "c1".into(),
+                    max_results: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Scratchpad");
+        };
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scratchpad_commands_are_user_scoped() {
+        let h = scratchpad_handler();
+
+        // Alice writes a note to conversation c1.
+        h.handle_command_for(
+            RequestContext::from(UserId::new("alice")),
+            api::Command::SetScratchpadNote {
+                conversation_id: "c1".into(),
+                key: "goal".into(),
+                content: "alice secret".into(),
+                note_type: String::new(),
+                sequence: None,
+                done: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Bob, asking for the same conversation_id, sees nothing.
+        let api::CommandResult::Scratchpad(notes) = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("bob")),
+                api::Command::GetConversationScratchpad {
+                    conversation_id: "c1".into(),
+                    max_results: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Scratchpad");
+        };
+        assert!(notes.is_empty(), "bob must not read alice's pad");
+
+        // Bob clearing the pad must not touch alice's note.
+        h.handle_command_for(
+            RequestContext::from(UserId::new("bob")),
+            api::Command::DeleteScratchpadNotes {
+                conversation_id: "c1".into(),
+                keys: vec![],
+                all: true,
+            },
+        )
+        .await
+        .unwrap();
+        let api::CommandResult::Scratchpad(notes) = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::GetConversationScratchpad {
+                    conversation_id: "c1".into(),
+                    max_results: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Scratchpad");
+        };
+        assert_eq!(notes.len(), 1, "alice's note survives bob's clear");
+        // Empty note_type defaults to the canonical default.
+        assert_eq!(notes[0].note_type, DEFAULT_NOTE_TYPE);
+    }
+
+    #[tokio::test]
+    async fn scratchpad_command_without_closures_errors() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+        let res = h
+            .handle_command(api::Command::GetConversationScratchpad {
+                conversation_id: "c1".into(),
+                max_results: None,
+            })
+            .await;
+        assert!(
+            matches!(&res, Err(ApiError::Core(m)) if m.contains("not configured")),
+            "expected not-configured error, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_set_rejects_empty_key_and_oversize_content() {
+        let h = scratchpad_handler();
+        let empty_key = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::SetScratchpadNote {
+                    conversation_id: "c1".into(),
+                    key: "   ".into(),
+                    content: "x".into(),
+                    note_type: String::new(),
+                    sequence: None,
+                    done: false,
+                },
+            )
+            .await;
+        assert!(matches!(&empty_key, Err(ApiError::Core(m)) if m.contains("must not be empty")));
+
+        let oversize = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::SetScratchpadNote {
+                    conversation_id: "c1".into(),
+                    key: "big".into(),
+                    content: "x".repeat(MAX_NOTE_BYTES + 1),
+                    note_type: String::new(),
+                    sequence: None,
+                    done: false,
+                },
+            )
+            .await;
+        assert!(matches!(&oversize, Err(ApiError::Core(m)) if m.contains("exceeds")));
     }
 
     #[tokio::test]
