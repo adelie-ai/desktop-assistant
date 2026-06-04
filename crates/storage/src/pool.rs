@@ -149,5 +149,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Conversation scratchpad (issue #184) — ephemeral per-conversation
+    // keyed notes, cascade-deleted with the conversation, with an FTS column.
+    sqlx::raw_sql(include_str!("../migrations/019_scratchpads.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }

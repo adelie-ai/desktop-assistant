@@ -5,6 +5,7 @@ pub enum PromptSectionKind {
     Identity,
     SafetyAndPlanning,
     KnowledgeBase,
+    Scratchpad,
     Database,
     Learning,
     ToolUse,
@@ -33,6 +34,7 @@ impl PromptSection {
 const SECTION_IDENTITY: &str = include_str!("sections/identity.txt");
 const SECTION_SAFETY_AND_PLANNING: &str = include_str!("sections/safety_and_planning.txt");
 const SECTION_KNOWLEDGE_BASE: &str = include_str!("sections/knowledge_base.txt");
+const SECTION_SCRATCHPAD: &str = include_str!("sections/scratchpad.txt");
 const SECTION_DATABASE: &str = include_str!("sections/database.txt");
 const SECTION_LEARNING: &str = include_str!("sections/learning.txt");
 const SECTION_TOOL_USE: &str = include_str!("sections/tool_use.txt");
@@ -46,6 +48,7 @@ pub fn static_sections() -> Vec<PromptSection> {
             SECTION_SAFETY_AND_PLANNING,
         ),
         PromptSection::new(PromptSectionKind::KnowledgeBase, SECTION_KNOWLEDGE_BASE),
+        PromptSection::new(PromptSectionKind::Scratchpad, SECTION_SCRATCHPAD),
         PromptSection::new(PromptSectionKind::Database, SECTION_DATABASE),
         PromptSection::new(PromptSectionKind::Learning, SECTION_LEARNING),
         PromptSection::new(PromptSectionKind::ToolUse, SECTION_TOOL_USE),
@@ -79,7 +82,7 @@ mod tests {
 
     #[test]
     fn static_sections_count() {
-        assert_eq!(static_sections().len(), 6);
+        assert_eq!(static_sections().len(), 7);
     }
 
     #[test]
@@ -88,8 +91,22 @@ mod tests {
         assert_eq!(sections[0].kind, PromptSectionKind::Identity);
         assert_eq!(sections[1].kind, PromptSectionKind::SafetyAndPlanning);
         assert_eq!(sections[2].kind, PromptSectionKind::KnowledgeBase);
-        assert_eq!(sections[3].kind, PromptSectionKind::Database);
-        assert_eq!(sections[4].kind, PromptSectionKind::Learning);
-        assert_eq!(sections[5].kind, PromptSectionKind::ToolUse);
+        assert_eq!(sections[3].kind, PromptSectionKind::Scratchpad);
+        assert_eq!(sections[4].kind, PromptSectionKind::Database);
+        assert_eq!(sections[5].kind, PromptSectionKind::Learning);
+        assert_eq!(sections[6].kind, PromptSectionKind::ToolUse);
+    }
+
+    #[test]
+    fn assembled_prompt_advertises_scratchpad_tools() {
+        // The scratchpad must be advertised in the always-present system prompt
+        // so the model knows the tools exist (#184).
+        let assembled = assemble(&static_sections());
+        assert!(assembled.contains("== Scratchpad =="));
+        assert!(assembled.contains("builtin_scratchpad_write"));
+        assert!(assembled.contains("builtin_scratchpad_search"));
+        assert!(assembled.contains("builtin_scratchpad_delete"));
+        // The reserved goal note must be called out.
+        assert!(assembled.contains("\"goal\""));
     }
 }

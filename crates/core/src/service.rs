@@ -6,11 +6,13 @@ use crate::context::{
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition, ToolNamespace,
 };
+use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget,
 };
+use crate::ports::scratchpad::{SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
@@ -155,6 +157,12 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// stored one. The hash covers tool names AND descriptions, so any
     /// edit to either triggers a fresh categorization.
     namespace_cache: std::sync::Mutex<Option<(u64, Vec<ToolNamespace>)>>,
+    /// Optional reader for the reserved scratchpad `goal` note. When set, the
+    /// dispatch loop reads it each round and prefers it over the verbatim
+    /// user prompt as the task anchor, so a model-maintained goal survives
+    /// windowing/compaction. `None` (the default) preserves the prior
+    /// verbatim-prompt-only anchor behaviour.
+    scratchpad_goal_read: Option<ScratchpadGetManyFn>,
 }
 
 impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
@@ -166,6 +174,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             tools: NoopToolExecutor,
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
+            scratchpad_goal_read: None,
         }
     }
 }
@@ -184,6 +193,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             tools,
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
+            scratchpad_goal_read: None,
         }
     }
 
@@ -191,6 +201,16 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// Falls back to the primary LLM when not set.
     pub fn with_backend_llm(mut self, llm: L) -> Self {
         self.backend_llm = Some(llm);
+        self
+    }
+
+    /// Wire a reader for the reserved scratchpad `goal` note. The dispatch
+    /// loop reads it once per tool round (a bounded single-key fetch) and,
+    /// when present, surfaces it as the conversation's task anchor in
+    /// preference to the verbatim user prompt — so a model-maintained,
+    /// evolving goal keeps showing up even after history is compacted away.
+    pub fn with_scratchpad_goal(mut self, goal_read: ScratchpadGetManyFn) -> Self {
+        self.scratchpad_goal_read = Some(goal_read);
         self
     }
 }
@@ -408,6 +428,28 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // `send_prompt` — so this is exactly the round counter we want
             // to thread into the active-task injection check.
             let tool_rounds_since_anchor = u32::try_from(round).unwrap_or(u32::MAX);
+
+            // Auto-surface the evolving goal. When a scratchpad goal reader is
+            // wired, read the reserved `goal` note (a bounded single-key fetch)
+            // and prefer it over the verbatim user prompt as the task anchor —
+            // a model-maintained goal then keeps showing up even after history
+            // is windowed/compacted away. Reading per round means a goal the
+            // model wrote mid-turn surfaces on the next round.
+            let goal = match &self.scratchpad_goal_read {
+                Some(read) => read(
+                    conversation_id.0.clone(),
+                    vec![SCRATCHPAD_GOAL_KEY.to_string()],
+                    1,
+                )
+                .await
+                .ok()
+                .and_then(|mut notes| notes.pop())
+                .map(|note| note.content)
+                .filter(|content| !content.trim().is_empty()),
+                None => None,
+            };
+            let anchor = goal.as_deref().or(conv.active_task.as_deref());
+
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
@@ -418,7 +460,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 deferred_ns,
                 &conv.context_summary,
                 target_window,
-                conv.active_task.as_deref(),
+                anchor,
                 tool_rounds_since_anchor,
                 current_context_budget(),
                 &estimate,
@@ -691,7 +733,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     serde_json::from_str(&tool_call.arguments).unwrap_or_default();
                 on_status(tool_status_message(&tool_call.name, &arguments));
                 tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
-                let result = match self.tools.execute_tool(&tool_call.name, arguments).await {
+                // Install the conversation as a task-local for the duration of
+                // tool execution so conversation-scoped builtins (the
+                // scratchpad) can resolve which pad they operate on without
+                // the `ToolExecutor` port growing a conversation parameter.
+                let exec = self.tools.execute_tool(&tool_call.name, arguments);
+                let result = match with_conversation_id(conversation_id.clone(), exec).await {
                     Ok(output) => {
                         tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
                         output
@@ -3038,6 +3085,182 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "categorizer must run once when the raw listing exceeds the budget threshold"
+        );
+    }
+
+    // --- Scratchpad: conversation scoping + goal anchor ---
+
+    /// Tool executor that records the task-local conversation id observed
+    /// during `execute_tool`, proving the dispatch loop installs it.
+    struct ConvIdCapturingExecutor {
+        tools: Vec<ToolDefinition>,
+        observed: Arc<Mutex<Option<ConversationId>>>,
+    }
+
+    impl ToolExecutor for ConvIdCapturingExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            *self.observed.lock().unwrap() =
+                crate::ports::conversation_ctx::current_conversation_id();
+            Ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_id_scoped_during_tool_execution() {
+        let observed: Arc<Mutex<Option<ConversationId>>> = Arc::new(Mutex::new(None));
+        let tool = ToolDefinition::new("noop", "noop", serde_json::json!({"type": "object"}));
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "noop", "{}")]),
+            LlmResponse::text("done"),
+        ];
+        let executor = ConvIdCapturingExecutor {
+            tools: vec![tool],
+            observed: Arc::clone(&observed),
+        };
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            executor,
+            Box::new(|| "conv-scope-1".to_string()),
+        );
+        let conv = handler.create_conversation("t".into()).await.unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.lock().unwrap().clone(),
+            Some(conv.id.clone()),
+            "execute_tool must observe the conversation as a task-local"
+        );
+    }
+
+    /// LLM that captures the messages from every invocation, so we can assert
+    /// how the task anchor was assembled. (First-message title generation
+    /// also calls `stream_completion`, so we record all calls and inspect
+    /// them collectively rather than keeping only the last.)
+    struct MessageCapturingLlm {
+        captured: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for MessageCapturingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.captured.lock().unwrap().push(messages);
+            Ok(LlmResponse::text("done"))
+        }
+    }
+
+    fn goal_reader(content: &'static str) -> ScratchpadGetManyFn {
+        Arc::new(move |conv: String, keys: Vec<String>, _limit: usize| {
+            Box::pin(async move {
+                // Only the reserved goal key resolves to a note.
+                if keys.iter().any(|k| k == SCRATCHPAD_GOAL_KEY) {
+                    Ok(vec![crate::domain::ScratchpadNote::new(
+                        "g",
+                        conv,
+                        SCRATCHPAD_GOAL_KEY,
+                        content,
+                    )])
+                } else {
+                    Ok(vec![])
+                }
+            })
+        })
+    }
+
+    /// Find a `[Current task]` anchor system message across all captured
+    /// LLM invocations.
+    fn find_anchor(captures: &[Vec<Message>]) -> Option<String> {
+        captures
+            .iter()
+            .flatten()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Current task]"))
+            .map(|m| m.content.clone())
+    }
+
+    #[tokio::test]
+    async fn scratchpad_goal_is_surfaced_as_task_anchor() {
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            MessageCapturingLlm {
+                captured: Arc::clone(&captured),
+            },
+            NoopToolExecutor,
+            Box::new(|| "conv-goal-1".to_string()),
+        )
+        .with_scratchpad_goal(goal_reader("Ship the scratchpad, then promote learnings"));
+
+        let conv = handler.create_conversation("t".into()).await.unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "what next?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let anchor = find_anchor(&captured.lock().unwrap())
+            .expect("a [Current task] anchor must be injected from the goal note");
+        assert!(
+            anchor.contains("Ship the scratchpad, then promote learnings"),
+            "anchor must carry the goal note content, got {anchor:?}"
+        );
+        assert!(
+            !anchor.contains("what next?"),
+            "the evolving goal must take precedence over the verbatim prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_falls_back_to_prompt_when_no_goal_note() {
+        // With a goal reader that returns nothing, the verbatim prompt remains
+        // the anchor source — and since it's a visible user message in a
+        // single-turn conversation, no [Current task] line is injected.
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let empty_reader: ScratchpadGetManyFn =
+            Arc::new(|_c, _k, _l| Box::pin(async { Ok(vec![]) }));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            MessageCapturingLlm {
+                captured: Arc::clone(&captured),
+            },
+            NoopToolExecutor,
+            Box::new(|| "conv-goal-2".to_string()),
+        )
+        .with_scratchpad_goal(empty_reader);
+
+        let conv = handler.create_conversation("t".into()).await.unwrap();
+        handler
+            .send_prompt(&conv.id, "just this".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        assert!(
+            find_anchor(&captured.lock().unwrap()).is_none(),
+            "no anchor should be injected when there's no goal and the prompt is visible"
         );
     }
 }
