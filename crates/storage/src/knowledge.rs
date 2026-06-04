@@ -68,6 +68,14 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         tags: Option<Vec<String>>,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        // No query embedding (e.g. the embedding backend timed out — see
+        // `EMBED_TIMEOUT` in mcp-client): the hybrid query's vector branch
+        // (`chunk <=> $1`) would error on a 0-dimension vector, so fall back to
+        // the full-text-only path.
+        if query_embedding.is_empty() {
+            return self.search_text(query, tags, limit).await;
+        }
+
         let user_id = current_user_id();
         let embedding_vec = Vector::from(query_embedding);
         let fetch_limit = (limit * 2) as i64;

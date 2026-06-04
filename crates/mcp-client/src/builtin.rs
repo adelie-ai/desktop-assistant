@@ -33,6 +33,13 @@ const TOOL_SCRATCHPAD_WRITE: &str = "builtin_scratchpad_write";
 const TOOL_SCRATCHPAD_SEARCH: &str = "builtin_scratchpad_search";
 const TOOL_SCRATCHPAD_DELETE: &str = "builtin_scratchpad_delete";
 
+/// Hard cap on how long an embedding call may block a real-time request. A
+/// slow/wedged embedding backend (e.g. a stuck Ollama) must not hang the turn:
+/// on timeout we return no embedding, so semantic search falls back to FTS and
+/// KB writes persist without an embedding for the background dreaming/backfill
+/// cycle to fill in later.
+const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1062,10 +1069,17 @@ impl BuiltinToolService {
     /// Used for search queries which are always short and don't need chunking.
     async fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
         let embed_fn = self.embed_fn.as_ref()?;
-        match embed_fn(vec![text.to_string()]).await {
-            Ok(mut vecs) => vecs.pop(),
-            Err(e) => {
+        match tokio::time::timeout(EMBED_TIMEOUT, embed_fn(vec![text.to_string()])).await {
+            Ok(Ok(mut vecs)) => vecs.pop(),
+            Ok(Err(e)) => {
                 tracing::warn!("failed to embed text: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?EMBED_TIMEOUT,
+                    "embedding timed out; falling back to full-text search"
+                );
                 None
             }
         }
@@ -1078,11 +1092,18 @@ impl BuiltinToolService {
 
         let embed_fn = self.embed_fn.as_ref()?;
         let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        match embed_fn(chunks).await {
-            Ok(vecs) if !vecs.is_empty() => Some(vecs),
-            Ok(_) => None,
-            Err(e) => {
+        match tokio::time::timeout(EMBED_TIMEOUT, embed_fn(chunks)).await {
+            Ok(Ok(vecs)) if !vecs.is_empty() => Some(vecs),
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
                 tracing::warn!("failed to embed chunks: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?EMBED_TIMEOUT,
+                    "embedding timed out; saving without embedding for backfill to retry"
+                );
                 None
             }
         }
@@ -2163,5 +2184,54 @@ mod tests {
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "jira__create_issue");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn embedding_timeout_falls_back_to_empty_embedding() {
+        // A wedged embedding backend (a never-completing future, like a stuck
+        // Ollama) must not hang the search: `embed_text` times out after
+        // EMBED_TIMEOUT and the search runs with an empty embedding, which the
+        // store turns into an FTS-only query. With the clock paused, the 5s
+        // timeout elapses immediately so the test is instant.
+        use desktop_assistant_core::domain::ToolDefinition;
+        use desktop_assistant_core::ports::embedding::EmbedFn;
+        use std::sync::{Arc, Mutex};
+
+        let embed_fn: EmbedFn = Arc::new(|_texts| Box::pin(std::future::pending()));
+
+        // Capture the embedding the search closure is handed.
+        let seen: Arc<Mutex<Option<Vec<f32>>>> = Arc::new(Mutex::new(None));
+        let seen_w = Arc::clone(&seen);
+        let search_fn: ToolSearchFn = Arc::new(move |_query, emb, _limit| {
+            *seen_w.lock().unwrap() = Some(emb);
+            Box::pin(async {
+                Ok(vec![ToolDefinition::new(
+                    "weather__forecast",
+                    "Get the forecast",
+                    serde_json::json!({}),
+                )])
+            })
+        });
+        let def_fn: ToolDefinitionFn = Arc::new(|_name| Box::pin(async { Ok(None) }));
+
+        let service = BuiltinToolService::new()
+            .with_embedding(embed_fn)
+            .with_tool_registry(search_fn, def_fn);
+
+        let result = service
+            .execute_tool(
+                TOOL_SEARCH,
+                serde_json::json!({"query": "weather forecast"}),
+            )
+            .await
+            .expect("tool search must return, not hang, when embedding times out");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            seen.lock().unwrap().as_ref().expect("search ran").len(),
+            0,
+            "a timed-out embedding must yield an empty vector so the store falls back to FTS"
+        );
     }
 }
