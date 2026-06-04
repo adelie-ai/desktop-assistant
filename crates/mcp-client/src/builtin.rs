@@ -13,7 +13,7 @@ use desktop_assistant_core::ports::knowledge::{
     KnowledgeDeleteFn, KnowledgeSearchFn, KnowledgeWriteFn,
 };
 use desktop_assistant_core::ports::scratchpad::{
-    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_RESULTS_CEILING,
+    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_RESULTS_CEILING, NewScratchpadNote,
     RESPONSE_BYTE_BUDGET, ScratchpadClearFn, ScratchpadDeleteManyFn, ScratchpadGetManyFn,
     ScratchpadListFn, ScratchpadSearchFn, ScratchpadWriteFn,
 };
@@ -388,10 +388,13 @@ impl BuiltinToolService {
                  keyed; writing the same key again replaces it. Pass `notes` to upsert several \
                  at once. Use the reserved key 'goal' for the current objective: it is \
                  auto-surfaced as your task anchor every turn (so it survives compaction), and \
-                 you should evolve it as the goal shifts and delete it when done. The scratchpad \
-                 is discarded when the conversation is deleted and is NOT durable across \
-                 conversations — promote anything worth keeping to the knowledge base with \
-                 builtin_knowledge_base_write, then delete the note here.",
+                 you should evolve it as the goal shifts and delete it when done. Each note has \
+                 a `type` (default \"note\"; use \"todo\" for plan steps) and an optional integer \
+                 `sequence` — notes of the same type are returned sorted by `sequence`, so keep \
+                 your plan as `todo` notes numbered in order. Set `done: true` to check a todo \
+                 off (it stays visible). The scratchpad is discarded when the conversation is \
+                 deleted and is NOT durable across conversations — promote anything worth keeping \
+                 to the knowledge base with builtin_knowledge_base_write, then delete the note here.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -401,24 +404,33 @@ impl BuiltinToolService {
                                 "type": "object",
                                 "properties": {
                                     "key": {"type": "string", "description": "Short handle for the note; upserts by key."},
-                                    "content": {"type": "string", "description": "The note body (keep it small and high-signal)."}
+                                    "content": {"type": "string", "description": "The note body (keep it small and high-signal)."},
+                                    "type": {"type": "string", "description": "Category, e.g. \"todo\"/\"note\"/\"other\". Defaults to \"note\". Used for filtering/grouping; same-type notes sort by `sequence`."},
+                                    "sequence": {"type": "integer", "description": "Optional ordering hint within the type (ascending). Use for ordered todos."},
+                                    "done": {"type": "boolean", "description": "Whether this note (e.g. a todo) is checked off. Defaults to false."}
                                 },
                                 "required": ["key", "content"]
                             },
                             "description": "One or more notes to add/update in a single call."
                         },
                         "key": {"type": "string", "description": "Single-note convenience: the note key (use with `content`)."},
-                        "content": {"type": "string", "description": "Single-note convenience: the note body (use with `key`)."}
+                        "content": {"type": "string", "description": "Single-note convenience: the note body (use with `key`)."},
+                        "type": {"type": "string", "description": "Single-note convenience: the note type (default \"note\")."},
+                        "sequence": {"type": "integer", "description": "Single-note convenience: ordering hint within the type."},
+                        "done": {"type": "boolean", "description": "Single-note convenience: checked-off flag."}
                     }
                 }),
             ),
             ToolDefinition::new(
                 TOOL_SCRATCHPAD_SEARCH,
                 "Read this conversation's scratchpad. Omit `query` and `keys` to list all notes \
-                 newest-first; pass `query` for a full-text search over note keys and content; \
-                 pass `keys` to fetch specific notes. `max_results` is required. Results are \
-                 bounded — if the response is truncated you'll get `truncated: true` and should \
-                 narrow with a `query` or a smaller key set.",
+                 (ordered by type, then `sequence`); pass `query` for a full-text search over \
+                 note keys and content; pass `keys` to fetch specific notes. Pass `type` to \
+                 restrict a list/search to one category, e.g. `type: \"todo\"` for just your \
+                 plan. Each returned note includes its `type`, `sequence`, and `done`. \
+                 `max_results` is required. Results are bounded — if the response is truncated \
+                 you'll get `truncated: true` and should narrow with a `query`, a `type`, or a \
+                 smaller key set.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -428,6 +440,7 @@ impl BuiltinToolService {
                             "items": {"type": "string"},
                             "description": "Fetch specific notes by key. Takes precedence over `query`."
                         },
+                        "type": {"type": "string", "description": "Restrict a list/search to one note type, e.g. \"todo\". Ignored when `keys` is given."},
                         "max_results": {
                             "type": "integer",
                             "minimum": 1,
@@ -827,21 +840,16 @@ impl BuiltinToolService {
             .as_ref()
             .ok_or_else(|| CoreError::ToolExecution("scratchpad not configured".to_string()))?;
 
-        // Accept either a `notes` array or a single `key`+`content`.
-        let raw: Vec<(String, String)> =
+        // Accept either a `notes` array or a single `key`+`content`. Each note
+        // may carry an optional `type` (default "note"), `sequence`, and `done`.
+        let raw: Vec<NewScratchpadNote> =
             if let Some(arr) = arguments.get("notes").and_then(serde_json::Value::as_array) {
-                arr.iter()
-                    .filter_map(|n| {
-                        let key = n.get("key").and_then(serde_json::Value::as_str)?;
-                        let content = n.get("content").and_then(serde_json::Value::as_str)?;
-                        Some((key.trim().to_string(), content.to_string()))
-                    })
-                    .collect()
-            } else if let (Some(key), Some(content)) = (
-                arguments.get("key").and_then(serde_json::Value::as_str),
-                arguments.get("content").and_then(serde_json::Value::as_str),
-            ) {
-                vec![(key.trim().to_string(), content.to_string())]
+                arr.iter().filter_map(parse_new_note).collect()
+            } else if arguments.get("key").is_some() || arguments.get("content").is_some() {
+                match parse_new_note(&arguments) {
+                    Some(note) => vec![note],
+                    None => Vec::new(),
+                }
             } else {
                 return Err(CoreError::ToolExecution(
                 "scratchpad_write requires `notes: [{key, content}]` or a single `key` + `content`"
@@ -859,23 +867,23 @@ impl BuiltinToolService {
         // INSERT can't carry a duplicate ON CONFLICT target). Invalid notes
         // are reported individually rather than failing the whole call.
         let mut rejected: Vec<serde_json::Value> = Vec::new();
-        let mut accepted: Vec<(String, String)> = Vec::new();
-        for (key, content) in raw {
-            if key.is_empty() {
-                rejected.push(serde_json::json!({"key": key, "reason": "empty key"}));
+        let mut accepted: Vec<NewScratchpadNote> = Vec::new();
+        for note in raw {
+            if note.key.is_empty() {
+                rejected.push(serde_json::json!({"key": note.key, "reason": "empty key"}));
                 continue;
             }
-            if content.len() > MAX_NOTE_BYTES {
+            if note.content.len() > MAX_NOTE_BYTES {
                 rejected.push(serde_json::json!({
-                    "key": key,
+                    "key": note.key,
                     "reason": format!("content exceeds {MAX_NOTE_BYTES} bytes")
                 }));
                 continue;
             }
-            if let Some(existing) = accepted.iter_mut().find(|(k, _)| *k == key) {
-                existing.1 = content;
+            if let Some(existing) = accepted.iter_mut().find(|n| n.key == note.key) {
+                *existing = note;
             } else {
-                accepted.push((key, content));
+                accepted.push(note);
             }
         }
 
@@ -887,7 +895,7 @@ impl BuiltinToolService {
             skipped = accepted
                 .split_off(MAX_NOTES_PER_WRITE)
                 .into_iter()
-                .map(|(k, _)| k)
+                .map(|n| n.key)
                 .collect();
         }
 
@@ -930,6 +938,9 @@ impl BuiltinToolService {
 
         let keys = optional_string_array(&arguments, "keys");
         let query = optional_string(&arguments, "query");
+        // Optional structured filter restricting list/search to one note_type
+        // (e.g. only `todo`s). Ignored on the by-keys path (keys are explicit).
+        let note_type = optional_string(&arguments, "type");
 
         // Mode precedence: keys -> query -> list-all. Each path is bounded.
         let mut keys_truncated = false;
@@ -948,12 +959,12 @@ impl BuiltinToolService {
                 let search = self.scratchpad_search_fn.as_ref().ok_or_else(|| {
                     CoreError::ToolExecution("scratchpad not configured".to_string())
                 })?;
-                search(conversation_id, query, limit).await?
+                search(conversation_id, query, note_type, limit).await?
             } else {
                 let list = self.scratchpad_list_fn.as_ref().ok_or_else(|| {
                     CoreError::ToolExecution("scratchpad not configured".to_string())
                 })?;
-                list(conversation_id, limit).await?
+                list(conversation_id, note_type, limit).await?
             };
 
         let hit_limit = results.len() >= limit;
@@ -967,6 +978,9 @@ impl BuiltinToolService {
             let entry = serde_json::json!({
                 "key": note.key,
                 "content": note.content,
+                "type": note.note_type,
+                "sequence": note.sequence,
+                "done": note.done,
                 "updated_at": note.updated_at,
             });
             let size = entry.to_string().len();
@@ -1111,6 +1125,37 @@ fn optional_string_array_nonempty(args: &serde_json::Value, key: &str) -> Option
     } else {
         Some(values)
     }
+}
+
+/// Parse one scratchpad note object (`{key, content, type?, sequence?, done?}`)
+/// into a [`NewScratchpadNote`]. Returns `None` when `key` or `content` is
+/// absent (the caller treats that as a malformed note). `type` defaults to
+/// [`DEFAULT_NOTE_TYPE`]; the key is trimmed (emptiness is validated upstream).
+fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
+    let key = obj.get("key").and_then(serde_json::Value::as_str)?;
+    let content = obj.get("content").and_then(serde_json::Value::as_str)?;
+    let note_type = obj
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(desktop_assistant_core::domain::DEFAULT_NOTE_TYPE)
+        .to_string();
+    let sequence = obj
+        .get("sequence")
+        .and_then(serde_json::Value::as_i64)
+        .map(|v| v as i32);
+    let done = obj
+        .get("done")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Some(NewScratchpadNote {
+        key: key.trim().to_string(),
+        content: content.to_string(),
+        note_type,
+        sequence,
+        done,
+    })
 }
 
 fn detect_username() -> Option<String> {
@@ -1353,22 +1398,32 @@ mod tests {
 
         let w = Arc::clone(&store);
         let write_fn: ScratchpadWriteFn =
-            Arc::new(move |conv: String, notes: Vec<(String, String)>| {
+            Arc::new(move |conv: String, notes: Vec<NewScratchpadNote>| {
                 let store = Arc::clone(&w);
                 Box::pin(async move {
                     let mut guard = store.lock().unwrap();
                     let mut saved = Vec::new();
-                    for (i, (key, content)) in notes.into_iter().enumerate() {
+                    for (i, note) in notes.into_iter().enumerate() {
                         if let Some(existing) = guard
                             .iter_mut()
-                            .find(|n| n.conversation_id == conv && n.key == key)
+                            .find(|n| n.conversation_id == conv && n.key == note.key)
                         {
-                            existing.content = content;
+                            existing.content = note.content;
+                            existing.note_type = note.note_type;
+                            existing.sequence = note.sequence;
+                            existing.done = note.done;
                             existing.updated_at = "t1".into();
                             saved.push(existing.clone());
                         } else {
-                            let mut n =
-                                ScratchpadNote::new(format!("id-{i}-{key}"), &conv, &key, &content);
+                            let mut n = ScratchpadNote::new(
+                                format!("id-{i}-{}", note.key),
+                                &conv,
+                                &note.key,
+                                &note.content,
+                            );
+                            n.note_type = note.note_type;
+                            n.sequence = note.sequence;
+                            n.done = note.done;
                             n.updated_at = "t0".into();
                             guard.push(n.clone());
                             saved.push(n);
@@ -1400,22 +1455,38 @@ mod tests {
             });
 
         let l = Arc::clone(&store);
-        let list_fn: ScratchpadListFn = Arc::new(move |conv: String, limit: usize| {
-            let store = Arc::clone(&l);
-            Box::pin(async move {
-                let guard = store.lock().unwrap();
-                Ok(guard
-                    .iter()
-                    .filter(|n| n.conversation_id == conv)
-                    .take(limit)
-                    .cloned()
-                    .collect())
-            })
-        });
+        let list_fn: ScratchpadListFn = Arc::new(
+            move |conv: String, note_type: Option<String>, limit: usize| {
+                let store = Arc::clone(&l);
+                Box::pin(async move {
+                    let guard = store.lock().unwrap();
+                    let mut notes: Vec<ScratchpadNote> = guard
+                        .iter()
+                        .filter(|n| n.conversation_id == conv)
+                        .filter(|n| note_type.as_deref().is_none_or(|t| n.note_type == t))
+                        .cloned()
+                        .collect();
+                    // Mirror the store ordering: type, then sequence ascending
+                    // (nulls last), then recency (timestamps omitted here).
+                    notes.sort_by(|a, b| {
+                        a.note_type
+                            .cmp(&b.note_type)
+                            .then_with(|| match (a.sequence, b.sequence) {
+                                (Some(x), Some(y)) => x.cmp(&y),
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => std::cmp::Ordering::Equal,
+                            })
+                    });
+                    notes.truncate(limit);
+                    Ok(notes)
+                })
+            },
+        );
 
         let s = Arc::clone(&store);
-        let search_fn: ScratchpadSearchFn =
-            Arc::new(move |conv: String, query: String, limit: usize| {
+        let search_fn: ScratchpadSearchFn = Arc::new(
+            move |conv: String, query: String, note_type: Option<String>, limit: usize| {
                 let store = Arc::clone(&s);
                 Box::pin(async move {
                     let guard = store.lock().unwrap();
@@ -1424,12 +1495,14 @@ mod tests {
                         .filter(|n| {
                             n.conversation_id == conv
                                 && (n.content.contains(&query) || n.key.contains(&query))
+                                && note_type.as_deref().is_none_or(|t| n.note_type == t)
                         })
                         .take(limit)
                         .cloned()
                         .collect())
                 })
-            });
+            },
+        );
 
         let d = Arc::clone(&store);
         let delete_many_fn: ScratchpadDeleteManyFn =
