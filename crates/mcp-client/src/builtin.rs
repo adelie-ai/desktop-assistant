@@ -1701,6 +1701,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scratchpad_write_persists_type_sequence_done() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({
+                        "key": "t1", "content": "wire the migration",
+                        "type": "todo", "sequence": 2, "done": false
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let by_key = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"keys": ["t1"], "max_results": 10}),
+                )
+                .await
+                .unwrap();
+            let note = &parse(&by_key)["results"][0];
+            assert_eq!(note["type"], "todo");
+            assert_eq!(note["sequence"], 2);
+            assert_eq!(note["done"], false);
+
+            // Re-writing the same key flips `done` (the check-off path).
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({
+                        "key": "t1", "content": "wire the migration",
+                        "type": "todo", "sequence": 2, "done": true
+                    }),
+                )
+                .await
+                .unwrap();
+            let after = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"keys": ["t1"], "max_results": 10}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(parse(&after)["results"][0]["done"], true);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scratchpad_search_filters_by_type() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"notes": [
+                        {"key": "t1", "content": "do a thing", "type": "todo", "sequence": 1},
+                        {"key": "n1", "content": "a plain note", "type": "note"}
+                    ]}),
+                )
+                .await
+                .unwrap();
+
+            let todos = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"type": "todo", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+            let results = parse(&todos);
+            assert_eq!(results["results"].as_array().unwrap().len(), 1);
+            assert_eq!(results["results"][0]["key"], "t1");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scratchpad_list_orders_todos_by_sequence() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            // Written out of order; expect list to return them sorted by `seq`.
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"notes": [
+                        {"key": "c", "content": "third",  "type": "todo", "sequence": 3},
+                        {"key": "a", "content": "first",  "type": "todo", "sequence": 1},
+                        {"key": "b", "content": "second", "type": "todo", "sequence": 2}
+                    ]}),
+                )
+                .await
+                .unwrap();
+
+            let listed = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"type": "todo", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+            let results = parse(&listed);
+            let keys: Vec<String> = results["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["key"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(keys, vec!["a", "b", "c"], "todos sort by sequence");
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn conversation_search_without_store_returns_error() {
         let service = BuiltinToolService::new();
         let result = service
