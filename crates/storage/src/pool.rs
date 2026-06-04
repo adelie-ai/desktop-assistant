@@ -155,5 +155,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Scratchpad note kind/order/done (issue #188) — note_type / seq / done
+    // columns so a scratchpad can hold an ordered, checkable plan of TODOs.
+    sqlx::raw_sql(include_str!(
+        "../migrations/020_scratchpad_type_sequence_done.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

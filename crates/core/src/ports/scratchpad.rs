@@ -3,7 +3,34 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::CoreError;
-use crate::domain::ScratchpadNote;
+use crate::domain::{DEFAULT_NOTE_TYPE, ScratchpadNote};
+
+/// A note to upsert into the scratchpad. Carries the structured fields that
+/// don't fit a bare `(key, content)` pair: a free-text `note_type`
+/// (default `note`), an optional `sequence` (sorted within a type), and a
+/// `done` flag. Construct via [`NewScratchpadNote::new`] and the field
+/// setters, or as a struct literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewScratchpadNote {
+    pub key: String,
+    pub content: String,
+    pub note_type: String,
+    pub sequence: Option<i32>,
+    pub done: bool,
+}
+
+impl NewScratchpadNote {
+    /// A `note`-typed, unsequenced, not-done upsert for `key` / `content`.
+    pub fn new(key: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            content: content.into(),
+            note_type: DEFAULT_NOTE_TYPE.to_string(),
+            sequence: None,
+            done: false,
+        }
+    }
+}
 
 /// Reserved note key whose content the service auto-surfaces as the
 /// conversation's task anchor each turn (see `crate::service`). The model
@@ -44,13 +71,13 @@ pub const RESPONSE_BYTE_BUDGET: usize = 20 * 1024;
 /// through the multi-entity forms (`get_many`/`delete_many`) — the goal
 /// anchor reads via `get_many(conv, &["goal"], 1)`.
 pub trait ScratchpadStore: Send + Sync {
-    /// Upsert a batch of `(key, content)` notes for a conversation, replacing
-    /// the content of any existing note with the same key. Returns the saved
-    /// notes (with populated timestamps).
+    /// Upsert a batch of notes for a conversation, replacing the content (and
+    /// `note_type` / `sequence` / `done`) of any existing note with the same
+    /// key. Returns the saved notes (with populated timestamps).
     fn write(
         &self,
         conversation_id: &str,
-        notes: &[(String, String)],
+        notes: &[NewScratchpadNote],
     ) -> impl Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send;
 
     /// Fetch the notes for the given keys (in `updated_at DESC` order),
@@ -62,19 +89,25 @@ pub trait ScratchpadStore: Send + Sync {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send;
 
-    /// List all notes for a conversation, newest first, capped at `limit`.
+    /// List a conversation's notes, capped at `limit`. Ordered by `note_type`,
+    /// then `sequence` ascending (nulls last), then `updated_at` descending —
+    /// so a sequenced plan of `todo`s reads in order. When `note_type` is
+    /// `Some`, only notes of that type are returned.
     fn list(
         &self,
         conversation_id: &str,
+        note_type: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send;
 
     /// Full-text search over a conversation's notes (key + content), ranked,
-    /// capped at `limit`.
+    /// capped at `limit`. When `note_type` is `Some`, results are restricted
+    /// to that type.
     fn search(
         &self,
         conversation_id: &str,
         query: &str,
+        note_type: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send;
 
@@ -94,7 +127,7 @@ pub trait ScratchpadStore: Send + Sync {
 pub type ScratchpadWriteFn = Arc<
     dyn Fn(
             String,
-            Vec<(String, String)>,
+            Vec<NewScratchpadNote>,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send>>
         + Send
         + Sync,
@@ -111,21 +144,25 @@ pub type ScratchpadGetManyFn = Arc<
         + Sync,
 >;
 
-/// Boxed async closure for listing all notes (newest first).
+/// Boxed async closure for listing notes (optionally filtered by `note_type`),
+/// ordered by type then sequence.
 pub type ScratchpadListFn = Arc<
     dyn Fn(
             String,
+            Option<String>,
             usize,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send>>
         + Send
         + Sync,
 >;
 
-/// Boxed async closure for full-text searching notes.
+/// Boxed async closure for full-text searching notes (optionally filtered by
+/// `note_type`).
 pub type ScratchpadSearchFn = Arc<
     dyn Fn(
             String,
             String,
+            Option<String>,
             usize,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send>>
         + Send
@@ -154,12 +191,19 @@ mod tests {
         async fn write(
             &self,
             conversation_id: &str,
-            notes: &[(String, String)],
+            notes: &[NewScratchpadNote],
         ) -> Result<Vec<ScratchpadNote>, CoreError> {
             Ok(notes
                 .iter()
                 .enumerate()
-                .map(|(i, (k, c))| ScratchpadNote::new(format!("id-{i}"), conversation_id, k, c))
+                .map(|(i, n)| {
+                    let mut note =
+                        ScratchpadNote::new(format!("id-{i}"), conversation_id, &n.key, &n.content);
+                    note.note_type = n.note_type.clone();
+                    note.sequence = n.sequence;
+                    note.done = n.done;
+                    note
+                })
                 .collect())
         }
 
@@ -175,6 +219,7 @@ mod tests {
         async fn list(
             &self,
             _conversation_id: &str,
+            _note_type: Option<&str>,
             _limit: usize,
         ) -> Result<Vec<ScratchpadNote>, CoreError> {
             Ok(vec![])
@@ -184,6 +229,7 @@ mod tests {
             &self,
             _conversation_id: &str,
             _query: &str,
+            _note_type: Option<&str>,
             _limit: usize,
         ) -> Result<Vec<ScratchpadNote>, CoreError> {
             Ok(vec![])
@@ -205,14 +251,17 @@ mod tests {
     #[tokio::test]
     async fn mock_store_write_roundtrips_batch() {
         let store = MockScratchpadStore;
-        let notes = vec![
-            ("goal".to_string(), "ship it".to_string()),
-            ("q".to_string(), "which db".to_string()),
-        ];
+        let mut todo = NewScratchpadNote::new("step-1", "wire it");
+        todo.note_type = "todo".to_string();
+        todo.sequence = Some(1);
+        let notes = vec![NewScratchpadNote::new("goal", "ship it"), todo];
         let saved = store.write("conv-1", &notes).await.unwrap();
         assert_eq!(saved.len(), 2);
         assert_eq!(saved[0].key, "goal");
-        assert_eq!(saved[1].content, "which db");
+        assert_eq!(saved[0].note_type, DEFAULT_NOTE_TYPE);
+        assert_eq!(saved[1].content, "wire it");
+        assert_eq!(saved[1].note_type, "todo");
+        assert_eq!(saved[1].sequence, Some(1));
     }
 
     #[tokio::test]

@@ -1001,13 +1001,17 @@ async fn main() -> Result<()> {
                 let store = Arc::clone(&sp_g);
                 Box::pin(async move { store.get_many(&conv, &keys, limit).await })
             }),
-            Arc::new(move |conv, limit| {
+            Arc::new(move |conv, note_type: Option<String>, limit| {
                 let store = Arc::clone(&sp_l);
-                Box::pin(async move { store.list(&conv, limit).await })
+                Box::pin(async move { store.list(&conv, note_type.as_deref(), limit).await })
             }),
-            Arc::new(move |conv, query, limit| {
+            Arc::new(move |conv, query, note_type: Option<String>, limit| {
                 let store = Arc::clone(&sp_s);
-                Box::pin(async move { store.search(&conv, &query, limit).await })
+                Box::pin(async move {
+                    store
+                        .search(&conv, &query, note_type.as_deref(), limit)
+                        .await
+                })
             }),
             Arc::new(move |conv, keys| {
                 let store = Arc::clone(&sp_d);

@@ -38,6 +38,11 @@ Current goal:
 - Keep a note under the key "goal" describing what you are trying to accomplish right now. It is auto-surfaced as your [Current task] anchor every turn, so it survives context compaction without you re-reading the pad.
 - Evolve it as the objective shifts; clear it when the task is done.
 
+Plan and TODOs:
+- For any multi-step task, keep your plan in the scratchpad as notes with type "todo" and an integer "sequence" (1, 2, 3, …). Notes of the same type come back sorted by sequence, so your plan always reads in order.
+- As you finish a step, set that todo's "done": true (re-write the same key) to check it off — it stays visible so you don't redo it — or delete it. Add, re-sequence, or revise todos as the plan changes.
+- Use builtin_scratchpad_search with type "todo" to read just your plan.
+
 Work incrementally:
 - Prefer many small, targeted lookups over one giant context pull. After each fact search (knowledge base, past conversations, tools), record the outcome as its own note rather than holding everything in your head — batch-write several notes when a step yields multiple facts.
 

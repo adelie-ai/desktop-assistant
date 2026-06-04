@@ -7,5 +7,5 @@ pub mod tool;
 pub use conversation::{Conversation, ConversationId, ConversationSummary, MessageSummary};
 pub use knowledge::KnowledgeEntry;
 pub use message::{Message, Role};
-pub use scratchpad::ScratchpadNote;
+pub use scratchpad::{DEFAULT_NOTE_TYPE, ScratchpadNote};
 pub use tool::{ToolCall, ToolDefinition, ToolNamespace, ToolResult};
