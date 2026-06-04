@@ -340,12 +340,29 @@ mod tests {
     use desktop_assistant_core::ports::llm::ReasoningConfig;
     use indexmap::IndexMap;
 
+    /// Ollama base URL for tests: a closed loopback port. Connecting here
+    /// yields an instant connection-refused, so the connector returns `Err`
+    /// fast regardless of whether a real Ollama is running on `:11434`. Using
+    /// the real port made these tests hang on dev machines (#186).
+    const DEAD_OLLAMA: &str = "http://127.0.0.1:1";
+
+    /// Hard cap on a test-side network call: panic (fail the test) if it does
+    /// not finish in time, so a hung endpoint can never stall the whole suite
+    /// (#186). `DEAD_OLLAMA` makes the call fail fast in practice; this is the
+    /// backstop in case some future endpoint blocks instead of refusing.
+    async fn no_hang<F: std::future::Future>(label: &str, fut: F) -> F::Output {
+        match tokio::time::timeout(std::time::Duration::from_secs(15), fut).await {
+            Ok(v) => v,
+            Err(_) => panic!("{label} did not complete within 15s — network call hung?"),
+        }
+    }
+
     fn build_ollama_registry() -> Arc<dyn LlmClient> {
         let cfg = crate::config::DaemonConfig {
             connections: IndexMap::from([(
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
-                    base_url: Some("http://localhost:11434".into()),
+                    base_url: Some(DEAD_OLLAMA.into()),
                 }),
             )]),
             ..crate::config::DaemonConfig::default()
@@ -397,8 +414,9 @@ mod tests {
     async fn stream_completion_delegates_to_resolved_client() {
         let fallback = build_ollama_registry();
         let client = RoutingLlmClient::new(fallback);
-        let _ = client
-            .stream_completion(
+        let _ = no_hang(
+            "stream_completion_delegates_to_resolved_client",
+            client.stream_completion(
                 vec![Message::new(
                     desktop_assistant_core::domain::Role::User,
                     "hi",
@@ -406,10 +424,11 @@ mod tests {
                 &[],
                 ReasoningConfig::default(),
                 Box::new(|_| true),
-            )
-            .await;
-        // Result will be an `Err` (no ollama server), but the call
-        // path itself must complete without panicking.
+            ),
+        )
+        .await;
+        // Result will be an `Err` (connection refused at DEAD_OLLAMA), but the
+        // call path itself must complete without panicking.
     }
 
     fn _assert_llm_client_impl<L: LlmClient>() {}
@@ -422,7 +441,7 @@ mod tests {
             connections: IndexMap::from([(
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
-                    base_url: Some("http://localhost:11434".into()),
+                    base_url: Some(DEAD_OLLAMA.into()),
                 }),
             )]),
             ..crate::config::DaemonConfig::default()
@@ -493,7 +512,7 @@ mod tests {
             connections: IndexMap::from([(
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
-                    base_url: Some("http://localhost:11434".into()),
+                    base_url: Some(DEAD_OLLAMA.into()),
                 }),
             )]),
             purposes,
@@ -526,7 +545,7 @@ mod tests {
             connections: IndexMap::from([(
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
-                    base_url: Some("http://localhost:11434".into()),
+                    base_url: Some(DEAD_OLLAMA.into()),
                 }),
             )]),
             purposes,
@@ -535,8 +554,9 @@ mod tests {
         let reg = build_registry(&cfg);
         let handle = Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg));
         let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
-        let err = client
-            .stream_completion(
+        let err = no_hang(
+            "dynamic_purpose_unconfigured_returns_error",
+            client.stream_completion(
                 vec![Message::new(
                     desktop_assistant_core::domain::Role::User,
                     "hi",
@@ -544,9 +564,10 @@ mod tests {
                 &[],
                 ReasoningConfig::default(),
                 Box::new(|_| true),
-            )
-            .await
-            .expect_err("dispatch should fail when purpose is unconfigured");
+            ),
+        )
+        .await
+        .expect_err("dispatch should fail when purpose is unconfigured");
         assert!(
             matches!(err, CoreError::Llm(ref msg) if msg.contains("titling")
                 && msg.contains("resolution failed")),
@@ -569,8 +590,9 @@ mod tests {
         let handle = build_handle_with_titling("titling-model");
         let client =
             RoutingLlmClient::new_dynamic_purpose(Arc::clone(&handle), PurposeKind::Titling);
-        let result = client
-            .stream_completion(
+        let result = no_hang(
+            "dynamic_purpose_looks_up_registry_by_connection_id",
+            client.stream_completion(
                 vec![Message::new(
                     desktop_assistant_core::domain::Role::User,
                     "hi",
@@ -578,8 +600,9 @@ mod tests {
                 &[],
                 ReasoningConfig::default(),
                 Box::new(|_| true),
-            )
-            .await;
+            ),
+        )
+        .await;
         // The Ollama connection in the test registry isn't backed by a
         // real server, so dispatch reaches the connector and errors out
         // there — that's fine. What we *must not* see is a registry-
@@ -637,5 +660,20 @@ mod tests {
         let (resolved2, _) = resolve_purpose_dispatch(Some(&cfg2), PurposeKind::Titling)
             .expect("titling resolves after mutation");
         assert_eq!(resolved2.model, "model-v2");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_hang_fails_fast_when_inner_call_times_out() {
+        // The backstop must *fail* (panic) — never hang — when a wrapped call
+        // doesn't complete (#186). With the clock paused, the runtime
+        // auto-advances to the 15s deadline so this runs instantly; the
+        // spawned task's panic surfaces as a JoinError.
+        let handle = tokio::spawn(async {
+            no_hang("never-completes", std::future::pending::<()>()).await;
+        });
+        assert!(
+            handle.await.is_err(),
+            "no_hang must fail (panic) when the inner call times out, not hang"
+        );
     }
 }
