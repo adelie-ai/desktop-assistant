@@ -49,10 +49,7 @@ impl<L> ClassifyingLlmClient<L> {
     /// tier-1 matchers recognize it. `Ok` and already-structured errors pass
     /// through untouched, and an unrecognized `Llm` error is returned
     /// verbatim — so behavior is unchanged on a miss.
-    fn reclassify(
-        &self,
-        result: Result<LlmResponse, CoreError>,
-    ) -> Result<LlmResponse, CoreError> {
+    fn reclassify(&self, result: Result<LlmResponse, CoreError>) -> Result<LlmResponse, CoreError> {
         match result {
             Err(CoreError::Llm(detail)) => {
                 let cause = classify_builtin(&ErrorContext {
@@ -141,7 +138,9 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
     ) -> Result<LlmResponse, CoreError> {
         let result = self
             .inner
-            .stream_completion_with_namespaces(messages, core_tools, namespaces, reasoning, on_chunk)
+            .stream_completion_with_namespaces(
+                messages, core_tools, namespaces, reasoning, on_chunk,
+            )
             .await;
         self.reclassify(result)
     }
@@ -251,7 +250,10 @@ mod tests {
             "You exceeded your current quota; check your billing details.".into(),
         ));
         let err = run(&c).await.expect_err("must be an error");
-        assert!(matches!(err, CoreError::QuotaExceeded { .. }), "got {err:?}");
+        assert!(
+            matches!(err, CoreError::QuotaExceeded { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -285,7 +287,11 @@ mod tests {
             "Input length (479258) exceeds model's maximum context length (131072).".into(),
         ));
         let _ = run(&c).await;
-        assert_eq!(c.inner.calls(), 1, "inner client must be called exactly once");
+        assert_eq!(
+            c.inner.calls(),
+            1,
+            "inner client must be called exactly once"
+        );
     }
 
     #[test]
