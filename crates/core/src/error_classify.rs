@@ -60,6 +60,43 @@ impl NormalizedCause {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::BillingFatal | Self::Auth)
     }
+
+    /// Stable string key for persisting a learned classification (tier 2).
+    /// Overflow token counts are intentionally dropped — the learned cache
+    /// keys on the cause *kind*; tier 1 recovers counts from the live message
+    /// when it carries them.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::ContextOverflow { .. } => "context_overflow",
+            Self::RateLimited => "rate_limited",
+            Self::BillingFatal => "billing_fatal",
+            Self::Auth => "auth",
+            Self::ModelLoading => "model_loading",
+            Self::ToolsUnsupported => "tools_unsupported",
+            Self::Transient => "transient",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Inverse of [`Self::as_key`]. `ContextOverflow` rehydrates with no
+    /// counts. Returns `None` for an unrecognized key, which the caller
+    /// treats as a cache miss (and never as a behavior change).
+    pub fn from_key(key: &str) -> Option<Self> {
+        Some(match key {
+            "context_overflow" => Self::ContextOverflow {
+                prompt_tokens: None,
+                max_tokens: None,
+            },
+            "rate_limited" => Self::RateLimited,
+            "billing_fatal" => Self::BillingFatal,
+            "auth" => Self::Auth,
+            "model_loading" => Self::ModelLoading,
+            "tools_unsupported" => Self::ToolsUnsupported,
+            "transient" => Self::Transient,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
+    }
 }
 
 /// The signals available about a backend error, gathered at the connector
@@ -310,6 +347,26 @@ mod tests {
             classify_builtin(&ctx("a wild and unfamiliar failure appeared")),
             NormalizedCause::Unknown
         );
+    }
+
+    #[test]
+    fn cause_key_round_trips() {
+        for cause in [
+            NormalizedCause::ContextOverflow {
+                prompt_tokens: None,
+                max_tokens: None,
+            },
+            NormalizedCause::RateLimited,
+            NormalizedCause::BillingFatal,
+            NormalizedCause::Auth,
+            NormalizedCause::ModelLoading,
+            NormalizedCause::ToolsUnsupported,
+            NormalizedCause::Transient,
+            NormalizedCause::Unknown,
+        ] {
+            assert_eq!(NormalizedCause::from_key(cause.as_key()), Some(cause));
+        }
+        assert_eq!(NormalizedCause::from_key("nonsense"), None);
     }
 
     #[test]

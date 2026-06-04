@@ -308,6 +308,38 @@ pub trait BackgroundTaskStore: Send + Sync {
     async fn scan_non_terminal(&self) -> Result<Vec<BackgroundTaskRow>, CoreError>;
 }
 
+/// A learned classification (epic #178, tier 2): a connector-scoped
+/// signature substring that maps a class of opaque backend error messages to
+/// a [`crate::error_classify::NormalizedCause`] key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedClassification {
+    /// The distinctive substring matched within the error message.
+    pub signature: String,
+    /// `NormalizedCause::as_key()` — rehydrated via `NormalizedCause::from_key`.
+    pub cause: String,
+}
+
+/// Outbound port for the learned error-classification cache (epic #178).
+///
+/// This store is **global, not per-user** — it holds connector knowledge
+/// (how to read an opaque provider error), not personal data, so unlike the
+/// other stores it deliberately does not scope by `current_user_id()`.
+#[async_trait::async_trait]
+pub trait ErrorClassificationStore: Send + Sync {
+    /// Find a learned classification whose signature occurs (case-insensitive)
+    /// in `message` for `connector`. When several match, the most specific
+    /// (longest signature) wins. Returns `Ok(None)` on a miss.
+    async fn lookup(
+        &self,
+        connector: &str,
+        message: &str,
+    ) -> Result<Option<LearnedClassification>, CoreError>;
+
+    /// Persist (upsert) a learned `(connector, signature) -> cause` mapping.
+    /// Idempotent on the `(connector, signature)` pair.
+    async fn record(&self, connector: &str, signature: &str, cause: &str) -> Result<(), CoreError>;
+}
+
 /// Outbound port for persisting conversations.
 pub trait ConversationStore: Send + Sync {
     fn create(
