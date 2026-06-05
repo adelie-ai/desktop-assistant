@@ -100,6 +100,7 @@ impl FakeConversations {
     }
 }
 
+#[async_trait::async_trait]
 impl ConversationService for FakeConversations {
     async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
         let id = self.next_id();

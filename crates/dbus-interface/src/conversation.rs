@@ -498,6 +498,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ConversationService for RecordingConversationService {
         async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
             self.record();
@@ -679,6 +680,40 @@ mod tests {
         );
     }
 
+    /// #207 regression guard. The future `tokio::spawn` receives at the
+    /// send-prompt site must be a thin state machine that keeps the
+    /// handler's work behind a boxed `Pin<Box<dyn Future>>`, not the
+    /// deeply nested generic future inlined by value. Before #207
+    /// `ConversationService` used RPITIT (`-> impl Future`), so
+    /// `send_prompt_with_override` monomorphized the whole
+    /// handler/LLM/tool stack into one multi-MB async state machine —
+    /// constructing/moving it onto the 2 MB tokio worker stack at
+    /// `tokio::spawn` overflowed the guard page (#205/#206).
+    /// `#[async_trait]` boxes that future, so the spawned task frame is
+    /// now a few hundred bytes. If the trait ever reverts to RPITIT the
+    /// future inlines the stack again and balloons far past the
+    /// threshold below.
+    #[test]
+    fn spawned_send_prompt_future_stays_small() {
+        let service = Arc::new(FakeConversationService);
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let fut = crate::conversation::run_send_prompt_llm_task(
+            service,
+            "conv-1".to_string(),
+            "hello".to_string(),
+            String::new(),
+            tx,
+        );
+        let size = std::mem::size_of_val(&fut);
+        assert!(
+            size < 8 * 1024,
+            "spawned send-prompt future is {size} bytes; expected < 8 KiB. \
+             A multi-KB/MB size means `ConversationService` lost its \
+             `#[async_trait]` boxing and the handler future is being inlined \
+             again — the #205/#206 worker-stack-overflow regression."
+        );
+    }
+
     /// Service double that records the `prompt` and `system_refinement`
     /// it was dispatched with via `send_prompt_with_override`, so the
     /// `SendPromptWithSystemRefinement` plumbing can be asserted without a
@@ -697,6 +732,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ConversationService for RefinementCapturingService {
         async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("rec-id", title))
@@ -804,6 +840,7 @@ mod tests {
 
     struct FakeConversationService;
 
+    #[async_trait::async_trait]
     impl ConversationService for FakeConversationService {
         async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("test-id", title))
@@ -931,6 +968,7 @@ mod tests {
     async fn get_messages_include_filters_to_allowlist() {
         use desktop_assistant_core::domain::Message;
         struct MultiRoleService;
+        #[async_trait::async_trait]
         impl ConversationService for MultiRoleService {
             async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
                 Ok(Conversation::new("id", title))
@@ -1024,6 +1062,7 @@ mod tests {
     async fn get_messages_after_count_slices_raw() {
         use desktop_assistant_core::domain::Message;
         struct SeqService;
+        #[async_trait::async_trait]
         impl ConversationService for SeqService {
             async fn create_conversation(&self, t: String) -> Result<Conversation, CoreError> {
                 Ok(Conversation::new("id", t))

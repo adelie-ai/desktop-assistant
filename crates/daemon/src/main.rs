@@ -561,14 +561,20 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
 }
 
 fn main() -> Result<()> {
-    // The interactive send-prompt task spawns a very large future: the deeply
-    // nested generic ConversationHandler / LLM-client stack
-    // (RoutingConversationHandler<ConversationHandler<MaybeProfiled<Retrying<
-    // FixedReasoning<RoutingLlmClient>>>, McpToolExecutor>>) monomorphizes into
-    // a multi-MB async state machine, and constructing it on the default 2 MB
-    // tokio worker stack overflowed the guard page (#205). Give workers a
-    // larger stack. (Proper follow-up: shrink the future via `Arc<dyn …>`
-    // dynamic dispatch so it isn't multi-MB in the first place.)
+    // Larger-than-default tokio worker stacks. Originally a workaround for
+    // #205: the interactive send-prompt task spawned a multi-MB future
+    // because `ConversationService` used RPITIT and monomorphized the whole
+    // nested handler/LLM/tool stack into one inlined state machine, which
+    // overflowed the default 2 MB worker stack at `tokio::spawn` (#206).
+    //
+    // #207 fixed the root cause: `ConversationService` is now `#[async_trait]`
+    // and the LLM decorator stack is erased to `Arc<dyn LlmClient>`, so the
+    // *persistent* spawned future is a thin boxed `Pin<Box<dyn Future>>`
+    // (guarded by `dbus`/`ws` `spawned_send_prompt_future_stays_small` tests).
+    // The bump is retained as defensive headroom for per-layer transient
+    // future construction in debug builds and deep agentic recursion; it can
+    // be lowered toward the default once confirmed with a live debug-build
+    // repro (busctl SendPrompt), which is left as a follow-up.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(16 * 1024 * 1024)
@@ -1437,12 +1443,21 @@ async fn run() -> Result<()> {
     // and `with_backend_llm(L)` requires both stacks to match).
     let llm = backend_reasoning::FixedReasoningLlmClient::new(llm, ReasoningConfig::default());
     let llm = RetryingLlmClient::new(llm, 3);
-    let llm = MaybeProfiled::from_config(
+    // Erase the decorator stack to `Arc<dyn LlmClient>` (#207). The inner
+    // type — `MaybeProfiled<Retrying<FixedReasoning<RoutingLlmClient>>>` —
+    // was previously carried by value as the `L` of `ConversationHandler`,
+    // so it monomorphized into the per-turn future and was a large part of
+    // the multi-MB frame that overflowed the worker stack (#205/#206).
+    // Behind a trait object the handler holds a thin pointer instead, and
+    // the primary and backend slots share `L = Arc<dyn LlmClient>` for free
+    // (the `FixedReasoning` passthrough above is no longer needed to make
+    // the two slots' types match, but is left as a harmless no-op).
+    let llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
         llm,
         profiling.enabled,
         profiling.log_path.as_deref(),
         profiling.full_content,
-    );
+    ));
     let mut handler = ConversationHandler::with_tools(
         conversation_store.clone(),
         llm,
@@ -1518,12 +1533,12 @@ async fn run() -> Result<()> {
         let bt_llm =
             backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
-        let bt_llm = MaybeProfiled::from_config(
+        let bt_llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
             bt_llm,
             profiling.enabled,
             profiling.log_path.as_deref(),
             profiling.full_content,
-        );
+        ));
         handler = handler.with_backend_llm(bt_llm);
     } else {
         let resolved_bt = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
@@ -1541,12 +1556,12 @@ async fn run() -> Result<()> {
             let bt_llm =
                 backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
             let bt_llm = RetryingLlmClient::new(bt_llm, 3);
-            let bt_llm = MaybeProfiled::from_config(
+            let bt_llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
                 bt_llm,
                 profiling.enabled,
                 profiling.log_path.as_deref(),
                 profiling.full_content,
-            );
+            ));
             handler = handler.with_backend_llm(bt_llm);
         }
     }

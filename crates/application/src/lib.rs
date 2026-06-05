@@ -2029,6 +2029,7 @@ mod tests {
     }
 
     struct FakeConversations;
+    #[async_trait::async_trait]
     impl ConversationService for FakeConversations {
         async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
@@ -2530,6 +2531,7 @@ mod tests {
     struct AbortAwareConversations {
         aborted: Arc<AtomicBool>,
     }
+    #[async_trait::async_trait]
     impl ConversationService for AbortAwareConversations {
         async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))

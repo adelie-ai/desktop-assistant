@@ -238,6 +238,7 @@ impl<S, L: LlmClient, T> ConversationHandler<S, L, T> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
     for ConversationHandler<S, L, T>
 {
