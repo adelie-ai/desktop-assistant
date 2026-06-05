@@ -1,5 +1,8 @@
 //! AWS Bedrock Converse API connector implementing the core `LlmClient` port.
 
+mod tool_names;
+pub use tool_names::ToolNameMap;
+
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_bedrock::Client as BedrockControlClient;
@@ -330,6 +333,7 @@ fn static_credentials_from_api_key(api_key: &str) -> Option<Credentials> {
 
 fn convert_messages(
     messages: &[Message],
+    tool_names: &ToolNameMap,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), CoreError> {
     let mut system = Vec::new();
     let mut api_messages = Vec::new();
@@ -380,10 +384,19 @@ fn convert_messages(
                     let input_json = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                         .unwrap_or(serde_json::json!({}));
                     let doc = json_to_document(input_json);
+                    // Sanitize the historical tool name to satisfy Bedrock's
+                    // `^[a-zA-Z0-9_-]+$` constraint. This is essential: a
+                    // `toolUse` block from an EARLIER turn lives in the
+                    // message history, so the offending name is re-sent on
+                    // every subsequent turn (the live error points at
+                    // `messages.N`, i.e. pre-existing history). The tool_use_id
+                    // is an id, not a name, and is left untouched so result
+                    // correlation still works.
+                    let safe_name = tool_names.to_safe(&tc.name).into_owned();
                     builder = builder.content(ContentBlock::ToolUse(
                         ToolUseBlock::builder()
                             .tool_use_id(tc.id.clone())
-                            .name(tc.name.clone())
+                            .name(safe_name)
                             .input(doc)
                             .build()
                             .map_err(|e| {
@@ -458,7 +471,10 @@ fn convert_messages(
     Ok((system, api_messages))
 }
 
-fn convert_tools(tools: &[ToolDefinition]) -> Result<Option<ToolConfiguration>, CoreError> {
+fn convert_tools(
+    tools: &[ToolDefinition],
+    tool_names: &ToolNameMap,
+) -> Result<Option<ToolConfiguration>, CoreError> {
     if tools.is_empty() {
         return Ok(None);
     }
@@ -466,8 +482,12 @@ fn convert_tools(tools: &[ToolDefinition]) -> Result<Option<ToolConfiguration>, 
     let mut cfg_builder = ToolConfiguration::builder();
     for tool in tools {
         let input_doc = json_to_document(tool.parameters.clone());
+        // Sanitize the tool-spec name to Bedrock's `^[a-zA-Z0-9_-]+$`. Must
+        // match the sanitization applied to history `toolUse` names so the
+        // model's response correlates back to the right tool.
+        let safe_name = tool_names.to_safe(&tool.name).into_owned();
         let spec = ToolSpecification::builder()
-            .name(tool.name.clone())
+            .name(safe_name)
             .description(tool.description.clone())
             .input_schema(ToolInputSchema::Json(input_doc))
             .build()
@@ -1056,8 +1076,17 @@ impl LlmClient for BedrockClient {
         }
 
         let client = self.client().await?;
-        let (system, api_messages) = convert_messages(&messages)?;
-        let tool_config = convert_tools(tools)?;
+
+        // Bedrock validates every tool name (in the request tool-spec AND in
+        // every `toolUse` block carried in the message history) against
+        // `^[a-zA-Z0-9_-]+$` with a 64-char cap — stricter than the Anthropic
+        // API. Build a per-request bijection from the available tools, apply
+        // it consistently to the tool definitions and to historical
+        // `toolUse.name`s, and reverse it when the model echoes a name back so
+        // dispatch still hits the real (possibly `.`/`:`/`/`-containing) tool.
+        let tool_names = ToolNameMap::from_names(tools.iter().map(|t| t.name.as_str()));
+        let (system, api_messages) = convert_messages(&messages, &tool_names)?;
+        let tool_config = convert_tools(tools, &tool_names)?;
 
         // Per-turn model override (issue #34): when the daemon-side routing
         // layer has set `MODEL_OVERRIDE`, dispatch the user-chosen model id
@@ -1086,6 +1115,7 @@ impl LlmClient for BedrockClient {
             tool_config,
             inference_cfg: self.build_inference_config(),
             additional_request_fields: build_additional_model_request_fields(&model, reasoning),
+            tool_names,
         };
 
         // Path selection (#67):
@@ -1170,6 +1200,10 @@ struct BedrockRequestInputs {
     tool_config: Option<ToolConfiguration>,
     inference_cfg: Option<aws_sdk_bedrockruntime::types::InferenceConfiguration>,
     additional_request_fields: Option<Document>,
+    /// Sanitized<->original tool-name bijection for this request. Used to map
+    /// the (sanitized) name the model returns in a `toolUse` back to the real
+    /// tool so the upstream dispatch can execute it. (#198)
+    tool_names: ToolNameMap,
 }
 
 impl BedrockClient {
@@ -1283,7 +1317,11 @@ impl BedrockClient {
             }
         }
 
-        let tool_calls = tool_acc.into_tool_calls();
+        // Reverse the sanitization: the model echoed back the Bedrock-safe
+        // tool name, but the upstream dispatch (and the MCP routing table)
+        // keys on the ORIGINAL name. Map each call's name back. The
+        // tool_use_id is left untouched.
+        let tool_calls = restore_tool_call_names(tool_acc.into_tool_calls(), &inputs.tool_names);
         let mut response = if tool_calls.is_empty() {
             LlmResponse::text(text)
         } else {
@@ -1334,9 +1372,13 @@ impl BedrockClient {
                 match block {
                     ContentBlock::Text(s) => text.push_str(s),
                     ContentBlock::ToolUse(tool_use) => {
+                        // Reverse the sanitization so upstream dispatch hits
+                        // the real tool; the id is left untouched.
+                        let original_name =
+                            inputs.tool_names.to_original(tool_use.name()).into_owned();
                         tool_calls.push(ToolCall::new(
                             tool_use.tool_use_id().to_string(),
-                            tool_use.name().to_string(),
+                            original_name,
                             document_to_json_string(tool_use.input()),
                         ));
                     }
@@ -1502,6 +1544,20 @@ fn build_additional_model_request_fields(
     let mut root: HashMap<String, Document> = HashMap::new();
     root.insert("thinking".to_string(), Document::Object(thinking));
     Some(Document::Object(root))
+}
+
+/// Map each tool call's (Bedrock-sanitized) name back to the original tool
+/// name using the per-request bijection, leaving ids and arguments untouched.
+/// Applied to the calls the model returns so upstream dispatch keys on the
+/// real name. (#198)
+fn restore_tool_call_names(calls: Vec<ToolCall>, tool_names: &ToolNameMap) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .map(|call| {
+            let original = tool_names.to_original(&call.name).into_owned();
+            ToolCall::new(call.id, original, call.arguments)
+        })
+        .collect()
 }
 
 fn json_to_document(value: serde_json::Value) -> Document {
@@ -2442,6 +2498,173 @@ mod tests {
             json["items"],
             serde_json::json!(["a", serde_json::Value::Null])
         );
+    }
+
+    // --- Tool-name sanitization on the Bedrock path (#198) ---------------
+
+    // `ToolDefinition`, `ToolCall`, `Tool`, `ToolConfiguration`, `ContentBlock`
+    // are all in scope via `super::*`.
+
+    /// Pull the tool-spec names out of a built `ToolConfiguration`.
+    fn tool_spec_names(cfg: &ToolConfiguration) -> Vec<String> {
+        cfg.tools()
+            .iter()
+            .filter_map(|t| match t {
+                Tool::ToolSpec(spec) => Some(spec.name().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collect every `toolUse` name across all assistant messages.
+    fn tool_use_names(messages: &[BedrockMessage]) -> Vec<String> {
+        let mut names = Vec::new();
+        for m in messages {
+            for block in m.content() {
+                if let ContentBlock::ToolUse(tu) = block {
+                    names.push(tu.name().to_string());
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn convert_tools_sanitizes_spec_names() {
+        let tools = vec![
+            ToolDefinition::new("fs.read", "read", serde_json::json!({"type": "object"})),
+            ToolDefinition::new("do thing", "do", serde_json::json!({"type": "object"})),
+            ToolDefinition::new("ok_name", "ok", serde_json::json!({"type": "object"})),
+        ];
+        let map = ToolNameMap::from_names(tools.iter().map(|t| t.name.as_str()));
+        let cfg = convert_tools(&tools, &map).expect("ok").expect("some");
+        let names = tool_spec_names(&cfg);
+        for n in &names {
+            assert!(
+                n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "spec name not Bedrock-valid: {n:?}"
+            );
+        }
+        // The already-valid name is untouched.
+        assert!(names.contains(&"ok_name".to_string()));
+        // And each safe name reverses to its original.
+        for n in &names {
+            let orig = map.to_original(n).into_owned();
+            assert!(
+                ["fs.read", "do thing", "ok_name"].contains(&orig.as_str()),
+                "unexpected reverse: {n:?} -> {orig:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn convert_messages_sanitizes_historical_tool_use_name() {
+        // THE core fix: a `toolUse` block from an earlier turn lives in the
+        // history; its name must be sanitized when re-serialized, because
+        // Bedrock validates every `messages.N...toolUse.name`. This is the
+        // live failure (error at `messages.10`), independent of the current
+        // tool definitions.
+        let history = vec![
+            Message::new(Role::User, "hi"),
+            Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "call-1",
+                "weather.lookup", // invalid for Bedrock (contains '.')
+                r#"{"city":"NYC"}"#,
+            )]),
+            Message::tool_result("call-1", "sunny"),
+        ];
+        // Map built from the CURRENT tool set (which still offers the tool).
+        let map = ToolNameMap::from_names(["weather.lookup"]);
+        let (_system, messages) = convert_messages(&history, &map).expect("convert ok");
+
+        let names = tool_use_names(&messages);
+        assert_eq!(names.len(), 1, "expected one toolUse in history");
+        let safe = &names[0];
+        assert!(
+            safe.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "historical toolUse name not sanitized: {safe:?}"
+        );
+        assert!(!safe.contains('.'), "dot must be gone: {safe:?}");
+        // And it round-trips to the original via the same map, so a tool def
+        // built from the same map will agree with this name.
+        assert_eq!(map.to_original(safe), "weather.lookup");
+    }
+
+    #[test]
+    fn convert_messages_sanitizes_history_even_when_tool_not_offered_now() {
+        // A tool used in an earlier turn may no longer be in the current tool
+        // set. Its historical `toolUse` name STILL must be valid for Bedrock,
+        // or the whole request is rejected.
+        let history = vec![Message::assistant_with_tool_calls(vec![ToolCall::new(
+            "call-9",
+            "legacy:tool/name",
+            "{}",
+        )])];
+        // Empty map: the tool isn't offered this turn.
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        let (_system, messages) = convert_messages(&history, &map).expect("convert ok");
+        let names = tool_use_names(&messages);
+        assert_eq!(names.len(), 1);
+        assert!(
+            names[0]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "name not sanitized: {:?}",
+            names[0]
+        );
+    }
+
+    #[test]
+    fn spec_and_history_names_agree_for_same_tool() {
+        // The name Bedrock sees in the tool-spec MUST equal the name it sees
+        // in the historical `toolUse` block for the same tool, or the model's
+        // call won't correlate. Verify they're identical through one map.
+        let tool = "ns__weird.name:1";
+        let map = ToolNameMap::from_names([tool]);
+
+        let cfg = convert_tools(
+            &[ToolDefinition::new(tool, "d", serde_json::json!({}))],
+            &map,
+        )
+        .expect("ok")
+        .expect("some");
+        let spec_name = tool_spec_names(&cfg).into_iter().next().expect("one spec");
+
+        let history = vec![Message::assistant_with_tool_calls(vec![ToolCall::new(
+            "c1", tool, "{}",
+        )])];
+        let (_s, messages) = convert_messages(&history, &map).expect("ok");
+        let hist_name = tool_use_names(&messages).into_iter().next().expect("one");
+
+        assert_eq!(
+            spec_name, hist_name,
+            "tool-spec name and history toolUse name must match"
+        );
+    }
+
+    #[test]
+    fn restore_tool_call_names_reverses_to_original() {
+        // The dispatch path: the model returns the sanitized name; we must
+        // hand the ORIGINAL back to the caller so MCP routing resolves it.
+        let map = ToolNameMap::from_names(["fs.read", "a.b", "a:b"]);
+        let safe_fs = map.to_safe("fs.read").into_owned();
+        let safe_ab1 = map.to_safe("a.b").into_owned();
+        let safe_ab2 = map.to_safe("a:b").into_owned();
+
+        let returned = vec![
+            ToolCall::new("id1", safe_fs, r#"{"p":1}"#),
+            ToolCall::new("id2", safe_ab1, "{}"),
+            ToolCall::new("id3", safe_ab2, "{}"),
+        ];
+        let restored = restore_tool_call_names(returned, &map);
+        assert_eq!(restored[0].name, "fs.read");
+        assert_eq!(restored[1].name, "a.b");
+        assert_eq!(restored[2].name, "a:b");
+        // ids and arguments survive untouched.
+        assert_eq!(restored[0].id, "id1");
+        assert_eq!(restored[0].arguments, r#"{"p":1}"#);
     }
 
     // --- Cancellation (issue #109) ---------------------------------------
