@@ -560,8 +560,23 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The interactive send-prompt task spawns a very large future: the deeply
+    // nested generic ConversationHandler / LLM-client stack
+    // (RoutingConversationHandler<ConversationHandler<MaybeProfiled<Retrying<
+    // FixedReasoning<RoutingLlmClient>>>, McpToolExecutor>>) monomorphizes into
+    // a multi-MB async state machine, and constructing it on the default 2 MB
+    // tokio worker stack overflowed the guard page (#205). Give workers a
+    // larger stack. (Proper follow-up: shrink the future via `Arc<dyn …>`
+    // dynamic dispatch so it isn't multi-MB in the first place.)
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
