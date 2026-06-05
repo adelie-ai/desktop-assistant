@@ -45,6 +45,48 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
     async fn dispatch(&self, cmd: api::Command) -> fdo::Result<api::CommandResult> {
         self.transport.request(cmd).await.map_err(map_transport_err)
     }
+
+    /// Shared body for `SendPrompt` / `SendPromptWithSystemRefinement`:
+    /// builds the `SendMessage` command (with the given
+    /// `system_refinement`; empty = none), dispatches it, and maps the
+    /// immediate result to a correlation id for the caller. Keeping this
+    /// in one place guarantees the two D-Bus methods stay
+    /// byte-identical apart from the refinement.
+    async fn dispatch_send_message(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        system_refinement: String,
+    ) -> fdo::Result<String> {
+        let result = self
+            .dispatch(api::Command::SendMessage {
+                conversation_id: conversation_id.to_string(),
+                content: prompt.to_string(),
+                override_selection: None,
+                system_refinement,
+            })
+            .await
+            .map_err(|e| {
+                // SendMessage returns an immediate Ack on success; if
+                // the daemon refused the request before streaming, we
+                // surface the error directly.
+                to_fdo(e)
+            })?;
+
+        match result {
+            api::CommandResult::Ack => {
+                // Daemon hasn't told us the request id yet — events
+                // will carry it. Use a placeholder so clients have
+                // something to log against; the events flowing through
+                // the forwarder carry the daemon's correlation id.
+                Ok(uuid::Uuid::new_v4().to_string())
+            }
+            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SendMessage result: {other:?}"
+            ))),
+        }
+    }
 }
 
 #[interface(name = "org.desktopAssistant.Conversations")]
@@ -244,34 +286,30 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
     /// the in-process adapter where the dbus-interface created its
     /// own request id.
     async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> fdo::Result<String> {
-        let result = self
-            .dispatch(api::Command::SendMessage {
-                conversation_id: conversation_id.to_string(),
-                content: prompt.to_string(),
-                override_selection: None,
-                system_refinement: String::new(),
-            })
+        self.dispatch_send_message(conversation_id, prompt, String::new())
             .await
-            .map_err(|e| {
-                // SendMessage returns an immediate Ack on success; if
-                // the daemon refused the request before streaming, we
-                // surface the error directly.
-                to_fdo(e)
-            })?;
+    }
 
-        match result {
-            api::CommandResult::Ack => {
-                // Daemon hasn't told us the request id yet — events
-                // will carry it. Use a placeholder so clients have
-                // something to log against; the events flowing through
-                // the forwarder carry the daemon's correlation id.
-                Ok(uuid::Uuid::new_v4().to_string())
-            }
-            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
-            other => Err(fdo::Error::Failed(format!(
-                "unexpected SendMessage result: {other:?}"
-            ))),
-        }
+    /// Like [`send_prompt`](Self::send_prompt) but attaches a
+    /// per-request `system_refinement` that the daemon appends to the
+    /// system prompt for THIS turn only. The refinement is never stored
+    /// as a message and never affects later turns (see
+    /// `api::Command::SendMessage`), so the visible transcript records
+    /// only the clean `prompt`. An empty `system_refinement` is
+    /// equivalent to [`send_prompt`](Self::send_prompt).
+    ///
+    /// Added additively (issue #200 follow-up) so the voice daemon can
+    /// dictate "respond briefly, by voice" into an existing chat without
+    /// polluting history. `send_prompt` is intentionally left
+    /// byte-identical for existing chat clients.
+    async fn send_prompt_with_system_refinement(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        system_refinement: &str,
+    ) -> fdo::Result<String> {
+        self.dispatch_send_message(conversation_id, prompt, system_refinement.to_string())
+            .await
     }
 
     /// Signal emitted for each chunk of a streaming response.
@@ -304,4 +342,119 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         request_id: &str,
         error: &str,
     ) -> zbus::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Mutex;
+    use tokio::sync::broadcast;
+
+    /// Recording [`BridgeTransport`] that captures every dispatched
+    /// command so a test can assert the exact `api::Command` the adapter
+    /// builds. Returns a fixed `SendMessageAck` so the adapter's
+    /// result-mapping path is exercised end to end.
+    struct RecordingTransport {
+        commands: Mutex<Vec<api::Command>>,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeTransport for RecordingTransport {
+        async fn request(
+            &self,
+            command: api::Command,
+        ) -> Result<api::CommandResult, BridgeTransportError> {
+            self.commands.lock().await.push(command);
+            Ok(api::CommandResult::SendMessageAck {
+                task_id: "task-1".to_string(),
+            })
+        }
+
+        fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
+            let (tx, rx) = broadcast::channel(1);
+            // Keep the sender alive for the lifetime of the receiver so
+            // it isn't immediately closed; tests here don't emit events.
+            std::mem::forget(tx);
+            rx
+        }
+    }
+
+    /// A non-empty refinement must produce a `SendMessage` whose
+    /// `system_refinement` carries that text and whose `content` is the
+    /// CLEAN prompt (no blurb prepended). This is the wire half of the
+    /// voice "system-prompt refinement" feature: the daemon appends the
+    /// refinement to the system prompt for this turn only, while the
+    /// visible transcript records just `content`.
+    #[tokio::test]
+    async fn send_prompt_with_system_refinement_sets_refinement_and_clean_content() {
+        let transport = Arc::new(RecordingTransport::new());
+        let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
+
+        let task_id = adapter
+            .send_prompt_with_system_refinement(
+                "conv-1",
+                "what's the weather?",
+                "Respond briefly, by voice.",
+            )
+            .await
+            .expect("send returns the daemon task id");
+        assert_eq!(task_id, "task-1");
+
+        let commands = transport.commands.lock().await;
+        assert_eq!(commands.len(), 1, "exactly one command dispatched");
+        match &commands[0] {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                override_selection,
+                system_refinement,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                // The prompt is stored CLEAN — no "You are Adele…" blurb.
+                assert_eq!(content, "what's the weather?");
+                assert_eq!(system_refinement, "Respond briefly, by voice.");
+                assert!(override_selection.is_none());
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+    }
+
+    /// `SendPrompt` must stay byte-identical: it builds a `SendMessage`
+    /// with an EMPTY `system_refinement` so existing chat clients are
+    /// unaffected by the additive method.
+    #[tokio::test]
+    async fn send_prompt_leaves_system_refinement_empty() {
+        let transport = Arc::new(RecordingTransport::new());
+        let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
+
+        adapter.send_prompt("conv-2", "hello").await.unwrap();
+
+        let commands = transport.commands.lock().await;
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                override_selection,
+                system_refinement,
+            } => {
+                assert_eq!(conversation_id, "conv-2");
+                assert_eq!(content, "hello");
+                assert!(
+                    system_refinement.is_empty(),
+                    "send_prompt must not set a refinement"
+                );
+                assert!(override_selection.is_none());
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+    }
 }

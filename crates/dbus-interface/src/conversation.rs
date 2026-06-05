@@ -4,6 +4,7 @@ use desktop_assistant_core::domain::ConversationId;
 use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 use desktop_assistant_core::ports::inbound::ConversationService;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
 
@@ -20,6 +21,87 @@ pub struct DbusConversationAdapter<S: ConversationService + 'static> {
 impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
     pub fn new(service: Arc<S>) -> Self {
         Self { service }
+    }
+
+    /// Shared body for `SendPrompt` / `SendPromptWithSystemRefinement`:
+    /// spawn the LLM-call task (carrying `system_refinement`; empty =
+    /// none) under the resolved user_id scope, spawn the signal-emitter
+    /// task, and return the correlation `request_id`. Keeping this in one
+    /// place guarantees the two D-Bus methods stay identical apart from
+    /// the refinement.
+    async fn start_streaming_send(
+        &self,
+        emitter: SignalEmitter<'_>,
+        conversation_id: &str,
+        prompt: &str,
+        system_refinement: String,
+    ) -> String {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let conv_id = conversation_id.to_string();
+        let prompt = prompt.to_string();
+        let service = Arc::clone(&self.service);
+        let req_id = request_id.clone();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+
+        // Install the D-Bus user_id scope before spawning the LLM
+        // task so `spawn_send_prompt_llm_task` captures the right id
+        // for the in-spawn `with_user_id` wrap (#156).
+        let llm_conv_id = conv_id.clone();
+        with_user_id(resolve_dbus_user_id(), async {
+            drop(spawn_send_prompt_llm_task(
+                service,
+                llm_conv_id,
+                prompt,
+                system_refinement,
+                tx,
+            ));
+        })
+        .await;
+
+        // Spawn the signal emitter task. Signal emission does not
+        // touch per-user storage, so it doesn't need the scope.
+        let emitter = emitter.to_owned();
+        let signal_conv_id = conv_id.clone();
+        let signal_req_id = req_id.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Chunk(chunk) => {
+                        if let Err(e) =
+                            Self::response_chunk(&emitter, &signal_conv_id, &signal_req_id, &chunk)
+                                .await
+                        {
+                            tracing::error!("failed to emit ResponseChunk signal: {e}");
+                        }
+                    }
+                    StreamEvent::Complete(full) => {
+                        if let Err(e) = Self::response_complete(
+                            &emitter,
+                            &signal_conv_id,
+                            &signal_req_id,
+                            &full,
+                        )
+                        .await
+                        {
+                            tracing::error!("failed to emit ResponseComplete signal: {e}");
+                        }
+                        break;
+                    }
+                    StreamEvent::Error(err) => {
+                        if let Err(e) =
+                            Self::response_error(&emitter, &signal_conv_id, &signal_req_id, &err)
+                                .await
+                        {
+                            tracing::error!("failed to emit ResponseError signal: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        request_id
     }
 }
 
@@ -44,6 +126,7 @@ pub(crate) async fn run_send_prompt_llm_task<S>(
     service: Arc<S>,
     conversation_id: String,
     prompt: String,
+    system_refinement: String,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) where
     S: ConversationService + 'static,
@@ -54,14 +137,25 @@ pub(crate) async fn run_send_prompt_llm_task<S>(
 
     let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(|_| {});
 
+    // `system_refinement` (empty = none) is a per-request addition to the
+    // system prompt for THIS turn only. We route through
+    // `send_prompt_with_override` with no model override and install the
+    // refinement as a task-local; the core service appends it to the system
+    // message for the LLM call but never stores it, so the visible transcript
+    // records only the clean `prompt`. A fresh `CancellationToken` preserves
+    // pre-existing behaviour (this in-process adapter never cancels).
     match service
-        .send_prompt(
+        .send_prompt_with_override(
             &ConversationId::from(conversation_id.as_str()),
             prompt,
+            None,
+            system_refinement,
             callback,
             on_status,
+            CancellationToken::new(),
         )
         .await
+        .map(|outcome| outcome.response)
     {
         Ok(full_response) => {
             let _ = tx.send(StreamEvent::Complete(full_response));
@@ -90,6 +184,7 @@ pub(crate) fn spawn_send_prompt_llm_task<S>(
     service: Arc<S>,
     conversation_id: String,
     prompt: String,
+    system_refinement: String,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -98,7 +193,7 @@ where
     let user_id_for_body = current_user_id();
     tokio::spawn(with_user_id(
         user_id_for_body,
-        run_send_prompt_llm_task(service, conversation_id, prompt, tx),
+        run_send_prompt_llm_task(service, conversation_id, prompt, system_refinement, tx),
     ))
 }
 
@@ -310,66 +405,33 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
         conversation_id: &str,
         prompt: &str,
     ) -> fdo::Result<String> {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let conv_id = conversation_id.to_string();
-        let prompt = prompt.to_string();
-        let service = Arc::clone(&self.service);
-        let req_id = request_id.clone();
+        Ok(self
+            .start_streaming_send(emitter, conversation_id, prompt, String::new())
+            .await)
+    }
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
-
-        // Install the D-Bus user_id scope before spawning the LLM
-        // task so `spawn_send_prompt_llm_task` captures the right id
-        // for the in-spawn `with_user_id` wrap (#156).
-        let llm_conv_id = conv_id.clone();
-        with_user_id(resolve_dbus_user_id(), async {
-            drop(spawn_send_prompt_llm_task(service, llm_conv_id, prompt, tx));
-        })
-        .await;
-
-        // Spawn the signal emitter task. Signal emission does not
-        // touch per-user storage, so it doesn't need the scope.
-        let emitter = emitter.to_owned();
-        let signal_conv_id = conv_id.clone();
-        let signal_req_id = req_id.clone();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    StreamEvent::Chunk(chunk) => {
-                        if let Err(e) =
-                            Self::response_chunk(&emitter, &signal_conv_id, &signal_req_id, &chunk)
-                                .await
-                        {
-                            tracing::error!("failed to emit ResponseChunk signal: {e}");
-                        }
-                    }
-                    StreamEvent::Complete(full) => {
-                        if let Err(e) = Self::response_complete(
-                            &emitter,
-                            &signal_conv_id,
-                            &signal_req_id,
-                            &full,
-                        )
-                        .await
-                        {
-                            tracing::error!("failed to emit ResponseComplete signal: {e}");
-                        }
-                        break;
-                    }
-                    StreamEvent::Error(err) => {
-                        if let Err(e) =
-                            Self::response_error(&emitter, &signal_conv_id, &signal_req_id, &err)
-                                .await
-                        {
-                            tracing::error!("failed to emit ResponseError signal: {e}");
-                        }
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(request_id)
+    /// Like [`send_prompt`](Self::send_prompt) but attaches a
+    /// per-request `system_refinement` that the daemon appends to the
+    /// system prompt for THIS turn only (empty = none). The refinement is
+    /// never stored as a message and never affects later turns, so the
+    /// visible transcript records only the clean `prompt`. Added
+    /// additively (issue #200 follow-up) for the voice daemon; the chat
+    /// clients' `send_prompt` is left byte-identical.
+    async fn send_prompt_with_system_refinement(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        conversation_id: &str,
+        prompt: &str,
+        system_refinement: &str,
+    ) -> fdo::Result<String> {
+        Ok(self
+            .start_streaming_send(
+                emitter,
+                conversation_id,
+                prompt,
+                system_refinement.to_string(),
+            )
+            .await)
     }
 
     /// Signal emitted for each chunk of a streaming response.
@@ -593,6 +655,7 @@ mod tests {
                 svc_for_task,
                 "conv-x".to_string(),
                 "hello".to_string(),
+                String::new(),
                 tx,
             )
         })
@@ -613,6 +676,129 @@ mod tests {
             observed,
             vec!["alice-spawn".to_string()],
             "spawned LLM-call body must observe the caller's user_id, not the default sentinel"
+        );
+    }
+
+    /// Service double that records the `prompt` and `system_refinement`
+    /// it was dispatched with via `send_prompt_with_override`, so the
+    /// `SendPromptWithSystemRefinement` plumbing can be asserted without a
+    /// real D-Bus connection.
+    struct RefinementCapturingService {
+        prompt: Mutex<Option<String>>,
+        refinement: Mutex<Option<String>>,
+    }
+
+    impl RefinementCapturingService {
+        fn new() -> Self {
+            Self {
+                prompt: Mutex::new(None),
+                refinement: Mutex::new(None),
+            }
+        }
+    }
+
+    impl ConversationService for RefinementCapturingService {
+        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("rec-id", title))
+        }
+        async fn list_conversations(
+            &self,
+            _: Option<u32>,
+            _: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "rec"))
+        }
+        async fn delete_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _: &ConversationId,
+            _: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _: &ConversationId,
+            _: String,
+            _: ChunkCallback,
+            _: StatusCallback,
+        ) -> Result<String, CoreError> {
+            // Should not be hit: the adapter routes through
+            // `send_prompt_with_override` so the refinement is carried.
+            panic!("plain send_prompt must not be called by the streaming send path");
+        }
+        async fn send_prompt_with_override(
+            &self,
+            _conversation_id: &ConversationId,
+            prompt: String,
+            _override_selection: Option<
+                desktop_assistant_core::ports::inbound::PromptSelectionOverride,
+            >,
+            system_refinement: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+            _cancellation: CancellationToken,
+        ) -> Result<desktop_assistant_core::ports::inbound::PromptDispatchOutcome, CoreError>
+        {
+            *self.prompt.lock().unwrap() = Some(prompt);
+            *self.refinement.lock().unwrap() = Some(system_refinement);
+            on_chunk("ok".to_string());
+            Ok(
+                desktop_assistant_core::ports::inbound::PromptDispatchOutcome {
+                    response: "ok".to_string(),
+                    warnings: Vec::new(),
+                },
+            )
+        }
+    }
+
+    /// The `SendPromptWithSystemRefinement` path must pass the CLEAN
+    /// prompt as `content` and the caller-supplied text as
+    /// `system_refinement` through to the core service — mirroring the
+    /// `SendPrompt` handler but with the refinement populated. (The core
+    /// service is what guarantees the refinement is appended to the
+    /// system prompt for this turn only and never stored; see
+    /// `service::tests::system_refinement_is_appended_to_system_prompt_for_the_request`.)
+    #[tokio::test]
+    async fn send_prompt_with_system_refinement_routes_clean_prompt_and_refinement() {
+        let service = Arc::new(RefinementCapturingService::new());
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+
+        run_send_prompt_llm_task(
+            Arc::clone(&service),
+            "conv-x".to_string(),
+            "what's the weather?".to_string(),
+            "Respond briefly, by voice.".to_string(),
+            tx,
+        )
+        .await;
+
+        // Drain so we know the body ran to completion.
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(
+            service.prompt.lock().unwrap().as_deref(),
+            Some("what's the weather?"),
+            "the clean prompt (no blurb) must be sent as content"
+        );
+        assert_eq!(
+            service.refinement.lock().unwrap().as_deref(),
+            Some("Respond briefly, by voice."),
+            "the configured hint must be carried as the per-request system_refinement"
         );
     }
 

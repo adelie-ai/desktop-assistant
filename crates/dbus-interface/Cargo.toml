@@ -10,6 +10,7 @@ desktop-assistant-application = { path = "../application" }
 desktop-assistant-api-model = { path = "../api-model" }
 zbus.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
