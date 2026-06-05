@@ -59,6 +59,64 @@ pub(crate) const MAX_OVERFLOW_RETRIES: u32 = 3;
 /// avoid the "notice larger than payload" pathology, not to be precise.
 pub(crate) const MIN_TRUNCATION_TOKENS: u64 = 1024;
 
+/// Maximum byte length a single tool result may occupy before it is
+/// truncated at ingestion (issue #174). A misbehaving tool can return a
+/// multi-megabyte payload (observed: 124 MB across 8 messages); stored
+/// verbatim it wedges the conversation against the model's context window
+/// on *every* subsequent turn and stalls the `messages` INSERT. Capping at
+/// ingestion bounds the blast radius of any single tool call.
+///
+/// Why a byte cap rather than a token cap: it's deterministic, O(1) to
+/// check, requires no estimator pass over a huge string, and directly
+/// bounds what is written to the database. 256 KiB is ~64K tokens at the
+/// chars/4 default — far above any legitimate tool result, so honest tools
+/// are never touched.
+pub(crate) const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+
+/// Replacement tail appended when a tool result is truncated at ingestion.
+/// Addressed to the model so it learns to re-run the tool with a narrower
+/// request instead of assuming the output was complete.
+pub(crate) fn tool_result_truncation_notice(original_bytes: usize) -> String {
+    format!(
+        "\n\n<tool output truncated: {original_bytes} bytes exceeded the per-result \
+         storage cap; only the beginning is shown. Re-run the tool with a narrower \
+         request — e.g. a smaller byte/line range, a filtered listing, or only the \
+         fields you need — to see the rest.>"
+    )
+}
+
+/// Cap a tool result to `max_bytes` before it is stored as a message.
+///
+/// Returns `None` when `content` already fits (the common case — no
+/// allocation, caller stores the original). Returns `Some(truncated)` when
+/// it is over the cap: the longest UTF-8 prefix that, together with
+/// [`tool_result_truncation_notice`], stays within `max_bytes`. Truncation
+/// always lands on a `char` boundary so the result is valid UTF-8.
+pub(crate) fn cap_tool_result(content: &str, max_bytes: usize) -> Option<String> {
+    if content.len() <= max_bytes {
+        return None;
+    }
+
+    let notice = tool_result_truncation_notice(content.len());
+    // Reserve room for the notice. If the cap is so small the notice alone
+    // would not fit, keep no prefix — the notice still tells the model what
+    // happened (a pathological case; real caps dwarf the notice).
+    let body_budget = max_bytes.saturating_sub(notice.len());
+
+    // Largest char boundary at or below the body budget. `is_char_boundary`
+    // is O(1) and at most three steps back from any byte index, so this is
+    // cheap even for a multi-megabyte payload.
+    let mut cut = body_budget.min(content.len());
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+
+    let mut truncated = String::with_capacity(cut + notice.len());
+    truncated.push_str(&content[..cut]);
+    truncated.push_str(&notice);
+    Some(truncated)
+}
+
 /// Fraction of the prompt-token budget the system instruction (static
 /// prompt + tool availability listing) is allowed to consume before the
 /// listing is demoted to a namespace-only summary.
@@ -1015,6 +1073,68 @@ mod tests {
         let notice = overflow_truncation_notice(500, None, None);
         assert!(notice.contains("500 bytes"));
         assert!(!notice.contains("prompt was"));
+    }
+
+    // --- Tool-result ingestion cap (issue #174) ---
+
+    #[test]
+    fn cap_tool_result_returns_none_when_under_cap() {
+        assert_eq!(cap_tool_result("small output", 1024), None);
+    }
+
+    #[test]
+    fn cap_tool_result_empty_is_unchanged() {
+        assert_eq!(cap_tool_result("", 1024), None);
+    }
+
+    #[test]
+    fn cap_tool_result_exactly_at_cap_is_unchanged() {
+        let content = "x".repeat(1024);
+        assert_eq!(cap_tool_result(&content, 1024), None);
+    }
+
+    #[test]
+    fn cap_tool_result_truncates_when_over_cap_with_notice() {
+        let content = "x".repeat(10_000);
+        let out = cap_tool_result(&content, 1024).expect("over-cap result must truncate");
+        assert!(
+            out.len() <= 1024,
+            "truncated result {} > cap 1024",
+            out.len()
+        );
+        assert!(out.contains("truncated"), "notice must explain truncation");
+        assert!(
+            out.contains("10000 bytes"),
+            "notice must cite the original size"
+        );
+        // The kept prefix is from the original content.
+        assert!(out.starts_with("xxxx"));
+    }
+
+    #[test]
+    fn cap_tool_result_stays_within_byte_cap_across_sizes() {
+        for cap in [512usize, 1024, 4096, 50_000] {
+            let content = "y".repeat(cap * 4);
+            let out = cap_tool_result(&content, cap).expect("over-cap must truncate");
+            assert!(
+                out.len() <= cap,
+                "cap {cap}: result {} exceeds cap",
+                out.len()
+            );
+        }
+    }
+
+    #[test]
+    fn cap_tool_result_truncates_on_char_boundary_no_panic() {
+        // Dense multi-byte content: every char is 4 bytes. A naive byte cut
+        // would land mid-codepoint and panic; the cap must snap to a
+        // boundary and always yield valid UTF-8.
+        let content = "🚀".repeat(2_000); // 8_000 bytes
+        let out = cap_tool_result(&content, 1024).expect("over-cap must truncate");
+        assert!(out.len() <= 1024);
+        // Valid UTF-8 by construction (String), and the kept prefix is whole rockets.
+        assert!(out.starts_with('🚀'));
+        assert!(out.contains("truncated"));
     }
 
     // --- Pure assembly tests (issue #65 + earlier) ---
