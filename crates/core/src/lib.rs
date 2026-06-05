@@ -3,6 +3,7 @@
 pub mod chunking;
 pub mod context;
 pub mod domain;
+pub mod error_classify;
 pub mod ports;
 pub mod prompts;
 pub mod sanitize;
