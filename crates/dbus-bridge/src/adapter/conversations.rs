@@ -64,6 +64,8 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
                 content: prompt.to_string(),
                 override_selection: None,
                 system_refinement,
+                // The D-Bus bridge does not originate idempotency keys (#204).
+                idempotency_key: None,
             })
             .await
             .map_err(|e| {
@@ -416,6 +418,7 @@ mod tests {
                 content,
                 override_selection,
                 system_refinement,
+                ..
             } => {
                 assert_eq!(conversation_id, "conv-1");
                 // The prompt is stored CLEAN — no "You are Adele…" blurb.
@@ -445,6 +448,7 @@ mod tests {
                 content,
                 override_selection,
                 system_refinement,
+                ..
             } => {
                 assert_eq!(conversation_id, "conv-2");
                 assert_eq!(content, "hello");

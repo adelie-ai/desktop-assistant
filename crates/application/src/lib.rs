@@ -22,6 +22,7 @@ use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
     ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
+use desktop_assistant_core::ports::store::IdempotencyKeyStore;
 use thiserror::Error;
 use tracing::warn;
 
@@ -188,9 +189,10 @@ pub trait AssistantApiHandler: Send + Sync {
         override_selection: Option<api::SendPromptOverride>,
         system_refinement: String,
         request_id: String,
+        idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
-        let _ = (override_selection, system_refinement);
+        let _ = (override_selection, system_refinement, idempotency_key);
         self.handle_send_message(conversation_id, content, request_id, sink)
             .await
     }
@@ -216,6 +218,9 @@ pub trait AssistantApiHandler: Send + Sync {
                 override_selection,
                 system_refinement,
                 request_id,
+                // The context-aware variant is a test/multi-tenant helper; it
+                // does not carry an idempotency key (#204).
+                None,
                 sink,
             ),
         )
@@ -253,6 +258,7 @@ pub trait AssistantApiHandler: Send + Sync {
     /// bare-Ack flow and dispatch `handle_send_message_with_override`
     /// directly — used by tests and single-tenant deploys that don't
     /// attach a registry to the handler.
+    #[allow(clippy::too_many_arguments)]
     async fn start_send_message(
         &self,
         conversation_id: String,
@@ -260,6 +266,7 @@ pub trait AssistantApiHandler: Send + Sync {
         override_selection: Option<api::SendPromptOverride>,
         system_refinement: String,
         request_id: String,
+        idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<Option<api::TaskId>> {
         let _ = (
@@ -268,6 +275,7 @@ pub trait AssistantApiHandler: Send + Sync {
             override_selection,
             system_refinement,
             request_id,
+            idempotency_key,
             sink,
         );
         Ok(None)
@@ -317,6 +325,12 @@ where
     scratchpad_list: Option<ScratchpadListFn>,
     scratchpad_delete_many: Option<ScratchpadDeleteManyFn>,
     scratchpad_clear: Option<ScratchpadClearFn>,
+    /// Optional idempotency-key store (#204). When attached, a `SendMessage`
+    /// carrying an `idempotency_key` whose turn already completed replays the
+    /// stored reply instead of re-running the LLM/tools (crash-safe
+    /// completed-dedup). `None` (no DB, tests) makes the key a no-op so
+    /// `SendMessage` behaves exactly as before.
+    idempotency: Option<Arc<dyn IdempotencyKeyStore>>,
 }
 
 impl<A, C, S, N, K> DefaultAssistantApiHandler<A, C, S, N, K>
@@ -346,6 +360,7 @@ where
             scratchpad_list: None,
             scratchpad_delete_many: None,
             scratchpad_clear: None,
+            idempotency: None,
         }
     }
 
@@ -383,6 +398,43 @@ where
     /// only the foreground path itself needs it.
     pub fn registry(&self) -> Option<&Arc<BackgroundTaskRegistry>> {
         self.registry.as_ref()
+    }
+
+    /// Attach an [`IdempotencyKeyStore`] so `SendMessage`s that carry an
+    /// `idempotency_key` are deduplicated: a retry of a turn that already
+    /// completed replays the stored reply instead of re-running it (#204).
+    /// The daemon wires this in `main.rs` when a database is available;
+    /// callers without one skip it and keys become no-ops.
+    pub fn with_idempotency_store(mut self, store: Arc<dyn IdempotencyKeyStore>) -> Self {
+        self.idempotency = Some(store);
+        self
+    }
+
+    /// Completed-dedup helper (#204). When an idempotency key is present, a
+    /// store is attached, and that `(current user, conversation, key)`
+    /// already holds a committed reply, replay it to `sink` and return
+    /// `true` so the caller skips dispatching a fresh turn. Returns `false`
+    /// (caller runs the turn normally) when there is no key, no store, or no
+    /// completed row.
+    async fn try_replay_idempotent(
+        &self,
+        conversation_id: &str,
+        idempotency_key: Option<&str>,
+        request_id: &str,
+        sink: &Arc<dyn EventSink>,
+    ) -> ApiResult<bool> {
+        let (Some(key), Some(store)) = (idempotency_key, self.idempotency.as_ref()) else {
+            return Ok(false);
+        };
+        let Some(response) = store
+            .lookup_completed(conversation_id, key)
+            .await
+            .map_err(Self::map_core_err)?
+        else {
+            return Ok(false);
+        };
+        replay_completed_response(sink, conversation_id, request_id, response).await;
+        Ok(true)
     }
 
     fn map_core_err<E: ToString>(e: E) -> ApiError {
@@ -1385,6 +1437,7 @@ where
             None,
             String::new(),
             request_id,
+            None,
             sink,
         )
         .await
@@ -1397,8 +1450,28 @@ where
         override_selection: Option<api::SendPromptOverride>,
         system_refinement: String,
         request_id: String,
+        idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
+        // Completed-dedup (#204): if this key already has a committed reply,
+        // replay it and skip dispatching a fresh turn. (The registry-aware
+        // streaming path does the same check in `start_send_message`; this
+        // covers the no-registry / direct-call path.)
+        if self
+            .try_replay_idempotent(
+                &conversation_id,
+                idempotency_key.as_deref(),
+                &request_id,
+                &sink,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        // Pair the store with the key (both-or-neither) so the turn body
+        // records the reply on completion for a future retry.
+        let idempotency = self.idempotency.clone().zip(idempotency_key);
+
         // When a registry is attached we route the turn body through
         // it so the user has a cancellable, identifiable handle on the
         // running work (#111). When no registry is attached we fall back
@@ -1412,6 +1485,7 @@ where
                 override_selection,
                 system_refinement,
                 request_id,
+                idempotency,
                 sink,
             )
             .await
@@ -1423,6 +1497,7 @@ where
                 override_selection,
                 system_refinement,
                 request_id,
+                idempotency,
                 sink,
                 tokio_util::sync::CancellationToken::new(),
             )
@@ -1440,6 +1515,7 @@ where
     /// Returns `None` when no registry is attached so callers
     /// (transport-dispatch) can fall back to the legacy
     /// `handle_send_message_with_override` + bare-`Ack` flow.
+    #[allow(clippy::too_many_arguments)]
     async fn start_send_message(
         &self,
         conversation_id: String,
@@ -1447,13 +1523,50 @@ where
         override_selection: Option<api::SendPromptOverride>,
         system_refinement: String,
         request_id: String,
+        idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<Option<api::TaskId>> {
         let Some(registry) = self.registry.clone() else {
             return Ok(None);
         };
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
+
+        // Completed-dedup (#204): when this key already has a committed
+        // reply, register a tiny replay task so the dispatcher's
+        // `SendMessageAck { task_id }` arrives before the stream — exactly
+        // as for a normal turn — then replay the stored reply instead of
+        // re-running the LLM/tools.
+        if let (Some(key), Some(store)) = (idempotency_key.as_deref(), self.idempotency.as_ref()) {
+            let completed = store
+                .lookup_completed(&conversation_id, key)
+                .await
+                .map_err(Self::map_core_err)?;
+            if let Some(response) = completed {
+                let kind = api::TaskKind::Conversation {
+                    conversation_id: conversation_id.clone(),
+                };
+                let title = format!("Conversation: {conversation_id}");
+                let sink_for_replay = Arc::clone(&sink);
+                let conv_for_replay = conversation_id.clone();
+                let req_for_replay = request_id.clone();
+                let task_id = registry.spawn(user_id, kind, title, move |_ctx| async move {
+                    replay_completed_response(
+                        &sink_for_replay,
+                        &conv_for_replay,
+                        &req_for_replay,
+                        response,
+                    )
+                    .await;
+                    Ok(())
+                });
+                return Ok(Some(task_id));
+            }
+        }
+
         let conversations = Arc::clone(&self.conversations);
+        // Pair the store with the key (both-or-neither) so the turn body
+        // records the reply on completion for a future retry (#204).
+        let idempotency = self.idempotency.clone().zip(idempotency_key);
         let kind = api::TaskKind::Conversation {
             conversation_id: conversation_id.clone(),
         };
@@ -1490,6 +1603,7 @@ where
                     override_selection,
                     system_refinement,
                     request_id_for_body,
+                    idempotency,
                     sink_for_body,
                     ctx.token.clone(),
                 ),
@@ -1543,6 +1657,7 @@ where
         override_selection: Option<api::SendPromptOverride>,
         system_refinement: String,
         request_id: String,
+        idempotency: Option<(Arc<dyn IdempotencyKeyStore>, String)>,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
@@ -1582,6 +1697,7 @@ where
                     override_selection,
                     system_refinement,
                     request_id_for_body,
+                    idempotency,
                     sink_for_body,
                     ctx.token.clone(),
                 ),
@@ -1776,6 +1892,33 @@ where
     })
 }
 
+/// Re-emit a stored idempotent reply (#204) as the canonical event
+/// sequence a fresh turn produces — one `AssistantDelta` carrying the full
+/// text, then `AssistantCompleted` — keyed by the *current* `request_id` so
+/// the retrying client correlates it with its pending request. Best-effort:
+/// a dropped sink just means the client went away.
+async fn replay_completed_response(
+    sink: &Arc<dyn EventSink>,
+    conversation_id: &str,
+    request_id: &str,
+    response: String,
+) {
+    let _ = sink
+        .emit(api::Event::AssistantDelta {
+            conversation_id: conversation_id.to_string(),
+            request_id: request_id.to_string(),
+            chunk: response.clone(),
+        })
+        .await;
+    let _ = sink
+        .emit(api::Event::AssistantCompleted {
+            conversation_id: conversation_id.to_string(),
+            request_id: request_id.to_string(),
+            full_response: response,
+        })
+        .await;
+}
+
 /// Inline turn body, shared between the registry-aware and the
 /// no-registry code paths. Returns `CoreError` so the caller can either
 /// map it for the trait return type or propagate it into the registry's
@@ -1792,6 +1935,7 @@ async fn run_send_turn<C>(
     override_selection: Option<api::SendPromptOverride>,
     system_refinement: String,
     request_id: String,
+    idempotency: Option<(Arc<dyn IdempotencyKeyStore>, String)>,
     sink: Arc<dyn EventSink>,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<(), desktop_assistant_core::CoreError>
@@ -1874,6 +2018,19 @@ where
             }
 
             let full_response = outcome.response;
+
+            // Record the committed reply for idempotent retry (#204) before
+            // emitting completion. Best-effort: a storage error is logged but
+            // must not fail a turn the client has effectively received.
+            if let Some((store, key)) = &idempotency {
+                let recorded = store
+                    .record_response(&conversation_id, key, &request_id, &full_response)
+                    .await;
+                if let Err(e) = recorded {
+                    warn!("failed to record idempotency reply for key {key}: {e}");
+                }
+            }
+
             let _ = sink
                 .emit(api::Event::AssistantCompleted {
                     conversation_id: conversation_id.clone(),
@@ -3200,6 +3357,360 @@ mod tests {
             api::CommandResult::Pong {
                 value: "pong".into()
             }
+        );
+    }
+
+    // --- Idempotency-key completed-dedup (#204) ---------------------------
+
+    /// `ConversationService` double that counts how many turns actually run
+    /// and returns a fixed reply, so dedup tests can assert that a replayed
+    /// retry did NOT re-invoke the LLM.
+    struct CountingConversations {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        reply: String,
+    }
+    #[async_trait::async_trait]
+    impl ConversationService for CountingConversations {
+        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("c1", title))
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            on_chunk(self.reply.clone());
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// In-memory `IdempotencyKeyStore` scoped by `current_user_id()` exactly
+    /// like `PgIdempotencyKeyStore`, so the dedup handler logic (including
+    /// per-(user, conversation, key) scoping) can be exercised without
+    /// Postgres.
+    #[derive(Default)]
+    struct InMemoryIdempotency {
+        rows: Mutex<std::collections::HashMap<(String, String, String), String>>,
+    }
+    #[async_trait::async_trait]
+    impl IdempotencyKeyStore for InMemoryIdempotency {
+        async fn lookup_completed(
+            &self,
+            conversation_id: &str,
+            idempotency_key: &str,
+        ) -> Result<Option<String>, CoreError> {
+            let uid = desktop_assistant_core::ports::auth::current_user_id()
+                .as_str()
+                .to_string();
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(
+                    uid,
+                    conversation_id.to_string(),
+                    idempotency_key.to_string(),
+                ))
+                .cloned())
+        }
+        async fn record_response(
+            &self,
+            conversation_id: &str,
+            idempotency_key: &str,
+            _request_id: &str,
+            response: &str,
+        ) -> Result<(), CoreError> {
+            let uid = desktop_assistant_core::ports::auth::current_user_id()
+                .as_str()
+                .to_string();
+            self.rows.lock().unwrap().insert(
+                (
+                    uid,
+                    conversation_id.to_string(),
+                    idempotency_key.to_string(),
+                ),
+                response.to_string(),
+            );
+            Ok(())
+        }
+    }
+
+    fn idem_handler(
+        conv: Arc<CountingConversations>,
+        store: Arc<InMemoryIdempotency>,
+    ) -> DefaultAssistantApiHandler<
+        FakeAssistant,
+        CountingConversations,
+        FakeSettings,
+        FakeConnections,
+        FakeKnowledge,
+    > {
+        DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            conv,
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_idempotency_store(store)
+    }
+
+    /// Fresh key (no stored row): the turn runs once and its reply is
+    /// recorded so a future retry can replay it.
+    #[tokio::test]
+    async fn idempotency_new_key_runs_turn_and_records_reply() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "answer".into(),
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        let h = idem_handler(conv, Arc::clone(&store));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "a fresh key runs the turn");
+        assert_eq!(
+            store.lookup_completed("c1", "k1").await.unwrap().as_deref(),
+            Some("answer"),
+            "the committed reply is recorded under the key"
+        );
+    }
+
+    /// A key whose turn already completed replays the stored reply and does
+    /// NOT re-run the LLM — the crash-safe completed-dedup win.
+    #[tokio::test]
+    async fn idempotency_completed_key_replays_without_rerunning() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "fresh".into(),
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        store
+            .record_response("c1", "k1", "orig-req", "stored answer")
+            .await
+            .unwrap();
+        let h = idem_handler(conv, Arc::clone(&store));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "retry-req".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "a completed key must not re-run the turn"
+        );
+        let evs = sink.0.lock().await.clone();
+        assert!(
+            matches!(&evs[0], api::Event::AssistantDelta { request_id, chunk, .. }
+                if request_id == "retry-req" && chunk == "stored answer"),
+            "replay emits the stored reply as a delta keyed by the retry's request id, got {:?}",
+            evs.first()
+        );
+        assert!(
+            matches!(&evs[1], api::Event::AssistantCompleted { request_id, full_response, .. }
+                if request_id == "retry-req" && full_response == "stored answer"),
+            "replay completes with the stored reply, got {:?}",
+            evs.get(1)
+        );
+    }
+
+    /// No key: the turn runs and nothing is recorded (backward compat).
+    #[tokio::test]
+    async fn idempotency_absent_key_runs_and_records_nothing() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "x".into(),
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        let h = idem_handler(conv, Arc::clone(&store));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            None,
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no key still runs the turn");
+        assert!(
+            store.rows.lock().unwrap().is_empty(),
+            "a turn with no key records nothing"
+        );
+    }
+
+    /// Dedup is scoped to the conversation: the same key in a different
+    /// conversation is not a hit.
+    #[tokio::test]
+    async fn idempotency_scoped_to_conversation() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "x".into(),
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        store
+            .record_response("conv-A", "k1", "o", "stored")
+            .await
+            .unwrap();
+        let h = idem_handler(conv, Arc::clone(&store));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        h.handle_send_message_with_override(
+            "conv-B".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the same key in a different conversation is not a dedup hit"
+        );
+    }
+
+    /// Dedup is scoped to the user: another user's identical key is not a
+    /// hit (cross-tenant isolation).
+    #[tokio::test]
+    async fn idempotency_scoped_to_user() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "x".into(),
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        with_user_id(
+            UserId::new("alice"),
+            store.record_response("c1", "k1", "o", "alice-reply"),
+        )
+        .await
+        .unwrap();
+        let h = idem_handler(conv, Arc::clone(&store));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        with_user_id(
+            UserId::new("bob"),
+            h.handle_send_message_with_override(
+                "c1".into(),
+                "hi".into(),
+                None,
+                String::new(),
+                "r1".into(),
+                Some("k1".into()),
+                sink.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "another user's identical key must not dedup"
+        );
+    }
+
+    /// With no store attached, a key is a harmless no-op: the turn runs.
+    #[tokio::test]
+    async fn idempotency_no_store_is_noop() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "x".into(),
+        });
+        // Note: no `.with_idempotency_store(...)`.
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            conv,
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "a key with no store attached runs the turn as normal"
         );
     }
 }

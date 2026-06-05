@@ -924,6 +924,7 @@ async fn start_send_message_returns_task_id_that_appears_in_listing() {
                 None,
                 String::new(),
                 "req-1".into(),
+                None,
                 Arc::clone(&sink),
             )
             .await
@@ -978,6 +979,7 @@ async fn start_send_message_propagates_user_id_to_spawned_body() {
                 None,
                 String::new(),
                 "req-1".into(),
+                None,
                 Arc::clone(&sink),
             )
             .await
@@ -1020,6 +1022,7 @@ async fn handle_send_message_with_override_propagates_user_id_to_spawned_body() 
                 None,
                 String::new(),
                 "req-2".into(),
+                None,
                 sink,
             )
             .await
@@ -1057,6 +1060,7 @@ async fn start_send_message_returns_none_without_registry() {
                 None,
                 String::new(),
                 "req-1".into(),
+                None,
                 sink,
             )
             .await

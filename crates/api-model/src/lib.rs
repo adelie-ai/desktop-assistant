@@ -1237,6 +1237,7 @@ mod tests {
                 effort: Some(EffortLevel::High),
             }),
             system_refinement: String::new(),
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd2).unwrap();
         assert!(json.contains("\"override\":"));
@@ -1264,6 +1265,7 @@ mod tests {
             content: "hi".into(),
             override_selection: None,
             system_refinement: String::new(),
+            idempotency_key: None,
         };
         let json_empty = serde_json::to_string(&empty).unwrap();
         assert!(
@@ -1277,11 +1279,54 @@ mod tests {
             content: "hi".into(),
             override_selection: None,
             system_refinement: "Respond briefly, by voice.".into(),
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&with_refinement).unwrap();
         assert!(json.contains("\"system_refinement\":\"Respond briefly, by voice.\""));
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(with_refinement, back);
+    }
+
+    #[test]
+    fn send_message_idempotency_key_is_optional_and_round_trips() {
+        // Absent on the wire → None (byte-compatible with pre-#204 SendMessage).
+        let cmd: Command =
+            serde_json::from_str(r#"{"send_message":{"conversation_id":"c1","content":"hi"}}"#)
+                .unwrap();
+        match &cmd {
+            Command::SendMessage {
+                idempotency_key, ..
+            } => assert!(idempotency_key.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // None is omitted from the serialized form (no wire bloat for callers
+        // that don't use idempotency).
+        let without = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            idempotency_key: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(
+            !json.contains("idempotency_key"),
+            "an absent key must not appear on the wire: {json}"
+        );
+
+        // A present key serializes and round-trips.
+        let with_key = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            idempotency_key: Some("turn-uuid-1".into()),
+        };
+        let json = serde_json::to_string(&with_key).unwrap();
+        assert!(json.contains("\"idempotency_key\":\"turn-uuid-1\""));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_key, back);
     }
 
     #[test]

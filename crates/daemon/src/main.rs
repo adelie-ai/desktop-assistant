@@ -1634,6 +1634,17 @@ async fn run() -> Result<()> {
         api_handler_impl =
             api_handler_impl.with_scratchpad(write, get_many, list, delete_many, clear);
     }
+    // Idempotency-key dedup (#204): when a database is available, attach the
+    // store so a retried `SendMessage` carrying an `idempotency_key` whose turn
+    // already completed replays the stored reply instead of re-running it.
+    // Without a pool the key is a harmless no-op.
+    if let Some(pool) = &pg_pool {
+        let idempotency_store: Arc<dyn desktop_assistant_core::ports::store::IdempotencyKeyStore> =
+            Arc::new(desktop_assistant_storage::PgIdempotencyKeyStore::new(
+                pool.clone(),
+            ));
+        api_handler_impl = api_handler_impl.with_idempotency_store(idempotency_store);
+    }
     let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
         Arc::new(api_handler_impl);
 

@@ -119,6 +119,7 @@ impl AssistantApiHandler for RegistryHandler {
         _override_selection: Option<api::SendPromptOverride>,
         _system_refinement: String,
         _request_id: String,
+        _idempotency_key: Option<String>,
         _sink: Arc<dyn EventSink>,
     ) -> ApiResult<Option<api::TaskId>> {
         *self.start_send_calls.lock().unwrap() += 1;
@@ -419,6 +420,7 @@ async fn send_message_ack_carries_a_real_task_id() {
                 content: "hello".into(),
                 override_selection: None,
                 system_refinement: String::new(),
+                idempotency_key: None,
             },
         }],
     );
@@ -476,6 +478,7 @@ async fn send_message_falls_back_to_legacy_ack_when_handler_opts_out() {
                 content: "hello".into(),
                 override_selection: None,
                 system_refinement: String::new(),
+                idempotency_key: None,
             },
         }],
     );
