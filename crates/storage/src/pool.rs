@@ -172,5 +172,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Learned error-classification cache (issue #178, tier 2) — global
+    // (no user_id) connector knowledge mapping opaque error signatures to a
+    // normalized cause, populated by the cheap-LLM tier so repeats are
+    // recognized locally.
+    sqlx::raw_sql(include_str!("../migrations/022_error_classifications.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }

@@ -1449,6 +1449,29 @@ async fn main() -> Result<()> {
         .with_config_path(config_path.clone()),
     );
 
+    // Wire the learned (tier 2) and LLM (tier 3) tiers of the backend-error
+    // classifier (#178). The deterministic tier-1 matchers already run inside
+    // every `ClassifyingLlmClient` built by `build_llm_client`; here we install
+    // the process-wide store and a cheap classifier LLM (the titling-purpose
+    // routing client) so genuinely novel errors are learned. Requires a
+    // database — tier 1 keeps working without one. The reentrancy guard keeps
+    // the (itself-wrapped) classifier from recursing.
+    if let Some(pool) = &pg_pool {
+        let store: Arc<dyn desktop_assistant_core::ports::store::ErrorClassificationStore> =
+            Arc::new(desktop_assistant_storage::PgErrorClassificationStore::new(
+                pool.clone(),
+            ));
+        let classifier: Arc<dyn LlmClient> =
+            Arc::new(routing_llm::RoutingLlmClient::new_dynamic_purpose(
+                Arc::clone(&registry_handle),
+                purposes::PurposeKind::Titling,
+            ));
+        classifying_llm::install_classification_deps(classifying_llm::ClassificationDeps {
+            store,
+            classifier: Some(classifier),
+        });
+    }
+
     // Build a separate LLM for backend tasks (title generation, context summary).
     //
     // Resolution order:
