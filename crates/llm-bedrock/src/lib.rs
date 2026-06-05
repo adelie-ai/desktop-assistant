@@ -538,27 +538,55 @@ fn apply_stream_event(
     true
 }
 
-/// Parse a Bedrock validation-error message of the form
-/// `"prompt is too long: 203524 tokens > 200000 maximum"` into its
-/// numeric components. Returns `None` if the message doesn't match.
+/// Parsed details of a Bedrock context-overflow validation error. The token
+/// counts are optional because not every overflow message carries them (e.g.
+/// `"Input is too long for requested model."`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextOverflowInfo {
+    pub prompt_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+}
+
+/// Detect whether a Bedrock validation-error message means the prompt
+/// exceeded the model's context window, extracting the token counts when the
+/// message includes them. Returns `None` for unrelated errors so the caller
+/// falls through to the generic mapping.
 ///
-/// Used to map prompt-overflow errors into `CoreError::ContextOverflow`
-/// so the core service can truncate the offending tool result and retry
-/// rather than surfacing a hard failure.
-pub fn parse_prompt_too_long(message: &str) -> Option<(u64, u64)> {
+/// Recognized shapes (case-insensitive) — Bedrock is not consistent across
+/// model families, so we match several:
+///   - `"prompt is too long: 203524 tokens > 200000 maximum"` (Anthropic)
+///   - `"Input length (479258) exceeds model's maximum context length (131072)."`
+///   - `"Input is too long for requested model."` (no counts)
+///
+/// Mapping these to `CoreError::ContextOverflow` is what lets the core
+/// recovery ladder (truncate the largest tool result → trim old pairs →
+/// summarise-and-shrink) fire and retry, instead of surfacing a hard failure
+/// and losing the turn.
+pub fn parse_context_overflow(message: &str) -> Option<ContextOverflowInfo> {
     let lower = message.to_ascii_lowercase();
-    if !lower.contains("prompt is too long") {
+    let is_overflow = lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || (lower.contains("exceeds") && lower.contains("context length"));
+    if !is_overflow {
         return None;
     }
+
+    // Pull the first two integers, if any. Across the recognized shapes the
+    // counts appear as (prompt, max) in that order; fewer than two means the
+    // message stated the overflow without numbers, which is still actionable.
     let nums: Vec<u64> = message
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse::<u64>().ok())
         .collect();
-    match nums.as_slice() {
-        [prompt, max, ..] => Some((*prompt, *max)),
-        _ => None,
-    }
+    let (prompt_tokens, max_tokens) = match nums.as_slice() {
+        [prompt, max, ..] => (Some(*prompt), Some(*max)),
+        _ => (None, None),
+    };
+    Some(ContextOverflowInfo {
+        prompt_tokens,
+        max_tokens,
+    })
 }
 
 /// Map a Bedrock `converse_stream` SDK error to the equivalent
@@ -575,15 +603,15 @@ fn map_converse_stream_error(
     // the offending tool result and retry.
     if let Some(ConverseStreamError::ValidationException(ve)) = e.as_service_error() {
         let raw = ve.message().unwrap_or("unknown");
-        if let Some((prompt_tokens, max_tokens)) = parse_prompt_too_long(raw) {
+        if let Some(info) = parse_context_overflow(raw) {
             tracing::warn!(
-                prompt_tokens,
-                max_tokens,
+                prompt_tokens = ?info.prompt_tokens,
+                max_tokens = ?info.max_tokens,
                 "Bedrock rejected request for context overflow"
             );
             return CoreError::ContextOverflow {
-                prompt_tokens: Some(prompt_tokens),
-                max_tokens: Some(max_tokens),
+                prompt_tokens: info.prompt_tokens,
+                max_tokens: info.max_tokens,
                 detail: format!("Bedrock validation error: {raw}"),
             };
         }
@@ -1340,15 +1368,15 @@ fn map_converse_error(
     use aws_sdk_bedrockruntime::operation::converse::ConverseError;
     if let Some(ConverseError::ValidationException(ve)) = e.as_service_error() {
         let raw = ve.message().unwrap_or("unknown");
-        if let Some((prompt_tokens, max_tokens)) = parse_prompt_too_long(raw) {
+        if let Some(info) = parse_context_overflow(raw) {
             tracing::warn!(
-                prompt_tokens,
-                max_tokens,
+                prompt_tokens = ?info.prompt_tokens,
+                max_tokens = ?info.max_tokens,
                 "Bedrock rejected non-streaming request for context overflow"
             );
             return CoreError::ContextOverflow {
-                prompt_tokens: Some(prompt_tokens),
-                max_tokens: Some(max_tokens),
+                prompt_tokens: info.prompt_tokens,
+                max_tokens: info.max_tokens,
                 detail: format!("Bedrock validation error: {raw}"),
             };
         }
@@ -1609,30 +1637,61 @@ mod tests {
     }
 
     #[test]
-    fn parse_prompt_too_long_extracts_counts() {
+    fn parse_context_overflow_extracts_counts_anthropic_phrase() {
         assert_eq!(
-            parse_prompt_too_long("prompt is too long: 203524 tokens > 200000 maximum"),
-            Some((203_524, 200_000))
+            parse_context_overflow("prompt is too long: 203524 tokens > 200000 maximum"),
+            Some(ContextOverflowInfo {
+                prompt_tokens: Some(203_524),
+                max_tokens: Some(200_000),
+            })
         );
     }
 
     #[test]
-    fn parse_prompt_too_long_case_insensitive_phrase() {
+    fn parse_context_overflow_case_insensitive_phrase() {
         assert_eq!(
-            parse_prompt_too_long("Prompt Is Too Long: 250000 tokens > 200000 maximum"),
-            Some((250_000, 200_000))
+            parse_context_overflow("Prompt Is Too Long: 250000 tokens > 200000 maximum"),
+            Some(ContextOverflowInfo {
+                prompt_tokens: Some(250_000),
+                max_tokens: Some(200_000),
+            })
         );
     }
 
     #[test]
-    fn parse_prompt_too_long_rejects_unrelated_message() {
-        assert_eq!(parse_prompt_too_long("model not ready"), None);
-        assert_eq!(parse_prompt_too_long("bad token 12345 in request"), None);
+    fn parse_context_overflow_exceeds_maximum_context_length_form() {
+        // The exact string gpt-oss on Bedrock returns.
+        assert_eq!(
+            parse_context_overflow(
+                "Input length (479258) exceeds model's maximum context length (131072)."
+            ),
+            Some(ContextOverflowInfo {
+                prompt_tokens: Some(479_258),
+                max_tokens: Some(131_072),
+            })
+        );
     }
 
     #[test]
-    fn parse_prompt_too_long_handles_message_without_numbers() {
-        assert_eq!(parse_prompt_too_long("prompt is too long"), None);
+    fn parse_context_overflow_input_too_long_without_counts() {
+        // The other gpt-oss/Bedrock variant — no numbers available.
+        assert_eq!(
+            parse_context_overflow("Input is too long for requested model."),
+            Some(ContextOverflowInfo {
+                prompt_tokens: None,
+                max_tokens: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_context_overflow_rejects_unrelated_message() {
+        assert_eq!(parse_context_overflow("model not ready"), None);
+        assert_eq!(parse_context_overflow("bad token 12345 in request"), None);
+        assert_eq!(
+            parse_context_overflow("access denied: not authorized"),
+            None
+        );
     }
 
     #[test]
