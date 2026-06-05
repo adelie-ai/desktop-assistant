@@ -163,5 +163,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Message FTS INSERT guard (issue #177) — the migration-013 generated
+    // `tsv` column ran `to_tsvector` over full message content, which on a
+    // large/high-entropy message exceeds Postgres's 1 MB tsvector limit and
+    // aborts the INSERT. Redefine it to skip `tool`-role rows and bound the
+    // indexed input so a large message can always be stored.
+    sqlx::raw_sql(include_str!("../migrations/021_message_fts_guard.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
