@@ -620,6 +620,7 @@ pub fn map_effort_to_reasoning_config(
     }
 }
 
+#[async_trait::async_trait]
 impl<S, Inner> ConversationService for RoutingConversationHandler<S, Inner>
 where
     S: ConversationSelectionStore + 'static,
@@ -1471,6 +1472,7 @@ mod tests {
             }
         }
 
+        #[async_trait::async_trait]
         impl ConversationService for CapturingInner {
             async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
                 Ok(Conversation::new("c1", title))

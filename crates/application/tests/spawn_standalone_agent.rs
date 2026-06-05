@@ -370,6 +370,7 @@ impl RecordingConversations {
     }
 }
 
+#[async_trait::async_trait]
 impl ConversationService for RecordingConversations {
     async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
         let observed = current_user_id();

@@ -105,22 +105,27 @@ pub trait AssistantService: Send + Sync {
 }
 
 /// Inbound port for conversation management.
+///
+/// Uses [`async_trait::async_trait`] so the per-turn future is boxed
+/// (`Pin<Box<dyn Future>>`) rather than a deeply nested generic state
+/// machine. The interactive turn spawns `send_prompt[_with_override]` on
+/// a tokio worker (`dbus-interface` / `ws-interface` / subagents); the
+/// unboxed RPITIT form monomorphized into a multi-MB frame that
+/// overflowed the 2 MB worker stack (#205/#206). Boxing keeps the
+/// spawned future thin — the one heap allocation per call is negligible
+/// next to an LLM round-trip, the same trade-off
+/// [`crate::ports::llm::LlmClient`] already makes (#207).
+#[async_trait::async_trait]
 pub trait ConversationService: Send + Sync {
-    fn create_conversation(
-        &self,
-        title: String,
-    ) -> impl std::future::Future<Output = Result<Conversation, CoreError>> + Send;
+    async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError>;
 
-    fn list_conversations(
+    async fn list_conversations(
         &self,
         max_age_days: Option<u32>,
         include_archived: bool,
-    ) -> impl std::future::Future<Output = Result<Vec<ConversationSummary>, CoreError>> + Send;
+    ) -> Result<Vec<ConversationSummary>, CoreError>;
 
-    fn get_conversation(
-        &self,
-        id: &ConversationId,
-    ) -> impl std::future::Future<Output = Result<Conversation, CoreError>> + Send;
+    async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError>;
 
     /// Read the conversation's currently stored model selection, if one has
     /// been pinned by a prior override. Returns `Ok(None)` when the
@@ -129,50 +134,35 @@ pub trait ConversationService: Send + Sync {
     ///
     /// The default implementation returns `Ok(None)`; the daemon's routing
     /// wrapper overrides this to consult the persistent selection store.
-    fn get_conversation_model_selection(
+    async fn get_conversation_model_selection(
         &self,
         id: &ConversationId,
-    ) -> impl std::future::Future<Output = Result<Option<ConversationModelSelection>, CoreError>> + Send
-    where
-        Self: Sync,
-    {
-        async move {
-            let _ = id;
-            Ok(None)
-        }
+    ) -> Result<Option<ConversationModelSelection>, CoreError> {
+        let _ = id;
+        Ok(None)
     }
 
-    fn delete_conversation(
-        &self,
-        id: &ConversationId,
-    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+    async fn delete_conversation(&self, id: &ConversationId) -> Result<(), CoreError>;
 
-    fn rename_conversation(
+    async fn rename_conversation(
         &self,
         id: &ConversationId,
         title: String,
-    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+    ) -> Result<(), CoreError>;
 
-    fn archive_conversation(
-        &self,
-        id: &ConversationId,
-    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+    async fn archive_conversation(&self, id: &ConversationId) -> Result<(), CoreError>;
 
-    fn unarchive_conversation(
-        &self,
-        id: &ConversationId,
-    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+    async fn unarchive_conversation(&self, id: &ConversationId) -> Result<(), CoreError>;
 
-    fn clear_all_history(&self)
-    -> impl std::future::Future<Output = Result<u32, CoreError>> + Send;
+    async fn clear_all_history(&self) -> Result<u32, CoreError>;
 
-    fn send_prompt(
+    async fn send_prompt(
         &self,
         conversation_id: &ConversationId,
         prompt: String,
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
-    ) -> impl std::future::Future<Output = Result<String, CoreError>> + Send;
+    ) -> Result<String, CoreError>;
 
     /// Send a prompt with optional per-send model/connection override.
     ///
@@ -218,7 +208,7 @@ pub trait ConversationService: Send + Sync {
     // the 7-arg lint would obscure every implementor and call site across the
     // daemon, application, and connector layers.
     #[allow(clippy::too_many_arguments)]
-    fn send_prompt_with_override(
+    async fn send_prompt_with_override(
         &self,
         conversation_id: &ConversationId,
         prompt: String,
@@ -227,25 +217,20 @@ pub trait ConversationService: Send + Sync {
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
         cancellation: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<PromptDispatchOutcome, CoreError>> + Send
-    where
-        Self: Sync,
-    {
-        async move {
-            let _ = override_selection;
-            let inner = async move {
-                crate::ports::llm::with_system_refinement(
-                    system_refinement,
-                    self.send_prompt(conversation_id, prompt, on_chunk, on_status),
-                )
-                .await
-            };
-            let text = with_cancellation_token(cancellation, inner).await?;
-            Ok(PromptDispatchOutcome {
-                response: text,
-                warnings: Vec::new(),
-            })
-        }
+    ) -> Result<PromptDispatchOutcome, CoreError> {
+        let _ = override_selection;
+        let inner = async move {
+            crate::ports::llm::with_system_refinement(
+                system_refinement,
+                self.send_prompt(conversation_id, prompt, on_chunk, on_status),
+            )
+            .await
+        };
+        let text = with_cancellation_token(cancellation, inner).await?;
+        Ok(PromptDispatchOutcome {
+            response: text,
+            warnings: Vec::new(),
+        })
     }
 }
 

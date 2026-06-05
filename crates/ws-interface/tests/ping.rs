@@ -169,6 +169,7 @@ fn basic_auth_header(username: &str, password: &str) -> String {
 }
 
 struct FakeConversations;
+#[async_trait::async_trait]
 impl ConversationService for FakeConversations {
     async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
         Ok(Conversation::new("c1", title))
@@ -218,6 +219,7 @@ impl ConversationService for FakeConversations {
 struct CancelAwareConversations {
     cancelled: Arc<AtomicBool>,
 }
+#[async_trait::async_trait]
 impl ConversationService for CancelAwareConversations {
     async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
         Ok(Conversation::new("c1", title))

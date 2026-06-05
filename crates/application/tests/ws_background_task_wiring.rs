@@ -349,6 +349,7 @@ impl RecordingConversations {
     }
 }
 
+#[async_trait::async_trait]
 impl ConversationService for RecordingConversations {
     async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
         let id = format!("conv-{}", self.next_conv_id.fetch_add(1, Ordering::SeqCst));

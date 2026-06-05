@@ -783,6 +783,7 @@ mod foreground_send {
         }
     }
 
+    #[async_trait::async_trait]
     impl ConversationService for ControllableConversations {
         async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
