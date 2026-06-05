@@ -74,6 +74,13 @@ pub enum Command {
         override_selection: Option<SendPromptOverride>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         system_refinement: String,
+        /// Optional client-supplied idempotency key, scoped to the conversation.
+        /// A retry carrying the same key is de-duplicated by the daemon — the
+        /// still-running request is re-attached, or a completed reply replayed —
+        /// instead of re-running the turn, so a dropped connection can be retried
+        /// without double-processing an action. Absent = no idempotency.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
 
     // Settings (legacy `[llm]`-block single-connection surface).
