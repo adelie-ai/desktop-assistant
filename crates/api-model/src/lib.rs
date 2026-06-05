@@ -56,11 +56,24 @@ pub enum Command {
     /// An optional `override` selects a specific connection/model/effort for
     /// this send only; when omitted, the server falls back to (in order) the
     /// conversation's last selection and the `interactive` purpose.
+    ///
+    /// `system_refinement` (optional; defaults to empty, omitted on the wire
+    /// when empty) is a per-request addition to the system prompt for THIS
+    /// send only. When non-empty the daemon appends it after the
+    /// conversation's normal system prompt for the LLM call, but does NOT
+    /// store it as a message and does NOT attach it to the conversation — so
+    /// it never appears in chat history and never affects later turns. This
+    /// lets a client (e.g. the voice daemon) attach instructions like
+    /// "respond briefly, by voice" to a single turn dictated into an existing
+    /// chat without polluting the visible transcript or permanently changing
+    /// that conversation's behaviour.
     SendMessage {
         conversation_id: String,
         content: String,
         #[serde(default, rename = "override", skip_serializing_if = "Option::is_none")]
         override_selection: Option<SendPromptOverride>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        system_refinement: String,
     },
 
     // Settings (legacy `[llm]`-block single-connection surface).
@@ -1216,11 +1229,52 @@ mod tests {
                 model_id: "claude-sonnet-4".into(),
                 effort: Some(EffortLevel::High),
             }),
+            system_refinement: String::new(),
         };
         let json = serde_json::to_string(&cmd2).unwrap();
         assert!(json.contains("\"override\":"));
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd2, back);
+    }
+
+    #[test]
+    fn send_message_system_refinement_is_optional_and_round_trips() {
+        // Absent on the wire → defaults to empty.
+        let cmd: Command =
+            serde_json::from_str(r#"{"send_message":{"conversation_id":"c1","content":"hi"}}"#)
+                .unwrap();
+        match &cmd {
+            Command::SendMessage {
+                system_refinement, ..
+            } => assert!(system_refinement.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Empty refinement is omitted from the serialized form (byte-compatible
+        // with pre-refinement `SendMessage`).
+        let empty = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+        };
+        let json_empty = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !json_empty.contains("system_refinement"),
+            "empty refinement must not appear on the wire: {json_empty}"
+        );
+
+        // Non-empty refinement is present and round-trips.
+        let with_refinement = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: "Respond briefly, by voice.".into(),
+        };
+        let json = serde_json::to_string(&with_refinement).unwrap();
+        assert!(json.contains("\"system_refinement\":\"Respond briefly, by voice.\""));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_refinement, back);
     }
 
     #[test]

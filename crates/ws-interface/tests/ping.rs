@@ -1038,6 +1038,7 @@ async fn ws_send_message_ack_then_streaming_events() {
             override_selection: None,
             conversation_id: "c1".into(),
             content: "hello".into(),
+            system_refinement: String::new(),
         },
     };
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1149,6 +1150,7 @@ async fn ws_send_message_cancels_when_client_disconnects() {
             override_selection: None,
             conversation_id: "c1".into(),
             content: "cancel-me".into(),
+            system_refinement: String::new(),
         },
     };
     ws.send(tokio_tungstenite::tungstenite::Message::Text(

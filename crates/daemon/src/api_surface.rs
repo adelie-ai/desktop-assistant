@@ -38,7 +38,7 @@ use desktop_assistant_core::ports::inbound::{
 };
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
-    with_model_override, with_reasoning_config,
+    with_model_override, with_reasoning_config, with_system_refinement,
 };
 
 use crate::config::{
@@ -696,6 +696,7 @@ where
                 conversation_id,
                 prompt,
                 None,
+                String::new(),
                 on_chunk,
                 on_status,
                 tokio_util::sync::CancellationToken::new(),
@@ -709,6 +710,7 @@ where
         conversation_id: &ConversationId,
         prompt: String,
         override_selection: Option<PromptSelectionOverride>,
+        system_refinement: String,
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
         cancellation: tokio_util::sync::CancellationToken,
@@ -906,6 +908,11 @@ where
                     .send_prompt(&conv_id, prompt, on_chunk, on_status)
                     .await
             };
+            // Install the per-request system-prompt refinement so the core
+            // context assembler appends it to this turn's system prompt. Empty
+            // string = no refinement (unchanged prompt). It is request-scoped
+            // and never persisted; see `SYSTEM_REFINEMENT`.
+            let dispatch = with_system_refinement(system_refinement, dispatch);
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch = with_context_budget(budget, dispatch);
             let dispatch =
@@ -1581,6 +1588,7 @@ mod tests {
                         model_id: "llama3".into(),
                         effort: None,
                     }),
+                    String::new(),
                     on_chunk,
                     on_status,
                     tokio_util::sync::CancellationToken::new(),
@@ -1926,6 +1934,7 @@ mod tests {
                         model_id: "qwen3".into(),
                         effort: None,
                     }),
+                    String::new(),
                     on_chunk,
                     on_status,
                     tokio_util::sync::CancellationToken::new(),
@@ -2004,6 +2013,7 @@ mod tests {
                         model_id: "llama3.2".into(),
                         effort: None,
                     }),
+                    String::new(),
                     on_chunk,
                     on_status,
                     tokio_util::sync::CancellationToken::new(),
@@ -2050,6 +2060,7 @@ mod tests {
                     &ConversationId::from("c1"),
                     "hi".into(),
                     None,
+                    String::new(),
                     on_chunk,
                     on_status,
                     tokio_util::sync::CancellationToken::new(),

@@ -835,6 +835,7 @@ mod foreground_send {
             _conversation_id: &ConversationId,
             _prompt: String,
             _override_selection: Option<PromptSelectionOverride>,
+            _system_refinement: String,
             mut on_chunk: ChunkCallback,
             _on_status: StatusCallback,
             cancellation: tokio_util::sync::CancellationToken,
@@ -906,6 +907,7 @@ mod foreground_send {
                     "conv-9".into(),
                     "hi".into(),
                     None,
+                    String::new(),
                     "req-1".into(),
                     sink_for_task,
                 )
@@ -980,6 +982,7 @@ mod foreground_send {
                     "conv-x".into(),
                     "hi".into(),
                     None,
+                    String::new(),
                     "req-1".into(),
                     sink_for_task,
                 )

@@ -428,6 +428,7 @@ impl ConversationService for RecordingConversations {
         conversation_id: &ConversationId,
         prompt: String,
         override_selection: Option<PromptSelectionOverride>,
+        _system_refinement: String,
         mut on_chunk: ChunkCallback,
         _on_status: StatusCallback,
         cancellation: CancellationToken,

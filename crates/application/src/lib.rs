@@ -167,29 +167,44 @@ pub trait AssistantApiHandler: Send + Sync {
     }
 
     /// Handle a streaming `SendMessage` with an optional per-send model
-    /// override. The default implementation ignores the override and
-    /// forwards to `handle_send_message`; the concrete handler overrides
-    /// this to thread the override through.
+    /// override and an optional per-request system-prompt refinement. The
+    /// default implementation ignores both and forwards to
+    /// `handle_send_message`; the concrete handler overrides this to thread
+    /// them through.
+    ///
+    /// `system_refinement` (empty = none) is appended to the system prompt
+    /// for this one turn only; it is never persisted, so it stays out of
+    /// chat history and does not affect later turns. See
+    /// [`ConversationService::send_prompt_with_override`].
+    // Why allow: a streaming-send entry point carrying the conversation
+    // target, two independent per-request inputs (model override + system
+    // refinement), the request id, and the event sink. Bundling them solely
+    // to satisfy the 7-arg lint would obscure every override of this method.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_send_message_with_override(
         &self,
         conversation_id: String,
         content: String,
         override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
-        let _ = override_selection;
+        let _ = (override_selection, system_refinement);
         self.handle_send_message(conversation_id, content, request_id, sink)
             .await
     }
 
     /// Context-aware variant of [`Self::handle_send_message_with_override`].
+    // Why allow: same shape as the method above, plus the `RequestContext`.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_send_message_with_override_for(
         &self,
         ctx: RequestContext,
         conversation_id: String,
         content: String,
         override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
@@ -199,6 +214,7 @@ pub trait AssistantApiHandler: Send + Sync {
                 conversation_id,
                 content,
                 override_selection,
+                system_refinement,
                 request_id,
                 sink,
             ),
@@ -242,6 +258,7 @@ pub trait AssistantApiHandler: Send + Sync {
         conversation_id: String,
         content: String,
         override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<Option<api::TaskId>> {
@@ -249,6 +266,7 @@ pub trait AssistantApiHandler: Send + Sync {
             conversation_id,
             content,
             override_selection,
+            system_refinement,
             request_id,
             sink,
         );
@@ -1361,8 +1379,15 @@ where
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
-        self.handle_send_message_with_override(conversation_id, content, None, request_id, sink)
-            .await
+        self.handle_send_message_with_override(
+            conversation_id,
+            content,
+            None,
+            String::new(),
+            request_id,
+            sink,
+        )
+        .await
     }
 
     async fn handle_send_message_with_override(
@@ -1370,6 +1395,7 @@ where
         conversation_id: String,
         content: String,
         override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
@@ -1384,6 +1410,7 @@ where
                 conversation_id,
                 content,
                 override_selection,
+                system_refinement,
                 request_id,
                 sink,
             )
@@ -1394,6 +1421,7 @@ where
                 conversation_id,
                 content,
                 override_selection,
+                system_refinement,
                 request_id,
                 sink,
                 tokio_util::sync::CancellationToken::new(),
@@ -1417,6 +1445,7 @@ where
         conversation_id: String,
         content: String,
         override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<Option<api::TaskId>> {
@@ -1439,7 +1468,11 @@ where
         // `tokio::spawn` so we can return the new task id immediately.
         // `tokio::spawn` does not propagate task-locals, so the body
         // must re-install `with_user_id` for storage queries inside
-        // `run_send_turn` to scope to the right user (#154).
+        // `run_send_turn` to scope to the right user (#154). The
+        // `system_refinement` is moved into the closure as an explicit
+        // value for the same reason — it can't ride a task-local across
+        // the spawn; it is installed as a task-local further down, inside
+        // the per-turn dispatch in the daemon's routing handler.
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             ctx.logs.append(
                 api::LogLevel::Info,
@@ -1455,6 +1488,7 @@ where
                     conv_id_for_body,
                     content,
                     override_selection,
+                    system_refinement,
                     request_id_for_body,
                     sink_for_body,
                     ctx.token.clone(),
@@ -1497,12 +1531,17 @@ where
     /// broadcast channel sees `TaskStarted`/`TaskCompleted` events; then
     /// awaits the spawned task to preserve the pre-#111 "blocking"
     /// contract that existing transport adapters rely on.
+    // Why allow: forwards the streaming-send inputs (conversation target,
+    // model override, system refinement, request id, sink) plus the registry
+    // handle to the spawned turn body; no meaningful struct to bundle into.
+    #[allow(clippy::too_many_arguments)]
     async fn send_message_via_registry(
         &self,
         registry: Arc<BackgroundTaskRegistry>,
         conversation_id: String,
         content: String,
         override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
         request_id: String,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
@@ -1520,7 +1559,9 @@ where
 
         // `tokio::spawn` does not propagate task-locals, so the body
         // must re-install `with_user_id` for storage queries inside
-        // `run_send_turn` to scope to the right user (#154).
+        // `run_send_turn` to scope to the right user (#154). The
+        // `system_refinement` is moved into the closure as an explicit
+        // value for the same reason (task-locals don't cross the spawn).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             // Lifecycle log so the UI knows the foreground turn is
             // tracked — Status category keeps it distinct from the
@@ -1539,6 +1580,7 @@ where
                     conv_id_for_body,
                     content,
                     override_selection,
+                    system_refinement,
                     request_id_for_body,
                     sink_for_body,
                     ctx.token.clone(),
@@ -1686,6 +1728,10 @@ where
                     ),
                     initial_prompt,
                     override_for_core,
+                    // Agent runs (standalone / subagent) carry no per-request
+                    // system-prompt refinement — that's a foreground voice/chat
+                    // concern, not an agent one.
+                    String::new(),
                     on_chunk,
                     on_status,
                     token,
@@ -1734,11 +1780,17 @@ where
 /// no-registry code paths. Returns `CoreError` so the caller can either
 /// map it for the trait return type or propagate it into the registry's
 /// task finalization.
+// Why allow: this is the streaming-send body. Its arguments are the
+// conversation store, the turn inputs (conversation id, content, model
+// override, system refinement, request id), the event sink, and the cancel
+// token — independent values with no natural struct grouping.
+#[allow(clippy::too_many_arguments)]
 async fn run_send_turn<C>(
     conversations: Arc<C>,
     conversation_id: String,
     content: String,
     override_selection: Option<api::SendPromptOverride>,
+    system_refinement: String,
     request_id: String,
     sink: Arc<dyn EventSink>,
     cancellation: tokio_util::sync::CancellationToken,
@@ -1799,6 +1851,7 @@ where
             &desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str()),
             content,
             override_for_core,
+            system_refinement,
             callback,
             on_status,
             cancellation,

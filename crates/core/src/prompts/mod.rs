@@ -13,6 +13,11 @@ pub enum PromptSectionKind {
     ToolAvailability,
     ContextSummary,
     MessageSummary,
+    /// Per-request, client-supplied addition to the system prompt for a
+    /// single turn (e.g. a voice client's "respond briefly, by voice").
+    /// Appended last so it can refine/override the static guidance above.
+    /// Never persisted; see `crate::ports::llm::SYSTEM_REFINEMENT`.
+    SystemRefinement,
 }
 
 /// A single section of the system prompt.

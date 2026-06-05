@@ -106,6 +106,39 @@ tokio::task_local! {
     /// set skips the learned-cache and LLM tiers (tier 1 still runs), which
     /// breaks the recursion regardless of how the LLM handles are wired.
     static CLASSIFICATION_IN_PROGRESS: ();
+
+    /// Per-request system-prompt refinement.
+    ///
+    /// An optional client-supplied addition to the system prompt that applies
+    /// to a single `send_prompt` request only. Installed by the daemon's
+    /// dispatch wrapper (`send_prompt_with_override`) via
+    /// [`with_system_refinement`] from the request's `system_refinement`
+    /// field, and read by the context assembler via
+    /// [`current_system_refinement`] when it builds the system message. The
+    /// text is appended *after* the conversation's normal system prompt for
+    /// that turn.
+    ///
+    /// Crucially this is **request-scoped, not conversation-scoped**: it is
+    /// never stored as a message and never written to the conversation, so it
+    /// does not appear in chat history and does not affect later turns. A
+    /// voice client can therefore attach "respond briefly, by voice" to one
+    /// turn dictated into an existing chat without permanently changing how
+    /// that conversation behaves for subsequent typed turns.
+    ///
+    /// Unset (or empty) outside the daemon dispatch path — which
+    /// [`current_system_refinement`] returns as an empty string — so tests,
+    /// dreaming jobs, and any caller that doesn't route through the dispatch
+    /// wrapper get the unchanged "no refinement" behaviour.
+    ///
+    /// Why a task-local: mirrors the other per-turn task-locals in this
+    /// module (e.g. [`REASONING_CONFIG`], [`CONTEXT_BUDGET`]) so the value
+    /// threads to the assembler without changing the `LlmClient` connector
+    /// trait signatures. The *request* value still travels as an explicit
+    /// argument through the application layer (so it survives the
+    /// `tokio::spawn` background-task boundary, which task-locals do not
+    /// cross); the task-local is installed only at the final dispatch hop,
+    /// inside the spawned body.
+    static SYSTEM_REFINEMENT: String;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -122,6 +155,27 @@ where
 /// (all `None`) when not set. Safe to call from any async context.
 pub fn current_reasoning_config() -> ReasoningConfig {
     REASONING_CONFIG.try_with(|c| *c).unwrap_or_default()
+}
+
+/// Run `fut` with `refinement` installed as the current request's
+/// system-prompt refinement. The context assembler reads it via
+/// [`current_system_refinement`] and appends it to the system message for
+/// the turn. See [`SYSTEM_REFINEMENT`].
+pub async fn with_system_refinement<F, T>(refinement: String, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SYSTEM_REFINEMENT.scope(refinement, fut).await
+}
+
+/// Current task-local system-prompt refinement, or an empty string when not
+/// set. An empty result means "no refinement" — the assembler appends
+/// nothing and the system prompt is unchanged. Safe to call from any async
+/// context.
+pub fn current_system_refinement() -> String {
+    SYSTEM_REFINEMENT
+        .try_with(|r| r.clone())
+        .unwrap_or_default()
 }
 
 /// Run `fut` with `model` installed as the current turn's model override.

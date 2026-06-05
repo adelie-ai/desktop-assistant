@@ -121,22 +121,8 @@ pub trait AssistantCommands: Send + Sync {
     }
 
     async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String> {
-        let result = self
-            .send_command(api::Command::SendMessage {
-                conversation_id: conversation_id.to_string(),
-                content: prompt.to_string(),
-                override_selection: None,
-            })
-            .await?;
-        // Post-#114 the daemon returns `SendMessageAck { task_id }` when its
-        // handler is wired with a `BackgroundTaskRegistry`; older / test
-        // daemons may still return the legacy bare `Ack`. Both are valid
-        // wire-level acks here — the task id is surfaced via streaming events.
-        match result {
-            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
-            api::CommandResult::Ack => Ok(String::new()),
-            other => Err(anyhow!("unexpected response for send_prompt: {other:?}")),
-        }
+        self.send_prompt_full(conversation_id, prompt, None, String::new())
+            .await
     }
 
     /// Send a prompt with an optional per-message model/connection override
@@ -150,11 +136,49 @@ pub trait AssistantCommands: Send + Sync {
         prompt: &str,
         override_selection: Option<api::SendPromptOverride>,
     ) -> Result<String> {
+        self.send_prompt_full(conversation_id, prompt, override_selection, String::new())
+            .await
+    }
+
+    /// Send a prompt with a per-request **system-prompt refinement**: an
+    /// addition to the system prompt that applies to THIS turn only.
+    ///
+    /// `system_refinement` is appended after the conversation's normal system
+    /// prompt for the LLM call, but is never stored as a message and never
+    /// attached to the conversation — so it does not appear in chat history
+    /// and does not affect later turns. This is how a voice client attaches
+    /// instructions like "respond briefly, by voice" to a turn dictated into
+    /// an existing chat without polluting the visible transcript. An empty
+    /// `system_refinement` is equivalent to [`send_prompt`].
+    async fn send_prompt_with_system_refinement(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        system_refinement: &str,
+    ) -> Result<String> {
+        self.send_prompt_full(conversation_id, prompt, None, system_refinement.to_string())
+            .await
+    }
+
+    /// Full `SendMessage` send: optional per-message model override plus an
+    /// optional per-request system-prompt refinement. The three convenience
+    /// methods above delegate here so the ack-handling and wire shape live in
+    /// one place. `system_refinement` is omitted on the wire when empty
+    /// (`#[serde(skip_serializing_if = "String::is_empty")]`), so existing
+    /// callers produce a byte-identical `SendMessage`.
+    async fn send_prompt_full(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
+    ) -> Result<String> {
         let result = self
             .send_command(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),
                 content: prompt.to_string(),
                 override_selection,
+                system_refinement,
             })
             .await?;
         // Post-#114 the daemon returns `SendMessageAck { task_id }` when its
@@ -417,11 +441,51 @@ mod tests {
                 conversation_id,
                 content,
                 override_selection: emitted,
+                system_refinement,
             } => {
                 assert_eq!(conversation_id, "conv-1");
                 assert_eq!(content, "hello");
                 assert_eq!(emitted, override_selection);
                 assert!(emitted.is_some());
+                // The override path carries no system refinement.
+                assert!(system_refinement.is_empty());
+            }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_prompt_with_system_refinement_emits_send_message_with_refinement() {
+        let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            task_id: "task-3".to_string(),
+        });
+
+        let task_id = client
+            .send_prompt_with_system_refinement(
+                "conv-1",
+                "what's the weather?",
+                "You are Adele, responding by voice. Keep it brief.",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task_id, "task-3");
+        match client.last() {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                override_selection,
+                system_refinement,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                // The visible user message is the clean prompt — the
+                // refinement rides a separate field, not the content.
+                assert_eq!(content, "what's the weather?");
+                assert!(override_selection.is_none());
+                assert_eq!(
+                    system_refinement,
+                    "You are Adele, responding by voice. Keep it brief."
+                );
             }
             other => panic!("expected Command::SendMessage, got {other:?}"),
         }
