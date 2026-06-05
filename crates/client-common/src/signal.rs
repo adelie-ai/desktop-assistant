@@ -1,6 +1,7 @@
 use desktop_assistant_api_model as api;
 
-#[derive(Debug)]
+// `Clone` lets the `Connector` fan one signal stream out to many subscribers.
+#[derive(Debug, Clone)]
 pub enum SignalEvent {
     Chunk {
         request_id: String,
