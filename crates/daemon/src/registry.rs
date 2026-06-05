@@ -187,7 +187,8 @@ impl Default for ConnectionRegistry {
 /// *before* calling this so misconfigured connections can be marked
 /// unavailable up front.
 pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
-    match resolved.connector.as_str() {
+    let connector = resolved.connector.clone();
+    let inner: Arc<dyn LlmClient> = match resolved.connector.as_str() {
         "ollama" => Arc::new(
             desktop_assistant_llm_ollama::OllamaClient::new(resolved.base_url, resolved.model)
                 .with_temperature(resolved.temperature)
@@ -238,7 +239,18 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
             }
             Arc::new(client)
         }
-    }
+    };
+
+    // Classify opaque backend errors (#178): innermost wrap, so it sees the
+    // connector's raw `CoreError::Llm` and remaps it into the structured
+    // variant the recovery ladder / `RetryingLlmClient` act on. Applies to
+    // every stack built through here (interactive, dreaming, backend-tasks,
+    // and the per-connection registry clients). Loop-safe: the remap is pure
+    // and single-shot, and it sits inside `RetryingLlmClient`, which only
+    // retries `RateLimited` — terminal causes are never retried.
+    Arc::new(crate::classifying_llm::ClassifyingLlmClient::new(
+        inner, connector,
+    ))
 }
 
 /// Validate a resolved connection config before building the client.
