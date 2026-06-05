@@ -196,6 +196,7 @@ pub(crate) fn llm_messages_for_turn(
     max_messages: usize,
     active_task: Option<&str>,
     tool_rounds_since_anchor: u32,
+    system_refinement: &str,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
@@ -209,6 +210,7 @@ pub(crate) fn llm_messages_for_turn(
         current_max,
         active_task,
         tool_rounds_since_anchor,
+        system_refinement,
         budget,
         estimate,
     );
@@ -254,6 +256,7 @@ pub(crate) fn llm_messages_for_turn(
             current_max,
             active_task,
             tool_rounds_since_anchor,
+            system_refinement,
             Some(budget),
             estimate,
         );
@@ -336,15 +339,30 @@ fn build_demoted_tool_note(
 }
 
 /// Render the assembled system instruction containing `tool_note` as the
-/// final tool-availability section. Centralised so the demotion path
-/// rebuilds the same shape as the default path.
-fn assemble_system_instruction(tool_note: String) -> String {
+/// tool-availability section, optionally followed by a per-request
+/// `system_refinement` section. Centralised so the demotion path rebuilds
+/// the same shape as the default path.
+///
+/// `system_refinement` is a client-supplied, request-scoped addition to the
+/// system prompt (see `crate::ports::llm::SYSTEM_REFINEMENT`). When empty
+/// (the common case), no section is appended and the output is byte-for-byte
+/// identical to the pre-refinement prompt. When present, it is appended
+/// last — after every static section and the tool note — so it can refine or
+/// override the standing guidance for this turn only.
+fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> String {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
     let mut sections = prompts::static_sections();
     sections.push(PromptSection::new(
         PromptSectionKind::ToolAvailability,
         tool_note,
     ));
+    let trimmed = system_refinement.trim();
+    if !trimmed.is_empty() {
+        sections.push(PromptSection::new(
+            PromptSectionKind::SystemRefinement,
+            trimmed.to_string(),
+        ));
+    }
     prompts::assemble(&sections)
 }
 
@@ -362,11 +380,12 @@ fn assemble_messages_inner(
     max_messages: usize,
     active_task: Option<&str>,
     tool_rounds_since_anchor: u32,
+    system_refinement: &str,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
     let tool_note = build_full_tool_note(tool_defs, deferred_namespaces);
-    let system_instruction = assemble_system_instruction(tool_note);
+    let system_instruction = assemble_system_instruction(tool_note, system_refinement);
 
     // Measure the system block. The system instruction is always
     // re-included in every turn, so any space it claims is permanently
@@ -385,7 +404,7 @@ fn assemble_messages_inner(
         let threshold = (b.max_input_tokens as f64 * SYSTEM_BLOCK_BUDGET_RATIO) as u64;
         if system_tokens_before > threshold {
             let demoted_note = build_demoted_tool_note(tool_defs, deferred_namespaces);
-            let demoted_system = assemble_system_instruction(demoted_note);
+            let demoted_system = assemble_system_instruction(demoted_note, system_refinement);
             let system_tokens_after = estimate(&demoted_system);
             tracing::warn!(
                 original_tokens = system_tokens_before,
@@ -800,6 +819,35 @@ mod tests {
         (s.chars().count() as u64).div_ceil(4)
     }
 
+    #[test]
+    fn assemble_system_instruction_appends_refinement_last() {
+        let base = assemble_system_instruction("TOOLNOTE".to_string(), "");
+        let refined =
+            assemble_system_instruction("TOOLNOTE".to_string(), "Respond briefly, by voice.");
+
+        // Empty refinement is byte-identical to no refinement.
+        assert_eq!(
+            base,
+            assemble_system_instruction("TOOLNOTE".to_string(), "   "),
+            "whitespace-only refinement must be treated as empty"
+        );
+
+        // The refined form is a strict superset: the base prompt is preserved
+        // verbatim as a prefix, and the refinement is appended at the end.
+        assert!(
+            refined.starts_with(&base),
+            "refined prompt must keep the entire base prompt as a prefix"
+        );
+        assert!(
+            refined.ends_with("Respond briefly, by voice."),
+            "refinement must be the final section, got: {refined:?}"
+        );
+        assert!(
+            refined.contains("TOOLNOTE"),
+            "tool note must still be present"
+        );
+    }
+
     /// Mock LLM that returns canned chunks. Used by summary-generation
     /// tests that exercise [`generate_context_summary`] directly.
     struct MockLlm {
@@ -1160,6 +1208,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1194,6 +1243,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1238,6 +1288,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1276,6 +1327,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1318,6 +1370,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             Some(budget),
             &one_per_char,
         );
@@ -1363,6 +1416,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             Some(budget),
             &one_per_char,
         );
@@ -1404,6 +1458,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1444,6 +1499,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1480,6 +1536,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1517,6 +1574,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1549,6 +1607,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1582,6 +1641,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             6,
+            "",
             None,
             &default_estimate,
         );
@@ -1608,6 +1668,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1633,6 +1694,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(""),
             99,
+            "",
             None,
             &default_estimate,
         );
@@ -1669,6 +1731,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             Some(task),
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1720,6 +1783,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1751,6 +1815,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1796,6 +1861,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1849,6 +1915,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -1901,6 +1968,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );
@@ -2035,6 +2103,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             Some(budget),
             &default_estimate,
         );
@@ -2085,6 +2154,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             Some(budget),
             &default_estimate,
         );
@@ -2125,6 +2195,7 @@ mod tests {
             MAX_CONTEXT_MESSAGES,
             None,
             0,
+            "",
             None,
             &default_estimate,
         );

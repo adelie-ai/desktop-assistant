@@ -11,7 +11,7 @@ use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
-    current_context_budget,
+    current_context_budget, current_system_refinement,
 };
 use crate::ports::scratchpad::{SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn};
 use crate::ports::store::ConversationStore;
@@ -345,6 +345,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // persistently-oversized request doesn't loop indefinitely.
         let mut overflow_retries: u32 = 0;
 
+        // Per-request system-prompt refinement (installed by the daemon
+        // dispatch wrapper from the client's `system_refinement` field; empty
+        // for callers that don't route through it). Read once here so the
+        // value is stable for every assembly pass in this turn. It is
+        // appended to the system prompt for THIS request only — it is never
+        // pushed onto `conv.messages` or otherwise persisted, so it stays out
+        // of chat history and never affects a later turn.
+        let system_refinement = current_system_refinement();
+
         // Run compaction if enough messages have been dropped by windowing.
         if let Some((from, to)) = compaction_range(&conv, target_window) {
             let summary = generate_context_summary(
@@ -478,6 +487,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 target_window,
                 anchor,
                 tool_rounds_since_anchor,
+                &system_refinement,
                 current_context_budget(),
                 &estimate,
             );
@@ -3329,6 +3339,146 @@ mod tests {
         assert!(
             find_anchor(&captured.lock().unwrap()).is_none(),
             "no anchor should be injected when there's no goal and the prompt is visible"
+        );
+    }
+
+    // --- Per-request system-prompt refinement --------------------------------
+
+    /// A distinctive marker the test injects as the refinement so it can be
+    /// found unambiguously in the captured system prompt.
+    const REFINEMENT_MARKER: &str =
+        "You are Adele, responding by voice. Keep replies to one or two sentences.";
+
+    /// Opening of the static identity section — proves the BASE system prompt
+    /// is still present alongside the refinement.
+    const BASE_PROMPT_MARKER: &str = "You are Adele, a desktop assistant named in reference";
+
+    /// Find the primary system instruction (the first `Role::System` message,
+    /// which is the assembled static + tool-availability + refinement block)
+    /// across all captured LLM invocations.
+    fn first_system_message(captures: &[Vec<Message>]) -> Option<String> {
+        captures
+            .iter()
+            .flatten()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.content.clone())
+    }
+
+    #[tokio::test]
+    async fn system_refinement_is_appended_to_system_prompt_for_the_request() {
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            MessageCapturingLlm {
+                captured: Arc::clone(&captured),
+            },
+            NoopToolExecutor,
+            Box::new(|| "conv-refine-1".to_string()),
+        );
+        let conv = handler.create_conversation("t".into()).await.unwrap();
+
+        // Install the per-request refinement the way the daemon dispatch
+        // wrapper does (a task-local around the send), then send a clean
+        // prompt.
+        crate::ports::llm::with_system_refinement(REFINEMENT_MARKER.to_string(), async {
+            handler
+                .send_prompt(
+                    &conv.id,
+                    "what's the weather?".into(),
+                    noop_callback(),
+                    noop_status(),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // The system prompt sent to the LLM carries BOTH the base prompt and
+        // the refinement.
+        let system = first_system_message(&captured.lock().unwrap())
+            .expect("a system message must be present in the LLM request");
+        assert!(
+            system.contains(BASE_PROMPT_MARKER),
+            "system prompt must still contain the base prompt, got: {system:?}"
+        );
+        assert!(
+            system.contains(REFINEMENT_MARKER),
+            "system prompt must contain the appended refinement, got: {system:?}"
+        );
+        // The refinement is appended AFTER the base prompt, not prepended.
+        let base_at = system.find(BASE_PROMPT_MARKER).unwrap();
+        let refine_at = system.find(REFINEMENT_MARKER).unwrap();
+        assert!(
+            refine_at > base_at,
+            "refinement must come after the base system prompt"
+        );
+
+        // The stored conversation contains ONLY the clean user prompt and the
+        // assistant reply — the refinement is never persisted as a message.
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(stored.messages.len(), 2);
+        assert_eq!(stored.messages[0].role, Role::User);
+        assert_eq!(stored.messages[0].content, "what's the weather?");
+        assert_eq!(stored.messages[1].role, Role::Assistant);
+        for m in &stored.messages {
+            assert!(
+                !m.content.contains(REFINEMENT_MARKER),
+                "the refinement must never appear in stored conversation messages, got: {:?}",
+                m.content
+            );
+        }
+        // And it must not have been stashed on the conversation's active_task
+        // anchor either — that's the user's prompt, not the refinement.
+        assert_eq!(stored.active_task.as_deref(), Some("what's the weather?"));
+    }
+
+    #[tokio::test]
+    async fn empty_system_refinement_leaves_system_prompt_unchanged() {
+        // Capture a turn WITH a refinement installed and one WITHOUT, and
+        // assert the no-refinement system prompt equals the prompt produced
+        // when the refinement scope is simply absent (the default path).
+        async fn capture_system_prompt(refinement: Option<&str>) -> String {
+            let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+            let handler = ConversationHandler::with_tools(
+                MockStore::new(),
+                MessageCapturingLlm {
+                    captured: Arc::clone(&captured),
+                },
+                NoopToolExecutor,
+                Box::new(|| "conv-refine-2".to_string()),
+            );
+            let conv = handler.create_conversation("t".into()).await.unwrap();
+            let send = async {
+                handler
+                    .send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status())
+                    .await
+                    .unwrap();
+            };
+            match refinement {
+                Some(r) => {
+                    crate::ports::llm::with_system_refinement(r.to_string(), send).await;
+                }
+                None => send.await,
+            }
+            first_system_message(&captured.lock().unwrap()).expect("system message present")
+        }
+
+        // An explicitly empty refinement must produce the identical system
+        // prompt to never installing one at all.
+        let no_scope = capture_system_prompt(None).await;
+        let empty_scope = capture_system_prompt(Some("")).await;
+        let whitespace_scope = capture_system_prompt(Some("   \n  ")).await;
+        assert_eq!(
+            no_scope, empty_scope,
+            "an empty refinement must not change the system prompt"
+        );
+        assert_eq!(
+            no_scope, whitespace_scope,
+            "a whitespace-only refinement must not change the system prompt"
+        );
+        assert!(
+            !no_scope.contains(REFINEMENT_MARKER),
+            "no refinement marker should leak into the baseline prompt"
         );
     }
 }

@@ -98,6 +98,7 @@ async fn dispatcher_streams_send_message_ack_then_events() {
             conversation_id: "c1".into(),
             content: "hello".into(),
             override_selection: None,
+            system_refinement: String::new(),
         },
     };
     let inbound = stream::iter(vec![Ok::<_, anyhow::Error>(req)]);

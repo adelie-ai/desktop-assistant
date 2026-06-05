@@ -399,6 +399,7 @@ impl ConversationService for RecordingConversations {
         conversation_id: &ConversationId,
         prompt: String,
         _override_selection: Option<PromptSelectionOverride>,
+        _system_refinement: String,
         mut on_chunk: ChunkCallback,
         _on_status: StatusCallback,
         cancellation: CancellationToken,
@@ -920,6 +921,7 @@ async fn start_send_message_returns_task_id_that_appears_in_listing() {
                 "conv-x".into(),
                 "hello".into(),
                 None,
+                String::new(),
                 "req-1".into(),
                 Arc::clone(&sink),
             )
@@ -973,6 +975,7 @@ async fn start_send_message_propagates_user_id_to_spawned_body() {
                 "conv-x".into(),
                 "hello".into(),
                 None,
+                String::new(),
                 "req-1".into(),
                 Arc::clone(&sink),
             )
@@ -1014,6 +1017,7 @@ async fn handle_send_message_with_override_propagates_user_id_to_spawned_body() 
                 "conv-y".into(),
                 "hello".into(),
                 None,
+                String::new(),
                 "req-2".into(),
                 sink,
             )
@@ -1046,7 +1050,14 @@ async fn start_send_message_returns_none_without_registry() {
 
     let result = with_user_id(user, async {
         handler
-            .start_send_message("conv-x".into(), "hello".into(), None, "req-1".into(), sink)
+            .start_send_message(
+                "conv-x".into(),
+                "hello".into(),
+                None,
+                String::new(),
+                "req-1".into(),
+                sink,
+            )
             .await
     })
     .await

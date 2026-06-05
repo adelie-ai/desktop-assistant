@@ -249,6 +249,7 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
                 conversation_id: conversation_id.to_string(),
                 content: prompt.to_string(),
                 override_selection: None,
+                system_refinement: String::new(),
             })
             .await
             .map_err(|e| {

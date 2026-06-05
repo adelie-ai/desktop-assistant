@@ -191,18 +191,39 @@ pub trait ConversationService: Send + Sync {
     /// to cancel — that's a fresh, never-tripped token and keeps pre-#109
     /// behaviour intact.
     ///
+    /// `system_refinement` is an optional, **request-scoped** addition to
+    /// the system prompt for this one turn (empty string = none). When
+    /// non-empty it is appended *after* the conversation's normal system
+    /// prompt for the LLM call only — it is never stored as a message, never
+    /// written to the conversation, and so never appears in chat history or
+    /// affects later turns. A voice client uses it to attach instructions
+    /// like "respond briefly, by voice" to a turn dictated into an existing
+    /// chat without permanently changing that conversation's behaviour. It
+    /// is provider-agnostic (just system-prompt text).
+    ///
     /// Returns the assistant's full response text plus any advisory
     /// warnings that should be surfaced to the client (for example, a
     /// dangling stored selection that was cleared on this call). Default
     /// implementation ignores overrides and delegates to `send_prompt`,
-    /// installing the cancellation token as a task-local so adapters can
-    /// read it without per-method threading; the concrete
-    /// `ConversationHandler` overrides this with the full resolution path.
+    /// installing the cancellation token and the system refinement as
+    /// task-locals so adapters and the context assembler can read them
+    /// without per-method threading; the concrete `ConversationHandler`
+    /// overrides this with the full resolution path.
+    ///
+    // Why allow: this is the per-send dispatch entry point. Its arguments are
+    // the conversation target plus three independent per-request inputs
+    // (model override, system-prompt refinement) and the streaming/cancel
+    // plumbing (chunk + status callbacks, cancellation token). They don't
+    // cluster into a meaningful struct, and bundling them solely to satisfy
+    // the 7-arg lint would obscure every implementor and call site across the
+    // daemon, application, and connector layers.
+    #[allow(clippy::too_many_arguments)]
     fn send_prompt_with_override(
         &self,
         conversation_id: &ConversationId,
         prompt: String,
         override_selection: Option<PromptSelectionOverride>,
+        system_refinement: String,
         on_chunk: ChunkCallback,
         on_status: StatusCallback,
         cancellation: CancellationToken,
@@ -213,8 +234,11 @@ pub trait ConversationService: Send + Sync {
         async move {
             let _ = override_selection;
             let inner = async move {
-                self.send_prompt(conversation_id, prompt, on_chunk, on_status)
-                    .await
+                crate::ports::llm::with_system_refinement(
+                    system_refinement,
+                    self.send_prompt(conversation_id, prompt, on_chunk, on_status),
+                )
+                .await
             };
             let text = with_cancellation_token(cancellation, inner).await?;
             Ok(PromptDispatchOutcome {

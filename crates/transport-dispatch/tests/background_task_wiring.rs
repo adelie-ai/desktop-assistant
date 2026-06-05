@@ -117,6 +117,7 @@ impl AssistantApiHandler for RegistryHandler {
         conversation_id: String,
         content: String,
         _override_selection: Option<api::SendPromptOverride>,
+        _system_refinement: String,
         _request_id: String,
         _sink: Arc<dyn EventSink>,
     ) -> ApiResult<Option<api::TaskId>> {
@@ -417,6 +418,7 @@ async fn send_message_ack_carries_a_real_task_id() {
                 conversation_id: "conv-1".into(),
                 content: "hello".into(),
                 override_selection: None,
+                system_refinement: String::new(),
             },
         }],
     );
@@ -473,6 +475,7 @@ async fn send_message_falls_back_to_legacy_ack_when_handler_opts_out() {
                 conversation_id: "conv-2".into(),
                 content: "hello".into(),
                 override_selection: None,
+                system_refinement: String::new(),
             },
         }],
     );

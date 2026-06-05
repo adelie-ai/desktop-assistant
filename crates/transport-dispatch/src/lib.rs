@@ -155,6 +155,7 @@ pub async fn dispatch_loop<R, W>(
                 conversation_id,
                 content,
                 override_selection,
+                system_refinement,
             } => {
                 // Per-request id for event correlation (matches old WS path).
                 let request_id = uuid::Uuid::new_v4().to_string();
@@ -172,6 +173,7 @@ pub async fn dispatch_loop<R, W>(
                         conversation_id.clone(),
                         content.clone(),
                         override_selection.clone(),
+                        system_refinement.clone(),
                         request_id.clone(),
                         Arc::clone(&sink),
                     ),
@@ -218,6 +220,7 @@ pub async fn dispatch_loop<R, W>(
                                     conversation_id,
                                     content,
                                     override_selection,
+                                    system_refinement,
                                     request_id,
                                     sink,
                                 ),
