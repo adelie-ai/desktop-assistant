@@ -560,29 +560,17 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
     }
 }
 
-fn main() -> Result<()> {
-    // Larger-than-default tokio worker stacks. Originally a workaround for
-    // #205: the interactive send-prompt task spawned a multi-MB future
-    // because `ConversationService` used RPITIT and monomorphized the whole
-    // nested handler/LLM/tool stack into one inlined state machine, which
-    // overflowed the default 2 MB worker stack at `tokio::spawn` (#206).
-    //
-    // #207 fixed the root cause: `ConversationService` is now `#[async_trait]`
-    // and the LLM decorator stack is erased to `Arc<dyn LlmClient>`, so the
-    // *persistent* spawned future is a thin boxed `Pin<Box<dyn Future>>`
-    // (guarded by `dbus`/`ws` `spawned_send_prompt_future_stays_small` tests).
-    // The bump is retained as defensive headroom for per-layer transient
-    // future construction in debug builds and deep agentic recursion; it can
-    // be lowered toward the default once confirmed with a live debug-build
-    // repro (busctl SendPrompt), which is left as a follow-up.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(16 * 1024 * 1024)
-        .build()?;
-    runtime.block_on(run())
-}
-
-async fn run() -> Result<()> {
+// #205/#206 history: the interactive send-prompt task once spawned a multi-MB
+// future — `ConversationService` used RPITIT, so the whole nested
+// handler/LLM/tool stack monomorphized into one inlined state machine that
+// overflowed the default 2 MB tokio worker stack at `tokio::spawn`. #206 worked
+// around it by bumping `thread_stack_size` to 16 MB. #207 fixed the root cause:
+// `ConversationService` is now `#[async_trait]` and the LLM decorator stack is
+// erased to `Arc<dyn LlmClient>`, so the spawned future is a thin boxed
+// `Pin<Box<dyn Future>>` (guarded by the `spawned_send_prompt_future_stays_small`
+// tests). The workaround is therefore removed — we run on the default runtime.
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
