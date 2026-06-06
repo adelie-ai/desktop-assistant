@@ -173,15 +173,40 @@ pub trait AssistantCommands: Send + Sync {
         override_selection: Option<api::SendPromptOverride>,
         system_refinement: String,
     ) -> Result<String> {
+        self.send_prompt_idempotent(
+            conversation_id,
+            prompt,
+            override_selection,
+            system_refinement,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`send_prompt_full`](AssistantCommands::send_prompt_full) but with a
+    /// client-supplied **idempotency key** scoped to the conversation (#204).
+    ///
+    /// A retry carrying the same key after a dropped connection is
+    /// de-duplicated by the daemon — re-attached to the still-running turn, or
+    /// (if it already finished) the committed reply replayed — instead of
+    /// re-running the turn and re-processing an action. `None` is identical to
+    /// [`send_prompt_full`]. Every `send_prompt*` method routes through here so
+    /// the ack-handling and wire shape live in one place.
+    async fn send_prompt_idempotent(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
         let result = self
             .send_command(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),
                 content: prompt.to_string(),
                 override_selection,
                 system_refinement,
-                // No idempotency key from this entry point yet — clients that
-                // want safe retry will pass one via a dedicated method (#204).
-                idempotency_key: None,
+                idempotency_key,
             })
             .await?;
         // Post-#114 the daemon returns `SendMessageAck { task_id }` when its
@@ -454,6 +479,61 @@ mod tests {
                 // The override path carries no system refinement.
                 assert!(system_refinement.is_empty());
             }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_prompt_idempotent_emits_send_message_with_key() {
+        let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            task_id: "task-1".to_string(),
+        });
+
+        let task_id = client
+            .send_prompt_idempotent(
+                "conv-1",
+                "hello",
+                None,
+                String::new(),
+                Some("turn-key-1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task_id, "task-1");
+        match client.last() {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                idempotency_key,
+                ..
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(content, "hello");
+                assert_eq!(idempotency_key.as_deref(), Some("turn-key-1"));
+            }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_prompt_full_stays_idempotency_key_free() {
+        // Non-breaking: the existing entry point must keep emitting a key-less
+        // SendMessage so callers that don't opt into idempotency are unchanged.
+        let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            task_id: "t".to_string(),
+        });
+        client
+            .send_prompt_full("c", "hi", None, String::new())
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::SendMessage {
+                idempotency_key, ..
+            } => assert!(
+                idempotency_key.is_none(),
+                "send_prompt_full must not attach an idempotency key"
+            ),
             other => panic!("expected Command::SendMessage, got {other:?}"),
         }
     }

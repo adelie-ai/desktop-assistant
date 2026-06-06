@@ -119,6 +119,42 @@ impl Connector {
             self.client.send_prompt(conversation_id, &composed).await
         }
     }
+
+    /// Send a prompt with a per-request system-prompt refinement AND a
+    /// client-supplied **idempotency key** (#204), so a retry after a dropped
+    /// connection re-attaches to the live turn (or replays a completed reply)
+    /// instead of re-running it. Socket transports (UDS / WS) carry both as
+    /// dedicated fields; the D-Bus transport has neither, so it folds the
+    /// refinement into the prompt and drops the key — a dropped D-Bus call
+    /// isn't recoverable this way, so use a socket transport for idempotent
+    /// retry. `idempotency_key = None` behaves like
+    /// [`send_prompt_with_system_refinement`](Self::send_prompt_with_system_refinement).
+    pub async fn send_prompt_with_system_refinement_idempotent(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        system_refinement: &str,
+        idempotency_key: Option<String>,
+    ) -> Result<String> {
+        if let Some(commands) = self.client.as_commands() {
+            commands
+                .send_prompt_idempotent(
+                    conversation_id,
+                    prompt,
+                    None,
+                    system_refinement.to_string(),
+                    idempotency_key,
+                )
+                .await
+        } else {
+            let composed = if system_refinement.trim().is_empty() {
+                prompt.to_string()
+            } else {
+                format!("{system_refinement}\n\n{prompt}")
+            };
+            self.client.send_prompt(conversation_id, &composed).await
+        }
+    }
 }
 
 #[cfg(test)]

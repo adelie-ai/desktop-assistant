@@ -5,6 +5,7 @@
 
 pub mod background_tasks;
 pub mod client_tools;
+mod inflight;
 pub mod subagent_tools;
 
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::background_tasks::{BackgroundTaskRegistry, TaskError};
+use crate::inflight::{InFlightRegistry, InFlightTurn, TeeSink, forward_inflight};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -331,6 +333,12 @@ where
     /// completed-dedup). `None` (no DB, tests) makes the key a no-op so
     /// `SendMessage` behaves exactly as before.
     idempotency: Option<Arc<dyn IdempotencyKeyStore>>,
+    /// In-memory index of live keyed turns (#204 phase 2). A `SendMessage`
+    /// carrying an `idempotency_key` whose original is still running in this
+    /// process re-attaches to that live turn (replay buffered chunks + forward
+    /// live) instead of running a second turn. Always present (no DB needed);
+    /// only consulted when a request carries a key.
+    inflight: Arc<InFlightRegistry>,
 }
 
 impl<A, C, S, N, K> DefaultAssistantApiHandler<A, C, S, N, K>
@@ -361,6 +369,7 @@ where
             scratchpad_delete_many: None,
             scratchpad_clear: None,
             idempotency: None,
+            inflight: Arc::new(InFlightRegistry::default()),
         }
     }
 
@@ -435,6 +444,49 @@ where
         };
         replay_completed_response(sink, conversation_id, request_id, response).await;
         Ok(true)
+    }
+
+    /// Spawn a registry task that re-attaches `sink` to a live in-flight turn:
+    /// replay its buffered events, then forward live events until it ends
+    /// (#204 phase 2).
+    async fn spawn_reattach(
+        registry: &BackgroundTaskRegistry,
+        user_id: UserId,
+        conversation_id: &str,
+        sink: Arc<dyn EventSink>,
+        turn: Arc<InFlightTurn>,
+    ) -> api::TaskId {
+        let (replay, rx) = turn.snapshot_and_subscribe().await;
+        let kind = api::TaskKind::Conversation {
+            conversation_id: conversation_id.to_string(),
+        };
+        let title = format!("Conversation: {conversation_id}");
+        registry.spawn(user_id, kind, title, move |_ctx| async move {
+            forward_inflight(replay, rx, sink).await;
+            Ok(())
+        })
+    }
+
+    /// Spawn a registry task that replays a completed turn's stored reply to
+    /// `sink` (#204 phase 1), keyed by the retry's own `request_id`.
+    fn spawn_completed_replay(
+        registry: &BackgroundTaskRegistry,
+        user_id: UserId,
+        conversation_id: &str,
+        request_id: &str,
+        sink: Arc<dyn EventSink>,
+        response: String,
+    ) -> api::TaskId {
+        let kind = api::TaskKind::Conversation {
+            conversation_id: conversation_id.to_string(),
+        };
+        let title = format!("Conversation: {conversation_id}");
+        let conv = conversation_id.to_string();
+        let req = request_id.to_string();
+        registry.spawn(user_id, kind, title, move |_ctx| async move {
+            replay_completed_response(&sink, &conv, &req, response).await;
+            Ok(())
+        })
     }
 
     fn map_core_err<E: ToString>(e: E) -> ApiError {
@@ -1531,37 +1583,72 @@ where
         };
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
 
-        // Completed-dedup (#204): when this key already has a committed
-        // reply, register a tiny replay task so the dispatcher's
-        // `SendMessageAck { task_id }` arrives before the stream — exactly
-        // as for a normal turn — then replay the stored reply instead of
-        // re-running the LLM/tools.
-        if let (Some(key), Some(store)) = (idempotency_key.as_deref(), self.idempotency.as_ref()) {
-            let completed = store
-                .lookup_completed(&conversation_id, key)
-                .await
-                .map_err(Self::map_core_err)?;
-            if let Some(response) = completed {
-                let kind = api::TaskKind::Conversation {
-                    conversation_id: conversation_id.clone(),
-                };
-                let title = format!("Conversation: {conversation_id}");
-                let sink_for_replay = Arc::clone(&sink);
-                let conv_for_replay = conversation_id.clone();
-                let req_for_replay = request_id.clone();
-                let task_id = registry.spawn(user_id, kind, title, move |_ctx| async move {
-                    replay_completed_response(
-                        &sink_for_replay,
-                        &conv_for_replay,
-                        &req_for_replay,
-                        response,
-                    )
-                    .await;
-                    Ok(())
-                });
+        // Idempotency shortcuts for a keyed SendMessage (#204), tried before
+        // dispatching a fresh turn.
+        if let Some(key) = idempotency_key.as_deref() {
+            // (1) In-flight re-attach (phase 2): the original is still running
+            // in this process — re-attach to its live stream (replay buffered
+            // chunks, then forward live) instead of running a second turn.
+            if let Some(turn) = self.inflight.get(user_id.as_str(), &conversation_id, key) {
+                let task_id = Self::spawn_reattach(
+                    &registry,
+                    user_id,
+                    &conversation_id,
+                    Arc::clone(&sink),
+                    turn,
+                )
+                .await;
                 return Ok(Some(task_id));
             }
+            // (2) Completed-dedup (phase 1): the original finished — replay its
+            // committed reply. A registry replay-task keeps the dispatcher's
+            // `SendMessageAck { task_id }`-then-stream ordering identical to a
+            // normal turn.
+            if let Some(store) = self.idempotency.as_ref() {
+                let completed = store
+                    .lookup_completed(&conversation_id, key)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                if let Some(response) = completed {
+                    let task_id = Self::spawn_completed_replay(
+                        &registry,
+                        user_id,
+                        &conversation_id,
+                        &request_id,
+                        Arc::clone(&sink),
+                        response,
+                    );
+                    return Ok(Some(task_id));
+                }
+            }
         }
+
+        // Fresh turn. For a keyed turn, claim an in-flight slot so a concurrent
+        // duplicate can re-attach; if we lose that claim to a racing same-key
+        // turn, re-attach to the winner rather than running twice.
+        let inflight_slot = match idempotency_key.as_deref() {
+            Some(key) => match self
+                .inflight
+                .register(user_id.as_str(), &conversation_id, key)
+            {
+                Some(turn) => Some((key.to_string(), turn)),
+                None => {
+                    if let Some(turn) = self.inflight.get(user_id.as_str(), &conversation_id, key) {
+                        let task_id = Self::spawn_reattach(
+                            &registry,
+                            user_id,
+                            &conversation_id,
+                            Arc::clone(&sink),
+                            turn,
+                        )
+                        .await;
+                        return Ok(Some(task_id));
+                    }
+                    None
+                }
+            },
+            None => None,
+        };
 
         let conversations = Arc::clone(&self.conversations);
         // Pair the store with the key (both-or-neither) so the turn body
@@ -1572,20 +1659,25 @@ where
         };
         let title = format!("Conversation: {conversation_id}");
 
-        let conv_id_for_body = conversation_id.clone();
-        let request_id_for_body = request_id.clone();
-        let sink_for_body = Arc::clone(&sink);
-        let user_id_for_body = user_id.clone();
+        // A keyed turn emits through a `TeeSink` so its events both reach the
+        // caller and feed the in-flight hub for re-attachers; an unkeyed turn
+        // emits straight to the caller's sink.
+        let turn_sink: Arc<dyn EventSink> = match &inflight_slot {
+            Some((_, turn)) => Arc::new(TeeSink::new(Arc::clone(&sink), Arc::clone(turn))),
+            None => Arc::clone(&sink),
+        };
 
-        // `registry.spawn` is sync; the body runs on its own
-        // `tokio::spawn` so we can return the new task id immediately.
-        // `tokio::spawn` does not propagate task-locals, so the body
-        // must re-install `with_user_id` for storage queries inside
-        // `run_send_turn` to scope to the right user (#154). The
-        // `system_refinement` is moved into the closure as an explicit
-        // value for the same reason — it can't ride a task-local across
-        // the spawn; it is installed as a task-local further down, inside
-        // the per-turn dispatch in the daemon's routing handler.
+        let inflight_index = Arc::clone(&self.inflight);
+        let conv_id_for_body = conversation_id.clone();
+        let conv_id_for_cleanup = conversation_id.clone();
+        let request_id_for_body = request_id.clone();
+        let user_id_for_body = user_id.clone();
+        let user_id_for_cleanup = user_id.clone();
+
+        // `registry.spawn` is sync; the body runs on its own `tokio::spawn` so
+        // we can return the new task id immediately. `tokio::spawn` doesn't
+        // propagate task-locals, so the body re-installs `with_user_id` for
+        // storage queries inside `run_send_turn` (#154).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             ctx.logs.append(
                 api::LogLevel::Info,
@@ -1604,11 +1696,19 @@ where
                     system_refinement,
                     request_id_for_body,
                     idempotency,
-                    sink_for_body,
+                    turn_sink,
                     ctx.token.clone(),
                 ),
             )
             .await;
+
+            // Free the in-flight slot now the turn is done. `run_send_turn` has
+            // returned, so its `TeeSink` (the other hub owner) is dropped here
+            // too — once the slot is removed the broadcast closes and any
+            // re-attach streams finish.
+            if let Some((key, _turn)) = inflight_slot {
+                inflight_index.remove(user_id_for_cleanup.as_str(), &conv_id_for_cleanup, &key);
+            }
 
             match result {
                 Ok(()) => Ok(()),
@@ -3711,6 +3811,157 @@ mod tests {
             runs.load(Ordering::SeqCst),
             1,
             "a key with no store attached runs the turn as normal"
+        );
+    }
+
+    /// `ConversationService` double that emits one chunk, blocks until
+    /// released, then emits a second chunk and completes — so a second
+    /// same-key request can arrive while the turn is provably in flight.
+    struct GatedConversations {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl ConversationService for GatedConversations {
+        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("c1", title))
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            on_chunk("part1 ".to_string());
+            self.release.notified().await;
+            on_chunk("part2".to_string());
+            Ok("part1 part2".to_string())
+        }
+    }
+
+    /// #204 phase 2: a second `SendMessage` with the same key while the first
+    /// is still running in this process re-attaches to the live turn (replay +
+    /// live) instead of running it again. The turn runs exactly once and both
+    /// callers see completion; the re-attacher receives chunks emitted after it
+    /// joined.
+    #[tokio::test]
+    async fn idempotency_inflight_reattach_does_not_rerun() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let conv = Arc::new(GatedConversations {
+            runs: Arc::clone(&runs),
+            release: Arc::clone(&release),
+        });
+        let registry = Arc::new(crate::background_tasks::BackgroundTaskRegistry::new());
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            conv,
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_registry(Arc::clone(&registry));
+
+        let sink1 = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        let sink2 = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        // Request 1 registers the in-flight slot (synchronously) and spawns the
+        // turn, which blocks after its first chunk.
+        let t1 = h
+            .start_send_message(
+                "c1".into(),
+                "hi".into(),
+                None,
+                String::new(),
+                "r1".into(),
+                Some("k1".into()),
+                sink1.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("task 1");
+        // Request 2, same key while #1 is in flight, must re-attach (not rerun).
+        let t2 = h
+            .start_send_message(
+                "c1".into(),
+                "hi".into(),
+                None,
+                String::new(),
+                "r2".into(),
+                Some("k1".into()),
+                sink2.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("task 2");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(&t1))
+            .await
+            .expect("turn finishes");
+        tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(&t2))
+            .await
+            .expect("re-attach finishes");
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the turn must run exactly once for two same-key requests"
+        );
+
+        let ev1 = sink1.0.lock().await.clone();
+        let ev2 = sink2.0.lock().await.clone();
+        assert!(
+            ev1.iter()
+                .any(|e| matches!(e, api::Event::AssistantCompleted { .. })),
+            "original caller completes"
+        );
+        assert!(
+            ev2.iter()
+                .any(|e| matches!(e, api::Event::AssistantCompleted { .. })),
+            "re-attached caller completes"
+        );
+        let live2: String = ev2
+            .iter()
+            .filter_map(|e| match e {
+                api::Event::AssistantDelta { chunk, .. } => Some(chunk.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            live2.contains("part2"),
+            "re-attacher receives chunks emitted after it joined: {live2:?}"
         );
     }
 }
