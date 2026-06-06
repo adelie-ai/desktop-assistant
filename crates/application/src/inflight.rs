@@ -93,25 +93,50 @@ impl EventSink for TeeSink {
     }
 }
 
+/// Restamp a forwarded event with the re-attacher's `request_id`.
+///
+/// The live turn emitted its events under the *original* request's id, but the
+/// re-attaching client (a retry) correlates the stream against the id of *its
+/// own* request — exactly as it would for a normal turn (and as completed-dedup
+/// replay already does). Without this, a retrying client like the voice service
+/// (which matches `event.request_id == its_request_id`) would silently ignore
+/// every re-attached event. Only the request-scoped events carry a
+/// `request_id`; conversation-scoped ones pass through untouched.
+fn restamp_request_id(mut event: api::Event, request_id: &str) -> api::Event {
+    match &mut event {
+        api::Event::AssistantDelta { request_id: r, .. }
+        | api::Event::AssistantStatus { request_id: r, .. }
+        | api::Event::AssistantCompleted { request_id: r, .. }
+        | api::Event::AssistantError { request_id: r, .. } => {
+            *r = request_id.to_string();
+        }
+        _ => {}
+    }
+    event
+}
+
 /// Re-attach a sink to a live turn: replay the buffered events, then forward
 /// live events until the turn ends (the hub's sender drops) or the sink
-/// disconnects. Holds only a [`broadcast::Receiver`], never a strong reference
-/// to the [`InFlightTurn`], so it never keeps the hub (and thus the broadcast
-/// channel) alive past the turn it's following.
+/// disconnects. Each forwarded event is restamped with `request_id` (the
+/// re-attacher's request id) so the retrying client correlates the stream the
+/// same way it would a normal turn. Holds only a [`broadcast::Receiver`], never
+/// a strong reference to the [`InFlightTurn`], so it never keeps the hub (and
+/// thus the broadcast channel) alive past the turn it's following.
 pub(crate) async fn forward_inflight(
     replay: Vec<api::Event>,
     mut rx: broadcast::Receiver<api::Event>,
+    request_id: String,
     sink: Arc<dyn EventSink>,
 ) {
     for event in replay {
-        if !sink.emit(event).await {
+        if !sink.emit(restamp_request_id(event, &request_id)).await {
             return;
         }
     }
     loop {
         match rx.recv().await {
             Ok(event) => {
-                if !sink.emit(event).await {
+                if !sink.emit(restamp_request_id(event, &request_id)).await {
                     return;
                 }
             }
@@ -212,6 +237,17 @@ mod tests {
                 })
                 .collect()
         }
+        fn request_ids(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    api::Event::AssistantDelta { request_id, .. } => Some(request_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
     }
     #[async_trait]
     impl EventSink for RecordingSink {
@@ -240,7 +276,12 @@ mod tests {
         let (replay, rx) = turn.snapshot_and_subscribe().await;
         let sink = RecordingSink::new();
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
-        let forward = tokio::spawn(forward_inflight(replay, rx, sink_dyn));
+        let forward = tokio::spawn(forward_inflight(
+            replay,
+            rx,
+            "reattacher-rid".to_string(),
+            sink_dyn,
+        ));
 
         // More chunks emitted after re-attach arrive live.
         turn.emit_event(delta("c")).await;
@@ -251,6 +292,10 @@ mod tests {
         forward.await.unwrap();
 
         assert_eq!(sink.delta_chunks(), vec!["a", "b", "c", "d"]);
+        assert!(
+            sink.request_ids().iter().all(|r| r == "reattacher-rid"),
+            "every re-attached event is restamped with the re-attacher's request id"
+        );
     }
 
     #[tokio::test]
@@ -264,7 +309,7 @@ mod tests {
 
         let sink = RecordingSink::new();
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
-        let forward = tokio::spawn(forward_inflight(replay, rx, sink_dyn));
+        let forward = tokio::spawn(forward_inflight(replay, rx, "rid".to_string(), sink_dyn));
         drop(turn);
         forward.await.unwrap();
 

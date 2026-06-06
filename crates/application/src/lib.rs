@@ -453,6 +453,7 @@ where
         registry: &BackgroundTaskRegistry,
         user_id: UserId,
         conversation_id: &str,
+        request_id: &str,
         sink: Arc<dyn EventSink>,
         turn: Arc<InFlightTurn>,
     ) -> api::TaskId {
@@ -461,8 +462,11 @@ where
             conversation_id: conversation_id.to_string(),
         };
         let title = format!("Conversation: {conversation_id}");
+        // Restamp forwarded events with this (the re-attacher's) request id so
+        // the retrying client correlates the stream like a normal turn.
+        let request_id = request_id.to_string();
         registry.spawn(user_id, kind, title, move |_ctx| async move {
-            forward_inflight(replay, rx, sink).await;
+            forward_inflight(replay, rx, request_id, sink).await;
             Ok(())
         })
     }
@@ -1594,6 +1598,7 @@ where
                     &registry,
                     user_id,
                     &conversation_id,
+                    &request_id,
                     Arc::clone(&sink),
                     turn,
                 )
@@ -1638,6 +1643,7 @@ where
                             &registry,
                             user_id,
                             &conversation_id,
+                            &request_id,
                             Arc::clone(&sink),
                             turn,
                         )
@@ -3948,9 +3954,12 @@ mod tests {
             "original caller completes"
         );
         assert!(
-            ev2.iter()
-                .any(|e| matches!(e, api::Event::AssistantCompleted { .. })),
-            "re-attached caller completes"
+            ev2.iter().any(|e| matches!(
+                e,
+                api::Event::AssistantCompleted { request_id, .. } if request_id == "r2"
+            )),
+            "re-attached caller completes, with events restamped to ITS request id (r2), \
+             not the original turn's (r1) — so a request_id-correlating client matches them"
         );
         let live2: String = ev2
             .iter()
