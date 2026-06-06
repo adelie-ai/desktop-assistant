@@ -180,5 +180,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // SendMessage idempotency keys (#204): records a completed turn's reply
+    // keyed by (user_id, conversation_id, idempotency_key) so a dropped-then-
+    // retried turn replays instead of re-running.
+    sqlx::raw_sql(include_str!("../migrations/023_idempotency_keys.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }

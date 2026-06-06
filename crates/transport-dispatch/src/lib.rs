@@ -156,6 +156,7 @@ pub async fn dispatch_loop<R, W>(
                 content,
                 override_selection,
                 system_refinement,
+                idempotency_key,
             } => {
                 // Per-request id for event correlation (matches old WS path).
                 let request_id = uuid::Uuid::new_v4().to_string();
@@ -175,6 +176,7 @@ pub async fn dispatch_loop<R, W>(
                         override_selection.clone(),
                         system_refinement.clone(),
                         request_id.clone(),
+                        idempotency_key.clone(),
                         Arc::clone(&sink),
                     ),
                 )
@@ -222,6 +224,7 @@ pub async fn dispatch_loop<R, W>(
                                     override_selection,
                                     system_refinement,
                                     request_id,
+                                    idempotency_key,
                                     sink,
                                 ),
                             )

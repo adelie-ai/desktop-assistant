@@ -179,6 +179,9 @@ pub trait AssistantCommands: Send + Sync {
                 content: prompt.to_string(),
                 override_selection,
                 system_refinement,
+                // No idempotency key from this entry point yet — clients that
+                // want safe retry will pass one via a dedicated method (#204).
+                idempotency_key: None,
             })
             .await?;
         // Post-#114 the daemon returns `SendMessageAck { task_id }` when its
@@ -442,6 +445,7 @@ mod tests {
                 content,
                 override_selection: emitted,
                 system_refinement,
+                ..
             } => {
                 assert_eq!(conversation_id, "conv-1");
                 assert_eq!(content, "hello");
@@ -476,6 +480,7 @@ mod tests {
                 content,
                 override_selection,
                 system_refinement,
+                ..
             } => {
                 assert_eq!(conversation_id, "conv-1");
                 // The visible user message is the clean prompt — the

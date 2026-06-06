@@ -7,6 +7,7 @@ pub mod database;
 pub mod dreaming;
 pub mod embedding_backfill;
 pub mod error_classifications;
+pub mod idempotency_keys;
 pub mod kb_metadata;
 pub mod knowledge;
 pub mod migrate_json;
@@ -28,6 +29,7 @@ pub use conversation::PgConversationStore;
 pub use conversation_search::PgConversationSearchStore;
 pub use database::execute_database_query;
 pub use error_classifications::PgErrorClassificationStore;
+pub use idempotency_keys::PgIdempotencyKeyStore;
 pub use knowledge::PgKnowledgeBaseStore;
 pub use migrate_json::{
     is_conversations_table_empty, is_knowledge_base_table_empty, migrate_conversations,

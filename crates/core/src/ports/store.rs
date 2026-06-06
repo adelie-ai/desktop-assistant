@@ -395,6 +395,57 @@ pub trait ConversationStore: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
+// ---- #204: SendMessage idempotency keys -----------------------------------
+
+/// Outbound port for SendMessage idempotency keys (#204).
+///
+/// Lets a client safely retry a `SendMessage` whose connection dropped (or
+/// whose daemon restarted) mid-turn without re-running the LLM and
+/// re-executing the turn's tool actions. The store persists the committed
+/// reply keyed by `(user_id, conversation_id, idempotency_key)`; a retry
+/// that finds a completed row replays the stored reply instead of
+/// dispatching a fresh turn.
+///
+/// This is the crash-safe *completed-dedup* half of #204. A turn that never
+/// finished records nothing, so a retry re-runs it (the action did not
+/// complete) — the common "connection dropped after the turn already
+/// finished" case is the one made recoverable here. In-flight re-attach (a
+/// duplicate key while the original is still running in *this* process) is
+/// handled separately by the application layer's in-memory registry.
+///
+/// Implementations scope every operation to `current_user_id()` and the
+/// given `conversation_id`, riding the same conversation-ownership
+/// authorization `SendMessage` already enforces — a key presented against a
+/// conversation the caller can't send to can't collide with or read another
+/// user's stored reply. Cross-user reads MUST behave like the row doesn't
+/// exist. Uses `async_trait` so the application layer can hold the store
+/// behind a `dyn IdempotencyKeyStore` (the call rate is one lookup + one
+/// record per turn).
+#[async_trait::async_trait]
+pub trait IdempotencyKeyStore: Send + Sync {
+    /// Return the stored reply for a previously completed turn with this
+    /// `(current_user_id, conversation_id, idempotency_key)`, or `None`
+    /// when no completed row exists (so the caller dispatches a fresh turn).
+    async fn lookup_completed(
+        &self,
+        conversation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, CoreError>;
+
+    /// Record the committed reply for a finished turn, keyed by
+    /// `(current_user_id, conversation_id, idempotency_key)`. Idempotent:
+    /// re-recording the same key overwrites the stored reply, so a retried
+    /// turn that raced past the dedup check and ran again still converges to
+    /// a single row. `request_id` is stored for audit only.
+    async fn record_response(
+        &self,
+        conversation_id: &str,
+        idempotency_key: &str,
+        request_id: &str,
+        response: &str,
+    ) -> Result<(), CoreError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
