@@ -50,6 +50,11 @@ fn cancellation_token_or_default() -> CancellationToken {
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
 
+/// Turn-start liveness status (issue #223), emitted via `on_status` before the
+/// first LLM token so clients (voice) get an immediate heartbeat. Terse and
+/// speakable; the voice client decides whether/how to narrate it.
+const TURN_START_STATUS: &str = "Working on it";
+
 fn now_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -423,6 +428,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             std::collections::HashMap::new();
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
+
+        // Turn-start liveness status (issue #223): emit a brief "working on it"
+        // as soon as the turn is set up, before the first LLM token. This gives
+        // clients (voice) an immediate heartbeat — without it a multi-round tool
+        // turn is silent until the final answer streams. Per-tool-round statuses
+        // follow from the dispatch loop below.
+        on_status(TURN_START_STATUS.to_string());
 
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-turns cancellation checkpoint (issue #109): if the
@@ -1005,6 +1017,15 @@ mod tests {
         Box::new(|_| {})
     }
 
+    /// A [`StatusCallback`] that records every emitted status message into the
+    /// returned shared buffer, so a test can assert what the turn emitted.
+    fn recording_status() -> (StatusCallback, Arc<std::sync::Mutex<Vec<String>>>) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_cb = Arc::clone(&log);
+        let cb: StatusCallback = Box::new(move |msg| log_for_cb.lock().unwrap().push(msg));
+        (cb, log)
+    }
+
     struct ListOnlyStore {
         conversations: Vec<Conversation>,
     }
@@ -1404,6 +1425,74 @@ mod tests {
             updated.messages[3].content,
             "The file contains: hello world"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_emits_turn_start_then_per_tool_status() {
+        // Issue #223: a turn must emit a turn-start liveness status before the
+        // first LLM token, and one status per tool call from the dispatch loop,
+        // so clients get a heartbeat + narratable progress between rounds.
+        let tools = vec![
+            ToolDefinition::new("calendar_list", "List calendar", serde_json::json!({})),
+            ToolDefinition::new("notes_search", "Search notes", serde_json::json!({})),
+        ];
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![
+                    ToolCall::new("c1", "calendar_list", "{}"),
+                    ToolCall::new("c2", "notes_search", "{}"),
+                ],
+            ),
+            LlmResponse::text("All set"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("calendar_list".to_string(), "ok".to_string());
+        tool_results.insert("notes_search".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let (status_cb, status_log) = recording_status();
+        let result = handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .unwrap();
+        assert_eq!(result, "All set");
+
+        let statuses = status_log.lock().unwrap().clone();
+        // First status is the turn-start heartbeat, before any tool round.
+        assert_eq!(
+            statuses.first().map(String::as_str),
+            Some(TURN_START_STATUS),
+            "expected turn-start status first; got {statuses:?}"
+        );
+        // Each tool call emits a human-labelled status.
+        assert!(
+            statuses.contains(&"Checking your calendar".to_string()),
+            "expected a calendar status; got {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&"Searching your notes".to_string()),
+            "expected a notes status; got {statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_with_no_tools_still_emits_turn_start_status() {
+        // Even a plain text turn (no tool rounds) must emit the turn-start
+        // heartbeat so the client knows the assistant is working.
+        let handler = make_handler(vec!["Hello there"]);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Hi".into(), noop_callback(), status_cb)
+            .await
+            .unwrap();
+
+        let statuses = status_log.lock().unwrap().clone();
+        assert_eq!(statuses, vec![TURN_START_STATUS.to_string()]);
     }
 
     #[tokio::test]
