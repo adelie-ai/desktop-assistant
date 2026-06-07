@@ -17,9 +17,10 @@ tokio-util = "0.7"
 desktop-assistant-api-model = { path = "../api-model" }
 desktop-assistant-application = { path = "../application" }
 desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
+# System-id co-location comparison (#248).
+desktop-assistant-core = { path = "../core" }
 
 [dev-dependencies]
-desktop-assistant-core = { path = "../core" }
 desktop-assistant-auth-jwt.workspace = true
 desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
 tempfile = "3"

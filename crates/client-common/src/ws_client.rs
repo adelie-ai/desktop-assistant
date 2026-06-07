@@ -67,10 +67,17 @@ impl WsClient {
     /// Connect a WebSocket transport. Returns the client, the persistent signal
     /// stream, and a drop-notifier receiver that fires once per underlying
     /// socket close (#246) — the Connector uses the latter to drive reconnect.
+    ///
+    /// `system_id` / `host_label` (#248) ride custom upgrade headers (WS
+    /// authenticates via the `Authorization` header at upgrade time, not an
+    /// in-band frame) so the daemon can compute exact co-location even over
+    /// WebSocket; `None`/`None` simply omits them.
     pub async fn connect(
         ws_url: &str,
         bearer_token: &str,
         tls_ca_cert: Option<&Path>,
+        system_id: Option<&str>,
+        host_label: Option<&str>,
     ) -> Result<(
         Self,
         mpsc::UnboundedReceiver<SignalEvent>,
@@ -87,6 +94,8 @@ impl WsClient {
             ws_url,
             bearer_token,
             tls_ca_cert,
+            system_id,
+            host_label,
             Arc::clone(&pending),
             signal_tx.clone(),
             drop_tx.clone(),
@@ -110,19 +119,46 @@ impl WsClient {
     /// **persistent** `pending` / `signal_tx` / `drop_tx`, and return the new
     /// writer handle. Shared by [`connect`](Self::connect) and
     /// [`reconnect`](Self::reconnect) (#246).
+    // Each argument is a distinct connection input (endpoint, credential, TLS,
+    // the #248 id/label, and the three persistent channels); bundling them into
+    // a struct would just relocate the same fan-out without making it clearer.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_connection(
         ws_url: &str,
         bearer_token: &str,
         tls_ca_cert: Option<&Path>,
+        system_id: Option<&str>,
+        host_label: Option<&str>,
         pending: Arc<Mutex<PendingState>>,
         signal_tx: mpsc::UnboundedSender<SignalEvent>,
         drop_tx: mpsc::UnboundedSender<()>,
     ) -> Result<mpsc::UnboundedSender<Message>> {
+        use tokio_tungstenite::tungstenite::http::HeaderName;
         let mut request = ws_url.into_client_request()?;
         request.headers_mut().insert(
             tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
             format!("Bearer {bearer_token}").parse()?,
         );
+        // System-id co-location handshake (#248): the daemon reads these custom
+        // headers and compares the id to its own. Optional — omitted when the
+        // client has no id, so the daemon falls back to the transport heuristic.
+        // A header value that won't parse (non-ASCII control bytes) is silently
+        // skipped — the id is a hint, not load-bearing, so we degrade rather
+        // than fail the connect.
+        if let Some(id) = system_id.filter(|s| !s.trim().is_empty())
+            && let Ok(value) = id.parse()
+        {
+            request
+                .headers_mut()
+                .insert(HeaderName::from_static(api::WS_SYSTEM_ID_HEADER), value);
+        }
+        if let Some(label) = host_label.filter(|s| !s.trim().is_empty())
+            && let Ok(value) = label.parse()
+        {
+            request
+                .headers_mut()
+                .insert(HeaderName::from_static(api::WS_HOST_LABEL_HEADER), value);
+        }
 
         let connector = if ws_url.starts_with("wss://") {
             Some(build_tls_connector(tls_ca_cert)?)
@@ -212,16 +248,25 @@ impl WsClient {
     /// spawn fresh writer/keepalive/reader tasks bound to the persistent
     /// channels, and swap in the new writer. On failure the error is returned so
     /// the supervisor can back off and retry.
+    ///
+    /// The system id + host label (#248) are re-sent on every reconnect — the
+    /// caller (`TransportClient::reconnect`) re-reads them from the stored
+    /// `ConnectionConfig`, so the co-location handshake field survives a daemon
+    /// restart exactly like the bearer token does.
     pub(crate) async fn reconnect(
         &self,
         ws_url: &str,
         bearer_token: &str,
         tls_ca_cert: Option<&Path>,
+        system_id: Option<&str>,
+        host_label: Option<&str>,
     ) -> Result<()> {
         let outbound_tx = Self::spawn_connection(
             ws_url,
             bearer_token,
             tls_ca_cert,
+            system_id,
+            host_label,
             Arc::clone(&self.pending),
             self.signal_tx.clone(),
             self.drop_tx.clone(),

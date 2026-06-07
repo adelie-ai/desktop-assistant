@@ -24,7 +24,9 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
-use desktop_assistant_core::ports::transport::with_transport_kind;
+use desktop_assistant_core::ports::transport::{
+    with_client_label, with_co_location, with_transport_kind,
+};
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
@@ -40,35 +42,67 @@ const OUTBOUND_BUFFER: usize = 64;
 
 /// Pre-validated identity for the connection.
 ///
-/// Carries the JWT `sub` (`user_id`) and the connection's [`TransportKind`]
-/// so the dispatcher can scope per-user state (#105) and infer tool
-/// co-location (#243). Structured as a type so further per-connection fields
-/// can be added without changing the dispatcher signature.
+/// Carries the JWT `sub` (`user_id`), the connection's [`TransportKind`], and
+/// (issue #248) the authoritative per-machine **system-id co-location** result
+/// plus an optional client-reported host label. The dispatcher uses these to
+/// scope per-user state (#105) and tag tool co-location (#243/#248). Structured
+/// as a type so further per-connection fields can be added without changing the
+/// dispatcher signature.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     /// JWT `sub` claim.
     pub user_id: String,
-    /// How this connection reaches the daemon — drives tool co-location
-    /// (UDS/D-Bus ⇒ same machine, WebSocket ⇒ possibly remote) (#243).
+    /// How this connection reaches the daemon — the **fallback** co-location
+    /// signal (UDS/D-Bus ⇒ same machine, WebSocket ⇒ possibly remote), used only
+    /// when [`Self::co_located`] is `None` (#243).
     pub transport: TransportKind,
+    /// Authoritative co-location from the per-machine system-id handshake
+    /// (#248): `Some(true)` when the client's reported id equals the daemon's
+    /// own (same machine — even over WebSocket), `Some(false)` when they differ,
+    /// `None` when the client reported no id (an older client ⇒ fall back to
+    /// [`Self::transport`]).
+    pub co_located: Option<bool>,
+    /// A client-reported host label (#248) for a friendlier remote tool note
+    /// (e.g. `your device 'laptop'`); `None` when the client sent none.
+    pub client_label: Option<String>,
 }
 
 impl AuthContext {
-    /// Build a context for a connection on `transport`. Each transport adapter
-    /// passes its own kind so the per-turn tool note can tag tool localities.
+    /// Build a context for a connection on `transport`, with no system-id
+    /// co-location result (older-client / no-id path — co-location falls back to
+    /// the transport heuristic). Each transport adapter passes its own kind so
+    /// the per-turn tool note can tag tool localities.
     pub fn new(user_id: impl Into<String>, transport: TransportKind) -> Self {
         Self {
             user_id: user_id.into(),
             transport,
+            co_located: None,
+            client_label: None,
         }
     }
 
+    /// Attach the authoritative system-id co-location result (#248): `Some(true)`
+    /// / `Some(false)` when the client reported an id the daemon could compare,
+    /// `None` to defer to the transport heuristic.
+    pub fn with_co_location(mut self, co_located: Option<bool>) -> Self {
+        self.co_located = co_located;
+        self
+    }
+
+    /// Attach a client-reported host label (#248) for the remote tool note.
+    pub fn with_client_label(mut self, label: Option<String>) -> Self {
+        self.client_label = label.filter(|l| !l.trim().is_empty());
+        self
+    }
+
     /// Convenience for tests that don't need a real subject. Defaults to the
-    /// co-located UDS transport.
+    /// co-located UDS transport with no system-id result.
     pub fn anonymous() -> Self {
         Self {
             user_id: "anonymous".to_string(),
             transport: TransportKind::Uds,
+            co_located: None,
+            client_label: None,
         }
     }
 }
@@ -155,6 +189,11 @@ pub async fn dispatch_loop<R, W>(
     // `tokio::spawn`. Only the send-message paths run the LLM turn, so the
     // command/subscribe paths don't need it.
     let transport = auth.transport;
+    // The authoritative per-machine system-id co-location result and an
+    // optional client-reported host label (#248), installed alongside the
+    // transport so the turn loop prefers the id match over the heuristic.
+    let co_located = auth.co_located;
+    let client_label = auth.client_label.clone();
 
     // Per-connection state for `SubscribeBackgroundTasks` (#114).
     // At most one forwarder runs per connection — Subscribe is
@@ -197,18 +236,24 @@ pub async fn dispatch_loop<R, W>(
                 // streamed events are stamped with, so a socket client
                 // can correlate the response (voice#49); the legacy path
                 // simply leaves `task_id` empty.
-                let task_id = with_transport_kind(
-                    transport,
-                    with_user_id(
-                        user_id.clone(),
-                        handler.start_send_message(
-                            conversation_id.clone(),
-                            content.clone(),
-                            override_selection.clone(),
-                            system_refinement.clone(),
-                            request_id.clone(),
-                            idempotency_key.clone(),
-                            Arc::clone(&sink),
+                let task_id = with_co_location(
+                    co_located,
+                    with_client_label(
+                        client_label.clone(),
+                        with_transport_kind(
+                            transport,
+                            with_user_id(
+                                user_id.clone(),
+                                handler.start_send_message(
+                                    conversation_id.clone(),
+                                    content.clone(),
+                                    override_selection.clone(),
+                                    system_refinement.clone(),
+                                    request_id.clone(),
+                                    idempotency_key.clone(),
+                                    Arc::clone(&sink),
+                                ),
+                            ),
                         ),
                     ),
                 )
@@ -264,19 +309,30 @@ pub async fn dispatch_loop<R, W>(
                         let handler = Arc::clone(&handler);
                         let user_id_for_task = user_id.clone();
                         let transport_for_task = transport;
+                        // Re-install the #248 co-location result + client label
+                        // inside the spawn, like the transport, since task-locals
+                        // don't cross `tokio::spawn`.
+                        let co_located_for_task = co_located;
+                        let client_label_for_task = client_label.clone();
                         tokio::spawn(async move {
-                            let _ = with_transport_kind(
-                                transport_for_task,
-                                with_user_id(
-                                    user_id_for_task,
-                                    handler.handle_send_message_with_override(
-                                        conversation_id,
-                                        content,
-                                        override_selection,
-                                        system_refinement,
-                                        request_id,
-                                        idempotency_key,
-                                        sink,
+                            let _ = with_co_location(
+                                co_located_for_task,
+                                with_client_label(
+                                    client_label_for_task,
+                                    with_transport_kind(
+                                        transport_for_task,
+                                        with_user_id(
+                                            user_id_for_task,
+                                            handler.handle_send_message_with_override(
+                                                conversation_id,
+                                                content,
+                                                override_selection,
+                                                system_refinement,
+                                                request_id,
+                                                idempotency_key,
+                                                sink,
+                                            ),
+                                        ),
                                     ),
                                 ),
                             )
@@ -525,4 +581,38 @@ pub async fn dispatch_loop<R, W>(
     // returns `false` — the cancellation signal core relies on.
     drop(out_tx);
     let _ = writer.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_context_defaults_have_no_co_location_result() {
+        // #248: a plain `new`/`anonymous` context carries no authoritative
+        // system-id result, so co-location falls back to the transport
+        // heuristic (the Phase-1, #243, behaviour for older clients).
+        let a = AuthContext::new("dave", TransportKind::WebSocket);
+        assert_eq!(a.co_located, None);
+        assert_eq!(a.client_label, None);
+        assert_eq!(AuthContext::anonymous().co_located, None);
+    }
+
+    #[test]
+    fn auth_context_builders_attach_co_location_and_label() {
+        let a = AuthContext::new("dave", TransportKind::WebSocket)
+            .with_co_location(Some(true))
+            .with_client_label(Some("laptop".to_string()));
+        assert_eq!(a.co_located, Some(true));
+        assert_eq!(a.client_label.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn auth_context_blank_label_is_dropped() {
+        // A blank/whitespace label is treated as absent so it never produces a
+        // `your device ''` in the tool note.
+        let a =
+            AuthContext::new("dave", TransportKind::Uds).with_client_label(Some("   ".to_string()));
+        assert_eq!(a.client_label, None);
+    }
 }

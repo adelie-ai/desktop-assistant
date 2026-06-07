@@ -41,6 +41,12 @@ pub struct WsServerState {
     login_service: Option<Arc<dyn WsLoginService>>,
     auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
     allowed_origins: Arc<Vec<String>>,
+    /// The daemon's own per-machine system id (#248), read once at startup.
+    /// Compared against the client's `x-adelie-system-id` upgrade header to
+    /// decide co-location exactly — same machine ⇒ co-located even over
+    /// WebSocket. `None` ⇒ co-location falls back to the transport heuristic
+    /// (WS ⇒ remote), preserving Phase-1 behaviour.
+    daemon_system_id: Arc<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -116,12 +122,38 @@ pub fn router_full(
     auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
     allowed_origins: Vec<String>,
 ) -> Router {
+    router_full_with_system_id(
+        handler,
+        auth_validator,
+        login_service,
+        auth_discovery,
+        allowed_origins,
+        None,
+    )
+}
+
+/// Like [`router_full`] but also wires the daemon's own per-machine system id
+/// (#248) so the `/ws` handler can compute exact tool-locality co-location from
+/// the client's `x-adelie-system-id` upgrade header. `None` reproduces the
+/// transport-heuristic-only behaviour of [`router_full`].
+// One distinct collaborator per argument; a config struct would be an
+// out-of-scope refactor of the public router API.
+#[allow(clippy::too_many_arguments)]
+pub fn router_full_with_system_id(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Vec<String>,
+    daemon_system_id: Option<String>,
+) -> Router {
     let state = WsServerState {
         handler,
         auth_validator,
         login_service,
         auth_discovery,
         allowed_origins: Arc::new(allowed_origins),
+        daemon_system_id: Arc::new(daemon_system_id),
     };
 
     Router::new()
@@ -178,6 +210,17 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     Some((username.to_string(), password.to_string()))
 }
 
+/// Read a header value as a trimmed, non-empty `String`, or `None` if absent /
+/// non-ASCII / blank. Used for the #248 system-id + host-label upgrade headers.
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsServerState>,
@@ -207,9 +250,23 @@ async fn ws_handler(
         .await
         .unwrap_or_default();
 
+    // System-id co-location (#248): the client reports its per-machine id (and
+    // optionally a host label) in custom upgrade headers. Compare it to the
+    // daemon's own id; a match co-locates even over WebSocket. `None` (no header
+    // or unresolved daemon id) defers to the transport heuristic (WS ⇒ remote),
+    // preserving Phase-1 behaviour. The id is a routing HINT, not a trust
+    // boundary — it is self-reported and no privilege is gated on it (auth is
+    // the bearer token validated above).
+    let client_system_id = header_string(&headers, api::WS_SYSTEM_ID_HEADER);
+    let client_label = header_string(&headers, api::WS_HOST_LABEL_HEADER);
+    let co_located = desktop_assistant_core::system_id::co_location_from_ids(
+        state.daemon_system_id.as_deref(),
+        client_system_id.as_deref(),
+    );
+
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state, user_id))
+        .on_upgrade(move |socket| handle_socket(socket, state, user_id, co_located, client_label))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -274,7 +331,13 @@ async fn auth_config_handler(State(state): State<WsServerState>) -> impl IntoRes
 /// `WsFrame` values into `Message::Text`. A `tokio_util::PollSender`
 /// gives us a `Sink<WsFrame>` over the mpsc so the dispatcher's
 /// generic bound is satisfied without a hand-rolled adapter.
-async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: WsServerState,
+    user_id: UserId,
+    co_located: Option<bool>,
+    client_label: Option<String>,
+) {
     use axum::extract::ws::CloseFrame;
     use futures::stream::StreamExt;
     use tokio::sync::mpsc;
@@ -391,10 +454,14 @@ async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId)
     // the schema sentinel for single-tenant fallback. The dispatcher
     // installs this into the per-task task-local on every dispatched
     // command so storage queries scope correctly.
-    // A WebSocket connection may terminate on a different host, so its
-    // client-registered tools are treated as remote — distinct from the
-    // daemon's server-side tools (#243).
-    let auth = AuthContext::new(user_id.into_inner(), TransportKind::WebSocket);
+    // A WebSocket connection may terminate on a different host, so by the
+    // transport heuristic its client-registered tools are treated as remote
+    // (#243). When the client reported a system id that matches the daemon's,
+    // the #248 co-location result overrides that — co-located even over WS — and
+    // an optional client host label makes the remote tool note friendlier.
+    let auth = AuthContext::new(user_id.into_inner(), TransportKind::WebSocket)
+        .with_co_location(co_located)
+        .with_client_label(client_label);
 
     dispatch_loop(Arc::clone(&state.handler), auth, inbound, sink).await;
 
@@ -483,12 +550,44 @@ pub async fn serve_full<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let app = router_full(
+    serve_full_with_system_id(
         handler,
         auth_validator,
         login_service,
         auth_discovery,
         allowed_origins,
+        None,
+        bind,
+        shutdown,
+    )
+    .await
+}
+
+/// Like [`serve_full`] but also wires the daemon's own per-machine system id
+/// (#248) so co-location can be computed from the client's upgrade header.
+// One distinct collaborator per argument; a config struct would be an
+// out-of-scope refactor of the public serve API.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_full_with_system_id<F>(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Vec<String>,
+    daemon_system_id: Option<String>,
+    bind: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let app = router_full_with_system_id(
+        handler,
+        auth_validator,
+        login_service,
+        auth_discovery,
+        allowed_origins,
+        daemon_system_id,
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
@@ -516,16 +615,51 @@ pub async fn serve_full_tls<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use hyper_util::server::conn::auto::Builder as ConnBuilder;
-    use hyper_util::service::TowerToHyperService;
-
-    let app = router_full(
+    serve_full_tls_with_system_id(
         handler,
         auth_validator,
         login_service,
         auth_discovery,
         allowed_origins,
+        None,
+        tls_acceptor,
+        bind,
+        shutdown,
+    )
+    .await
+}
+
+/// Like [`serve_full_tls`] but also wires the daemon's own per-machine system id
+/// (#248) for co-location from the client's upgrade header.
+// One distinct collaborator per argument; a config struct would be an
+// out-of-scope refactor of the public serve API.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "tls")]
+pub async fn serve_full_tls_with_system_id<F>(
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Vec<String>,
+    daemon_system_id: Option<String>,
+    tls_acceptor: tokio_rustls::TlsAcceptor,
+    bind: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::service::TowerToHyperService;
+
+    let app = router_full_with_system_id(
+        handler,
+        auth_validator,
+        login_service,
+        auth_discovery,
+        allowed_origins,
+        daemon_system_id,
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
 

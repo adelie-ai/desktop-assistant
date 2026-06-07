@@ -23,7 +23,7 @@ use crate::ports::scratchpad::{
 };
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
-use crate::ports::transport::current_transport_kind;
+use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
 use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, tool_set_hash, tool_status_message,
@@ -701,14 +701,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             None => Vec::new(),
         };
 
-        // Tool execution-locality context (issue #243). Resolve the turn's
-        // co-location signal (the connection's transport: UDS/D-Bus ⇒ same
-        // machine, WebSocket ⇒ possibly remote) plus the daemon's host label,
-        // the server-side tool names, and the client-local tool names once. The
+        // Tool execution-locality context (issue #243, refined in #248).
+        // Resolve the turn's co-location signal once: the authoritative
+        // per-machine system-id match (#248) when the client reported an id, and
+        // the connection's transport (UDS/D-Bus ⇒ same machine, WebSocket ⇒
+        // possibly remote) as the fallback for older clients that sent none.
+        // Plus the daemon's host label, an optional client-reported host label,
+        // the server-side tool names, and the client-local tool names. The
         // tool-note builder uses it to tag each tool with where it runs and to
-        // route a capability that exists on both the server and a remote
-        // client. The server set is the full core set plus every namespaced
-        // tool — activated tools are always a subset of these (they come from
+        // route a capability that exists on both the server and a remote client.
+        // The server set is the full core set plus every namespaced tool —
+        // activated tools are always a subset of these (they come from
         // server-side search), so a tool that isn't in this set is client-only.
         let server_tool_names: Vec<String> = core_tools
             .iter()
@@ -719,10 +722,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     .flat_map(|ns| ns.tools.iter().map(|t| t.name.clone())),
             )
             .collect();
+        // Prefer a client-reported host label for the remote tool note; fall
+        // back to the generic "your device" when none was sent (#248).
+        let client_label = current_client_label()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| "your device".to_string());
         let tool_locality = ToolLocalityContext {
+            co_located: current_co_location(),
             transport: current_transport_kind(),
             host: self.host.clone(),
-            client_label: "your device".to_string(),
+            client_label,
             server_tool_names,
             client_tool_names: client_tool_defs.iter().map(|d| d.name.clone()).collect(),
         };

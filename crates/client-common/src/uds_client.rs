@@ -113,9 +113,15 @@ impl UdsClient {
     /// Connect a UDS transport. Returns the client, the persistent signal
     /// stream, and a drop-notifier receiver that fires once per underlying
     /// socket close (#246) — the Connector uses the latter to drive reconnect.
+    ///
+    /// `system_id` / `host_label` (#248) ride the JWT handshake frame so the
+    /// daemon can compute exact co-location; `None`/`None` reproduces the
+    /// pre-#248 `{"jwt": "…"}` handshake byte-for-byte.
     pub async fn connect(
         socket_path: &Path,
         bearer_token: &str,
+        system_id: Option<&str>,
+        host_label: Option<&str>,
     ) -> Result<(
         Self,
         mpsc::UnboundedReceiver<SignalEvent>,
@@ -131,6 +137,8 @@ impl UdsClient {
         let outbound_tx = Self::spawn_connection(
             socket_path,
             bearer_token,
+            system_id,
+            host_label,
             Arc::clone(&pending),
             signal_tx.clone(),
             drop_tx.clone(),
@@ -157,6 +165,8 @@ impl UdsClient {
     async fn spawn_connection(
         socket_path: &Path,
         bearer_token: &str,
+        system_id: Option<&str>,
+        host_label: Option<&str>,
         pending: Arc<Mutex<PendingState>>,
         signal_tx: mpsc::UnboundedSender<SignalEvent>,
         drop_tx: mpsc::UnboundedSender<()>,
@@ -166,11 +176,18 @@ impl UdsClient {
             .map_err(|e| anyhow!("failed to connect uds {}: {e}", socket_path.display()))?;
         let (mut read_half, mut write_half) = stream.into_split();
 
-        // Handshake: the first frame must be `{"jwt": "<token>"}`. On success
-        // the server sends nothing back and proceeds straight to the
-        // dispatcher; on failure it writes an error frame and closes, which
-        // the reader below turns into a connection-level failure.
-        let handshake = serde_json::to_vec(&serde_json::json!({ "jwt": bearer_token }))?;
+        // Handshake: the first frame carries the JWT plus, optionally, the
+        // client's per-machine system id + host label for co-location (#248).
+        // The optional fields are skipped when absent, so a no-id client sends
+        // the byte-identical pre-#248 `{"jwt": "…"}`. On success the server sends
+        // nothing back and proceeds straight to the dispatcher; on failure it
+        // writes an error frame and closes, which the reader below turns into a
+        // connection-level failure.
+        let handshake = serde_json::to_vec(&api::UdsHandshake {
+            jwt: Some(bearer_token.to_string()),
+            system_id: system_id.map(str::to_string),
+            host_label: host_label.map(str::to_string),
+        })?;
         write_frame(&mut write_half, &handshake)
             .await
             .map_err(|e| anyhow!("uds handshake write failed: {e}"))?;
@@ -245,10 +262,23 @@ impl UdsClient {
     /// channels, and swap in the new writer. On success the same
     /// `&TransportClient` resumes working; on failure the error is returned so
     /// the supervisor can back off and retry.
-    pub(crate) async fn reconnect(&self, socket_path: &Path, bearer_token: &str) -> Result<()> {
+    ///
+    /// The system id + host label (#248) are re-sent on every reconnect — the
+    /// caller (`TransportClient::reconnect`) re-reads them from the stored
+    /// `ConnectionConfig`, so a handshake field added in #248 survives a daemon
+    /// restart exactly like the bearer token does.
+    pub(crate) async fn reconnect(
+        &self,
+        socket_path: &Path,
+        bearer_token: &str,
+        system_id: Option<&str>,
+        host_label: Option<&str>,
+    ) -> Result<()> {
         let outbound_tx = Self::spawn_connection(
             socket_path,
             bearer_token,
+            system_id,
+            host_label,
             Arc::clone(&self.pending),
             self.signal_tx.clone(),
             self.drop_tx.clone(),

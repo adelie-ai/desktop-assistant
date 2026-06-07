@@ -52,6 +52,18 @@ pub struct ConnectionConfig {
     /// `transport_mode == TransportMode::Uds`; `None` resolves to
     /// [`default_desktop_socket_path`].
     pub socket_path: Option<PathBuf>,
+    /// The client's per-machine **system id** for tool-locality co-location
+    /// (#248), sent in the connect handshake on every transport. Stored on the
+    /// config so the Connector's reconnect path re-sends it (the supervisor
+    /// re-reads the config on each reconnect). `None` ⇒ no id reported and the
+    /// daemon falls back to the transport heuristic. The Connector fills this in
+    /// from `system_id::local_system_id()` when it connects; callers normally
+    /// leave it `None`.
+    pub system_id: Option<String>,
+    /// An optional friendly host label sent alongside [`Self::system_id`] (#248)
+    /// to make the remote tool note nicer (e.g. the client's hostname). Stored
+    /// on the config for the same reconnect reason.
+    pub host_label: Option<String>,
 }
 
 impl Default for ConnectionConfig {
@@ -65,6 +77,8 @@ impl Default for ConnectionConfig {
             ws_subject: DEFAULT_WS_SUBJECT.to_string(),
             tls_ca_cert: Some(default_ca_cert_path()),
             socket_path: None,
+            system_id: None,
+            host_label: None,
         }
     }
 }

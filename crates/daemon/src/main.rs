@@ -215,11 +215,10 @@ fn env_bool(name: &str, default: bool) -> bool {
     parse_env_bool(std::env::var(name).ok().as_deref(), default)
 }
 
-/// The daemon's self-identity label for server-side tool localities (#243).
-///
-/// Hostname is the groundwork value; the follow-up phase replaces it with a
-/// stable per-machine system-id (e.g. `/etc/machine-id`) so a client can send
-/// its own id and the daemon can decide co-location precisely. Resolution is
+/// The daemon's self-identity **display label** for server-side tool localities
+/// (#243) — the human-readable `host` shown in the tool note (e.g.
+/// `terminal — server 'daemon-host'`). Co-location is decided separately by the
+/// per-machine system-id handshake (#248), not by this label. Resolution is
 /// dependency-free and best-effort: the Linux kernel hostname
 /// (`/proc/sys/kernel/hostname`), then `/etc/hostname`, then the `HOSTNAME`
 /// env var, falling back to `"this machine"` so the tool note is always
@@ -1662,9 +1661,9 @@ async fn main() -> Result<()> {
         Box::new(|| uuid::Uuid::now_v7().to_string()),
     )
     // Server-side tool localities (#243) are labelled with the daemon's host
-    // identity. Hostname is the groundwork value; the follow-up phase swaps in
-    // a stable per-machine system-id (e.g. /etc/machine-id) shared with clients
-    // for the co-location handshake.
+    // identity (the hostname — a human-readable display label for the tool
+    // note). Co-location itself is decided by the per-machine system-id
+    // handshake (#248, wired into the WS/UDS frontends below), not this label.
     .with_host(daemon_host_label());
 
     // Build the shared registry handle (#11): wraps the in-memory
@@ -1995,6 +1994,25 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The daemon's own per-machine system id for the tool-locality co-location
+    // handshake (#248), read once at startup. Each client reports its id in the
+    // connect handshake (UDS frame field / WS upgrade header); when it equals
+    // this one they're the same machine ⇒ co-located, even over WebSocket. The
+    // id is a routing HINT, not a trust boundary — no privilege is gated on it
+    // (auth remains the JWT). `None` ⇒ co-location falls back to the transport
+    // heuristic for every connection (Phase-1, #243). Shared by both the WS and
+    // UDS frontends below.
+    let daemon_system_id = desktop_assistant_core::system_id::local_system_id();
+    match &daemon_system_id {
+        Some(id) => {
+            tracing::info!(system_id = %id, "tool-locality co-location: daemon system id resolved")
+        }
+        None => tracing::warn!(
+            "tool-locality co-location: could not resolve a daemon system id; \
+             falling back to the transport heuristic"
+        ),
+    }
+
     // Auth validator: OIDC-aware if configured, otherwise local-only. Built
     // unconditionally because the UDS frontend reuses it even when the
     // WebSocket listener is disabled.
@@ -2135,18 +2153,23 @@ async fn main() -> Result<()> {
         let ws_task = {
             let api_handler = Arc::clone(&api_handler);
             let ws_auth = Arc::clone(&ws_auth);
+            // The daemon system id (#248) so the WS upgrade handler can compare
+            // it to the client-reported header and co-locate same-machine WS
+            // connections.
+            let ws_daemon_system_id = daemon_system_id.clone();
             tokio::spawn(async move {
                 let shutdown = async {
                     let _ = ws_shutdown_rx.await;
                 };
                 let result = if let Some(acceptor) = tls_acceptor {
                     tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
-                    ws::serve_full_tls(
+                    ws::serve_full_tls_with_system_id(
                         api_handler,
                         ws_auth,
                         ws_login_service,
                         auth_discovery,
                         allowed_origins,
+                        ws_daemon_system_id,
                         acceptor,
                         ws_addr,
                         shutdown,
@@ -2154,12 +2177,13 @@ async fn main() -> Result<()> {
                     .await
                 } else {
                     tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
-                    ws::serve_full(
+                    ws::serve_full_with_system_id(
                         api_handler,
                         ws_auth,
                         ws_login_service,
                         auth_discovery,
                         allowed_origins,
+                        ws_daemon_system_id,
                         ws_addr,
                         shutdown,
                     )
@@ -2196,11 +2220,17 @@ async fn main() -> Result<()> {
         Some(path) => {
             let api_handler = Arc::clone(&api_handler);
             let ws_auth_for_uds = Arc::clone(&ws_auth);
+            // The daemon system id (#248) so the UDS handshake handler can
+            // compare it to the client-reported field. (A UDS client is already
+            // local, so this mostly refines the label; included for symmetry and
+            // so a mismatch — e.g. a namespaced peer — is honoured.)
+            let uds_daemon_system_id = daemon_system_id.clone();
             tracing::info!("UDS listening on {}", path.display());
             Some(tokio::spawn(async move {
                 let auth: Arc<dyn uds::UdsAuthValidator> =
                     Arc::new(WsAsUdsAuth::new(ws_auth_for_uds));
-                let config = uds::UdsServerConfig::new(path);
+                let config =
+                    uds::UdsServerConfig::new(path).with_daemon_system_id(uds_daemon_system_id);
                 let server = uds::UdsServer::new(api_handler, auth, config);
                 let shutdown = async {
                     let _ = uds_shutdown_rx.await;

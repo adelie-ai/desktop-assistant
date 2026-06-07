@@ -14,6 +14,8 @@ serde_json.workspace = true
 desktop-assistant-api-model = { path = "../api-model" }
 desktop-assistant-application = { path = "../application" }
 desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
+# System-id co-location comparison (#248).
+desktop-assistant-core = { path = "../core" }
 
 # Async + WS
 futures = "0.3"
@@ -34,7 +36,6 @@ default = []
 tls = ["dep:tokio-rustls", "dep:hyper", "dep:hyper-util"]
 
 [dev-dependencies]
-desktop-assistant-core = { path = "../core" }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 tokio.workspace = true
