@@ -7,6 +7,7 @@ use crate::context::{
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition, ToolNamespace,
 };
+use crate::ports::client_tools::current_client_tools;
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
@@ -436,6 +437,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // follow from the dispatch loop below.
         on_status(TURN_START_STATUS.to_string());
 
+        // Client-side tool execution (#107 / #234). When the connection
+        // registered client-local tools, the application installs a per-turn
+        // adapter as a task-local. Resolve it once: its `tool_definitions()`
+        // are merged into every round's tool set so the LLM can pick them, and
+        // a call to a registered name is routed through `port.execute(..)`
+        // (which suspends the turn) instead of the server-side `ToolExecutor`.
+        // Unset (no client tools registered, tests, background workers) leaves
+        // the loop's behaviour exactly as before — every tool is server-side.
+        let client_tool_port = current_client_tools();
+        let client_tool_defs: Vec<ToolDefinition> = match &client_tool_port {
+            Some(port) => port.tool_definitions().await,
+            None => Vec::new(),
+        };
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-turns cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -454,6 +469,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 core_tools_for_llm.clone()
             };
             tool_defs.extend(activated_tools.values().cloned());
+            // Offer the connection's registered client-local tools alongside
+            // the server-side set so the LLM can invoke them (#234). Skip any
+            // whose name already collides with a server-side tool — the
+            // server-side definition wins to keep dispatch unambiguous.
+            for def in &client_tool_defs {
+                if !tool_defs.iter().any(|t| t.name == def.name) {
+                    tool_defs.push(def.clone());
+                }
+            }
 
             let deferred_ns: &[ToolNamespace] = if !hosted_search_demoted {
                 &namespaces
@@ -772,19 +796,54 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     serde_json::from_str(&tool_call.arguments).unwrap_or_default();
                 on_status(tool_status_message(&tool_call.name, &arguments));
                 tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
-                // Install the conversation as a task-local for the duration of
-                // tool execution so conversation-scoped builtins (the
-                // scratchpad) can resolve which pad they operate on without
-                // the `ToolExecutor` port growing a conversation parameter.
-                let exec = self.tools.execute_tool(&tool_call.name, arguments);
-                let result = match with_conversation_id(conversation_id.clone(), exec).await {
-                    Ok(output) => {
-                        tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
-                        output
+
+                // Route client-local tools to the client (#107 / #234): if a
+                // per-turn client-tool port is installed and the called name is
+                // registered for this user, suspend the turn and await the
+                // client's result instead of running a server-side executor.
+                // A registered client tool whose name collides with a
+                // server-side one never reaches here — the tool-set merge above
+                // gives the server-side definition precedence, so the LLM was
+                // offered (and called) the server-side tool.
+                let client_exec = match &client_tool_port {
+                    Some(port) if port.is_registered(&tool_call.name).await => Some(port),
+                    _ => None,
+                };
+
+                let result = if let Some(port) = client_exec {
+                    match port
+                        .execute(&tool_call.id, &tool_call.name, arguments)
+                        .await
+                    {
+                        Ok(output) => {
+                            tracing::debug!(tool = %tool_call.name, output = %output, "client tool result");
+                            output
+                        }
+                        // Cancellation while a client tool was suspended (e.g.
+                        // the user pressed Cancel) must abort the turn, not be
+                        // folded into a tool result the LLM would keep looping
+                        // on.
+                        Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                        Err(e) => {
+                            tracing::warn!(tool = %tool_call.name, error = %e, "client tool execution failed");
+                            format!("Error: {e}")
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(tool = %tool_call.name, error = %e, "tool execution failed");
-                        format!("Error: {e}")
+                } else {
+                    // Install the conversation as a task-local for the duration
+                    // of tool execution so conversation-scoped builtins (the
+                    // scratchpad) can resolve which pad they operate on without
+                    // the `ToolExecutor` port growing a conversation parameter.
+                    let exec = self.tools.execute_tool(&tool_call.name, arguments);
+                    match with_conversation_id(conversation_id.clone(), exec).await {
+                        Ok(output) => {
+                            tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
+                            output
+                        }
+                        Err(e) => {
+                            tracing::warn!(tool = %tool_call.name, error = %e, "tool execution failed");
+                            format!("Error: {e}")
+                        }
                     }
                 };
 
@@ -1476,6 +1535,140 @@ mod tests {
             statuses.contains(&"Searching your notes".to_string()),
             "expected a notes status; got {statuses:?}"
         );
+    }
+
+    /// Fake [`ClientToolPort`] (#234) for the core turn-loop integration
+    /// tests. Records the names it was asked to execute and returns a
+    /// canned result so the loop can feed it back to the LLM. A parking
+    /// variant (held behind a oneshot) is used to prove the loop suspends.
+    struct FakeClientToolPort {
+        defs: Vec<ToolDefinition>,
+        executed: Arc<Mutex<Vec<(String, String)>>>,
+        result: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::client_tools::ClientToolPort for FakeClientToolPort {
+        async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            self.defs.clone()
+        }
+        async fn is_registered(&self, name: &str) -> bool {
+            self.defs.iter().any(|d| d.name == name)
+        }
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            tool_name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            self.executed
+                .lock()
+                .unwrap()
+                .push((tool_call_id.to_string(), tool_name.to_string()));
+            Ok(self.result.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_routes_registered_client_tool_through_port_and_feeds_result_back() {
+        use crate::ports::client_tools::with_client_tools;
+
+        // The LLM first calls `fs_read` (a client-local tool the server-side
+        // executor knows nothing about), then returns final text after seeing
+        // the client's result.
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "fs_read",
+                    r#"{"path":"/etc/hosts"}"#,
+                )],
+            ),
+            LlmResponse::text("The file says: 127.0.0.1 localhost"),
+        ];
+        // No server-side tools and no server-side result for `fs_read`: if the
+        // loop tried to run it server-side it would error, proving the client
+        // path is the one taken.
+        let handler = make_tool_handler(responses, vec![], HashMap::new());
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort {
+                defs: vec![ToolDefinition::new(
+                    "fs_read",
+                    "Read a file on the client",
+                    serde_json::json!({"type": "object"}),
+                )],
+                executed: Arc::clone(&executed),
+                result: "127.0.0.1 localhost".to_string(),
+            });
+
+        let result = with_client_tools(
+            port,
+            handler.send_prompt(
+                &conv.id,
+                "Read /etc/hosts".into(),
+                noop_callback(),
+                noop_status(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "The file says: 127.0.0.1 localhost");
+        // The client-tool port — not the server-side executor — ran `fs_read`.
+        let ran = executed.lock().unwrap().clone();
+        assert_eq!(ran, vec![("call-1".to_string(), "fs_read".to_string())]);
+
+        // The client's result was threaded into history as the tool result so
+        // the LLM saw it on the next round.
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let tool_msg = updated
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result message");
+        assert_eq!(tool_msg.content, "127.0.0.1 localhost");
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[tokio::test]
+    async fn turn_without_client_tool_port_runs_server_side_only() {
+        // Same tool name, but no port installed: the loop must fall through to
+        // the server-side executor (which here supplies the result). This pins
+        // that the client-tool hook is strictly opt-in and never changes the
+        // server-side path when unset.
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "fs_read", "{}")]),
+            LlmResponse::text("done"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("fs_read".to_string(), "server output".to_string());
+        let handler = make_tool_handler(
+            responses,
+            vec![ToolDefinition::new(
+                "fs_read",
+                "server tool",
+                serde_json::json!({}),
+            )],
+            tool_results,
+        );
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "done");
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let tool_msg = updated
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result message");
+        assert_eq!(tool_msg.content, "server output");
     }
 
     #[tokio::test]

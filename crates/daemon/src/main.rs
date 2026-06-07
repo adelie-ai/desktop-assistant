@@ -1765,6 +1765,20 @@ async fn main() -> Result<()> {
             ));
         api_handler_impl = api_handler_impl.with_idempotency_store(idempotency_store);
     }
+    // Client-side tool execution (#107 / #234): one shared coordinator plus an
+    // in-memory turn-state store, so `RegisterClientTools` / `ClientToolResult`
+    // are served and the LLM can invoke client-local tools (suspending the turn
+    // and resuming on the client's `ClientToolResult`). The in-memory store is
+    // sufficient for the live single-process deploy; a DB-backed
+    // `TurnStateStore` for crash-recovery is Phase-2 follow-up work.
+    let client_tool_coordinator =
+        Arc::new(desktop_assistant_application::client_tools::ClientToolCoordinator::new());
+    let turn_state_store: Arc<dyn desktop_assistant_core::ports::store::TurnStateStore> =
+        Arc::new(desktop_assistant_application::client_tools::InMemoryTurnStateStore::new());
+    api_handler_impl = api_handler_impl.with_client_tool_coordinator(
+        Arc::clone(&client_tool_coordinator),
+        Arc::clone(&turn_state_store),
+    );
     let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
         Arc::new(api_handler_impl);
 

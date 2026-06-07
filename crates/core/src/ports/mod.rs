@@ -41,6 +41,11 @@ pub mod auth;
 /// executors can scope per-conversation side state (e.g. the scratchpad).
 pub mod conversation_ctx;
 
+/// Client-side tool execution port — outbound trait the turn loop uses to
+/// consult the current user's registered client-local tools and suspend the
+/// turn on a client-tool call (#107 / #234).
+pub mod client_tools;
+
 #[cfg(test)]
 mod tests {
     #[test]

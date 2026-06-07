@@ -14,6 +14,7 @@ use desktop_assistant_api_model as api;
 pub use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::domain::{DEFAULT_NOTE_TYPE, KnowledgeEntry, ScratchpadNote};
 use desktop_assistant_core::ports::auth::with_user_id;
+use desktop_assistant_core::ports::client_tools::with_client_tools;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
     ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
@@ -23,11 +24,15 @@ use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
     ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
-use desktop_assistant_core::ports::store::IdempotencyKeyStore;
+use desktop_assistant_core::ports::store::{IdempotencyKeyStore, TurnStateStore};
 use thiserror::Error;
 use tracing::warn;
 
 use crate::background_tasks::{BackgroundTaskRegistry, TaskError};
+use crate::client_tools::{
+    ClientToolCoordinator, ClientToolResolutionError, CoordinatorClientToolPort,
+    register_client_tools, resolve_client_tool_result,
+};
 use crate::inflight::{InFlightRegistry, InFlightTurn, TeeSink, forward_inflight};
 
 #[derive(Debug, Error)]
@@ -339,6 +344,24 @@ where
     /// live) instead of running a second turn. Always present (no DB needed);
     /// only consulted when a request carries a key.
     inflight: Arc<InFlightRegistry>,
+    /// Shared client-tool coordinator + turn-state store (#107 / #234). When
+    /// attached, `RegisterClientTools` / `ClientToolResult` are served and a
+    /// per-turn [`CoordinatorClientToolPort`] is installed around each
+    /// send-turn so the LLM can call client-local tools (suspending the turn
+    /// and resuming on the client's result). `None` (the default) keeps the
+    /// pre-#234 behaviour: the two commands return `Unsupported` and every
+    /// tool is server-side.
+    client_tools: Option<ClientToolWiring>,
+}
+
+/// The handler-resident client-tool dependencies (#234). Both halves are
+/// daemon-lifetime singletons: one `ClientToolCoordinator` shared across all
+/// turns, paired with the `TurnStateStore` the coordinator writes its
+/// suspend/resolve transitions into.
+#[derive(Clone)]
+struct ClientToolWiring {
+    coord: Arc<ClientToolCoordinator>,
+    store: Arc<dyn TurnStateStore>,
 }
 
 impl<A, C, S, N, K> DefaultAssistantApiHandler<A, C, S, N, K>
@@ -370,7 +393,24 @@ where
             scratchpad_clear: None,
             idempotency: None,
             inflight: Arc::new(InFlightRegistry::default()),
+            client_tools: None,
         }
+    }
+
+    /// Attach the shared client-tool coordinator + turn-state store (#234) so
+    /// `RegisterClientTools` / `ClientToolResult` are served and send-turns
+    /// offer the connection's client-local tools to the LLM (suspending the
+    /// turn and resuming on the client's result). The daemon wires this in
+    /// `main.rs` to one shared `ClientToolCoordinator` and an
+    /// `InMemoryTurnStateStore`; callers that skip it keep the prior
+    /// server-side-only behaviour.
+    pub fn with_client_tool_coordinator(
+        mut self,
+        coord: Arc<ClientToolCoordinator>,
+        store: Arc<dyn TurnStateStore>,
+    ) -> Self {
+        self.client_tools = Some(ClientToolWiring { coord, store });
+        self
     }
 
     /// Attach the per-conversation scratchpad closures (#190) so the
@@ -812,6 +852,20 @@ fn dispatch_warning_to_api(w: DispatchWarning) -> api::ConversationWarning {
                 effort: fallback_to.effort,
             },
         },
+    }
+}
+
+/// Map a [`ClientToolResolutionError`] (#234) to the wire-level
+/// [`ApiError`]. A missing/cross-user turn is reported as `NotFound` (the
+/// existence-hiding rule of #105 — a cross-user probe can't tell "no such
+/// turn" from "not yours"); a `tool_call_id` mismatch or a malformed payload
+/// is a caller mistake reported as `Core`; storage failures surface as `Core`.
+fn map_client_tool_resolution_err(e: ClientToolResolutionError) -> ApiError {
+    match e {
+        ClientToolResolutionError::TurnNotFound { .. } => ApiError::NotFound,
+        ClientToolResolutionError::ToolCallIdMismatch { .. }
+        | ClientToolResolutionError::MalformedResult(_)
+        | ClientToolResolutionError::Storage(_) => ApiError::Core(e.to_string()),
     }
 }
 
@@ -1529,8 +1583,51 @@ where
                 Ok(api::CommandResult::Ack)
             }
 
-            api::Command::RegisterClientTools { .. } | api::Command::ClientToolResult { .. } => {
-                Err(ApiError::Unsupported)
+            // Client-side tool execution (#107 / #234). Served only when the
+            // handler carries a client-tool coordinator (wired by the daemon);
+            // otherwise the feature is off and we reject explicitly so
+            // transports surface a clean "not enabled" rather than silently
+            // dropping the command. User scope is already installed by the
+            // dispatcher's `with_user_id`, so the coordinator's per-user
+            // registration/resolution is automatically scoped to the
+            // connection's user.
+            api::Command::RegisterClientTools { tools } => {
+                let wiring = self.client_tools.as_ref().ok_or(ApiError::Unsupported)?;
+                let count = register_client_tools(&wiring.coord, &tools).await;
+                Ok(api::CommandResult::ClientToolsRegistered { count })
+            }
+            api::Command::ClientToolResult {
+                task_id,
+                tool_call_id,
+                result,
+                error,
+            } => {
+                let wiring = self.client_tools.as_ref().ok_or(ApiError::Unsupported)?;
+                // Exactly one of result/error should be set; both-None is a
+                // malformed result the coordinator's validator rejects, which
+                // we map to a clean request error.
+                let payload: Result<String, String> = match (result, error) {
+                    (Some(r), _) => Ok(r),
+                    (None, Some(e)) => Err(e),
+                    (None, None) => {
+                        return Err(ApiError::Core(
+                            "client tool result must populate exactly one of `result` or `error`"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let user_id = desktop_assistant_core::ports::auth::current_user_id();
+                resolve_client_tool_result(
+                    &wiring.coord,
+                    &*wiring.store,
+                    user_id,
+                    task_id,
+                    tool_call_id,
+                    payload,
+                )
+                .await
+                .map_err(map_client_tool_resolution_err)?;
+                Ok(api::CommandResult::Ack)
             }
         }
     }
@@ -1601,6 +1698,11 @@ where
             )
             .await
         } else {
+            // No-registry direct path (single-tenant tests / non-streaming
+            // callers): there is no registry `task_id` to correlate a
+            // `ClientToolResult` against, so client-tool execution is off
+            // here. The live daemon always attaches a registry, so this never
+            // applies to the real client-tool path.
             run_send_turn(
                 Arc::clone(&self.conversations),
                 conversation_id,
@@ -1611,6 +1713,7 @@ where
                 idempotency,
                 sink,
                 tokio_util::sync::CancellationToken::new(),
+                None,
             )
             .await
             .map_err(Self::map_core_err)
@@ -1715,6 +1818,10 @@ where
         // Pair the store with the key (both-or-neither) so the turn body
         // records the reply on completion for a future retry (#204).
         let idempotency = self.idempotency.clone().zip(idempotency_key);
+        // Client-tool wiring (#234), if attached, so the turn body can install
+        // a per-turn `CoordinatorClientToolPort` (keyed on the registry
+        // `task_id`) around the LLM loop.
+        let client_tools = self.client_tools.clone();
         let kind = api::TaskKind::Conversation {
             conversation_id: conversation_id.clone(),
         };
@@ -1747,6 +1854,22 @@ where
                 None,
             );
 
+            // Build the per-turn client-tool port from the registry task id so
+            // a client-local tool call suspends THIS turn and correlates with
+            // the client's `ClientToolResult` (#234). The port shares the
+            // turn's `turn_sink`, so emitted `ClientToolCall` events reach the
+            // same connection the response streams to.
+            let client_tool_port = client_tools.map(|wiring| {
+                Arc::new(CoordinatorClientToolPort::new(
+                    wiring.coord,
+                    wiring.store,
+                    Arc::clone(&turn_sink),
+                    ctx.task_id.clone(),
+                    conv_id_for_body.clone(),
+                ))
+                    as Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>
+            });
+
             let result = with_user_id(
                 user_id_for_body,
                 run_send_turn(
@@ -1759,6 +1882,7 @@ where
                     idempotency,
                     turn_sink,
                     ctx.token.clone(),
+                    client_tool_port,
                 ),
             )
             .await;
@@ -1823,6 +1947,7 @@ where
     ) -> ApiResult<()> {
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
         let conversations = Arc::clone(&self.conversations);
+        let client_tools = self.client_tools.clone();
         let kind = api::TaskKind::Conversation {
             conversation_id: conversation_id.clone(),
         };
@@ -1849,6 +1974,18 @@ where
                 None,
             );
 
+            // Per-turn client-tool port (#234) keyed on the registry task id.
+            let client_tool_port = client_tools.map(|wiring| {
+                Arc::new(CoordinatorClientToolPort::new(
+                    wiring.coord,
+                    wiring.store,
+                    Arc::clone(&sink_for_body),
+                    ctx.task_id.clone(),
+                    conv_id_for_body.clone(),
+                ))
+                    as Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>
+            });
+
             let result = with_user_id(
                 user_id_for_body,
                 run_send_turn(
@@ -1861,6 +1998,7 @@ where
                     idempotency,
                     sink_for_body,
                     ctx.token.clone(),
+                    client_tool_port,
                 ),
             )
             .await;
@@ -2099,6 +2237,7 @@ async fn run_send_turn<C>(
     idempotency: Option<(Arc<dyn IdempotencyKeyStore>, String)>,
     sink: Arc<dyn EventSink>,
     cancellation: tokio_util::sync::CancellationToken,
+    client_tool_port: Option<Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>>,
 ) -> Result<(), desktop_assistant_core::CoreError>
 where
     C: ConversationService + Send + Sync + 'static,
@@ -2151,17 +2290,26 @@ where
         effort: o.effort,
     });
 
-    let outcome = conversations
-        .send_prompt_with_override(
-            &desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str()),
-            content,
-            override_for_core,
-            system_refinement,
-            callback,
-            on_status,
-            cancellation,
-        )
-        .await;
+    let core_conv_id =
+        desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str());
+    let dispatch = conversations.send_prompt_with_override(
+        &core_conv_id,
+        content,
+        override_for_core,
+        system_refinement,
+        callback,
+        on_status,
+        cancellation,
+    );
+
+    // Install the per-turn client-tool port (#234) as a task-local around the
+    // dispatch so the core loop can offer the connection's client-local tools
+    // and suspend on a call. No port → the loop is server-side only, exactly
+    // as before.
+    let outcome = match client_tool_port {
+        Some(port) => with_client_tools(port, dispatch).await,
+        None => dispatch.await,
+    };
 
     if let Err(e) = forwarder.await {
         warn!("stream forwarder task failed: {e}");
