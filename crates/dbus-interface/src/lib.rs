@@ -3,6 +3,7 @@
 pub mod connections;
 pub mod conversation;
 pub mod knowledge;
+pub mod reload;
 pub mod settings;
 
 use desktop_assistant_core::ports::auth::UserId;

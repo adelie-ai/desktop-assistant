@@ -26,7 +26,8 @@ use clap::Parser;
 use desktop_assistant_api_model as api;
 use desktop_assistant_dbus_bridge::adapter::{
     DBUS_SERVICE_NAME, DbusBackgroundTasksAdapter, DbusConnectionsAdapter,
-    DbusConversationsAdapter, DbusKnowledgeAdapter, DbusSettingsAdapter, event_forwarder, paths,
+    DbusConversationsAdapter, DbusKnowledgeAdapter, DbusReloadAdapter, DbusSettingsAdapter,
+    event_forwarder, paths,
 };
 use desktop_assistant_dbus_bridge::minter::{MintRequest, default_minter_socket_path, fetch_jwt};
 use desktop_assistant_dbus_bridge::transport::{
@@ -139,6 +140,9 @@ async fn main() -> anyhow::Result<()> {
     let connections = DbusConnectionsAdapter::new(Arc::clone(&transport));
     let knowledge = DbusKnowledgeAdapter::new(Arc::clone(&transport));
     let background_tasks = DbusBackgroundTasksAdapter::new(Arc::clone(&transport));
+    // Config hot-reload (#222): nudges the daemon's file watcher so the KCM can
+    // apply config changes without a daemon restart.
+    let reload = DbusReloadAdapter::new();
 
     let connection = zbus::connection::Builder::session()
         .context("failed to connect to D-Bus session bus")?
@@ -148,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         .serve_at(paths::CONNECTIONS, connections)?
         .serve_at(paths::KNOWLEDGE, knowledge)?
         .serve_at(paths::BACKGROUND_TASKS, background_tasks)?
+        .serve_at(paths::RELOAD, reload)?
         .build()
         .await
         .context("failed to build D-Bus connection")?;
