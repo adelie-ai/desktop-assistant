@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use api::{WsFrame, WsRequest};
@@ -28,6 +29,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::commands::{AssistantCommands, PendingResult};
 use crate::signal::SignalEvent;
+use crate::timeouts::DISPATCH_TIMEOUT;
 use crate::ws_client::map_event_to_signal;
 
 /// 4 MB cap, matching the server. Keeps a buggy/hostile peer from claiming a
@@ -64,9 +66,19 @@ impl PendingState {
 pub struct UdsClient {
     outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     pending: Arc<Mutex<PendingState>>,
+    /// Per-command response deadline (#221). Defaults to
+    /// [`DISPATCH_TIMEOUT`]; tunable via [`set_dispatch_timeout`].
+    dispatch_timeout: Duration,
 }
 
 impl UdsClient {
+    /// Override the per-command dispatch timeout (#221). Mainly for tests that
+    /// need to assert the timeout fires without waiting the production window;
+    /// production callers can also shorten/lengthen it to taste.
+    pub fn set_dispatch_timeout(&mut self, timeout: Duration) {
+        self.dispatch_timeout = timeout;
+    }
+
     pub async fn connect(
         socket_path: &Path,
         bearer_token: &str,
@@ -157,6 +169,7 @@ impl UdsClient {
             Self {
                 outbound_tx,
                 pending,
+                dispatch_timeout: DISPATCH_TIMEOUT,
             },
             signal_rx,
         ))
@@ -187,10 +200,21 @@ impl AssistantCommands for UdsClient {
             return Err(anyhow!("failed to send uds request: writer closed"));
         }
 
-        match rx.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(anyhow!(error)),
-            Err(_closed) => Err(anyhow!("uds response channel closed")),
+        // Bound the wait for the response frame (#221): a server that accepts
+        // the connection but never replies must not hang the caller forever. On
+        // expiry we drop the pending slot so it can't leak and return a clear
+        // transport error.
+        match tokio::time::timeout(self.dispatch_timeout, rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(error))) => Err(anyhow!(error)),
+            Ok(Err(_closed)) => Err(anyhow!("uds response channel closed")),
+            Err(_elapsed) => {
+                self.pending.lock().await.map.remove(&id);
+                Err(anyhow!(
+                    "uds command timed out after {:?} with no response from the server",
+                    self.dispatch_timeout
+                ))
+            }
         }
     }
 }

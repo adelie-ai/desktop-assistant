@@ -9,6 +9,7 @@ pub mod connector;
 #[cfg(feature = "dbus")]
 pub mod dbus_client;
 pub mod signal;
+pub mod timeouts;
 pub mod transport;
 pub mod types;
 pub mod uds_client;

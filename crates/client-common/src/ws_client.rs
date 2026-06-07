@@ -13,13 +13,23 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::commands::{AssistantCommands, PendingResult};
 use crate::signal::SignalEvent;
+use crate::timeouts::{DISPATCH_TIMEOUT, WS_PING_INTERVAL};
 
 pub struct WsClient {
     outbound_tx: mpsc::UnboundedSender<Message>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<PendingResult>>>>,
+    /// Per-command response deadline (#221). Defaults to
+    /// [`DISPATCH_TIMEOUT`]; tunable via [`set_dispatch_timeout`].
+    dispatch_timeout: std::time::Duration,
 }
 
 impl WsClient {
+    /// Override the per-command dispatch timeout (#221). See
+    /// [`UdsClient::set_dispatch_timeout`](crate::uds_client::UdsClient::set_dispatch_timeout).
+    pub fn set_dispatch_timeout(&mut self, timeout: std::time::Duration) {
+        self.dispatch_timeout = timeout;
+    }
+
     pub async fn connect(
         ws_url: &str,
         bearer_token: &str,
@@ -47,6 +57,27 @@ impl WsClient {
             while let Some(message) = outbound_rx.recv().await {
                 if ws_tx.send(message).await.is_err() {
                     break;
+                }
+            }
+        });
+
+        // Keepalive (#221): periodically push a `Ping` through the same writer
+        // so a dead-but-open socket is detected. The server's matching `Pong`
+        // (and any other inbound traffic) resets the reader/connector stall
+        // clock; if the socket is dead the ping write fails, the writer task
+        // breaks and drops its receiver, and this ticker exits on the next send
+        // error. Cheap and self-terminating — no extra teardown wiring needed.
+        let ping_tx = outbound_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(WS_PING_INTERVAL);
+            ticker.tick().await; // first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                if ping_tx
+                    .send(Message::Ping(tokio_tungstenite::tungstenite::Bytes::new()))
+                    .is_err()
+                {
+                    break; // writer gone -> connection torn down
                 }
             }
         });
@@ -99,6 +130,7 @@ impl WsClient {
             Self {
                 outbound_tx,
                 pending,
+                dispatch_timeout: DISPATCH_TIMEOUT,
             },
             signal_rx,
         ))
@@ -164,10 +196,20 @@ impl AssistantCommands for WsClient {
             return Err(anyhow!("failed to send websocket request"));
         }
 
-        match rx.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(anyhow!(error)),
-            Err(_closed) => Err(anyhow!("websocket response channel closed")),
+        // Bound the wait for the response frame (#221), mirroring the UDS path:
+        // a silent server must not hang the caller. Drop the pending slot on
+        // expiry so it can't leak, and return a clear transport error.
+        match tokio::time::timeout(self.dispatch_timeout, rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(error))) => Err(anyhow!(error)),
+            Ok(Err(_closed)) => Err(anyhow!("websocket response channel closed")),
+            Err(_elapsed) => {
+                self.pending.lock().await.remove(&id);
+                Err(anyhow!(
+                    "websocket command timed out after {:?} with no response from the server",
+                    self.dispatch_timeout
+                ))
+            }
         }
     }
 }
