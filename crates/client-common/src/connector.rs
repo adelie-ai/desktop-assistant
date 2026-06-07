@@ -9,32 +9,61 @@
 //! WebSocket) lives entirely in the [`ConnectionConfig`].
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::config::ConnectionConfig;
 use crate::signal::SignalEvent;
+use crate::timeouts::EVENT_STALL_TIMEOUT;
 use crate::transport::{AssistantClient, TransportClient, connect_transport, transport_label};
 
 type Subscribers = Arc<Mutex<Vec<mpsc::UnboundedSender<SignalEvent>>>>;
 
-/// Pump a transport's signal stream out to all registered subscribers until it
-/// closes, then notify them with a final [`SignalEvent::Disconnected`].
-fn spawn_fanout(mut signal_rx: mpsc::UnboundedReceiver<SignalEvent>) -> Subscribers {
+/// Pump a transport's signal stream out to subscribers, surfacing both a closed
+/// AND a *stalled* (open but silent) connection as a terminal
+/// [`SignalEvent::Disconnected`] (#221).
+///
+/// Every received event resets the stall clock; if no event arrives within
+/// `stall_timeout` the connection is assumed wedged and subscribers get a
+/// `Disconnected { reason }` so a client waiting on the stream errors out
+/// instead of hanging forever. This pairs with the orchestrator emitting
+/// periodic `AssistantStatus`, which keeps a healthy connection's clock fresh
+/// even between LLM chunks. `stall_timeout` is a parameter so tests can drive a
+/// short window without waiting the production minute-plus.
+fn spawn_fanout_with_stall_timeout(
+    mut signal_rx: mpsc::UnboundedReceiver<SignalEvent>,
+    stall_timeout: Duration,
+) -> Subscribers {
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
     let pump = Arc::clone(&subscribers);
     tokio::spawn(async move {
-        while let Some(event) = signal_rx.recv().await {
-            // Deliver to every live subscriber; drop those whose receiver is gone.
-            pump.lock()
-                .unwrap()
-                .retain(|tx| tx.send(event.clone()).is_ok());
-        }
-        // The transport closed — give subscribers a terminal event to react to.
+        // The terminal reason depends on *why* we stopped: a closed upstream vs.
+        // a stall the client should distinguish (and may choose to reconnect on).
+        let reason = loop {
+            match tokio::time::timeout(stall_timeout, signal_rx.recv()).await {
+                Ok(Some(event)) => {
+                    // Deliver to every live subscriber; drop those whose
+                    // receiver is gone. Receipt also resets the stall clock,
+                    // since the next `timeout` starts fresh on the next iter.
+                    pump.lock()
+                        .unwrap()
+                        .retain(|tx| tx.send(event.clone()).is_ok());
+                }
+                Ok(None) => break "signal stream closed".to_string(),
+                Err(_elapsed) => {
+                    break format!(
+                        "connection stalled: no events for {}s",
+                        stall_timeout.as_secs()
+                    );
+                }
+            }
+        };
+        // The transport closed or stalled — give subscribers a terminal event.
         for tx in pump.lock().unwrap().drain(..) {
             let _ = tx.send(SignalEvent::Disconnected {
-                reason: "signal stream closed".to_string(),
+                reason: reason.clone(),
             });
         }
     });
@@ -56,12 +85,25 @@ pub struct Connector {
 
 impl Connector {
     /// Connect over the transport named by `config` and start pumping the
-    /// daemon's signal stream to subscribers.
+    /// daemon's signal stream to subscribers. Uses the default
+    /// [`EVENT_STALL_TIMEOUT`] for stall detection (#221).
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
+        Self::connect_with_stall_timeout(config, EVENT_STALL_TIMEOUT).await
+    }
+
+    /// Like [`connect`](Self::connect) but with an explicit event-stream stall
+    /// window (#221). A connection that stays open but emits no event for
+    /// `stall_timeout` surfaces a terminal [`SignalEvent::Disconnected`] to
+    /// every subscriber. Mainly for tests; production callers normally want the
+    /// default via [`connect`](Self::connect).
+    pub async fn connect_with_stall_timeout(
+        config: &ConnectionConfig,
+        stall_timeout: Duration,
+    ) -> Result<Self> {
         let (client, signal_rx) = connect_transport(config).await?;
         Ok(Self {
             client,
-            subscribers: spawn_fanout(signal_rx),
+            subscribers: spawn_fanout_with_stall_timeout(signal_rx, stall_timeout),
             label: transport_label(config),
         })
     }
@@ -161,6 +203,12 @@ impl Connector {
 mod tests {
     use super::*;
 
+    /// Fan-out with the production stall window — the default `connect` path —
+    /// for tests that exercise delivery/close, not the stall itself.
+    fn spawn_fanout(rx: mpsc::UnboundedReceiver<SignalEvent>) -> Subscribers {
+        spawn_fanout_with_stall_timeout(rx, EVENT_STALL_TIMEOUT)
+    }
+
     #[tokio::test]
     async fn fanout_delivers_to_every_subscriber() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -212,5 +260,55 @@ mod tests {
             a.recv().await,
             Some(SignalEvent::Disconnected { .. })
         ));
+    }
+
+    /// #221: a connection that stays *open but silent* (sender held, no events)
+    /// must surface a terminal `Disconnected` once the stall window elapses —
+    /// otherwise a subscriber waiting on `recv()` hangs forever.
+    #[tokio::test]
+    async fn fanout_emits_disconnected_on_stall() {
+        // Keep `tx` alive for the whole test: the stream is OPEN, just silent.
+        let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let subs = spawn_fanout_with_stall_timeout(rx, Duration::from_millis(50));
+        let mut a = register(&subs);
+
+        let event = tokio::time::timeout(Duration::from_secs(2), a.recv())
+            .await
+            .expect("stall must produce a terminal event, not hang");
+        match event {
+            Some(SignalEvent::Disconnected { reason }) => {
+                assert!(
+                    reason.contains("stalled"),
+                    "stall reason should be distinguishable from a clean close, got: {reason}"
+                );
+            }
+            other => panic!("expected SignalEvent::Disconnected on stall, got {other:?}"),
+        }
+        drop(tx);
+    }
+
+    /// A steady trickle of events under the stall window must keep the
+    /// connection alive — the stall clock resets on every received event.
+    #[tokio::test]
+    async fn fanout_received_events_reset_the_stall_clock() {
+        let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let subs = spawn_fanout_with_stall_timeout(rx, Duration::from_millis(80));
+        let mut a = register(&subs);
+
+        // Send three events spaced under the stall window; none should trip it.
+        for i in 0..3 {
+            tx.send(SignalEvent::Chunk {
+                request_id: "r".into(),
+                chunk: format!("c{i}"),
+            })
+            .unwrap();
+            assert!(
+                matches!(a.recv().await, Some(SignalEvent::Chunk { .. })),
+                "live trickle must be delivered, not treated as a stall"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        // Still alive: no Disconnected yet (we've only ever waited < window).
+        drop(tx);
     }
 }
