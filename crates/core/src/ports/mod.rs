@@ -37,6 +37,11 @@ pub mod conversation_search;
 /// Request-scoped auth context — task-local `UserId` for SQL scoping (#105).
 pub mod auth;
 
+/// Request-scoped transport context — task-local [`crate::domain::TransportKind`]
+/// so the turn loop can infer tool co-location (UDS/D-Bus ⇒ same machine,
+/// WebSocket ⇒ possibly remote) when tagging tools with locality (#243).
+pub mod transport;
+
 /// Request-scoped conversation context — task-local `ConversationId` so tool
 /// executors can scope per-conversation side state (e.g. the scratchpad).
 pub mod conversation_ctx;

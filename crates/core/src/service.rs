@@ -1,8 +1,8 @@
 use crate::CoreError;
 use crate::context::{
     COMPACTION_TOKEN_RATIO, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
-    MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, cap_tool_result, compaction_range,
-    generate_context_summary, llm_messages_for_turn, recover_from_overflow,
+    MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolLocalityContext, cap_tool_result,
+    compaction_range, generate_context_summary, llm_messages_for_turn, recover_from_overflow,
 };
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition, ToolNamespace,
@@ -17,6 +17,7 @@ use crate::ports::llm::{
 use crate::ports::scratchpad::{SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
+use crate::ports::transport::current_transport_kind;
 use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, tool_set_hash, tool_status_message,
@@ -175,7 +176,19 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
     /// [`Self::with_max_tool_result_bytes`].
     max_tool_result_bytes: usize,
+    /// The daemon's self-identity label, used as the `host` of a server-side
+    /// [`crate::domain::ToolLocality`] in the per-turn tool note (issue #243).
+    /// The daemon sets this to its hostname via [`Self::with_host`]; the
+    /// follow-up phase will replace it with a stable machine-id. Defaults to
+    /// [`DEFAULT_HOST_LABEL`] so callers that don't set it (tests, background
+    /// jobs) still produce a coherent note.
+    host: String,
 }
+
+/// Fallback `host` label for [`ConversationHandler`] when the daemon does not
+/// set one via [`ConversationHandler::with_host`] (issue #243). The live daemon
+/// always sets its hostname; this keeps tests and background jobs coherent.
+pub const DEFAULT_HOST_LABEL: &str = "this machine";
 
 impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
     pub fn new(store: S, llm: L, id_generator: Box<dyn Fn() -> String + Send + Sync>) -> Self {
@@ -188,6 +201,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             namespace_cache: std::sync::Mutex::new(None),
             scratchpad_goal_read: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            host: DEFAULT_HOST_LABEL.to_string(),
         }
     }
 }
@@ -208,7 +222,16 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             namespace_cache: std::sync::Mutex::new(None),
             scratchpad_goal_read: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            host: DEFAULT_HOST_LABEL.to_string(),
         }
+    }
+
+    /// Set the daemon's self-identity `host` label used for server-side tool
+    /// localities in the per-turn tool note (issue #243). The daemon wires its
+    /// hostname here; the follow-up phase replaces it with a stable machine-id.
+    pub fn with_host(mut self, host: impl Into<String>) -> Self {
+        self.host = host.into();
+        self
     }
 
     /// Set a separate LLM for backend tasks (title generation, context summary).
@@ -451,6 +474,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             None => Vec::new(),
         };
 
+        // Tool execution-locality context (issue #243). Resolve the turn's
+        // co-location signal (the connection's transport: UDS/D-Bus ⇒ same
+        // machine, WebSocket ⇒ possibly remote) plus the daemon's host label,
+        // the server-side tool names, and the client-local tool names once. The
+        // tool-note builder uses it to tag each tool with where it runs and to
+        // route a capability that exists on both the server and a remote
+        // client. The server set is the full core set plus every namespaced
+        // tool — activated tools are always a subset of these (they come from
+        // server-side search), so a tool that isn't in this set is client-only.
+        let server_tool_names: Vec<String> = core_tools
+            .iter()
+            .map(|t| t.name.clone())
+            .chain(
+                namespaces
+                    .iter()
+                    .flat_map(|ns| ns.tools.iter().map(|t| t.name.clone())),
+            )
+            .collect();
+        let tool_locality = ToolLocalityContext {
+            transport: current_transport_kind(),
+            host: self.host.clone(),
+            client_label: "your device".to_string(),
+            server_tool_names,
+            client_tool_names: client_tool_defs.iter().map(|d| d.name.clone()).collect(),
+        };
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-turns cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -526,6 +575,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 tool_rounds_since_anchor,
                 &system_refinement,
                 current_context_budget(),
+                Some(&tool_locality),
                 &estimate,
             );
             let mut raw_stream = String::new();
@@ -932,7 +982,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 mod tests {
     use super::*;
     use crate::context::MIN_TRUNCATION_TOKENS;
-    use crate::domain::{ToolCall, ToolDefinition};
+    use crate::domain::{ToolCall, ToolDefinition, TransportKind};
     use crate::ports::llm::{BudgetSource, ContextBudget, LlmResponse, TokenUsage};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2464,6 +2514,156 @@ mod tests {
             messages[0]
                 .content
                 .contains("Available tools in this turn: terminal.")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_ws_turn_twins_duplicated_capability_with_locality_labels() {
+        // Issue #243 end-to-end through the dispatch loop: a server-side
+        // `terminal` plus a client-registered `terminal` over a REMOTE
+        // (WebSocket) connection. The per-turn tool note must expose BOTH with
+        // locality labels (server host vs your device) and a routing hint —
+        // i.e. the remote case does not collapse the capability.
+        use crate::ports::client_tools::with_client_tools;
+        use crate::ports::transport::with_transport_kind;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let seen = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let server_tools = vec![ToolDefinition::new(
+            "terminal",
+            "Run terminal command on the daemon host",
+            serde_json::json!({"type": "object"}),
+        )];
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            CapturingLlm {
+                seen_messages: Arc::clone(&seen),
+            },
+            MockToolExecutor::new(server_tools, HashMap::new()),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        )
+        .with_host("daemon-host");
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        // Client registers a tool with the SAME name as the server-side one.
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort {
+                defs: vec![ToolDefinition::new(
+                    "terminal",
+                    "Run terminal command on the user's device",
+                    serde_json::json!({"type": "object"}),
+                )],
+                executed: Arc::new(Mutex::new(Vec::new())),
+                result: String::new(),
+            });
+
+        // Drive the turn as if it arrived over a WebSocket connection.
+        with_transport_kind(
+            TransportKind::WebSocket,
+            with_client_tools(
+                port,
+                handler.send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let messages = seen.lock().unwrap();
+        let system = &messages[0].content;
+        assert!(
+            system.contains("terminal — server 'daemon-host'"),
+            "remote note must label the server tool: {system}"
+        );
+        assert!(
+            system.contains("terminal — your device"),
+            "remote note must label the client twin: {system}"
+        );
+        assert!(
+            system.contains("ask which machine"),
+            "remote duplicated capability must carry the routing hint: {system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_uds_turn_collapses_duplicated_capability_to_plain_list() {
+        // Companion to the remote test: the SAME server+client `terminal` over
+        // a co-located (UDS) connection collapses to a single plain `terminal`
+        // entry — no locality labels, no routing hint.
+        use crate::ports::client_tools::with_client_tools;
+        use crate::ports::transport::with_transport_kind;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let seen = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            CapturingLlm {
+                seen_messages: Arc::clone(&seen),
+            },
+            MockToolExecutor::new(
+                vec![ToolDefinition::new(
+                    "terminal",
+                    "Run terminal command",
+                    serde_json::json!({"type": "object"}),
+                )],
+                HashMap::new(),
+            ),
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        )
+        .with_host("daemon-host");
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort {
+                defs: vec![ToolDefinition::new(
+                    "terminal",
+                    "Run terminal command on the user's device",
+                    serde_json::json!({"type": "object"}),
+                )],
+                executed: Arc::new(Mutex::new(Vec::new())),
+                result: String::new(),
+            });
+
+        with_transport_kind(
+            TransportKind::Uds,
+            with_client_tools(
+                port,
+                handler.send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let messages = seen.lock().unwrap();
+        let system = &messages[0].content;
+        // Inspect the tool-availability line specifically: the static prompt
+        // mentions "server"/"your device" as guidance, so assert against the
+        // generated tool listing rather than the whole system message.
+        let tool_line = system
+            .lines()
+            .find(|l| l.starts_with("Available tools in this turn:"))
+            .expect("a tool-availability line");
+        assert!(
+            tool_line.contains("Available tools in this turn: terminal."),
+            "co-located note must be a plain single entry: {tool_line}"
+        );
+        assert!(
+            !tool_line.contains("your device") && !tool_line.contains("server 'daemon-host'"),
+            "co-located note must omit locality labels: {tool_line}"
+        );
+        assert!(
+            !tool_line.contains("ask which machine"),
+            "co-located note must omit the routing hint: {tool_line}"
         );
     }
 

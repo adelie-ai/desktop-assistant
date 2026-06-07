@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::AssistantApiHandler;
-use desktop_assistant_transport_dispatch::{AuthContext, dispatch_loop};
+use desktop_assistant_transport_dispatch::{AuthContext, TransportKind, dispatch_loop};
 use futures::stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -392,8 +392,10 @@ async fn handle_connection(
 
     // Per-connection identity resolved above (#105). The dispatcher
     // installs this into the `with_user_id` task-local around each
-    // command so storage queries scope to the right partition.
-    let auth_ctx = AuthContext::new(user_id.into_inner());
+    // command so storage queries scope to the right partition. A UDS
+    // connection can only come from the daemon's own machine, so its tools
+    // are co-located with the server-side ones (#243).
+    let auth_ctx = AuthContext::new(user_id.into_inner(), TransportKind::Uds);
 
     dispatch_loop(handler, auth_ctx, inbound, sink).await;
 

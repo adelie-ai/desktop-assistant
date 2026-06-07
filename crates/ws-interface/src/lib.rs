@@ -14,7 +14,7 @@ use axum::{
 use base64::Engine;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{AssistantApiHandler, UserId};
-use desktop_assistant_transport_dispatch::{AuthContext, dispatch_loop};
+use desktop_assistant_transport_dispatch::{AuthContext, TransportKind, dispatch_loop};
 use futures::SinkExt;
 #[cfg(feature = "tls")]
 use tracing::debug;
@@ -391,7 +391,10 @@ async fn handle_socket(socket: WebSocket, state: WsServerState, user_id: UserId)
     // the schema sentinel for single-tenant fallback. The dispatcher
     // installs this into the per-task task-local on every dispatched
     // command so storage queries scope correctly.
-    let auth = AuthContext::new(user_id.into_inner());
+    // A WebSocket connection may terminate on a different host, so its
+    // client-registered tools are treated as remote — distinct from the
+    // daemon's server-side tools (#243).
+    let auth = AuthContext::new(user_id.into_inner(), TransportKind::WebSocket);
 
     dispatch_loop(Arc::clone(&state.handler), auth, inbound, sink).await;
 

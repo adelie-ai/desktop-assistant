@@ -177,7 +177,7 @@ impl AssistantApiHandler for NoSubscribeHandler {
 // ---------- Helpers ----------
 
 fn user(label: &str) -> AuthContext {
-    AuthContext::new(label)
+    AuthContext::new(label, desktop_assistant_core::domain::TransportKind::Uds)
 }
 
 /// Drive `dispatch_loop` against an in-memory stream of requests; return
