@@ -4,9 +4,15 @@ mod migration;
 mod oidc;
 #[cfg(target_os = "linux")]
 mod pam_auth;
+mod reload;
 mod resolution;
 mod secrets;
 mod views;
+
+// Hot-reload classification (#222): pure old/new config diff into a
+// `ReloadPlan`. Re-exported at `config::` so `api_surface` and `main` address
+// them without the submodule path.
+pub use reload::{ReloadPlan, plan_reload};
 
 // Re-export the settings views public API at `config::` so existing
 // callers (the inbound API handler, the dbus settings adapter) keep

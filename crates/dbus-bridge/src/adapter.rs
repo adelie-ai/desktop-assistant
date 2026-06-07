@@ -27,12 +27,14 @@ pub mod connections;
 pub mod conversations;
 pub mod event_forwarder;
 pub mod knowledge;
+pub mod reload;
 pub mod settings;
 
 pub use background_tasks::DbusBackgroundTasksAdapter;
 pub use connections::DbusConnectionsAdapter;
 pub use conversations::DbusConversationsAdapter;
 pub use knowledge::DbusKnowledgeAdapter;
+pub use reload::DbusReloadAdapter;
 pub use settings::DbusSettingsAdapter;
 
 /// Well-known D-Bus bus name. Same as the in-process daemon's name —
@@ -50,4 +52,5 @@ pub mod paths {
     pub const CONNECTIONS: &str = "/org/desktopAssistant/Connections";
     pub const KNOWLEDGE: &str = "/org/desktopAssistant/Knowledge";
     pub const BACKGROUND_TASKS: &str = "/org/desktopAssistant/BackgroundTasks";
+    pub const RELOAD: &str = "/org/desktopAssistant/Reload";
 }

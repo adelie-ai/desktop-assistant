@@ -32,6 +32,7 @@ use crate::registry::{ConnectionHealth, build_llm_client, build_registry};
 use desktop_assistant_application::DefaultAssistantApiHandler;
 use desktop_assistant_core::service::ConversationHandler;
 use desktop_assistant_dbus::conversation::DbusConversationAdapter;
+use desktop_assistant_dbus::reload::DbusReloadAdapter;
 use desktop_assistant_dbus::settings::DbusSettingsAdapter;
 use desktop_assistant_mcp_client::config as mcp_config;
 use desktop_assistant_mcp_client::executor::{BuiltinToolService, McpToolExecutor};
@@ -323,6 +324,120 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+}
+
+/// Consume reload pings (from the D-Bus `Reload` method and the config-file
+/// watcher) and apply the new config to the running daemon (#222).
+///
+/// Coalesces a burst: it drains any pings that arrived while the last apply ran
+/// so an editor's write/rename/chmod storm collapses into one
+/// validate-classify-swap. `apply_reload` is state-preserving — it swaps the
+/// connection registry under its lock so new turns pick up the new clients
+/// while in-flight turns keep theirs alive by refcount — and never panics on a
+/// bad config: it refuses the apply, logs the cause, and keeps the last-good
+/// config running.
+fn spawn_reload_consumer(
+    registry: Arc<api_surface::RegistryHandle>,
+    mut reload_rx: tokio::sync::mpsc::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        while reload_rx.recv().await.is_some() {
+            // Drain any pings queued behind this one — a single apply observes
+            // the latest on-disk config, so coalescing is correct.
+            while reload_rx.try_recv().is_ok() {}
+            tracing::info!("config reload requested; re-reading daemon.toml");
+            match registry.apply_reload() {
+                Ok(plan) if plan.is_empty() => {}
+                Ok(_) => tracing::info!("config reload applied"),
+                Err(e) => {
+                    tracing::error!("config reload refused; keeping the last-good config: {e:#}")
+                }
+            }
+        }
+        tracing::debug!("config reload consumer exiting (channel closed)");
+    });
+}
+
+/// Watch `daemon.toml` for edits and ping the reload consumer (#222),
+/// debounced so an editor's write/rename/chmod burst collapses into one reload.
+///
+/// Mirrors the voice daemon's `spawn_config_watcher`: watch the *parent
+/// directory* (many editors replace the file via a temp-file rename, which
+/// breaks a watch bound to the original inode), bridge `notify`'s callback
+/// thread to a std channel, then debounce on a dedicated blocking thread that
+/// forwards a single async ping per quiet window. The KCM gets instant reload
+/// via the D-Bus `Reload` method; this covers hand-edits and other tools.
+fn spawn_config_watcher(config_path: std::path::PathBuf, reload_tx: tokio::sync::mpsc::Sender<()>) {
+    use notify::{RecursiveMode, Watcher};
+
+    let dir = match config_path.parent() {
+        Some(d) => d.to_path_buf(),
+        None => {
+            tracing::warn!("config watcher: config path has no parent dir, not watching");
+            return;
+        }
+    };
+    let file_name = config_path.file_name().map(std::ffi::OsString::from);
+
+    // notify's callback runs on its own (non-async) thread; bridge to a std
+    // mpsc, then debounce on a dedicated blocking thread that forwards into the
+    // async reload channel. A blocking thread (not a Tokio task) is used because
+    // the std `recv()` would otherwise park a runtime worker.
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<()>();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            // Only react to events touching our config file (the dir may hold
+            // other files). Match by file name; rename targets count too.
+            let touches_config = file_name.as_ref().is_none_or(|name| {
+                event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(name.as_os_str()))
+            });
+            let relevant = matches!(
+                event.kind,
+                notify::EventKind::Modify(_)
+                    | notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+            );
+            if touches_config && relevant {
+                let _ = raw_tx.send(());
+            }
+        }
+    });
+    let mut watcher = match watcher {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                "config watcher: failed to create watcher, live reload on file edits disabled: {e}"
+            );
+            return;
+        }
+    };
+    if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+        tracing::warn!(
+            dir = %dir.display(),
+            "config watcher: failed to watch dir, live reload on file edits disabled: {e}"
+        );
+        return;
+    }
+
+    std::thread::spawn(move || {
+        // Keep the watcher alive for the life of the thread (dropping it stops
+        // watching).
+        let _watcher = watcher;
+        // Block until the first raw event, then wait out a short quiet window
+        // and drain any burst — collapsing an editor's write/rename/chmod storm
+        // into one reload.
+        while raw_rx.recv().is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            while raw_rx.try_recv().is_ok() {}
+            tracing::info!("daemon.toml changed on disk; requesting reload");
+            if reload_tx.blocking_send(()).is_err() {
+                break; // consumer gone
+            }
+        }
+    });
 }
 
 /// Enum wrapper to dispatch between conversation store backends at runtime.
@@ -1467,6 +1582,18 @@ async fn main() -> Result<()> {
         .with_config_path(config_path.clone()),
     );
 
+    // State-preserving config hot-reload (#222). The D-Bus `Reload` method and
+    // the config-file watcher both ping this bounded channel; one consumer task
+    // coalesces a burst and calls `RegistryHandle::apply_reload`, which
+    // validates the new config and swaps the registry under its lock — new turns
+    // get the new clients while in-flight turns keep theirs alive by refcount. A
+    // bad config is refused and the last-good config keeps running. The channel
+    // is bounded (depth 4) so a flood of edits can't grow it without limit; the
+    // consumer drains the queue before each apply.
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::channel::<()>(4);
+    spawn_reload_consumer(Arc::clone(&registry_handle), reload_rx);
+    spawn_config_watcher(config_path.clone(), reload_tx.clone());
+
     // Wire the learned (tier 2) and LLM (tier 3) tiers of the backend-error
     // classifier (#178). The deterministic tier-1 matchers already run inside
     // every `ClassifyingLlmClient` built by `build_llm_client`; here we install
@@ -1678,6 +1805,14 @@ async fn main() -> Result<()> {
                     desktop_assistant_dbus::knowledge::DbusKnowledgeAdapter::new(Arc::clone(
                         &api_handler,
                     )),
+                )
+            })
+            .and_then(|b| {
+                // Hot-reload trigger (#222): the KCM calls `Reload` after
+                // writing daemon.toml so changes apply without a restart.
+                b.serve_at(
+                    "/org/desktopAssistant/Reload",
+                    DbusReloadAdapter::new(reload_tx.clone()),
                 )
             }) {
             Ok(builder) => match builder.build().await {

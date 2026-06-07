@@ -196,6 +196,11 @@ impl RegistryHandle {
 
     /// Reload the registry (and re-read the config from disk). Used when
     /// external tools mutate the config file.
+    ///
+    /// Prefer [`RegistryHandle::apply_reload`] for the live hot-reload path:
+    /// it validates the new config and classifies what changed before
+    /// swapping. This method is the unconditional swap retained for callers
+    /// that already hold a known-good config.
     #[allow(dead_code)]
     pub fn reload(&self) -> anyhow::Result<()> {
         let config = load_daemon_config(&self.config_path)?.unwrap_or_default();
@@ -204,6 +209,95 @@ impl RegistryHandle {
         state.config = config;
         state.registry = registry;
         Ok(())
+    }
+
+    /// Validate the on-disk config and, if it parses and the registry
+    /// rebuilds, swap it in under the lock — a state-preserving hot reload
+    /// (#222).
+    ///
+    /// Non-breaking swap: the registry stores clients as `Arc<dyn LlmClient>`,
+    /// and dispatch clones the `Arc` it needs *before* awaiting (see
+    /// `client_for` / `send_prompt_with_override`). Replacing `state.registry`
+    /// here only drops the registry's own references; any in-flight turn that
+    /// already cloned its client keeps that client alive by refcount until the
+    /// turn finishes, while new turns resolve through the freshly built
+    /// registry. Active connections and turns are never torn down.
+    ///
+    /// Validate-before-apply: a config that fails to parse/validate is
+    /// refused — the method logs a clear error and returns `Err` while the
+    /// last-good config and registry keep running untouched. A reload never
+    /// panics or exits the daemon on a bad config. Subsystems wired once at
+    /// startup (database, embeddings, TLS, …) are reported as
+    /// "restart required" rather than silently dropped.
+    ///
+    /// Returns the [`ReloadPlan`] describing what was applied (and what still
+    /// needs a restart) on success.
+    pub fn apply_reload(&self) -> anyhow::Result<crate::config::ReloadPlan> {
+        // 1. Parse + validate the candidate from disk. `load_daemon_config`
+        //    surfaces TOML and [connections]/[purposes] validation errors. A
+        //    failure here returns Err and leaves the running state untouched.
+        let new_config = match load_daemon_config(&self.config_path) {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => {
+                tracing::warn!(
+                    "config reload: {} is missing or empty; keeping the running config",
+                    self.config_path.display()
+                );
+                anyhow::bail!("config file is missing or empty");
+            }
+            Err(e) => {
+                tracing::error!(
+                    "config reload refused: {} failed to parse/validate: {e:#}; \
+                     keeping the last-good running config",
+                    self.config_path.display()
+                );
+                return Err(e);
+            }
+        };
+
+        // 2. Build the candidate registry off the lock. `build_registry` is
+        //    infallible (bad connections become `Unavailable` rows rather than
+        //    aborting), but we refuse a config that yields *zero* usable
+        //    connections when the running one had at least one — that would
+        //    silently break every new turn. The running registry stays put.
+        let new_registry = build_registry(&new_config);
+        {
+            let state = self.state.read().expect("registry state poisoned");
+            let plan = crate::config::plan_reload(&state.config, &new_config);
+            if plan.is_empty() {
+                tracing::info!("config reload: no effective changes; nothing to apply");
+                return Ok(plan);
+            }
+            if state.registry.live_count() > 0 && new_registry.live_count() == 0 {
+                tracing::error!(
+                    "config reload refused: the new config has no usable LLM connection \
+                     (every connection failed to build); keeping the last-good running config"
+                );
+                anyhow::bail!("new config has no usable LLM connection");
+            }
+        }
+
+        // 3. Re-diff and swap under the write lock. Re-reading `state.config`
+        //    here (rather than trusting the read-lock snapshot above) keeps the
+        //    plan consistent if a concurrent `mutate_config` slipped in.
+        let mut state = self.state.write().expect("registry state poisoned");
+        let plan = crate::config::plan_reload(&state.config, &new_config);
+        state.config = new_config;
+        // Swapping the registry drops only its own Arc handles; in-flight turns
+        // that already cloned their client keep it alive (see method docs).
+        state.registry = new_registry;
+        drop(state);
+
+        if plan.rebuild_registry {
+            tracing::info!("config reload applied: connection registry rebuilt for new turns");
+        }
+        if plan.needs_restart() {
+            tracing::warn!(
+                "config reload: these changes need a daemon restart to take effect: {}",
+                plan.restart_required.join(", ")
+            );
+        }
+        Ok(plan)
     }
 }
 
@@ -1427,6 +1521,201 @@ mod tests {
         // Either the network fails (empty list) or succeeds — both are OK
         // since we're just checking we don't hard-error when aggregating.
         let _ = svc.list_available_models(None, false).await;
+    }
+
+    // ----- Hot-reload (apply_reload) tests (#222) ----------------------
+    //
+    // These cover the state-preserving swap:
+    // - an in-flight turn's cloned `Arc<dyn LlmClient>` stays alive across a
+    //   reload (registry swap drops only the registry's own handles)
+    // - a malformed config is refused without disturbing the running state
+    // - a valid edit swaps the config + registry in place
+
+    mod hot_reload {
+        use super::*;
+
+        /// Write `toml` to a fresh temp path and return a handle whose
+        /// `config_path` points at it, so `apply_reload` reads our file.
+        fn handle_for_toml(toml: &str) -> (Arc<RegistryHandle>, std::path::PathBuf) {
+            let path = tmp_config_path();
+            std::fs::write(&path, toml).expect("write initial config");
+            let cfg = crate::config::load_daemon_config(&path)
+                .expect("initial config parses")
+                .expect("initial config present");
+            let registry = build_registry(&cfg);
+            let handle =
+                Arc::new(RegistryHandle::new(cfg, registry).with_config_path(path.clone()));
+            (handle, path)
+        }
+
+        const OLLAMA_A: &str = r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+"#;
+
+        #[test]
+        fn in_flight_turn_client_survives_reload() {
+            // Simulate an in-flight turn: dispatch clones the `Arc<dyn
+            // LlmClient>` before awaiting. Hold that clone across a reload and
+            // assert the underlying client is NOT dropped — the registry swap
+            // must rely on refcounts, not forcibly tear clients down.
+            let (handle, path) = handle_for_toml(OLLAMA_A);
+            let id = ConnectionId::new("local").unwrap();
+
+            // The "in-flight turn" grabs its client up front.
+            let in_flight = handle.client_for(&id).expect("client present");
+            let weak = Arc::downgrade(&in_flight);
+            assert!(weak.upgrade().is_some());
+
+            // Edit the connection's base_url and reload. This rebuilds the
+            // registry — the swap drops the registry's own Arc but our
+            // in-flight clone must keep the old client alive.
+            std::fs::write(
+                &path,
+                r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:9999"
+"#,
+            )
+            .unwrap();
+            let plan = handle.apply_reload().expect("valid reload applies");
+            assert!(plan.rebuild_registry, "a connection edit rebuilds");
+            assert!(!plan.needs_restart());
+
+            // The in-flight turn's client is still alive (refcount held by our
+            // clone), even though the registry now serves a different client.
+            assert!(
+                weak.upgrade().is_some(),
+                "the registry swap must not drop a client an in-flight turn still holds"
+            );
+            // New turns resolve through the freshly built registry.
+            assert!(handle.client_for(&id).is_some());
+
+            // Drop the in-flight clone; now the old client can be reclaimed.
+            drop(in_flight);
+            assert!(
+                weak.upgrade().is_none(),
+                "once the in-flight turn finishes, the old client is reclaimed"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn malformed_config_is_refused_without_disturbing_running_state() {
+            let (handle, path) = handle_for_toml(OLLAMA_A);
+            let id = ConnectionId::new("local").unwrap();
+            let before = handle.snapshot_config();
+            let live_before = handle.client_for(&id).is_some();
+            assert!(live_before, "the good config has a live client");
+
+            // Garbage TOML on disk.
+            std::fs::write(&path, "this is not = valid toml [[[").unwrap();
+            let err = handle
+                .apply_reload()
+                .expect_err("a malformed config must be refused");
+            assert!(!format!("{err:#}").is_empty());
+
+            // Running state is untouched: same config, same live client.
+            let after = handle.snapshot_config();
+            assert_eq!(
+                toml::to_string(&before).unwrap(),
+                toml::to_string(&after).unwrap(),
+                "a refused reload must leave the last-good config in place"
+            );
+            assert!(
+                handle.client_for(&id).is_some(),
+                "a refused reload must not drop the running registry's clients"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn reload_with_no_changes_is_a_noop() {
+            let (handle, path) = handle_for_toml(OLLAMA_A);
+            // Rewrite identical content (an editor save with no edits).
+            std::fs::write(&path, OLLAMA_A).unwrap();
+            let plan = handle.apply_reload().expect("identical config applies");
+            assert!(plan.is_empty(), "an unchanged config is a no-op reload");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn valid_edit_swaps_config_and_registry() {
+            let (handle, path) = handle_for_toml(OLLAMA_A);
+            assert!(
+                handle
+                    .client_for(&ConnectionId::new("local").unwrap())
+                    .is_some()
+            );
+
+            // Add a second connection.
+            std::fs::write(
+                &path,
+                r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[connections.other]
+type = "ollama"
+base_url = "http://localhost:11435"
+"#,
+            )
+            .unwrap();
+            let plan = handle.apply_reload().expect("valid reload applies");
+            assert!(plan.rebuild_registry);
+            // The new connection is now routable.
+            assert!(
+                handle
+                    .client_for(&ConnectionId::new("other").unwrap())
+                    .is_some(),
+                "a reload that adds a connection makes it routable for new turns"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn reload_refused_when_new_config_has_no_usable_connection() {
+            // Start good (ollama is healthy), then edit to an openai
+            // connection with no api key — every connection fails to build.
+            // The reload must be refused so new turns don't all break.
+            let unused = format!("DA_TEST_RELOAD_KEY_{}", uuid::Uuid::new_v4().simple());
+            // SAFETY: unique name, single-threaded test.
+            unsafe {
+                std::env::remove_var(&unused);
+            }
+            let (handle, path) = handle_for_toml(OLLAMA_A);
+            let id = ConnectionId::new("local").unwrap();
+            assert!(handle.client_for(&id).is_some());
+
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[connections.cloud]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "{unused}"
+"#
+                ),
+            )
+            .unwrap();
+            let err = handle
+                .apply_reload()
+                .expect_err("a config with no usable connection must be refused");
+            assert!(
+                format!("{err:#}").contains("no usable LLM connection"),
+                "refusal should explain the cause: {err:#}"
+            );
+            // The original healthy connection is still live.
+            assert!(
+                handle.client_for(&id).is_some(),
+                "a refused reload keeps the last-good registry"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     // ----- RoutingConversationHandler dispatch-routing tests -----------

@@ -487,6 +487,7 @@ fn dbus_surface_object_paths_match_legacy() {
     assert_eq!(paths::SETTINGS, "/org/desktopAssistant/Settings");
     assert_eq!(paths::CONNECTIONS, "/org/desktopAssistant/Connections");
     assert_eq!(paths::KNOWLEDGE, "/org/desktopAssistant/Knowledge");
+    assert_eq!(paths::RELOAD, "/org/desktopAssistant/Reload");
 }
 
 #[test]

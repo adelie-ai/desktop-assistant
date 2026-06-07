@@ -18,6 +18,7 @@ desktop-assistant-mcp-client.workspace = true
 desktop-assistant-storage.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+notify.workspace = true
 zbus.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
