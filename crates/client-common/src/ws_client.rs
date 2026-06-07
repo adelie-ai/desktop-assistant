@@ -300,12 +300,24 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
         api::Event::ScratchpadChanged { conversation_id } => {
             Some(SignalEvent::ScratchpadChanged { conversation_id })
         }
-        // Client-side tool execution (#107): handled by clients that
-        // implement the client-tool protocol directly; the legacy
-        // `SignalEvent` stream is for the GTK desktop UI and does not
-        // surface tool-call requests. Listed explicitly so a future
-        // client that DOES want to react can move it out of this arm.
-        api::Event::ClientToolCall { .. } => None,
+        // Client-side tool execution (#107/#231): surfaced on the signal
+        // stream so a client that advertised client-local tools (voice first)
+        // can execute the requested tool and post the result back via
+        // `Connector::submit_client_tool_result`. The `TaskId` newtype is
+        // unwrapped to its inner `String` to match the rest of this stream.
+        api::Event::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => Some(SignalEvent::ClientToolCall {
+            task_id: task_id.0,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        }),
     }
 }
 
@@ -443,6 +455,37 @@ mod tests {
                 assert_eq!(conversation_id, "c-1");
             }
             other => panic!("expected SignalEvent::ScratchpadChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_client_tool_call_event() {
+        // #231: a `ClientToolCall` event used to be dropped (`=> None`); it now
+        // surfaces on the signal stream so a client that advertised tools can
+        // run the call and post a result back. The `TaskId` newtype is unwrapped
+        // to its inner string.
+        let signal = map_event_to_signal(api::Event::ClientToolCall {
+            task_id: api::TaskId("task-1".into()),
+            conversation_id: "conv-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "weather".into(),
+            arguments: serde_json::json!({ "city": "Boston" }),
+        });
+        match signal {
+            Some(SignalEvent::ClientToolCall {
+                task_id,
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+            }) => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(tool_call_id, "call-1");
+                assert_eq!(tool_name, "weather");
+                assert_eq!(arguments, serde_json::json!({ "city": "Boston" }));
+            }
+            other => panic!("expected SignalEvent::ClientToolCall, got {other:?}"),
         }
     }
 
