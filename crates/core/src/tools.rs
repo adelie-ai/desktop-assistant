@@ -52,12 +52,68 @@ pub(crate) fn tool_status_message(tool_name: &str, arguments: &serde_json::Value
             }
         }
         "builtin_mcp_control" => "Managing tool servers".into(),
-        name => {
-            // For MCP/dynamic tools, humanize the snake_case name.
-            let friendly = name.replace('_', " ");
-            format!("Running {friendly}")
-        }
+        name => humanize_mcp_tool_status(name),
     }
+}
+
+/// Render a friendly, speakable status for a dynamic/MCP tool from its name
+/// alone (issue #223). MCP tool names are not known at compile time, so we map
+/// by their leading action verb to a natural phrase and append the remaining
+/// words as the resource (e.g. `calendar_list_events` → "Checking your calendar
+/// events", `notes_search` → "Searching your notes"). Names use `_` or `.`
+/// separators (`calendar.list` ≡ `calendar_list`). Falls back to
+/// "Running <words>" when no verb is recognized.
+fn humanize_mcp_tool_status(name: &str) -> String {
+    // Normalize separators so `a.b.c` and `a_b_c` both split into words.
+    let words: Vec<&str> = name.split(['_', '.']).filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return "Working on it".into();
+    }
+
+    // The action verb may appear first (verb_resource, e.g. `list_events`) or
+    // last (resource_verb, e.g. `calendar_list`). Prefer a first-word match,
+    // then a last-word match, treating the remaining words as the resource.
+    let phrasing = |verb: &str, resource: &[&str]| -> Option<String> {
+        let template = verb_phrase(verb)?;
+        let resource = resource.join(" ");
+        Some(if resource.is_empty() {
+            // No resource words — use a generic object so the phrase reads.
+            template.replace("{}", "that")
+        } else {
+            template.replace("{}", &format!("your {resource}"))
+        })
+    };
+
+    if let Some(msg) = phrasing(words[0], &words[1..]) {
+        return msg;
+    }
+    if words.len() > 1
+        && let Some(msg) = phrasing(words[words.len() - 1], &words[..words.len() - 1])
+    {
+        return msg;
+    }
+
+    // No recognized verb: humanize the whole name.
+    format!("Running {}", words.join(" "))
+}
+
+/// Map a known action verb to a short status template containing a single `{}`
+/// placeholder for the resource (e.g. "your calendar"). Returns `None` for
+/// unrecognized verbs so the caller can fall back. Synonyms collapse onto the
+/// same phrasing so a wide range of MCP naming conventions read naturally.
+fn verb_phrase(verb: &str) -> Option<&'static str> {
+    let phrase = match verb {
+        "list" | "get" | "read" | "fetch" | "show" | "view" | "describe" | "check" => "Checking {}",
+        "search" | "find" | "query" | "lookup" => "Searching {}",
+        "create" | "add" | "new" | "insert" | "schedule" | "book" => "Adding to {}",
+        "update" | "edit" | "modify" | "set" | "change" | "patch" | "correct" => "Updating {}",
+        "delete" | "remove" | "cancel" | "clear" | "drop" => "Removing from {}",
+        "send" | "post" | "reply" | "email" | "message" => "Sending {}",
+        "download" | "export" => "Downloading {}",
+        "upload" | "import" => "Uploading {}",
+        _ => return None,
+    };
+    Some(phrase)
 }
 
 /// Use the LLM to semantically categorize tools into descriptive namespaces.
@@ -283,5 +339,97 @@ impl ToolExecutor for NoopToolExecutor {
         Err(CoreError::ToolExecution(format!(
             "no tool executor configured, cannot execute '{name}'"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn builtin_tools_get_tailored_status() {
+        assert_eq!(
+            tool_status_message("builtin_knowledge_base_write", &json!({})),
+            "Saving to knowledge base"
+        );
+        assert_eq!(
+            tool_status_message("builtin_sys_props", &json!({})),
+            "Checking system properties"
+        );
+        assert_eq!(
+            tool_status_message("builtin_db_query", &json!({})),
+            "Querying database"
+        );
+        assert_eq!(
+            tool_status_message("builtin_mcp_control", &json!({})),
+            "Managing tool servers"
+        );
+    }
+
+    #[test]
+    fn builtin_search_includes_truncated_query() {
+        let msg = tool_status_message(
+            "builtin_knowledge_base_search",
+            &json!({"query": "where did I park"}),
+        );
+        assert_eq!(msg, "Searching knowledge base: where did I park");
+
+        let long = "x".repeat(120);
+        let msg = tool_status_message("builtin_tool_search", &json!({ "query": long }));
+        // 60-char cap on the query portion.
+        assert_eq!(msg, format!("Searching for tools: {}", "x".repeat(60)));
+    }
+
+    #[test]
+    fn mcp_leading_verb_maps_to_human_phrase() {
+        // verb_resource ordering
+        assert_eq!(
+            tool_status_message("list_events", &json!({})),
+            "Checking your events"
+        );
+        assert_eq!(
+            tool_status_message("search_messages", &json!({})),
+            "Searching your messages"
+        );
+        assert_eq!(
+            tool_status_message("create_event", &json!({})),
+            "Adding to your event"
+        );
+        assert_eq!(
+            tool_status_message("delete_file", &json!({})),
+            "Removing from your file"
+        );
+    }
+
+    #[test]
+    fn mcp_trailing_verb_maps_to_human_phrase() {
+        // resource_verb ordering (e.g. calendar.list, notes_search)
+        assert_eq!(
+            tool_status_message("calendar.list", &json!({})),
+            "Checking your calendar"
+        );
+        assert_eq!(
+            tool_status_message("notes_search", &json!({})),
+            "Searching your notes"
+        );
+        assert_eq!(
+            tool_status_message("timeclock_session_query", &json!({})),
+            "Searching your timeclock session"
+        );
+    }
+
+    #[test]
+    fn mcp_unknown_verb_falls_back_to_running() {
+        assert_eq!(
+            tool_status_message("frobnicate_widget", &json!({})),
+            "Running frobnicate widget"
+        );
+    }
+
+    #[test]
+    fn mcp_verb_only_name_reads_naturally() {
+        // A bare verb has no resource words.
+        assert_eq!(tool_status_message("search", &json!({})), "Searching that");
     }
 }
