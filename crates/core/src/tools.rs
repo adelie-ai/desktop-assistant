@@ -116,6 +116,58 @@ fn verb_phrase(verb: &str) -> Option<&'static str> {
     Some(phrase)
 }
 
+/// Max characters of a tool's arguments/result surfaced to a tool-activity
+/// observer. Long enough to be informative in a log line, short enough to keep
+/// the per-task log ring cheap and each entry single-line.
+const TOOL_EVENT_SUMMARY_MAX: usize = 200;
+
+/// Compact, single-line rendering of a tool call's JSON arguments for an
+/// activity feed. Objects render as `key=value` pairs (the common, readable
+/// case); other shapes fall back to compact JSON. Empty for no-argument calls.
+/// Truncated to [`TOOL_EVENT_SUMMARY_MAX`] characters.
+pub(crate) fn summarize_tool_value(args: &serde_json::Value) -> String {
+    let rendered = match args {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Object(map) if map.is_empty() => String::new(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}={}", compact_scalar(v)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    };
+    truncate_single_line(&rendered, TOOL_EVENT_SUMMARY_MAX)
+}
+
+/// Compact, single-line rendering of a tool result (or error) string for an
+/// activity feed. Truncated to [`TOOL_EVENT_SUMMARY_MAX`] characters.
+pub(crate) fn summarize_tool_text(text: &str) -> String {
+    truncate_single_line(text, TOOL_EVENT_SUMMARY_MAX)
+}
+
+/// Render a single JSON value compactly: strings unquoted (so `path=/tmp/x`
+/// rather than `path="/tmp/x"`), everything else as compact JSON so a nested
+/// argument can't expand the summary's structure.
+fn compact_scalar(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Collapse internal whitespace runs to single spaces and cap the length,
+/// appending an ellipsis when truncated. Keeps activity-feed lines tidy and
+/// bounded regardless of how a tool formats its output.
+fn truncate_single_line(s: &str, max: usize) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let kept: String = collapsed.chars().take(max).collect();
+        format!("{kept}…")
+    }
+}
+
 /// Use the LLM to semantically categorize tools into descriptive namespaces.
 ///
 /// Takes the raw tool namespaces (typically grouped by MCP server) and asks
