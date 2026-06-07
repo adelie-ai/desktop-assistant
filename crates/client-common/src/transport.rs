@@ -82,7 +82,50 @@ impl TransportClient {
             Self::Uds(client) => Some(client),
         }
     }
+
+    /// Re-establish the underlying connection in place after a drop (#246),
+    /// re-running the handshake (re-auth via the credential in `config`) and
+    /// re-binding the persistent signal/drop channels — so the *same*
+    /// `TransportClient` (and any `&TransportClient` a caller holds) keeps
+    /// working without the Connector swapping the client. The socket transports
+    /// (UDS/WS) support this; the D-Bus transport doesn't reconnect this way and
+    /// returns an error (its clients don't use the Connector). Resolves the
+    /// bearer token from `config` on each attempt so a freshly-minted local JWT
+    /// is used (a long outage can still outlive a token's validity — surfaced as
+    /// an auth error the supervisor retries with backoff).
+    pub async fn reconnect(&self, config: &ConnectionConfig) -> Result<()> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(_) => Err(anyhow::anyhow!(
+                "the D-Bus transport does not support Connector auto-reconnect"
+            )),
+            Self::Ws(client) => {
+                let token = resolve_ws_bearer_token(config).await?;
+                client
+                    .reconnect(&config.ws_url, &token, config.tls_ca_cert.as_deref())
+                    .await
+            }
+            Self::Uds(client) => {
+                let token = resolve_ws_bearer_token(config).await?;
+                let path = config
+                    .socket_path
+                    .clone()
+                    .or_else(default_desktop_socket_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no UDS socket path: set ConnectionConfig.socket_path or XDG_RUNTIME_DIR"
+                        )
+                    })?;
+                client.reconnect(&path, &token).await
+            }
+        }
+    }
 }
+
+/// A receiver that fires once per underlying-socket close, so the
+/// [`Connector`](crate::Connector) reconnect supervisor can react (#246). `None`
+/// for the D-Bus transport, which doesn't auto-reconnect.
+pub type DropNotifier = mpsc::UnboundedReceiver<()>;
 
 #[async_trait]
 impl AssistantClient for TransportClient {
@@ -290,15 +333,24 @@ pub fn transport_label(config: &ConnectionConfig) -> String {
     }
 }
 
+/// Connect over the transport named by `config`. Returns the client, the signal
+/// stream, and a [`DropNotifier`] that fires once per underlying-socket close
+/// for the socket transports (#246) — `None` for D-Bus, which doesn't
+/// auto-reconnect. The [`Connector`](crate::Connector) uses the notifier to
+/// drive its reconnect supervisor.
 pub async fn connect_transport(
     config: &ConnectionConfig,
-) -> Result<(TransportClient, mpsc::UnboundedReceiver<SignalEvent>)> {
+) -> Result<(
+    TransportClient,
+    mpsc::UnboundedReceiver<SignalEvent>,
+    Option<DropNotifier>,
+)> {
     match config.transport_mode {
         #[cfg(feature = "dbus")]
         TransportMode::Dbus => {
             let client = crate::dbus_client::DbusClient::connect().await?;
             let signal_rx = client.subscribe_signals().await?;
-            Ok((TransportClient::Dbus(client), signal_rx))
+            Ok((TransportClient::Dbus(client), signal_rx, None))
         }
         #[cfg(not(feature = "dbus"))]
         TransportMode::Dbus => Err(anyhow::anyhow!(
@@ -306,9 +358,9 @@ pub async fn connect_transport(
         )),
         TransportMode::Ws => {
             let token = resolve_ws_bearer_token(config).await?;
-            let (client, signal_rx) =
+            let (client, signal_rx, drop_rx) =
                 WsClient::connect(&config.ws_url, &token, config.tls_ca_cert.as_deref()).await?;
-            Ok((TransportClient::Ws(client), signal_rx))
+            Ok((TransportClient::Ws(client), signal_rx, Some(drop_rx)))
         }
         TransportMode::Uds => {
             // The local minter issues the same JWT the UDS server's handshake
@@ -323,8 +375,8 @@ pub async fn connect_transport(
                         "no UDS socket path: set ConnectionConfig.socket_path or XDG_RUNTIME_DIR"
                     )
                 })?;
-            let (client, signal_rx) = UdsClient::connect(&path, &token).await?;
-            Ok((TransportClient::Uds(client), signal_rx))
+            let (client, signal_rx, drop_rx) = UdsClient::connect(&path, &token).await?;
+            Ok((TransportClient::Uds(client), signal_rx, Some(drop_rx)))
         }
     }
 }

@@ -12,6 +12,17 @@
 //! `crates/uds-interface/src/lib.rs`). Depending on that crate would drag the
 //! entire daemon stack into every client binary, so the ~20 lines are
 //! duplicated on purpose.
+//!
+//! ## Reconnect (#246)
+//!
+//! The live socket (the writer's `outbound_tx`) lives behind a swappable
+//! [`ConnState`] cell, while the request-correlation map, the signal stream the
+//! [`Connector`](crate::Connector) reads, and the drop-notification channel all
+//! **persist across reconnects**. [`UdsClient::reconnect`] re-runs the handshake
+//! and spawns fresh reader/writer tasks wired to those same persistent
+//! channels, then swaps the cell — so the connection comes back transparently
+//! under a stable `&TransportClient` without the Connector having to re-subscribe
+//! the event stream.
 
 use std::collections::HashMap;
 use std::io;
@@ -61,11 +72,31 @@ impl PendingState {
             let _ = tx.send(Err(reason.to_string()));
         }
     }
+
+    /// Re-arm the map for a fresh connection (#246): clear the closed marker so
+    /// new commands are accepted again. Any stragglers from the old connection
+    /// were already drained by `close`.
+    fn reopen(&mut self) {
+        self.closed = None;
+    }
+}
+
+/// The live connection's write handle, swapped on reconnect (#246).
+struct ConnState {
+    outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 pub struct UdsClient {
-    outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// The live writer, replaced in place by [`reconnect`](Self::reconnect).
+    conn: Arc<Mutex<ConnState>>,
     pending: Arc<Mutex<PendingState>>,
+    /// The persistent signal stream every reader (across reconnects) feeds. The
+    /// Connector subscribes to its receiver once and keeps it forever.
+    signal_tx: mpsc::UnboundedSender<SignalEvent>,
+    /// Fires once per underlying-socket close so the Connector's reconnect
+    /// supervisor knows to back off and reconnect (#246). Persistent across
+    /// reconnects; each fresh reader clones it.
+    drop_tx: mpsc::UnboundedSender<()>,
     /// Per-command response deadline (#221). Defaults to
     /// [`DISPATCH_TIMEOUT`]; tunable via [`set_dispatch_timeout`].
     dispatch_timeout: Duration,
@@ -79,10 +110,57 @@ impl UdsClient {
         self.dispatch_timeout = timeout;
     }
 
+    /// Connect a UDS transport. Returns the client, the persistent signal
+    /// stream, and a drop-notifier receiver that fires once per underlying
+    /// socket close (#246) — the Connector uses the latter to drive reconnect.
     pub async fn connect(
         socket_path: &Path,
         bearer_token: &str,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<SignalEvent>)> {
+    ) -> Result<(
+        Self,
+        mpsc::UnboundedReceiver<SignalEvent>,
+        mpsc::UnboundedReceiver<()>,
+    )> {
+        let pending = Arc::new(Mutex::new(PendingState {
+            map: HashMap::new(),
+            closed: None,
+        }));
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let (drop_tx, drop_rx) = mpsc::unbounded_channel::<()>();
+
+        let outbound_tx = Self::spawn_connection(
+            socket_path,
+            bearer_token,
+            Arc::clone(&pending),
+            signal_tx.clone(),
+            drop_tx.clone(),
+        )
+        .await?;
+
+        Ok((
+            Self {
+                conn: Arc::new(Mutex::new(ConnState { outbound_tx })),
+                pending,
+                signal_tx,
+                drop_tx,
+                dispatch_timeout: DISPATCH_TIMEOUT,
+            },
+            signal_rx,
+            drop_rx,
+        ))
+    }
+
+    /// Connect a fresh socket, perform the JWT handshake, and spawn the
+    /// reader/writer tasks wired to the **persistent** `pending` / `signal_tx` /
+    /// `drop_tx`. Returns the new writer handle. Shared by the initial
+    /// [`connect`](Self::connect) and [`reconnect`](Self::reconnect) (#246).
+    async fn spawn_connection(
+        socket_path: &Path,
+        bearer_token: &str,
+        pending: Arc<Mutex<PendingState>>,
+        signal_tx: mpsc::UnboundedSender<SignalEvent>,
+        drop_tx: mpsc::UnboundedSender<()>,
+    ) -> Result<mpsc::UnboundedSender<Vec<u8>>> {
         let stream = UnixStream::connect(socket_path)
             .await
             .map_err(|e| anyhow!("failed to connect uds {}: {e}", socket_path.display()))?;
@@ -107,13 +185,7 @@ impl UdsClient {
             }
         });
 
-        let pending = Arc::new(Mutex::new(PendingState {
-            map: HashMap::new(),
-            closed: None,
-        }));
         let pending_for_reader = Arc::clone(&pending);
-
-        let (signal_tx, signal_rx) = mpsc::unbounded_channel::<SignalEvent>();
         tokio::spawn(async move {
             loop {
                 let raw = match read_frame(&mut read_half).await {
@@ -152,27 +224,40 @@ impl UdsClient {
                 }
             }
 
-            // Teardown: mark closed (preserving a connection-level error reason
-            // if one was already set), drain any stragglers, notify once.
-            let reason = {
-                let mut state = pending_for_reader.lock().await;
-                state.close("uds connection closed");
-                state
-                    .closed
-                    .clone()
-                    .unwrap_or_else(|| "uds connection closed".to_string())
-            };
-            let _ = signal_tx.send(SignalEvent::Disconnected { reason });
+            // Teardown: fail any outstanding requests so callers don't hang.
+            // We do NOT emit a `Disconnected` on the signal stream here — that
+            // stream persists across reconnects (#246), so a close on it would
+            // wrongly read as a permanent end. Instead we notify the reconnect
+            // supervisor via `drop_tx`; it emits the terminal `Disconnected` to
+            // subscribers and drives the reconnect.
+            pending_for_reader
+                .lock()
+                .await
+                .close("uds connection closed");
+            let _ = drop_tx.send(());
         });
 
-        Ok((
-            Self {
-                outbound_tx,
-                pending,
-                dispatch_timeout: DISPATCH_TIMEOUT,
-            },
-            signal_rx,
-        ))
+        Ok(outbound_tx)
+    }
+
+    /// Re-establish the underlying socket after a drop (#246): re-run the JWT
+    /// handshake, spawn fresh reader/writer tasks bound to the persistent
+    /// channels, and swap in the new writer. On success the same
+    /// `&TransportClient` resumes working; on failure the error is returned so
+    /// the supervisor can back off and retry.
+    pub(crate) async fn reconnect(&self, socket_path: &Path, bearer_token: &str) -> Result<()> {
+        let outbound_tx = Self::spawn_connection(
+            socket_path,
+            bearer_token,
+            Arc::clone(&self.pending),
+            self.signal_tx.clone(),
+            self.drop_tx.clone(),
+        )
+        .await?;
+        // Accept commands again, then swap the writer.
+        self.pending.lock().await.reopen();
+        self.conn.lock().await.outbound_tx = outbound_tx;
+        Ok(())
     }
 }
 
@@ -195,7 +280,7 @@ impl AssistantCommands for UdsClient {
             state.map.insert(id.clone(), tx);
         }
 
-        if self.outbound_tx.send(body).is_err() {
+        if self.conn.lock().await.outbound_tx.send(body).is_err() {
             self.pending.lock().await.map.remove(&id);
             return Err(anyhow!("failed to send uds request: writer closed"));
         }

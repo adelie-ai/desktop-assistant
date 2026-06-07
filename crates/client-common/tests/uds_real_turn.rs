@@ -461,6 +461,327 @@ fn start_server(socket_path: PathBuf, signing_key: String) -> tokio::sync::onesh
     tx
 }
 
+// ---------------------------------------------------------------------------
+// #246 reconnect harness: a server whose entire runtime can be dropped to
+// simulate a daemon *restart* (which closes every live connection — unlike a
+// graceful shutdown, whose spawned per-connection tasks would linger), then a
+// fresh server stood up on the same socket path.
+// ---------------------------------------------------------------------------
+
+/// Like [`real_handler`] but bound to a caller-supplied coordinator, so a test
+/// can inspect the tools registered against the *new* daemon after reconnect.
+fn real_handler_with_coord(
+    coord: Arc<ClientToolCoordinator>,
+) -> Arc<dyn desktop_assistant_application::AssistantApiHandler> {
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let store: Arc<dyn desktop_assistant_core::ports::store::TurnStateStore> =
+        Arc::new(InMemoryTurnStateStore::new());
+    let handler = DefaultAssistantApiHandler::new(
+        Arc::new(FakeAssistant),
+        Arc::new(StreamingConversations),
+        Arc::new(FakeSettings),
+        Arc::new(FakeConnections),
+        Arc::new(FakeKnowledge),
+    )
+    .with_registry(registry)
+    .with_client_tool_coordinator(coord, store);
+    Arc::new(handler)
+}
+
+/// A server instance running on its own dedicated runtime thread. Dropping it
+/// shuts the runtime down, aborting the accept loop **and** every spawned
+/// per-connection task — so any connected client sees its socket close, exactly
+/// like a daemon binary restart. The coordinator is shared so the test can
+/// assert what the (post-restart) daemon has registered.
+struct ServerInstance {
+    runtime: Option<tokio::runtime::Runtime>,
+    coord: Arc<ClientToolCoordinator>,
+}
+
+impl ServerInstance {
+    fn start(socket_path: PathBuf, signing_key: String) -> Self {
+        let coord = Arc::new(ClientToolCoordinator::new());
+        let coord_for_server = Arc::clone(&coord);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build server runtime");
+        runtime.spawn(async move {
+            let handler = real_handler_with_coord(coord_for_server);
+            let auth: Arc<dyn UdsAuthValidator> = Arc::new(StaticJwtAuth { signing_key });
+            let server = UdsServer::new(handler, auth, UdsServerConfig::new(socket_path));
+            // Serve until the runtime is dropped (no graceful shutdown — a
+            // restart is abrupt).
+            let _ = server
+                .serve_with_shutdown(std::future::pending::<()>())
+                .await;
+        });
+        Self {
+            runtime: Some(runtime),
+            coord,
+        }
+    }
+}
+
+impl Drop for ServerInstance {
+    fn drop(&mut self) {
+        // Tear the runtime down without blocking the async test thread on its
+        // worker join (which would deadlock): hand the shutdown to a scratch
+        // thread.
+        if let Some(rt) = self.runtime.take() {
+            std::thread::spawn(move || drop(rt));
+        }
+    }
+}
+
+/// #246: after the daemon *restarts* (its runtime — and every live connection —
+/// is dropped, then a fresh daemon binds the same socket), the Connector must
+/// transparently reconnect: a `send_prompt` issued after the drop streams its
+/// turn on the new connection, and the client tools registered before the drop
+/// are **replayed** so the new daemon knows about them again.
+#[tokio::test]
+async fn connector_reconnects_and_replays_tools_after_daemon_restart() {
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    let path = dir.path().join("adelie.sock");
+
+    // Daemon #1.
+    let server1 = ServerInstance::start(path.clone(), signing_key.clone());
+    wait_for_socket(&path).await;
+
+    let cfg = uds_config(path.clone(), mint_test_jwt(&signing_key, "dave"));
+    // Short backoff is built into the connector; we drive the timing with a
+    // generous wait loop below rather than tuning constants here.
+    let connector = Connector::connect(&cfg).await.expect("connector over uds");
+
+    // Register a client tool against daemon #1 (voice's stop_listening shape).
+    let tool = desktop_assistant_api_model::ClientToolRegistration {
+        name: "stop_listening".into(),
+        description: "stop the microphone".into(),
+        input_schema: serde_json::json!({ "type": "object" }),
+    };
+    let count = connector
+        .register_client_tools(vec![tool.clone()])
+        .await
+        .expect("initial register");
+    assert_eq!(count, 1, "daemon #1 accepted the tool");
+
+    // A turn works on the original connection.
+    drive_one_turn(&connector).await;
+
+    // --- Daemon restart: drop #1 (closing the connection), bind #2. ---
+    drop(server1);
+    let server2 = ServerInstance::start(path.clone(), signing_key.clone());
+    wait_for_socket(&path).await;
+
+    // The fresh daemon starts with NO client tools — until the Connector
+    // replays the registration. Poll until the reconnect+replay lands.
+    let replayed = wait_until(Duration::from_secs(10), || {
+        let coord = Arc::clone(&server2.coord);
+        async move { coord.is_client_registered("stop_listening").await }
+    })
+    .await;
+    assert!(
+        replayed,
+        "the Connector must replay the client-tool registration to the restarted daemon (#246)"
+    );
+
+    // And a brand-new turn must stream on the reconnected transport. The send
+    // itself may transiently fail while the socket is between connections, so
+    // retry briefly until the reconnected transport accepts it.
+    drive_one_turn_with_retry(&connector, Duration::from_secs(10)).await;
+
+    drop(server2);
+}
+
+/// Drive a single SendMessage turn and assert it streams to completion on the
+/// connector's current connection.
+async fn drive_one_turn(connector: &Connector) {
+    let mut events = connector.subscribe();
+    let returned_id = timeout(
+        Duration::from_secs(5),
+        connector.send_prompt_with_system_refinement_idempotent(
+            "conv-1",
+            "hi",
+            "",
+            Some(uuid::Uuid::new_v4().to_string()),
+        ),
+    )
+    .await
+    .expect("send acks")
+    .expect("ack ok");
+    assert!(
+        collect_turn(&mut events, &returned_id).await,
+        "turn completed"
+    );
+}
+
+/// Like [`drive_one_turn`] but tolerant of the brief window right after a drop
+/// where the send may hit the dead socket before the reconnect lands: retries
+/// the send until it acks (or the deadline), then asserts the turn streams.
+async fn drive_one_turn_with_retry(connector: &Connector, within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let mut events = connector.subscribe();
+        let send = connector.send_prompt_with_system_refinement_idempotent(
+            "conv-1",
+            "hi again",
+            "",
+            Some(uuid::Uuid::new_v4().to_string()),
+        );
+        match timeout(Duration::from_secs(5), send).await {
+            Ok(Ok(returned_id)) => {
+                if collect_turn(&mut events, &returned_id).await {
+                    return;
+                }
+            }
+            _ => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("send never succeeded on the reconnected transport within {within:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("turn never completed on the reconnected transport within {within:?}");
+        }
+    }
+}
+
+/// Read from `events` until the turn for `request_id` completes. Returns `false`
+/// if the connection drops or stalls first (so a caller can retry).
+async fn collect_turn(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
+    request_id: &str,
+) -> bool {
+    for _ in 0..30 {
+        match timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(SignalEvent::Complete {
+                request_id: rid,
+                full_response,
+            })) if rid == request_id => {
+                return full_response == "hello";
+            }
+            Ok(Some(SignalEvent::Disconnected { .. })) => return false,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Poll `cond` until it returns true or the deadline elapses.
+async fn wait_until<F, Fut>(within: Duration, mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if cond().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// #246 invariant guard: a per-turn **stall** (a waiter on an open-but-silent
+/// connection) must surface the stall `Disconnected` to the waiter (#221)
+/// WITHOUT tearing the transport down or reconnecting. A reconnect would emit a
+/// *second*, "signal stream closed" Disconnected and would replay the tool
+/// registration; neither must happen. After the stall, the SAME connection must
+/// still stream the next turn.
+#[tokio::test]
+async fn per_turn_stall_does_not_trigger_a_reconnect() {
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    let path = dir.path().join("adelie.sock");
+    let server = ServerInstance::start(path.clone(), signing_key.clone());
+    wait_for_socket(&path).await;
+
+    let cfg = uds_config(path.clone(), mint_test_jwt(&signing_key, "dave"));
+    // A short stall window. The server stays up the whole time; the connection
+    // is open and healthy — it just has a waiter with no in-flight events.
+    let stall = Duration::from_millis(200);
+    let connector = Connector::connect_with_stall_timeout(&cfg, stall)
+        .await
+        .expect("connector over uds");
+
+    // A waiter on a silent connection (subscribe, but send nothing) trips the
+    // per-turn stall. It must get a "stalled" Disconnected, NOT a close.
+    let mut waiter = connector.subscribe();
+    let event = timeout(stall * 5, waiter.recv())
+        .await
+        .expect("the stall must unstick the waiter")
+        .expect("a terminal event");
+    match event {
+        SignalEvent::Disconnected { reason } => assert!(
+            reason.contains("stalled"),
+            "a per-turn stall must surface a 'stalled' Disconnected, not a close: {reason}"
+        ),
+        other => panic!("expected a stall Disconnected, got {other:?}"),
+    }
+
+    // No reconnect happened, so there must be NO follow-up "signal stream
+    // closed" Disconnected on a fresh subscriber, and the SAME connection must
+    // still stream the next turn (the transport was never torn down).
+    let mut probe = connector.subscribe();
+    // Give any (erroneous) reconnect a window to fire its close-Disconnected.
+    if let Ok(Some(SignalEvent::Disconnected { reason })) = timeout(stall, probe.recv()).await {
+        panic!("a stall must NOT trigger a transport close/reconnect, but got: {reason}");
+    }
+    drop(probe);
+
+    drive_one_turn(&connector).await;
+
+    drop(server);
+}
+
+/// #246 invariant guard: an **idle** Connector (connected, but no turns, no
+/// traffic) must NOT spuriously reconnect or tear its transport down — even
+/// well past the event-stall window. After sitting idle, a turn must still
+/// stream on the *original* connection (no reconnect happened).
+#[tokio::test]
+async fn idle_connector_does_not_spuriously_reconnect() {
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    let path = dir.path().join("adelie.sock");
+    let server = ServerInstance::start(path.clone(), signing_key.clone());
+    wait_for_socket(&path).await;
+
+    let cfg = uds_config(path.clone(), mint_test_jwt(&signing_key, "dave"));
+    // A short stall window; the connection is healthy and open the whole time.
+    let stall = Duration::from_millis(150);
+    let connector = Connector::connect_with_stall_timeout(&cfg, stall)
+        .await
+        .expect("connector over uds");
+
+    // Register a tool, then sit idle WELL past the stall window. If an idle
+    // connection wrongly reconnected, the replay would re-run; more importantly,
+    // a spurious teardown would break the next turn.
+    connector
+        .register_client_tools(vec![desktop_assistant_api_model::ClientToolRegistration {
+            name: "noop".into(),
+            description: String::new(),
+            input_schema: serde_json::Value::Null,
+        }])
+        .await
+        .expect("register");
+    tokio::time::sleep(stall * 5).await;
+
+    // The tool is still registered on the SAME daemon (no restart happened);
+    // and a turn still streams on the original, never-dropped connection.
+    assert!(
+        server.coord.is_client_registered("noop").await,
+        "an idle connection must not have dropped/reconnected (tool would survive either way, \
+         but a teardown would break the turn below)"
+    );
+    drive_one_turn(&connector).await;
+
+    drop(server);
+}
+
 /// The real-path voice#49 assertion: a SendMessage carrying an idempotency key
 /// (the voice client's exact behaviour) driven through the REAL handler must
 /// stream Status + Delta + Completed events back to the connecting UDS client,
