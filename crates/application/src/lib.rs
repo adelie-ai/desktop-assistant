@@ -519,6 +519,11 @@ where
             .get_persistence_settings()
             .await
             .map_err(Self::map_core_err)?;
+        let personality = self
+            .settings
+            .get_personality_settings()
+            .await
+            .map_err(Self::map_core_err)?;
 
         Ok(api::Config {
             embeddings: api::EmbeddingsSettingsView {
@@ -535,6 +540,9 @@ where
                 remote_name: persistence.remote_name,
                 push_on_update: persistence.push_on_update,
             },
+            // `PersonalitySettingsView` is the core `Personality` type in both
+            // the port and the api-model, so this is the identity conversion.
+            personality,
         })
     }
 
@@ -548,6 +556,13 @@ where
             persistence_remote_url,
             persistence_remote_name,
             persistence_push_on_update,
+            personality_professionalism,
+            personality_warmth,
+            personality_directness,
+            personality_enthusiasm,
+            personality_humor,
+            personality_sarcasm,
+            personality_pretentiousness,
         } = changes;
 
         let embeddings_changed = embeddings_connector.is_some()
@@ -601,6 +616,46 @@ where
 
             self.settings
                 .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
+                .await
+                .map_err(Self::map_core_err)?;
+        }
+
+        // Personality (#226): apply per-trait overrides over the current value.
+        // Each `None` leaves that trait unchanged; only a present level updates
+        // it. We write the whole struct back so the daemon refreshes the
+        // in-memory config the next send reads.
+        let personality_changed = personality_professionalism.is_some()
+            || personality_warmth.is_some()
+            || personality_directness.is_some()
+            || personality_enthusiasm.is_some()
+            || personality_humor.is_some()
+            || personality_sarcasm.is_some()
+            || personality_pretentiousness.is_some();
+        if personality_changed {
+            let mut p = current.personality;
+            if let Some(v) = personality_professionalism {
+                p.professionalism = v;
+            }
+            if let Some(v) = personality_warmth {
+                p.warmth = v;
+            }
+            if let Some(v) = personality_directness {
+                p.directness = v;
+            }
+            if let Some(v) = personality_enthusiasm {
+                p.enthusiasm = v;
+            }
+            if let Some(v) = personality_humor {
+                p.humor = v;
+            }
+            if let Some(v) = personality_sarcasm {
+                p.sarcasm = v;
+            }
+            if let Some(v) = personality_pretentiousness {
+                p.pretentiousness = v;
+            }
+            self.settings
+                .set_personality_settings(p)
                 .await
                 .map_err(Self::map_core_err)?;
         }
@@ -2184,7 +2239,8 @@ mod tests {
     use desktop_assistant_core::ports::inbound::{
         BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
         EmbeddingsSettingsView, LlmSettingsView, ModelListing as CoreModelListing,
-        PersistenceSettingsView, PurposeKind, PurposesView as CorePurposesView,
+        PersistenceSettingsView, PersonalitySettingsView, PurposeKind,
+        PurposesView as CorePurposesView,
     };
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;
@@ -2525,6 +2581,7 @@ mod tests {
         llm: LlmSettingsView,
         embeddings: EmbeddingsSettingsView,
         persistence: PersistenceSettingsView,
+        personality: PersonalitySettingsView,
         api_key_set: bool,
     }
 
@@ -2560,6 +2617,7 @@ mod tests {
                         remote_name: "origin".into(),
                         push_on_update: true,
                     },
+                    personality: PersonalitySettingsView::default(),
                     api_key_set: false,
                 }),
             }
@@ -2678,6 +2736,18 @@ mod tests {
                 state.persistence.remote_name = remote_name;
             }
             state.persistence.push_on_update = push_on_update;
+            Ok(())
+        }
+
+        async fn get_personality_settings(&self) -> Result<PersonalitySettingsView, CoreError> {
+            Ok(self.state.lock().unwrap().personality)
+        }
+
+        async fn set_personality_settings(
+            &self,
+            personality: PersonalitySettingsView,
+        ) -> Result<(), CoreError> {
+            self.state.lock().unwrap().personality = personality;
             Ok(())
         }
 
@@ -3323,6 +3393,60 @@ mod tests {
         assert_eq!(config.embeddings.model, "text-embedding-3-large");
         assert_eq!(config.persistence.remote_name, "upstream");
         assert!(!config.persistence.push_on_update);
+    }
+
+    #[tokio::test]
+    async fn get_config_returns_default_personality() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::clone(&settings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let res = h.handle_command(api::Command::GetConfig).await.unwrap();
+        let api::CommandResult::Config(config) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(
+            config.personality.professionalism,
+            api::PersonalityLevel::Always
+        );
+        assert_eq!(config.personality.humor, api::PersonalityLevel::Sometimes);
+    }
+
+    #[tokio::test]
+    async fn set_config_changes_personality() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::clone(&settings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let res = h
+            .handle_command(api::Command::SetConfig {
+                changes: api::ConfigChanges {
+                    personality_humor: Some(api::PersonalityLevel::Never),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+
+        let api::CommandResult::Config(config) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(config.personality.humor, api::PersonalityLevel::Never);
+        // Other traits untouched.
+        assert_eq!(
+            config.personality.professionalism,
+            api::PersonalityLevel::Always
+        );
     }
 
     // ---- RequestContext tests (issue #105) -----------------------------

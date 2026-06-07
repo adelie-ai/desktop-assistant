@@ -423,6 +423,7 @@ async fn event_translator_handles_config_changed() {
                 remote_name: "origin".into(),
                 push_on_update: true,
             },
+            personality: api::PersonalitySettingsView::default(),
         },
     };
     let action = translate(event);

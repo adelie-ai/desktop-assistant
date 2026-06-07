@@ -507,6 +507,7 @@ mod tests {
                     remote_name: "origin".to_string(),
                     push_on_update: true,
                 },
+                personality: api::PersonalitySettingsView::default(),
             },
         });
         assert!(event.is_none());

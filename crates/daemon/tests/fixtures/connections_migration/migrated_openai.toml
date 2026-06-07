@@ -64,3 +64,12 @@ allowed_origins = []
 
 [tls]
 enabled = true
+
+[personality]
+professionalism = "always"
+warmth = "often"
+directness = "often"
+enthusiasm = "sometimes"
+humor = "sometimes"
+sarcasm = "rarely"
+pretentiousness = "rarely"

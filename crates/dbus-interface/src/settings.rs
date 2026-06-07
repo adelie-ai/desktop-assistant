@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::inbound::SettingsService;
+use desktop_assistant_core::prompts::PersonalityLevel;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
 
@@ -27,6 +28,17 @@ pub struct ConfigData {
     pub llm_top_p: f64,
     pub llm_max_tokens: u32,
     pub llm_hosted_tool_search: i32,
+    // Personality (#226). Each trait is an integer 0..=4 (Never=0, Rarely=1,
+    // Sometimes=2, Often=3, Always=4) so the KCM can bind a 0..=4 slider
+    // directly. See `PersonalityLevel::as_ordinal` / `from_ordinal` for the
+    // canonical mapping.
+    pub personality_professionalism: u32,
+    pub personality_warmth: u32,
+    pub personality_directness: u32,
+    pub personality_enthusiasm: u32,
+    pub personality_humor: u32,
+    pub personality_sarcasm: u32,
+    pub personality_pretentiousness: u32,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
@@ -61,6 +73,23 @@ pub struct ConfigPatchArgs {
     pub llm_max_tokens: u32,
     pub set_llm_hosted_tool_search: bool,
     pub llm_hosted_tool_search: i32,
+    // Personality (#226). For each trait, set `set_personality_* = true` to
+    // apply the paired ordinal value (0..=4, Never..=Always). An out-of-range
+    // ordinal is rejected with an error rather than clamped.
+    pub set_personality_professionalism: bool,
+    pub personality_professionalism: u32,
+    pub set_personality_warmth: bool,
+    pub personality_warmth: u32,
+    pub set_personality_directness: bool,
+    pub personality_directness: u32,
+    pub set_personality_enthusiasm: bool,
+    pub personality_enthusiasm: u32,
+    pub set_personality_humor: bool,
+    pub personality_humor: u32,
+    pub set_personality_sarcasm: bool,
+    pub personality_sarcasm: u32,
+    pub set_personality_pretentiousness: bool,
+    pub personality_pretentiousness: u32,
 }
 
 #[derive(Debug, Default)]
@@ -80,6 +109,15 @@ struct ConfigPatch {
     llm_top_p: Option<f64>,
     llm_max_tokens: Option<u32>,
     llm_hosted_tool_search: Option<bool>,
+    // Personality (#226): each `Some(ordinal)` overrides that trait. The
+    // ordinal is validated against `PersonalityLevel::from_ordinal` when applied.
+    personality_professionalism: Option<u32>,
+    personality_warmth: Option<u32>,
+    personality_directness: Option<u32>,
+    personality_enthusiasm: Option<u32>,
+    personality_humor: Option<u32>,
+    personality_sarcasm: Option<u32>,
+    personality_pretentiousness: Option<u32>,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -126,6 +164,11 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             .get_persistence_settings()
             .await
             .map_err(to_fdo_error)?;
+        let personality = self
+            .service
+            .get_personality_settings()
+            .await
+            .map_err(to_fdo_error)?;
 
         Ok(ConfigData {
             llm_connector: llm.connector,
@@ -146,6 +189,14 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             llm_top_p: llm.top_p.unwrap_or(-1.0),
             llm_max_tokens: llm.max_tokens.unwrap_or(0),
             llm_hosted_tool_search: llm.hosted_tool_search.map(|v| v as i32).unwrap_or(-1),
+            // Expose each trait as its 0..=4 ordinal for the KCM (#226).
+            personality_professionalism: personality.professionalism.as_ordinal() as u32,
+            personality_warmth: personality.warmth.as_ordinal() as u32,
+            personality_directness: personality.directness.as_ordinal() as u32,
+            personality_enthusiasm: personality.enthusiasm.as_ordinal() as u32,
+            personality_humor: personality.humor.as_ordinal() as u32,
+            personality_sarcasm: personality.sarcasm.as_ordinal() as u32,
+            personality_pretentiousness: personality.pretentiousness.as_ordinal() as u32,
         })
     }
 
@@ -166,6 +217,13 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
             llm_top_p,
             llm_max_tokens,
             llm_hosted_tool_search,
+            personality_professionalism,
+            personality_warmth,
+            personality_directness,
+            personality_enthusiasm,
+            personality_humor,
+            personality_sarcasm,
+            personality_pretentiousness,
         } = patch;
 
         let llm_changed = llm_connector.is_some()
@@ -308,8 +366,54 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 .map_err(to_fdo_error)?;
         }
 
+        // Personality (#226): apply per-trait ordinal overrides. Each
+        // `Some(ordinal)` is validated and overlaid onto the current value;
+        // an out-of-range ordinal is a clean error rather than a silent clamp.
+        let personality_changed = personality_professionalism.is_some()
+            || personality_warmth.is_some()
+            || personality_directness.is_some()
+            || personality_enthusiasm.is_some()
+            || personality_humor.is_some()
+            || personality_sarcasm.is_some()
+            || personality_pretentiousness.is_some();
+        if personality_changed {
+            let mut p = self
+                .service
+                .get_personality_settings()
+                .await
+                .map_err(to_fdo_error)?;
+            apply_level(&mut p.professionalism, personality_professionalism)?;
+            apply_level(&mut p.warmth, personality_warmth)?;
+            apply_level(&mut p.directness, personality_directness)?;
+            apply_level(&mut p.enthusiasm, personality_enthusiasm)?;
+            apply_level(&mut p.humor, personality_humor)?;
+            apply_level(&mut p.sarcasm, personality_sarcasm)?;
+            apply_level(&mut p.pretentiousness, personality_pretentiousness)?;
+            self.service
+                .set_personality_settings(p)
+                .await
+                .map_err(to_fdo_error)?;
+        }
+
         self.get_config_tuple().await
     }
+}
+
+/// Overlay an optional 0..=4 ordinal onto a personality level, validating it.
+/// `None` leaves the level unchanged; out-of-range input is a clean error.
+fn apply_level(slot: &mut PersonalityLevel, ordinal: Option<u32>) -> fdo::Result<()> {
+    if let Some(n) = ordinal {
+        let level = u8::try_from(n)
+            .ok()
+            .and_then(PersonalityLevel::from_ordinal)
+            .ok_or_else(|| {
+                fdo::Error::InvalidArgs(format!(
+                    "personality level {n} out of range; expected 0..=4 (Never..=Always)"
+                ))
+            })?;
+        *slot = level;
+    }
+    Ok(())
 }
 
 #[interface(name = "org.desktopAssistant.Settings")]
@@ -627,6 +731,20 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 llm_max_tokens,
                 set_llm_hosted_tool_search,
                 llm_hosted_tool_search,
+                set_personality_professionalism,
+                personality_professionalism,
+                set_personality_warmth,
+                personality_warmth,
+                set_personality_directness,
+                personality_directness,
+                set_personality_enthusiasm,
+                personality_enthusiasm,
+                set_personality_humor,
+                personality_humor,
+                set_personality_sarcasm,
+                personality_sarcasm,
+                set_personality_pretentiousness,
+                personality_pretentiousness,
             } = changes;
 
             self.apply_config_patch(ConfigPatch {
@@ -649,6 +767,17 @@ impl<S: SettingsService + 'static> DbusSettingsAdapter<S> {
                 llm_max_tokens: set_llm_max_tokens.then_some(llm_max_tokens),
                 llm_hosted_tool_search: set_llm_hosted_tool_search
                     .then_some(llm_hosted_tool_search == 1),
+                personality_professionalism: set_personality_professionalism
+                    .then_some(personality_professionalism),
+                personality_warmth: set_personality_warmth.then_some(personality_warmth),
+                personality_directness: set_personality_directness
+                    .then_some(personality_directness),
+                personality_enthusiasm: set_personality_enthusiasm
+                    .then_some(personality_enthusiasm),
+                personality_humor: set_personality_humor.then_some(personality_humor),
+                personality_sarcasm: set_personality_sarcasm.then_some(personality_sarcasm),
+                personality_pretentiousness: set_personality_pretentiousness
+                    .then_some(personality_pretentiousness),
             })
             .await
         })
@@ -899,8 +1028,8 @@ mod tests {
     use desktop_assistant_core::CoreError;
     use desktop_assistant_core::ports::inbound::{
         BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
-        EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView, SettingsService,
-        WsAuthSettingsView,
+        EmbeddingsSettingsView, LlmSettingsView, PersistenceSettingsView, PersonalitySettingsView,
+        SettingsService, WsAuthSettingsView,
     };
     use std::sync::Mutex;
 
@@ -909,6 +1038,7 @@ mod tests {
         llm: LlmSettingsView,
         embeddings: EmbeddingsSettingsView,
         persistence: PersistenceSettingsView,
+        personality: PersonalitySettingsView,
         database: DatabaseSettingsView,
         backend_tasks: BackendTasksSettingsView,
         api_key_set: bool,
@@ -946,6 +1076,7 @@ mod tests {
                         remote_name: "origin".to_string(),
                         push_on_update: true,
                     },
+                    personality: PersonalitySettingsView::default(),
                     database: DatabaseSettingsView {
                         url: String::new(),
                         max_connections: 5,
@@ -1074,6 +1205,18 @@ mod tests {
                 state.persistence.remote_name = remote_name;
             }
             state.persistence.push_on_update = push_on_update;
+            Ok(())
+        }
+
+        async fn get_personality_settings(&self) -> Result<PersonalitySettingsView, CoreError> {
+            Ok(self.state.lock().unwrap().personality)
+        }
+
+        async fn set_personality_settings(
+            &self,
+            personality: PersonalitySettingsView,
+        ) -> Result<(), CoreError> {
+            self.state.lock().unwrap().personality = personality;
             Ok(())
         }
 
@@ -1233,6 +1376,48 @@ mod tests {
 
         let token = adapter.generate_ws_jwt("tui").await.unwrap();
         assert_eq!(token, "jwt-for-tui");
+    }
+
+    // --- Personality int<->level contract (#226) ---------------------------
+
+    #[tokio::test]
+    async fn get_config_exposes_personality_as_ordinals() {
+        // The KCM binds sliders to integers 0..=4 (Never=0 .. Always=4).
+        // `GetConfig` must surface the default Expressive-7 levels as those
+        // ordinals.
+        let service = Arc::new(StatefulSettingsService::new());
+        let adapter = DbusSettingsAdapter::new(service);
+        let config = adapter.get_config_tuple().await.unwrap();
+
+        assert_eq!(config.personality_professionalism, 4); // Always
+        assert_eq!(config.personality_warmth, 3); // Often
+        assert_eq!(config.personality_directness, 3); // Often
+        assert_eq!(config.personality_enthusiasm, 2); // Sometimes
+        assert_eq!(config.personality_humor, 2); // Sometimes
+        assert_eq!(config.personality_sarcasm, 1); // Rarely
+        assert_eq!(config.personality_pretentiousness, 1); // Rarely
+    }
+
+    #[tokio::test]
+    async fn set_config_personality_ordinal_round_trips() {
+        // Setting Humor=Never (0) via the patch must be reflected back as an
+        // ordinal in the returned `ConfigData`.
+        let service = Arc::new(StatefulSettingsService::new());
+        let adapter = DbusSettingsAdapter::new(Arc::clone(&service));
+
+        let updated = adapter
+            .apply_config_patch(ConfigPatch {
+                personality_humor: Some(0),   // Never
+                personality_sarcasm: Some(4), // Always
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(updated.personality_humor, 0);
+        assert_eq!(updated.personality_sarcasm, 4);
+        // Untouched traits keep their defaults.
+        assert_eq!(updated.personality_professionalism, 4);
     }
 
     /// Issue #156: settings methods that touch per-user storage must

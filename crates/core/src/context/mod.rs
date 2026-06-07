@@ -352,6 +352,23 @@ fn build_demoted_tool_note(
 fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> String {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
     let mut sections = prompts::static_sections();
+
+    // Personality disposition (#226): read the active personality the same way
+    // the per-turn refinement is read (a task-local installed by the daemon
+    // dispatch wrapper). Injected *before* the tool note and the per-turn
+    // refinement so the standing disposition is established up front while a
+    // one-turn refinement can still adjust tone last. Always rendered — the
+    // blurb at minimum carries the adaptation clause — so every turn carries a
+    // personality, with the default disposition for callers that install no
+    // scope.
+    let personality_blurb = crate::ports::llm::current_personality().render_blurb();
+    if !personality_blurb.trim().is_empty() {
+        sections.push(PromptSection::new(
+            PromptSectionKind::Personality,
+            personality_blurb,
+        ));
+    }
+
     sections.push(PromptSection::new(
         PromptSectionKind::ToolAvailability,
         tool_note,
@@ -845,6 +862,49 @@ mod tests {
         assert!(
             refined.contains("TOOLNOTE"),
             "tool note must still be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_system_instruction_injects_personality_before_tools_and_refinement() {
+        use crate::ports::llm::with_personality;
+        use crate::prompts::{Personality, PersonalityLevel};
+
+        // A personality with a recognizable trait so we can locate the
+        // injected section in the assembled output.
+        let personality = Personality {
+            sarcasm: PersonalityLevel::Always,
+            ..Personality::default()
+        };
+        let assembled = with_personality(personality, async {
+            assemble_system_instruction("TOOLNOTE".to_string(), "REFINEMENT")
+        })
+        .await;
+
+        // The personality blurb is present.
+        let blurb = personality.render_blurb();
+        assert!(
+            assembled.contains(&blurb),
+            "assembled prompt must contain the personality blurb:\n{assembled}"
+        );
+        // Ordering: personality blurb appears before the tool note, which
+        // appears before the per-turn refinement.
+        let p_idx = assembled.find(&blurb).unwrap();
+        let t_idx = assembled.find("TOOLNOTE").unwrap();
+        let r_idx = assembled.find("REFINEMENT").unwrap();
+        assert!(p_idx < t_idx, "personality must precede the tool note");
+        assert!(t_idx < r_idx, "tool note must precede the refinement");
+    }
+
+    #[tokio::test]
+    async fn assemble_system_instruction_default_personality_present_without_scope() {
+        // No `with_personality` scope installed → the default disposition is
+        // still injected (global personality applies to every turn).
+        let assembled = assemble_system_instruction("TOOLNOTE".to_string(), "");
+        let default_blurb = crate::prompts::Personality::default().render_blurb();
+        assert!(
+            assembled.contains(&default_blurb),
+            "default personality must be injected even without a scope:\n{assembled}"
         );
     }
 

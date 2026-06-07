@@ -38,8 +38,9 @@ use desktop_assistant_core::ports::inbound::{
 };
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
-    with_model_override, with_reasoning_config, with_system_refinement,
+    with_model_override, with_personality, with_reasoning_config, with_system_refinement,
 };
+use desktop_assistant_core::prompts::Personality;
 
 use crate::config::{
     DaemonConfig, default_daemon_config_path, load_daemon_config, save_daemon_config,
@@ -180,6 +181,29 @@ impl RegistryHandle {
             .expect("registry state poisoned")
             .config
             .clone()
+    }
+
+    /// The active assistant personality (issue #226). Read from the in-memory
+    /// config, which `mutate_config` (and `set_personality`) keep current, so
+    /// the dispatch wrapper and the settings GET observe the same value and a
+    /// `SetConfig` takes effect on the next turn without a separate reload.
+    pub fn personality(&self) -> Personality {
+        self.state
+            .read()
+            .expect("registry state poisoned")
+            .config
+            .personality
+    }
+
+    /// Update the active assistant personality. Persists to the config file and
+    /// refreshes the in-memory config (via `mutate_config`) so the next send's
+    /// task-local reflects the change. Cheap — the registry rebuild it triggers
+    /// only re-reads connection config, which is unchanged here.
+    pub fn set_personality(&self, personality: Personality) -> Result<(), CoreError> {
+        self.mutate_config(|cfg| {
+            cfg.personality = personality;
+            Ok(())
+        })
     }
 
     /// Test-only: swap the in-memory `DaemonConfig` and rebuild the
@@ -1008,6 +1032,14 @@ where
             // string = no refinement (unchanged prompt). It is request-scoped
             // and never persisted; see `SYSTEM_REFINEMENT`.
             let dispatch = with_system_refinement(system_refinement, dispatch);
+            // Install the active personality (#226). Phase 1 resolves it from
+            // the global config on every send; the in-memory config is the
+            // single source of truth a `SetConfig` updates, so a personality
+            // change takes effect on the next turn. The Phase-2 seam is here:
+            // future per-conversation resolution swaps *which* personality this
+            // line installs (e.g. `self.resolve_personality(conversation_id)`),
+            // leaving the core read side unchanged.
+            let dispatch = with_personality(self.registry.personality(), dispatch);
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch = with_context_budget(budget, dispatch);
             let dispatch =

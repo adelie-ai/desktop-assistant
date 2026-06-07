@@ -1702,8 +1702,13 @@ async fn main() -> Result<()> {
         &registry_handle,
     )));
 
-    let settings_service =
-        Arc::new(DaemonSettingsService::new(config_path.clone()).with_mcp_control(mcp_handle));
+    let settings_service = Arc::new(
+        DaemonSettingsService::new(config_path.clone())
+            .with_mcp_control(mcp_handle)
+            // Personality (#226) reads/writes through the shared registry handle
+            // so settings changes hit the in-memory config the dispatch reads.
+            .with_registry(Arc::clone(&registry_handle)),
+    );
 
     // Knowledge management service (#73). When a Postgres pool is
     // configured, wire the embedding closure so client-authored entries

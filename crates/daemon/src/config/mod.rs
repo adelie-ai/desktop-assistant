@@ -123,7 +123,26 @@ pub struct DaemonConfig {
     pub ws_auth: WsAuthConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Configurable assistant disposition (issue #226, Phase 1: global). The
+    /// resolved value is installed as a task-local on every send and rendered
+    /// into a system-prompt blurb. Defaults to the Expressive-7 table when the
+    /// `[personality]` section is absent. Reuses the core [`Personality`] type
+    /// directly (re-exported below) so config, the api-model view, and the
+    /// D-Bus surface share one schema.
+    #[serde(default)]
+    pub personality: Personality,
 }
+
+// Reuse the canonical core type rather than duplicating the trait set in the
+// daemon. `Personality` derives `Serialize`/`Deserialize` with a lowercase
+// representation, so it slots straight into the TOML `[personality]` section.
+pub use desktop_assistant_core::prompts::Personality;
+// `PersonalityLevel` is re-exported at `config::` for callers that spell the
+// level out (and the in-file tests); only test code references it directly, so
+// the non-test build sees it as unused — same pattern as the other `config::`
+// re-exports above (e.g. `DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS`).
+#[allow(unused_imports)]
+pub use desktop_assistant_core::prompts::PersonalityLevel;
 
 impl DaemonConfig {
     /// Validate the raw `connections` map and return a [`ConnectionsMap`].
@@ -2454,5 +2473,42 @@ max_context_tokens = 1000000
         );
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(parsed.purposes, reparsed.purposes);
+    }
+
+    // --- [personality] section (#226) --------------------------------------
+
+    #[test]
+    fn personality_defaults_when_section_absent() {
+        // A config with no `[personality]` block still resolves the
+        // Expressive-7 defaults so every install has a disposition.
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(config.personality, Personality::default());
+        assert_eq!(config.personality.professionalism, PersonalityLevel::Always);
+        assert_eq!(config.personality.humor, PersonalityLevel::Sometimes);
+    }
+
+    #[test]
+    fn personality_section_parses_and_round_trips() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [personality]
+            professionalism = "always"
+            warmth = "often"
+            directness = "often"
+            enthusiasm = "sometimes"
+            humor = "never"
+            sarcasm = "rarely"
+            pretentiousness = "rarely"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.personality.humor, PersonalityLevel::Never);
+        assert_eq!(config.personality.warmth, PersonalityLevel::Often);
+
+        // Serialize → reparse is lossless.
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config.personality, reparsed.personality);
     }
 }

@@ -139,6 +139,30 @@ tokio::task_local! {
     /// cross); the task-local is installed only at the final dispatch hop,
     /// inside the spawned body.
     static SYSTEM_REFINEMENT: String;
+
+    /// The active assistant personality for this turn (issue #226, Phase 1:
+    /// global). Installed by the daemon's dispatch wrapper via
+    /// [`with_personality`] from the resolved global config, and read by the
+    /// context assembler via [`current_personality`] when it builds the system
+    /// message. The rendered disposition blurb is injected as a system-prompt
+    /// section before the tool note and the per-turn system refinement.
+    ///
+    /// Unlike [`SYSTEM_REFINEMENT`] this is *configuration*, not per-request
+    /// client input: it carries the standing personality the user configured,
+    /// not a one-turn instruction. It still rides a task-local for the same
+    /// reason the others do — it threads to the assembler without changing the
+    /// `LlmClient` trait or the `send_prompt` signature.
+    ///
+    /// Phase 1 resolves it from the global config on every send. Phase 2 will
+    /// add per-conversation resolution; that future seam belongs at the install
+    /// site (the dispatch wrapper picks *which* personality to install), so the
+    /// read side here stays unchanged.
+    ///
+    /// Unset outside the dispatch path — which [`current_personality`] returns
+    /// as [`crate::prompts::Personality::default`], so tests, dreaming jobs, and
+    /// any caller that doesn't route through the dispatch wrapper still get the
+    /// default Expressive-7 disposition.
+    static PERSONALITY: crate::prompts::Personality;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -176,6 +200,25 @@ pub fn current_system_refinement() -> String {
     SYSTEM_REFINEMENT
         .try_with(|r| r.clone())
         .unwrap_or_default()
+}
+
+/// Run `fut` with `personality` installed as the active personality for this
+/// turn. The context assembler reads it via [`current_personality`] and injects
+/// the rendered disposition blurb into the system message. See [`PERSONALITY`].
+pub async fn with_personality<F, T>(personality: crate::prompts::Personality, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    PERSONALITY.scope(personality, fut).await
+}
+
+/// Current task-local personality, or [`crate::prompts::Personality::default`]
+/// when not set. The default means "the Expressive-7 disposition" — callers
+/// that don't route through the daemon dispatch wrapper (tests, dreaming jobs)
+/// still get the standard personality blurb. Safe to call from any async
+/// context.
+pub fn current_personality() -> crate::prompts::Personality {
+    PERSONALITY.try_with(|p| *p).unwrap_or_default()
 }
 
 /// Run `fut` with `model` installed as the current turn's model override.
@@ -1342,6 +1385,48 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("429"));
+    }
+
+    // --- PERSONALITY tests (issue #226) ---
+
+    #[tokio::test]
+    async fn current_personality_is_default_outside_scope() {
+        // Callers that never install a scope (tests, dreaming jobs, any path
+        // not routed through the daemon dispatch wrapper) observe the default
+        // disposition rather than an empty one.
+        assert_eq!(
+            current_personality(),
+            crate::prompts::Personality::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn current_personality_observes_installed_scope() {
+        let custom = crate::prompts::Personality {
+            humor: crate::prompts::PersonalityLevel::Never,
+            ..crate::prompts::Personality::default()
+        };
+        let observed = with_personality(custom, async { current_personality() }).await;
+        assert_eq!(observed, custom);
+        // After the scope exits the task-local is unset again (back to default).
+        assert_eq!(
+            current_personality(),
+            crate::prompts::Personality::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_personality_shadows_outer() {
+        let outer = crate::prompts::Personality::default();
+        let inner = crate::prompts::Personality {
+            sarcasm: crate::prompts::PersonalityLevel::Always,
+            ..crate::prompts::Personality::default()
+        };
+        let observed = with_personality(outer, async {
+            with_personality(inner, async { current_personality() }).await
+        })
+        .await;
+        assert_eq!(observed, inner);
     }
 
     // --- MODEL_OVERRIDE tests (issue #34) ---
