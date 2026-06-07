@@ -417,6 +417,37 @@ pub trait AssistantCommands: Send + Sync {
         Ok(())
     }
 
+    // --- Per-conversation personality override (issue #227) ----------------
+
+    /// Set (or clear) a conversation's personality override (#227, Phase 2).
+    ///
+    /// `personality` is a *partial* [`api::ConversationPersonalityView`] (a
+    /// [`api::PersonalityOverride`]): each `Some` trait pins that trait for the
+    /// conversation, each `None` falls back to the global config on every send.
+    /// An empty/all-`None` override clears it (back to global-only). Returns the
+    /// stored override after the write (cleared → empty). The current value is
+    /// also surfaced on [`ConversationDetail::conversation_personality`] from
+    /// `get_conversation`, which a picker pre-fills from. Used by the tui/gtk
+    /// personality pickers.
+    async fn set_conversation_personality(
+        &self,
+        conversation_id: &str,
+        personality: api::ConversationPersonalityView,
+    ) -> Result<api::ConversationPersonalityView> {
+        let result = self
+            .send_command(api::Command::SetConversationPersonality {
+                conversation_id: conversation_id.to_string(),
+                personality,
+            })
+            .await?;
+        let api::CommandResult::ConversationPersonality(stored) = result else {
+            return Err(anyhow!(
+                "unexpected response for set_conversation_personality"
+            ));
+        };
+        Ok(stored)
+    }
+
     // --- Client-side tool execution (issue #107 / #231) -------------------
 
     /// Advertise the set of client-local MCP tools this connection can run
@@ -783,6 +814,38 @@ mod tests {
                 assert!(!all);
             }
             other => panic!("expected DeleteScratchpadNotes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_conversation_personality_emits_command_and_returns_stored() {
+        // The picker-facing client method must emit the
+        // `SetConversationPersonality` command with the partial override and
+        // unwrap the stored value from `ConversationPersonality`.
+        let stored = api::ConversationPersonalityView {
+            humor: Some(api::PersonalityLevel::Never),
+            ..api::ConversationPersonalityView::default()
+        };
+        let client = RecordingClient::new(api::CommandResult::ConversationPersonality(stored));
+        let sent = api::ConversationPersonalityView {
+            humor: Some(api::PersonalityLevel::Never),
+            directness: Some(api::PersonalityLevel::Always),
+            ..api::ConversationPersonalityView::default()
+        };
+        let got = client
+            .set_conversation_personality("conv-1", sent)
+            .await
+            .unwrap();
+        assert_eq!(got, stored);
+        match client.last() {
+            api::Command::SetConversationPersonality {
+                conversation_id,
+                personality,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(personality, sent);
+            }
+            other => panic!("expected SetConversationPersonality, got {other:?}"),
         }
     }
 

@@ -5,6 +5,7 @@ use desktop_assistant_core::domain::{
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::inbound::ConversationModelSelection;
 use desktop_assistant_core::ports::store::ConversationStore;
+use desktop_assistant_core::prompts::PersonalityOverride;
 use sqlx::PgPool;
 
 pub struct PgConversationStore {
@@ -81,6 +82,71 @@ impl PgConversationStore {
             CoreError::Storage(format!("last_model_selection JSON in DB is malformed: {e}"))
         })?;
         Ok(Some(sel))
+    }
+
+    /// Set (or clear) the stored personality override for a conversation (#227).
+    ///
+    /// Passing `None` (or an empty/all-`None` override — handled by the caller)
+    /// clears the column (NULL). Mirrors
+    /// [`Self::set_conversation_model_selection`]: JSONB column, user-scoped,
+    /// `ConversationNotFound` on a missing/cross-user row (#105: don't leak
+    /// existence).
+    pub async fn set_conversation_personality(
+        &self,
+        conversation_id: &ConversationId,
+        personality: Option<&PersonalityOverride>,
+    ) -> Result<(), CoreError> {
+        let user_id = current_user_id();
+        let json = match personality {
+            Some(p) => Some(
+                serde_json::to_value(p)
+                    .map_err(|e| CoreError::Storage(format!("personality json: {e}")))?,
+            ),
+            None => None,
+        };
+        let result = sqlx::query(
+            "UPDATE conversations SET personality_override = $3 \
+             WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&conversation_id.0)
+        .bind(json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(CoreError::ConversationNotFound(conversation_id.0.clone()));
+        }
+        Ok(())
+    }
+
+    /// Read the stored personality override for a conversation (#227). Returns
+    /// `None` when the conversation exists but has no stored override; returns
+    /// `ConversationNotFound` when the id is unknown OR belongs to a different
+    /// user. Mirrors [`Self::get_conversation_model_selection`].
+    pub async fn get_conversation_personality(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Option<PersonalityOverride>, CoreError> {
+        let user_id = current_user_id();
+        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+            "SELECT personality_override FROM conversations \
+             WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&conversation_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        let row = row.ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
+        let Some(json) = row.0 else {
+            return Ok(None);
+        };
+        let ovr: PersonalityOverride = serde_json::from_value(json).map_err(|e| {
+            CoreError::Storage(format!("personality_override JSON in DB is malformed: {e}"))
+        })?;
+        Ok(Some(ovr))
     }
 }
 

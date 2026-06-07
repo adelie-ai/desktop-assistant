@@ -187,5 +187,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // #227: per-conversation personality override (JSONB column on
+    // conversations), mirroring 011's last_model_selection.
+    sqlx::raw_sql(include_str!(
+        "../migrations/024_conversation_personality.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

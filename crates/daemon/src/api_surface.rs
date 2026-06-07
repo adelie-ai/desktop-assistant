@@ -40,7 +40,7 @@ use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
     with_model_override, with_personality, with_reasoning_config, with_system_refinement,
 };
-use desktop_assistant_core::prompts::Personality;
+use desktop_assistant_core::prompts::{Personality, PersonalityOverride};
 
 use crate::config::{
     DaemonConfig, default_daemon_config_path, load_daemon_config, save_daemon_config,
@@ -576,6 +576,21 @@ pub trait ConversationSelectionStore: Send + Sync {
         id: &ConversationId,
         selection: Option<&ConversationModelSelection>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// Read the conversation's stored personality override (#227), or `None`
+    /// when no override is pinned. Mirrors [`Self::get_selection`].
+    fn get_personality(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<Option<PersonalityOverride>, CoreError>> + Send;
+
+    /// Set (or clear, with `None`) the conversation's personality override
+    /// (#227). Mirrors [`Self::set_selection`].
+    fn set_personality(
+        &self,
+        id: &ConversationId,
+        personality: Option<&PersonalityOverride>,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
 pub struct RoutingConversationHandler<S, Inner>
@@ -621,6 +636,30 @@ where
                 effort: p.effort,
             })
         })
+    }
+
+    /// Resolve the effective personality for a send (#227, Phase 2):
+    /// conversation override (partial) → global config → built-in default.
+    ///
+    /// The global config already folds in the built-in default (an absent
+    /// `[personality]` block resolves to `Personality::default()`), so the
+    /// merge is just "per-trait override over the global". When the
+    /// conversation has no stored override the global personality is returned
+    /// unchanged — identical to Phase-1 behaviour. A failed lookup logs and
+    /// falls back to the global so a storage hiccup never blocks a turn.
+    async fn resolve_personality(&self, conversation_id: &ConversationId) -> Personality {
+        let global = self.registry.personality();
+        match self.selection_store.get_personality(conversation_id).await {
+            Ok(Some(ovr)) => ovr.resolve(&global),
+            Ok(None) => global,
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id = %conversation_id.0,
+                    "failed to read conversation personality override; using global: {e}"
+                );
+                global
+            }
+        }
     }
 
     /// Check a stored selection against the live registry. Returns
@@ -767,6 +806,30 @@ where
         id: &ConversationId,
     ) -> Result<Option<ConversationModelSelection>, CoreError> {
         self.selection_store.get_selection(id).await
+    }
+
+    async fn get_conversation_personality(
+        &self,
+        id: &ConversationId,
+    ) -> Result<Option<PersonalityOverride>, CoreError> {
+        self.selection_store.get_personality(id).await
+    }
+
+    async fn set_conversation_personality(
+        &self,
+        id: &ConversationId,
+        personality: PersonalityOverride,
+    ) -> Result<(), CoreError> {
+        // An empty (all-`None`) override means "no override" — clear the column
+        // (store `None`) so a later `GetConversation` reports no override and
+        // the send path falls back to global-only, rather than persisting an
+        // empty object that resolves to the global anyway.
+        let to_store = if personality.is_empty() {
+            None
+        } else {
+            Some(&personality)
+        };
+        self.selection_store.set_personality(id, to_store).await
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> Result<(), CoreError> {
@@ -1019,6 +1082,12 @@ where
         //   - `current_cancellation_token()` (issue #109) surfaces the
         //     per-turn cancellation token so the agentic loop and each
         //     LLM adapter can `tokio::select!` against it.
+        // Resolve the effective personality for this send (#227, Phase 2):
+        // conversation override (partial) → global config → built-in default.
+        // Computed before the dispatch block so the lookup's `&self` borrow
+        // doesn't outlive the `'static` dispatch future.
+        let effective_personality = self.resolve_personality(conversation_id).await;
+
         let inner = Arc::clone(&self.inner);
         let conv_id = conversation_id.clone();
         let response = {
@@ -1032,14 +1101,12 @@ where
             // string = no refinement (unchanged prompt). It is request-scoped
             // and never persisted; see `SYSTEM_REFINEMENT`.
             let dispatch = with_system_refinement(system_refinement, dispatch);
-            // Install the active personality (#226). Phase 1 resolves it from
-            // the global config on every send; the in-memory config is the
-            // single source of truth a `SetConfig` updates, so a personality
-            // change takes effect on the next turn. The Phase-2 seam is here:
-            // future per-conversation resolution swaps *which* personality this
-            // line installs (e.g. `self.resolve_personality(conversation_id)`),
-            // leaving the core read side unchanged.
-            let dispatch = with_personality(self.registry.personality(), dispatch);
+            // Install the active personality (#226/#227). The effective value is
+            // resolved above as: conversation override (partial) → global config
+            // → built-in default. With no stored override this equals the global
+            // personality, identical to Phase-1 behaviour; the core read side
+            // (`current_personality`) is unchanged.
+            let dispatch = with_personality(effective_personality, dispatch);
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch = with_context_budget(budget, dispatch);
             let dispatch =
@@ -1220,6 +1287,7 @@ fn purposes_referencing(
 mod tests {
     use super::*;
     use crate::connections::{BedrockConnection, ConnectionConfig, OllamaConnection};
+    use desktop_assistant_core::prompts::PersonalityLevel;
 
     use std::sync::Mutex;
 
@@ -1228,12 +1296,14 @@ mod tests {
     /// storage crate.
     pub struct InMemoryConversationSelectionStore {
         inner: Mutex<std::collections::HashMap<String, ConversationModelSelection>>,
+        personality: Mutex<std::collections::HashMap<String, PersonalityOverride>>,
     }
 
     impl Default for InMemoryConversationSelectionStore {
         fn default() -> Self {
             Self {
                 inner: Mutex::new(std::collections::HashMap::new()),
+                personality: Mutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -1260,6 +1330,35 @@ mod tests {
             match selection {
                 Some(sel) => {
                     map.insert(id.0.clone(), sel.clone());
+                }
+                None => {
+                    map.remove(&id.0);
+                }
+            }
+            Ok(())
+        }
+
+        async fn get_personality(
+            &self,
+            id: &ConversationId,
+        ) -> Result<Option<PersonalityOverride>, CoreError> {
+            Ok(self
+                .personality
+                .lock()
+                .expect("selection store poisoned")
+                .get(&id.0)
+                .copied())
+        }
+
+        async fn set_personality(
+            &self,
+            id: &ConversationId,
+            personality: Option<&PersonalityOverride>,
+        ) -> Result<(), CoreError> {
+            let mut map = self.personality.lock().expect("selection store poisoned");
+            match personality {
+                Some(p) => {
+                    map.insert(id.0.clone(), *p);
                 }
                 None => {
                     map.remove(&id.0);
@@ -1781,6 +1880,11 @@ api_key_env = "{unused}"
             /// `send_prompt`. `None` means no override was installed —
             /// connectors will fall back to their baked-in `self.model`.
             captured_model_override: StdMutex<Vec<Option<String>>>,
+            /// Snapshot of the `PERSONALITY` task-local (#227) at each
+            /// `send_prompt`. Asserting on this proves the routing wrapper
+            /// resolved the conversation override against the global config and
+            /// installed the effective personality on the dispatch scope.
+            captured_personality: StdMutex<Vec<Personality>>,
         }
 
         impl CapturingInner {
@@ -1789,6 +1893,7 @@ api_key_env = "{unused}"
                     captured_reasoning: StdMutex::new(Vec::new()),
                     captured_active_client_set: StdMutex::new(Vec::new()),
                     captured_model_override: StdMutex::new(Vec::new()),
+                    captured_personality: StdMutex::new(Vec::new()),
                 }
             }
         }
@@ -1848,6 +1953,8 @@ api_key_env = "{unused}"
                 self.captured_active_client_set.lock().unwrap().push(active);
                 let model = desktop_assistant_core::ports::llm::current_model_override();
                 self.captured_model_override.lock().unwrap().push(model);
+                let personality = desktop_assistant_core::ports::llm::current_personality();
+                self.captured_personality.lock().unwrap().push(personality);
                 Ok("ok".to_string())
             }
         }
@@ -1896,6 +2003,112 @@ api_key_env = "{unused}"
                 Box::new(|_: String| -> bool { true }),
                 Box::new(|_: String| {}),
             )
+        }
+
+        // ─── Issue #227: per-conversation personality resolution at send ───
+
+        #[tokio::test]
+        async fn send_installs_global_personality_when_no_conversation_override() {
+            // With no stored override, the personality task-local the inner
+            // handler observes must equal the registry's global personality —
+            // identical to Phase-1 behaviour.
+            let (routing, inner, registry, _store) = make_handler();
+            let global = registry.personality();
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("plain send_prompt should succeed via interactive purpose");
+
+            let captured = inner.captured_personality.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                captured[0], global,
+                "no override → the global personality must be installed verbatim"
+            );
+        }
+
+        #[tokio::test]
+        async fn send_installs_resolved_override_over_global() {
+            // A stored partial override must be resolved against the global
+            // config (override wins per-trait, unspecified traits fall back)
+            // and the *resolved* personality installed on the dispatch scope.
+            let (routing, inner, registry, store) = make_handler();
+            let global = registry.personality();
+
+            // "No-nonsense" override: force humor off, directness max; leave the
+            // rest to fall back to the global.
+            let ovr = PersonalityOverride {
+                humor: Some(PersonalityLevel::Never),
+                directness: Some(PersonalityLevel::Always),
+                ..PersonalityOverride::default()
+            };
+            store
+                .set_personality(&ConversationId::from("c1"), Some(&ovr))
+                .await
+                .unwrap();
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("plain send_prompt should succeed via interactive purpose");
+
+            let captured = inner.captured_personality.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            let installed = captured[0];
+            // Pinned traits win.
+            assert_eq!(installed.humor, PersonalityLevel::Never);
+            assert_eq!(installed.directness, PersonalityLevel::Always);
+            // Unspecified traits fall back to the global.
+            assert_eq!(installed.professionalism, global.professionalism);
+            assert_eq!(installed.warmth, global.warmth);
+            assert_eq!(installed.sarcasm, global.sarcasm);
+            // Exactly the per-trait merge of the override over the global.
+            assert_eq!(installed, ovr.resolve(&global));
+        }
+
+        #[tokio::test]
+        async fn set_then_get_conversation_personality_round_trips_and_clears() {
+            // The routing wrapper's setter/getter persist through the store;
+            // an empty override clears it (getter reports None).
+            let (routing, _inner, _reg, _store) = make_handler();
+            let id = ConversationId::from("c1");
+
+            let ovr = PersonalityOverride {
+                sarcasm: Some(PersonalityLevel::Never),
+                ..PersonalityOverride::default()
+            };
+            routing
+                .set_conversation_personality(&id, ovr)
+                .await
+                .unwrap();
+            assert_eq!(
+                routing.get_conversation_personality(&id).await.unwrap(),
+                Some(ovr)
+            );
+
+            // Empty override clears the stored value.
+            routing
+                .set_conversation_personality(&id, PersonalityOverride::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                routing.get_conversation_personality(&id).await.unwrap(),
+                None,
+                "an all-None override must clear the stored override"
+            );
         }
 
         #[tokio::test]

@@ -147,6 +147,34 @@ pub trait ConversationService: Send + Sync {
         Ok(None)
     }
 
+    /// Read the conversation's stored personality override (#227, Phase 2), if
+    /// one has been pinned by `SetConversationPersonality`. Returns `Ok(None)`
+    /// when the conversation has no override (the daemon falls back to the
+    /// global personality on the next send).
+    ///
+    /// Default returns `Ok(None)`; the daemon's routing wrapper overrides this
+    /// to consult the persistent store, mirroring
+    /// [`Self::get_conversation_model_selection`].
+    async fn get_conversation_personality(
+        &self,
+        id: &ConversationId,
+    ) -> Result<Option<crate::prompts::PersonalityOverride>, CoreError> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Set (or clear) the conversation's personality override (#227). Passing an
+    /// empty/all-`None` override clears it (back to global-only). Default is a
+    /// no-op; the routing wrapper overrides it to persist through the store.
+    async fn set_conversation_personality(
+        &self,
+        id: &ConversationId,
+        personality: crate::prompts::PersonalityOverride,
+    ) -> Result<(), CoreError> {
+        let _ = (id, personality);
+        Ok(())
+    }
+
     async fn delete_conversation(&self, id: &ConversationId) -> Result<(), CoreError>;
 
     async fn rename_conversation(
