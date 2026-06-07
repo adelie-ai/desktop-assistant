@@ -190,7 +190,7 @@ pub(crate) fn overflow_truncation_notice(
 // outer wrapper threads the same set plus the budget pair. Bundling them
 // just to satisfy the lint would obscure the code at every call site.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn llm_messages_for_turn(
+pub(crate) fn llm_messages_for_turn_with_plan(
     conversation_messages: &[Message],
     summaries: &[MessageSummary],
     tool_defs: &[ToolDefinition],
@@ -198,6 +198,7 @@ pub(crate) fn llm_messages_for_turn(
     context_summary: &str,
     max_messages: usize,
     active_task: Option<&str>,
+    plan: Option<&str>,
     tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
@@ -213,6 +214,7 @@ pub(crate) fn llm_messages_for_turn(
         context_summary,
         current_max,
         active_task,
+        plan,
         tool_rounds_since_anchor,
         system_refinement,
         budget,
@@ -260,6 +262,7 @@ pub(crate) fn llm_messages_for_turn(
             context_summary,
             current_max,
             active_task,
+            plan,
             tool_rounds_since_anchor,
             system_refinement,
             Some(budget),
@@ -425,6 +428,43 @@ fn render_locality_list(entries: &[ToolLocalityEntry], co_located: bool) -> Stri
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Back-compat shim for [`llm_messages_for_turn_with_plan`] with no surfaced
+/// plan. The existing test suite exercises assembly through this plan-less
+/// form; production (the dispatch loop) calls the plan-aware entry directly
+/// (#240), so the shim is only compiled for tests.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn llm_messages_for_turn(
+    conversation_messages: &[Message],
+    summaries: &[MessageSummary],
+    tool_defs: &[ToolDefinition],
+    deferred_namespaces: &[ToolNamespace],
+    context_summary: &str,
+    max_messages: usize,
+    active_task: Option<&str>,
+    tool_rounds_since_anchor: u32,
+    system_refinement: &str,
+    budget: Option<ContextBudget>,
+    locality: Option<&ToolLocalityContext>,
+    estimate: &dyn Fn(&str) -> u64,
+) -> Vec<Message> {
+    llm_messages_for_turn_with_plan(
+        conversation_messages,
+        summaries,
+        tool_defs,
+        deferred_namespaces,
+        context_summary,
+        max_messages,
+        active_task,
+        None,
+        tool_rounds_since_anchor,
+        system_refinement,
+        budget,
+        locality,
+        estimate,
+    )
 }
 
 /// Build the full tool-availability note enumerating every tool name and
@@ -593,6 +633,7 @@ fn assemble_messages_inner(
     context_summary: &str,
     max_messages: usize,
     active_task: Option<&str>,
+    plan: Option<&str>,
     tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
@@ -691,6 +732,15 @@ fn assemble_messages_inner(
         if !anchor_visible || many_tool_rounds {
             messages.push(Message::new(Role::System, format!("[Current task] {task}")));
         }
+    }
+
+    // Surface the open plan (#240) right after the task anchor. The dispatch
+    // loop renders the conversation's `todo` notes into a compact tree each
+    // round, so the plan stays in view (cheap) while the verbose raw work that
+    // produced it is evicted from the message log. Request-scoped — never
+    // persisted to `conv.messages`.
+    if let Some(plan) = plan.filter(|p| !p.is_empty()) {
+        messages.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
     }
 
     // Track which summaries have already been injected.

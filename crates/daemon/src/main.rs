@@ -1184,6 +1184,18 @@ async fn main() -> Result<()> {
         desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn,
     > = None;
 
+    // Writer + lister handed to the conversation handler for the step-planning +
+    // context-compaction tools (#240): the writer records plan todos / distilled
+    // outcomes (the same emit-wrapped closure, so changes reach clients via
+    // ScratchpadChanged), the lister surfaces the open plan each round. Populated
+    // alongside the builtin-tool wiring below; None without a Postgres pool.
+    let mut scratchpad_write_fn: Option<
+        desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn,
+    > = None;
+    let mut scratchpad_list_fn: Option<
+        desktop_assistant_core::ports::scratchpad::ScratchpadListFn,
+    > = None;
+
     // Per-conversation scratchpad command closures (#190) for the API handler,
     // populated alongside the builtin-tool wiring below. The same emit-wrapped
     // closures the builtin tools get, so a mutation via either path notifies.
@@ -1302,6 +1314,12 @@ async fn main() -> Result<()> {
             Arc::clone(&delete_many_fn),
             Arc::clone(&clear_fn),
         );
+
+        // Capture the same event-emitting write + list closures for the
+        // conversation handler's planning/compaction tools (#240) before they
+        // are moved into the API-handler tuple below.
+        scratchpad_write_fn = Some(Arc::clone(&write_fn));
+        scratchpad_list_fn = Some(Arc::clone(&list_fn));
 
         // Hand the same (emit-wrapped) closures to the API handler so clients
         // can read/write/delete the scratchpad over the command channel (#190).
@@ -1766,6 +1784,16 @@ async fn main() -> Result<()> {
     // (#184). No-op when no Postgres pool is available.
     if let Some(goal_fn) = scratchpad_goal_fn {
         handler = handler.with_scratchpad_goal(goal_fn);
+    }
+
+    // Enable step-planning + context compaction (#240): the writer records plan
+    // todos and distilled step outcomes (emitting ScratchpadChanged); the lister
+    // surfaces the open plan each round. No-op without a Postgres pool.
+    if let Some(write_fn) = scratchpad_write_fn {
+        handler = handler.with_scratchpad_write(write_fn);
+    }
+    if let Some(list_fn) = scratchpad_list_fn {
+        handler = handler.with_scratchpad_list(list_fn);
     }
 
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters

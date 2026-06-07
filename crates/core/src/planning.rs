@@ -1,0 +1,668 @@
+//! Step-scoped planning and context compaction for long agentic turns (#240).
+//!
+//! The model works a non-trivial request the way a person with a scratchpad
+//! and pen would: break it into ordered steps, work each one, and — when a
+//! step turns out to need its own sub-plan — open nested sub-steps. As each
+//! step finishes, the *gist* of what was learned is jotted to the scratchpad
+//! and the verbose raw work (tool results) is **dropped from working
+//! context**, replaced by a short searchable pointer to the note. The plan
+//! itself stays cheaply in view; the firehose does not.
+//!
+//! This module is the pure mechanism behind that behaviour:
+//!
+//! - [`StepStack`] — a per-turn stack of [`StepFrame`]s. `begin` pushes a
+//!   frame and auto-assigns a dotted path from stack depth + a per-frame child
+//!   counter (step 1 → 1.1, 1.2, …; 1.2 → 1.2.1 … 1.2.6). `complete` pops it.
+//! - [`evict_tool_results`] — replaces the content of sizeable `Role::Tool`
+//!   messages in a scope with a pointer to the scratchpad note that distilled
+//!   them, **preserving role + `tool_call_id`** so provider ToolUse↔ToolResult
+//!   pairing stays valid (Bedrock/Ollama). Idempotent and structure-preserving.
+//! - [`render_plan`] — renders the open todos as a compact indented tree for
+//!   per-round surfacing.
+//! - [`begin_step_tool`] / [`complete_step_tool`] — the tool definitions the
+//!   dispatch loop advertises and intercepts (they are core-loop tools, not
+//!   MCP/builtin-executor tools, because only the loop owns `conv.messages`).
+//!
+//! The async orchestration (writing the todo/outcome notes through the wired
+//! scratchpad closures, then mutating `conv.messages`) lives in the service
+//! dispatch loop; everything here is synchronous and unit-tested in isolation.
+
+use crate::domain::{Message, Role, ToolDefinition};
+
+/// Tool the model calls to begin a (possibly nested) step. Advertised in the
+/// per-turn tool set and intercepted by name in the dispatch loop.
+pub const BEGIN_STEP_TOOL: &str = "begin_step";
+
+/// Tool the model calls to complete the current step — distil + evict.
+pub const COMPLETE_STEP_TOOL: &str = "complete_step";
+
+/// `note_type` used for plan steps so they sort/filter as ordered todos
+/// (matching the existing scratchpad `todo`/`sequence`/`done` convention).
+pub const STEP_NOTE_TYPE: &str = "todo";
+
+/// `note_type` used for the distilled carry-forward outcome of a step.
+pub const OUTCOME_NOTE_TYPE: &str = "note";
+
+/// Key prefix under which a step's distilled outcome note is stored
+/// (`outcome:<step-key>`). The plan renderer uses it to attach a step's finding
+/// to its todo and to decide when a finding has been rolled up.
+pub(crate) const OUTCOME_KEY_PREFIX: &str = "outcome:";
+
+/// Only `Role::Tool` results at least this many bytes are worth evicting —
+/// below it the pointer can be larger than the payload, so the savings are
+/// negligible. This threshold also conveniently skips the tiny JSON acks of
+/// the step-control tools themselves.
+pub(crate) const COMPACTION_MIN_EVICT_BYTES: usize = 512;
+
+/// Recognisable opening of an eviction pointer. Used to skip results that are
+/// already compacted, so a parent `complete_step` whose scope contains
+/// already-compacted child results does not re-stamp them.
+pub(crate) const COMPACTION_POINTER_PREFIX: &str = "<compacted to scratchpad";
+
+/// Maximum plan todos rendered into the per-round `[Plan]` surface. Keeps the
+/// re-sent-every-round plan cheap; deeper plans show a "… and N more" tail.
+pub(crate) const MAX_PLAN_ITEMS: usize = 40;
+
+/// One frame of an in-progress plan: a step and the working scope opened when
+/// it began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StepFrame {
+    /// Dotted step path, e.g. `"1"`, `"1.2"`, `"1.2.3"`.
+    pub key: String,
+    /// The step's objective — becomes the `todo` note's content.
+    pub goal: String,
+    /// `conv.messages.len()` captured when this step began. `complete_step`
+    /// evicts `Role::Tool` results from here to the current end of the log.
+    pub watermark: usize,
+    /// Child steps minted under this frame so far (drives `.1`, `.2`, …).
+    pub child_counter: u32,
+    /// Ordering hint for the todo note (the leaf number of `key`).
+    pub sequence: i32,
+}
+
+/// A per-turn stack of plan steps. Auto-numbers dotted paths from structure,
+/// so the model never has to track step numbers — it just begins and completes.
+#[derive(Debug, Default)]
+pub(crate) struct StepStack {
+    frames: Vec<StepFrame>,
+    /// Top-level steps minted so far (children of the implicit root).
+    root_counter: u32,
+}
+
+impl StepStack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// The dotted key of the current (innermost) step, if any.
+    pub fn current_key(&self) -> Option<&str> {
+        self.frames.last().map(|f| f.key.as_str())
+    }
+
+    /// Push a new step capturing `watermark` as its scope start, and return
+    /// its assigned `(dotted_key, sequence)`. A new top-level step gets the
+    /// next root number; a step begun while another is active becomes its
+    /// next numbered child.
+    pub fn begin(&mut self, goal: impl Into<String>, watermark: usize) -> (String, i32) {
+        let (key, sequence) = match self.frames.last_mut() {
+            Some(parent) => {
+                parent.child_counter += 1;
+                let seq = i32::try_from(parent.child_counter).unwrap_or(i32::MAX);
+                (format!("{}.{}", parent.key, parent.child_counter), seq)
+            }
+            None => {
+                self.root_counter += 1;
+                let seq = i32::try_from(self.root_counter).unwrap_or(i32::MAX);
+                (self.root_counter.to_string(), seq)
+            }
+        };
+        self.frames.push(StepFrame {
+            key: key.clone(),
+            goal: goal.into(),
+            watermark,
+            child_counter: 0,
+            sequence,
+        });
+        (key, sequence)
+    }
+
+    /// Pop and return the innermost step, or `None` if no step is active.
+    pub fn complete(&mut self) -> Option<StepFrame> {
+        self.frames.pop()
+    }
+
+    /// Drop every frame. Called by the dispatch loop after overflow recovery,
+    /// which can drain messages and invalidate the absolute watermarks. The
+    /// root counter is intentionally preserved: the todos written before the
+    /// clear still live on the scratchpad, so a fresh step must keep advancing
+    /// the numbering rather than reuse a key (e.g. `"1"`) that would clobber an
+    /// existing todo via upsert.
+    pub fn clear(&mut self) {
+        self.frames.clear();
+    }
+}
+
+/// Truncate `s` to at most `max_bytes`, landing on a UTF-8 char boundary.
+pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s[..cut].to_string()
+}
+
+/// Build the pointer that replaces an evicted tool result. Addressed to the
+/// model so it knows the detail still exists (in the named note, or via a
+/// re-run) and was removed only to keep the turn lean.
+pub(crate) fn compaction_pointer(tool_name: Option<&str>, note_keys: &[String]) -> String {
+    let ran = match tool_name {
+        Some(n) if !n.is_empty() => format!(" (ran {n})"),
+        _ => String::new(),
+    };
+    if note_keys.is_empty() {
+        return format!(
+            "{COMPACTION_POINTER_PREFIX}{ran}: this result was dropped from working \
+             context when its step completed (no carry-forward note was recorded). \
+             Re-run the tool if you need it again.>"
+        );
+    }
+    let keys = note_keys
+        .iter()
+        .map(|k| format!("\"{k}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{COMPACTION_POINTER_PREFIX}{ran}: this result was distilled into scratchpad \
+         note(s) {keys} and dropped from working context to keep the turn lean. Re-read \
+         the note(s) with builtin_scratchpad_search, or re-run the tool for the full output.>"
+    )
+}
+
+/// Replace the content of every sizeable `Role::Tool` message in
+/// `messages[from..]` with a [`compaction_pointer`], freeing context while
+/// leaving the message structure (role + `tool_call_id`) intact so provider
+/// tool-call/result pairing is never broken.
+///
+/// Returns `(results_evicted, bytes_freed)`.
+///
+/// Idempotent: results already bearing a pointer are skipped. `from` is
+/// clamped to the slice length. Only the rare overflow-recovery path drains
+/// messages mid-turn, and it drains from the left — shifting absolute
+/// watermarks so this *under*-evicts (safe) rather than over-evicts; the
+/// dispatch loop additionally clears the step stack on overflow recovery, so
+/// a stale watermark never reaches here.
+pub(crate) fn evict_tool_results(
+    messages: &mut [Message],
+    from: usize,
+    note_keys: &[String],
+) -> (usize, usize) {
+    let from = from.min(messages.len());
+
+    // Map each tool_call_id to the tool that produced it, from the assistant
+    // tool-call requests, so the pointer can name what ran. Owned to avoid
+    // holding an immutable borrow across the mutation below.
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for m in messages.iter() {
+        if m.role == Role::Assistant {
+            for tc in &m.tool_calls {
+                names.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+
+    let mut evicted = 0usize;
+    let mut freed = 0usize;
+    for m in messages[from..].iter_mut() {
+        if m.role != Role::Tool || m.content.len() < COMPACTION_MIN_EVICT_BYTES {
+            continue;
+        }
+        if m.content.starts_with(COMPACTION_POINTER_PREFIX) {
+            continue; // already compacted by an inner step
+        }
+        let tool_name = m
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| names.get(id))
+            .map(String::as_str);
+        let pointer = compaction_pointer(tool_name, note_keys);
+        freed += m.content.len().saturating_sub(pointer.len());
+        evicted += 1;
+        m.content = pointer;
+    }
+    (evicted, freed)
+}
+
+/// A single plan entry for [`render_plan`] (a `todo`-typed scratchpad note).
+pub(crate) struct PlanItem<'a> {
+    pub key: &'a str,
+    pub goal: &'a str,
+    pub done: bool,
+    /// The step's distilled finding, when it is still in view — a completed
+    /// step whose parent hasn't yet rolled it up. Rendered nested under the step.
+    pub outcome: Option<&'a str>,
+}
+
+/// Parse a dotted step key into numeric segments for tree ordering. A
+/// non-numeric segment sorts last within its level (defensive — auto-numbered
+/// keys are always numeric).
+fn dotted_key(key: &str) -> Vec<u64> {
+    key.split('.')
+        .map(|seg| seg.parse::<u64>().unwrap_or(u64::MAX))
+        .collect()
+}
+
+/// Render the open plan as a compact indented tree for per-round surfacing.
+/// Returns `None` when there are no steps to show. `current` marks the live
+/// step (you-are-here); `max_items` caps the rendered size so it stays cheap
+/// to re-send every round.
+pub(crate) fn render_plan(
+    items: &[PlanItem<'_>],
+    current: Option<&str>,
+    max_items: usize,
+) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&PlanItem> = items.iter().collect();
+    sorted.sort_by_key(|a| dotted_key(a.key));
+
+    let mut out = String::from(
+        "Your plan (steps on the scratchpad, with findings so far — keep working it; \
+         mark steps done as you go, and roll a step's sub-step findings up into its outcome):",
+    );
+    for item in sorted.iter().take(max_items) {
+        let depth = item.key.matches('.').count();
+        let indent = "  ".repeat(depth);
+        let check = if item.done { "[x]" } else { "[ ]" };
+        let here = if current == Some(item.key) {
+            "  ← you are here"
+        } else {
+            ""
+        };
+        let goal = truncate_on_char_boundary(item.goal, 160);
+        out.push_str(&format!("\n{indent}{} {check} {goal}{here}", item.key));
+        if let Some(outcome) = item.outcome.filter(|o| !o.is_empty()) {
+            let outcome = truncate_on_char_boundary(outcome, 200);
+            out.push_str(&format!("\n{indent}  → {outcome}"));
+        }
+    }
+    if sorted.len() > max_items {
+        out.push_str(&format!("\n… and {} more.", sorted.len() - max_items));
+    }
+    Some(out)
+}
+
+/// A scratchpad note as the plan renderer needs it — just the fields it reads,
+/// so the renderer stays decoupled from the storage row type.
+pub(crate) struct RawNote<'a> {
+    pub key: &'a str,
+    pub content: &'a str,
+    pub note_type: &'a str,
+    pub done: bool,
+}
+
+/// Build the plan surface from a conversation's scratchpad notes (#240).
+///
+/// Steps are the `todo`-typed notes; each step's distilled finding lives in a
+/// companion `outcome:<step-key>` note. A finding is surfaced (nested under its
+/// step) only while it is still *waiting to be rolled up* — i.e. its parent step
+/// is not yet done. Once a parent completes (summarising its children up into
+/// its own outcome), the children's findings drop from view, so the model always
+/// sees exactly the findings pending summary into the currently-open ancestor.
+/// Top-level findings (no parent) stay in view as the material for the final
+/// summary to the user. Returns `None` when there are no steps.
+pub(crate) fn render_plan_from_notes(
+    notes: &[RawNote<'_>],
+    current: Option<&str>,
+    max_items: usize,
+) -> Option<String> {
+    use std::collections::HashMap;
+
+    let done_by_key: HashMap<&str, bool> = notes
+        .iter()
+        .filter(|n| n.note_type == STEP_NOTE_TYPE)
+        .map(|n| (n.key, n.done))
+        .collect();
+    if done_by_key.is_empty() {
+        return None;
+    }
+
+    // Findings still pending roll-up, keyed by their step. Absorbed (dropped)
+    // once the parent step is done.
+    let outcomes: HashMap<&str, &str> = notes
+        .iter()
+        .filter_map(|n| {
+            n.key
+                .strip_prefix(OUTCOME_KEY_PREFIX)
+                .map(|step| (step, n.content))
+        })
+        .filter(|(step, _)| {
+            step.rsplit_once('.')
+                .map(|(parent, _)| !done_by_key.get(parent).copied().unwrap_or(false))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let items: Vec<PlanItem> = notes
+        .iter()
+        .filter(|n| n.note_type == STEP_NOTE_TYPE)
+        .map(|n| PlanItem {
+            key: n.key,
+            goal: n.content,
+            done: n.done,
+            outcome: outcomes.get(n.key).copied(),
+        })
+        .collect();
+    render_plan(&items, current, max_items)
+}
+
+/// The `begin_step` tool definition advertised to the model.
+pub(crate) fn begin_step_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        BEGIN_STEP_TOOL,
+        "Begin a step of a multi-step task. Pushes a step onto your plan and opens a \
+         fresh working scope. Use it to break a non-trivial request into ordered steps, \
+         and again — nested — when a step turns out to need its own sub-plan (a step begun \
+         inside step 1.2 becomes 1.2.1, 1.2.2, …). The step is recorded as an ordered todo \
+         on the scratchpad and numbered for you. Pair every begin_step with a later \
+         complete_step. For small one-shot tasks, don't use steps at all — just answer or act.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "What this step aims to accomplish or find out — a short, concrete objective (e.g. 'Get the 7-day forecast for Cary, NC')."
+                }
+            },
+            "required": ["goal"]
+        }),
+    )
+}
+
+/// The `complete_step` tool definition advertised to the model.
+pub(crate) fn complete_step_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        COMPLETE_STEP_TOOL,
+        "Complete the current step (the most recently begun one). Marks its todo done, \
+         records what you learned as a carry-forward note on the scratchpad, and removes \
+         the step's raw tool results from working context — they're distilled into the note, \
+         which stays searchable, so nothing important is lost and the turn stays lean. Write \
+         the `outcome` whenever the result matters to later steps, or when in doubt; omit it \
+         only for trivial steps. If this step had sub-steps, roll their findings up into your \
+         outcome — summarise them into one, don't repeat each. Use status \"abandoned\" for a \
+         dead end you're backing out of: the wasted exploration is still cleared and the note \
+         records why, so you don't repeat it.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "outcome": {
+                    "type": "string",
+                    "description": "The distilled finding(s) to carry forward — the gist, not the raw output (e.g. 'Cary, NC 7-day: highs low-80s°F, rain likely Tue'). Omit only for trivial steps."
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["done", "abandoned"],
+                    "description": "done (default) = the step succeeded. abandoned = a dead end you're backing out of."
+                }
+            }
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Message, Role, ToolCall};
+
+    #[test]
+    fn stack_auto_numbers_roots_and_nested_children() {
+        let mut stack = StepStack::new();
+        let (k1, s1) = stack.begin("research", 0);
+        assert_eq!(k1, "1");
+        assert_eq!(s1, 1);
+        assert_eq!(stack.current_key(), Some("1"));
+
+        // Nested children of step 1.
+        let (k11, _) = stack.begin("sub a", 3);
+        assert_eq!(k11, "1.1");
+        assert_eq!(stack.depth(), 2);
+        // Completing 1.1 pops back to 1.
+        let popped = stack.complete().unwrap();
+        assert_eq!(popped.key, "1.1");
+        assert_eq!(popped.watermark, 3);
+        assert_eq!(stack.current_key(), Some("1"));
+
+        // Next child of 1 continues the counter: 1.2, then 1.2.1.
+        let (k12, _) = stack.begin("sub b", 5);
+        assert_eq!(k12, "1.2");
+        let (k121, _) = stack.begin("sub b i", 7);
+        assert_eq!(k121, "1.2.1");
+
+        // Unwind fully, then a new root step is 2 (not 1).
+        stack.complete();
+        stack.complete();
+        stack.complete();
+        assert_eq!(stack.depth(), 0);
+        let (k2, s2) = stack.begin("write up", 9);
+        assert_eq!(k2, "2");
+        assert_eq!(s2, 2);
+    }
+
+    #[test]
+    fn complete_on_empty_stack_is_none() {
+        let mut stack = StepStack::new();
+        assert!(stack.complete().is_none());
+    }
+
+    #[test]
+    fn clear_drops_frames_but_preserves_numbering() {
+        let mut stack = StepStack::new();
+        stack.begin("a", 0);
+        stack.begin("b", 1);
+        stack.clear();
+        assert_eq!(stack.depth(), 0);
+        // Numbering does NOT reset: a fresh step after a clear must not reuse a
+        // key (e.g. "1") that an earlier, still-persisted todo already owns.
+        let (k, _) = stack.begin("c", 2);
+        assert_eq!(k, "2");
+    }
+
+    fn tool_msg(id: &str, content: &str) -> Message {
+        Message::tool_result(id, content)
+    }
+
+    #[test]
+    fn evict_shrinks_large_results_preserving_pairing() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::new(Role::User, "do it"),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "weather_forecast", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let keys = vec!["outcome:1".to_string()];
+        let (evicted, freed) = evict_tool_results(&mut messages, 1, &keys);
+        assert_eq!(evicted, 1);
+        assert!(freed > 4000);
+        // Structure preserved: still a Tool message with its tool_call_id.
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+        // Content is now the pointer, naming the tool and the note.
+        assert!(messages[2].content.starts_with(COMPACTION_POINTER_PREFIX));
+        assert!(messages[2].content.contains("weather_forecast"));
+        assert!(messages[2].content.contains("outcome:1"));
+        // The assistant tool-call request is untouched.
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn evict_skips_small_and_already_compacted_results() {
+        let big = "y".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![
+                ToolCall::new("c1", "t", "{}"),
+                ToolCall::new("c2", "t", "{}"),
+            ]),
+            tool_msg("c1", "tiny"), // below threshold
+            tool_msg("c2", &big),
+        ];
+        let keys = vec!["k".to_string()];
+        let (evicted, _) = evict_tool_results(&mut messages, 0, &keys);
+        assert_eq!(evicted, 1); // only the big one
+        assert_eq!(messages[1].content, "tiny");
+
+        // Second pass over the same range is a no-op (idempotent).
+        let (evicted2, freed2) = evict_tool_results(&mut messages, 0, &keys);
+        assert_eq!(evicted2, 0);
+        assert_eq!(freed2, 0);
+    }
+
+    #[test]
+    fn evict_clamps_out_of_range_watermark() {
+        let mut messages = vec![Message::new(Role::User, "hi")];
+        let (evicted, freed) = evict_tool_results(&mut messages, 99, &[]);
+        assert_eq!((evicted, freed), (0, 0));
+    }
+
+    #[test]
+    fn pointer_without_notes_says_dropped() {
+        let p = compaction_pointer(Some("geocode"), &[]);
+        assert!(p.contains("geocode"));
+        assert!(p.contains("no carry-forward"));
+    }
+
+    #[test]
+    fn render_plan_sorts_indents_and_marks_current() {
+        let items = vec![
+            PlanItem {
+                key: "1",
+                goal: "research",
+                done: true,
+                outcome: None,
+            },
+            PlanItem {
+                key: "1.2",
+                goal: "draft",
+                done: false,
+                outcome: None,
+            },
+            PlanItem {
+                key: "1.10",
+                goal: "late",
+                done: false,
+                outcome: None,
+            },
+            PlanItem {
+                key: "1.2.1",
+                goal: "pick crate",
+                done: true,
+                outcome: None,
+            },
+        ];
+        let rendered = render_plan(&items, Some("1.2"), 50).unwrap();
+        let lines: Vec<&str> = rendered.lines().collect();
+        // Header + 4 items.
+        assert_eq!(lines.len(), 5);
+        // Numeric (not lexical) ordering: 1, 1.2, 1.2.1, 1.10.
+        assert!(lines[1].contains("1 [x] research"));
+        assert!(lines[2].contains("1.2 [ ] draft"));
+        assert!(lines[2].contains("← you are here"));
+        assert!(lines[3].contains("1.2.1 [x] pick crate"));
+        assert!(lines[4].trim_start().starts_with("1.10"));
+        // Depth-based indentation: 1.2.1 is deeper than 1.2.
+        let indent_12 = lines[2].len() - lines[2].trim_start().len();
+        let indent_121 = lines[3].len() - lines[3].trim_start().len();
+        assert!(indent_121 > indent_12);
+    }
+
+    #[test]
+    fn render_plan_empty_is_none() {
+        assert!(render_plan(&[], None, 10).is_none());
+    }
+
+    #[test]
+    fn render_plan_caps_items() {
+        let items: Vec<PlanItem> = (1..=10)
+            .map(|_| PlanItem {
+                key: "1",
+                goal: "g",
+                done: false,
+                outcome: None,
+            })
+            .collect();
+        let rendered = render_plan(&items, None, 3).unwrap();
+        assert!(rendered.contains("… and 7 more."));
+    }
+
+    #[test]
+    fn render_plan_shows_outcome_nested_under_step() {
+        let items = vec![PlanItem {
+            key: "1",
+            goal: "research",
+            done: true,
+            outcome: Some("API is OAuth2, 100 req/min"),
+        }];
+        let rendered = render_plan(&items, None, 10).unwrap();
+        assert!(rendered.contains("1 [x] research"));
+        assert!(rendered.contains("→ API is OAuth2, 100 req/min"));
+    }
+
+    fn raw(
+        key: &'static str,
+        content: &'static str,
+        ty: &'static str,
+        done: bool,
+    ) -> RawNote<'static> {
+        RawNote {
+            key,
+            content,
+            note_type: ty,
+            done,
+        }
+    }
+
+    #[test]
+    fn plan_surfaces_findings_until_parent_rolls_them_up() {
+        // Step 1 open; 1.1 done with a finding (parent 1 still open → shown).
+        // 1.2 done; 1.2.1 done with a finding whose parent 1.2 IS done → that
+        // finding was rolled up into 1.2, so it drops from view.
+        let notes = vec![
+            raw("1", "build it", "todo", false),
+            raw("1.1", "research", "todo", true),
+            raw("outcome:1.1", "API is OAuth2", "note", false),
+            raw("1.2", "wire the client", "todo", true),
+            raw("outcome:1.2", "client built on reqwest", "note", false),
+            raw("1.2.1", "pick crate", "todo", true),
+            raw("outcome:1.2.1", "chose reqwest 0.12", "note", false),
+            raw("goal", "the overall goal", "note", false),
+        ];
+        let rendered = render_plan_from_notes(&notes, Some("1"), 50).unwrap();
+        // Pending roll-up into the still-open step 1 → shown.
+        assert!(rendered.contains("→ API is OAuth2"));
+        // 1.2's own finding is top-of-its-subtree and 1.2's parent (1) is open → shown.
+        assert!(rendered.contains("→ client built on reqwest"));
+        // 1.2.1's finding was absorbed when 1.2 completed → hidden.
+        assert!(!rendered.contains("chose reqwest"));
+        // The `goal` note is not a step and must not render as a todo line.
+        assert!(!rendered.contains("the overall goal"));
+    }
+
+    #[test]
+    fn render_plan_from_notes_none_without_todos() {
+        let notes = vec![raw("goal", "g", "note", false)];
+        assert!(render_plan_from_notes(&notes, None, 10).is_none());
+    }
+
+    #[test]
+    fn step_tools_have_stable_names() {
+        assert_eq!(begin_step_tool().name, "begin_step");
+        assert_eq!(complete_step_tool().name, "complete_step");
+    }
+}
