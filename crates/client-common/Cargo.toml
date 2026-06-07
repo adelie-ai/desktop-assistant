@@ -35,6 +35,7 @@ optional = true
 # clients never link the daemon stack.
 desktop-assistant-uds = { path = "../uds-interface" }
 desktop-assistant-application = { path = "../application" }
+desktop-assistant-core.workspace = true
 desktop-assistant-auth-jwt.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = [

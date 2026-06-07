@@ -1265,6 +1265,7 @@ dependencies = [
  "desktop-assistant-api-model",
  "desktop-assistant-application",
  "desktop-assistant-auth-jwt",
+ "desktop-assistant-core",
  "desktop-assistant-uds",
  "futures",
  "reqwest",
