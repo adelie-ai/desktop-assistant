@@ -2,11 +2,14 @@ use crate::CoreError;
 use crate::context::{
     COMPACTION_TOKEN_RATIO, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
     MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolLocalityContext, cap_tool_result,
-    compaction_range, generate_context_summary, llm_messages_for_turn, recover_from_overflow,
+    compaction_range, generate_context_summary, llm_messages_for_turn_with_plan,
+    recover_from_overflow,
 };
 use crate::domain::{
-    Conversation, ConversationId, ConversationSummary, Message, Role, ToolDefinition, ToolNamespace,
+    Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
+    ToolNamespace,
 };
+use crate::planning::{self, StepStack};
 use crate::ports::client_tools::current_client_tools;
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
@@ -14,7 +17,10 @@ use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_system_refinement,
 };
-use crate::ports::scratchpad::{SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn};
+use crate::ports::scratchpad::{
+    MAX_NOTE_BYTES, NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn, ScratchpadListFn,
+    ScratchpadWriteFn,
+};
 use crate::ports::store::ConversationStore;
 use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::current_transport_kind;
@@ -171,6 +177,18 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// windowing/compaction. `None` (the default) preserves the prior
     /// verbatim-prompt-only anchor behaviour.
     scratchpad_goal_read: Option<ScratchpadGetManyFn>,
+    /// Optional writer for scratchpad notes. When set, the planning tools
+    /// (`begin_step`/`complete_step`, #240) are advertised each turn and the
+    /// dispatch loop uses this to record plan todos + distilled step outcomes.
+    /// `None` (the default) leaves the planning tools off and the loop behaves
+    /// exactly as before. Wire the daemon's *event-emitting* write closure so
+    /// plan changes reach clients via `ScratchpadChanged`.
+    scratchpad_write: Option<ScratchpadWriteFn>,
+    /// Optional lister for scratchpad notes. When set, the dispatch loop reads
+    /// the conversation's `todo` notes each round and surfaces the open plan
+    /// as a compact `[Plan]` system message so it stays in view while raw work
+    /// is evicted. `None` disables per-round plan surfacing.
+    scratchpad_list: Option<ScratchpadListFn>,
     /// Maximum byte length a single tool result may occupy before it is
     /// truncated at ingestion (issue #174). Defaults to
     /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
@@ -200,6 +218,8 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             scratchpad_goal_read: None,
+            scratchpad_write: None,
+            scratchpad_list: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
         }
@@ -221,6 +241,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             scratchpad_goal_read: None,
+            scratchpad_write: None,
+            scratchpad_list: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
         }
@@ -251,12 +273,217 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         self
     }
 
+    /// Wire a writer for scratchpad notes, enabling the step-planning +
+    /// context-compaction tools (`begin_step`/`complete_step`, #240). The
+    /// dispatch loop advertises those tools each turn and uses this closure to
+    /// record plan todos and distilled step outcomes. Wire the daemon's
+    /// *event-emitting* write closure so plan changes reach clients.
+    pub fn with_scratchpad_write(mut self, write: ScratchpadWriteFn) -> Self {
+        self.scratchpad_write = Some(write);
+        self
+    }
+
+    /// Wire a lister for scratchpad notes, enabling per-round surfacing of the
+    /// open plan (the conversation's `todo` notes) as a `[Plan]` system message.
+    pub fn with_scratchpad_list(mut self, list: ScratchpadListFn) -> Self {
+        self.scratchpad_list = Some(list);
+        self
+    }
+
     /// Override the per-tool-result ingestion cap (issue #174). Results
     /// larger than this are truncated with a notice before being stored so a
     /// single runaway tool call can't wedge the conversation or the database.
     pub fn with_max_tool_result_bytes(mut self, max_bytes: usize) -> Self {
         self.max_tool_result_bytes = max_bytes;
         self
+    }
+
+    /// Handle a `begin_step` / `complete_step` control call (#240).
+    ///
+    /// These are core-loop tools, not tool-executor tools: only the dispatch
+    /// loop owns `conv.messages` (for eviction) and the per-turn [`StepStack`].
+    /// `begin_step` pushes a step and records its goal as an ordered `todo`
+    /// note; `complete_step` pops the step, writes the distilled outcome as a
+    /// carry-forward note, marks the todo done, and evicts the step's raw tool
+    /// results from working context (replacing them with a searchable pointer
+    /// to the note). Returns the JSON ack the model sees as the tool result —
+    /// for `begin_step` it carries the assigned dotted step number.
+    ///
+    /// Note writes are best-effort: a failed write is logged and the turn
+    /// continues (the plan note is simply missing) rather than aborting.
+    async fn handle_step_control(
+        &self,
+        conv: &mut Conversation,
+        stack: &mut StepStack,
+        call: &ToolCall,
+        args: &serde_json::Value,
+        conversation_id: &ConversationId,
+    ) -> String {
+        let Some(write) = self.scratchpad_write.clone() else {
+            return r#"{"ok":false,"error":"planning is not available in this turn"}"#.to_string();
+        };
+        let conv_id = conversation_id.0.clone();
+
+        if call.name == planning::BEGIN_STEP_TOOL {
+            let goal = args
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if goal.is_empty() {
+                return r#"{"ok":false,"error":"begin_step requires a non-empty 'goal'"}"#
+                    .to_string();
+            }
+            // Capture the scope start BEFORE this call's own ack is pushed, so
+            // complete_step evicts the work done *within* the step.
+            let watermark = conv.messages.len();
+            let (key, sequence) = stack.begin(goal, watermark);
+            let note = NewScratchpadNote {
+                key: key.clone(),
+                content: planning::truncate_on_char_boundary(goal, MAX_NOTE_BYTES),
+                note_type: planning::STEP_NOTE_TYPE.to_string(),
+                sequence: Some(sequence),
+                done: false,
+            };
+            if let Err(e) = write(conv_id, vec![note]).await {
+                tracing::warn!(step = %key, error = %e, "failed to record plan step note");
+            }
+            return serde_json::json!({
+                "ok": true,
+                "action": "begin_step",
+                "step": key,
+                "depth": stack.depth(),
+                "goal": goal,
+            })
+            .to_string();
+        }
+
+        // complete_step
+        let outcome = args
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let abandoned = args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("abandoned"));
+
+        let Some(frame) = stack.complete() else {
+            // No active step to close. Still record a standalone note if the
+            // model handed us an outcome, so the finding isn't lost.
+            if let Some(o) = outcome {
+                let key = format!("note-{}", (self.id_generator)());
+                let body = if abandoned {
+                    format!("Abandoned: {o}")
+                } else {
+                    o.to_string()
+                };
+                let note = NewScratchpadNote {
+                    key: key.clone(),
+                    content: planning::truncate_on_char_boundary(&body, MAX_NOTE_BYTES),
+                    note_type: planning::OUTCOME_NOTE_TYPE.to_string(),
+                    sequence: None,
+                    done: false,
+                };
+                if let Err(e) = write(conv_id, vec![note]).await {
+                    tracing::warn!(error = %e, "failed to record standalone outcome note");
+                }
+                return serde_json::json!({
+                    "ok": true,
+                    "action": "complete_step",
+                    "note": "no active step; recorded a standalone note",
+                    "outcome_note": key,
+                })
+                .to_string();
+            }
+            return r#"{"ok":true,"action":"complete_step","note":"no active step to complete"}"#
+                .to_string();
+        };
+
+        // One write for the done-todo plus the optional carry-forward outcome.
+        let mut notes = vec![NewScratchpadNote {
+            key: frame.key.clone(),
+            content: planning::truncate_on_char_boundary(&frame.goal, MAX_NOTE_BYTES),
+            note_type: planning::STEP_NOTE_TYPE.to_string(),
+            sequence: Some(frame.sequence),
+            done: true,
+        }];
+        let mut note_keys: Vec<String> = Vec::new();
+        if let Some(o) = outcome {
+            let okey = format!("{}{}", planning::OUTCOME_KEY_PREFIX, frame.key);
+            let body = if abandoned {
+                format!("Abandoned: {o}")
+            } else {
+                o.to_string()
+            };
+            notes.push(NewScratchpadNote {
+                key: okey.clone(),
+                content: planning::truncate_on_char_boundary(&body, MAX_NOTE_BYTES),
+                note_type: planning::OUTCOME_NOTE_TYPE.to_string(),
+                sequence: None,
+                done: false,
+            });
+            note_keys.push(okey);
+        }
+        if let Err(e) = write(conv_id, notes).await {
+            tracing::warn!(step = %frame.key, error = %e, "failed to record step completion notes");
+        }
+
+        // Evict the step's raw tool results, leaving a pointer to the outcome
+        // note. This is what stops the per-round `msg_chars` growth (#239).
+        let (evicted, freed) =
+            planning::evict_tool_results(&mut conv.messages, frame.watermark, &note_keys);
+        tracing::info!(
+            step = %frame.key,
+            evicted_results = evicted,
+            freed_bytes = freed,
+            abandoned,
+            "completed step — compacted scope to scratchpad"
+        );
+
+        serde_json::json!({
+            "ok": true,
+            "action": "complete_step",
+            "step": frame.key,
+            "status": if abandoned { "abandoned" } else { "done" },
+            "evicted_results": evicted,
+            "freed_bytes": freed,
+            "outcome_note": note_keys.first(),
+        })
+        .to_string()
+    }
+
+    /// Render the open plan (#240) for per-round surfacing: read the
+    /// conversation's notes and render the step tree with each completed step's
+    /// finding nested under it (findings drop from view once a parent rolls them
+    /// up). Marks the live step. Returns `None` when no lister is wired or there
+    /// are no steps to show.
+    async fn render_current_plan(
+        &self,
+        conversation_id: &ConversationId,
+        current_key: Option<&str>,
+    ) -> Option<String> {
+        let list = self.scratchpad_list.clone()?;
+        // Fetch all notes (todo steps + their outcome notes), a bit beyond the
+        // render cap so a step's finding isn't dropped before the step itself.
+        let notes = list(
+            conversation_id.0.clone(),
+            None,
+            planning::MAX_PLAN_ITEMS.saturating_mul(3),
+        )
+        .await
+        .ok()?;
+        let raw: Vec<planning::RawNote> = notes
+            .iter()
+            .map(|n| planning::RawNote {
+                key: n.key.as_str(),
+                content: n.content.as_str(),
+                note_type: n.note_type.as_str(),
+                done: n.done,
+            })
+            .collect();
+        planning::render_plan_from_notes(&raw, current_key, planning::MAX_PLAN_ITEMS)
     }
 }
 
@@ -500,6 +727,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             client_tool_names: client_tool_defs.iter().map(|d| d.name.clone()).collect(),
         };
 
+        // Per-turn step stack for the planning + compaction tools (#240).
+        // Frames hold watermarks into `conv.messages`; `complete_step` evicts a
+        // scope's raw tool results down to a searchable scratchpad pointer.
+        let mut step_stack = StepStack::new();
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-turns cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -526,6 +758,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 if !tool_defs.iter().any(|t| t.name == def.name) {
                     tool_defs.push(def.clone());
                 }
+            }
+            // Advertise the step-planning + compaction tools (#240) when a
+            // scratchpad writer is wired. They are core-loop tools — intercepted
+            // by name in the dispatch loop below rather than routed to the tool
+            // executor — so they're appended here, after the server/client sets,
+            // every round. Without a writer wired they stay off entirely.
+            if self.scratchpad_write.is_some() {
+                tool_defs.push(planning::begin_step_tool());
+                tool_defs.push(planning::complete_step_tool());
             }
 
             let deferred_ns: &[ToolNamespace] = if !hosted_search_demoted {
@@ -561,10 +802,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             };
             let anchor = goal.as_deref().or(conv.active_task.as_deref());
 
+            // Surface the open plan (#240): read the conversation's `todo`
+            // notes and render them as a compact tree so the plan stays in view
+            // across rounds while the expensive raw work is evicted. Reading per
+            // round means a step the model just began or completed shows up
+            // (with its updated done-mark) on the next round.
+            let current_step = step_stack.current_key().map(str::to_string);
+            let plan = self
+                .render_current_plan(conversation_id, current_step.as_deref())
+                .await;
+
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
-            let llm_messages = llm_messages_for_turn(
+            let llm_messages = llm_messages_for_turn_with_plan(
                 &conv.messages,
                 &conv.summaries,
                 &tool_defs,
@@ -572,6 +823,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 &conv.context_summary,
                 target_window,
                 anchor,
+                plan.as_deref(),
                 tool_rounds_since_anchor,
                 &system_refinement,
                 current_context_budget(),
@@ -670,6 +922,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         &estimate,
                     )
                     .await;
+                    // Overflow recovery can drain messages (trim_tool_pairs),
+                    // which invalidates the step stack's absolute watermarks.
+                    // Drop the frames so no later complete_step evicts the wrong
+                    // range — the plan todos persist on the scratchpad regardless.
+                    step_stack.clear();
                     on_chunk = Box::new(|_| true);
                     continue;
                 }
@@ -846,6 +1103,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     serde_json::from_str(&tool_call.arguments).unwrap_or_default();
                 on_status(tool_status_message(&tool_call.name, &arguments));
                 tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
+
+                // Step-planning + compaction control (#240) is handled here in
+                // the loop, not by the tool executor: only the loop owns
+                // `conv.messages` (for eviction) and the per-turn step stack.
+                // Every tool call still needs a tool_result for provider
+                // pairing, so we push the (small) ack and move to the next call.
+                // Gate on the same condition that advertises these tools, so when
+                // planning is off the names aren't shadowed (an MCP tool could
+                // otherwise share one) and dispatch falls through as normal.
+                if self.scratchpad_write.is_some()
+                    && (tool_call.name == planning::BEGIN_STEP_TOOL
+                        || tool_call.name == planning::COMPLETE_STEP_TOOL)
+                {
+                    let ack = self
+                        .handle_step_control(
+                            &mut conv,
+                            &mut step_stack,
+                            tool_call,
+                            &arguments,
+                            conversation_id,
+                        )
+                        .await;
+                    conv.messages
+                        .push(Message::tool_result(&tool_call.id, &ack));
+                    continue;
+                }
 
                 // Route client-local tools to the client (#107 / #234): if a
                 // per-turn client-tool port is installed and the called name is
@@ -1534,6 +1817,240 @@ mod tests {
             updated.messages[3].content,
             "The file contains: hello world"
         );
+    }
+
+    // --- Planning + compaction (#240) ---
+
+    /// An in-memory scratchpad backing the write/list closures, plus a handle
+    /// to inspect what was written.
+    fn in_memory_scratchpad() -> (
+        ScratchpadWriteFn,
+        ScratchpadListFn,
+        Arc<Mutex<HashMap<String, crate::domain::ScratchpadNote>>>,
+    ) {
+        use crate::domain::ScratchpadNote;
+        let store: Arc<Mutex<HashMap<String, ScratchpadNote>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let w = Arc::clone(&store);
+        let write: ScratchpadWriteFn =
+            Arc::new(move |_conv: String, notes: Vec<NewScratchpadNote>| {
+                let w = Arc::clone(&w);
+                Box::pin(async move {
+                    let mut map = w.lock().unwrap();
+                    let saved: Vec<ScratchpadNote> = notes
+                        .into_iter()
+                        .map(|n| {
+                            let mut note = ScratchpadNote::new(
+                                format!("id-{}", n.key),
+                                "conv",
+                                &n.key,
+                                &n.content,
+                            );
+                            note.note_type = n.note_type;
+                            note.sequence = n.sequence;
+                            note.done = n.done;
+                            map.insert(n.key.clone(), note.clone());
+                            note
+                        })
+                        .collect();
+                    Ok(saved)
+                })
+            });
+
+        let l = Arc::clone(&store);
+        let list: ScratchpadListFn = Arc::new(move |_conv, note_type: Option<String>, _limit| {
+            let l = Arc::clone(&l);
+            Box::pin(async move {
+                let map = l.lock().unwrap();
+                let mut out: Vec<ScratchpadNote> = map
+                    .values()
+                    .filter(|n| note_type.as_deref().is_none_or(|t| n.note_type == t))
+                    .cloned()
+                    .collect();
+                out.sort_by(|a, b| a.key.cmp(&b.key));
+                Ok(out)
+            })
+        });
+
+        (write, list, store)
+    }
+
+    fn id_gen() -> Box<dyn Fn() -> String + Send + Sync> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        Box::new(move || {
+            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            format!("conv-{n}")
+        })
+    }
+
+    #[tokio::test]
+    async fn complete_step_evicts_raw_tool_result_into_scratchpad_pointer() {
+        // The headline of #240: begin a step, run a tool that returns a big
+        // payload, complete the step — and the raw result leaves working context,
+        // replaced by a searchable pointer to the distilled outcome note, while
+        // the message structure (role + tool_call_id) is preserved.
+        let big = "DATA".repeat(2000); // ~8 KB, well above the eviction threshold
+        let tools = vec![ToolDefinition::new(
+            "weather_forecast",
+            "Get a forecast",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("weather_forecast".to_string(), big.clone());
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "b1",
+                    "begin_step",
+                    r#"{"goal":"get the forecast"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "weather_forecast", "{}")]),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "complete_step",
+                    r#"{"outcome":"Cary NC 7-day: highs low-80s, rain Tue"}"#,
+                )],
+            ),
+            LlmResponse::text("All done — it'll be warm with rain Tuesday."),
+        ];
+
+        let (write, list, sp) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let result = handler
+            .send_prompt(&conv.id, "weather?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "All done — it'll be warm with rain Tuesday.");
+
+        // The big tool result must have been compacted in place: still a Tool
+        // message bound to its call, but the payload is gone and replaced by a
+        // pointer naming the tool and the outcome note.
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let big_result = updated
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the weather tool result message must still exist");
+        assert!(
+            big_result.content.starts_with("<compacted to scratchpad"),
+            "raw result should be replaced by a pointer, got: {}",
+            big_result.content
+        );
+        assert!(big_result.content.contains("weather_forecast"));
+        assert!(big_result.content.contains("outcome:1"));
+        assert!(
+            !big_result.content.contains("DATADATA"),
+            "the raw payload must be gone from working context"
+        );
+
+        // The scratchpad holds the done todo + the distilled outcome note.
+        let notes = sp.lock().unwrap();
+        let todo = notes.get("1").expect("step todo must exist");
+        assert_eq!(todo.note_type, "todo");
+        assert!(todo.done, "the step todo must be checked off");
+        let outcome = notes.get("outcome:1").expect("outcome note must exist");
+        assert_eq!(outcome.content, "Cary NC 7-day: highs low-80s, rain Tue");
+    }
+
+    /// Capturing LLM that records the message list it is handed each round, then
+    /// returns the next scripted response.
+    struct PlanContextCapturingLlm {
+        responses: Mutex<Vec<LlmResponse>>,
+        captured: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for PlanContextCapturingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.captured.lock().unwrap().push(messages);
+            let response = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    return Ok(LlmResponse::text("fallback"));
+                }
+                responses.remove(0)
+            };
+            if !response.text.is_empty() {
+                on_chunk(response.text.clone());
+            }
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn open_plan_is_surfaced_into_the_next_round() {
+        // After begin_step records a todo, the next round's assembled context
+        // must carry a [Plan] system message so the plan stays in view.
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(
+                        "b1",
+                        "begin_step",
+                        r#"{"goal":"map the plan"}"#,
+                    )],
+                ),
+                LlmResponse::text("done"),
+            ]),
+            captured: Arc::clone(&captured),
+        };
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "do a multi-step thing".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let rounds = captured.lock().unwrap();
+        // Once begin_step records a todo, a later round's assembled context must
+        // carry the [Plan] surface. (Round 0 — before any todo — does not; a
+        // separate title-generation call also has none, so search all rounds.)
+        let plan_msg = rounds
+            .iter()
+            .flatten()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Plan]"))
+            .expect("the open plan must be surfaced once a todo exists");
+        assert!(plan_msg.content.contains("map the plan"));
+        assert!(plan_msg.content.contains("← you are here"));
     }
 
     #[tokio::test]

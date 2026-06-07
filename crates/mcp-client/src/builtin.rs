@@ -401,12 +401,13 @@ impl BuiltinToolService {
                  at once. Use the reserved key 'goal' for the current objective: it is \
                  auto-surfaced as your task anchor every turn (so it survives compaction), and \
                  you should evolve it as the goal shifts and delete it when done. Each note has \
-                 a `type` (default \"note\"; use \"todo\" for plan steps) and an optional integer \
-                 `sequence` — notes of the same type are returned sorted by `sequence`, so keep \
-                 your plan as `todo` notes numbered in order. Set `done: true` to check a todo \
-                 off (it stays visible). The scratchpad is discarded when the conversation is \
-                 deleted and is NOT durable across conversations — promote anything worth keeping \
-                 to the knowledge base with builtin_knowledge_base_write, then delete the note here.",
+                 a `type` (default \"note\") and an optional integer `sequence` (same-type notes \
+                 sort by it). For working a multi-step task, prefer the begin_step / complete_step \
+                 tools — they record and number your plan as todos for you and compact each finished \
+                 step's raw work into a note — rather than hand-managing `todo` notes here. The \
+                 scratchpad is discarded when the conversation is deleted and is NOT durable across \
+                 conversations — promote anything worth keeping to the knowledge base with \
+                 builtin_knowledge_base_write, then delete the note here.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -559,10 +560,24 @@ impl BuiltinToolService {
 
         let content = required_string(&arguments, "content")?;
         let tags = optional_string_array(&arguments, "tags");
-        let metadata = arguments
+        let mut metadata = arguments
             .get("metadata")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        // Provenance (#240): stamp the originating conversation so a promoted
+        // finding is traceable back to where it was learned, mirroring the
+        // dreaming extractor. Only when a conversation scope is active (the
+        // task-local installed by the dispatch loop) and the model didn't set
+        // it explicitly. Tool-written entries previously carried no provenance.
+        if let Some(conv) = current_conversation_id()
+            && let Some(obj) = metadata.as_object_mut()
+            && !obj.contains_key("source_conversation_id")
+        {
+            obj.insert(
+                "source_conversation_id".to_string(),
+                serde_json::Value::String(conv.0),
+            );
+        }
         let id =
             optional_string(&arguments, "id").unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
