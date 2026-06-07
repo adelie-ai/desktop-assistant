@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use desktop_assistant_api_model as api;
 use tokio::sync::mpsc;
 
 use crate::config::ConnectionConfig;
@@ -195,6 +196,54 @@ impl Connector {
                 format!("{system_refinement}\n\n{prompt}")
             };
             self.client.send_prompt(conversation_id, &composed).await
+        }
+    }
+
+    /// Advertise the set of client-local MCP tools this connection can run
+    /// (#107/#231). The daemon replaces any previously-registered set on each
+    /// call — send the full list, not deltas — so re-register on every connect.
+    /// Returns the count of tools the daemon accepted.
+    ///
+    /// Client tools ride the socket command channel, so this is supported only
+    /// over the UDS/WS transports; the D-Bus transport has no command channel
+    /// for it and returns an error.
+    pub async fn register_client_tools(
+        &self,
+        tools: Vec<api::ClientToolRegistration>,
+    ) -> Result<usize> {
+        match self.client.as_commands() {
+            Some(commands) => commands.register_client_tools(tools).await,
+            None => Err(anyhow::anyhow!(
+                "register_client_tools requires a socket transport (UDS or WS); \
+                 the D-Bus transport does not support client tools"
+            )),
+        }
+    }
+
+    /// Deliver the outcome of a
+    /// [`SignalEvent::ClientToolCall`](crate::SignalEvent::ClientToolCall) back
+    /// to the daemon so the suspended turn can resume (#107/#231). Pass the
+    /// `task_id` and `tool_call_id` from the event and exactly one of
+    /// `result` / `error` (encoded as `Ok` / `Err`).
+    ///
+    /// Supported only over the socket transports (UDS/WS), like
+    /// [`register_client_tools`](Self::register_client_tools).
+    pub async fn submit_client_tool_result(
+        &self,
+        task_id: &str,
+        tool_call_id: &str,
+        result: Result<String, String>,
+    ) -> Result<()> {
+        match self.client.as_commands() {
+            Some(commands) => {
+                commands
+                    .submit_client_tool_result(task_id, tool_call_id, result)
+                    .await
+            }
+            None => Err(anyhow::anyhow!(
+                "submit_client_tool_result requires a socket transport (UDS or WS); \
+                 the D-Bus transport does not support client tools"
+            )),
         }
     }
 }

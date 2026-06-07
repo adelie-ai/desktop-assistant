@@ -416,6 +416,55 @@ pub trait AssistantCommands: Send + Sync {
         };
         Ok(())
     }
+
+    // --- Client-side tool execution (issue #107 / #231) -------------------
+
+    /// Advertise the set of client-local MCP tools this connection can run
+    /// (#107). The daemon replaces any previously-registered set on each call —
+    /// send the full list, not deltas — so re-register on every connect.
+    /// Returns the count of tools the daemon accepted (from
+    /// `CommandResult::ClientToolsRegistered`).
+    async fn register_client_tools(
+        &self,
+        tools: Vec<api::ClientToolRegistration>,
+    ) -> Result<usize> {
+        let result = self
+            .send_command(api::Command::RegisterClientTools { tools })
+            .await?;
+        let api::CommandResult::ClientToolsRegistered { count } = result else {
+            return Err(anyhow!("unexpected response for register_client_tools"));
+        };
+        Ok(count as usize)
+    }
+
+    /// Deliver the outcome of a `ClientToolCall` back to the daemon so the
+    /// suspended turn can resume (#107). Pass the `task_id` and `tool_call_id`
+    /// the [`SignalEvent::ClientToolCall`](crate::SignalEvent::ClientToolCall)
+    /// carried, and exactly one of `result` / `error` — the daemon treats both
+    /// `None` as an error.
+    async fn submit_client_tool_result(
+        &self,
+        task_id: &str,
+        tool_call_id: &str,
+        result: Result<String, String>,
+    ) -> Result<()> {
+        let (ok, err) = match result {
+            Ok(value) => (Some(value), None),
+            Err(message) => (None, Some(message)),
+        };
+        let outcome = self
+            .send_command(api::Command::ClientToolResult {
+                task_id: api::TaskId(task_id.to_string()),
+                tool_call_id: tool_call_id.to_string(),
+                result: ok,
+                error: err,
+            })
+            .await?;
+        let api::CommandResult::Ack = outcome else {
+            return Err(anyhow!("unexpected response for submit_client_tool_result"));
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -734,6 +783,73 @@ mod tests {
                 assert!(!all);
             }
             other => panic!("expected DeleteScratchpadNotes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_client_tools_emits_command_and_returns_count() {
+        let client = RecordingClient::new(api::CommandResult::ClientToolsRegistered { count: 2 });
+        let tools = vec![
+            api::ClientToolRegistration {
+                name: "weather".into(),
+                description: "look up the weather".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            api::ClientToolRegistration {
+                name: "calendar".into(),
+                description: String::new(),
+                input_schema: serde_json::Value::Null,
+            },
+        ];
+        let count = client.register_client_tools(tools.clone()).await.unwrap();
+        assert_eq!(count, 2);
+        match client.last() {
+            api::Command::RegisterClientTools { tools: emitted } => {
+                assert_eq!(emitted, tools);
+            }
+            other => panic!("expected RegisterClientTools, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_client_tool_result_ok_emits_result_field() {
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        client
+            .submit_client_tool_result("task-1", "call-1", Ok("sunny".into()))
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::ClientToolResult {
+                task_id,
+                tool_call_id,
+                result,
+                error,
+            } => {
+                assert_eq!(task_id, api::TaskId("task-1".into()));
+                assert_eq!(tool_call_id, "call-1");
+                assert_eq!(result.as_deref(), Some("sunny"));
+                assert!(error.is_none());
+            }
+            other => panic!("expected ClientToolResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_client_tool_result_err_emits_error_field() {
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        client
+            .submit_client_tool_result("task-2", "call-2", Err("tool blew up".into()))
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::ClientToolResult { result, error, .. } => {
+                // Exactly one of result/error is populated — an Err maps to the
+                // error field with result left None (the daemon treats both
+                // None as an error).
+                assert!(result.is_none());
+                assert_eq!(error.as_deref(), Some("tool blew up"));
+            }
+            other => panic!("expected ClientToolResult, got {other:?}"),
         }
     }
 }

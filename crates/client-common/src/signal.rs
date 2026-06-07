@@ -62,6 +62,20 @@ pub enum SignalEvent {
     ScratchpadChanged {
         conversation_id: String,
     },
+    /// The daemon's turn has suspended on a client-local MCP tool call (#107).
+    /// The client is expected to execute `tool_name` with `arguments` against
+    /// its local environment and post the outcome back via
+    /// [`Connector::submit_client_tool_result`](crate::Connector::submit_client_tool_result)
+    /// with the same `task_id` and `tool_call_id`; until then the turn parks.
+    /// `task_id` is the `api::TaskId` unwrapped to its inner `String`, matching
+    /// the rest of this stream's id fields.
+    ClientToolCall {
+        task_id: String,
+        conversation_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
     Disconnected {
         reason: String,
     },
