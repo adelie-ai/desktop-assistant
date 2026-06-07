@@ -15,9 +15,43 @@ use crate::commands::{AssistantCommands, PendingResult};
 use crate::signal::SignalEvent;
 use crate::timeouts::{DISPATCH_TIMEOUT, WS_PING_INTERVAL};
 
-pub struct WsClient {
+/// In-flight request correlation map plus a terminal "closed" marker. Mirrors
+/// the UDS client's `PendingState` so a reconnect (#246) can re-arm the WS
+/// client after the reader drains it on a drop.
+struct PendingState {
+    map: HashMap<String, oneshot::Sender<PendingResult>>,
+    closed: Option<String>,
+}
+
+impl PendingState {
+    fn close(&mut self, reason: &str) {
+        if self.closed.is_none() {
+            self.closed = Some(reason.to_string());
+        }
+        for (_id, tx) in self.map.drain() {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+
+    fn reopen(&mut self) {
+        self.closed = None;
+    }
+}
+
+/// The live connection's write handle, swapped on reconnect (#246).
+struct ConnState {
     outbound_tx: mpsc::UnboundedSender<Message>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<PendingResult>>>>,
+}
+
+pub struct WsClient {
+    /// The live writer, replaced in place by [`reconnect`](Self::reconnect).
+    conn: Arc<Mutex<ConnState>>,
+    pending: Arc<Mutex<PendingState>>,
+    /// The persistent signal stream every reader (across reconnects) feeds.
+    signal_tx: mpsc::UnboundedSender<SignalEvent>,
+    /// Fires once per underlying-socket close so the Connector's reconnect
+    /// supervisor knows to back off and reconnect (#246).
+    drop_tx: mpsc::UnboundedSender<()>,
     /// Per-command response deadline (#221). Defaults to
     /// [`DISPATCH_TIMEOUT`]; tunable via [`set_dispatch_timeout`].
     dispatch_timeout: std::time::Duration,
@@ -30,11 +64,60 @@ impl WsClient {
         self.dispatch_timeout = timeout;
     }
 
+    /// Connect a WebSocket transport. Returns the client, the persistent signal
+    /// stream, and a drop-notifier receiver that fires once per underlying
+    /// socket close (#246) — the Connector uses the latter to drive reconnect.
     pub async fn connect(
         ws_url: &str,
         bearer_token: &str,
         tls_ca_cert: Option<&Path>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<SignalEvent>)> {
+    ) -> Result<(
+        Self,
+        mpsc::UnboundedReceiver<SignalEvent>,
+        mpsc::UnboundedReceiver<()>,
+    )> {
+        let pending = Arc::new(Mutex::new(PendingState {
+            map: HashMap::new(),
+            closed: None,
+        }));
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let (drop_tx, drop_rx) = mpsc::unbounded_channel::<()>();
+
+        let outbound_tx = Self::spawn_connection(
+            ws_url,
+            bearer_token,
+            tls_ca_cert,
+            Arc::clone(&pending),
+            signal_tx.clone(),
+            drop_tx.clone(),
+        )
+        .await?;
+
+        Ok((
+            Self {
+                conn: Arc::new(Mutex::new(ConnState { outbound_tx })),
+                pending,
+                signal_tx,
+                drop_tx,
+                dispatch_timeout: DISPATCH_TIMEOUT,
+            },
+            signal_rx,
+            drop_rx,
+        ))
+    }
+
+    /// Connect the socket, spawn the writer/keepalive/reader tasks bound to the
+    /// **persistent** `pending` / `signal_tx` / `drop_tx`, and return the new
+    /// writer handle. Shared by [`connect`](Self::connect) and
+    /// [`reconnect`](Self::reconnect) (#246).
+    async fn spawn_connection(
+        ws_url: &str,
+        bearer_token: &str,
+        tls_ca_cert: Option<&Path>,
+        pending: Arc<Mutex<PendingState>>,
+        signal_tx: mpsc::UnboundedSender<SignalEvent>,
+        drop_tx: mpsc::UnboundedSender<()>,
+    ) -> Result<mpsc::UnboundedSender<Message>> {
         let mut request = ws_url.into_client_request()?;
         request.headers_mut().insert(
             tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
@@ -82,12 +165,7 @@ impl WsClient {
             }
         });
 
-        let pending = Arc::new(Mutex::new(
-            HashMap::<String, oneshot::Sender<PendingResult>>::new(),
-        ));
         let pending_for_reader = Arc::clone(&pending);
-
-        let (signal_tx, signal_rx) = mpsc::unbounded_channel::<SignalEvent>();
         tokio::spawn(async move {
             while let Some(Ok(message)) = ws_rx.next().await {
                 let Message::Text(text) = message else {
@@ -99,12 +177,12 @@ impl WsClient {
 
                 match frame {
                     WsFrame::Result { id, result } => {
-                        if let Some(tx) = pending_for_reader.lock().await.remove(&id) {
+                        if let Some(tx) = pending_for_reader.lock().await.map.remove(&id) {
                             let _ = tx.send(Ok(result));
                         }
                     }
                     WsFrame::Error { id, error } => {
-                        if let Some(tx) = pending_for_reader.lock().await.remove(&id) {
+                        if let Some(tx) = pending_for_reader.lock().await.map.remove(&id) {
                             let _ = tx.send(Err(error));
                         }
                     }
@@ -116,24 +194,42 @@ impl WsClient {
                 }
             }
 
-            let _ = signal_tx.send(SignalEvent::Disconnected {
-                reason: "WebSocket connection closed".to_string(),
-            });
-
-            let mut pending = pending_for_reader.lock().await;
-            for (_id, tx) in pending.drain() {
-                let _ = tx.send(Err("websocket disconnected".to_string()));
-            }
+            // The socket closed. As with UDS (#246), do NOT emit a
+            // `Disconnected` on the persistent signal stream — fail any
+            // outstanding requests and notify the reconnect supervisor via
+            // `drop_tx`, which owns the terminal-Disconnected + reconnect.
+            pending_for_reader
+                .lock()
+                .await
+                .close("websocket disconnected");
+            let _ = drop_tx.send(());
         });
 
-        Ok((
-            Self {
-                outbound_tx,
-                pending,
-                dispatch_timeout: DISPATCH_TIMEOUT,
-            },
-            signal_rx,
-        ))
+        Ok(outbound_tx)
+    }
+
+    /// Re-establish the underlying WebSocket after a drop (#246): reconnect,
+    /// spawn fresh writer/keepalive/reader tasks bound to the persistent
+    /// channels, and swap in the new writer. On failure the error is returned so
+    /// the supervisor can back off and retry.
+    pub(crate) async fn reconnect(
+        &self,
+        ws_url: &str,
+        bearer_token: &str,
+        tls_ca_cert: Option<&Path>,
+    ) -> Result<()> {
+        let outbound_tx = Self::spawn_connection(
+            ws_url,
+            bearer_token,
+            tls_ca_cert,
+            Arc::clone(&self.pending),
+            self.signal_tx.clone(),
+            self.drop_tx.clone(),
+        )
+        .await?;
+        self.pending.lock().await.reopen();
+        self.conn.lock().await.outbound_tx = outbound_tx;
+        Ok(())
     }
 
     /// Send a prompt with an optional per-message model/connection override.
@@ -185,14 +281,23 @@ impl AssistantCommands for WsClient {
         let payload = serde_json::to_string(&request)?;
 
         let (tx, rx) = oneshot::channel::<PendingResult>();
-        self.pending.lock().await.insert(id.clone(), tx);
+        {
+            let mut state = self.pending.lock().await;
+            if let Some(reason) = &state.closed {
+                return Err(anyhow!("websocket connection closed: {reason}"));
+            }
+            state.map.insert(id.clone(), tx);
+        }
 
         if self
+            .conn
+            .lock()
+            .await
             .outbound_tx
             .send(Message::Text(payload.into()))
             .is_err()
         {
-            self.pending.lock().await.remove(&id);
+            self.pending.lock().await.map.remove(&id);
             return Err(anyhow!("failed to send websocket request"));
         }
 
@@ -204,7 +309,7 @@ impl AssistantCommands for WsClient {
             Ok(Ok(Err(error))) => Err(anyhow!(error)),
             Ok(Err(_closed)) => Err(anyhow!("websocket response channel closed")),
             Err(_elapsed) => {
-                self.pending.lock().await.remove(&id);
+                self.pending.lock().await.map.remove(&id);
                 Err(anyhow!(
                     "websocket command timed out after {:?} with no response from the server",
                     self.dispatch_timeout

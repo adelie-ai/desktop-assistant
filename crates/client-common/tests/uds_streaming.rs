@@ -174,7 +174,7 @@ async fn uds_streamed_response_is_correlatable_to_the_send() {
     wait_for_socket(&path).await;
 
     let cfg = uds_config(path, mint_test_jwt(&signing_key, "dave"));
-    let (client, mut signals) = connect_transport(&cfg).await.expect("connect over uds");
+    let (client, mut signals, _drop) = connect_transport(&cfg).await.expect("connect over uds");
 
     let returned_id = timeout(Duration::from_secs(2), client.send_prompt("conv-1", "hi"))
         .await

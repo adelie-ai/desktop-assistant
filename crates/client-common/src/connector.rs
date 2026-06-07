@@ -7,6 +7,31 @@
 //! events through one object instead of juggling a `(client, receiver)` pair and
 //! per-transport channel wiring — the transport choice (D-Bus / local UDS /
 //! WebSocket) lives entirely in the [`ConnectionConfig`].
+//!
+//! ## Auto-reconnect (#246)
+//!
+//! The daemon is redeployed often (a binary restart), which closes every live
+//! socket. Rather than strand the client on a dead connection until its own
+//! process is restarted, the Connector runs a **supervisor** task that, when the
+//! underlying socket *closes*, reconnects to the same endpoint with capped
+//! exponential backoff + jitter — re-running the full handshake (re-auth via the
+//! credential in the stored [`ConnectionConfig`]) and **replaying** the last
+//! client-tool registration so a daemon restart doesn't silently drop a client's
+//! tools. The current waiters are unstuck with a terminal `Disconnected` (their
+//! in-flight turn is genuinely lost when the server restarts), but the Connector
+//! stays usable: the next `subscribe()` / `send_prompt` / command runs on the
+//! fresh transport.
+//!
+//! The reconnect happens *inside* the [`TransportClient`] (it swaps its own
+//! socket in place and keeps feeding the same persistent signal stream), so
+//! [`client`](Connector::client) keeps returning a stable `&TransportClient`
+//! across reconnects — callers holding that reference don't have to re-fetch it.
+//!
+//! Reconnect is triggered **only** by an actual transport close (the transport's
+//! drop-notifier fires), never by a per-turn *stall*: an open-but-silent
+//! connection still unsticks its waiters (#221) and keeps the same connection
+//! pumping for the next turn (voice#49/#241). An idle connection (no
+//! subscribers, no traffic) is never torn down or reconnected.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,20 +42,33 @@ use tokio::sync::mpsc;
 
 use crate::config::ConnectionConfig;
 use crate::signal::SignalEvent;
-use crate::timeouts::EVENT_STALL_TIMEOUT;
-use crate::transport::{AssistantClient, TransportClient, connect_transport, transport_label};
+use crate::timeouts::{EVENT_STALL_TIMEOUT, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX};
+use crate::transport::{
+    AssistantClient, DropNotifier, TransportClient, connect_transport, transport_label,
+};
 
 type Subscribers = Arc<Mutex<Vec<mpsc::UnboundedSender<SignalEvent>>>>;
 
-/// Pump a transport's signal stream out to subscribers.
+/// The last client-tool registration the caller asked for, remembered so the
+/// supervisor can replay it after a reconnect (#246). `None` until the first
+/// [`Connector::register_client_tools`] call; an explicit empty `Vec` is
+/// remembered too (it clears the daemon's set on every connect).
+type RememberedTools = Arc<Mutex<Option<Vec<api::ClientToolRegistration>>>>;
+
+/// Pump a transport's signal stream out to subscribers (#241 semantics).
 ///
-/// Closing the upstream stream is terminal: every subscriber gets a
-/// `Disconnected { reason: "signal stream closed" }` and the pump stops.
+/// Closing the upstream stream is terminal *for this pump*: it stops and every
+/// subscriber gets a `Disconnected { reason: "signal stream closed" }`. With the
+/// reconnect supervisor (#246) the transport's signal stream is *persistent* —
+/// it does not close on a socket drop (the transport reconnects underneath and
+/// keeps feeding it), so in practice this pump only ends when the Connector is
+/// dropped. The terminal-on-close behaviour is retained for the D-Bus transport
+/// (no reconnect) and as a safety net.
 ///
 /// A *stall* (open but silent) is treated as a **per-turn** signal, not a reason
-/// to tear the connection down (voice#49, reopened). The stall clock only runs
-/// while at least one subscriber is attached — i.e. a turn is potentially in
-/// flight: if no event arrives within `stall_timeout`, every *current*
+/// to tear the connection down (voice#49, reopened #241). The stall clock only
+/// runs while at least one subscriber is attached — i.e. a turn is potentially
+/// in flight: if no event arrives within `stall_timeout`, every *current*
 /// subscriber gets a terminal `Disconnected { reason: "…stalled…" }` so a client
 /// waiting on a wedged turn errors out instead of hanging (#221), but the pump
 /// **keeps reading** so the next turn still streams.
@@ -41,9 +79,7 @@ type Subscribers = Arc<Mutex<Vec<mpsc::UnboundedSender<SignalEvent>>>>;
 /// keepalive (UDS): otherwise a healthy-but-idle connection would trip the
 /// stall and the pump would die before the first turn ever arrived, so every
 /// later subscriber would be attached to a dead pump and receive ZERO events
-/// (the reopened voice#49: send acks, turn completes, client gets nothing).
-/// `stall_timeout` is a parameter so tests can drive a short window without
-/// waiting the production minute-plus.
+/// (the reopened voice#49).
 fn spawn_fanout_with_stall_timeout(
     mut signal_rx: mpsc::UnboundedReceiver<SignalEvent>,
     stall_timeout: Duration,
@@ -63,7 +99,8 @@ fn spawn_fanout_with_stall_timeout(
                     Err(_elapsed) => {
                         // No progress for a turn that had a waiter: unstick the
                         // current subscribers, but KEEP the pump alive so the
-                        // next turn still streams.
+                        // next turn still streams. This is a per-turn stall, NOT
+                        // a transport close — no reconnect (#246).
                         let reason = format!(
                             "connection stalled: no events for {}s",
                             stall_timeout.as_secs()
@@ -110,17 +147,130 @@ fn register(subscribers: &Subscribers) -> mpsc::UnboundedReceiver<SignalEvent> {
     rx
 }
 
-/// A connected assistant client plus its automatically-managed event stream.
-pub struct Connector {
-    client: TransportClient,
+/// Tell every current subscriber the connection dropped (so an in-flight turn
+/// errors out instead of hanging) and clear the set. New events on the
+/// reconnected stream go to whoever subscribes next.
+fn disconnect_waiters(subscribers: &Subscribers, reason: &str) {
+    for tx in subscribers.lock().unwrap().drain(..) {
+        let _ = tx.send(SignalEvent::Disconnected {
+            reason: reason.to_string(),
+        });
+    }
+}
+
+/// Next backoff delay: clamp `current` to the cap and add up to ~10% jitter so a
+/// fleet of clients reconnecting after one daemon restart doesn't thunder in
+/// lockstep. Jitter uses a cheap per-call varying source (sub-second nanos of
+/// the wall clock); a tiny bias is harmless for a backoff. (The
+/// `Math.random`/`Date::now` caveat is only for workflow scripts — fine here in
+/// Rust.)
+fn jittered_backoff(current: Duration) -> Duration {
+    let base = current.min(RECONNECT_BACKOFF_MAX);
+    let jitter_span = base.as_millis() as u64 / 10; // up to ~10%
+    let jitter = if jitter_span == 0 {
+        0
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        nanos % (jitter_span + 1)
+    };
+    base + Duration::from_millis(jitter)
+}
+
+/// The reconnect supervisor (#246). Waits on the transport's drop-notifier; on a
+/// socket close it unsticks the current waiters and reconnects the *same*
+/// `TransportClient` in place with capped exponential backoff + jitter,
+/// replaying the remembered client-tool registration after each successful
+/// reconnect. Runs until the task is aborted (Connector dropped) or the
+/// notifier's sender is gone.
+fn spawn_supervisor(
+    config: ConnectionConfig,
+    client: Arc<TransportClient>,
     subscribers: Subscribers,
+    tools: RememberedTools,
+    mut drop_rx: DropNotifier,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Each `()` is one underlying-socket close. The persistent signal stream
+        // keeps flowing across reconnects, so the fan-out never sees the gap —
+        // only this notifier does.
+        while drop_rx.recv().await.is_some() {
+            // The connection is gone. Unstick anyone still waiting on this turn
+            // — it's lost when the server goes away — then reconnect.
+            disconnect_waiters(&subscribers, "signal stream closed");
+
+            // Reconnect with capped exponential backoff + jitter, retrying
+            // indefinitely (a single attempt at a time — no thundering herd)
+            // until the daemon comes back or this task is aborted.
+            let mut backoff = RECONNECT_BACKOFF_INITIAL;
+            loop {
+                tokio::time::sleep(jittered_backoff(backoff)).await;
+                match client.reconnect(&config).await {
+                    Ok(()) => {
+                        // Replay the last client-tool registration (#246) so a
+                        // daemon restart doesn't silently lose this client's
+                        // tools. The daemon replaces its set per call, so
+                        // sending the full remembered list is correct. A failure
+                        // here isn't fatal — the connection is up; log and carry
+                        // on (the next explicit register, or the next reconnect,
+                        // fixes it).
+                        let remembered = tools.lock().unwrap().clone();
+                        if let Some(tools_to_replay) = remembered
+                            && let Some(commands) = client.as_commands()
+                            && let Err(e) = commands.register_client_tools(tools_to_replay).await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to replay client-tool registration after reconnect"
+                            );
+                        }
+                        tracing::info!("connector reconnected after transport drop");
+                        break;
+                    }
+                    Err(e) => {
+                        // Keep retrying with backoff — a long outage (or an
+                        // expired JWT, acceptable for v1) backs off to the cap
+                        // rather than spinning. Surface the reason at debug so an
+                        // operator can see *why* it isn't reconnecting.
+                        tracing::debug!(error = %e, "connector reconnect attempt failed; backing off");
+                        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// A connected assistant client plus its automatically-managed, auto-reconnecting
+/// event stream.
+pub struct Connector {
+    client: Arc<TransportClient>,
+    subscribers: Subscribers,
+    /// Last client-tool registration, replayed after a reconnect (#246).
+    tools: RememberedTools,
     label: String,
+    /// The reconnect supervisor, if the transport supports reconnect (#246).
+    /// `None` for D-Bus. Aborted on drop so the loop stops with the Connector.
+    supervisor: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Connector {
+    fn drop(&mut self) {
+        // Stop the reconnect loop when the last handle goes away; otherwise it
+        // would keep trying to reconnect to a daemon no one is listening to.
+        if let Some(handle) = &self.supervisor {
+            handle.abort();
+        }
+    }
 }
 
 impl Connector {
     /// Connect over the transport named by `config` and start pumping the
-    /// daemon's signal stream to subscribers. Uses the default
-    /// [`EVENT_STALL_TIMEOUT`] for stall detection (#221).
+    /// daemon's signal stream to subscribers, auto-reconnecting on a transport
+    /// drop (#246). Uses the default [`EVENT_STALL_TIMEOUT`] for stall detection
+    /// (#221).
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
         Self::connect_with_stall_timeout(config, EVENT_STALL_TIMEOUT).await
     }
@@ -129,24 +279,53 @@ impl Connector {
     /// window (#221). While a subscriber is attached (a turn may be in flight), a
     /// connection that stays open but emits no event for `stall_timeout` surfaces
     /// a terminal [`SignalEvent::Disconnected`] to the *current* subscribers — but
-    /// the pump keeps running so later turns still stream (voice#49). An idle
-    /// connection with no subscribers is never stalled out. Mainly for tests;
-    /// production callers normally want the default via [`connect`](Self::connect).
+    /// the pump keeps running so later turns still stream (voice#49) and the
+    /// transport is NOT torn down or reconnected (a stall is per-turn, not a
+    /// close). An idle connection with no subscribers is never stalled out.
+    /// Mainly for tests; production callers normally want the default via
+    /// [`connect`](Self::connect).
     pub async fn connect_with_stall_timeout(
         config: &ConnectionConfig,
         stall_timeout: Duration,
     ) -> Result<Self> {
-        let (client, signal_rx) = connect_transport(config).await?;
+        // The initial connect is awaited (and may fail) so the caller gets a
+        // clear error if the daemon isn't up at all; only *subsequent* drops
+        // trigger the background reconnect loop.
+        let (client, signal_rx, drop_rx) = connect_transport(config).await?;
+        let client = Arc::new(client);
+        let subscribers = spawn_fanout_with_stall_timeout(signal_rx, stall_timeout);
+        let tools: RememberedTools = Arc::new(Mutex::new(None));
+
+        // Only the socket transports hand back a drop-notifier; D-Bus doesn't
+        // reconnect (its clients don't use the Connector).
+        let supervisor = drop_rx.map(|drop_rx| {
+            spawn_supervisor(
+                config.clone(),
+                Arc::clone(&client),
+                Arc::clone(&subscribers),
+                Arc::clone(&tools),
+                drop_rx,
+            )
+        });
+
         Ok(Self {
             client,
-            subscribers: spawn_fanout_with_stall_timeout(signal_rx, stall_timeout),
+            subscribers,
+            tools,
             label: transport_label(config),
+            supervisor,
         })
     }
 
     /// A fresh receiver for the daemon's signal stream. Every subscriber sees
     /// every event from the moment it subscribes; drop the receiver to
     /// unsubscribe. Subscribe before sending a prompt so no early chunk is lost.
+    ///
+    /// Survives reconnects (#246): the underlying transport reconnects in place
+    /// and keeps feeding the same stream, so a subscriber registered *after* a
+    /// drop receives the new connection's events. A subscriber that was waiting
+    /// across the drop gets a terminal `Disconnected` (its turn is lost) and
+    /// should re-subscribe for the next turn.
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<SignalEvent> {
         register(&self.subscribers)
     }
@@ -154,12 +333,16 @@ impl Connector {
     /// The underlying transport client — the full [`AssistantClient`] surface
     /// plus [`as_commands`](TransportClient::as_commands) for socket-only
     /// commands not modelled on the convenience methods below.
+    ///
+    /// Stable across reconnects (#246): the same `TransportClient` swaps its own
+    /// socket in place, so a held `&TransportClient` keeps working after a
+    /// daemon restart — callers don't need to re-fetch it.
     pub fn client(&self) -> &TransportClient {
         &self.client
     }
 
     /// Human-readable description of the active connection (e.g. "Connected via
-    /// local socket …").
+    /// local socket …"). Stable across reconnects (the endpoint doesn't change).
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -170,6 +353,13 @@ impl Connector {
     }
 
     /// Send a prompt (works over every transport).
+    ///
+    /// While the transport is mid-reconnect (the daemon is down), the underlying
+    /// socket client rejects the command immediately ("connection closed") or,
+    /// once a fresh connection is up, bounds the wait by the per-command
+    /// dispatch timeout (#221) — so a send during an outage fails fast or
+    /// succeeds on the reconnected transport, never hangs forever. After
+    /// reconnect, commands work normally.
     pub async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String> {
         self.client.send_prompt(conversation_id, prompt).await
     }
@@ -239,6 +429,11 @@ impl Connector {
     /// call — send the full list, not deltas — so re-register on every connect.
     /// Returns the count of tools the daemon accepted.
     ///
+    /// The Connector **remembers** the last registration and replays it
+    /// automatically after an auto-reconnect (#246), so a daemon restart doesn't
+    /// silently drop this client's tools — callers don't have to re-register on
+    /// every reconnect.
+    ///
     /// Client tools ride the socket command channel, so this is supported only
     /// over the UDS/WS transports; the D-Bus transport has no command channel
     /// for it and returns an error.
@@ -247,7 +442,13 @@ impl Connector {
         tools: Vec<api::ClientToolRegistration>,
     ) -> Result<usize> {
         match self.client.as_commands() {
-            Some(commands) => commands.register_client_tools(tools).await,
+            Some(commands) => {
+                let count = commands.register_client_tools(tools.clone()).await?;
+                // Remember the *accepted* registration only after the daemon
+                // confirms it, so a rejected payload isn't replayed on reconnect.
+                *self.tools.lock().unwrap() = Some(tools);
+                Ok(count)
+            }
             None => Err(anyhow::anyhow!(
                 "register_client_tools requires a socket transport (UDS or WS); \
                  the D-Bus transport does not support client tools"
@@ -465,5 +666,33 @@ mod tests {
             "expected the next turn's chunk, got {event:?}"
         );
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn jittered_backoff_never_exceeds_cap_plus_jitter() {
+        // Capped at MAX; jitter adds at most ~10% on top.
+        let d = jittered_backoff(Duration::from_secs(120));
+        let ceiling = RECONNECT_BACKOFF_MAX + RECONNECT_BACKOFF_MAX / 10;
+        assert!(
+            d <= ceiling,
+            "backoff {d:?} should be capped at MAX (+jitter) {ceiling:?}"
+        );
+        assert!(
+            d >= RECONNECT_BACKOFF_MAX,
+            "backoff should be at least the cap when input exceeds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn jittered_backoff_grows_from_initial() {
+        let d = jittered_backoff(RECONNECT_BACKOFF_INITIAL);
+        assert!(
+            d >= RECONNECT_BACKOFF_INITIAL,
+            "backoff {d:?} should be at least the (non-jittered) initial delay"
+        );
+        assert!(
+            d < RECONNECT_BACKOFF_INITIAL * 2,
+            "initial backoff plus ~10% jitter should stay well under a doubling"
+        );
     }
 }

@@ -85,7 +85,7 @@ async fn uds_command_dispatch_times_out_on_a_silent_server() {
 
     // Connect at the raw-client level so we can shorten the dispatch deadline;
     // the production default is 30s, far too long for a unit test.
-    let (mut client, _signals) = UdsClient::connect(&path, "silent-server-no-validation")
+    let (mut client, _signals, _drop) = UdsClient::connect(&path, "silent-server-no-validation")
         .await
         .expect("connect to silent uds");
     client.set_dispatch_timeout(Duration::from_millis(150));
@@ -113,7 +113,7 @@ async fn uds_pending_slot_is_reclaimed_after_a_timeout() {
     spawn_silent_server(path.clone()).await;
     wait_for_socket(&path).await;
 
-    let (mut client, _signals) = UdsClient::connect(&path, "silent-server-no-validation")
+    let (mut client, _signals, _drop) = UdsClient::connect(&path, "silent-server-no-validation")
         .await
         .expect("connect to silent uds");
     client.set_dispatch_timeout(Duration::from_millis(100));

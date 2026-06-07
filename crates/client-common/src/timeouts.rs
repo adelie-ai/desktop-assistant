@@ -38,3 +38,16 @@ pub const EVENT_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 /// [`EVENT_STALL_TIMEOUT`]. Well under the stall window so several pings ride
 /// inside one stall budget.
 pub const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// First delay before the [`Connector`](crate::Connector) retries connecting
+/// after the transport drops (#246). Each subsequent failure doubles the delay
+/// up to [`RECONNECT_BACKOFF_MAX`]; a small jitter is added so a fleet of
+/// clients reconnecting after a single daemon restart doesn't thunder in
+/// lockstep.
+pub const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+
+/// Cap on the [`Connector`](crate::Connector) reconnect backoff (#246). The
+/// delay grows exponentially from [`RECONNECT_BACKOFF_INITIAL`] but never
+/// exceeds this, so a long outage settles into a steady ~30s retry cadence
+/// rather than spinning tightly or backing off into the minutes.
+pub const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);

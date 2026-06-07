@@ -130,7 +130,7 @@ async fn uds_transport_round_trips_commands() {
     wait_for_socket(&path).await;
 
     let config = uds_config(path, mint_test_jwt(&signing_key, "dave"));
-    let (client, _signals) = connect_transport(&config).await.expect("connect over uds");
+    let (client, _signals, _drop) = connect_transport(&config).await.expect("connect over uds");
 
     // Empty-list round-trip: confirms request/response correlation + framing.
     let conversations = timeout(Duration::from_secs(2), client.list_conversations())
@@ -164,7 +164,7 @@ async fn uds_transport_exposes_command_channel_via_as_commands() {
     wait_for_socket(&path).await;
 
     let config = uds_config(path, mint_test_jwt(&signing_key, "dave"));
-    let (client, _signals) = connect_transport(&config).await.expect("connect over uds");
+    let (client, _signals, _drop) = connect_transport(&config).await.expect("connect over uds");
 
     let commands = client
         .as_commands()
@@ -218,7 +218,7 @@ async fn uds_transport_rejects_invalid_jwt() {
     // connect time; the rejection surfaces as a failed command (the server
     // writes an error frame and closes).
     let config = uds_config(path, "not-a-real-jwt".to_string());
-    let (client, _signals) = connect_transport(&config)
+    let (client, _signals, _drop) = connect_transport(&config)
         .await
         .expect("socket connect itself succeeds");
 
