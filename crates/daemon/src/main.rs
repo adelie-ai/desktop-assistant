@@ -1876,6 +1876,18 @@ async fn main() -> Result<()> {
                 )
             })
             .and_then(|b| {
+                // Generic command channel (#213): the shared `AssistantCommands`
+                // surface over D-Bus, dispatching through the same handler the
+                // socket transports use, so `TransportClient::as_commands` works
+                // on every transport.
+                b.serve_at(
+                    "/org/desktopAssistant/Commands",
+                    desktop_assistant_dbus::commands::DbusCommandsAdapter::new(Arc::clone(
+                        &api_handler,
+                    )),
+                )
+            })
+            .and_then(|b| {
                 // Hot-reload trigger (#222): the KCM calls `Reload` after
                 // writing daemon.toml so changes apply without a restart.
                 b.serve_at(

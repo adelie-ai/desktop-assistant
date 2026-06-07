@@ -1,8 +1,8 @@
-//! adele-gtk#49: the generic command channel must be reachable on every
-//! socket transport, so `TransportClient::as_commands` yields a
-//! `&dyn AssistantCommands` for the WebSocket *and* Unix-domain-socket
-//! variants and `None` for D-Bus (which speaks a separate typed zbus
-//! interface).
+//! adele-gtk#49 / #213: the generic command channel must be reachable on
+//! *every* transport, so `TransportClient::as_commands` yields a
+//! `&dyn AssistantCommands` for the WebSocket, Unix-domain-socket *and* D-Bus
+//! variants — there is no longer any connector-specific command surface and
+//! the WS-only `as_ws` accessor has been retired.
 //!
 //! The `Uds` arm and the round-trip of the two promoted command methods over
 //! UDS are exercised in `uds_transport.rs` against the real UDS server. This
@@ -52,22 +52,22 @@ async fn as_commands_returns_some_for_ws_transport() {
         transport.as_commands().is_some(),
         "as_commands must be Some for a WebSocket transport"
     );
-    // `as_ws` is retained alongside `as_commands` for now.
-    assert!(transport.as_ws().is_some());
 }
 
-/// The D-Bus transport speaks a separate typed zbus interface and does not
-/// implement `AssistantCommands`, so `as_commands` must be `None` for it.
+/// #213: the D-Bus transport now implements `AssistantCommands` (round-tripping
+/// `api::Command`/`api::CommandResult` as JSON over `org.desktopAssistant.
+/// Commands`), so `as_commands` must be `Some` for it too — no transport is
+/// left without the management command channel.
 ///
 /// zbus proxies build lazily, so `DbusClient::connect` succeeds against the
 /// session bus without the daemon's service being present. If no session bus
 /// is reachable at all (some CI sandboxes), the capability mapping is still
-/// guaranteed by the type system — the `Dbus` match arm cannot return
-/// `Some(client)` because `DbusClient: !AssistantCommands` — so we skip rather
+/// guaranteed by the type system — the `Dbus` match arm returns
+/// `Some(client)` because `DbusClient: AssistantCommands` — so we skip rather
 /// than fail.
 #[cfg(feature = "dbus")]
 #[tokio::test]
-async fn as_commands_returns_none_for_dbus_transport() {
+async fn as_commands_returns_some_for_dbus_transport() {
     let client = match desktop_assistant_client_common::dbus_client::DbusClient::connect().await {
         Ok(client) => client,
         Err(e) => {
@@ -78,8 +78,7 @@ async fn as_commands_returns_none_for_dbus_transport() {
 
     let transport = TransportClient::Dbus(client);
     assert!(
-        transport.as_commands().is_none(),
-        "as_commands must be None for a D-Bus transport"
+        transport.as_commands().is_some(),
+        "as_commands must be Some for a D-Bus transport (#213)"
     );
-    assert!(transport.as_ws().is_none());
 }

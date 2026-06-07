@@ -61,33 +61,23 @@ pub enum TransportClient {
 }
 
 impl TransportClient {
-    /// Access the underlying WebSocket client when the transport is WS, so
-    /// callers can issue commands that aren't exposed on the shared
-    /// `AssistantClient` trait (e.g. named-connection management).
-    pub fn as_ws(&self) -> Option<&WsClient> {
-        match self {
-            #[cfg(feature = "dbus")]
-            Self::Dbus(_) => None,
-            Self::Ws(client) => Some(client),
-            Self::Uds(_) => None,
-        }
-    }
-
     /// Access the transport-agnostic command channel, so callers can issue
     /// commands that aren't exposed on the high-level [`AssistantClient`]
-    /// facade (config Settings, per-conversation model override, background
-    /// tasks) over *any* socket transport — WebSocket or local UDS.
+    /// facade (config Settings, per-conversation model override / model
+    /// selection, background tasks, purposes, named-connection management)
+    /// over *any* transport.
     ///
-    /// Returns `Some` for the `Ws` and `Uds` variants, which both speak the
-    /// shared `WsRequest`/`WsFrame` protocol via [`AssistantCommands`], and
-    /// `None` for `Dbus`, which talks a separate typed zbus interface and so
-    /// does not implement that trait. This supersedes [`as_ws`](Self::as_ws)
-    /// for command-channel access (adele-gtk#49); `as_ws` is retained until
-    /// downstream callers migrate.
+    /// Returns `Some` for **all three** transports (#213): `Ws` and `Uds`
+    /// speak the shared `WsRequest`/`WsFrame` protocol, and `Dbus` round-trips
+    /// the same `api::Command`/`api::CommandResult` as JSON over the
+    /// `org.desktopAssistant.Commands` interface — all via the single
+    /// [`AssistantCommands`] trait. This replaced the WS-only `as_ws`
+    /// accessor (adele-gtk#49 / #213): there is no longer any
+    /// connector-specific command surface.
     pub fn as_commands(&self) -> Option<&(dyn AssistantCommands + '_)> {
         match self {
             #[cfg(feature = "dbus")]
-            Self::Dbus(_) => None,
+            Self::Dbus(client) => Some(client),
             Self::Ws(client) => Some(client),
             Self::Uds(client) => Some(client),
         }
