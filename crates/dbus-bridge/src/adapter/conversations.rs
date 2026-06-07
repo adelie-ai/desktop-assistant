@@ -17,6 +17,68 @@ fn to_fdo<E: std::fmt::Display>(error: E) -> fdo::Error {
     fdo::Error::Failed(error.to_string())
 }
 
+/// D-Bus ordinal contract for one personality-override trait (#227): `-1` =
+/// unset (fall back to global), `0..=4` pins the level (Never=0 … Always=4).
+/// Mirrors `dbus-interface`'s `trait_from_dbus_ordinal`.
+fn trait_from_dbus_ordinal(name: &str, n: i32) -> fdo::Result<Option<api::PersonalityLevel>> {
+    if n < 0 {
+        return Ok(None);
+    }
+    let ordinal = u8::try_from(n).ok().filter(|v| *v <= 4).ok_or_else(|| {
+        fdo::Error::InvalidArgs(format!(
+            "personality trait {name}: ordinal {n} out of range 0..=4 (or -1 to leave unset)"
+        ))
+    })?;
+    Ok(api::PersonalityLevel::from_ordinal(ordinal))
+}
+
+/// Inverse of [`trait_from_dbus_ordinal`]: `None` → `-1`, `Some` → 0..=4.
+fn trait_to_dbus_ordinal(level: Option<api::PersonalityLevel>) -> i32 {
+    match level {
+        None => -1,
+        Some(l) => l.as_ordinal() as i32,
+    }
+}
+
+/// Build a [`api::PersonalityOverride`] from the 7-ordinal tuple in fixed trait
+/// order (professionalism, warmth, directness, enthusiasm, humor, sarcasm,
+/// pretentiousness).
+#[allow(clippy::too_many_arguments)]
+fn personality_override_from_ordinals(
+    professionalism: i32,
+    warmth: i32,
+    directness: i32,
+    enthusiasm: i32,
+    humor: i32,
+    sarcasm: i32,
+    pretentiousness: i32,
+) -> fdo::Result<api::PersonalityOverride> {
+    Ok(api::PersonalityOverride {
+        professionalism: trait_from_dbus_ordinal("professionalism", professionalism)?,
+        warmth: trait_from_dbus_ordinal("warmth", warmth)?,
+        directness: trait_from_dbus_ordinal("directness", directness)?,
+        enthusiasm: trait_from_dbus_ordinal("enthusiasm", enthusiasm)?,
+        humor: trait_from_dbus_ordinal("humor", humor)?,
+        sarcasm: trait_from_dbus_ordinal("sarcasm", sarcasm)?,
+        pretentiousness: trait_from_dbus_ordinal("pretentiousness", pretentiousness)?,
+    })
+}
+
+/// Inverse of [`personality_override_from_ordinals`].
+fn personality_override_to_ordinals(
+    ovr: &api::PersonalityOverride,
+) -> (i32, i32, i32, i32, i32, i32, i32) {
+    (
+        trait_to_dbus_ordinal(ovr.professionalism),
+        trait_to_dbus_ordinal(ovr.warmth),
+        trait_to_dbus_ordinal(ovr.directness),
+        trait_to_dbus_ordinal(ovr.enthusiasm),
+        trait_to_dbus_ordinal(ovr.humor),
+        trait_to_dbus_ordinal(ovr.sarcasm),
+        trait_to_dbus_ordinal(ovr.pretentiousness),
+    )
+}
+
 /// Translate a transport-level error to a D-Bus error. Daemon-level
 /// errors propagate verbatim; everything else gets a `Failed` with a
 /// descriptive prefix.
@@ -282,6 +344,72 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         }
     }
 
+    /// Set (or clear) a conversation's personality override (#227, Phase 2).
+    /// Each trait is a signed ordinal: `-1` = unset (fall back to global),
+    /// `0..=4` pins the level (Never=0 … Always=4); all `-1` clears the
+    /// override. Args in fixed trait order: professionalism, warmth,
+    /// directness, enthusiasm, humor, sarcasm, pretentiousness. Returns the
+    /// stored override echoed as the same 7-ordinal tuple. Mirrors the
+    /// in-process `dbus-interface` method.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_conversation_personality(
+        &self,
+        conversation_id: &str,
+        professionalism: i32,
+        warmth: i32,
+        directness: i32,
+        enthusiasm: i32,
+        humor: i32,
+        sarcasm: i32,
+        pretentiousness: i32,
+    ) -> fdo::Result<(i32, i32, i32, i32, i32, i32, i32)> {
+        let personality = personality_override_from_ordinals(
+            professionalism,
+            warmth,
+            directness,
+            enthusiasm,
+            humor,
+            sarcasm,
+            pretentiousness,
+        )?;
+        let result = self
+            .dispatch(api::Command::SetConversationPersonality {
+                conversation_id: conversation_id.to_string(),
+                personality,
+            })
+            .await?;
+        match result {
+            api::CommandResult::ConversationPersonality(stored) => {
+                Ok(personality_override_to_ordinals(&stored))
+            }
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetConversationPersonality result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Read a conversation's personality override (#227) as the 7-ordinal
+    /// tuple (`-1` = unset; `0..=4` = pinned). All `-1` when no override is
+    /// stored. Reads `conversation_personality` from `GetConversation`.
+    async fn get_conversation_personality(
+        &self,
+        conversation_id: &str,
+    ) -> fdo::Result<(i32, i32, i32, i32, i32, i32, i32)> {
+        let result = self
+            .dispatch(api::Command::GetConversation {
+                id: conversation_id.to_string(),
+            })
+            .await?;
+        match result {
+            api::CommandResult::Conversation(view) => Ok(personality_override_to_ordinals(
+                &view.conversation_personality.unwrap_or_default(),
+            )),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected GetConversation result: {other:?}"
+            ))),
+        }
+    }
+
     /// Send a prompt; daemon streams back via `AssistantDelta` events
     /// which the event forwarder turns into `ResponseChunk` /
     /// `ResponseComplete` / `ResponseError` signals.
@@ -469,5 +597,92 @@ mod tests {
             }
             other => panic!("expected SendMessage, got {other:?}"),
         }
+    }
+
+    /// Transport that records commands and returns a caller-supplied result,
+    /// so methods whose result is not `SendMessageAck` (e.g. personality) can
+    /// exercise their result-mapping path.
+    struct CannedTransport {
+        commands: Mutex<Vec<api::Command>>,
+        result: api::CommandResult,
+    }
+
+    impl CannedTransport {
+        fn new(result: api::CommandResult) -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+                result,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeTransport for CannedTransport {
+        async fn request(
+            &self,
+            command: api::Command,
+        ) -> Result<api::CommandResult, BridgeTransportError> {
+            self.commands.lock().await.push(command);
+            Ok(self.result.clone())
+        }
+
+        fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
+            let (tx, rx) = broadcast::channel(1);
+            std::mem::forget(tx);
+            rx
+        }
+    }
+
+    #[tokio::test]
+    async fn set_conversation_personality_builds_command_and_maps_ordinals() {
+        // The bridge must translate the 7-ordinal tuple into a partial
+        // `PersonalityOverride` (only pinned traits present) and map the
+        // `ConversationPersonality` result back to ordinals.
+        let stored = api::PersonalityOverride {
+            humor: Some(api::PersonalityLevel::Never),
+            directness: Some(api::PersonalityLevel::Always),
+            ..api::PersonalityOverride::default()
+        };
+        let transport = Arc::new(CannedTransport::new(
+            api::CommandResult::ConversationPersonality(stored),
+        ));
+        let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
+
+        // Pin directness=Always(4), humor=Never(0); rest unset(-1).
+        let echoed = adapter
+            .set_conversation_personality("conv-1", -1, -1, 4, -1, 0, -1, -1)
+            .await
+            .unwrap();
+        assert_eq!(echoed, (-1, -1, 4, -1, 0, -1, -1));
+
+        let commands = transport.commands.lock().await;
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            api::Command::SetConversationPersonality {
+                conversation_id,
+                personality,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(personality.directness, Some(api::PersonalityLevel::Always));
+                assert_eq!(personality.humor, Some(api::PersonalityLevel::Never));
+                // Unset traits are `None` (fall back to global).
+                assert_eq!(personality.warmth, None);
+            }
+            other => panic!("expected SetConversationPersonality, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_conversation_personality_rejects_out_of_range_before_dispatch() {
+        let transport = Arc::new(CannedTransport::new(
+            api::CommandResult::ConversationPersonality(api::PersonalityOverride::default()),
+        ));
+        let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
+        let err = adapter
+            .set_conversation_personality("conv-1", -1, -1, -1, -1, 9, -1, -1)
+            .await;
+        assert!(err.is_err(), "out-of-range ordinal must be rejected");
+        // Validation happens before dispatch — no command sent.
+        assert!(transport.commands.lock().await.is_empty());
     }
 }

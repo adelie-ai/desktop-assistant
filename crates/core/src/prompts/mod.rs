@@ -189,6 +189,61 @@ impl Personality {
     }
 }
 
+/// A partial, per-conversation override of the global [`Personality`] (issue
+/// #227, Phase 2). Each trait is an `Option<PersonalityLevel>`: `Some(level)`
+/// pins that trait for the conversation, `None` falls back to the global value.
+///
+/// Why a separate type rather than reusing `Personality` directly: the global
+/// config is always a *complete* disposition (every trait has a level), but a
+/// conversation override is *partial by design* — a "no-nonsense" client may
+/// only want to force `humor = Never` and `directness = Always` and inherit the
+/// rest of the user's global tuning. Modeling each trait as `Option` makes that
+/// partial intent explicit and type-checked, and keeps [`Self::resolve`] a
+/// trait-by-trait merge rather than an all-or-nothing replacement. The override
+/// only sets the *initial disposition*; it still flows through
+/// [`Personality::render_blurb`], so the adaptation clause continues to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PersonalityOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub professionalism: Option<PersonalityLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmth: Option<PersonalityLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directness: Option<PersonalityLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enthusiasm: Option<PersonalityLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub humor: Option<PersonalityLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sarcasm: Option<PersonalityLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretentiousness: Option<PersonalityLevel>,
+}
+
+impl PersonalityOverride {
+    /// Resolve this partial override against the `global` disposition into a
+    /// concrete [`Personality`]: each `Some` trait wins, each `None` falls back
+    /// to `global`. An all-`None` override resolves to `global` unchanged.
+    pub fn resolve(&self, global: &Personality) -> Personality {
+        Personality {
+            professionalism: self.professionalism.unwrap_or(global.professionalism),
+            warmth: self.warmth.unwrap_or(global.warmth),
+            directness: self.directness.unwrap_or(global.directness),
+            enthusiasm: self.enthusiasm.unwrap_or(global.enthusiasm),
+            humor: self.humor.unwrap_or(global.humor),
+            sarcasm: self.sarcasm.unwrap_or(global.sarcasm),
+            pretentiousness: self.pretentiousness.unwrap_or(global.pretentiousness),
+        }
+    }
+
+    /// `true` when every trait is `None` — i.e. the override pins nothing and
+    /// [`Self::resolve`] returns the global value verbatim. Used by the
+    /// persistence layer to store `NULL` rather than an empty object.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Per-level phrasing for a single trait. Each field is the clause body used at
 /// that level; `Never` has no field because a Never trait is omitted entirely.
 struct TraitPhrasing {
@@ -511,5 +566,99 @@ mod tests {
         assert!(json.contains("\"never\""), "json: {json}");
         let parsed: Personality = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, p);
+    }
+
+    // --- PersonalityOverride (#227, Phase 2) -------------------------------
+
+    #[test]
+    fn override_empty_resolves_to_global_unchanged() {
+        // No override → resolution is the global disposition verbatim. This is
+        // the "no per-conversation override" baseline.
+        let global = Personality {
+            humor: PersonalityLevel::Often,
+            sarcasm: PersonalityLevel::Always,
+            ..Personality::default()
+        };
+        let ovr = PersonalityOverride::default();
+        assert!(ovr.is_empty());
+        assert_eq!(ovr.resolve(&global), global);
+    }
+
+    #[test]
+    fn override_some_trait_wins_per_trait() {
+        // A "no-nonsense" override forces humor/sarcasm off and directness up;
+        // each pinned trait wins over the global value.
+        let global = Personality::default();
+        let ovr = PersonalityOverride {
+            humor: Some(PersonalityLevel::Never),
+            sarcasm: Some(PersonalityLevel::Never),
+            directness: Some(PersonalityLevel::Always),
+            ..PersonalityOverride::default()
+        };
+        let resolved = ovr.resolve(&global);
+        assert_eq!(resolved.humor, PersonalityLevel::Never);
+        assert_eq!(resolved.sarcasm, PersonalityLevel::Never);
+        assert_eq!(resolved.directness, PersonalityLevel::Always);
+    }
+
+    #[test]
+    fn override_unspecified_traits_fall_back_to_global() {
+        // Traits the override leaves `None` inherit the global value, even when
+        // the global differs from the built-in default.
+        let global = Personality {
+            professionalism: PersonalityLevel::Rarely,
+            warmth: PersonalityLevel::Always,
+            enthusiasm: PersonalityLevel::Always,
+            pretentiousness: PersonalityLevel::Often,
+            ..Personality::default()
+        };
+        let ovr = PersonalityOverride {
+            humor: Some(PersonalityLevel::Never),
+            ..PersonalityOverride::default()
+        };
+        let resolved = ovr.resolve(&global);
+        // Pinned trait wins.
+        assert_eq!(resolved.humor, PersonalityLevel::Never);
+        // Every unspecified trait falls back to the (non-default) global.
+        assert_eq!(resolved.professionalism, PersonalityLevel::Rarely);
+        assert_eq!(resolved.warmth, PersonalityLevel::Always);
+        assert_eq!(resolved.directness, global.directness);
+        assert_eq!(resolved.enthusiasm, PersonalityLevel::Always);
+        assert_eq!(resolved.sarcasm, global.sarcasm);
+        assert_eq!(resolved.pretentiousness, PersonalityLevel::Often);
+    }
+
+    #[test]
+    fn override_is_empty_only_when_all_none() {
+        assert!(PersonalityOverride::default().is_empty());
+        assert!(
+            !PersonalityOverride {
+                humor: Some(PersonalityLevel::Never),
+                ..PersonalityOverride::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn override_serde_omits_none_traits_and_round_trips() {
+        // Only the pinned trait should appear on the wire; the rest are omitted
+        // (skip_serializing_if) so a partial override stays compact. Round-trip
+        // must be lossless.
+        let ovr = PersonalityOverride {
+            humor: Some(PersonalityLevel::Never),
+            ..PersonalityOverride::default()
+        };
+        let json = serde_json::to_string(&ovr).unwrap();
+        assert!(json.contains("\"humor\""), "json: {json}");
+        assert!(json.contains("\"never\""), "json: {json}");
+        assert!(!json.contains("\"warmth\""), "json: {json}");
+        let parsed: PersonalityOverride = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ovr);
+        // An empty override serializes to `{}` and round-trips to empty.
+        let empty_json = serde_json::to_string(&PersonalityOverride::default()).unwrap();
+        assert_eq!(empty_json, "{}");
+        let back: PersonalityOverride = serde_json::from_str("{}").unwrap();
+        assert!(back.is_empty());
     }
 }

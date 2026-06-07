@@ -965,6 +965,13 @@ where
                     .await
                     .map_err(Self::map_core_err)?
                     .map(model_selection_to_view);
+                // #227: surface the conversation's personality override
+                // alongside the model selection. `None` = no override (global).
+                let conversation_personality = self
+                    .conversations
+                    .get_conversation_personality(&conv_id)
+                    .await
+                    .map_err(Self::map_core_err)?;
 
                 Ok(api::CommandResult::Conversation(api::ConversationView {
                     id: conv.id.0,
@@ -979,7 +986,29 @@ where
                         .collect(),
                     warnings: Vec::new(),
                     model_selection,
+                    conversation_personality,
                 }))
+            }
+
+            api::Command::SetConversationPersonality {
+                conversation_id,
+                personality,
+            } => {
+                let conv_id =
+                    desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str());
+                self.conversations
+                    .set_conversation_personality(&conv_id, personality)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                // Echo the stored value (cleared → empty/all-None) so the
+                // client confirms the write, mirroring `SetScratchpadNote`.
+                let stored = self
+                    .conversations
+                    .get_conversation_personality(&conv_id)
+                    .await
+                    .map_err(Self::map_core_err)?
+                    .unwrap_or_default();
+                Ok(api::CommandResult::ConversationPersonality(stored))
             }
 
             api::Command::DeleteConversation { id } => {

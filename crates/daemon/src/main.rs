@@ -637,6 +637,29 @@ impl api_surface::ConversationSelectionStore for SharedConversationStore {
         )
         .await
     }
+
+    async fn get_personality(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<Option<desktop_assistant_core::prompts::PersonalityOverride>, CoreError> {
+        <AnyConversationStore as api_surface::ConversationSelectionStore>::get_personality(
+            &self.0, id,
+        )
+        .await
+    }
+
+    async fn set_personality(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+        personality: Option<&desktop_assistant_core::prompts::PersonalityOverride>,
+    ) -> Result<(), CoreError> {
+        <AnyConversationStore as api_surface::ConversationSelectionStore>::set_personality(
+            &self.0,
+            id,
+            personality,
+        )
+        .await
+    }
 }
 
 // Per-conversation model selection. Only the Postgres backend persists
@@ -669,6 +692,32 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
             Self::Json(_) => {
                 // No-op on the JSON backend — see comment on `get_selection`.
                 let _ = selection;
+                Ok(())
+            }
+        }
+    }
+
+    // Per-conversation personality override (#227). Same backend split as the
+    // model selection above: only Postgres persists; the JSON fallback drops it.
+    async fn get_personality(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<Option<desktop_assistant_core::prompts::PersonalityOverride>, CoreError> {
+        match self {
+            Self::Postgres(s) => s.get_conversation_personality(id).await,
+            Self::Json(_) => Ok(None),
+        }
+    }
+
+    async fn set_personality(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+        personality: Option<&desktop_assistant_core::prompts::PersonalityOverride>,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Postgres(s) => s.set_conversation_personality(id, personality).await,
+            Self::Json(_) => {
+                let _ = personality;
                 Ok(())
             }
         }

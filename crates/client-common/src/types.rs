@@ -20,6 +20,9 @@ pub struct ConversationDetail {
     pub title: String,
     pub messages: Vec<ChatMessage>,
     pub model_selection: Option<api::ConversationModelSelectionView>,
+    /// The conversation's stored personality override (#227), or `None` when it
+    /// uses the global personality. A picker pre-fills its sliders from this.
+    pub conversation_personality: Option<api::ConversationPersonalityView>,
 }
 
 impl From<api::ConversationSummary> for ConversationSummary {
@@ -49,6 +52,7 @@ impl From<api::ConversationView> for ConversationDetail {
             title: value.title,
             messages: value.messages.into_iter().map(ChatMessage::from).collect(),
             model_selection: value.model_selection,
+            conversation_personality: value.conversation_personality,
         }
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use desktop_assistant_core::domain::ConversationId;
 use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 use desktop_assistant_core::ports::inbound::ConversationService;
+use desktop_assistant_core::prompts::{PersonalityLevel, PersonalityOverride};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zbus::object_server::SignalEmitter;
@@ -195,6 +196,33 @@ where
         user_id_for_body,
         run_send_prompt_llm_task(service, conversation_id, prompt, system_refinement, tx),
     ))
+}
+
+/// D-Bus ordinal contract for one personality-override trait (#227): `-1`
+/// means "unset" (fall back to the global config), `0..=4` pins the level
+/// (Never=0 … Always=4). Out-of-range positives are rejected. Mirrors the
+/// signed-int "unset" convention the settings interface uses (e.g.
+/// `llm_hosted_tool_search = -1`), while reusing the 0..=4 personality ordinal
+/// contract the KCM already binds to.
+fn trait_from_dbus_ordinal(name: &str, n: i32) -> fdo::Result<Option<PersonalityLevel>> {
+    if n < 0 {
+        return Ok(None);
+    }
+    let ordinal = u8::try_from(n).ok().filter(|v| *v <= 4).ok_or_else(|| {
+        fdo::Error::InvalidArgs(format!(
+            "personality trait {name}: ordinal {n} out of range 0..=4 (or -1 to leave unset)"
+        ))
+    })?;
+    Ok(PersonalityLevel::from_ordinal(ordinal))
+}
+
+/// Inverse of [`trait_from_dbus_ordinal`]: `None` → `-1`, `Some(level)` → its
+/// 0..=4 ordinal.
+fn trait_to_dbus_ordinal(level: Option<PersonalityLevel>) -> i32 {
+    match level {
+        None => -1,
+        Some(l) => l.as_ordinal() as i32,
+    }
 }
 
 #[interface(name = "org.desktopAssistant.Conversations")]
@@ -393,6 +421,90 @@ impl<S: ConversationService + 'static> DbusConversationAdapter<S> {
                 .clear_all_history()
                 .await
                 .map_err(|e| fdo::Error::Failed(e.to_string()))
+        })
+        .await
+    }
+
+    /// Set (or clear) a conversation's personality override (#227, Phase 2).
+    ///
+    /// Each trait is a signed ordinal: `-1` leaves it unset (falls back to the
+    /// global config on every send), `0..=4` pins the level (Never=0 …
+    /// Always=4). When every trait is `-1` the override is cleared
+    /// (global-only). The override sets only the *initial disposition* — the
+    /// assistant stays soft/adaptive. Arguments are in the fixed trait order:
+    /// professionalism, warmth, directness, enthusiasm, humor, sarcasm,
+    /// pretentiousness. Returns the stored override echoed back as the same
+    /// 7-ordinal tuple (cleared → all `-1`).
+    #[allow(clippy::too_many_arguments)]
+    async fn set_conversation_personality(
+        &self,
+        conversation_id: &str,
+        professionalism: i32,
+        warmth: i32,
+        directness: i32,
+        enthusiasm: i32,
+        humor: i32,
+        sarcasm: i32,
+        pretentiousness: i32,
+    ) -> fdo::Result<(i32, i32, i32, i32, i32, i32, i32)> {
+        let ovr = PersonalityOverride {
+            professionalism: trait_from_dbus_ordinal("professionalism", professionalism)?,
+            warmth: trait_from_dbus_ordinal("warmth", warmth)?,
+            directness: trait_from_dbus_ordinal("directness", directness)?,
+            enthusiasm: trait_from_dbus_ordinal("enthusiasm", enthusiasm)?,
+            humor: trait_from_dbus_ordinal("humor", humor)?,
+            sarcasm: trait_from_dbus_ordinal("sarcasm", sarcasm)?,
+            pretentiousness: trait_from_dbus_ordinal("pretentiousness", pretentiousness)?,
+        };
+        with_user_id(resolve_dbus_user_id(), async {
+            let id = ConversationId::from(conversation_id);
+            self.service
+                .set_conversation_personality(&id, ovr)
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            // Echo the stored value (cleared → all-None → all -1).
+            let stored = self
+                .service
+                .get_conversation_personality(&id)
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))?
+                .unwrap_or_default();
+            Ok((
+                trait_to_dbus_ordinal(stored.professionalism),
+                trait_to_dbus_ordinal(stored.warmth),
+                trait_to_dbus_ordinal(stored.directness),
+                trait_to_dbus_ordinal(stored.enthusiasm),
+                trait_to_dbus_ordinal(stored.humor),
+                trait_to_dbus_ordinal(stored.sarcasm),
+                trait_to_dbus_ordinal(stored.pretentiousness),
+            ))
+        })
+        .await
+    }
+
+    /// Read a conversation's personality override (#227) as the 7-ordinal tuple
+    /// (`-1` = unset / global fallback; `0..=4` = pinned level). When no
+    /// override is stored every value is `-1`.
+    async fn get_conversation_personality(
+        &self,
+        conversation_id: &str,
+    ) -> fdo::Result<(i32, i32, i32, i32, i32, i32, i32)> {
+        with_user_id(resolve_dbus_user_id(), async {
+            let stored = self
+                .service
+                .get_conversation_personality(&ConversationId::from(conversation_id))
+                .await
+                .map_err(|e| fdo::Error::Failed(e.to_string()))?
+                .unwrap_or_default();
+            Ok((
+                trait_to_dbus_ordinal(stored.professionalism),
+                trait_to_dbus_ordinal(stored.warmth),
+                trait_to_dbus_ordinal(stored.directness),
+                trait_to_dbus_ordinal(stored.enthusiasm),
+                trait_to_dbus_ordinal(stored.humor),
+                trait_to_dbus_ordinal(stored.sarcasm),
+                trait_to_dbus_ordinal(stored.pretentiousness),
+            ))
         })
         .await
     }
@@ -836,6 +948,149 @@ mod tests {
             Some("Respond briefly, by voice."),
             "the configured hint must be carried as the per-request system_refinement"
         );
+    }
+
+    // --- #227: per-conversation personality ordinal contract ---------------
+
+    #[test]
+    fn personality_trait_ordinal_round_trips_through_dbus() {
+        // -1 means "unset / fall back to global".
+        assert_eq!(trait_from_dbus_ordinal("humor", -1).unwrap(), None);
+        assert_eq!(trait_to_dbus_ordinal(None), -1);
+        // 0..=4 round-trips to the level and back.
+        for (n, level) in [
+            (0, PersonalityLevel::Never),
+            (1, PersonalityLevel::Rarely),
+            (2, PersonalityLevel::Sometimes),
+            (3, PersonalityLevel::Often),
+            (4, PersonalityLevel::Always),
+        ] {
+            assert_eq!(
+                trait_from_dbus_ordinal("humor", n).unwrap(),
+                Some(level),
+                "ordinal {n} must map to {level:?}"
+            );
+            assert_eq!(trait_to_dbus_ordinal(Some(level)), n);
+        }
+        // Out-of-range positive is rejected, not clamped.
+        assert!(trait_from_dbus_ordinal("humor", 5).is_err());
+    }
+
+    /// Conversation service double that stores a per-conversation personality
+    /// override in memory so the D-Bus method's persist + echo can be asserted.
+    struct PersonalityStoringService {
+        stored: Mutex<Option<PersonalityOverride>>,
+    }
+
+    impl PersonalityStoringService {
+        fn new() -> Self {
+            Self {
+                stored: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConversationService for PersonalityStoringService {
+        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("c", title))
+        }
+        async fn list_conversations(
+            &self,
+            _: Option<u32>,
+            _: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _: &ConversationId,
+            _: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _: &ConversationId,
+            _: String,
+            _: ChunkCallback,
+            _: StatusCallback,
+        ) -> Result<String, CoreError> {
+            Ok(String::new())
+        }
+        async fn get_conversation_personality(
+            &self,
+            _: &ConversationId,
+        ) -> Result<Option<PersonalityOverride>, CoreError> {
+            Ok(*self.stored.lock().unwrap())
+        }
+        async fn set_conversation_personality(
+            &self,
+            _: &ConversationId,
+            personality: PersonalityOverride,
+        ) -> Result<(), CoreError> {
+            // Mirror the routing wrapper: an empty override clears the store.
+            *self.stored.lock().unwrap() = if personality.is_empty() {
+                None
+            } else {
+                Some(personality)
+            };
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dbus_set_get_conversation_personality_round_trips_and_clears() {
+        let service = Arc::new(PersonalityStoringService::new());
+        let adapter = DbusConversationAdapter::new(Arc::clone(&service));
+        let _guard = crate::testing::UserEnvGuard::set("alice");
+
+        // Pin humor=Never(0) and directness=Always(4); leave the rest unset(-1).
+        let echoed = adapter
+            .set_conversation_personality("c1", -1, -1, 4, -1, 0, -1, -1)
+            .await
+            .unwrap();
+        // Echo: directness=4, humor=0, rest -1.
+        assert_eq!(echoed, (-1, -1, 4, -1, 0, -1, -1));
+
+        // GET reflects the stored value.
+        let got = adapter.get_conversation_personality("c1").await.unwrap();
+        assert_eq!(got, (-1, -1, 4, -1, 0, -1, -1));
+
+        // All -1 clears the override → GET returns all -1.
+        let cleared = adapter
+            .set_conversation_personality("c1", -1, -1, -1, -1, -1, -1, -1)
+            .await
+            .unwrap();
+        assert_eq!(cleared, (-1, -1, -1, -1, -1, -1, -1));
+        assert!(service.stored.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dbus_set_conversation_personality_rejects_out_of_range() {
+        let service = Arc::new(PersonalityStoringService::new());
+        let adapter = DbusConversationAdapter::new(service);
+        let _guard = crate::testing::UserEnvGuard::set("alice");
+        // ordinal 5 is out of range for the humor slot.
+        let err = adapter
+            .set_conversation_personality("c1", -1, -1, -1, -1, 5, -1, -1)
+            .await;
+        assert!(err.is_err(), "out-of-range ordinal must be rejected");
     }
 
     struct FakeConversationService;

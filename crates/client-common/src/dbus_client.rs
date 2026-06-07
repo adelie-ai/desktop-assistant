@@ -234,6 +234,7 @@ impl DbusClient {
                 .map(|(role, content)| ChatMessage { role, content })
                 .collect(),
             model_selection: None,
+            conversation_personality: None,
         })
     }
 

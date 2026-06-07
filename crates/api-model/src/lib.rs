@@ -83,6 +83,21 @@ pub enum Command {
         idempotency_key: Option<String>,
     },
 
+    /// Set (or clear) a conversation's personality override (issue #227,
+    /// Phase 2). `personality` is a *partial* [`ConversationPersonalityView`]
+    /// (a [`PersonalityOverride`]): each `Some` trait pins that trait for the
+    /// conversation, each `None` falls back to the global config on every send.
+    /// An all-`None`/empty override clears the stored override (back to
+    /// global-only). The override sets only the *initial disposition* — the
+    /// assistant stays soft/adaptive. Returns
+    /// [`CommandResult::ConversationPersonality`] echoing the stored value.
+    /// Mirrors the per-conversation model selection: stored on the
+    /// conversation, resolved on the send path against the global config.
+    SetConversationPersonality {
+        conversation_id: String,
+        personality: ConversationPersonalityView,
+    },
+
     // Settings (legacy `[llm]`-block single-connection surface).
     //
     // The legacy `SetLlmSettings` / `GetLlmSettings` commands have been
@@ -386,6 +401,12 @@ pub enum CommandResult {
     /// requested (or just-saved) scratchpad notes for the conversation.
     Scratchpad(Vec<ScratchpadNoteView>),
 
+    /// Response to `SetConversationPersonality` — the conversation's stored
+    /// personality override after the write (#227). An empty/all-`None` view
+    /// means the override was cleared and the conversation falls back to the
+    /// global personality on every send.
+    ConversationPersonality(ConversationPersonalityView),
+
     // --- Background tasks (issue #110) ------------------------------------
     /// Response to `ListBackgroundTasks`.
     BackgroundTasks(Vec<TaskView>),
@@ -645,6 +666,12 @@ pub struct ConversationView {
     /// longer resolves (see `ConversationWarning::DanglingModelSelection`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_selection: Option<ConversationModelSelectionView>,
+    /// The conversation's stored personality override (#227), when one has been
+    /// pinned by a prior `SetConversationPersonality`. `None` means the
+    /// conversation uses the global personality. Like `model_selection`, this is
+    /// a partial override resolved against the global config on each send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_personality: Option<ConversationPersonalityView>,
 }
 
 /// Advisory conditions attached to a conversation view. Modeled as an enum
@@ -851,6 +878,14 @@ pub use desktop_assistant_core::ports::inbound::PurposeKind as PurposeKindApi;
 // identity `From` impl.
 pub use desktop_assistant_core::prompts::{Personality, PersonalityLevel};
 pub type PersonalitySettingsView = Personality;
+
+// Per-conversation personality override (#227, Phase 2). Re-export the canonical
+// core [`PersonalityOverride`] (7 optional trait levels) so the per-conversation
+// command/view shares one schema with the resolution logic in core. The view
+// returned by `GetConversation` / `SetConversationPersonality` is that override
+// verbatim, so converting between wire and core is the identity.
+pub use desktop_assistant_core::prompts::PersonalityOverride;
+pub type ConversationPersonalityView = PersonalityOverride;
 
 /// Protocol-neutral purpose config. String `"primary"` in the connection or
 /// model field means "inherit from interactive" — the daemon resolves this
@@ -2078,5 +2113,77 @@ mod tests {
         assert!(!json.contains("personality_warmth"), "json: {json}");
         let back: ConfigChanges = serde_json::from_str(&json).unwrap();
         assert_eq!(changes, back);
+    }
+
+    // --- Per-conversation personality override wire types (#227) ------------
+
+    #[test]
+    fn set_conversation_personality_command_round_trips() {
+        // The command carries the conversation id and a partial override; it
+        // must round-trip losslessly so the daemon parses exactly what the
+        // client (tui/gtk picker) sent.
+        let cmd = Command::SetConversationPersonality {
+            conversation_id: "conv-1".into(),
+            personality: ConversationPersonalityView {
+                humor: Some(PersonalityLevel::Never),
+                directness: Some(PersonalityLevel::Always),
+                ..ConversationPersonalityView::default()
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(
+            json.contains("\"set_conversation_personality\""),
+            "json: {json}"
+        );
+        // Only the pinned traits are on the wire (skip_serializing_if).
+        assert!(json.contains("\"humor\""), "json: {json}");
+        assert!(json.contains("\"directness\""), "json: {json}");
+        assert!(!json.contains("\"warmth\""), "json: {json}");
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn conversation_personality_result_round_trips() {
+        let res = CommandResult::ConversationPersonality(ConversationPersonalityView {
+            sarcasm: Some(PersonalityLevel::Never),
+            ..ConversationPersonalityView::default()
+        });
+        let json = serde_json::to_string(&res).unwrap();
+        assert!(
+            json.contains("\"conversation_personality\""),
+            "json: {json}"
+        );
+        let back: CommandResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn conversation_view_carries_optional_personality_override() {
+        // `conversation_personality` is omitted from the wire when `None`
+        // (no override) and present when an override is stored — mirrors
+        // `model_selection`.
+        let mut view = ConversationView {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![],
+            warnings: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(
+            !json.contains("conversation_personality"),
+            "absent override must not appear on the wire: {json}"
+        );
+
+        view.conversation_personality = Some(ConversationPersonalityView {
+            humor: Some(PersonalityLevel::Never),
+            ..ConversationPersonalityView::default()
+        });
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("conversation_personality"), "json: {json}");
+        let back: ConversationView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
     }
 }
