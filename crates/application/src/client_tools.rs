@@ -38,16 +38,18 @@
 //! disagrees with the resolver's, exactly the
 //! `turn_cross_user_isolation` test acceptance criterion.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::auth::current_user_id;
+use desktop_assistant_core::ports::client_tools::ClientToolPort;
 use desktop_assistant_core::ports::llm::current_cancellation_token;
 use desktop_assistant_core::ports::store::{
-    PendingClientToolCall, TurnStateJson, TurnStateStore, TurnStatus,
+    PendingClientToolCall, TurnRow, TurnStateJson, TurnStateStore, TurnStatus,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -111,14 +113,17 @@ const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 1_048_576;
 /// internal mutexes around small `HashMap`s — there is no async work
 /// inside the mutex critical sections, so blocking is bounded.
 pub struct ClientToolCoordinator {
-    /// Per-user set of currently-registered tool names. The
+    /// Per-user map of currently-registered client-local tools, keyed by
+    /// tool name → full registration (description + input schema). The
     /// architecture's "per-session" registration semantic collapses to
     /// "per-user" in this slice: the application layer has no native
     /// concept of a connection session yet, and the tests pin that
     /// registration is overwritten on each new `RegisterClientTools`
     /// call so a reconnecting client gets the same per-session
-    /// behaviour without us tracking the connection.
-    registrations: Mutex<HashMap<String, HashSet<String>>>,
+    /// behaviour without us tracking the connection. The full registration
+    /// (not just the name) is retained so the turn loop can offer the tool's
+    /// schema to the LLM (#234).
+    registrations: Mutex<HashMap<String, HashMap<String, api::ClientToolRegistration>>>,
     /// In-flight suspensions, keyed by task_id. Each entry holds the
     /// expected `tool_call_id` so the resolver can refuse mismatches
     /// without consulting the DB, and the oneshot sender used to wake
@@ -151,7 +156,7 @@ impl ClientToolCoordinator {
         let entry = regs.entry(user_id).or_default();
         entry.clear();
         for t in tools {
-            entry.insert(t.name.clone());
+            entry.insert(t.name.clone(), t.clone());
         }
         u32::try_from(entry.len()).unwrap_or(u32::MAX)
     }
@@ -161,8 +166,31 @@ impl ClientToolCoordinator {
         let user_id = current_user_id().as_str().to_string();
         let regs = self.registrations.lock().unwrap();
         regs.get(&user_id)
-            .map(|set| set.contains(name))
+            .map(|set| set.contains_key(name))
             .unwrap_or(false)
+    }
+
+    /// The tool definitions registered as client-local for the current user,
+    /// in the shape the LLM tool list expects (#234). Maps each
+    /// [`api::ClientToolRegistration`] to a core [`ToolDefinition`] so the
+    /// turn loop can offer them to the model without `core` depending on
+    /// `api-model`.
+    pub async fn registered_definitions(&self) -> Vec<ToolDefinition> {
+        let user_id = current_user_id().as_str().to_string();
+        let regs = self.registrations.lock().unwrap();
+        regs.get(&user_id)
+            .map(|set| {
+                set.values()
+                    .map(|r| {
+                        ToolDefinition::new(
+                            r.name.clone(),
+                            r.description.clone(),
+                            r.input_schema.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -398,4 +426,170 @@ pub async fn sweep_non_terminal_turns_on_startup(
         count = count.saturating_add(1);
     }
     Ok(count)
+}
+
+/// Per-turn adapter implementing the core [`ClientToolPort`] (#234).
+///
+/// The shared [`ClientToolCoordinator`] and [`TurnStateStore`] live for the
+/// life of the daemon; the `task_id`, `conversation_id`, and the turn's
+/// [`EventSink`] are only known once a `send_prompt` is in flight. The
+/// application's send-turn body constructs one of these per turn (cheap — all
+/// `Arc` clones plus three owned strings) and installs it via
+/// [`desktop_assistant_core::ports::client_tools::with_client_tools`] so the
+/// core dispatch loop can consult the registered set and suspend on a
+/// client-local tool call without `core` depending on `application`.
+///
+/// User scoping is implicit: every coordinator entry point reads
+/// `current_user_id()` from the task-local the dispatcher installed, so this
+/// adapter's `tool_definitions`/`is_registered`/`execute` are all scoped to
+/// the connection's user.
+pub struct CoordinatorClientToolPort {
+    coord: Arc<ClientToolCoordinator>,
+    store: Arc<dyn TurnStateStore>,
+    sink: Arc<dyn EventSink>,
+    task_id: api::TaskId,
+    conversation_id: String,
+}
+
+impl CoordinatorClientToolPort {
+    /// Build the per-turn adapter. `task_id` is the registry task id for the
+    /// turn — the same id the client received in `SendMessageAck` and the id
+    /// the emitted `ClientToolCall` / inbound `ClientToolResult` correlate on.
+    pub fn new(
+        coord: Arc<ClientToolCoordinator>,
+        store: Arc<dyn TurnStateStore>,
+        sink: Arc<dyn EventSink>,
+        task_id: api::TaskId,
+        conversation_id: String,
+    ) -> Self {
+        Self {
+            coord,
+            store,
+            sink,
+            task_id,
+            conversation_id,
+        }
+    }
+
+    /// Ensure a turn row exists before the coordinator's `update_turn` writes
+    /// the `pending_client_tool` transition. The row is created lazily on the
+    /// first client-tool suspension of the turn (turns that never call a
+    /// client tool never create a row). A row created by an earlier suspension
+    /// in the same turn — or by a concurrent racer — is fine: a duplicate-id
+    /// `create_turn` error is swallowed, leaving the existing row untouched.
+    async fn ensure_turn_row(&self) {
+        let row = TurnRow {
+            id: self.task_id.0.clone(),
+            user_id: current_user_id().as_str().to_string(),
+            conversation_id: self.conversation_id.clone(),
+            status: TurnStatus::PendingLlm,
+            state: TurnStateJson::default(),
+            last_error: None,
+        };
+        // Best-effort: a dup id just means the row already exists. Any other
+        // storage error is left for `suspend_for_client_tool`'s own
+        // `update_turn` to surface.
+        let _ = self.store.create_turn(row).await;
+    }
+}
+
+/// In-memory [`TurnStateStore`] for the live single-node deploy (#234).
+///
+/// Phase-2 of the architecture (`docs/architecture-evolution.md`) calls for
+/// a DB-persisted turn-state machine so a crashed daemon can sweep abandoned
+/// turns and a Lambda invocation can resume one. That durable store is future
+/// work; this slice activates client-tool execution on the live UDS path,
+/// where the daemon is a long-lived single process and the turn row only
+/// needs to survive within that process. This map provides exactly that: it
+/// records the `pending_client_tool` transition so the coordinator's
+/// suspend/resolve dance has a backing row, and `scan_non_terminal` lets the
+/// startup sweep clear anything a restart left behind (here, nothing, since
+/// the map starts empty). Swapping in a `PgTurnStateStore` later is a drop-in
+/// behind the same trait.
+#[derive(Default)]
+pub struct InMemoryTurnStateStore {
+    rows: Mutex<HashMap<String, TurnRow>>,
+}
+
+impl InMemoryTurnStateStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnStateStore for InMemoryTurnStateStore {
+    async fn create_turn(&self, row: TurnRow) -> Result<(), CoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        if rows.contains_key(&row.id) {
+            return Err(CoreError::Storage(format!("duplicate turn id: {}", row.id)));
+        }
+        rows.insert(row.id.clone(), row);
+        Ok(())
+    }
+
+    async fn get_turn(&self, id: &str) -> Result<Option<TurnRow>, CoreError> {
+        Ok(self.rows.lock().unwrap().get(id).cloned())
+    }
+
+    async fn update_turn(
+        &self,
+        id: &str,
+        status: TurnStatus,
+        state: &TurnStateJson,
+        last_error: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows
+            .get_mut(id)
+            .ok_or_else(|| CoreError::Storage(format!("turn missing: {id}")))?;
+        row.status = status;
+        row.state = state.clone();
+        row.last_error = last_error.map(String::from);
+        Ok(())
+    }
+
+    async fn scan_non_terminal(&self) -> Result<Vec<TurnRow>, CoreError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| !r.status.is_terminal())
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl ClientToolPort for CoordinatorClientToolPort {
+    async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.coord.registered_definitions().await
+    }
+
+    async fn is_registered(&self, name: &str) -> bool {
+        self.coord.is_client_registered(name).await
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String, CoreError> {
+        self.ensure_turn_row().await;
+        suspend_for_client_tool(
+            &self.coord,
+            &*self.store,
+            &*self.sink,
+            self.task_id.clone(),
+            self.conversation_id.clone(),
+            PendingClientToolCall {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments,
+            },
+        )
+        .await
+    }
 }
