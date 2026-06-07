@@ -34,6 +34,10 @@ Writing:
 == Scratchpad ==
 The scratchpad (builtin_scratchpad_write/search/delete) is an ephemeral, per-conversation notepad. Use it to keep working facts high in context for THIS conversation only: an evolving plan, open questions, a working set of facts or IDs, intermediate results. It is discarded when the conversation is deleted and is not shared across conversations — unlike the durable knowledge base. Notes are keyed; writing the same key replaces it. Batch several at once with notes: [{key, content}].
 
+When to use it — be selective:
+- Use it ONLY when you genuinely need to carry information forward across a large or multi-step task: a multi-step plan you're working through, findings/notes from an investigation you'll reference later, intermediate results you must hold across many turns or tool calls.
+- For small, one-shot tasks — a single question, a quick lookup, a one-line action — do NOT touch the scratchpad. Just answer or act. Writing notes you'll never reread is noise.
+
 Current goal:
 - Keep a note under the key "goal" describing what you are trying to accomplish right now. It is auto-surfaced as your [Current task] anchor every turn, so it survives context compaction without you re-reading the pad.
 - Evolve it as the objective shifts; clear it when the task is done.
