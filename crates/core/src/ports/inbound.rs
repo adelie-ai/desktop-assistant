@@ -52,6 +52,11 @@ pub struct DatabaseSettingsView {
     pub max_connections: u32,
 }
 
+/// Resolved assistant-personality settings (issue #226). A thin alias for the
+/// canonical [`crate::prompts::Personality`] so the settings surface carries
+/// the same typed trait set the prompt assembler uses — no parallel schema.
+pub type PersonalitySettingsView = crate::prompts::Personality;
+
 #[derive(Debug, Clone)]
 pub struct McpServerView {
     pub name: String,
@@ -559,6 +564,31 @@ pub trait SettingsService: Send + Sync {
         url: Option<String>,
         max_connections: u32,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// Return the active assistant personality (issue #226).
+    ///
+    /// Default returns the Expressive-7 [`crate::prompts::Personality::default`]
+    /// so test mocks and adapters that don't manage personality opt out without
+    /// boilerplate; the daemon's real service overrides it to read the resolved
+    /// config.
+    fn get_personality_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<PersonalitySettingsView, CoreError>> + Send {
+        async { Ok(PersonalitySettingsView::default()) }
+    }
+
+    /// Update the active assistant personality (issue #226).
+    ///
+    /// Default is a no-op (`Ok`) so mocks/adapters that don't manage
+    /// personality opt out; the daemon's real service overrides it to persist
+    /// the change and refresh the in-memory config used by the next send.
+    fn set_personality_settings(
+        &self,
+        personality: PersonalitySettingsView,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        let _ = personality;
+        async { Ok(()) }
+    }
 
     fn get_backend_tasks_settings(
         &self,

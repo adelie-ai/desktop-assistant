@@ -1,17 +1,26 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
     BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView,
-    LlmSettingsView, McpServerView, PersistenceSettingsView, SettingsService, WsAuthSettingsView,
+    LlmSettingsView, McpServerView, PersistenceSettingsView, PersonalitySettingsView,
+    SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
+use crate::api_surface::RegistryHandle;
 use crate::config;
 
 pub struct DaemonSettingsService {
     config_path: PathBuf,
     mcp_handle: Option<McpControlHandle>,
+    /// Shared handle to the live registry + config. Personality (#226) is read
+    /// and written through here rather than via disk-only `config::` helpers, so
+    /// the settings GET, the dispatch wrapper's per-send read, and a `SetConfig`
+    /// all share the registry's in-memory config — making personality changes
+    /// take effect on the next turn without a separate reload.
+    registry: Option<Arc<RegistryHandle>>,
 }
 
 impl DaemonSettingsService {
@@ -19,12 +28,24 @@ impl DaemonSettingsService {
         Self {
             config_path,
             mcp_handle: None,
+            registry: None,
         }
     }
 
     pub fn with_mcp_control(mut self, handle: McpControlHandle) -> Self {
         self.mcp_handle = Some(handle);
         self
+    }
+
+    pub fn with_registry(mut self, registry: Arc<RegistryHandle>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    fn registry(&self) -> Result<&Arc<RegistryHandle>, CoreError> {
+        self.registry
+            .as_ref()
+            .ok_or_else(|| CoreError::SystemService("registry handle not configured".to_string()))
     }
 
     fn mcp_handle(&self) -> Result<&McpControlHandle, CoreError> {
@@ -177,6 +198,21 @@ impl SettingsService for DaemonSettingsService {
     ) -> Result<(), CoreError> {
         config::set_database_settings(&self.config_path, url.as_deref(), max_connections)
             .map_err(|e| CoreError::SystemService(e.to_string()))
+    }
+
+    async fn get_personality_settings(&self) -> Result<PersonalitySettingsView, CoreError> {
+        // Read from the registry's in-memory config — the same value the
+        // dispatch wrapper installs as the per-turn task-local (#226).
+        Ok(self.registry()?.personality())
+    }
+
+    async fn set_personality_settings(
+        &self,
+        personality: PersonalitySettingsView,
+    ) -> Result<(), CoreError> {
+        // Persists to the config file and refreshes the in-memory config, so
+        // the next send's task-local reflects the change (hot reload).
+        self.registry()?.set_personality(personality)
     }
 
     async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {

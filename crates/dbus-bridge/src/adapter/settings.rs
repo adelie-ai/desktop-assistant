@@ -75,6 +75,16 @@ pub struct ConfigData {
     pub llm_top_p: f64,
     pub llm_max_tokens: u32,
     pub llm_hosted_tool_search: i32,
+    // Personality (#226): each trait as a 0..=4 ordinal (Never=0..=Always=4),
+    // matching the in-process adapter's contract so the KCM sees the same shape
+    // regardless of which D-Bus surface it talks to.
+    pub personality_professionalism: u32,
+    pub personality_warmth: u32,
+    pub personality_directness: u32,
+    pub personality_enthusiasm: u32,
+    pub personality_humor: u32,
+    pub personality_sarcasm: u32,
+    pub personality_pretentiousness: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, zbus::zvariant::Type)]
@@ -109,6 +119,22 @@ pub struct ConfigPatchArgs {
     pub llm_max_tokens: u32,
     pub set_llm_hosted_tool_search: bool,
     pub llm_hosted_tool_search: i32,
+    // Personality (#226): set `set_personality_* = true` to apply the paired
+    // 0..=4 ordinal. Validation/clamping happens daemon-side.
+    pub set_personality_professionalism: bool,
+    pub personality_professionalism: u32,
+    pub set_personality_warmth: bool,
+    pub personality_warmth: u32,
+    pub set_personality_directness: bool,
+    pub personality_directness: u32,
+    pub set_personality_enthusiasm: bool,
+    pub personality_enthusiasm: u32,
+    pub set_personality_humor: bool,
+    pub personality_humor: u32,
+    pub set_personality_sarcasm: bool,
+    pub personality_sarcasm: u32,
+    pub set_personality_pretentiousness: bool,
+    pub personality_pretentiousness: u32,
 }
 
 /// Build a `ConfigData` from the wire-level `api::Config`. LLM fields
@@ -137,6 +163,13 @@ fn config_from_wire(c: &api::Config) -> ConfigData {
         llm_top_p: -1.0,
         llm_max_tokens: 0,
         llm_hosted_tool_search: -1,
+        personality_professionalism: c.personality.professionalism.as_ordinal() as u32,
+        personality_warmth: c.personality.warmth.as_ordinal() as u32,
+        personality_directness: c.personality.directness.as_ordinal() as u32,
+        personality_enthusiasm: c.personality.enthusiasm.as_ordinal() as u32,
+        personality_humor: c.personality.humor.as_ordinal() as u32,
+        personality_sarcasm: c.personality.sarcasm.as_ordinal() as u32,
+        personality_pretentiousness: c.personality.pretentiousness.as_ordinal() as u32,
     }
 }
 
@@ -330,6 +363,45 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
             wire_changes.persistence_push_on_update = Some(changes.persistence_push_on_update);
         }
 
+        // Personality (#226): translate each set ordinal into the wire level.
+        // An out-of-range ordinal is a clean InvalidArgs error rather than a
+        // silent clamp, matching the in-process adapter.
+        ordinal_to_level(
+            changes.set_personality_professionalism,
+            changes.personality_professionalism,
+            &mut wire_changes.personality_professionalism,
+        )?;
+        ordinal_to_level(
+            changes.set_personality_warmth,
+            changes.personality_warmth,
+            &mut wire_changes.personality_warmth,
+        )?;
+        ordinal_to_level(
+            changes.set_personality_directness,
+            changes.personality_directness,
+            &mut wire_changes.personality_directness,
+        )?;
+        ordinal_to_level(
+            changes.set_personality_enthusiasm,
+            changes.personality_enthusiasm,
+            &mut wire_changes.personality_enthusiasm,
+        )?;
+        ordinal_to_level(
+            changes.set_personality_humor,
+            changes.personality_humor,
+            &mut wire_changes.personality_humor,
+        )?;
+        ordinal_to_level(
+            changes.set_personality_sarcasm,
+            changes.personality_sarcasm,
+            &mut wire_changes.personality_sarcasm,
+        )?;
+        ordinal_to_level(
+            changes.set_personality_pretentiousness,
+            changes.personality_pretentiousness,
+            &mut wire_changes.personality_pretentiousness,
+        )?;
+
         let result = self
             .dispatch(api::Command::SetConfig {
                 changes: wire_changes,
@@ -379,6 +451,28 @@ fn normalize(s: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+/// When `set` is true, validate the 0..=4 `ordinal` into a [`api::PersonalityLevel`]
+/// and store it in `slot`; otherwise leave `slot` as `None`. Out-of-range input
+/// is a clean `InvalidArgs` error rather than a silent clamp (#226).
+fn ordinal_to_level(
+    set: bool,
+    ordinal: u32,
+    slot: &mut Option<api::PersonalityLevel>,
+) -> fdo::Result<()> {
+    if set {
+        let level = u8::try_from(ordinal)
+            .ok()
+            .and_then(api::PersonalityLevel::from_ordinal)
+            .ok_or_else(|| {
+                fdo::Error::InvalidArgs(format!(
+                    "personality level {ordinal} out of range; expected 0..=4 (Never..=Always)"
+                ))
+            })?;
+        *slot = Some(level);
+    }
+    Ok(())
 }
 
 /// Translate an `api::Config` from a `ConfigChanged` wire event into

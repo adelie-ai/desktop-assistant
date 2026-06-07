@@ -117,7 +117,26 @@ pub struct DaemonConfig {
     pub ws_auth: WsAuthConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Configurable assistant disposition (issue #226, Phase 1: global). The
+    /// resolved value is installed as a task-local on every send and rendered
+    /// into a system-prompt blurb. Defaults to the Expressive-7 table when the
+    /// `[personality]` section is absent. Reuses the core [`Personality`] type
+    /// directly (re-exported below) so config, the api-model view, and the
+    /// D-Bus surface share one schema.
+    #[serde(default)]
+    pub personality: Personality,
 }
+
+// Reuse the canonical core type rather than duplicating the trait set in the
+// daemon. `Personality` derives `Serialize`/`Deserialize` with a lowercase
+// representation, so it slots straight into the TOML `[personality]` section.
+pub use desktop_assistant_core::prompts::Personality;
+// `PersonalityLevel` is re-exported at `config::` for callers that spell the
+// level out (and the in-file tests); only test code references it directly, so
+// the non-test build sees it as unused — same pattern as the other `config::`
+// re-exports above (e.g. `DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS`).
+#[allow(unused_imports)]
+pub use desktop_assistant_core::prompts::PersonalityLevel;
 
 impl DaemonConfig {
     /// Validate the raw `connections` map and return a [`ConnectionsMap`].

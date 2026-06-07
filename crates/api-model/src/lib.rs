@@ -577,6 +577,11 @@ pub struct Status {
 pub struct Config {
     pub embeddings: EmbeddingsSettingsView,
     pub persistence: PersistenceSettingsView,
+    /// Configurable assistant disposition (issue #226). Carries the 7
+    /// "Expressive 7" trait levels as a typed struct (see
+    /// [`PersonalitySettingsView`]).
+    #[serde(default)]
+    pub personality: PersonalitySettingsView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -595,6 +600,23 @@ pub struct ConfigChanges {
     pub persistence_remote_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_push_on_update: Option<bool>,
+    // Personality (#226): one optional level per trait. `None` = leave that
+    // trait unchanged on `SetConfig`; a present value overrides just that
+    // trait. Serializes as the lowercase level string (e.g. `"never"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality_professionalism: Option<PersonalityLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality_warmth: Option<PersonalityLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality_directness: Option<PersonalityLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality_enthusiasm: Option<PersonalityLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality_humor: Option<PersonalityLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality_sarcasm: Option<PersonalityLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality_pretentiousness: Option<PersonalityLevel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -820,6 +842,15 @@ pub struct ModelCapabilitiesView {
 // can use either name.
 pub use desktop_assistant_core::ports::inbound::Effort as EffortLevel;
 pub use desktop_assistant_core::ports::inbound::PurposeKind as PurposeKindApi;
+
+// Personality wire types (#226). Re-export the canonical core types so the
+// settings channel, the daemon config, and clients (e.g. the KCM) share one
+// schema rather than maintaining a parallel definition. `PersonalitySettingsView`
+// is the `Config`-view shape (the 7 trait levels); it is the core `Personality`
+// struct verbatim, so converting between the wire view and the core type is the
+// identity `From` impl.
+pub use desktop_assistant_core::prompts::{Personality, PersonalityLevel};
+pub type PersonalitySettingsView = Personality;
 
 /// Protocol-neutral purpose config. String `"primary"` in the connection or
 /// model field means "inherit from interactive" — the daemon resolves this
@@ -2004,7 +2035,7 @@ mod tests {
                 remote_name: "origin".into(),
                 push_on_update: false,
             },
-            personality: PersonalitySettingsView::from(Personality::default()),
+            personality: PersonalitySettingsView::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
@@ -2014,15 +2045,19 @@ mod tests {
     }
 
     #[test]
-    fn personality_settings_view_round_trips_to_core() {
-        // The wire view converts losslessly to/from the core `Personality`.
+    fn personality_settings_view_is_the_core_type() {
+        // `PersonalitySettingsView` is the canonical core `Personality` (one
+        // schema, no parallel definition), so a value flows between the wire
+        // view and the core type with no lossy conversion.
         let core = Personality {
             humor: PersonalityLevel::Never,
             sarcasm: PersonalityLevel::Always,
             ..Personality::default()
         };
-        let view = PersonalitySettingsView::from(core.clone());
-        assert_eq!(Personality::from(view), core);
+        let view: PersonalitySettingsView = core;
+        assert_eq!(view, core);
+        assert_eq!(view.humor, PersonalityLevel::Never);
+        assert_eq!(view.sarcasm, PersonalityLevel::Always);
     }
 
     #[test]

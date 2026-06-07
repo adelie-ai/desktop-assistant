@@ -352,6 +352,23 @@ fn build_demoted_tool_note(
 fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> String {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
     let mut sections = prompts::static_sections();
+
+    // Personality disposition (#226): read the active personality the same way
+    // the per-turn refinement is read (a task-local installed by the daemon
+    // dispatch wrapper). Injected *before* the tool note and the per-turn
+    // refinement so the standing disposition is established up front while a
+    // one-turn refinement can still adjust tone last. Always rendered — the
+    // blurb at minimum carries the adaptation clause — so every turn carries a
+    // personality, with the default disposition for callers that install no
+    // scope.
+    let personality_blurb = crate::ports::llm::current_personality().render_blurb();
+    if !personality_blurb.trim().is_empty() {
+        sections.push(PromptSection::new(
+            PromptSectionKind::Personality,
+            personality_blurb,
+        ));
+    }
+
     sections.push(PromptSection::new(
         PromptSectionKind::ToolAvailability,
         tool_note,
@@ -859,7 +876,7 @@ mod tests {
             sarcasm: PersonalityLevel::Always,
             ..Personality::default()
         };
-        let assembled = with_personality(personality.clone(), async {
+        let assembled = with_personality(personality, async {
             assemble_system_instruction("TOOLNOTE".to_string(), "REFINEMENT")
         })
         .await;
