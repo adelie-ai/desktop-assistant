@@ -1982,4 +1982,66 @@ mod tests {
             other => panic!("unexpected variant: {other:?}"),
         }
     }
+
+    // --- Personality config wire types (#226) ------------------------------
+
+    #[test]
+    fn config_carries_default_personality() {
+        // A `Config` view round-trips its personality block, and the view's
+        // levels match the Expressive-7 defaults.
+        let cfg = Config {
+            embeddings: EmbeddingsSettingsView {
+                connector: "openai".into(),
+                model: "text-embedding-3-small".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                has_api_key: true,
+                available: true,
+                is_default: true,
+            },
+            persistence: PersistenceSettingsView {
+                enabled: false,
+                remote_url: String::new(),
+                remote_name: "origin".into(),
+                push_on_update: false,
+            },
+            personality: PersonalitySettingsView::from(Personality::default()),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+        assert_eq!(back.personality.professionalism, PersonalityLevel::Always);
+        assert_eq!(back.personality.humor, PersonalityLevel::Sometimes);
+    }
+
+    #[test]
+    fn personality_settings_view_round_trips_to_core() {
+        // The wire view converts losslessly to/from the core `Personality`.
+        let core = Personality {
+            humor: PersonalityLevel::Never,
+            sarcasm: PersonalityLevel::Always,
+            ..Personality::default()
+        };
+        let view = PersonalitySettingsView::from(core.clone());
+        assert_eq!(Personality::from(view), core);
+    }
+
+    #[test]
+    fn config_changes_personality_fields_optional_and_round_trip() {
+        // Default `ConfigChanges` omits every personality field from the wire.
+        let empty = ConfigChanges::default();
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("personality_humor"), "json: {json}");
+
+        // A single personality change serializes only that field.
+        let changes = ConfigChanges {
+            personality_humor: Some(PersonalityLevel::Never),
+            ..ConfigChanges::default()
+        };
+        let json = serde_json::to_string(&changes).unwrap();
+        assert!(json.contains("personality_humor"), "json: {json}");
+        assert!(json.contains("\"never\""), "json: {json}");
+        assert!(!json.contains("personality_warmth"), "json: {json}");
+        let back: ConfigChanges = serde_json::from_str(&json).unwrap();
+        assert_eq!(changes, back);
+    }
 }

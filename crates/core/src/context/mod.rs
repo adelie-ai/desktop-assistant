@@ -848,6 +848,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn assemble_system_instruction_injects_personality_before_tools_and_refinement() {
+        use crate::ports::llm::with_personality;
+        use crate::prompts::{Personality, PersonalityLevel};
+
+        // A personality with a recognizable trait so we can locate the
+        // injected section in the assembled output.
+        let personality = Personality {
+            sarcasm: PersonalityLevel::Always,
+            ..Personality::default()
+        };
+        let assembled = with_personality(personality.clone(), async {
+            assemble_system_instruction("TOOLNOTE".to_string(), "REFINEMENT")
+        })
+        .await;
+
+        // The personality blurb is present.
+        let blurb = personality.render_blurb();
+        assert!(
+            assembled.contains(&blurb),
+            "assembled prompt must contain the personality blurb:\n{assembled}"
+        );
+        // Ordering: personality blurb appears before the tool note, which
+        // appears before the per-turn refinement.
+        let p_idx = assembled.find(&blurb).unwrap();
+        let t_idx = assembled.find("TOOLNOTE").unwrap();
+        let r_idx = assembled.find("REFINEMENT").unwrap();
+        assert!(p_idx < t_idx, "personality must precede the tool note");
+        assert!(t_idx < r_idx, "tool note must precede the refinement");
+    }
+
+    #[tokio::test]
+    async fn assemble_system_instruction_default_personality_present_without_scope() {
+        // No `with_personality` scope installed → the default disposition is
+        // still injected (global personality applies to every turn).
+        let assembled = assemble_system_instruction("TOOLNOTE".to_string(), "");
+        let default_blurb = crate::prompts::Personality::default().render_blurb();
+        assert!(
+            assembled.contains(&default_blurb),
+            "default personality must be injected even without a scope:\n{assembled}"
+        );
+    }
+
     /// Mock LLM that returns canned chunks. Used by summary-generation
     /// tests that exercise [`generate_context_summary`] directly.
     struct MockLlm {

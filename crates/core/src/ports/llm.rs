@@ -1344,6 +1344,48 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("429"));
     }
 
+    // --- PERSONALITY tests (issue #226) ---
+
+    #[tokio::test]
+    async fn current_personality_is_default_outside_scope() {
+        // Callers that never install a scope (tests, dreaming jobs, any path
+        // not routed through the daemon dispatch wrapper) observe the default
+        // disposition rather than an empty one.
+        assert_eq!(
+            current_personality(),
+            crate::prompts::Personality::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn current_personality_observes_installed_scope() {
+        let custom = crate::prompts::Personality {
+            humor: crate::prompts::PersonalityLevel::Never,
+            ..crate::prompts::Personality::default()
+        };
+        let observed = with_personality(custom.clone(), async { current_personality() }).await;
+        assert_eq!(observed, custom);
+        // After the scope exits the task-local is unset again (back to default).
+        assert_eq!(
+            current_personality(),
+            crate::prompts::Personality::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_personality_shadows_outer() {
+        let outer = crate::prompts::Personality::default();
+        let inner = crate::prompts::Personality {
+            sarcasm: crate::prompts::PersonalityLevel::Always,
+            ..crate::prompts::Personality::default()
+        };
+        let observed = with_personality(outer, async {
+            with_personality(inner.clone(), async { current_personality() }).await
+        })
+        .await;
+        assert_eq!(observed, inner);
+    }
+
     // --- MODEL_OVERRIDE tests (issue #34) ---
 
     #[tokio::test]

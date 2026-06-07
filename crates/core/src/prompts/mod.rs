@@ -114,4 +114,134 @@ mod tests {
         // The reserved goal note must be called out.
         assert!(assembled.contains("\"goal\""));
     }
+
+    // --- Personality (#226) ------------------------------------------------
+
+    /// The fixed adaptation clause is appended to every personality blurb,
+    /// regardless of trait levels. Pinned here so the copy can't drift away
+    /// from the rest of the suite without a deliberate edit.
+    const ADAPTATION_CLAUSE: &str = "Treat this as a starting point, not a script. \
+         Take your cues from the conversation and adapt both ways \u{2014} if the user is \
+         playful or jokes around, it's fine to loosen up and joke back a bit; if things \
+         turn serious or they seem stressed, ease off the humor and sarcasm unless a light \
+         touch genuinely helps. Match the user's energy rather than forcing a trait that \
+         doesn't fit the moment.";
+
+    #[test]
+    fn personality_level_ordinal_round_trip() {
+        // The D-Bus contract exposes levels as integers 0..=4. Every level
+        // must map to a stable ordinal and back.
+        for (level, ordinal) in [
+            (PersonalityLevel::Never, 0u8),
+            (PersonalityLevel::Rarely, 1),
+            (PersonalityLevel::Sometimes, 2),
+            (PersonalityLevel::Often, 3),
+            (PersonalityLevel::Always, 4),
+        ] {
+            assert_eq!(level.as_ordinal(), ordinal);
+            assert_eq!(PersonalityLevel::from_ordinal(ordinal), Some(level));
+        }
+        // Out-of-range ordinals are rejected (no silent clamp).
+        assert_eq!(PersonalityLevel::from_ordinal(5), None);
+    }
+
+    #[test]
+    fn personality_defaults_match_expressive_7_table() {
+        let p = Personality::default();
+        assert_eq!(p.professionalism, PersonalityLevel::Always);
+        assert_eq!(p.warmth, PersonalityLevel::Often);
+        assert_eq!(p.directness, PersonalityLevel::Often);
+        assert_eq!(p.enthusiasm, PersonalityLevel::Sometimes);
+        assert_eq!(p.humor, PersonalityLevel::Sometimes);
+        assert_eq!(p.sarcasm, PersonalityLevel::Rarely);
+        assert_eq!(p.pretentiousness, PersonalityLevel::Rarely);
+    }
+
+    #[test]
+    fn render_blurb_defaults_emits_disposition_then_adaptation() {
+        let blurb = Personality::default().render_blurb();
+        // Disposition paragraph mentions each non-Never trait.
+        assert!(blurb.contains("professional"), "blurb: {blurb}");
+        assert!(blurb.contains("warm"), "blurb: {blurb}");
+        assert!(blurb.contains("direct"), "blurb: {blurb}");
+        assert!(blurb.contains("enthusias"), "blurb: {blurb}");
+        assert!(blurb.contains("humor") || blurb.contains("humour"), "blurb: {blurb}");
+        assert!(blurb.contains("sarcas"), "blurb: {blurb}");
+        assert!(blurb.contains("pretenti"), "blurb: {blurb}");
+        // The adaptation clause is always present and comes last.
+        assert!(blurb.contains(ADAPTATION_CLAUSE), "blurb: {blurb}");
+        assert!(blurb.trim_end().ends_with(ADAPTATION_CLAUSE), "blurb: {blurb}");
+    }
+
+    #[test]
+    fn render_blurb_omits_never_traits() {
+        // Set Humor and Sarcasm to Never; their clauses must disappear while
+        // the other traits remain.
+        let p = Personality {
+            humor: PersonalityLevel::Never,
+            sarcasm: PersonalityLevel::Never,
+            ..Personality::default()
+        };
+        let blurb = p.render_blurb();
+        assert!(!blurb.contains("humor") && !blurb.contains("humour"), "blurb: {blurb}");
+        assert!(!blurb.contains("sarcas"), "blurb: {blurb}");
+        // Remaining traits still rendered.
+        assert!(blurb.contains("professional"), "blurb: {blurb}");
+        assert!(blurb.contains("warm"), "blurb: {blurb}");
+        // Adaptation clause still appended.
+        assert!(blurb.contains(ADAPTATION_CLAUSE), "blurb: {blurb}");
+    }
+
+    #[test]
+    fn render_blurb_all_never_is_adaptation_clause_only() {
+        let p = Personality {
+            professionalism: PersonalityLevel::Never,
+            warmth: PersonalityLevel::Never,
+            directness: PersonalityLevel::Never,
+            enthusiasm: PersonalityLevel::Never,
+            humor: PersonalityLevel::Never,
+            sarcasm: PersonalityLevel::Never,
+            pretentiousness: PersonalityLevel::Never,
+        };
+        let blurb = p.render_blurb();
+        // No disposition sentence at all — only the adaptation clause.
+        assert_eq!(blurb.trim(), ADAPTATION_CLAUSE);
+    }
+
+    #[test]
+    fn render_blurb_adaptation_clause_always_present() {
+        // Property: every possible single-trait setting still appends the
+        // adaptation clause. Exhaustive over levels for one representative
+        // trait is enough to pin the invariant.
+        for level in [
+            PersonalityLevel::Never,
+            PersonalityLevel::Rarely,
+            PersonalityLevel::Sometimes,
+            PersonalityLevel::Often,
+            PersonalityLevel::Always,
+        ] {
+            let p = Personality {
+                humor: level,
+                ..Personality::default()
+            };
+            assert!(
+                p.render_blurb().contains(ADAPTATION_CLAUSE),
+                "level {level:?} dropped the adaptation clause"
+            );
+        }
+    }
+
+    #[test]
+    fn personality_serde_round_trip_lowercase() {
+        // TOML/JSON config persists levels as lowercase strings; round-trip
+        // must be lossless so a stored `[personality]` reloads identically.
+        let p = Personality {
+            humor: PersonalityLevel::Never,
+            ..Personality::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"never\""), "json: {json}");
+        let parsed: Personality = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, p);
+    }
 }

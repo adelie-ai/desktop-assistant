@@ -3325,6 +3325,60 @@ mod tests {
         assert!(!config.persistence.push_on_update);
     }
 
+    #[tokio::test]
+    async fn get_config_returns_default_personality() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::clone(&settings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let res = h.handle_command(api::Command::GetConfig).await.unwrap();
+        let api::CommandResult::Config(config) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(
+            config.personality.professionalism,
+            api::PersonalityLevel::Always
+        );
+        assert_eq!(config.personality.humor, api::PersonalityLevel::Sometimes);
+    }
+
+    #[tokio::test]
+    async fn set_config_changes_personality() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::clone(&settings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let res = h
+            .handle_command(api::Command::SetConfig {
+                changes: api::ConfigChanges {
+                    personality_humor: Some(api::PersonalityLevel::Never),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+
+        let api::CommandResult::Config(config) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(config.personality.humor, api::PersonalityLevel::Never);
+        // Other traits untouched.
+        assert_eq!(
+            config.personality.professionalism,
+            api::PersonalityLevel::Always
+        );
+    }
+
     // ---- RequestContext tests (issue #105) -----------------------------
 
     #[test]

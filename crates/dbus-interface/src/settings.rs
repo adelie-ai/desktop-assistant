@@ -1235,6 +1235,48 @@ mod tests {
         assert_eq!(token, "jwt-for-tui");
     }
 
+    // --- Personality int<->level contract (#226) ---------------------------
+
+    #[tokio::test]
+    async fn get_config_exposes_personality_as_ordinals() {
+        // The KCM binds sliders to integers 0..=4 (Never=0 .. Always=4).
+        // `GetConfig` must surface the default Expressive-7 levels as those
+        // ordinals.
+        let service = Arc::new(StatefulSettingsService::new());
+        let adapter = DbusSettingsAdapter::new(service);
+        let config = adapter.get_config_tuple().await.unwrap();
+
+        assert_eq!(config.personality_professionalism, 4); // Always
+        assert_eq!(config.personality_warmth, 3); // Often
+        assert_eq!(config.personality_directness, 3); // Often
+        assert_eq!(config.personality_enthusiasm, 2); // Sometimes
+        assert_eq!(config.personality_humor, 2); // Sometimes
+        assert_eq!(config.personality_sarcasm, 1); // Rarely
+        assert_eq!(config.personality_pretentiousness, 1); // Rarely
+    }
+
+    #[tokio::test]
+    async fn set_config_personality_ordinal_round_trips() {
+        // Setting Humor=Never (0) via the patch must be reflected back as an
+        // ordinal in the returned `ConfigData`.
+        let service = Arc::new(StatefulSettingsService::new());
+        let adapter = DbusSettingsAdapter::new(Arc::clone(&service));
+
+        let updated = adapter
+            .apply_config_patch(ConfigPatch {
+                personality_humor: Some(0), // Never
+                personality_sarcasm: Some(4), // Always
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(updated.personality_humor, 0);
+        assert_eq!(updated.personality_sarcasm, 4);
+        // Untouched traits keep their defaults.
+        assert_eq!(updated.personality_professionalism, 4);
+    }
+
     /// Issue #156: settings methods that touch per-user storage must
     /// scope to the local OS user, not the `"default"` sentinel. The
     /// recording fake captures `current_user_id()` at the inbound call

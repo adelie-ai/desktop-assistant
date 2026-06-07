@@ -2449,4 +2449,41 @@ max_context_tokens = 1000000
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(parsed.purposes, reparsed.purposes);
     }
+
+    // --- [personality] section (#226) --------------------------------------
+
+    #[test]
+    fn personality_defaults_when_section_absent() {
+        // A config with no `[personality]` block still resolves the
+        // Expressive-7 defaults so every install has a disposition.
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(config.personality, Personality::default());
+        assert_eq!(config.personality.professionalism, PersonalityLevel::Always);
+        assert_eq!(config.personality.humor, PersonalityLevel::Sometimes);
+    }
+
+    #[test]
+    fn personality_section_parses_and_round_trips() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [personality]
+            professionalism = "always"
+            warmth = "often"
+            directness = "often"
+            enthusiasm = "sometimes"
+            humor = "never"
+            sarcasm = "rarely"
+            pretentiousness = "rarely"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.personality.humor, PersonalityLevel::Never);
+        assert_eq!(config.personality.warmth, PersonalityLevel::Often);
+
+        // Serialize → reparse is lossless.
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config.personality, reparsed.personality);
+    }
 }
