@@ -171,21 +171,27 @@ async fn uds_transport_exposes_command_channel_via_as_commands() {
         .expect("as_commands must be Some for a UDS transport");
 
     // Per-conversation model override over UDS. The TestHandler uses the
-    // legacy `Ack` send path, so the returned task id is empty — the point is
-    // that the command reaches the daemon over the local socket at all.
+    // legacy (no-registry) send path, which the dispatcher now acks with a
+    // `SendMessageAck` carrying the turn `request_id` (and an empty task_id) so
+    // the response stream is correlatable even here (voice#49). The point of
+    // this test is that the command reaches the daemon over the local socket at
+    // all, so we just assert a correlation id came back.
     let override_selection = Some(api::SendPromptOverride {
         connection_id: "conn-1".to_string(),
         model_id: "model-1".to_string(),
         effort: None,
     });
-    let task_id = timeout(
+    let request_id = timeout(
         Duration::from_secs(2),
         commands.send_prompt_with_override("conv-1", "hi", override_selection),
     )
     .await
     .expect("no response within 2s")
     .expect("send_prompt_with_override over uds");
-    assert_eq!(task_id, String::new());
+    assert!(
+        !request_id.is_empty(),
+        "the legacy send path must still return a turn request_id (voice#49)"
+    );
 
     // Model listing over UDS.
     let models = timeout(

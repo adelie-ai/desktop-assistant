@@ -9,9 +9,11 @@
 //! - Subscribe is idempotent at the per-connection level — a second
 //!   Subscribe on a connection that already has a live forwarder Acks
 //!   without leaking a second receiver.
-//! - SendMessage's response carries `SendMessageAck { task_id }` when
-//!   the handler registered the turn with the registry; the legacy bare
-//!   `Ack` is preserved for handlers that don't opt into registration.
+//! - SendMessage's response carries `SendMessageAck { request_id, task_id }`:
+//!   the `task_id` when the handler registered the turn with the registry, and
+//!   the turn `request_id` (which streamed events are stamped with) on both the
+//!   registry and the legacy paths so a socket client can correlate the
+//!   response stream (voice#49).
 //! - When the handler exposes no broadcast hook (no registry attached)
 //!   Subscribe surfaces a clean error frame rather than spawning a dead
 //!   forwarder.
@@ -402,8 +404,10 @@ async fn connection_drop_cancels_event_subscription_cleanly() {
 }
 
 /// SendMessage with a handler that registers via `start_send_message`
-/// produces `SendMessageAck { task_id }` — and the id matches a row in
-/// the registry.
+/// produces `SendMessageAck { request_id, task_id }` — the `task_id`
+/// matches a row in the registry, and the `request_id` (the id streamed
+/// `Assistant*` events are stamped with) is present so a socket client can
+/// correlate the response stream (voice#49).
 #[tokio::test]
 async fn send_message_ack_carries_a_real_task_id() {
     let registry = Arc::new(BackgroundTaskRegistry::new());
@@ -429,9 +433,20 @@ async fn send_message_ack_carries_a_real_task_id() {
     let task_id = match frame {
         WsFrame::Result {
             id,
-            result: api::CommandResult::SendMessageAck { task_id },
+            result:
+                api::CommandResult::SendMessageAck {
+                    request_id,
+                    task_id,
+                },
         } => {
             assert_eq!(id, "send-1");
+            // The ack must carry a non-empty turn correlation id (voice#49):
+            // it is what every streamed `Assistant*` event is keyed on, so a
+            // socket client matches its response stream by this id.
+            assert!(
+                !request_id.is_empty(),
+                "registry-path ack must carry the turn request_id"
+            );
             api::TaskId(task_id)
         }
         other => panic!("expected SendMessageAck, got {other:?}"),
@@ -444,13 +459,17 @@ async fn send_message_ack_carries_a_real_task_id() {
 }
 
 /// When the handler does NOT opt into `start_send_message` (default impl
-/// returns `None`), the dispatcher falls back to the legacy bare-Ack
-/// flow so existing transports keep working.
+/// returns `None`), the dispatcher falls back to the legacy inline-streaming
+/// flow so existing transports keep working. The ack still carries the turn
+/// `request_id` (with an empty `task_id`, since no task was registered) so a
+/// socket client can correlate the streamed response on this path too
+/// (voice#49).
 #[tokio::test]
 async fn send_message_falls_back_to_legacy_ack_when_handler_opts_out() {
     /// Stub that only implements `handle_send_message` (no
     /// `start_send_message` override) — the dispatcher should not panic
-    /// and should send `CommandResult::Ack` back.
+    /// and should send a `SendMessageAck` carrying the turn request_id and
+    /// an empty task_id.
     struct LegacyHandler;
     #[async_trait::async_trait]
     impl AssistantApiHandler for LegacyHandler {
@@ -487,9 +506,25 @@ async fn send_message_falls_back_to_legacy_ack_when_handler_opts_out() {
     match frame {
         WsFrame::Result {
             id,
-            result: api::CommandResult::Ack,
-        } => assert_eq!(id, "send-2"),
-        other => panic!("expected legacy Ack, got {other:?}"),
+            result:
+                api::CommandResult::SendMessageAck {
+                    request_id,
+                    task_id,
+                },
+        } => {
+            assert_eq!(id, "send-2");
+            // Legacy path: a turn request_id is present (so the response stream
+            // can be correlated) but no background task was registered.
+            assert!(
+                !request_id.is_empty(),
+                "legacy-path ack must still carry the turn request_id"
+            );
+            assert!(
+                task_id.is_empty(),
+                "legacy path registers no task, so task_id is empty"
+            );
+        }
+        other => panic!("expected SendMessageAck on the legacy path, got {other:?}"),
     }
 
     let _ = handle.await;
@@ -587,4 +622,119 @@ async fn subscribe_is_idempotent_per_connection() {
 
     drop(in_tx);
     let _ = dispatch.await;
+}
+
+/// voice#49 regression at the dispatcher level: the `request_id` in the
+/// `SendMessageAck` MUST equal the `request_id` stamped on the streamed
+/// `AssistantDelta` / `AssistantCompleted` events. A socket client correlates
+/// its response stream by the ack's id, so if these diverge (as they did when
+/// the ack returned the registry `task_id` instead) every event is dropped and
+/// the turn hangs.
+#[tokio::test]
+async fn send_message_ack_request_id_matches_streamed_event_request_id() {
+    /// Streams two deltas + a completed event, each stamped with the
+    /// dispatcher-supplied `request_id`, from a background task — mirroring
+    /// the production registry path.
+    struct StreamingHandler;
+    #[async_trait::async_trait]
+    impl AssistantApiHandler for StreamingHandler {
+        async fn handle_command(&self, _cmd: api::Command) -> ApiResult<api::CommandResult> {
+            Err(ApiError::Unsupported)
+        }
+        async fn handle_send_message(
+            &self,
+            _c: String,
+            _t: String,
+            _r: String,
+            _s: Arc<dyn EventSink>,
+        ) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn start_send_message(
+            &self,
+            conversation_id: String,
+            _content: String,
+            _override_selection: Option<api::SendPromptOverride>,
+            _system_refinement: String,
+            request_id: String,
+            _idempotency_key: Option<String>,
+            sink: Arc<dyn EventSink>,
+        ) -> ApiResult<Option<api::TaskId>> {
+            // task_id is deliberately a different uuid than request_id.
+            let task_id = api::TaskId(uuid::Uuid::new_v4().to_string());
+            tokio::spawn(async move {
+                sink.emit(api::Event::AssistantDelta {
+                    conversation_id: conversation_id.clone(),
+                    request_id: request_id.clone(),
+                    chunk: "hi".into(),
+                })
+                .await;
+                sink.emit(api::Event::AssistantCompleted {
+                    conversation_id,
+                    request_id,
+                    full_response: "hi".into(),
+                })
+                .await;
+            });
+            Ok(Some(task_id))
+        }
+    }
+
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(StreamingHandler);
+    let (mut out_rx, handle) = drive(
+        handler,
+        user("alice"),
+        vec![WsRequest {
+            id: "send-corr".into(),
+            command: api::Command::SendMessage {
+                conversation_id: "conv-1".into(),
+                content: "hello".into(),
+                override_selection: None,
+                system_refinement: String::new(),
+                idempotency_key: None,
+            },
+        }],
+    );
+
+    // First frame: the ack carrying the correlation request_id.
+    let ack_request_id = match next_frame(&mut out_rx).await {
+        WsFrame::Result {
+            id,
+            result: api::CommandResult::SendMessageAck { request_id, .. },
+        } => {
+            assert_eq!(id, "send-corr");
+            request_id
+        }
+        other => panic!("expected SendMessageAck, got {other:?}"),
+    };
+    assert!(!ack_request_id.is_empty(), "ack must carry a request_id");
+
+    // Every streamed response event must carry that same request_id.
+    let mut saw_delta = false;
+    let mut saw_completed = false;
+    for _ in 0..5 {
+        match next_frame(&mut out_rx).await {
+            WsFrame::Event {
+                event: api::Event::AssistantDelta { request_id, .. },
+            } => {
+                assert_eq!(request_id, ack_request_id, "delta must match the ack id");
+                saw_delta = true;
+            }
+            WsFrame::Event {
+                event: api::Event::AssistantCompleted { request_id, .. },
+            } => {
+                assert_eq!(
+                    request_id, ack_request_id,
+                    "completed must match the ack id"
+                );
+                saw_completed = true;
+                break;
+            }
+            other => panic!("unexpected frame while streaming: {other:?}"),
+        }
+    }
+    assert!(saw_delta, "expected an AssistantDelta event");
+    assert!(saw_completed, "expected an AssistantCompleted event");
+
+    let _ = handle.await;
 }

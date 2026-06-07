@@ -87,9 +87,13 @@ impl EventSink for ChannelEventSink {
 /// Behavior preserved from the old WS `handle_socket`:
 ///
 /// - Each [`WsRequest::command`] is dispatched through `handler`.
-/// - `SendMessage` is streamed: an immediate `Ack` result frame, then
-///   `AssistantDelta` / `AssistantCompleted` / `AssistantError` events,
-///   forwarded through a [`ChannelEventSink`] into the outbound channel.
+/// - `SendMessage` is streamed: an immediate `SendMessageAck` result frame
+///   carrying the turn `request_id` (and, when a registry is attached, the
+///   `task_id`), then `AssistantDelta` / `AssistantCompleted` /
+///   `AssistantError` events stamped with that same `request_id`, forwarded
+///   through a [`ChannelEventSink`] into the outbound channel. The ack's
+///   `request_id` is what a socket client correlates its response stream by,
+///   mirroring the D-Bus `SendPrompt` reply (voice#49).
 /// - `SetConfig` emits both a `Result` and a `ConfigChanged` event on
 ///   success.
 /// - Other commands round-trip through `handler.handle_command` and
@@ -166,8 +170,12 @@ pub async fn dispatch_loop<R, W>(
                 // path so the ack can carry the registered task id
                 // (#114). When the handler opts out (no registry
                 // attached — single-tenant tests and the like) we
-                // fall back to the legacy bare-`Ack` + inline
-                // streaming path that pre-#114 transports used.
+                // fall back to the inline-streaming path that pre-#114
+                // transports used. Either way the ack is a
+                // `SendMessageAck` carrying the turn `request_id` that
+                // streamed events are stamped with, so a socket client
+                // can correlate the response (voice#49); the legacy path
+                // simply leaves `task_id` empty.
                 let task_id = with_user_id(
                     user_id.clone(),
                     handler.start_send_message(
@@ -187,11 +195,20 @@ pub async fn dispatch_loop<R, W>(
                         // Handler registered the turn via the registry
                         // and the body is already running in the
                         // background — emit the new typed ack and
-                        // continue the loop.
+                        // continue the loop. The ack carries BOTH the
+                        // turn `request_id` (which every streamed
+                        // `Assistant*` event is stamped with) and the
+                        // registry `task_id` (which the `Task*` events
+                        // carry), so a socket client can correlate the
+                        // streamed RESPONSE back to its send the same way
+                        // the D-Bus `SendPrompt` reply does (voice#49).
                         if out_tx
                             .send(WsFrame::Result {
                                 id: req.id.clone(),
-                                result: api::CommandResult::SendMessageAck { task_id: id.0 },
+                                result: api::CommandResult::SendMessageAck {
+                                    request_id: request_id.clone(),
+                                    task_id: id.0,
+                                },
                             })
                             .await
                             .is_err()
@@ -200,13 +217,20 @@ pub async fn dispatch_loop<R, W>(
                         }
                     }
                     Ok(None) => {
-                        // Legacy path: ack first, then drive the
-                        // streaming send on a spawned task so the
-                        // dispatcher remains responsive.
+                        // Legacy path (no registry attached — single-tenant
+                        // tests and the like): ack first, then drive the
+                        // streaming send on a spawned task so the dispatcher
+                        // remains responsive. The ack still carries the turn
+                        // `request_id` (with an empty `task_id`, since no task
+                        // was registered) so a socket client can correlate the
+                        // streamed response even on this path (voice#49).
                         if out_tx
                             .send(WsFrame::Result {
                                 id: req.id.clone(),
-                                result: api::CommandResult::Ack,
+                                result: api::CommandResult::SendMessageAck {
+                                    request_id: request_id.clone(),
+                                    task_id: String::new(),
+                                },
                             })
                             .await
                             .is_err()
