@@ -24,37 +24,51 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+use desktop_assistant_core::ports::transport::with_transport_kind;
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 pub use api::{WsFrame, WsRequest};
+// Re-exported so transport adapters can name their kind without each taking a
+// direct dependency on `desktop-assistant-core` (#243).
+pub use desktop_assistant_core::domain::TransportKind;
 
 /// Outbound frame buffer; matches the WS adapter's pre-refactor sizing.
 const OUTBOUND_BUFFER: usize = 64;
 
 /// Pre-validated identity for the connection.
 ///
-/// Today only `user_id` is used; structured as a type so #105 (per-user
-/// state lookup) can extend it without changing the dispatcher signature.
+/// Carries the JWT `sub` (`user_id`) and the connection's [`TransportKind`]
+/// so the dispatcher can scope per-user state (#105) and infer tool
+/// co-location (#243). Structured as a type so further per-connection fields
+/// can be added without changing the dispatcher signature.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     /// JWT `sub` claim.
     pub user_id: String,
+    /// How this connection reaches the daemon — drives tool co-location
+    /// (UDS/D-Bus ⇒ same machine, WebSocket ⇒ possibly remote) (#243).
+    pub transport: TransportKind,
 }
 
 impl AuthContext {
-    pub fn new(user_id: impl Into<String>) -> Self {
+    /// Build a context for a connection on `transport`. Each transport adapter
+    /// passes its own kind so the per-turn tool note can tag tool localities.
+    pub fn new(user_id: impl Into<String>, transport: TransportKind) -> Self {
         Self {
             user_id: user_id.into(),
+            transport,
         }
     }
 
-    /// Convenience for tests that don't need a real subject.
+    /// Convenience for tests that don't need a real subject. Defaults to the
+    /// co-located UDS transport.
     pub fn anonymous() -> Self {
         Self {
             user_id: "anonymous".to_string(),
+            transport: TransportKind::Uds,
         }
     }
 }
@@ -135,6 +149,13 @@ pub async fn dispatch_loop<R, W>(
     // across `tokio::spawn`).
     let user_id = UserId::new(auth.user_id.clone());
 
+    // The connection's transport (#243): installed around the send-message
+    // dispatch so the turn loop can infer tool co-location. Like `user_id` it
+    // is re-installed on spawned send tasks because `task_local`s don't cross
+    // `tokio::spawn`. Only the send-message paths run the LLM turn, so the
+    // command/subscribe paths don't need it.
+    let transport = auth.transport;
+
     // Per-connection state for `SubscribeBackgroundTasks` (#114).
     // At most one forwarder runs per connection — Subscribe is
     // idempotent (a second one observes the existing handle and Acks
@@ -176,16 +197,19 @@ pub async fn dispatch_loop<R, W>(
                 // streamed events are stamped with, so a socket client
                 // can correlate the response (voice#49); the legacy path
                 // simply leaves `task_id` empty.
-                let task_id = with_user_id(
-                    user_id.clone(),
-                    handler.start_send_message(
-                        conversation_id.clone(),
-                        content.clone(),
-                        override_selection.clone(),
-                        system_refinement.clone(),
-                        request_id.clone(),
-                        idempotency_key.clone(),
-                        Arc::clone(&sink),
+                let task_id = with_transport_kind(
+                    transport,
+                    with_user_id(
+                        user_id.clone(),
+                        handler.start_send_message(
+                            conversation_id.clone(),
+                            content.clone(),
+                            override_selection.clone(),
+                            system_refinement.clone(),
+                            request_id.clone(),
+                            idempotency_key.clone(),
+                            Arc::clone(&sink),
+                        ),
                     ),
                 )
                 .await;
@@ -239,17 +263,21 @@ pub async fn dispatch_loop<R, W>(
                         }
                         let handler = Arc::clone(&handler);
                         let user_id_for_task = user_id.clone();
+                        let transport_for_task = transport;
                         tokio::spawn(async move {
-                            let _ = with_user_id(
-                                user_id_for_task,
-                                handler.handle_send_message_with_override(
-                                    conversation_id,
-                                    content,
-                                    override_selection,
-                                    system_refinement,
-                                    request_id,
-                                    idempotency_key,
-                                    sink,
+                            let _ = with_transport_kind(
+                                transport_for_task,
+                                with_user_id(
+                                    user_id_for_task,
+                                    handler.handle_send_message_with_override(
+                                        conversation_id,
+                                        content,
+                                        override_selection,
+                                        system_refinement,
+                                        request_id,
+                                        idempotency_key,
+                                        sink,
+                                    ),
                                 ),
                             )
                             .await;

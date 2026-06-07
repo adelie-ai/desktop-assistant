@@ -20,7 +20,10 @@
 //! `service.rs` to mirror this module's defaults (e.g., the floor on
 //! window size, the compaction-token-pressure threshold).
 
-use crate::domain::{Conversation, Message, MessageSummary, Role, ToolDefinition, ToolNamespace};
+use crate::domain::{
+    Conversation, Message, MessageSummary, Role, ToolDefinition, ToolLocality, ToolNamespace,
+    TransportKind,
+};
 use crate::ports::llm::{ContextBudget, LlmClient, ReasoningConfig};
 
 /// Default maximum number of conversation messages sent to the LLM per turn.
@@ -198,6 +201,7 @@ pub(crate) fn llm_messages_for_turn(
     tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
+    locality: Option<&ToolLocalityContext>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
     let mut current_max = max_messages;
@@ -212,6 +216,7 @@ pub(crate) fn llm_messages_for_turn(
         tool_rounds_since_anchor,
         system_refinement,
         budget,
+        locality,
         estimate,
     );
 
@@ -258,6 +263,7 @@ pub(crate) fn llm_messages_for_turn(
             tool_rounds_since_anchor,
             system_refinement,
             Some(budget),
+            locality,
             estimate,
         );
     }
@@ -265,13 +271,177 @@ pub(crate) fn llm_messages_for_turn(
     assembled
 }
 
+/// Per-turn tool execution-locality context (issue #243).
+///
+/// Bundles the inputs the tool-note builder needs to tag each tool with where
+/// it runs: the connection's [`TransportKind`] (the co-location signal), the
+/// daemon's self-identity `host` label, and the names of the tools registered
+/// as client-local for this turn. Cheap to build — the dispatch loop assembles
+/// it once per turn from the transport task-local, the handler's host label,
+/// and the client-tool port's definitions.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolLocalityContext {
+    /// How the turn's connection reaches the daemon. Drives co-location:
+    /// local transports collapse the server/client distinction.
+    pub transport: TransportKind,
+    /// The daemon's self-identity label used for `Server { host }` (hostname
+    /// today; a stable machine-id in the follow-up phase).
+    pub host: String,
+    /// Label shown for a client tool's machine in the remote tool note (e.g.
+    /// `your device`). A per-client device name arrives with the system-id
+    /// handshake in the follow-up phase.
+    pub client_label: String,
+    /// Names of the tools that run server-side (MCP / built-in) on the daemon
+    /// host. A name in BOTH this set and [`Self::client_tool_names`] is a
+    /// capability duplicated across machines (the routing case).
+    pub server_tool_names: Vec<String>,
+    /// Names of the tools registered as client-local for this turn (run on the
+    /// registering client's machine).
+    pub client_tool_names: Vec<String>,
+}
+
+impl ToolLocalityContext {
+    /// Whether the connection is co-located with the daemon (same machine).
+    fn is_co_located(&self) -> bool {
+        self.transport.is_co_located()
+    }
+
+    fn is_server(&self, name: &str) -> bool {
+        self.server_tool_names.iter().any(|n| n == name)
+    }
+
+    fn is_client(&self, name: &str) -> bool {
+        self.client_tool_names.iter().any(|n| n == name)
+    }
+}
+
+/// One entry in the resolved per-turn locality plan (issue #243).
+///
+/// `resolve_tool_localities` turns the flat tool set plus the locality context
+/// into a plan the note renders. Each entry records the tool's `name`, its
+/// [`ToolLocality`], and whether it is the **primary** for its capability —
+/// the tool the service nudges the LLM toward when the same capability exists
+/// on both the server and a (remote) client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolLocalityEntry {
+    pub name: String,
+    pub locality: ToolLocality,
+    /// True when this entry is the primary for a capability that is duplicated
+    /// across localities. For a non-duplicated capability every entry is
+    /// trivially primary. Only meaningful in the remote case (the local case
+    /// collapses duplicates to the single server tool).
+    pub primary: bool,
+}
+
+/// Resolve the flat tool set into a locality plan (issue #243).
+///
+/// Behaviour:
+/// - **Co-located** (UDS / D-Bus): the client and daemon are the same machine,
+///   so a server tool and a client tool with the same name are physically the
+///   same capability. We collapse them — keep the server-side tool, drop the
+///   duplicate client one — so the LLM sees one tool per capability and the
+///   note carries no confusing per-machine distinction.
+/// - **Remote** (WebSocket): server and client are distinct hosts. Both tools
+///   of a duplicated capability are exposed, each tagged with its locality, and
+///   the **server-side** one is marked primary (daemon-side execution is the
+///   safe default; the prompt rule tells the model to prefer the client tool
+///   for work on the user's own device and to ask when genuinely ambiguous).
+///
+/// Tool order is preserved (server entries keep their position; in the remote
+/// case the matching client entry is appended right after its server twin).
+pub(crate) fn resolve_tool_localities(
+    tool_names: &[&str],
+    ctx: &ToolLocalityContext,
+) -> Vec<ToolLocalityEntry> {
+    let co_located = ctx.is_co_located();
+    let mut entries: Vec<ToolLocalityEntry> = Vec::with_capacity(tool_names.len());
+
+    for &name in tool_names {
+        let is_server = ctx.is_server(name);
+        let is_client = ctx.is_client(name);
+        let duplicated = is_server && is_client;
+
+        if duplicated {
+            // Capability on both machines. Co-located ⇒ the two are physically
+            // the same, so keep only the server-side tool. Remote ⇒ expose both
+            // with the server tool as the primary and the client tool as the
+            // labelled alternative.
+            entries.push(ToolLocalityEntry {
+                name: name.to_string(),
+                locality: ToolLocality::server(&ctx.host),
+                primary: true,
+            });
+            if !co_located {
+                entries.push(ToolLocalityEntry {
+                    name: name.to_string(),
+                    locality: ToolLocality::client(name, &ctx.client_label),
+                    primary: false,
+                });
+            }
+        } else if is_client {
+            // Client-only capability: a plain local tool when co-located, a
+            // labelled remote tool otherwise.
+            entries.push(ToolLocalityEntry {
+                name: name.to_string(),
+                locality: ToolLocality::client(name, &ctx.client_label),
+                primary: true,
+            });
+        } else {
+            // Server-side (MCP / built-in), the default for anything not
+            // registered as client-local.
+            entries.push(ToolLocalityEntry {
+                name: name.to_string(),
+                locality: ToolLocality::server(&ctx.host),
+                primary: true,
+            });
+        }
+    }
+    entries
+}
+
+/// Render a locality plan into the human-readable tool list used in the note.
+///
+/// - **Co-located**: a plain comma-joined name list — everything is on this
+///   machine, so no per-tool label is added.
+/// - **Remote**: each tool is labelled with its locality, e.g.
+///   `terminal — server 'daemon-host'` / `terminal — your device 'laptop'`,
+///   and a duplicated capability's non-primary alternative is noted.
+fn render_locality_list(entries: &[ToolLocalityEntry], co_located: bool) -> String {
+    if co_located {
+        return entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    entries
+        .iter()
+        .map(|e| match &e.locality {
+            ToolLocality::Server { host } => format!("{} — server '{host}'", e.name),
+            ToolLocality::Client { label, .. } => {
+                let alt = if e.primary { "" } else { " (alternative)" };
+                format!("{} — your device '{label}'{alt}", e.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Build the full tool-availability note enumerating every tool name and
 /// the deferred-namespace index. Returned by default; demoted to a
 /// namespace-only summary by [`build_demoted_tool_note`] when the
 /// assembled system block exceeds [`SYSTEM_BLOCK_BUDGET_RATIO`].
+///
+/// When `locality` is `Some`, tools are tagged with where they run (issue
+/// #243): co-located connections (UDS / D-Bus) get a plain list because
+/// everything is on this machine, while a remote (WebSocket) connection gets
+/// per-tool locality labels and a short routing hint. When `None` (callers
+/// that don't thread a transport context) the listing is the plain name list,
+/// byte-identical to the pre-#243 behaviour.
 fn build_full_tool_note(
     tool_defs: &[ToolDefinition],
     deferred_namespaces: &[ToolNamespace],
+    locality: Option<&ToolLocalityContext>,
 ) -> String {
     if tool_defs.is_empty() && deferred_namespaces.is_empty() {
         return "No tools are available in this turn.".to_string();
@@ -281,19 +451,46 @@ fn build_full_tool_note(
     let mut note = String::new();
 
     if !tool_defs.is_empty() {
-        let names = tool_defs
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Resolve locality and render the tool list. The co-located common
+        // case (and the no-context fallback) produce the plain comma-joined
+        // list; a remote connection produces per-tool locality labels.
+        let (names, remote_routing_hint) = match locality {
+            Some(ctx) => {
+                let tool_names: Vec<&str> = tool_defs.iter().map(|t| t.name.as_str()).collect();
+                let entries = resolve_tool_localities(&tool_names, ctx);
+                let co_located = ctx.is_co_located();
+                let rendered = render_locality_list(&entries, co_located);
+                // Only emit a routing hint when a capability is genuinely
+                // duplicated across distinct machines (remote case).
+                let has_remote_dup =
+                    !co_located && entries.iter().any(|e| !e.primary && e.locality.is_client());
+                let hint = if has_remote_dup {
+                    " Some capabilities exist on both the server and your device — \
+                     prefer the tool on your device for work on your own machine, the \
+                     server tool for daemon-side work, and ask which machine when it's \
+                     genuinely ambiguous."
+                } else {
+                    ""
+                };
+                (rendered, hint)
+            }
+            None => (
+                tool_defs
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "",
+            ),
+        };
         if has_tool_search {
             note = format!(
-                "Available tools in this turn: {names}. \
+                "Available tools in this turn: {names}.{remote_routing_hint} \
                  Additional tools may be available — use builtin_tool_search to discover \
                  tools for tasks not covered by the tools listed above."
             );
         } else {
-            note = format!("Available tools in this turn: {names}.");
+            note = format!("Available tools in this turn: {names}.{remote_routing_hint}");
         }
     }
 
@@ -399,9 +596,10 @@ fn assemble_messages_inner(
     tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
+    locality: Option<&ToolLocalityContext>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
-    let tool_note = build_full_tool_note(tool_defs, deferred_namespaces);
+    let tool_note = build_full_tool_note(tool_defs, deferred_namespaces, locality);
     let system_instruction = assemble_system_instruction(tool_note, system_refinement);
 
     // Measure the system block. The system instruction is always
@@ -1270,6 +1468,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
         // System message + all 10 conversation messages
@@ -1304,6 +1503,7 @@ mod tests {
             None,
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1350,6 +1550,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -1388,6 +1589,7 @@ mod tests {
             None,
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1432,6 +1634,7 @@ mod tests {
             0,
             "",
             Some(budget),
+            None,
             &one_per_char,
         );
 
@@ -1478,6 +1681,7 @@ mod tests {
             0,
             "",
             Some(budget),
+            None,
             &one_per_char,
         );
 
@@ -1520,6 +1724,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -1561,6 +1766,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -1597,6 +1803,7 @@ mod tests {
             None,
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1636,6 +1843,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -1668,6 +1876,7 @@ mod tests {
             Some(task),
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1703,6 +1912,7 @@ mod tests {
             6,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -1730,6 +1940,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -1755,6 +1966,7 @@ mod tests {
             Some(""),
             99,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1792,6 +2004,7 @@ mod tests {
             Some(task),
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1845,6 +2058,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -1876,6 +2090,7 @@ mod tests {
             None,
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1922,6 +2137,7 @@ mod tests {
             None,
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -1977,6 +2193,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -2029,6 +2246,7 @@ mod tests {
             None,
             0,
             "",
+            None,
             None,
             &default_estimate,
         );
@@ -2165,6 +2383,7 @@ mod tests {
             0,
             "",
             Some(budget),
+            None,
             &default_estimate,
         );
 
@@ -2216,6 +2435,7 @@ mod tests {
             0,
             "",
             Some(budget),
+            None,
             &default_estimate,
         );
 
@@ -2257,6 +2477,7 @@ mod tests {
             0,
             "",
             None,
+            None,
             &default_estimate,
         );
 
@@ -2277,5 +2498,171 @@ mod tests {
                 .contains(&format!("There are {} tools across", tools.len())),
             "demoted summary must not appear when no budget installed"
         );
+    }
+
+    // --- Tool execution-locality (issue #243) ------------------------------
+
+    fn locality_ctx(
+        transport: TransportKind,
+        host: &str,
+        server_names: &[&str],
+        client_names: &[&str],
+    ) -> ToolLocalityContext {
+        ToolLocalityContext {
+            transport,
+            host: host.to_string(),
+            client_label: "your device".to_string(),
+            server_tool_names: server_names.iter().map(|s| s.to_string()).collect(),
+            client_tool_names: client_names.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_localities_co_located_collapses_duplicates() {
+        // `terminal` exists on both server and client; `voice_stop` is
+        // client-only; `kb_search` is server-only. Co-located (UDS) ⇒ the
+        // duplicate collapses to the single server-side tool.
+        let ctx = locality_ctx(
+            TransportKind::Uds,
+            "daemon-host",
+            &["terminal", "kb_search"],
+            &["terminal", "voice_stop"],
+        );
+        let entries = resolve_tool_localities(&["terminal", "kb_search", "voice_stop"], &ctx);
+        // terminal exists both sides → only the server entry survives.
+        let terminal: Vec<_> = entries.iter().filter(|e| e.name == "terminal").collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "co-located duplicate must collapse to one"
+        );
+        assert!(terminal[0].locality.is_server());
+        // voice_stop is client-only → present once, client locality.
+        let voice: Vec<_> = entries.iter().filter(|e| e.name == "voice_stop").collect();
+        assert_eq!(voice.len(), 1);
+        assert!(voice[0].locality.is_client());
+        // kb_search is server-only.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "kb_search" && e.locality.is_server())
+        );
+    }
+
+    #[test]
+    fn resolve_localities_remote_exposes_both_with_primary_server() {
+        // `terminal` on both server and client + a remote (WebSocket)
+        // transport: both are exposed, server is primary, client is the
+        // labelled alternative.
+        let ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal", "kb_search"],
+            &["terminal"],
+        );
+        let entries = resolve_tool_localities(&["terminal", "kb_search"], &ctx);
+        let terminal: Vec<_> = entries.iter().filter(|e| e.name == "terminal").collect();
+        assert_eq!(terminal.len(), 2, "remote duplicate must expose both tools");
+        // Exactly one is server (primary), one is client (alternative).
+        let server = terminal.iter().find(|e| e.locality.is_server()).unwrap();
+        let client = terminal.iter().find(|e| e.locality.is_client()).unwrap();
+        assert!(
+            server.primary,
+            "server side is the primary in the remote case"
+        );
+        assert!(
+            !client.primary,
+            "client side is the non-primary alternative"
+        );
+    }
+
+    #[test]
+    fn build_tool_note_co_located_omits_locality_labels() {
+        // Co-located: plain name list, no "server '...'" / "your device" labels.
+        let tools = vec![
+            ToolDefinition::new("terminal", "run", serde_json::json!({})),
+            ToolDefinition::new("kb_search", "search", serde_json::json!({})),
+        ];
+        let ctx = locality_ctx(
+            TransportKind::Uds,
+            "daemon-host",
+            &["terminal", "kb_search"],
+            &[],
+        );
+        let note = build_full_tool_note(&tools, &[], Some(&ctx));
+        assert!(note.contains("Available tools in this turn: terminal, kb_search."));
+        assert!(!note.contains("server 'daemon-host'"), "note: {note}");
+        assert!(!note.contains("your device"), "note: {note}");
+    }
+
+    #[test]
+    fn build_tool_note_remote_labels_localities_and_routes() {
+        // Remote duplicate: per-tool locality labels plus a routing hint. The
+        // flat list carries the deduped (server) `terminal`; the context marks
+        // it as also client-registered, so the note twins it.
+        let tools = vec![ToolDefinition::new(
+            "terminal",
+            "run",
+            serde_json::json!({}),
+        )];
+        let ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal"],
+            &["terminal"],
+        );
+        let note = build_full_tool_note(&tools, &[], Some(&ctx));
+        assert!(
+            note.contains("terminal — server 'daemon-host'"),
+            "note: {note}"
+        );
+        assert!(note.contains("your device"), "note: {note}");
+        // Routing hint for the duplicated capability.
+        assert!(
+            note.contains("prefer the tool on your device") && note.contains("ask which machine"),
+            "remote routing hint must be present: {note}"
+        );
+    }
+
+    #[test]
+    fn build_tool_note_remote_client_only_labels_without_routing_hint() {
+        // A client-only capability over a remote transport still gets a
+        // locality label, but there's no duplicated capability so no routing
+        // hint is emitted.
+        let tools = vec![ToolDefinition::new(
+            "voice_stop",
+            "stop",
+            serde_json::json!({}),
+        )];
+        let ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &[],
+            &["voice_stop"],
+        );
+        let note = build_full_tool_note(&tools, &[], Some(&ctx));
+        assert!(note.contains("voice_stop — your device"), "note: {note}");
+        assert!(
+            !note.contains("ask which machine"),
+            "no routing hint without a duplicated capability: {note}"
+        );
+    }
+
+    #[test]
+    fn build_tool_note_none_locality_is_plain_list() {
+        // No locality context (legacy callers) → byte-identical plain list.
+        let tools = vec![ToolDefinition::new(
+            "terminal",
+            "run",
+            serde_json::json!({}),
+        )];
+        let with_none = build_full_tool_note(&tools, &[], None);
+        let co_located = locality_ctx(TransportKind::Uds, "daemon-host", &["terminal"], &[]);
+        let with_local = build_full_tool_note(&tools, &[], Some(&co_located));
+        assert_eq!(
+            with_none, with_local,
+            "co-located note must match the no-context plain list"
+        );
+        assert!(with_none.contains("Available tools in this turn: terminal."));
     }
 }

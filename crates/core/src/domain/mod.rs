@@ -8,4 +8,4 @@ pub use conversation::{Conversation, ConversationId, ConversationSummary, Messag
 pub use knowledge::KnowledgeEntry;
 pub use message::{Message, Role};
 pub use scratchpad::{DEFAULT_NOTE_TYPE, ScratchpadNote};
-pub use tool::{ToolCall, ToolDefinition, ToolNamespace, ToolResult};
+pub use tool::{ToolCall, ToolDefinition, ToolLocality, ToolNamespace, ToolResult, TransportKind};

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use desktop_assistant_core::domain::ConversationId;
+use desktop_assistant_core::domain::{ConversationId, TransportKind};
 use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 use desktop_assistant_core::ports::inbound::ConversationService;
+use desktop_assistant_core::ports::transport::with_transport_kind;
 use desktop_assistant_core::prompts::{PersonalityLevel, PersonalityOverride};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -192,9 +193,16 @@ where
     S: ConversationService + 'static,
 {
     let user_id_for_body = current_user_id();
-    tokio::spawn(with_user_id(
-        user_id_for_body,
-        run_send_prompt_llm_task(service, conversation_id, prompt, system_refinement, tx),
+    // A D-Bus connection always reaches the daemon from the same machine, so
+    // its tools are co-located with the server-side ones (#243). Install the
+    // transport in the spawned body the same way `with_user_id` is — task-locals
+    // don't cross `tokio::spawn`.
+    tokio::spawn(with_transport_kind(
+        TransportKind::Dbus,
+        with_user_id(
+            user_id_for_body,
+            run_send_prompt_llm_task(service, conversation_id, prompt, system_refinement, tx),
+        ),
     ))
 }
 

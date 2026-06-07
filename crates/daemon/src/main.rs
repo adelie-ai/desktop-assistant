@@ -215,6 +215,33 @@ fn env_bool(name: &str, default: bool) -> bool {
     parse_env_bool(std::env::var(name).ok().as_deref(), default)
 }
 
+/// The daemon's self-identity label for server-side tool localities (#243).
+///
+/// Hostname is the groundwork value; the follow-up phase replaces it with a
+/// stable per-machine system-id (e.g. `/etc/machine-id`) so a client can send
+/// its own id and the daemon can decide co-location precisely. Resolution is
+/// dependency-free and best-effort: the Linux kernel hostname
+/// (`/proc/sys/kernel/hostname`), then `/etc/hostname`, then the `HOSTNAME`
+/// env var, falling back to `"this machine"` so the tool note is always
+/// coherent.
+fn daemon_host_label() -> String {
+    let from_file = |path: &str| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    from_file("/proc/sys/kernel/hostname")
+        .or_else(|| from_file("/etc/hostname"))
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "this machine".to_string())
+}
+
 /// Pure parser behind [`env_bool`], split out so the flag semantics are
 /// unit-testable without touching the process environment. `None` (unset) and
 /// unrecognized values fall back to `default`.
@@ -1615,7 +1642,12 @@ async fn main() -> Result<()> {
         llm,
         tool_executor,
         Box::new(|| uuid::Uuid::now_v7().to_string()),
-    );
+    )
+    // Server-side tool localities (#243) are labelled with the daemon's host
+    // identity. Hostname is the groundwork value; the follow-up phase swaps in
+    // a stable per-machine system-id (e.g. /etc/machine-id) shared with clients
+    // for the co-location handshake.
+    .with_host(daemon_host_label());
 
     // Build the shared registry handle (#11): wraps the in-memory
     // `ConnectionRegistry` plus the loaded `DaemonConfig` behind a single

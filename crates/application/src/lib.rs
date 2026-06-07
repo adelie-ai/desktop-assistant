@@ -25,6 +25,7 @@ use desktop_assistant_core::ports::scratchpad::{
     ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
 use desktop_assistant_core::ports::store::{IdempotencyKeyStore, TurnStateStore};
+use desktop_assistant_core::ports::transport::{current_transport_kind, with_transport_kind};
 use thiserror::Error;
 use tracing::warn;
 
@@ -1870,11 +1871,17 @@ where
         let request_id_for_body = request_id.clone();
         let user_id_for_body = user_id.clone();
         let user_id_for_cleanup = user_id.clone();
+        // Capture the connection's transport before the spawn (#243). Read here
+        // while still inside the dispatcher's `with_transport_kind` scope, then
+        // re-install in the spawned body — `task_local`s don't cross
+        // `tokio::spawn`, so this mirrors the `with_user_id` re-install.
+        let transport_for_body = current_transport_kind();
 
         // `registry.spawn` is sync; the body runs on its own `tokio::spawn` so
         // we can return the new task id immediately. `tokio::spawn` doesn't
-        // propagate task-locals, so the body re-installs `with_user_id` for
-        // storage queries inside `run_send_turn` (#154).
+        // propagate task-locals, so the body re-installs `with_user_id` (and
+        // `with_transport_kind`, #243) for the queries / tool-note inside
+        // `run_send_turn` (#154).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             ctx.logs.append(
                 api::LogLevel::Info,
@@ -1899,19 +1906,22 @@ where
                     as Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>
             });
 
-            let result = with_user_id(
-                user_id_for_body,
-                run_send_turn(
-                    conversations,
-                    conv_id_for_body,
-                    content,
-                    override_selection,
-                    system_refinement,
-                    request_id_for_body,
-                    idempotency,
-                    turn_sink,
-                    ctx.token.clone(),
-                    client_tool_port,
+            let result = with_transport_kind(
+                transport_for_body,
+                with_user_id(
+                    user_id_for_body,
+                    run_send_turn(
+                        conversations,
+                        conv_id_for_body,
+                        content,
+                        override_selection,
+                        system_refinement,
+                        request_id_for_body,
+                        idempotency,
+                        turn_sink,
+                        ctx.token.clone(),
+                        client_tool_port,
+                    ),
                 ),
             )
             .await;
@@ -1986,10 +1996,15 @@ where
         let request_id_for_body = request_id.clone();
         let sink_for_body = Arc::clone(&sink);
         let user_id_for_body = user_id.clone();
+        // Capture the connection's transport before the spawn and re-install it
+        // in the body (#243), the same way `user_id` is threaded across the
+        // `tokio::spawn` boundary.
+        let transport_for_body = current_transport_kind();
 
         // `tokio::spawn` does not propagate task-locals, so the body
         // must re-install `with_user_id` for storage queries inside
-        // `run_send_turn` to scope to the right user (#154). The
+        // `run_send_turn` to scope to the right user (#154), and
+        // `with_transport_kind` so the tool note tags localities (#243). The
         // `system_refinement` is moved into the closure as an explicit
         // value for the same reason (task-locals don't cross the spawn).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
@@ -2015,19 +2030,22 @@ where
                     as Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>
             });
 
-            let result = with_user_id(
-                user_id_for_body,
-                run_send_turn(
-                    conversations,
-                    conv_id_for_body,
-                    content,
-                    override_selection,
-                    system_refinement,
-                    request_id_for_body,
-                    idempotency,
-                    sink_for_body,
-                    ctx.token.clone(),
-                    client_tool_port,
+            let result = with_transport_kind(
+                transport_for_body,
+                with_user_id(
+                    user_id_for_body,
+                    run_send_turn(
+                        conversations,
+                        conv_id_for_body,
+                        content,
+                        override_selection,
+                        system_refinement,
+                        request_id_for_body,
+                        idempotency,
+                        sink_for_body,
+                        ctx.token.clone(),
+                        client_tool_port,
+                    ),
                 ),
             )
             .await;
