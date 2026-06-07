@@ -391,7 +391,12 @@ impl BuiltinToolService {
                 TOOL_SCRATCHPAD_WRITE,
                 "Add or update notes in this conversation's scratchpad — an ephemeral, \
                  per-conversation working store for facts you want to keep high in context \
-                 right now (an evolving plan, open questions, a working set of IDs). Notes are \
+                 right now (an evolving plan, open questions, a working set of IDs). Use it \
+                 SELECTIVELY: only when you need to carry information forward across a large or \
+                 multi-step task (a multi-step plan, investigation notes you'll reference later, \
+                 intermediate results held across many turns). For small one-shot tasks — a \
+                 single question, quick lookup, or one-line action — don't write here; just \
+                 answer or act. Notes are \
                  keyed; writing the same key again replaces it. Pass `notes` to upsert several \
                  at once. Use the reserved key 'goal' for the current objective: it is \
                  auto-surfaced as your task anchor every turn (so it survives compaction), and \
