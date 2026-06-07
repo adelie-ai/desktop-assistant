@@ -179,6 +179,42 @@ fn jittered_backoff(current: Duration) -> Duration {
     base + Duration::from_millis(jitter)
 }
 
+/// Best-effort local hostname for the friendly tool-note host label (#248).
+/// Dependency-free: the Linux kernel hostname, then `/etc/hostname`, then the
+/// `HOSTNAME` env var. `None` when none resolve — the label is purely cosmetic,
+/// so omitting it is fine (the daemon shows the generic "your device").
+fn local_hostname() -> Option<String> {
+    let from_file = |path: &str| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    from_file("/proc/sys/kernel/hostname")
+        .or_else(|| from_file("/etc/hostname"))
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// Fill in the per-machine system id and host label on `config` for the connect
+/// handshake (#248), unless the caller already set them (respected so tests can
+/// inject a specific id). Reads the local id once (cached). Returns the
+/// (possibly) updated config — stored by the Connector and re-read by the
+/// reconnect supervisor, so the id rides both connect AND reconnect.
+fn stamp_system_id(mut config: ConnectionConfig) -> ConnectionConfig {
+    if config.system_id.is_none() {
+        config.system_id = crate::system_id::local_system_id();
+    }
+    if config.host_label.is_none() {
+        config.host_label = local_hostname();
+    }
+    config
+}
+
 /// The reconnect supervisor (#246). Waits on the transport's drop-notifier; on a
 /// socket close it unsticks the current waiters and reconnects the *same*
 /// `TransportClient` in place with capped exponential backoff + jitter,
@@ -288,10 +324,18 @@ impl Connector {
         config: &ConnectionConfig,
         stall_timeout: Duration,
     ) -> Result<Self> {
+        // Stamp the per-machine system id (+ host label) onto the config so the
+        // connect handshake carries it on EVERY transport (#248), and — because
+        // the reconnect supervisor re-reads this same stored config — it is
+        // re-sent on every reconnect too (#246/#247). A caller that already set
+        // an id (e.g. a test) is respected; otherwise we read the local one. The
+        // id is a co-location HINT, not a trust boundary — see `system_id`.
+        let config = stamp_system_id(config.clone());
+
         // The initial connect is awaited (and may fail) so the caller gets a
         // clear error if the daemon isn't up at all; only *subsequent* drops
         // trigger the background reconnect loop.
-        let (client, signal_rx, drop_rx) = connect_transport(config).await?;
+        let (client, signal_rx, drop_rx) = connect_transport(&config).await?;
         let client = Arc::new(client);
         let subscribers = spawn_fanout_with_stall_timeout(signal_rx, stall_timeout);
         let tools: RememberedTools = Arc::new(Mutex::new(None));
@@ -308,11 +352,12 @@ impl Connector {
             )
         });
 
+        let label = transport_label(&config);
         Ok(Self {
             client,
             subscribers,
             tools,
-            label: transport_label(config),
+            label,
             supervisor,
         })
     }

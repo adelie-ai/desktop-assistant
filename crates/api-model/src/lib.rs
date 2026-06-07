@@ -1133,9 +1133,94 @@ pub enum WsFrame {
     Event { event: Event },
 }
 
+/// The first frame on a UDS connection: the JWT plus, optionally, the client's
+/// per-machine **system id** and a friendly host label for tool-locality
+/// co-location (issue #248).
+///
+/// The UDS server has always read the JWT out of this frame's `jwt` field; the
+/// `system_id` / `host_label` fields are **optional additions** — older clients
+/// omit them and the server falls back to the transport heuristic (#243),
+/// unchanged. Both are `#[serde(default, skip_serializing_if = "Option::is_none")]`
+/// so the wire shape is byte-identical to the old `{"jwt": "…"}` when a client
+/// sends no id.
+///
+/// The system id is a **co-location/routing hint, not a trust boundary** (#248):
+/// it is self-reported and no privilege is gated on it (auth remains the JWT).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UdsHandshake {
+    /// Bearer JWT the server validates. Optional in the *type* (so a handshake
+    /// frame missing it still parses and the server can reply with the same
+    /// explicit "missing jwt" auth error it always has — rather than a generic
+    /// deserialize failure); the server rejects a `None`/blank jwt. The client
+    /// always sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt: Option<String>,
+    /// The client's per-machine system id (#248). `None`/absent for older
+    /// clients ⇒ the server falls back to the transport heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_id: Option<String>,
+    /// A friendly host label for the remote tool note (#248), e.g. the client's
+    /// hostname. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_label: Option<String>,
+}
+
+/// HTTP header carrying the client's per-machine **system id** on the WebSocket
+/// upgrade (issue #248). The WS transport authenticates via the `Authorization`
+/// bearer header at upgrade time (not an in-band frame), so the system id rides
+/// a custom header alongside it. Optional — older clients omit it and the server
+/// falls back to the transport heuristic.
+pub const WS_SYSTEM_ID_HEADER: &str = "x-adelie-system-id";
+
+/// HTTP header carrying the client's friendly host label on the WebSocket
+/// upgrade (issue #248). Optional companion to [`WS_SYSTEM_ID_HEADER`].
+pub const WS_HOST_LABEL_HEADER: &str = "x-adelie-host-label";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uds_handshake_without_system_id_is_wire_compatible() {
+        // Older shape: a bare `{"jwt": "…"}`. The optional fields must be
+        // skipped on serialize so the wire bytes match the pre-#248 handshake,
+        // and a legacy `{"jwt": "…"}` must still deserialize.
+        let h = UdsHandshake {
+            jwt: Some("tok".into()),
+            system_id: None,
+            host_label: None,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert_eq!(json, r#"{"jwt":"tok"}"#, "absent fields must not appear");
+
+        let legacy: UdsHandshake = serde_json::from_str(r#"{"jwt": "tok"}"#).unwrap();
+        assert_eq!(legacy.jwt.as_deref(), Some("tok"));
+        assert_eq!(legacy.system_id, None);
+        assert_eq!(legacy.host_label, None);
+    }
+
+    #[test]
+    fn uds_handshake_missing_jwt_still_parses() {
+        // A frame with no `jwt` must still deserialize (so the server can return
+        // its explicit "missing jwt" auth error rather than a generic parse
+        // failure). `jwt` is `None`.
+        let h: UdsHandshake = serde_json::from_str(r#"{"hello":"world"}"#).unwrap();
+        assert_eq!(h.jwt, None);
+    }
+
+    #[test]
+    fn uds_handshake_with_system_id_roundtrips() {
+        let h = UdsHandshake {
+            jwt: Some("tok".into()),
+            system_id: Some("machine-abc".into()),
+            host_label: Some("laptop".into()),
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        let back: UdsHandshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, h);
+        assert!(json.contains("machine-abc"));
+        assert!(json.contains("laptop"));
+    }
 
     #[test]
     fn command_json_roundtrip_ping() {

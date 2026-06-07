@@ -271,25 +271,33 @@ pub(crate) fn llm_messages_for_turn(
     assembled
 }
 
-/// Per-turn tool execution-locality context (issue #243).
+/// Per-turn tool execution-locality context (issue #243, refined in #248).
 ///
 /// Bundles the inputs the tool-note builder needs to tag each tool with where
-/// it runs: the connection's [`TransportKind`] (the co-location signal), the
-/// daemon's self-identity `host` label, and the names of the tools registered
-/// as client-local for this turn. Cheap to build — the dispatch loop assembles
-/// it once per turn from the transport task-local, the handler's host label,
-/// and the client-tool port's definitions.
+/// it runs: the per-machine **system-id co-location** result (#248) with the
+/// connection's [`TransportKind`] as a fallback, the daemon's self-identity
+/// `host` label, and the names of the tools registered as client-local for this
+/// turn. Cheap to build — the dispatch loop assembles it once per turn from the
+/// transport + co-location task-locals, the handler's host label, and the
+/// client-tool port's definitions.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolLocalityContext {
-    /// How the turn's connection reaches the daemon. Drives co-location:
+    /// Authoritative co-location result from the per-machine system-id
+    /// handshake (#248): `Some(true)` when the client's reported id equals the
+    /// daemon's own id (same machine — even over WebSocket), `Some(false)` when
+    /// the ids differ, and `None` when the client reported no id (an older
+    /// client). When `None`, co-location falls back to [`Self::transport`],
+    /// preserving the Phase-1 (#243) behaviour exactly.
+    pub co_located: Option<bool>,
+    /// How the turn's connection reaches the daemon. The **fallback**
+    /// co-location signal (#243) used only when [`Self::co_located`] is `None`:
     /// local transports collapse the server/client distinction.
     pub transport: TransportKind,
-    /// The daemon's self-identity label used for `Server { host }` (hostname
-    /// today; a stable machine-id in the follow-up phase).
+    /// The daemon's self-identity label used for `Server { host }` (the
+    /// hostname).
     pub host: String,
     /// Label shown for a client tool's machine in the remote tool note (e.g.
-    /// `your device`). A per-client device name arrives with the system-id
-    /// handshake in the follow-up phase.
+    /// `your device`, or a hostname the client reported in the handshake, #248).
     pub client_label: String,
     /// Names of the tools that run server-side (MCP / built-in) on the daemon
     /// host. A name in BOTH this set and [`Self::client_tool_names`] is a
@@ -302,8 +310,13 @@ pub(crate) struct ToolLocalityContext {
 
 impl ToolLocalityContext {
     /// Whether the connection is co-located with the daemon (same machine).
+    ///
+    /// Prefers the authoritative system-id match (#248) when the client
+    /// reported an id ([`Self::co_located`] is `Some`); otherwise falls back to
+    /// the transport heuristic (#243) for older clients that send no id.
     fn is_co_located(&self) -> bool {
-        self.transport.is_co_located()
+        self.co_located
+            .unwrap_or_else(|| self.transport.is_co_located())
     }
 
     fn is_server(&self, name: &str) -> bool {
@@ -2502,6 +2515,10 @@ mod tests {
 
     // --- Tool execution-locality (issue #243) ------------------------------
 
+    /// Build a context that relies on the **transport** co-location heuristic
+    /// (`co_located: None`), i.e. an older client that reported no system id.
+    /// This preserves the Phase-1 (#243) behaviour the existing assertions
+    /// cover.
     fn locality_ctx(
         transport: TransportKind,
         host: &str,
@@ -2509,6 +2526,28 @@ mod tests {
         client_names: &[&str],
     ) -> ToolLocalityContext {
         ToolLocalityContext {
+            co_located: None,
+            transport,
+            host: host.to_string(),
+            client_label: "your device".to_string(),
+            server_tool_names: server_names.iter().map(|s| s.to_string()).collect(),
+            client_tool_names: client_names.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Build a context with an authoritative system-id co-location result
+    /// (#248). `co_located` overrides the transport heuristic — used to assert
+    /// id-match co-locates even over WebSocket, and id-mismatch keeps localities
+    /// distinct even over a "local" transport.
+    fn locality_ctx_with_id(
+        co_located: bool,
+        transport: TransportKind,
+        host: &str,
+        server_names: &[&str],
+        client_names: &[&str],
+    ) -> ToolLocalityContext {
+        ToolLocalityContext {
+            co_located: Some(co_located),
             transport,
             host: host.to_string(),
             client_label: "your device".to_string(),
@@ -2573,6 +2612,91 @@ mod tests {
         assert!(
             !client.primary,
             "client side is the non-primary alternative"
+        );
+    }
+
+    #[test]
+    fn resolve_localities_id_match_co_locates_over_websocket() {
+        // #248: an authoritative system-id MATCH co-locates even on WebSocket —
+        // overriding the transport heuristic (which would treat WS as remote).
+        // The duplicate `terminal` collapses to the single server-side tool.
+        let ctx = locality_ctx_with_id(
+            true,
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal", "kb_search"],
+            &["terminal"],
+        );
+        let entries = resolve_tool_localities(&["terminal", "kb_search"], &ctx);
+        let terminal: Vec<_> = entries.iter().filter(|e| e.name == "terminal").collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "id-match must co-locate (collapse the duplicate) even over WebSocket"
+        );
+        assert!(terminal[0].locality.is_server());
+    }
+
+    #[test]
+    fn resolve_localities_id_mismatch_keeps_distinct_over_local_transport() {
+        // #248: an authoritative system-id MISMATCH keeps the localities
+        // distinct even on a nominally-local transport — overriding the
+        // transport heuristic (which would co-locate). Both `terminal` entries
+        // survive, server primary + client alternative.
+        let ctx = locality_ctx_with_id(
+            false,
+            TransportKind::Uds,
+            "daemon-host",
+            &["terminal"],
+            &["terminal"],
+        );
+        let entries = resolve_tool_localities(&["terminal"], &ctx);
+        let terminal: Vec<_> = entries.iter().filter(|e| e.name == "terminal").collect();
+        assert_eq!(
+            terminal.len(),
+            2,
+            "id-mismatch must keep both tools distinct even over a local transport"
+        );
+        assert!(terminal.iter().any(|e| e.locality.is_server() && e.primary));
+        assert!(
+            terminal
+                .iter()
+                .any(|e| e.locality.is_client() && !e.primary)
+        );
+    }
+
+    #[test]
+    fn resolve_localities_no_id_falls_back_to_transport() {
+        // #248: with no system id reported (`co_located: None`), co-location is
+        // the Phase-1 transport heuristic — WS remote (distinct), UDS local
+        // (collapsed). This is the backward-compat path for older clients.
+        let ws = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal"],
+            &["terminal"],
+        );
+        assert_eq!(
+            resolve_tool_localities(&["terminal"], &ws)
+                .iter()
+                .filter(|e| e.name == "terminal")
+                .count(),
+            2,
+            "no-id + WebSocket must stay remote (transport fallback, distinct tools)"
+        );
+        let uds = locality_ctx(
+            TransportKind::Uds,
+            "daemon-host",
+            &["terminal"],
+            &["terminal"],
+        );
+        assert_eq!(
+            resolve_tool_localities(&["terminal"], &uds)
+                .iter()
+                .filter(|e| e.name == "terminal")
+                .count(),
+            1,
+            "no-id + UDS must co-locate (transport fallback, collapsed)"
         );
     }
 

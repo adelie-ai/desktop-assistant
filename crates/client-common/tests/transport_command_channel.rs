@@ -41,7 +41,7 @@ async fn as_commands_returns_some_for_ws_transport() {
     // No TLS for plain `ws://`; the accept server ignores the bearer token.
     let (client, _signals, _drop) = timeout(
         Duration::from_secs(5),
-        WsClient::connect(&ws_url, "test-token", None),
+        WsClient::connect(&ws_url, "test-token", None, None, None),
     )
     .await
     .expect("ws connect did not complete in time")

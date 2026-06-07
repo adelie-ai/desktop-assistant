@@ -132,13 +132,25 @@ pub struct UdsServerConfig {
     /// Filesystem path the listener binds. Existing files at this
     /// path are unlinked before bind.
     pub socket_path: PathBuf,
+    /// The daemon's own per-machine system id (#248), read once at startup.
+    /// Compared against each client's reported id in the handshake to decide
+    /// co-location exactly. `None` ⇒ the daemon couldn't resolve its own id, so
+    /// co-location falls back to the transport heuristic (UDS ⇒ co-located).
+    pub daemon_system_id: Option<String>,
 }
 
 impl UdsServerConfig {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            daemon_system_id: None,
         }
+    }
+
+    /// Set the daemon's own system id for the #248 co-location handshake.
+    pub fn with_daemon_system_id(mut self, id: Option<String>) -> Self {
+        self.daemon_system_id = id;
+        self
     }
 }
 
@@ -239,14 +251,20 @@ impl UdsServer {
 
         let handler = Arc::clone(&self.handler);
         let auth = Arc::clone(&self.auth);
+        // The daemon's own system id (#248), shared by every connection's
+        // co-location comparison. `Arc` so the spawn per connection is cheap.
+        let daemon_system_id = Arc::new(self.config.daemon_system_id.clone());
         let accept_loop = async {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
                         let handler = Arc::clone(&handler);
                         let auth = Arc::clone(&auth);
+                        let daemon_system_id = Arc::clone(&daemon_system_id);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, handler, auth).await {
+                            if let Err(e) =
+                                handle_connection(stream, handler, auth, daemon_system_id).await
+                            {
                                 debug!("uds connection ended: {e}");
                             }
                         });
@@ -291,15 +309,18 @@ async fn handle_connection(
     stream: UnixStream,
     handler: Arc<dyn AssistantApiHandler>,
     auth: Arc<dyn UdsAuthValidator>,
+    daemon_system_id: Arc<Option<String>>,
 ) -> anyhow::Result<()> {
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // Handshake: first frame must be `{"jwt": "<token>"}`. Anything
-    // else (including non-JSON, an empty body, or a missing/blank
-    // field) is rejected with an explicit error frame so clients can
-    // tell auth from framing problems.
+    // Handshake: first frame is the JWT plus, optionally, the client's
+    // per-machine system id + host label for co-location (#248). Anything that
+    // isn't valid JSON, or has a missing/blank `jwt`, is rejected with an
+    // explicit error frame so clients can tell auth from framing problems. An
+    // older client sends the bare `{"jwt": "<token>"}`, which still parses (the
+    // id fields default to absent).
     let handshake_raw = read_frame(&mut read_half).await?;
-    let handshake_json: serde_json::Value = match serde_json::from_slice(&handshake_raw) {
+    let handshake: api::UdsHandshake = match serde_json::from_slice(&handshake_raw) {
         Ok(v) => v,
         Err(e) => {
             // Surface the parse error to the client before closing so a
@@ -309,9 +330,8 @@ async fn handle_connection(
         }
     };
 
-    let token = handshake_json
-        .get("jwt")
-        .and_then(|v| v.as_str())
+    let token = handshake
+        .jwt
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
@@ -322,6 +342,16 @@ async fn handle_connection(
             return Ok(());
         }
     };
+
+    // System-id co-location (#248): compare the client's reported id to the
+    // daemon's own. `None` (older client / unresolved daemon id) defers to the
+    // transport heuristic. The id is a routing HINT, not a trust boundary — it
+    // is self-reported and no privilege is gated on it (auth is the JWT above).
+    let co_located = desktop_assistant_core::system_id::co_location_from_ids(
+        daemon_system_id.as_deref(),
+        handshake.system_id.as_deref(),
+    );
+    let client_label = handshake.host_label;
 
     if !auth.validate_bearer_token(&token).await {
         write_error(&mut write_half, "", "auth: invalid jwt").await?;
@@ -393,9 +423,12 @@ async fn handle_connection(
     // Per-connection identity resolved above (#105). The dispatcher
     // installs this into the `with_user_id` task-local around each
     // command so storage queries scope to the right partition. A UDS
-    // connection can only come from the daemon's own machine, so its tools
-    // are co-located with the server-side ones (#243).
-    let auth_ctx = AuthContext::new(user_id.into_inner(), TransportKind::Uds);
+    // connection is local, so the transport heuristic already treats its tools
+    // as co-located (#243); when the client also reported a system id we attach
+    // the authoritative match result + an optional host label (#248).
+    let auth_ctx = AuthContext::new(user_id.into_inner(), TransportKind::Uds)
+        .with_co_location(co_located)
+        .with_client_label(client_label);
 
     dispatch_loop(handler, auth_ctx, inbound, sink).await;
 

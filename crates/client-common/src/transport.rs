@@ -101,8 +101,17 @@ impl TransportClient {
             )),
             Self::Ws(client) => {
                 let token = resolve_ws_bearer_token(config).await?;
+                // Re-send the #248 system id + host label from the stored config
+                // so co-location survives a reconnect (the supervisor re-reads
+                // this same config).
                 client
-                    .reconnect(&config.ws_url, &token, config.tls_ca_cert.as_deref())
+                    .reconnect(
+                        &config.ws_url,
+                        &token,
+                        config.tls_ca_cert.as_deref(),
+                        config.system_id.as_deref(),
+                        config.host_label.as_deref(),
+                    )
                     .await
             }
             Self::Uds(client) => {
@@ -116,7 +125,14 @@ impl TransportClient {
                             "no UDS socket path: set ConnectionConfig.socket_path or XDG_RUNTIME_DIR"
                         )
                     })?;
-                client.reconnect(&path, &token).await
+                client
+                    .reconnect(
+                        &path,
+                        &token,
+                        config.system_id.as_deref(),
+                        config.host_label.as_deref(),
+                    )
+                    .await
             }
         }
     }
@@ -358,8 +374,16 @@ pub async fn connect_transport(
         )),
         TransportMode::Ws => {
             let token = resolve_ws_bearer_token(config).await?;
-            let (client, signal_rx, drop_rx) =
-                WsClient::connect(&config.ws_url, &token, config.tls_ca_cert.as_deref()).await?;
+            // Carry the #248 system id + host label from the config into the
+            // handshake (custom upgrade headers); the Connector stamps them on.
+            let (client, signal_rx, drop_rx) = WsClient::connect(
+                &config.ws_url,
+                &token,
+                config.tls_ca_cert.as_deref(),
+                config.system_id.as_deref(),
+                config.host_label.as_deref(),
+            )
+            .await?;
             Ok((TransportClient::Ws(client), signal_rx, Some(drop_rx)))
         }
         TransportMode::Uds => {
@@ -375,7 +399,15 @@ pub async fn connect_transport(
                         "no UDS socket path: set ConnectionConfig.socket_path or XDG_RUNTIME_DIR"
                     )
                 })?;
-            let (client, signal_rx, drop_rx) = UdsClient::connect(&path, &token).await?;
+            // Carry the #248 system id + host label from the config into the
+            // JWT handshake frame; the Connector stamps them on.
+            let (client, signal_rx, drop_rx) = UdsClient::connect(
+                &path,
+                &token,
+                config.system_id.as_deref(),
+                config.host_label.as_deref(),
+            )
+            .await?;
             Ok((TransportClient::Uds(client), signal_rx, Some(drop_rx)))
         }
     }
