@@ -22,17 +22,28 @@ use crate::transport::{AssistantClient, TransportClient, connect_transport, tran
 
 type Subscribers = Arc<Mutex<Vec<mpsc::UnboundedSender<SignalEvent>>>>;
 
-/// Pump a transport's signal stream out to subscribers, surfacing both a closed
-/// AND a *stalled* (open but silent) connection as a terminal
-/// [`SignalEvent::Disconnected`] (#221).
+/// Pump a transport's signal stream out to subscribers.
 ///
-/// Every received event resets the stall clock; if no event arrives within
-/// `stall_timeout` the connection is assumed wedged and subscribers get a
-/// `Disconnected { reason }` so a client waiting on the stream errors out
-/// instead of hanging forever. This pairs with the orchestrator emitting
-/// periodic `AssistantStatus`, which keeps a healthy connection's clock fresh
-/// even between LLM chunks. `stall_timeout` is a parameter so tests can drive a
-/// short window without waiting the production minute-plus.
+/// Closing the upstream stream is terminal: every subscriber gets a
+/// `Disconnected { reason: "signal stream closed" }` and the pump stops.
+///
+/// A *stall* (open but silent) is treated as a **per-turn** signal, not a reason
+/// to tear the connection down (voice#49, reopened). The stall clock only runs
+/// while at least one subscriber is attached — i.e. a turn is potentially in
+/// flight: if no event arrives within `stall_timeout`, every *current*
+/// subscriber gets a terminal `Disconnected { reason: "…stalled…" }` so a client
+/// waiting on a wedged turn errors out instead of hanging (#221), but the pump
+/// **keeps reading** so the next turn still streams.
+///
+/// While there are no subscribers, the connection is simply idle — the gap
+/// between connecting and the first request, or between turns — and the pump
+/// waits without a stall deadline. This is essential on transports without a
+/// keepalive (UDS): otherwise a healthy-but-idle connection would trip the
+/// stall and the pump would die before the first turn ever arrived, so every
+/// later subscriber would be attached to a dead pump and receive ZERO events
+/// (the reopened voice#49: send acks, turn completes, client gets nothing).
+/// `stall_timeout` is a parameter so tests can drive a short window without
+/// waiting the production minute-plus.
 fn spawn_fanout_with_stall_timeout(
     mut signal_rx: mpsc::UnboundedReceiver<SignalEvent>,
     stall_timeout: Duration,
@@ -40,32 +51,54 @@ fn spawn_fanout_with_stall_timeout(
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
     let pump = Arc::clone(&subscribers);
     tokio::spawn(async move {
-        // The terminal reason depends on *why* we stopped: a closed upstream vs.
-        // a stall the client should distinguish (and may choose to reconnect on).
-        let reason = loop {
-            match tokio::time::timeout(stall_timeout, signal_rx.recv()).await {
-                Ok(Some(event)) => {
-                    // Deliver to every live subscriber; drop those whose
-                    // receiver is gone. Receipt also resets the stall clock,
-                    // since the next `timeout` starts fresh on the next iter.
+        loop {
+            // The stall clock only applies while a subscriber is waiting (a turn
+            // may be in flight). With no subscribers the connection is idle, not
+            // wedged, so we wait unbounded — never stalling out a healthy link
+            // that simply has no traffic yet (voice#49).
+            let has_subscribers = !pump.lock().unwrap().is_empty();
+            let next = if has_subscribers {
+                match tokio::time::timeout(stall_timeout, signal_rx.recv()).await {
+                    Ok(item) => item,
+                    Err(_elapsed) => {
+                        // No progress for a turn that had a waiter: unstick the
+                        // current subscribers, but KEEP the pump alive so the
+                        // next turn still streams.
+                        let reason = format!(
+                            "connection stalled: no events for {}s",
+                            stall_timeout.as_secs()
+                        );
+                        for tx in pump.lock().unwrap().drain(..) {
+                            let _ = tx.send(SignalEvent::Disconnected {
+                                reason: reason.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                signal_rx.recv().await
+            };
+
+            match next {
+                Some(event) => {
+                    // Deliver to every live subscriber; drop those whose receiver
+                    // is gone. Receipt resets the stall clock implicitly — the
+                    // next iteration re-arms the timeout from now.
                     pump.lock()
                         .unwrap()
                         .retain(|tx| tx.send(event.clone()).is_ok());
                 }
-                Ok(None) => break "signal stream closed".to_string(),
-                Err(_elapsed) => {
-                    break format!(
-                        "connection stalled: no events for {}s",
-                        stall_timeout.as_secs()
-                    );
+                // Upstream closed — terminal. Notify whoever is left and stop.
+                None => {
+                    for tx in pump.lock().unwrap().drain(..) {
+                        let _ = tx.send(SignalEvent::Disconnected {
+                            reason: "signal stream closed".to_string(),
+                        });
+                    }
+                    break;
                 }
             }
-        };
-        // The transport closed or stalled — give subscribers a terminal event.
-        for tx in pump.lock().unwrap().drain(..) {
-            let _ = tx.send(SignalEvent::Disconnected {
-                reason: reason.clone(),
-            });
         }
     });
     subscribers
@@ -93,10 +126,12 @@ impl Connector {
     }
 
     /// Like [`connect`](Self::connect) but with an explicit event-stream stall
-    /// window (#221). A connection that stays open but emits no event for
-    /// `stall_timeout` surfaces a terminal [`SignalEvent::Disconnected`] to
-    /// every subscriber. Mainly for tests; production callers normally want the
-    /// default via [`connect`](Self::connect).
+    /// window (#221). While a subscriber is attached (a turn may be in flight), a
+    /// connection that stays open but emits no event for `stall_timeout` surfaces
+    /// a terminal [`SignalEvent::Disconnected`] to the *current* subscribers — but
+    /// the pump keeps running so later turns still stream (voice#49). An idle
+    /// connection with no subscribers is never stalled out. Mainly for tests;
+    /// production callers normally want the default via [`connect`](Self::connect).
     pub async fn connect_with_stall_timeout(
         config: &ConnectionConfig,
         stall_timeout: Duration,
@@ -358,6 +393,77 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         // Still alive: no Disconnected yet (we've only ever waited < window).
+        drop(tx);
+    }
+
+    /// voice#49 (reopened): a connection that sits IDLE with no subscribers past
+    /// the stall window must NOT tear the pump down. A subscriber that registers
+    /// for the first turn *after* that idle period must still receive its events.
+    /// (UDS has no keepalive, so this idle gap always exceeds the window.)
+    #[tokio::test]
+    async fn fanout_idle_without_subscribers_does_not_stall_out() {
+        let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let stall = Duration::from_millis(40);
+        let subs = spawn_fanout_with_stall_timeout(rx, stall);
+
+        // Idle well past the stall window with NO subscribers (the
+        // connect→first-turn gap). The pump must survive.
+        tokio::time::sleep(stall * 4).await;
+
+        // First turn: subscribe, then events arrive — they must be delivered.
+        let mut a = register(&subs);
+        tx.send(SignalEvent::Chunk {
+            request_id: "r".into(),
+            chunk: "hi".into(),
+        })
+        .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), a.recv())
+            .await
+            .expect("a turn after an idle period must still deliver, not be a dead pump");
+        assert!(
+            matches!(event, Some(SignalEvent::Chunk { .. })),
+            "expected the first turn's chunk after idle, got {event:?}"
+        );
+        drop(tx);
+    }
+
+    /// A stall unsticks the *current* subscribers (so a wedged turn errors out)
+    /// but must NOT kill the pump: a fresh subscriber for the next turn still
+    /// gets its events. This is the per-turn-vs-terminal distinction at the
+    /// heart of the voice#49 fix.
+    #[tokio::test]
+    async fn fanout_stall_unsticks_waiters_but_keeps_serving_later_turns() {
+        let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let stall = Duration::from_millis(40);
+        let subs = spawn_fanout_with_stall_timeout(rx, stall);
+
+        // Turn 1: a subscriber waits on a wedged (silent) connection → gets a
+        // terminal Disconnected once the stall fires.
+        let mut first = register(&subs);
+        let event = tokio::time::timeout(Duration::from_secs(2), first.recv())
+            .await
+            .expect("the waiting subscriber must be unstuck by the stall");
+        assert!(
+            matches!(event, Some(SignalEvent::Disconnected { ref reason }) if reason.contains("stalled")),
+            "the waiter on a wedged turn should get a stall Disconnected, got {event:?}"
+        );
+
+        // Turn 2: a NEW subscriber on the SAME (still-open) connection must
+        // still receive events — the pump survived the stall.
+        let mut second = register(&subs);
+        tx.send(SignalEvent::Chunk {
+            request_id: "r2".into(),
+            chunk: "next".into(),
+        })
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), second.recv())
+            .await
+            .expect("the next turn must still stream after a prior stall");
+        assert!(
+            matches!(event, Some(SignalEvent::Chunk { ref chunk, .. }) if chunk == "next"),
+            "expected the next turn's chunk, got {event:?}"
+        );
         drop(tx);
     }
 }
