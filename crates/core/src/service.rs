@@ -13,6 +13,7 @@ use crate::planning::{self, StepStack};
 use crate::ports::client_tools::current_client_tools;
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
+use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_system_refinement,
@@ -26,7 +27,8 @@ use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
 use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
 use crate::tools::{
-    NoopToolExecutor, categorize_tool_namespaces, tool_set_hash, tool_status_message,
+    NoopToolExecutor, categorize_tool_namespaces, summarize_tool_text, summarize_tool_value,
+    tool_set_hash, tool_status_message,
 };
 use chrono::{Duration, Local};
 use tokio_util::sync::CancellationToken;
@@ -1139,6 +1141,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     continue;
                 }
 
+                // Report the call to any installed tool observer (the task
+                // panel's activity feed). Emitted here — after the step-control
+                // fast path, before either execution branch — so it covers real
+                // tool work (server-side and client-local alike) exactly once.
+                notify_tool_event(ToolEvent::Started {
+                    name: tool_call.name.clone(),
+                    args: summarize_tool_value(&arguments),
+                });
+
                 // Route client-local tools to the client (#107 / #234): if a
                 // per-turn client-tool port is installed and the called name is
                 // registered for this user, suspend the turn and await the
@@ -1152,14 +1163,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     _ => None,
                 };
 
-                let result = if let Some(port) = client_exec {
+                // `tool_ok` is tracked alongside the result so the observer can
+                // distinguish a successful call from an error the loop folds
+                // into the tool result (and keeps looping on).
+                let (result, tool_ok) = if let Some(port) = client_exec {
                     match port
                         .execute(&tool_call.id, &tool_call.name, arguments)
                         .await
                     {
                         Ok(output) => {
                             tracing::debug!(tool = %tool_call.name, output = %output, "client tool result");
-                            output
+                            (output, true)
                         }
                         // Cancellation while a client tool was suspended (e.g.
                         // the user pressed Cancel) must abort the turn, not be
@@ -1168,7 +1182,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
                         Err(e) => {
                             tracing::warn!(tool = %tool_call.name, error = %e, "client tool execution failed");
-                            format!("Error: {e}")
+                            (format!("Error: {e}"), false)
                         }
                     }
                 } else {
@@ -1180,14 +1194,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     match with_conversation_id(conversation_id.clone(), exec).await {
                         Ok(output) => {
                             tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
-                            output
+                            (output, true)
                         }
                         Err(e) => {
                             tracing::warn!(tool = %tool_call.name, error = %e, "tool execution failed");
-                            format!("Error: {e}")
+                            (format!("Error: {e}"), false)
                         }
                     }
                 };
+
+                notify_tool_event(ToolEvent::Finished {
+                    name: tool_call.name.clone(),
+                    ok: tool_ok,
+                    output: summarize_tool_text(&result),
+                });
 
                 // Dynamic activation: if tool_search returned results,
                 // activate the discovered tools for subsequent rounds.

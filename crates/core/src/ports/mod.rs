@@ -51,6 +51,12 @@ pub mod conversation_ctx;
 /// turn on a client-tool call (#107 / #234).
 pub mod client_tools;
 
+/// Request-scoped tool-activity observer — task-local sink the turn loop
+/// notifies of each tool/MCP call and its outcome, so a caller can surface a
+/// live activity feed (e.g. the background-task panel) without threading a
+/// sink through the `send_prompt` trait surface.
+pub mod tool_observer;
+
 #[cfg(test)]
 mod tests {
     #[test]

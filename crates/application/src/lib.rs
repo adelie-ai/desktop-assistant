@@ -15,6 +15,7 @@ pub use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::domain::{DEFAULT_NOTE_TYPE, KnowledgeEntry, ScratchpadNote};
 use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::client_tools::with_client_tools;
+use desktop_assistant_core::ports::tool_observer::{ToolEvent, ToolObserver, with_tool_observer};
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
     ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
@@ -29,7 +30,7 @@ use desktop_assistant_core::ports::transport::{current_transport_kind, with_tran
 use thiserror::Error;
 use tracing::warn;
 
-use crate::background_tasks::{BackgroundTaskRegistry, TaskError};
+use crate::background_tasks::{BackgroundTaskRegistry, TaskContext, TaskError};
 use crate::client_tools::{
     ClientToolCoordinator, ClientToolResolutionError, CoordinatorClientToolPort,
     register_client_tools, resolve_client_tool_result,
@@ -1744,6 +1745,7 @@ where
                 sink,
                 tokio_util::sync::CancellationToken::new(),
                 None,
+                None,
             )
             .await
             .map_err(Self::map_core_err)
@@ -1921,6 +1923,7 @@ where
                         turn_sink,
                         ctx.token.clone(),
                         client_tool_port,
+                        Some(ctx.clone()),
                     ),
                 ),
             )
@@ -2045,6 +2048,7 @@ where
                         sink_for_body,
                         ctx.token.clone(),
                         client_tool_port,
+                        Some(ctx.clone()),
                     ),
                 ),
             )
@@ -2131,6 +2135,40 @@ pub(crate) struct AgentConversationSpec {
     pub result_sink: Option<AgentResultSink>,
 }
 
+/// Build a [`ToolObserver`] that mirrors the core loop's tool/MCP calls into a
+/// background task's log ring. Installed around the dispatch (via
+/// [`with_tool_observer`]) so the task panel shows a live feed of what the turn
+/// is doing — each call's name + arguments, then its outcome — instead of an
+/// empty log. The one-line `progress_hint` (driven separately by `on_status`)
+/// still shows the latest humanized activity; this is the detailed timeline.
+fn task_tool_observer(ctx: TaskContext) -> ToolObserver {
+    Arc::new(move |event: ToolEvent| match event {
+        ToolEvent::Started { name, args } => {
+            let message = if args.is_empty() {
+                name
+            } else {
+                format!("{name}  {args}")
+            };
+            ctx.logs
+                .append(api::LogLevel::Info, api::LogCategory::ToolCall, message, None);
+        }
+        ToolEvent::Finished { name, ok, output } => {
+            let (level, message) = if ok {
+                let msg = if output.is_empty() {
+                    format!("{name} ✓")
+                } else {
+                    format!("{name} ✓ {output}")
+                };
+                (api::LogLevel::Info, msg)
+            } else {
+                (api::LogLevel::Warn, format!("{name} ✗ {output}"))
+            };
+            ctx.logs
+                .append(level, api::LogCategory::ToolResult, message, None);
+        }
+    })
+}
+
 pub(crate) fn spawn_agent_conversation<C>(
     registry: Arc<BackgroundTaskRegistry>,
     conversations: Arc<C>,
@@ -2168,13 +2206,16 @@ where
             effort: o.effort,
         });
 
-        // Drop callbacks — standalone / subagent runs emit progress
-        // through the registry's per-task log ring and broadcast
-        // channel, not through the streaming `SendMessage` chunk path.
-        // The chunk and status callbacks are required by the trait, so
-        // we wire no-op closures.
+        // Drop the chunk callback — standalone / subagent runs emit their
+        // final text through the registry, not the streaming `SendMessage`
+        // chunk path. The status callback, however, drives the task's
+        // `progress_hint` so the task list shows what the agent is doing right
+        // now (e.g. the current tool/MCP call) instead of just its title.
         let on_chunk: desktop_assistant_core::ports::llm::ChunkCallback = Box::new(|_chunk| true);
-        let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(|_msg| {});
+        let progress_ctx = ctx.clone();
+        let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(move |msg| {
+            progress_ctx.set_progress_hint(Some(msg));
+        });
 
         // Install the tool allowlist (if any) and the requesting user's
         // identity so the inner `send_prompt_with_override` call (and
@@ -2182,7 +2223,9 @@ where
         // foreground send path uses.
         let conv_id_for_send = conversation_id.clone();
         let token = ctx.token.clone();
-        let inner = async move {
+        // Mirror this agent's tool/MCP calls into its task log so the panel
+        // shows what the agent is doing, same as the foreground send path.
+        let inner = with_tool_observer(task_tool_observer(ctx.clone()), async move {
             conversations
                 .send_prompt_with_override(
                     &desktop_assistant_core::domain::ConversationId::from(
@@ -2199,7 +2242,7 @@ where
                     token,
                 )
                 .await
-        };
+        });
         let result = if let Some(tools) = tools {
             desktop_assistant_core::ports::auth::with_user_id(
                 user_id.clone(),
@@ -2209,6 +2252,10 @@ where
         } else {
             desktop_assistant_core::ports::auth::with_user_id(user_id.clone(), inner).await
         };
+
+        // The run is over — clear the "currently doing" hint so a finished
+        // agent that lingers in the list doesn't show a stale tool action.
+        ctx.set_progress_hint(None);
 
         match result {
             Ok(outcome) => {
@@ -2285,6 +2332,12 @@ async fn run_send_turn<C>(
     sink: Arc<dyn EventSink>,
     cancellation: tokio_util::sync::CancellationToken,
     client_tool_port: Option<Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>>,
+    // When this turn runs inside a registry task, the context lets us mirror
+    // the core loop's status messages onto the task's `progress_hint` so the
+    // task list shows what the turn is doing right now — e.g. the current
+    // tool/MCP call (#223 status strings, surfaced per-task). `None` on the
+    // no-registry direct path, which has no task to annotate.
+    task_ctx: Option<TaskContext>,
 ) -> Result<(), desktop_assistant_core::CoreError>
 where
     C: ConversationService + Send + Sync + 'static,
@@ -2312,11 +2365,20 @@ where
         .is_ok()
     });
 
-    // Bridge status updates from core callback -> canonical events.
+    // Bridge status updates from core callback -> canonical events, and mirror
+    // them onto the registry task's `progress_hint` so the task list shows the
+    // current activity (e.g. "Checking your calendar events") rather than just
+    // the static title.
     let status_tx = sink.clone();
     let conv_id_for_status = conversation_id.clone();
     let req_id_for_status = request_id.clone();
+    let progress_ctx = task_ctx.clone();
     let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(move |message| {
+        // `set_progress_hint` is cheap and synchronous (lock + broadcast), so
+        // update the hint inline before the fire-and-forget event emit.
+        if let Some(ctx) = &progress_ctx {
+            ctx.set_progress_hint(Some(message.clone()));
+        }
         let sink = Arc::clone(&status_tx);
         let conv_id = conv_id_for_status.clone();
         let req_id = req_id_for_status.clone();
@@ -2349,17 +2411,31 @@ where
         cancellation,
     );
 
-    // Install the per-turn client-tool port (#234) as a task-local around the
-    // dispatch so the core loop can offer the connection's client-local tools
-    // and suspend on a call. No port → the loop is server-side only, exactly
-    // as before.
-    let outcome = match client_tool_port {
-        Some(port) => with_client_tools(port, dispatch).await,
-        None => dispatch.await,
+    // Layer the per-turn task-locals around the dispatch. Innermost: the
+    // client-tool port (#234) so the core loop can offer the connection's
+    // client-local tools and suspend on a call. Outermost: a tool observer
+    // (when this turn is a tracked task) so the loop's tool/MCP calls land in
+    // the task's log ring for the panel's activity feed.
+    let dispatched = async move {
+        match client_tool_port {
+            Some(port) => with_client_tools(port, dispatch).await,
+            None => dispatch.await,
+        }
+    };
+    let outcome = match task_ctx.clone().map(task_tool_observer) {
+        Some(observer) => with_tool_observer(observer, dispatched).await,
+        None => dispatched.await,
     };
 
     if let Err(e) = forwarder.await {
         warn!("stream forwarder task failed: {e}");
+    }
+
+    // The turn is fully drained — nothing is "happening" anymore, so clear the
+    // hint. Matters for tasks that linger in the list after finishing (e.g. a
+    // fire-and-forget standalone agent) where a stale tool hint would mislead.
+    if let Some(ctx) = &task_ctx {
+        ctx.set_progress_hint(None);
     }
 
     match outcome {
