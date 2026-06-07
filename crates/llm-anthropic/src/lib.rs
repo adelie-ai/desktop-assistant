@@ -13,6 +13,49 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
+/// Maximum time to wait for the HTTP connection handshake (response headers)
+/// before failing the turn. Mirrors the Bedrock connector (#214/#220).
+const ANTHROPIC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Maximum gap allowed between two streamed SSE events. Each received event
+/// resets the clock (the heartbeat), so this only fires when the stream goes
+/// silent mid-response. Matches the Bedrock per-event timeout (#214/#220).
+const ANTHROPIC_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Outcome of racing a stream's next item against cancellation and a stall
+/// timeout. Extracted so the timeout behaviour is unit-testable with a short
+/// duration instead of the production 60s constant (#220).
+enum StreamStep<T> {
+    /// The stream yielded an item.
+    Item(T),
+    /// The stream ended (no more items).
+    Done,
+    /// The cancellation token tripped.
+    Cancelled,
+    /// No item arrived within the stall timeout.
+    Stalled,
+}
+
+/// Await the next item from `stream`, racing it against `cancellation` and a
+/// `timeout`. A fresh `tokio::time::sleep(timeout)` is created on every call,
+/// so the stall window resets each time a caller consumes an item.
+async fn next_step<S>(
+    stream: &mut S,
+    cancellation: &tokio_util::sync::CancellationToken,
+    timeout: std::time::Duration,
+) -> StreamStep<S::Item>
+where
+    S: tokio_stream::Stream + Unpin,
+{
+    tokio::select! {
+        _ = cancellation.cancelled() => StreamStep::Cancelled,
+        _ = tokio::time::sleep(timeout) => StreamStep::Stalled,
+        next = stream.next() => match next {
+            Some(item) => StreamStep::Item(item),
+            None => StreamStep::Done,
+        },
+    }
+}
+
 /// Return the prompt-token context window for a known Anthropic model id.
 ///
 /// Anthropic's Messages API does not expose context windows in its model
@@ -462,11 +505,19 @@ impl AnthropicClient {
             .json(request_body)
             .send();
 
-        // Race the connection-establishment future against cancellation
-        // so the HTTP connection itself is dropped (no orphaned socket)
-        // when the user cancels mid-handshake.
+        // Race the connection-establishment future against cancellation and a
+        // connect timeout so the HTTP connection itself is dropped (no orphaned
+        // socket) when the user cancels mid-handshake, and so a stalled connect
+        // fails the turn instead of hanging forever (#220).
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            _ = tokio::time::sleep(ANTHROPIC_CONNECT_TIMEOUT) => {
+                tracing::error!(
+                    timeout_s = ANTHROPIC_CONNECT_TIMEOUT.as_secs(),
+                    "Anthropic request send() timed out (no response headers)"
+                );
+                return Err(CoreError::Llm("Anthropic stream stalled".into()));
+            }
             r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
         };
 
@@ -522,19 +573,28 @@ impl AnthropicClient {
             std::collections::HashMap::new();
 
         loop {
-            // Race the next SSE event against cancellation. When the
-            // token trips, drop `events` (and with it the underlying
-            // reqwest body stream) so the HTTP connection is closed
-            // rather than left orphaned in the connection pool.
-            let next = tokio::select! {
-                _ = cancellation.cancelled() => {
+            // Race the next SSE event against cancellation and a stall
+            // timeout. When the token trips, drop `events` (and with it the
+            // underlying reqwest body stream) so the HTTP connection is closed
+            // rather than left orphaned in the connection pool. The stall
+            // window resets on every received event (#220).
+            let event = match next_step(&mut events, &cancellation, ANTHROPIC_EVENT_TIMEOUT).await {
+                StreamStep::Item(ev) => ev,
+                StreamStep::Done => break,
+                StreamStep::Cancelled => {
                     tracing::debug!("Anthropic stream cancelled by token");
                     drop(events);
                     return Err(CoreError::Cancelled);
                 }
-                ev = events.next() => ev,
+                StreamStep::Stalled => {
+                    tracing::error!(
+                        timeout_s = ANTHROPIC_EVENT_TIMEOUT.as_secs(),
+                        "Anthropic stream stalled — no further event"
+                    );
+                    drop(events);
+                    return Err(CoreError::Llm("Anthropic stream stalled".into()));
+                }
             };
-            let Some(event) = next else { break };
             let event = event.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
             let data = event.data.as_str();
             if data == "[DONE]" {
@@ -940,6 +1000,68 @@ fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stream that yields `n` items then stays `Pending` forever, simulating a
+    /// mid-stream stall (#220).
+    struct StallingStream {
+        remaining: usize,
+    }
+
+    impl tokio_stream::Stream for StallingStream {
+        type Item = u32;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                std::task::Poll::Ready(Some(0))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    fn step_name<T>(step: &StreamStep<T>) -> &'static str {
+        match step {
+            StreamStep::Item(_) => "Item",
+            StreamStep::Done => "Done",
+            StreamStep::Cancelled => "Cancelled",
+            StreamStep::Stalled => "Stalled",
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_step_fires_stall_timeout_after_silence() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut stream = StallingStream { remaining: 1 };
+        let timeout = std::time::Duration::from_millis(50);
+
+        // First item arrives immediately (the heartbeat).
+        match next_step(&mut stream, &cancellation, timeout).await {
+            StreamStep::Item(_) => {}
+            other => panic!("expected first item, got {}", step_name(&other)),
+        }
+
+        // Stream now silent: the per-event timeout must fire rather than hang.
+        match next_step(&mut stream, &cancellation, timeout).await {
+            StreamStep::Stalled => {}
+            other => panic!("expected stall, got {}", step_name(&other)),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_step_prefers_cancellation_over_stall() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let mut stream = StallingStream { remaining: 0 };
+        let timeout = std::time::Duration::from_millis(50);
+        match next_step(&mut stream, &cancellation, timeout).await {
+            StreamStep::Cancelled => {}
+            other => panic!("expected cancelled, got {}", step_name(&other)),
+        }
+    }
 
     #[test]
     fn client_builder() {
