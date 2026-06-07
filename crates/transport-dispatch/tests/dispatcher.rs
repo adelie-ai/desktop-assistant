@@ -115,39 +115,47 @@ async fn dispatcher_streams_send_message_ack_then_events() {
 
     use futures::StreamExt;
 
+    // The send is acked with `SendMessageAck` carrying the turn request_id
+    // (voice#49); the streamed events are stamped with that same id.
     let f1 = tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.next())
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        f1,
+    let ack_request_id = match f1 {
         WsFrame::Result {
-            result: api::CommandResult::Ack,
+            result: api::CommandResult::SendMessageAck { request_id, .. },
             ..
+        } => {
+            assert!(!request_id.is_empty(), "ack must carry the turn request_id");
+            request_id
         }
-    ));
+        other => panic!("expected SendMessageAck, got {other:?}"),
+    };
 
     let f2 = tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.next())
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        f2,
+    match f2 {
         WsFrame::Event {
-            event: api::Event::AssistantDelta { .. }
-        }
-    ));
+            event: api::Event::AssistantDelta { request_id, .. },
+        } => assert_eq!(request_id, ack_request_id, "delta must match the ack id"),
+        other => panic!("expected AssistantDelta, got {other:?}"),
+    }
 
     let f3 = tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.next())
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        f3,
+    match f3 {
         WsFrame::Event {
-            event: api::Event::AssistantCompleted { .. }
-        }
-    ));
+            event: api::Event::AssistantCompleted { request_id, .. },
+        } => assert_eq!(
+            request_id, ack_request_id,
+            "completed must match the ack id"
+        ),
+        other => panic!("expected AssistantCompleted, got {other:?}"),
+    }
 
     dispatch.abort();
 }

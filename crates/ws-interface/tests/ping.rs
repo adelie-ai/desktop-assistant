@@ -1050,16 +1050,28 @@ async fn ws_send_message_ack_then_streaming_events() {
     .await
     .unwrap();
 
+    // The send is acked with a `SendMessageAck` carrying the turn `request_id`
+    // (and an empty task_id on this no-registry path) so a socket client can
+    // correlate the streamed response (voice#49).
     let first =
         serde_json::from_str::<WsFrame>(&ws.next().await.unwrap().unwrap().into_text().unwrap())
             .unwrap();
-    assert_eq!(
-        first,
+    let ack_request_id = match first {
         WsFrame::Result {
-            id: "3".into(),
-            result: desktop_assistant_api_model::CommandResult::Ack
+            id,
+            result:
+                desktop_assistant_api_model::CommandResult::SendMessageAck {
+                    request_id,
+                    task_id,
+                },
+        } => {
+            assert_eq!(id, "3");
+            assert!(!request_id.is_empty(), "ack must carry the turn request_id");
+            assert!(task_id.is_empty(), "no-registry path registers no task");
+            request_id
         }
-    );
+        other => panic!("expected SendMessageAck, got {other:?}"),
+    };
 
     let second =
         serde_json::from_str::<WsFrame>(&ws.next().await.unwrap().unwrap().into_text().unwrap())
@@ -1079,6 +1091,12 @@ async fn ws_send_message_ack_then_streaming_events() {
         }
         other => panic!("unexpected frame: {other:?}"),
     };
+    // voice#49: the streamed events MUST carry the same request_id the ack
+    // returned, so a client filtering by the ack id sees its response.
+    assert_eq!(
+        request_id, ack_request_id,
+        "streamed event request_id must match the SendMessageAck request_id"
+    );
 
     let third =
         serde_json::from_str::<WsFrame>(&ws.next().await.unwrap().unwrap().into_text().unwrap())
@@ -1166,13 +1184,16 @@ async fn ws_send_message_cancels_when_client_disconnects() {
     let ack =
         serde_json::from_str::<WsFrame>(&ws.next().await.unwrap().unwrap().into_text().unwrap())
             .unwrap();
-    assert_eq!(
-        ack,
+    match ack {
         WsFrame::Result {
-            id: "4".into(),
-            result: desktop_assistant_api_model::CommandResult::Ack
+            id,
+            result: desktop_assistant_api_model::CommandResult::SendMessageAck { request_id, .. },
+        } => {
+            assert_eq!(id, "4");
+            assert!(!request_id.is_empty(), "ack must carry the turn request_id");
         }
-    );
+        other => panic!("expected SendMessageAck, got {other:?}"),
+    }
 
     ws.close(None).await.unwrap();
     drop(ws);

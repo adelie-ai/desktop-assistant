@@ -209,13 +209,19 @@ pub trait AssistantCommands: Send + Sync {
                 idempotency_key,
             })
             .await?;
-        // Post-#114 the daemon returns `SendMessageAck { task_id }` when its
-        // handler is wired with a `BackgroundTaskRegistry`; older / test
-        // daemons may still return the legacy bare `Ack`. Both are valid
-        // wire-level acks for this call site — the task id is surfaced via
-        // streaming events, not the ack.
+        // The daemon replies with `SendMessageAck { request_id, task_id }`. We
+        // return the `request_id` — the id every streamed `AssistantDelta` /
+        // `AssistantCompleted` / `AssistantError` event for this turn is
+        // stamped with — so a streaming client can correlate the response back
+        // to its send (voice#49). The `task_id` (background-task id, used to
+        // correlate `Task*` events / drive Cancel) is not what a response
+        // stream is keyed on, so it is intentionally not the return value here.
+        //
+        // A legacy / pre-#114 daemon that still replies with a bare `Ack`
+        // carries no correlation id; we surface an empty string as before
+        // (such a client falls back to matching events loosely).
         match result {
-            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
+            api::CommandResult::SendMessageAck { request_id, .. } => Ok(request_id),
             api::CommandResult::Ack => Ok(String::new()),
             other => Err(anyhow!("unexpected response for send_prompt: {other:?}")),
         }
@@ -450,6 +456,7 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_with_override_emits_send_message_with_override() {
         let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-1".to_string(),
             task_id: "task-1".to_string(),
         });
         let override_selection = Some(api::SendPromptOverride {
@@ -458,12 +465,14 @@ mod tests {
             effort: None,
         });
 
-        let task_id = client
+        let returned = client
             .send_prompt_with_override("conv-1", "hello", override_selection.clone())
             .await
             .unwrap();
 
-        assert_eq!(task_id, "task-1");
+        // The send returns the turn `request_id` (what streamed events carry),
+        // not the `task_id` (voice#49).
+        assert_eq!(returned, "req-1");
         match client.last() {
             api::Command::SendMessage {
                 conversation_id,
@@ -486,10 +495,11 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_idempotent_emits_send_message_with_key() {
         let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-1".to_string(),
             task_id: "task-1".to_string(),
         });
 
-        let task_id = client
+        let returned = client
             .send_prompt_idempotent(
                 "conv-1",
                 "hello",
@@ -500,7 +510,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(task_id, "task-1");
+        // Returns the correlation `request_id`, not the `task_id` (voice#49).
+        assert_eq!(returned, "req-1");
         match client.last() {
             api::Command::SendMessage {
                 conversation_id,
@@ -521,6 +532,7 @@ mod tests {
         // Non-breaking: the existing entry point must keep emitting a key-less
         // SendMessage so callers that don't opt into idempotency are unchanged.
         let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "r".to_string(),
             task_id: "t".to_string(),
         });
         client
@@ -541,10 +553,11 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_with_system_refinement_emits_send_message_with_refinement() {
         let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-3".to_string(),
             task_id: "task-3".to_string(),
         });
 
-        let task_id = client
+        let returned = client
             .send_prompt_with_system_refinement(
                 "conv-1",
                 "what's the weather?",
@@ -553,7 +566,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(task_id, "task-3");
+        // Returns the correlation `request_id`, not the `task_id` (voice#49).
+        assert_eq!(returned, "req-3");
         match client.last() {
             api::Command::SendMessage {
                 conversation_id,
@@ -616,11 +630,12 @@ mod tests {
         // reached as via `TransportClient::as_commands`), not only on a
         // concrete `WsClient`.
         let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-2".to_string(),
             task_id: "task-2".to_string(),
         });
         let commands: &dyn AssistantCommands = &client;
 
-        let task_id = commands
+        let returned = commands
             .send_prompt_with_override(
                 "conv-2",
                 "hi",
@@ -632,7 +647,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(task_id, "task-2");
+        // Returns the correlation `request_id`, not the `task_id` (voice#49).
+        assert_eq!(returned, "req-2");
         assert!(matches!(
             client.last(),
             api::Command::SendMessage {

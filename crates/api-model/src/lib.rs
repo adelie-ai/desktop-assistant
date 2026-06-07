@@ -401,10 +401,23 @@ pub enum CommandResult {
     BackgroundTaskSpawned {
         id: String,
     },
-    /// Ack for `SendMessage`, carrying the registered task id so callers can
-    /// correlate the streamed `Task*` events back to the request. Introduced
-    /// alongside the background-task registry so we don't overload `Ack`.
+    /// Ack for `SendMessage`, carrying both correlation ids the streamed
+    /// events use:
+    ///
+    /// - `request_id` — stamped on every `AssistantDelta` / `AssistantCompleted`
+    ///   / `AssistantError` event for THIS turn. Socket clients (UDS / WS) match
+    ///   streamed response events to their send by this id, exactly as the
+    ///   D-Bus `SendPrompt` reply does. This is the field a streaming client
+    ///   wants (voice#49).
+    /// - `task_id` — the registered background-task id, used to correlate the
+    ///   `Task*` lifecycle events and to drive the process-manager UI / Cancel.
+    ///
+    /// Introduced alongside the background-task registry so we don't overload
+    /// `Ack`; `request_id` was added in voice#49 so socket clients can correlate
+    /// streamed responses (the dispatcher generates a turn `request_id` distinct
+    /// from the `task_id`, and the events carry the former).
     SendMessageAck {
+        request_id: String,
         task_id: String,
     },
 
@@ -1670,15 +1683,20 @@ mod tests {
     }
 
     #[test]
-    fn send_message_ack_carries_task_id() {
-        // Golden-file test for the new SendMessageAck shape: callers must be
-        // able to correlate the ack to the registered background task.
+    fn send_message_ack_carries_request_and_task_ids() {
+        // Golden-file test for the SendMessageAck shape: callers must be able
+        // to correlate the ack to BOTH the streamed response events
+        // (`request_id`, voice#49) and the registered background task
+        // (`task_id`).
         let res = CommandResult::SendMessageAck {
+            request_id: "req-xyz".into(),
             task_id: "task-abc".into(),
         };
         let v: serde_json::Value = serde_json::to_value(&res).unwrap();
-        let expected: serde_json::Value =
-            serde_json::from_str(r#"{"send_message_ack":{"task_id":"task-abc"}}"#).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"send_message_ack":{"request_id":"req-xyz","task_id":"task-abc"}}"#,
+        )
+        .unwrap();
         assert_eq!(v, expected);
         let back: CommandResult = serde_json::from_value(v).unwrap();
         assert_eq!(res, back);

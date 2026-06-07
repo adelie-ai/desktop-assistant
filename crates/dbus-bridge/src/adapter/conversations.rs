@@ -77,13 +77,18 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
 
         match result {
             api::CommandResult::Ack => {
-                // Daemon hasn't told us the request id yet — events
-                // will carry it. Use a placeholder so clients have
-                // something to log against; the events flowing through
-                // the forwarder carry the daemon's correlation id.
+                // Legacy bare `Ack`: the daemon told us no correlation id, so
+                // use a placeholder for the caller to log against. (The events
+                // flowing through the forwarder carry the daemon's own
+                // correlation id, which a bare-Ack daemon never surfaced here.)
                 Ok(uuid::Uuid::new_v4().to_string())
             }
-            api::CommandResult::SendMessageAck { task_id } => Ok(task_id),
+            // Return the turn `request_id` — the id every streamed `Assistant*`
+            // event carries — so the D-Bus caller can correlate the response
+            // events the bridge forwards (voice#49). The `task_id` keys `Task*`
+            // events, not the response stream, so it is not the value to hand
+            // back here.
+            api::CommandResult::SendMessageAck { request_id, .. } => Ok(request_id),
             other => Err(fdo::Error::Failed(format!(
                 "unexpected SendMessage result: {other:?}"
             ))),
@@ -376,6 +381,7 @@ mod tests {
         ) -> Result<api::CommandResult, BridgeTransportError> {
             self.commands.lock().await.push(command);
             Ok(api::CommandResult::SendMessageAck {
+                request_id: "req-1".to_string(),
                 task_id: "task-1".to_string(),
             })
         }
@@ -400,15 +406,18 @@ mod tests {
         let transport = Arc::new(RecordingTransport::new());
         let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
 
-        let task_id = adapter
+        let request_id = adapter
             .send_prompt_with_system_refinement(
                 "conv-1",
                 "what's the weather?",
                 "Respond briefly, by voice.",
             )
             .await
-            .expect("send returns the daemon task id");
-        assert_eq!(task_id, "task-1");
+            .expect("send returns the daemon correlation id");
+        // The adapter returns the turn `request_id` (what streamed events carry,
+        // so the D-Bus caller can correlate the response), not the `task_id`
+        // (voice#49).
+        assert_eq!(request_id, "req-1");
 
         let commands = transport.commands.lock().await;
         assert_eq!(commands.len(), 1, "exactly one command dispatched");
