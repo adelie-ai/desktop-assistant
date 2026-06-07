@@ -383,7 +383,12 @@ fn convert_messages(
                 for tc in &msg.tool_calls {
                     let input_json = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                         .unwrap_or(serde_json::json!({}));
-                    let doc = json_to_document(input_json);
+                    // gpt-oss on Bedrock emits `{"":{}}` (an empty-string key) for
+                    // no-argument tool calls; echoing that back as `toolUse.input`
+                    // makes Bedrock 400 ("messages.N.content.0.toolUse.input is
+                    // invalid") on every subsequent turn, since the bad block lives
+                    // in history. Normalize it to a valid object (#214).
+                    let doc = json_to_document(sanitize_tool_input(input_json));
                     // Sanitize the historical tool name to satisfy Bedrock's
                     // `^[a-zA-Z0-9_-]+$` constraint. This is essential: a
                     // `toolUse` block from an EARLIER turn lives in the
@@ -1258,13 +1263,30 @@ impl BedrockClient {
             request = request.additional_model_request_fields(extra);
         }
 
-        // Race connection establishment against cancellation. If the
-        // user cancels mid-handshake we drop the in-flight request
-        // (the SDK's HTTP body) before it resolves.
+        // Bound both the connection handshake and the gap between streamed
+        // events so a stalled Bedrock stream fails the turn gracefully instead
+        // of hanging forever (#214). `stream.recv()` and `send()` have no
+        // built-in timeout; gpt-oss on Bedrock was observed accepting a
+        // tool-history follow-up request and then never emitting an event.
+        const BEDROCK_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const BEDROCK_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        // Race connection establishment against cancellation and a timeout. If
+        // the user cancels mid-handshake we drop the in-flight request (the
+        // SDK's HTTP body) before it resolves.
         let send_fut = request.send();
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
                 return Err(StreamingDispatchError::Other(CoreError::Cancelled));
+            }
+            _ = tokio::time::sleep(BEDROCK_CONNECT_TIMEOUT) => {
+                tracing::error!(
+                    timeout_s = BEDROCK_CONNECT_TIMEOUT.as_secs(),
+                    "Bedrock converse_stream send() timed out (no response headers)"
+                );
+                return Err(StreamingDispatchError::Other(CoreError::Llm(
+                    "Bedrock converse_stream connection timed out".into(),
+                )));
             }
             r = send_fut => match r {
                 Ok(r) => r,
@@ -1284,19 +1306,32 @@ impl BedrockClient {
         let mut text = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
+        let mut event_count: u64 = 0;
 
         loop {
-            // Race the next streaming event against cancellation.
-            // Dropping `stream` closes the underlying HTTP body the
-            // same way the SSE adapters do.
+            // Race the next streaming event against cancellation and a
+            // stall timeout. Dropping `stream` closes the underlying HTTP
+            // body the same way the SSE adapters do.
             let event_result = tokio::select! {
                 _ = cancellation.cancelled() => {
                     tracing::debug!("Bedrock stream cancelled by token");
                     drop(stream);
                     return Err(StreamingDispatchError::Other(CoreError::Cancelled));
                 }
+                _ = tokio::time::sleep(BEDROCK_EVENT_TIMEOUT) => {
+                    tracing::error!(
+                        timeout_s = BEDROCK_EVENT_TIMEOUT.as_secs(),
+                        events_so_far = event_count,
+                        "Bedrock converse_stream stalled — no further event"
+                    );
+                    drop(stream);
+                    return Err(StreamingDispatchError::Other(CoreError::Llm(
+                        "Bedrock converse_stream stalled (no events)".into(),
+                    )));
+                }
                 ev = stream.recv() => ev,
             };
+            event_count += 1;
             let event = match event_result {
                 Ok(Some(e)) => e,
                 Ok(None) => break,
@@ -1560,6 +1595,24 @@ fn restore_tool_call_names(calls: Vec<ToolCall>, tool_names: &ToolNameMap) -> Ve
         .collect()
 }
 
+/// Normalize a tool call's arguments into something Bedrock accepts as
+/// `toolUse.input`. gpt-oss-120b on Bedrock emits `{"":{}}` (an object with a
+/// single empty-string key) for no-argument calls; Bedrock then rejects the
+/// echoed history with "toolUse.input is invalid". We drop empty-string keys
+/// (the observed garbage), and coerce a non-object input to an empty object so
+/// the field is always a valid JSON object. Well-formed arguments pass through
+/// unchanged. (#214)
+fn sanitize_tool_input(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            serde_json::Value::Object(map.into_iter().filter(|(k, _)| !k.is_empty()).collect())
+        }
+        // A non-object input is not a valid `toolUse.input`; represent
+        // "no arguments" as an empty object.
+        _ => serde_json::json!({}),
+    }
+}
+
 fn json_to_document(value: serde_json::Value) -> Document {
     match value {
         serde_json::Value::Null => Document::Null,
@@ -1593,6 +1646,43 @@ mod tests {
         ConverseStreamOutput, ToolUseBlockDelta, ToolUseBlockStart,
     };
     use std::sync::{Arc, Mutex};
+
+    // --- toolUse.input sanitization (#214) -------------------------------
+
+    #[test]
+    fn sanitize_tool_input_strips_empty_key_garbage() {
+        // gpt-oss's no-arg-call garbage -> a clean empty object.
+        let got = sanitize_tool_input(serde_json::json!({"": {}}));
+        assert_eq!(got, serde_json::json!({}));
+    }
+
+    #[test]
+    fn sanitize_tool_input_preserves_real_arguments() {
+        let args = serde_json::json!({"content": "note", "key": "goal"});
+        assert_eq!(sanitize_tool_input(args.clone()), args);
+    }
+
+    #[test]
+    fn sanitize_tool_input_drops_only_the_empty_key() {
+        let got = sanitize_tool_input(serde_json::json!({"": 1, "real": 2}));
+        assert_eq!(got, serde_json::json!({"real": 2}));
+    }
+
+    #[test]
+    fn sanitize_tool_input_coerces_non_object_to_empty_object() {
+        assert_eq!(
+            sanitize_tool_input(serde_json::json!(null)),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            sanitize_tool_input(serde_json::json!("oops")),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            sanitize_tool_input(serde_json::json!([1, 2])),
+            serde_json::json!({})
+        );
+    }
 
     // --- Extended-thinking (reasoning) wiring ----------------------------
 
