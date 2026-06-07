@@ -1,9 +1,11 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use desktop_assistant_api_model as api;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use zbus::Connection;
 
+use crate::commands::AssistantCommands;
 use crate::signal::SignalEvent;
 use crate::types::{ChatMessage, ConversationDetail, ConversationSummary};
 
@@ -45,6 +47,7 @@ const DEFAULT_DBUS_SERVICE: &str = "org.desktopAssistant";
 const DBUS_CONVERSATIONS_PATH: &str = "/org/desktopAssistant/Conversations";
 const DBUS_SETTINGS_PATH: &str = "/org/desktopAssistant/Settings";
 const DBUS_KNOWLEDGE_PATH: &str = "/org/desktopAssistant/Knowledge";
+const DBUS_COMMANDS_PATH: &str = "/org/desktopAssistant/Commands";
 
 /// Wire shape of a `list_conversations` row: `(id, title, message_count,
 /// updated_at, archived)` — mirrors the D-Bus `a(ssusb)` reply.
@@ -142,6 +145,15 @@ trait Knowledge {
     async fn delete_entry(&self, id: &str) -> zbus::fdo::Result<()>;
 }
 
+/// Generic command channel (#213). One method maps every request/response
+/// `api::Command` to its `api::CommandResult`, both passed as JSON strings —
+/// the D-Bus counterpart of the socket transports' `WsRequest`/`WsFrame`
+/// round-trip. This is what makes [`AssistantCommands`] reachable over D-Bus.
+#[zbus::proxy(interface = "org.desktopAssistant.Commands")]
+trait Commands {
+    async fn send_command(&self, command_json: &str) -> zbus::fdo::Result<String>;
+}
+
 fn resolve_dbus_service_name() -> String {
     std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
         .ok()
@@ -165,6 +177,7 @@ pub async fn generate_ws_jwt(subject: &str) -> Result<String> {
 pub struct DbusClient {
     proxy: ConversationsProxy<'static>,
     knowledge: KnowledgeProxy<'static>,
+    commands: CommandsProxy<'static>,
 }
 
 impl DbusClient {
@@ -177,11 +190,20 @@ impl DbusClient {
             .build()
             .await?;
         let knowledge = KnowledgeProxy::builder(&connection)
-            .destination(service_name)?
+            .destination(service_name.clone())?
             .path(DBUS_KNOWLEDGE_PATH)?
             .build()
             .await?;
-        Ok(Self { proxy, knowledge })
+        let commands = CommandsProxy::builder(&connection)
+            .destination(service_name)?
+            .path(DBUS_COMMANDS_PATH)?
+            .build()
+            .await?;
+        Ok(Self {
+            proxy,
+            knowledge,
+            commands,
+        })
     }
 
     pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
@@ -380,5 +402,33 @@ impl DbusClient {
         });
 
         Ok(rx)
+    }
+}
+
+/// Generic command channel over D-Bus (#213).
+///
+/// `DbusClient` now implements the shared [`AssistantCommands`] trait by
+/// round-tripping each `api::Command` as a JSON string through the
+/// `org.desktopAssistant.Commands.SendCommand` method (the D-Bus counterpart
+/// of the WS/UDS `WsRequest`/`WsFrame` exchange). This is what lets
+/// [`crate::transport::TransportClient::as_commands`] return `Some` for the
+/// D-Bus transport, so the config Settings / model-override / purposes /
+/// named-connection management surface is reachable over D-Bus too.
+///
+/// The inherent typed methods above (`list_conversations`, the streaming
+/// `send_prompt`, the knowledge helpers) are retained: they win at the
+/// `AssistantClient` call sites (inherent methods shadow trait methods on a
+/// concrete `DbusClient`), while `&dyn AssistantCommands` callers reach this
+/// trait impl. The streaming `send_prompt` in particular keeps using the typed
+/// `Conversations.SendPrompt` path with its `ResponseChunk` signals — only the
+/// trait's `send_command` routes through the generic channel.
+#[async_trait]
+impl AssistantCommands for DbusClient {
+    async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
+        let command_json = serde_json::to_string(&command)
+            .map_err(|e| anyhow::anyhow!("encoding command for D-Bus: {e}"))?;
+        let raw = self.commands.send_command(&command_json).await?;
+        serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("decoding D-Bus command result: {e}"))
     }
 }
