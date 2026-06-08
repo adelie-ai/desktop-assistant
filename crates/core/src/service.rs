@@ -28,7 +28,7 @@ use crate::ports::transport::{current_client_label, current_co_location, current
 use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_text, summarize_tool_value,
-    tool_set_hash, tool_status_message,
+    tool_set_hash,
 };
 use chrono::{Duration, Local};
 use tokio_util::sync::CancellationToken;
@@ -59,11 +59,6 @@ fn cancellation_token_or_default() -> CancellationToken {
 
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
-
-/// Turn-start liveness status (issue #223), emitted via `on_status` before the
-/// first LLM token so clients (voice) get an immediate heartbeat. Terse and
-/// speakable; the voice client decides whether/how to narrate it.
-const TURN_START_STATUS: &str = "Working on it";
 
 fn now_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -682,12 +677,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
 
-        // Turn-start liveness status (issue #223): emit a brief "working on it"
-        // as soon as the turn is set up, before the first LLM token. This gives
-        // clients (voice) an immediate heartbeat — without it a multi-round tool
-        // turn is silent until the final answer streams. Per-tool-round statuses
-        // follow from the dispatch loop below.
-        on_status(TURN_START_STATUS.to_string());
+        // No turn-start filler. A quick/direct answer narrates nothing and just
+        // streams its reply. Progress is narrated only when the model declares a
+        // logical step (`begin_step`, in the dispatch loop below) — a step spans
+        // multiple tool calls, so we narrate the step, not the turn start or each
+        // tool. A slow turn that declares no step is covered by the voice
+        // client's delayed-liveness safety net, not an unconditional status here.
 
         // Client-side tool execution (#107 / #234). When the connection
         // registered client-local tools, the application installs a per-turn
@@ -1112,7 +1107,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
                 let arguments: serde_json::Value =
                     serde_json::from_str(&tool_call.arguments).unwrap_or_default();
-                on_status(tool_status_message(&tool_call.name, &arguments));
                 tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
 
                 // Step-planning + compaction control (#240) is handled here in
@@ -1127,6 +1121,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     && (tool_call.name == planning::BEGIN_STEP_TOOL
                         || tool_call.name == planning::COMPLETE_STEP_TOOL)
                 {
+                    // Step-level narration: announce the logical step the model
+                    // just declared, once, as its goal. This is the only progress
+                    // narration now (turn-start filler and per-tool chatter were
+                    // removed); a step spans multiple tool calls. complete_step
+                    // stays silent.
+                    if tool_call.name == planning::BEGIN_STEP_TOOL
+                        && let Some(goal) = arguments.get("goal").and_then(|v| v.as_str())
+                    {
+                        let goal = goal.trim();
+                        if !goal.is_empty() {
+                            on_status(goal.to_string());
+                        }
+                    }
                     let ack = self
                         .handle_step_control(
                             &mut conv,
@@ -2097,10 +2104,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_emits_turn_start_then_per_tool_status() {
-        // Issue #223: a turn must emit a turn-start liveness status before the
-        // first LLM token, and one status per tool call from the dispatch loop,
-        // so clients get a heartbeat + narratable progress between rounds.
+    async fn tool_calls_without_steps_emit_no_status() {
+        // New narration model: no turn-start filler and no per-tool chatter. A
+        // turn that calls tools but declares no plan steps narrates nothing —
+        // progress is reserved for logical steps (`begin_step`).
         let tools = vec![
             ToolDefinition::new("calendar_list", "List calendar", serde_json::json!({})),
             ToolDefinition::new("notes_search", "Search notes", serde_json::json!({})),
@@ -2130,20 +2137,54 @@ mod tests {
         assert_eq!(result, "All set");
 
         let statuses = status_log.lock().unwrap().clone();
-        // First status is the turn-start heartbeat, before any tool round.
+        assert!(
+            statuses.is_empty(),
+            "tool calls without declared steps must emit no status; got {statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_step_narrates_its_goal() {
+        // A declared logical step IS narrated — once, as its goal — so clients
+        // (text + voice) get meaningful progress on multi-step work.
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new("b1", "begin_step", r#"{"goal":"map the plan"}"#)],
+                ),
+                LlmResponse::text("done"),
+            ]),
+            captured: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(
+                &conv.id,
+                "do a multi-step thing".into(),
+                noop_callback(),
+                status_cb,
+            )
+            .await
+            .unwrap();
+
+        let statuses = status_log.lock().unwrap().clone();
         assert_eq!(
-            statuses.first().map(String::as_str),
-            Some(TURN_START_STATUS),
-            "expected turn-start status first; got {statuses:?}"
-        );
-        // Each tool call emits a human-labelled status.
-        assert!(
-            statuses.contains(&"Checking your calendar".to_string()),
-            "expected a calendar status; got {statuses:?}"
-        );
-        assert!(
-            statuses.contains(&"Searching your notes".to_string()),
-            "expected a notes status; got {statuses:?}"
+            statuses,
+            vec!["map the plan".to_string()],
+            "the begin_step goal must be narrated once; got {statuses:?}"
         );
     }
 
@@ -2490,9 +2531,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_with_no_tools_still_emits_turn_start_status() {
-        // Even a plain text turn (no tool rounds) must emit the turn-start
-        // heartbeat so the client knows the assistant is working.
+    async fn turn_with_no_tools_emits_no_status() {
+        // A plain text turn (no tools, no steps) is a "quick answer": it
+        // narrates nothing and just streams its reply.
         let handler = make_handler(vec!["Hello there"]);
         let conv = handler.create_conversation("Test".into()).await.unwrap();
 
@@ -2503,7 +2544,10 @@ mod tests {
             .unwrap();
 
         let statuses = status_log.lock().unwrap().clone();
-        assert_eq!(statuses, vec![TURN_START_STATUS.to_string()]);
+        assert!(
+            statuses.is_empty(),
+            "a no-tool quick answer must emit no status; got {statuses:?}"
+        );
     }
 
     #[tokio::test]
