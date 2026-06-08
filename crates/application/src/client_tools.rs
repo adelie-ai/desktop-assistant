@@ -48,6 +48,7 @@ use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::client_tools::ClientToolPort;
 use desktop_assistant_core::ports::llm::current_cancellation_token;
+use desktop_assistant_core::ports::session::current_session_id;
 use desktop_assistant_core::ports::store::{
     PendingClientToolCall, TurnRow, TurnStateJson, TurnStateStore, TurnStatus,
 };
@@ -113,17 +114,20 @@ const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 1_048_576;
 /// internal mutexes around small `HashMap`s — there is no async work
 /// inside the mutex critical sections, so blocking is bounded.
 pub struct ClientToolCoordinator {
-    /// Per-user map of currently-registered client-local tools, keyed by
-    /// tool name → full registration (description + input schema). The
-    /// architecture's "per-session" registration semantic collapses to
-    /// "per-user" in this slice: the application layer has no native
-    /// concept of a connection session yet, and the tests pin that
-    /// registration is overwritten on each new `RegisterClientTools`
-    /// call so a reconnecting client gets the same per-session
-    /// behaviour without us tracking the connection. The full registration
+    /// Currently-registered client-local tools, keyed by [`RegistrationKey`]
+    /// (the `(user_id, session_id)` of the registering connection) → tool name
+    /// → full registration (description + input schema). The full registration
     /// (not just the name) is retained so the turn loop can offer the tool's
     /// schema to the LLM (#234).
-    registrations: Mutex<HashMap<String, HashMap<String, api::ClientToolRegistration>>>,
+    ///
+    /// Keying on the **login session**, not just the user, is the #261 fix:
+    /// each client connection registers its own tools, so the voice daemon's
+    /// `say_this` is offered only on the voice session's turns and never leaks
+    /// onto a text client's turn (two windows of one user have independent
+    /// sets). The `user_id` component is retained in the key so cross-user
+    /// isolation holds even in the unscoped fallback bucket, where every
+    /// connection would otherwise share a single sentinel session id.
+    registrations: Mutex<HashMap<RegistrationKey, HashMap<String, api::ClientToolRegistration>>>,
     /// In-flight suspensions, keyed by task_id. Each entry holds the
     /// expected `tool_call_id` so the resolver can refuse mismatches
     /// without consulting the DB, and the oneshot sender used to wake
@@ -137,6 +141,22 @@ struct PendingSlot {
     waker: oneshot::Sender<Result<String, String>>,
 }
 
+/// Registry key for a client-tool registration: `(user_id, session_id)`.
+/// Scoping by the login session keeps two connections of the same user
+/// independent (#261); the `user_id` component preserves cross-user
+/// isolation in the unscoped fallback bucket. Both come from the
+/// transport-installed task-locals.
+type RegistrationKey = (String, String);
+
+/// The `(user_id, session_id)` of the calling connection, read from the
+/// request-scoped task-locals.
+fn current_registration_key() -> RegistrationKey {
+    (
+        current_user_id().as_str().to_string(),
+        current_session_id().as_str().to_string(),
+    )
+}
+
 impl ClientToolCoordinator {
     pub fn new() -> Self {
         Self {
@@ -145,15 +165,17 @@ impl ClientToolCoordinator {
         }
     }
 
-    /// Replace the registered tool set for the *current* user (read via
-    /// `current_user_id()`). Idempotent under the same set; clears
-    /// previously-registered tools that aren't in the new set.
+    /// Replace the registered tool set for the *current connection* (the
+    /// `(user_id, session_id)` read from the request-scoped task-locals).
+    /// Idempotent under the same set; clears previously-registered tools on
+    /// this session that aren't in the new set. A re-register on one session
+    /// never touches another session's set, even for the same user (#261).
     ///
     /// Returns the count of tools accepted.
     pub async fn register(&self, tools: &[api::ClientToolRegistration]) -> u32 {
-        let user_id = current_user_id().as_str().to_string();
+        let key = current_registration_key();
         let mut regs = self.registrations.lock().unwrap();
-        let entry = regs.entry(user_id).or_default();
+        let entry = regs.entry(key).or_default();
         entry.clear();
         for t in tools {
             entry.insert(t.name.clone(), t.clone());
@@ -161,24 +183,25 @@ impl ClientToolCoordinator {
         u32::try_from(entry.len()).unwrap_or(u32::MAX)
     }
 
-    /// True iff `name` is registered for the current user.
+    /// True iff `name` is registered for the current connection's session.
     pub async fn is_client_registered(&self, name: &str) -> bool {
-        let user_id = current_user_id().as_str().to_string();
+        let key = current_registration_key();
         let regs = self.registrations.lock().unwrap();
-        regs.get(&user_id)
+        regs.get(&key)
             .map(|set| set.contains_key(name))
             .unwrap_or(false)
     }
 
-    /// The tool definitions registered as client-local for the current user,
-    /// in the shape the LLM tool list expects (#234). Maps each
-    /// [`api::ClientToolRegistration`] to a core [`ToolDefinition`] so the
-    /// turn loop can offer them to the model without `core` depending on
-    /// `api-model`.
+    /// The tool definitions registered as client-local for the current
+    /// connection's session, in the shape the LLM tool list expects (#234).
+    /// Maps each [`api::ClientToolRegistration`] to a core [`ToolDefinition`]
+    /// so the turn loop can offer them to the model without `core` depending
+    /// on `api-model`. A turn only ever sees the tools registered by the
+    /// connection driving it (#261).
     pub async fn registered_definitions(&self) -> Vec<ToolDefinition> {
-        let user_id = current_user_id().as_str().to_string();
+        let key = current_registration_key();
         let regs = self.registrations.lock().unwrap();
-        regs.get(&user_id)
+        regs.get(&key)
             .map(|set| {
                 set.values()
                     .map(|r| {
@@ -191,6 +214,19 @@ impl ClientToolCoordinator {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Drop every registration belonging to the current session (read from
+    /// the `session_id` task-local). Called when a connection closes so a
+    /// long-lived daemon doesn't accumulate stale per-session buckets across
+    /// reconnects (#261). A session belongs to exactly one user, so this
+    /// normally removes a single bucket. In-flight suspensions (keyed by
+    /// `task_id`) are intentionally left untouched — a closing connection may
+    /// still have its `ClientToolResult` in flight on another path.
+    pub fn clear_session(&self) {
+        let session = current_session_id().as_str().to_string();
+        let mut regs = self.registrations.lock().unwrap();
+        regs.retain(|(_user, sess), _| sess != &session);
     }
 }
 

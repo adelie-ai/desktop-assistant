@@ -27,6 +27,7 @@ use desktop_assistant_application::client_tools::{
 use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::with_user_id;
+use desktop_assistant_core::ports::session::{SessionId, with_session_id};
 use desktop_assistant_core::ports::store::{
     PendingClientToolCall, TurnRow, TurnStateJson, TurnStateStore, TurnStatus,
 };
@@ -744,4 +745,169 @@ fn _api_surface_compiles_check() {
         _accepts_arc(c);
     }
     let _ = _check;
+}
+
+// ---- #261: client-tool registration is per login session ----------------
+
+fn reg(name: &str) -> api::ClientToolRegistration {
+    api::ClientToolRegistration {
+        name: name.into(),
+        description: "x".into(),
+        input_schema: serde_json::json!({}),
+    }
+}
+
+/// The #260 repro at the coordinator boundary: the voice daemon (session A)
+/// registers `say_this`; a *text* client of the SAME user on a different
+/// connection (session B) must not be offered that tool, or its turn would
+/// call a tool it can't fulfil and wedge. Two TUIs of one user must have
+/// independent tool sets — so registration keys on the session, not the user.
+#[tokio::test]
+async fn two_sessions_same_user_have_independent_tool_sets() {
+    let coord = Arc::new(ClientToolCoordinator::new());
+
+    // Session A (voice) registers say_this.
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            register_client_tools(&coord, &[reg("say_this")]).await;
+        }),
+    )
+    .await;
+
+    // Session B — same user, different connection — must see nothing.
+    let b_sees = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            coord.is_client_registered("say_this").await
+        }),
+    )
+    .await;
+    let b_defs = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            coord.registered_definitions().await
+        }),
+    )
+    .await;
+
+    assert!(
+        !b_sees,
+        "a second login session of the same user must NOT inherit session A's client tools"
+    );
+    assert!(
+        b_defs.is_empty(),
+        "session B's offered client-tool defs must be empty (got {b_defs:?})"
+    );
+
+    // Sanity: session A itself still sees its own registration.
+    let a_sees = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            coord.is_client_registered("say_this").await
+        }),
+    )
+    .await;
+    assert!(a_sees, "session A must still see its own registration");
+}
+
+/// Re-registration is scoped to the session that sent it: a reconnect /
+/// re-register on session A replaces only A's set and never disturbs a
+/// concurrent session B of the same user.
+#[tokio::test]
+async fn registration_overwrite_is_per_session() {
+    let coord = Arc::new(ClientToolCoordinator::new());
+
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            register_client_tools(&coord, &[reg("say_this")]).await;
+        }),
+    )
+    .await;
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            register_client_tools(&coord, &[reg("fs_read")]).await;
+        }),
+    )
+    .await;
+
+    // Session A re-registers a different set.
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            register_client_tools(&coord, &[reg("listen_for_more")]).await;
+        }),
+    )
+    .await;
+
+    let b_still_has_fs_read = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            coord.is_client_registered("fs_read").await
+                && !coord.is_client_registered("listen_for_more").await
+                && !coord.is_client_registered("say_this").await
+        }),
+    )
+    .await;
+
+    assert!(
+        b_still_has_fs_read,
+        "session A's re-registration must not touch session B's tool set"
+    );
+}
+
+/// On disconnect the dispatcher calls `clear_session`, which must evict only
+/// the ending session's registrations — a concurrent session of the same
+/// user keeps its tools. Prevents a long-lived daemon accumulating stale
+/// per-session buckets across reconnects (#261).
+#[tokio::test]
+async fn clear_session_evicts_only_that_sessions_registrations() {
+    let coord = Arc::new(ClientToolCoordinator::new());
+
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            register_client_tools(&coord, &[reg("say_this")]).await;
+        }),
+    )
+    .await;
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            register_client_tools(&coord, &[reg("fs_read")]).await;
+        }),
+    )
+    .await;
+
+    // Session A disconnects.
+    with_session_id(SessionId::new("conn-A"), async {
+        coord.clear_session();
+    })
+    .await;
+
+    let a_gone = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            coord.registered_definitions().await.is_empty()
+        }),
+    )
+    .await;
+    let b_intact = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            coord.is_client_registered("fs_read").await
+        }),
+    )
+    .await;
+
+    assert!(
+        a_gone,
+        "session A's registrations must be evicted on disconnect"
+    );
+    assert!(
+        b_intact,
+        "session B's registrations must survive session A's disconnect"
+    );
 }

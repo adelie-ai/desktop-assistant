@@ -37,6 +37,11 @@ pub mod conversation_search;
 /// Request-scoped auth context — task-local `UserId` for SQL scoping (#105).
 pub mod auth;
 
+/// Request-scoped login-session identity — task-local [`session::SessionId`],
+/// unique per client connection, so per-connection state (client-local tool
+/// registration) doesn't bleed between two windows of the same user (#261).
+pub mod session;
+
 /// Request-scoped transport context — task-local [`crate::domain::TransportKind`]
 /// so the turn loop can infer tool co-location (UDS/D-Bus ⇒ same machine,
 /// WebSocket ⇒ possibly remote) when tagging tools with locality (#243).
