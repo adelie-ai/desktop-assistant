@@ -393,6 +393,91 @@ async fn completed_tasks_persist_as_completed() {
 }
 
 #[tokio::test]
+async fn panicking_body_clears_progress_hint_on_terminal_row() {
+    // #254: a task body that sets a progress_hint and then panics must not
+    // leave a stale hint on the finished/failed row. The in-body
+    // `set_progress_hint(None)` is skipped on panic, so `finalize` (the
+    // single panic-safe finalization point) is responsible for clearing it.
+    let store = Arc::new(MockStore::new());
+    let registry = BackgroundTaskRegistry::new().with_store(store.clone());
+    let user = UserId::new("alice");
+
+    let task_id = registry.spawn(
+        user.clone(),
+        standalone_kind(),
+        "panicker".into(),
+        move |ctx| async move {
+            // Establish a stale hint, then panic before any in-body clear.
+            ctx.set_progress_hint(Some("running tool xyz".into()));
+            panic!("kaboom");
+        },
+    );
+
+    timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() on a panicked task must resolve, not hang");
+
+    wait_until(
+        || {
+            store
+                .get_raw(&task_id.0)
+                .map(|r| r.status == BackgroundTaskStatus::Failed)
+                .unwrap_or(false)
+        },
+        "panicked row persisted as Failed",
+    )
+    .await;
+
+    let row = store.get_raw(&task_id.0).unwrap();
+    assert_eq!(row.status, BackgroundTaskStatus::Failed);
+    assert_eq!(
+        row.progress_hint, None,
+        "a panicked task must not keep a stale progress_hint"
+    );
+}
+
+#[tokio::test]
+async fn completed_body_clears_progress_hint_on_terminal_row() {
+    // #254 (normal path): a task that sets a hint and completes normally
+    // must also land with progress_hint == None on the terminal row.
+    let store = Arc::new(MockStore::new());
+    let registry = BackgroundTaskRegistry::new().with_store(store.clone());
+    let user = UserId::new("alice");
+
+    let task_id = registry.spawn(
+        user.clone(),
+        standalone_kind(),
+        "finisher".into(),
+        move |ctx| async move {
+            ctx.set_progress_hint(Some("running tool xyz".into()));
+            Ok(())
+        },
+    );
+
+    timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve once the task finalizes");
+
+    wait_until(
+        || {
+            store
+                .get_raw(&task_id.0)
+                .map(|r| r.status == BackgroundTaskStatus::Completed)
+                .unwrap_or(false)
+        },
+        "completed row persisted",
+    )
+    .await;
+
+    let row = store.get_raw(&task_id.0).unwrap();
+    assert_eq!(row.status, BackgroundTaskStatus::Completed);
+    assert_eq!(
+        row.progress_hint, None,
+        "a finished task must not keep a stale progress_hint"
+    );
+}
+
+#[tokio::test]
 async fn task_rows_are_user_id_scoped() {
     // Alice and Bob both spawn standalone tasks; the restart sweep
     // marks each as Failed but the in-memory listings stay scoped: a

@@ -2169,6 +2169,25 @@ fn task_tool_observer(ctx: TaskContext) -> ToolObserver {
     })
 }
 
+/// Wrap `fut` with this turn's task-tool observer when the turn is tracked by
+/// a registry task (#256). Both the streaming send path (`run_send_turn`) and
+/// the agent path (`spawn_agent_conversation`) need the loop's tool/MCP calls
+/// mirrored into the task's log ring; this is the single place that installs
+/// the observer so the two paths can't drift. When `task_ctx` is `None` (the
+/// no-registry direct path) the future runs unwrapped.
+///
+/// The companion `progress_hint` clear is NOT done here: it lives in the
+/// registry's panic-safe `finalize` (#254), so neither caller clears it inline.
+async fn with_task_observer<F, T>(task_ctx: Option<TaskContext>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    match task_ctx {
+        Some(ctx) => with_tool_observer(task_tool_observer(ctx), fut).await,
+        None => fut.await,
+    }
+}
+
 pub(crate) fn spawn_agent_conversation<C>(
     registry: Arc<BackgroundTaskRegistry>,
     conversations: Arc<C>,
@@ -2224,8 +2243,9 @@ where
         let conv_id_for_send = conversation_id.clone();
         let token = ctx.token.clone();
         // Mirror this agent's tool/MCP calls into its task log so the panel
-        // shows what the agent is doing, same as the foreground send path.
-        let inner = with_tool_observer(task_tool_observer(ctx.clone()), async move {
+        // shows what the agent is doing, same as the foreground send path
+        // (shared observer install — #256).
+        let inner = with_task_observer(Some(ctx), async move {
             conversations
                 .send_prompt_with_override(
                     &desktop_assistant_core::domain::ConversationId::from(
@@ -2253,9 +2273,9 @@ where
             desktop_assistant_core::ports::auth::with_user_id(user_id.clone(), inner).await
         };
 
-        // The run is over — clear the "currently doing" hint so a finished
-        // agent that lingers in the list doesn't show a stale tool action.
-        ctx.set_progress_hint(None);
+        // The "currently doing" hint is cleared by the registry's panic-safe
+        // `finalize` (#254/#256), so a finished/failed agent never shows a
+        // stale tool action — no in-body clear needed here.
 
         match result {
             Ok(outcome) => {
@@ -2422,20 +2442,14 @@ where
             None => dispatch.await,
         }
     };
-    let outcome = match task_ctx.clone().map(task_tool_observer) {
-        Some(observer) => with_tool_observer(observer, dispatched).await,
-        None => dispatched.await,
-    };
+    // Install this turn's task-tool observer when tracked by a registry task
+    // (#256 — shared with the agent path). The companion `progress_hint` clear
+    // lives in the registry's panic-safe `finalize` (#254), so there is no
+    // in-body clear here.
+    let outcome = with_task_observer(task_ctx.clone(), dispatched).await;
 
     if let Err(e) = forwarder.await {
         warn!("stream forwarder task failed: {e}");
-    }
-
-    // The turn is fully drained — nothing is "happening" anymore, so clear the
-    // hint. Matters for tasks that linger in the list after finishing (e.g. a
-    // fire-and-forget standalone agent) where a stale tool hint would mislead.
-    if let Some(ctx) = &task_ctx {
-        ctx.set_progress_hint(None);
     }
 
     match outcome {

@@ -1178,8 +1178,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         // Cancellation while a client tool was suspended (e.g.
                         // the user pressed Cancel) must abort the turn, not be
                         // folded into a tool result the LLM would keep looping
-                        // on.
-                        Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                        // on. The observer already saw `Started` above; emit a
+                        // matching `Finished{ok:false}` before the early return
+                        // so the activity feed never strands a started-but-never
+                        // -finished row on the cancel path (issue #252).
+                        Err(CoreError::Cancelled) => {
+                            notify_tool_event(ToolEvent::Finished {
+                                name: tool_call.name.clone(),
+                                ok: false,
+                                output: "cancelled".to_string(),
+                            });
+                            return Err(CoreError::Cancelled);
+                        }
                         Err(e) => {
                             tracing::warn!(tool = %tool_call.name, error = %e, "client tool execution failed");
                             (format!("Error: {e}"), false)
@@ -1203,10 +1213,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     }
                 };
 
+                // Cap the result at ingestion (issue #174): a runaway tool can
+                // return a multi-megabyte payload that, stored verbatim, wedges
+                // the conversation against the model's context window on every
+                // later turn and stalls the messages INSERT. Truncate with a
+                // notice so the model still sees what ran and how to narrow it.
+                // Computed before the `Finished` event so the activity feed
+                // mirrors exactly what the model is shown (issue #257), rather
+                // than summarizing a pre-cap payload the turn never used.
+                let stored = match cap_tool_result(&result, self.max_tool_result_bytes) {
+                    Some(truncated) => {
+                        tracing::warn!(
+                            tool = %tool_call.name,
+                            original_bytes = result.len(),
+                            kept_bytes = truncated.len(),
+                            cap_bytes = self.max_tool_result_bytes,
+                            "tool result exceeded the ingestion cap — truncated"
+                        );
+                        truncated
+                    }
+                    None => result.clone(),
+                };
+
                 notify_tool_event(ToolEvent::Finished {
                     name: tool_call.name.clone(),
                     ok: tool_ok,
-                    output: summarize_tool_text(&result),
+                    output: summarize_tool_text(&stored),
                 });
 
                 // Dynamic activation: if tool_search returned results,
@@ -1256,24 +1288,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     }
                 }
 
-                // Cap the result at ingestion (issue #174): a runaway tool can
-                // return a multi-megabyte payload that, stored verbatim, wedges
-                // the conversation against the model's context window on every
-                // later turn and stalls the messages INSERT. Truncate with a
-                // notice so the model still sees what ran and how to narrow it.
-                let stored = match cap_tool_result(&result, self.max_tool_result_bytes) {
-                    Some(truncated) => {
-                        tracing::warn!(
-                            tool = %tool_call.name,
-                            original_bytes = result.len(),
-                            kept_bytes = truncated.len(),
-                            cap_bytes = self.max_tool_result_bytes,
-                            "tool result exceeded the ingestion cap — truncated"
-                        );
-                        truncated
-                    }
-                    None => result,
-                };
                 conv.messages
                     .push(Message::tool_result(&tool_call.id, &stored));
             }
@@ -2141,6 +2155,33 @@ mod tests {
         defs: Vec<ToolDefinition>,
         executed: Arc<Mutex<Vec<(String, String)>>>,
         result: String,
+        /// When set, `execute` returns this error instead of `result` — used to
+        /// drive the cancel/error paths through the dispatch loop.
+        error: Option<CoreError>,
+    }
+
+    impl FakeClientToolPort {
+        fn ok(defs: Vec<ToolDefinition>, executed: Arc<Mutex<Vec<(String, String)>>>, result: impl Into<String>) -> Self {
+            Self {
+                defs,
+                executed,
+                result: result.into(),
+                error: None,
+            }
+        }
+
+        fn failing(
+            defs: Vec<ToolDefinition>,
+            executed: Arc<Mutex<Vec<(String, String)>>>,
+            error: CoreError,
+        ) -> Self {
+            Self {
+                defs,
+                executed,
+                result: String::new(),
+                error: Some(error),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2161,8 +2202,29 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((tool_call_id.to_string(), tool_name.to_string()));
-            Ok(self.result.clone())
+            match &self.error {
+                Some(CoreError::Cancelled) => Err(CoreError::Cancelled),
+                Some(other) => Err(CoreError::Llm(other.to_string())),
+                None => Ok(self.result.clone()),
+            }
         }
+    }
+
+    /// Install a recording tool observer around `fut` and return its result
+    /// alongside the events the dispatch loop emitted (issue #252/#257 tests).
+    async fn capture_tool_events<F, T>(fut: F) -> (T, Vec<ToolEvent>)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        use crate::ports::tool_observer::{ToolObserver, with_tool_observer};
+        let events: Arc<Mutex<Vec<ToolEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            Arc::new(move |e: ToolEvent| events.lock().unwrap().push(e)) as ToolObserver
+        };
+        let out = with_tool_observer(sink, fut).await;
+        let captured = events.lock().unwrap().clone();
+        (out, captured)
     }
 
     #[tokio::test]
@@ -2191,15 +2253,15 @@ mod tests {
 
         let executed = Arc::new(Mutex::new(Vec::new()));
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort {
-                defs: vec![ToolDefinition::new(
+            Arc::new(FakeClientToolPort::ok(
+                vec![ToolDefinition::new(
                     "fs_read",
                     "Read a file on the client",
                     serde_json::json!({"type": "object"}),
                 )],
-                executed: Arc::clone(&executed),
-                result: "127.0.0.1 localhost".to_string(),
-            });
+                Arc::clone(&executed),
+                "127.0.0.1 localhost",
+            ));
 
         let result = with_client_tools(
             port,
@@ -2228,6 +2290,153 @@ mod tests {
             .expect("a tool result message");
         assert_eq!(tool_msg.content, "127.0.0.1 localhost");
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_client_tool_emits_matched_started_and_finished() {
+        // Issue #252: when a suspended client tool is cancelled, the dispatch
+        // loop aborts the turn with `Err(Cancelled)`. The activity feed must
+        // still see exactly one `Started` and one `Finished{ok:false}` for that
+        // call — never a started-but-never-finished row.
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new("call-1", "fs_read", r#"{"path":"/etc/hosts"}"#)],
+        )];
+        let handler = make_tool_handler(responses, vec![], HashMap::new());
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort::failing(
+                vec![ToolDefinition::new(
+                    "fs_read",
+                    "Read a file on the client",
+                    serde_json::json!({"type": "object"}),
+                )],
+                Arc::clone(&executed),
+                CoreError::Cancelled,
+            ));
+
+        let (result, events) = capture_tool_events(with_client_tools(
+            port,
+            handler.send_prompt(&conv.id, "Read /etc/hosts".into(), noop_callback(), noop_status()),
+        ))
+        .await;
+
+        assert!(matches!(result, Err(CoreError::Cancelled)));
+
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, ToolEvent::Started { name, .. } if name == "fs_read"))
+            .count();
+        let finishes: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                ToolEvent::Finished { name, ok, .. } if name == "fs_read" => Some(*ok),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, 1, "exactly one Started; events={events:?}");
+        assert_eq!(
+            finishes,
+            vec![false],
+            "exactly one Finished{{ok:false}}; events={events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn errored_client_tool_emits_one_started_finished_pair() {
+        // Server-error (non-cancel) path: the loop folds the error into a tool
+        // result and keeps going, but the observer must still see exactly one
+        // Started/Finished pair with ok=false for that call.
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "fs_read", "{}")]),
+            LlmResponse::text("recovered"),
+        ];
+        let handler = make_tool_handler(responses, vec![], HashMap::new());
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort::failing(
+                vec![ToolDefinition::new(
+                    "fs_read",
+                    "Read a file on the client",
+                    serde_json::json!({"type": "object"}),
+                )],
+                Arc::clone(&executed),
+                CoreError::Llm("boom".into()),
+            ));
+
+        let (result, events) = capture_tool_events(with_client_tools(
+            port,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        ))
+        .await;
+
+        assert_eq!(result.unwrap(), "recovered");
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, ToolEvent::Started { name, .. } if name == "fs_read"))
+            .count();
+        let finishes: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                ToolEvent::Finished { name, ok, .. } if name == "fs_read" => Some(*ok),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, 1, "events={events:?}");
+        assert_eq!(finishes, vec![false], "events={events:?}");
+    }
+
+    #[tokio::test]
+    async fn finished_event_summarizes_capped_result() {
+        // Issue #257: the Finished event must summarize the same (post-cap)
+        // value the model is shown, not the pre-cap payload. Drive a tool that
+        // returns more than the cap and assert the observer's output reflects
+        // the truncated/stored text (it contains the "truncated" notice rather
+        // than the full original body).
+        let tool_def = ToolDefinition::new("dump", "Dumps a lot", serde_json::json!({}));
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "dump", "{}")]),
+            LlmResponse::text("ok"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("dump".to_string(), "A".repeat(5_000));
+
+        // Cap so small the truncation notice surfaces at the front of the
+        // stored value (the kept prefix collapses to ~nothing). The pre-cap
+        // payload is 5000 'A's and contains no "truncated" notice, so seeing
+        // the notice in the Finished summary proves we summarized `stored`,
+        // not `result`.
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results)
+            .with_max_tool_result_bytes(16);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let (_result, events) = capture_tool_events(handler.send_prompt(
+            &conv.id,
+            "dump it".into(),
+            noop_callback(),
+            noop_status(),
+        ))
+        .await;
+
+        let output = events
+            .iter()
+            .find_map(|e| match e {
+                ToolEvent::Finished { name, output, .. } if name == "dump" => Some(output.clone()),
+                _ => None,
+            })
+            .expect("a Finished event for dump");
+        assert!(
+            output.contains("truncated"),
+            "Finished output should mirror the capped result; got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -3099,15 +3308,15 @@ mod tests {
 
         // Client registers a tool with the SAME name as the server-side one.
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort {
-                defs: vec![ToolDefinition::new(
+            Arc::new(FakeClientToolPort::ok(
+                vec![ToolDefinition::new(
                     "terminal",
                     "Run terminal command on the user's device",
                     serde_json::json!({"type": "object"}),
                 )],
-                executed: Arc::new(Mutex::new(Vec::new())),
-                result: String::new(),
-            });
+                Arc::new(Mutex::new(Vec::new())),
+                "",
+            ));
 
         // Drive the turn as if it arrived over a WebSocket connection.
         with_transport_kind(
@@ -3170,15 +3379,15 @@ mod tests {
 
         let conv = handler.create_conversation("Test".into()).await.unwrap();
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort {
-                defs: vec![ToolDefinition::new(
+            Arc::new(FakeClientToolPort::ok(
+                vec![ToolDefinition::new(
                     "terminal",
                     "Run terminal command on the user's device",
                     serde_json::json!({"type": "object"}),
                 )],
-                executed: Arc::new(Mutex::new(Vec::new())),
-                result: String::new(),
-            });
+                Arc::new(Mutex::new(Vec::new())),
+                "",
+            ));
 
         with_transport_kind(
             TransportKind::Uds,

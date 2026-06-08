@@ -77,6 +77,7 @@ pub fn notify_tool_event(event: ToolEvent) {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn notify_outside_scope_is_a_silent_noop() {
@@ -116,10 +117,20 @@ mod tests {
 
     #[tokio::test]
     async fn slot_does_not_cross_spawn() {
-        let sink = Arc::new(|_e: ToolEvent| {}) as ToolObserver;
+        // A spawned task does not inherit the parent's task-local observer;
+        // a `notify_tool_event` inside the spawn must drop silently rather than
+        // reach the parent's sink. Prove it with a shared counter the sink
+        // bumps on every delivery — the spawned notify must leave it at zero,
+        // and a sibling notify in the parent scope must bump it to one (so the
+        // sink is genuinely wired, not merely never called).
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let sink = {
+            let deliveries = Arc::clone(&deliveries);
+            Arc::new(move |_e: ToolEvent| {
+                deliveries.fetch_add(1, Ordering::SeqCst);
+            }) as ToolObserver
+        };
         with_tool_observer(sink, async {
-            // A spawned task does not inherit the task-local; notifying there
-            // must be a no-op rather than reaching the parent's observer.
             tokio::spawn(async {
                 notify_tool_event(ToolEvent::Started {
                     name: "x".into(),
@@ -128,6 +139,21 @@ mod tests {
             })
             .await
             .unwrap();
+            // The spawned task could not reach the parent sink.
+            assert_eq!(
+                deliveries.load(Ordering::SeqCst),
+                0,
+                "observer must not cross tokio::spawn"
+            );
+
+            // Sanity: a notify in the parent scope IS delivered, so the zero
+            // above reflects scope isolation, not a dead sink.
+            notify_tool_event(ToolEvent::Finished {
+                name: "x".into(),
+                ok: true,
+                output: String::new(),
+            });
+            assert_eq!(deliveries.load(Ordering::SeqCst), 1);
         })
         .await;
     }

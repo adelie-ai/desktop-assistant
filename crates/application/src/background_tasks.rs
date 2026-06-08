@@ -998,6 +998,12 @@ impl Inner {
             let ended_at = now_ms();
             state.view.ended_at = Some(ended_at);
             state.view.last_error = err.clone();
+            // Clear the "currently doing" hint on the terminal row (#254).
+            // `finalize` is the single panic-safe finalization point — the
+            // in-body `set_progress_hint(None)` is skipped when the task body
+            // panics, so clearing here guarantees a finished/failed row never
+            // carries a stale tool/MCP action.
+            state.view.progress_hint = None;
             state.completed = true;
             // Snapshot the fields needed for the post-broadcast persist
             // and eviction passes; the lock is released at scope end.
