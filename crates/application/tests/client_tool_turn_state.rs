@@ -20,9 +20,11 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::EventSink;
+use std::time::Duration;
+
 use desktop_assistant_application::client_tools::{
     ClientToolCoordinator, ClientToolResolutionError, register_client_tools,
-    resolve_client_tool_result, suspend_for_client_tool,
+    resolve_client_tool_result, suspend_for_client_tool, with_client_tool_timeout,
 };
 use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::CoreError;
@@ -910,4 +912,201 @@ async fn clear_session_evicts_only_that_sessions_registrations() {
         b_intact,
         "session B's registrations must survive session A's disconnect"
     );
+}
+
+// ---- #262: client-tool suspension timeout --------------------------------
+
+/// Helper: register `tool` for alice and create a fresh PendingLlm turn row.
+async fn registered_turn(
+    coord: &Arc<ClientToolCoordinator>,
+    store: &Arc<dyn TurnStateStore>,
+    tool: &str,
+) {
+    with_user_id(UserId::new("alice"), async {
+        register_client_tools(coord, &[reg(tool)]).await;
+        store
+            .create_turn(TurnRow {
+                id: "task-1".into(),
+                user_id: "alice".into(),
+                conversation_id: "conv-1".into(),
+                status: TurnStatus::PendingLlm,
+                state: TurnStateJson::default(),
+                last_error: None,
+            })
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
+/// A suspension whose client never answers must give up after the cap and
+/// resolve as a tool error (not hang). The slot is dropped so a late result
+/// is cleanly rejected, and the row is marked failed (#262).
+#[tokio::test]
+async fn client_tool_suspension_times_out_into_tool_error() {
+    let coord = Arc::new(ClientToolCoordinator::new());
+    let store: Arc<dyn TurnStateStore> = Arc::new(InMemoryTurnStore::new());
+    let sink: Arc<dyn EventSink> = Arc::new(CapturingSink::new());
+    registered_turn(&coord, &store, "say_this").await;
+
+    // Suspend with a short cap and never deliver a result; await inline — if
+    // the timeout didn't fire this test would hang, which IS the failure.
+    let outcome = with_user_id(
+        UserId::new("alice"),
+        with_client_tool_timeout(
+            Duration::from_millis(50),
+            suspend_for_client_tool(
+                &coord,
+                &*store,
+                &*sink,
+                api::TaskId("task-1".into()),
+                "conv-1".to_string(),
+                PendingClientToolCall {
+                    tool_call_id: "call-7".into(),
+                    tool_name: "say_this".into(),
+                    arguments: serde_json::Value::Null,
+                },
+            ),
+        ),
+    )
+    .await;
+
+    let err = outcome.expect_err("an unanswered client tool must surface an error, not hang");
+    assert!(
+        matches!(err, CoreError::ToolExecution(_)),
+        "timeout must surface a tool-execution error so the loop continues; got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("did not respond"),
+        "error should explain the client never answered; got {err}"
+    );
+
+    // The slot is gone: a late ClientToolResult is now a clean TurnNotFound.
+    let late = resolve_client_tool_result(
+        &coord,
+        &*store,
+        UserId::new("alice"),
+        api::TaskId("task-1".into()),
+        "call-7".into(),
+        Ok("too late".into()),
+    )
+    .await;
+    assert!(
+        matches!(late, Err(ClientToolResolutionError::TurnNotFound { .. })),
+        "after the timeout the pending slot must be removed"
+    );
+
+    let row = store.get_turn("task-1").await.unwrap().unwrap();
+    assert_eq!(row.status, TurnStatus::Failed);
+}
+
+/// A result delivered before the cap resolves normally — the timeout must not
+/// fire spuriously on a healthy, prompt client (#262).
+#[tokio::test]
+async fn client_tool_result_before_timeout_resolves_normally() {
+    let coord = Arc::new(ClientToolCoordinator::new());
+    let store: Arc<dyn TurnStateStore> = Arc::new(InMemoryTurnStore::new());
+    let sink: Arc<dyn EventSink> = Arc::new(CapturingSink::new());
+    registered_turn(&coord, &store, "say_this").await;
+
+    let coord_for_task = Arc::clone(&coord);
+    let store_for_task = Arc::clone(&store);
+    let sink_for_task = Arc::clone(&sink);
+    let suspended = tokio::spawn(async move {
+        with_user_id(
+            UserId::new("alice"),
+            // Generous cap; the result lands well within it.
+            with_client_tool_timeout(
+                Duration::from_secs(5),
+                suspend_for_client_tool(
+                    &coord_for_task,
+                    &*store_for_task,
+                    &*sink_for_task,
+                    api::TaskId("task-1".into()),
+                    "conv-1".to_string(),
+                    PendingClientToolCall {
+                        tool_call_id: "call-7".into(),
+                        tool_name: "say_this".into(),
+                        arguments: serde_json::Value::Null,
+                    },
+                ),
+            ),
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    resolve_client_tool_result(
+        &coord,
+        &*store,
+        UserId::new("alice"),
+        api::TaskId("task-1".into()),
+        "call-7".into(),
+        Ok("spoken".into()),
+    )
+    .await
+    .unwrap();
+
+    let outcome = suspended.await.unwrap();
+    assert_eq!(
+        outcome.unwrap(),
+        "spoken",
+        "a result delivered before the cap must resolve normally"
+    );
+}
+
+/// Cancellation still wins over a (much longer) timeout: a cancelled turn
+/// surfaces `Cancelled`, not a timeout tool-error (#262).
+#[tokio::test]
+async fn cancellation_still_preempts_timeout() {
+    use desktop_assistant_core::ports::llm::with_cancellation_token;
+
+    let coord = Arc::new(ClientToolCoordinator::new());
+    let store: Arc<dyn TurnStateStore> = Arc::new(InMemoryTurnStore::new());
+    let sink: Arc<dyn EventSink> = Arc::new(CapturingSink::new());
+    registered_turn(&coord, &store, "say_this").await;
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let token_for_cancel = token.clone();
+    let coord_for_task = Arc::clone(&coord);
+    let store_for_task = Arc::clone(&store);
+    let sink_for_task = Arc::clone(&sink);
+    let suspended = tokio::spawn(async move {
+        with_user_id(
+            UserId::new("alice"),
+            with_client_tool_timeout(
+                Duration::from_secs(30),
+                with_cancellation_token(
+                    token,
+                    suspend_for_client_tool(
+                        &coord_for_task,
+                        &*store_for_task,
+                        &*sink_for_task,
+                        api::TaskId("task-1".into()),
+                        "conv-1".to_string(),
+                        PendingClientToolCall {
+                            tool_call_id: "call-7".into(),
+                            tool_name: "say_this".into(),
+                            arguments: serde_json::Value::Null,
+                        },
+                    ),
+                ),
+            ),
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    token_for_cancel.cancel();
+
+    let err = suspended
+        .await
+        .unwrap()
+        .expect_err("cancel must surface an error");
+    assert!(
+        matches!(err, CoreError::Cancelled),
+        "cancellation must win over the timeout; got {err:?}"
+    );
+    let row = store.get_turn("task-1").await.unwrap().unwrap();
+    assert_eq!(row.last_error.as_deref(), Some("cancelled"));
 }
