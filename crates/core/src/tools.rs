@@ -29,6 +29,12 @@ use crate::ports::tools::ToolExecutor;
 const FULL_LISTING_FIT_RATIO: f64 = 0.10;
 
 /// Generate a short, human-readable status message for a tool call.
+///
+/// No longer wired into the turn loop: per-tool status narration was replaced
+/// by step-level narration (`begin_step`). Retained (and still tested) for
+/// possible reuse; the whole cluster (`humanize_mcp_tool_status`/`verb_phrase`)
+/// is safe to delete if it stays unused.
+#[allow(dead_code)]
 pub(crate) fn tool_status_message(tool_name: &str, arguments: &serde_json::Value) -> String {
     match tool_name {
         "builtin_knowledge_base_search" => {
@@ -63,6 +69,7 @@ pub(crate) fn tool_status_message(tool_name: &str, arguments: &serde_json::Value
 /// events", `notes_search` → "Searching your notes"). Names use `_` or `.`
 /// separators (`calendar.list` ≡ `calendar_list`). Falls back to
 /// "Running <words>" when no verb is recognized.
+#[allow(dead_code)]
 fn humanize_mcp_tool_status(name: &str) -> String {
     // Normalize separators so `a.b.c` and `a_b_c` both split into words.
     let words: Vec<&str> = name.split(['_', '.']).filter(|w| !w.is_empty()).collect();
@@ -101,6 +108,7 @@ fn humanize_mcp_tool_status(name: &str) -> String {
 /// placeholder for the resource (e.g. "your calendar"). Returns `None` for
 /// unrecognized verbs so the caller can fall back. Synonyms collapse onto the
 /// same phrasing so a wide range of MCP naming conventions read naturally.
+#[allow(dead_code)]
 fn verb_phrase(verb: &str) -> Option<&'static str> {
     let phrase = match verb {
         "list" | "get" | "read" | "fetch" | "show" | "view" | "describe" | "check" => "Checking {}",
