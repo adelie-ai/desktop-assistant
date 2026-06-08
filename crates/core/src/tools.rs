@@ -133,14 +133,7 @@ const REDACTED: &str = "‹redacted›";
 /// match would catch too much. Named so it can be unit-tested directly.
 pub(crate) fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    const CONTAINS: [&str; 6] = [
-        "key",
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "credential",
-    ];
+    const CONTAINS: [&str; 6] = ["key", "token", "secret", "password", "passwd", "credential"];
     if CONTAINS.iter().any(|needle| lower.contains(needle)) {
         return true;
     }
@@ -603,10 +596,7 @@ mod tests {
         // order by default, but assert on substrings to stay order-agnostic).
         assert!(out.contains("query=weather"), "got: {out}");
         assert!(out.contains("api_key=‹redacted›"), "got: {out}");
-        assert!(
-            !out.contains("supersecret"),
-            "secret value leaked: {out}"
-        );
+        assert!(!out.contains("supersecret"), "secret value leaked: {out}");
     }
 
     #[test]

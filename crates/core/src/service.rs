@@ -13,7 +13,6 @@ use crate::planning::{self, StepStack};
 use crate::ports::client_tools::current_client_tools;
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
-use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_system_refinement,
@@ -23,6 +22,7 @@ use crate::ports::scratchpad::{
     ScratchpadWriteFn,
 };
 use crate::ports::store::ConversationStore;
+use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
 use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
@@ -2161,7 +2161,11 @@ mod tests {
     }
 
     impl FakeClientToolPort {
-        fn ok(defs: Vec<ToolDefinition>, executed: Arc<Mutex<Vec<(String, String)>>>, result: impl Into<String>) -> Self {
+        fn ok(
+            defs: Vec<ToolDefinition>,
+            executed: Arc<Mutex<Vec<(String, String)>>>,
+            result: impl Into<String>,
+        ) -> Self {
             Self {
                 defs,
                 executed,
@@ -2302,7 +2306,11 @@ mod tests {
 
         let responses = vec![LlmResponse::with_tool_calls(
             "",
-            vec![ToolCall::new("call-1", "fs_read", r#"{"path":"/etc/hosts"}"#)],
+            vec![ToolCall::new(
+                "call-1",
+                "fs_read",
+                r#"{"path":"/etc/hosts"}"#,
+            )],
         )];
         let handler = make_tool_handler(responses, vec![], HashMap::new());
         let conv = handler.create_conversation("Test".into()).await.unwrap();
@@ -2321,7 +2329,12 @@ mod tests {
 
         let (result, events) = capture_tool_events(with_client_tools(
             port,
-            handler.send_prompt(&conv.id, "Read /etc/hosts".into(), noop_callback(), noop_status()),
+            handler.send_prompt(
+                &conv.id,
+                "Read /etc/hosts".into(),
+                noop_callback(),
+                noop_status(),
+            ),
         ))
         .await;
 

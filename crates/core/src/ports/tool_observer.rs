@@ -94,7 +94,9 @@ mod tests {
         let sink = {
             let seen = Arc::clone(&seen);
             Arc::new(move |e: ToolEvent| match e {
-                ToolEvent::Started { name, .. } => seen.lock().unwrap().push(format!("start:{name}")),
+                ToolEvent::Started { name, .. } => {
+                    seen.lock().unwrap().push(format!("start:{name}"))
+                }
                 ToolEvent::Finished { name, ok, .. } => {
                     seen.lock().unwrap().push(format!("done:{name}:{ok}"))
                 }
@@ -112,7 +114,10 @@ mod tests {
             });
         })
         .await;
-        assert_eq!(*seen.lock().unwrap(), vec!["start:search", "done:search:true"]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["start:search", "done:search:true"]
+        );
     }
 
     #[tokio::test]
