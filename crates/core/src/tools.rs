@@ -121,17 +121,51 @@ fn verb_phrase(verb: &str) -> Option<&'static str> {
 /// the per-task log ring cheap and each entry single-line.
 const TOOL_EVENT_SUMMARY_MAX: usize = 200;
 
+/// Placeholder substituted for a sensitive argument value before it reaches
+/// the activity feed (which is broadcast over WebSocket and D-Bus, issue #253).
+const REDACTED: &str = "‹redacted›";
+
+/// Whether an object key names a sensitive value that must be redacted before
+/// it leaves the process in an activity-feed summary (issue #253). Matches
+/// case-insensitively: keys *containing* a secret-bearing substring
+/// (`key`, `token`, `secret`, `password`, `passwd`, `credential`) or keys that
+/// *equal* a short auth marker (`auth`, `authorization`) where a substring
+/// match would catch too much. Named so it can be unit-tested directly.
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    const CONTAINS: [&str; 6] = [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+    ];
+    if CONTAINS.iter().any(|needle| lower.contains(needle)) {
+        return true;
+    }
+    matches!(lower.as_str(), "auth" | "authorization")
+}
+
 /// Compact, single-line rendering of a tool call's JSON arguments for an
 /// activity feed. Objects render as `key=value` pairs (the common, readable
 /// case); other shapes fall back to compact JSON. Empty for no-argument calls.
-/// Truncated to [`TOOL_EVENT_SUMMARY_MAX`] characters.
+/// Values under a [`is_sensitive_key`] key are replaced with [`REDACTED`]
+/// (issue #253), including inside nested objects. Truncated to
+/// [`TOOL_EVENT_SUMMARY_MAX`] characters.
 pub(crate) fn summarize_tool_value(args: &serde_json::Value) -> String {
     let rendered = match args {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Object(map) if map.is_empty() => String::new(),
         serde_json::Value::Object(map) => map
             .iter()
-            .map(|(k, v)| format!("{k}={}", compact_scalar(v)))
+            .map(|(k, v)| {
+                if is_sensitive_key(k) {
+                    format!("{k}={REDACTED}")
+                } else {
+                    format!("{k}={}", compact_scalar(v))
+                }
+            })
             .collect::<Vec<_>>()
             .join(", "),
         other => other.to_string(),
@@ -147,10 +181,57 @@ pub(crate) fn summarize_tool_text(text: &str) -> String {
 
 /// Render a single JSON value compactly: strings unquoted (so `path=/tmp/x`
 /// rather than `path="/tmp/x"`), everything else as compact JSON so a nested
-/// argument can't expand the summary's structure.
+/// argument can't expand the summary's structure. Nested objects have their
+/// own keys checked for sensitivity (issue #253) so a secret tucked one level
+/// down (e.g. `headers.authorization`) is still redacted.
 fn compact_scalar(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) => {
+            let inner = map
+                .iter()
+                .map(|(k, val)| {
+                    if is_sensitive_key(k) {
+                        format!("{k:?}:{REDACTED:?}")
+                    } else {
+                        format!("{k:?}:{}", compact_value_json(val))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Recursive compact JSON rendering that redacts sensitive keys at every
+/// object level (issue #253). Used for values nested inside an argument object
+/// so a secret in a deeply nested structure is never emitted verbatim.
+fn compact_value_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let inner = map
+                .iter()
+                .map(|(k, val)| {
+                    if is_sensitive_key(k) {
+                        format!("{k:?}:{REDACTED:?}")
+                    } else {
+                        format!("{k:?}:{}", compact_value_json(val))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+        serde_json::Value::Array(items) => {
+            let inner = items
+                .iter()
+                .map(compact_value_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
         other => other.to_string(),
     }
 }
@@ -483,5 +564,76 @@ mod tests {
     fn mcp_verb_only_name_reads_naturally() {
         // A bare verb has no resource words.
         assert_eq!(tool_status_message("search", &json!({})), "Searching that");
+    }
+
+    #[test]
+    fn sensitive_key_predicate_matches_case_insensitively() {
+        for k in [
+            "key",
+            "api_key",
+            "API_KEY",
+            "token",
+            "AccessToken",
+            "secret",
+            "client_secret",
+            "password",
+            "Passwd",
+            "credential",
+            "credentials",
+            "auth",
+            "Authorization",
+        ] {
+            assert!(is_sensitive_key(k), "{k} should be sensitive");
+        }
+        for k in ["query", "path", "url", "author", "limit", "name"] {
+            assert!(!is_sensitive_key(k), "{k} should not be sensitive");
+        }
+        // `author` contains "auth" only as a prefix, not the whole key, so the
+        // equality arm (not a substring arm) keeps it clear.
+        assert!(!is_sensitive_key("author"));
+    }
+
+    #[test]
+    fn summarize_redacts_sensitive_values() {
+        let out = summarize_tool_value(&json!({
+            "query": "weather",
+            "api_key": "sk-supersecret-12345",
+        }));
+        // Keys render in sorted order (serde_json::Map preserves insertion
+        // order by default, but assert on substrings to stay order-agnostic).
+        assert!(out.contains("query=weather"), "got: {out}");
+        assert!(out.contains("api_key=‹redacted›"), "got: {out}");
+        assert!(
+            !out.contains("supersecret"),
+            "secret value leaked: {out}"
+        );
+    }
+
+    #[test]
+    fn summarize_redaction_is_case_insensitive() {
+        let out = summarize_tool_value(&json!({ "Authorization": "Bearer abc.def" }));
+        assert_eq!(out, "Authorization=‹redacted›");
+        assert!(!out.contains("Bearer"), "got: {out}");
+    }
+
+    #[test]
+    fn summarize_redacts_nested_sensitive_values() {
+        let out = summarize_tool_value(&json!({
+            "config": {
+                "host": "example.com",
+                "password": "hunter2",
+            }
+        }));
+        assert!(out.contains("example.com"), "got: {out}");
+        assert!(!out.contains("hunter2"), "nested secret leaked: {out}");
+        assert!(out.contains("‹redacted›"), "got: {out}");
+    }
+
+    #[test]
+    fn summarize_passes_through_non_sensitive_args() {
+        // serde_json::Map renders keys in sorted order by default, so the
+        // pairs come out alphabetically — assert on that ordering.
+        let out = summarize_tool_value(&json!({ "path": "/tmp/x", "limit": 5 }));
+        assert_eq!(out, "limit=5, path=/tmp/x");
     }
 }
