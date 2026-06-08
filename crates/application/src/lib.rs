@@ -15,7 +15,6 @@ pub use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::domain::{DEFAULT_NOTE_TYPE, KnowledgeEntry, ScratchpadNote};
 use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::client_tools::with_client_tools;
-use desktop_assistant_core::ports::tool_observer::{ToolEvent, ToolObserver, with_tool_observer};
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
     ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
@@ -25,7 +24,9 @@ use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
     ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
+use desktop_assistant_core::ports::session::{current_session_id, with_session_id};
 use desktop_assistant_core::ports::store::{IdempotencyKeyStore, TurnStateStore};
+use desktop_assistant_core::ports::tool_observer::{ToolEvent, ToolObserver, with_tool_observer};
 use desktop_assistant_core::ports::transport::{current_transport_kind, with_transport_kind};
 use thiserror::Error;
 use tracing::warn;
@@ -289,6 +290,14 @@ pub trait AssistantApiHandler: Send + Sync {
         );
         Ok(None)
     }
+
+    /// Called by the dispatcher when a connection closes, inside the
+    /// connection's `with_session_id` scope (#261). The default is a no-op;
+    /// a handler that tracks per-session state (client-local tool
+    /// registrations) overrides this to evict the ending session's entries
+    /// via `current_session_id()`. Handlers without per-session state (tests,
+    /// single-tenant deploys) need do nothing.
+    async fn on_session_end(&self) {}
 }
 
 /// Minimal sink for emitting canonical events.
@@ -903,6 +912,16 @@ where
     N: ConnectionsService + 'static,
     K: KnowledgeService + 'static,
 {
+    /// Evict the ending connection's client-local tool registrations (#261).
+    /// Runs inside the dispatcher's `with_session_id` scope, so the
+    /// coordinator's `clear_session` reads the correct session from the
+    /// task-local. No-op when client tools aren't wired (no coordinator).
+    async fn on_session_end(&self) {
+        if let Some(wiring) = self.client_tools.as_ref() {
+            wiring.coord.clear_session();
+        }
+    }
+
     async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult> {
         match cmd {
             api::Command::Ping => Ok(api::CommandResult::Pong {
@@ -1878,12 +1897,19 @@ where
         // re-install in the spawned body — `task_local`s don't cross
         // `tokio::spawn`, so this mirrors the `with_user_id` re-install.
         let transport_for_body = current_transport_kind();
+        // The connection's login session (#261): captured here while still in
+        // the dispatcher's `with_session_id` scope and re-installed in the
+        // spawned body so the per-turn `CoordinatorClientToolPort` resolves
+        // *this connection's* registered client tools — not the unscoped
+        // bucket. Without this the registry path (used by voice) would offer
+        // the turn no client tools at all.
+        let session_for_body = current_session_id();
 
         // `registry.spawn` is sync; the body runs on its own `tokio::spawn` so
         // we can return the new task id immediately. `tokio::spawn` doesn't
         // propagate task-locals, so the body re-installs `with_user_id` (and
-        // `with_transport_kind`, #243) for the queries / tool-note inside
-        // `run_send_turn` (#154).
+        // `with_transport_kind`, #243; `with_session_id`, #261) for the
+        // queries / tool-note / client-tool lookup inside `run_send_turn`.
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             ctx.logs.append(
                 api::LogLevel::Info,
@@ -1912,18 +1938,21 @@ where
                 transport_for_body,
                 with_user_id(
                     user_id_for_body,
-                    run_send_turn(
-                        conversations,
-                        conv_id_for_body,
-                        content,
-                        override_selection,
-                        system_refinement,
-                        request_id_for_body,
-                        idempotency,
-                        turn_sink,
-                        ctx.token.clone(),
-                        client_tool_port,
-                        Some(ctx.clone()),
+                    with_session_id(
+                        session_for_body,
+                        run_send_turn(
+                            conversations,
+                            conv_id_for_body,
+                            content,
+                            override_selection,
+                            system_refinement,
+                            request_id_for_body,
+                            idempotency,
+                            turn_sink,
+                            ctx.token.clone(),
+                            client_tool_port,
+                            Some(ctx.clone()),
+                        ),
                     ),
                 ),
             )
@@ -2003,11 +2032,16 @@ where
         // in the body (#243), the same way `user_id` is threaded across the
         // `tokio::spawn` boundary.
         let transport_for_body = current_transport_kind();
+        // The connection's login session (#261), re-installed in the body so
+        // the per-turn client-tool port resolves this connection's registered
+        // tools rather than the unscoped bucket — same reason as `user_id`.
+        let session_for_body = current_session_id();
 
         // `tokio::spawn` does not propagate task-locals, so the body
         // must re-install `with_user_id` for storage queries inside
-        // `run_send_turn` to scope to the right user (#154), and
-        // `with_transport_kind` so the tool note tags localities (#243). The
+        // `run_send_turn` to scope to the right user (#154),
+        // `with_transport_kind` so the tool note tags localities (#243), and
+        // `with_session_id` so client-tool lookup is per-connection (#261). The
         // `system_refinement` is moved into the closure as an explicit
         // value for the same reason (task-locals don't cross the spawn).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
@@ -2037,18 +2071,21 @@ where
                 transport_for_body,
                 with_user_id(
                     user_id_for_body,
-                    run_send_turn(
-                        conversations,
-                        conv_id_for_body,
-                        content,
-                        override_selection,
-                        system_refinement,
-                        request_id_for_body,
-                        idempotency,
-                        sink_for_body,
-                        ctx.token.clone(),
-                        client_tool_port,
-                        Some(ctx.clone()),
+                    with_session_id(
+                        session_for_body,
+                        run_send_turn(
+                            conversations,
+                            conv_id_for_body,
+                            content,
+                            override_selection,
+                            system_refinement,
+                            request_id_for_body,
+                            idempotency,
+                            sink_for_body,
+                            ctx.token.clone(),
+                            client_tool_port,
+                            Some(ctx.clone()),
+                        ),
                     ),
                 ),
             )
@@ -2149,8 +2186,12 @@ fn task_tool_observer(ctx: TaskContext) -> ToolObserver {
             } else {
                 format!("{name}  {args}")
             };
-            ctx.logs
-                .append(api::LogLevel::Info, api::LogCategory::ToolCall, message, None);
+            ctx.logs.append(
+                api::LogLevel::Info,
+                api::LogCategory::ToolCall,
+                message,
+                None,
+            );
         }
         ToolEvent::Finished { name, ok, output } => {
             let (level, message) = if ok {

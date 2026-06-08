@@ -20,10 +20,12 @@
 //! they validate the JWT.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+use desktop_assistant_core::ports::session::{SessionId, with_session_id};
 use desktop_assistant_core::ports::transport::{
     with_client_label, with_co_location, with_transport_kind,
 };
@@ -39,6 +41,17 @@ pub use desktop_assistant_core::domain::TransportKind;
 
 /// Outbound frame buffer; matches the WS adapter's pre-refactor sizing.
 const OUTBOUND_BUFFER: usize = 64;
+
+/// Monotonic source of per-connection session ids (#261). A process-local
+/// counter is sufficient: session ids are ephemeral, never persisted, and
+/// never leave the process — they only need to be unique among live
+/// connections so one client's registered tools don't bleed into another's.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Mint a fresh, process-unique session id for a newly-accepted connection.
+fn mint_session_id() -> String {
+    format!("sess-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Pre-validated identity for the connection.
 ///
@@ -65,6 +78,11 @@ pub struct AuthContext {
     /// A client-reported host label (#248) for a friendlier remote tool note
     /// (e.g. `your device 'laptop'`); `None` when the client sent none.
     pub client_label: Option<String>,
+    /// Unique id for this login session / connection (#261), minted by the
+    /// constructors. Installed as a task-local around every request so
+    /// per-connection state (client-local tool registration) keys on it
+    /// instead of the user — two windows of the same user stay independent.
+    pub session_id: String,
 }
 
 impl AuthContext {
@@ -78,6 +96,7 @@ impl AuthContext {
             transport,
             co_located: None,
             client_label: None,
+            session_id: mint_session_id(),
         }
     }
 
@@ -103,6 +122,7 @@ impl AuthContext {
             transport: TransportKind::Uds,
             co_located: None,
             client_label: None,
+            session_id: mint_session_id(),
         }
     }
 }
@@ -183,6 +203,12 @@ pub async fn dispatch_loop<R, W>(
     // across `tokio::spawn`).
     let user_id = UserId::new(auth.user_id.clone());
 
+    // The connection's login-session id (#261): installed as a task-local
+    // around every request so client-local tool registration keys on the
+    // connection, not the user. Like `user_id` it is re-installed on spawned
+    // send tasks (task-locals don't cross `tokio::spawn`).
+    let session_id = SessionId::new(auth.session_id.clone());
+
     // The connection's transport (#243): installed around the send-message
     // dispatch so the turn loop can infer tool co-location. Like `user_id` it
     // is re-installed on spawned send tasks because `task_local`s don't cross
@@ -244,14 +270,17 @@ pub async fn dispatch_loop<R, W>(
                             transport,
                             with_user_id(
                                 user_id.clone(),
-                                handler.start_send_message(
-                                    conversation_id.clone(),
-                                    content.clone(),
-                                    override_selection.clone(),
-                                    system_refinement.clone(),
-                                    request_id.clone(),
-                                    idempotency_key.clone(),
-                                    Arc::clone(&sink),
+                                with_session_id(
+                                    session_id.clone(),
+                                    handler.start_send_message(
+                                        conversation_id.clone(),
+                                        content.clone(),
+                                        override_selection.clone(),
+                                        system_refinement.clone(),
+                                        request_id.clone(),
+                                        idempotency_key.clone(),
+                                        Arc::clone(&sink),
+                                    ),
                                 ),
                             ),
                         ),
@@ -308,6 +337,7 @@ pub async fn dispatch_loop<R, W>(
                         }
                         let handler = Arc::clone(&handler);
                         let user_id_for_task = user_id.clone();
+                        let session_id_for_task = session_id.clone();
                         let transport_for_task = transport;
                         // Re-install the #248 co-location result + client label
                         // inside the spawn, like the transport, since task-locals
@@ -323,14 +353,17 @@ pub async fn dispatch_loop<R, W>(
                                         transport_for_task,
                                         with_user_id(
                                             user_id_for_task,
-                                            handler.handle_send_message_with_override(
-                                                conversation_id,
-                                                content,
-                                                override_selection,
-                                                system_refinement,
-                                                request_id,
-                                                idempotency_key,
-                                                sink,
+                                            with_session_id(
+                                                session_id_for_task,
+                                                handler.handle_send_message_with_override(
+                                                    conversation_id,
+                                                    content,
+                                                    override_selection,
+                                                    system_refinement,
+                                                    request_id,
+                                                    idempotency_key,
+                                                    sink,
+                                                ),
                                             ),
                                         ),
                                     ),
@@ -387,7 +420,11 @@ pub async fn dispatch_loop<R, W>(
                     }
                     continue;
                 }
-                let receiver = with_user_id(user_id.clone(), handler.subscribe_user_events()).await;
+                let receiver = with_user_id(
+                    user_id.clone(),
+                    with_session_id(session_id.clone(), handler.subscribe_user_events()),
+                )
+                .await;
                 let Some(mut receiver) = receiver else {
                     // No-op handler → no event source. Surface as a
                     // clean error frame so the client knows
@@ -461,7 +498,10 @@ pub async fn dispatch_loop<R, W>(
             api::Command::SetConfig { changes } => {
                 let res = with_user_id(
                     user_id.clone(),
-                    handler.handle_command(api::Command::SetConfig { changes }),
+                    with_session_id(
+                        session_id.clone(),
+                        handler.handle_command(api::Command::SetConfig { changes }),
+                    ),
                 )
                 .await;
                 match res {
@@ -523,7 +563,11 @@ pub async fn dispatch_loop<R, W>(
             }
 
             other => {
-                let res = with_user_id(user_id.clone(), handler.handle_command(other)).await;
+                let res = with_user_id(
+                    user_id.clone(),
+                    with_session_id(session_id.clone(), handler.handle_command(other)),
+                )
+                .await;
                 match res {
                     Ok(result) => {
                         if out_tx
@@ -571,6 +615,12 @@ pub async fn dispatch_loop<R, W>(
     if let Some(handle) = bg_subscription.take() {
         handle.abort();
     }
+
+    // Connection closed: evict any client-local tools this session
+    // registered (#261) so a long-lived daemon doesn't accumulate stale
+    // per-session buckets across reconnects. Run inside the session scope
+    // so the handler's coordinator can read which session ended.
+    with_session_id(session_id.clone(), handler.on_session_end()).await;
 
     // Drop the inbound side's `out_tx` so the writer can finish
     // draining whatever is buffered. Spawned `SendMessage` tasks

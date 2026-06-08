@@ -857,3 +857,57 @@ async fn registration_overwrite_is_per_session() {
         "session A's re-registration must not touch session B's tool set"
     );
 }
+
+/// On disconnect the dispatcher calls `clear_session`, which must evict only
+/// the ending session's registrations — a concurrent session of the same
+/// user keeps its tools. Prevents a long-lived daemon accumulating stale
+/// per-session buckets across reconnects (#261).
+#[tokio::test]
+async fn clear_session_evicts_only_that_sessions_registrations() {
+    let coord = Arc::new(ClientToolCoordinator::new());
+
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            register_client_tools(&coord, &[reg("say_this")]).await;
+        }),
+    )
+    .await;
+    with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            register_client_tools(&coord, &[reg("fs_read")]).await;
+        }),
+    )
+    .await;
+
+    // Session A disconnects.
+    with_session_id(SessionId::new("conn-A"), async {
+        coord.clear_session();
+    })
+    .await;
+
+    let a_gone = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-A"), async {
+            coord.registered_definitions().await.is_empty()
+        }),
+    )
+    .await;
+    let b_intact = with_user_id(
+        UserId::new("alice"),
+        with_session_id(SessionId::new("conn-B"), async {
+            coord.is_client_registered("fs_read").await
+        }),
+    )
+    .await;
+
+    assert!(
+        a_gone,
+        "session A's registrations must be evicted on disconnect"
+    );
+    assert!(
+        b_intact,
+        "session B's registrations must survive session A's disconnect"
+    );
+}
