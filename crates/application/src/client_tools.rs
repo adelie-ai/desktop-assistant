@@ -40,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_auth_jwt::UserId;
@@ -107,6 +108,42 @@ impl From<CoreError> for ClientToolResolutionError {
 /// prompt within the model's context window — the LLM sees the
 /// rejection as a tool error.
 const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 1_048_576;
+
+/// Default cap on how long a turn waits for a client to answer a client-tool
+/// call before the suspension gives up (#262). Generous on purpose: a
+/// legitimately slow interactive client (one that needs the user to act) must
+/// not be cut off — the point is only to bound an *indefinite* wedge when a
+/// client can't fulfil the tool at all (e.g. a text client offered a tool it
+/// never registered, the #260 failure mode). On expiry the suspension resolves
+/// as a tool error so the LLM loop continues to a terminal state instead of
+/// parking forever. Conservative default; the daemon can install a
+/// config-driven value per turn via [`with_client_tool_timeout`].
+pub const DEFAULT_CLIENT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
+tokio::task_local! {
+    /// Per-turn override for the client-tool suspension cap. The daemon can
+    /// install a config-driven value around the turn body; when unset (the
+    /// common case) [`current_client_tool_timeout`] falls back to
+    /// [`DEFAULT_CLIENT_TOOL_TIMEOUT`]. Tests install a short value to exercise
+    /// the expiry path without waiting.
+    static CLIENT_TOOL_TIMEOUT: Duration;
+}
+
+/// Run `fut` with `timeout` as the client-tool suspension cap (#262).
+pub async fn with_client_tool_timeout<F, T>(timeout: Duration, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CLIENT_TOOL_TIMEOUT.scope(timeout, fut).await
+}
+
+/// The active client-tool suspension cap, or [`DEFAULT_CLIENT_TOOL_TIMEOUT`]
+/// when no scope is installed.
+fn current_client_tool_timeout() -> Duration {
+    CLIENT_TOOL_TIMEOUT
+        .try_with(|d| *d)
+        .unwrap_or(DEFAULT_CLIENT_TOOL_TIMEOUT)
+}
 
 /// Coordinator for the registration + suspension halves of the client-
 /// tool dance. One instance is shared by the whole daemon; concurrent
@@ -340,6 +377,19 @@ pub async fn suspend_for_client_tool(
                 .update_turn(&task_id.0, TurnStatus::Failed, &state, Some("cancelled"))
                 .await;
             return Err(CoreError::Cancelled);
+        }
+        _ = tokio::time::sleep(current_client_tool_timeout()) => {
+            // The client never answered (#262). Don't wedge the turn: drop the
+            // slot so a late `ClientToolResult` is cleanly rejected
+            // (`TurnNotFound`), and fall through with a tool-error outcome so
+            // the LLM loop sees a failed tool call and continues to a terminal
+            // state rather than parking forever.
+            coord.pending.lock().unwrap().remove(&task_id.0);
+            Err(format!(
+                "client did not respond to tool call '{}' within {}s",
+                pending_call.tool_name,
+                current_client_tool_timeout().as_secs()
+            ))
         }
     };
 
