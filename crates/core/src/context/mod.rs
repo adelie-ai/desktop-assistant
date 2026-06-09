@@ -24,6 +24,7 @@ use crate::domain::{
     Conversation, Message, MessageSummary, Role, ToolDefinition, ToolLocality, ToolNamespace,
     TransportKind,
 };
+use crate::planning;
 use crate::ports::llm::{ContextBudget, LlmClient, ReasoningConfig};
 
 /// Default maximum number of conversation messages sent to the LLM per turn.
@@ -898,10 +899,17 @@ pub(crate) fn window_start(messages: &[Message], max_messages: usize) -> usize {
     }
     // No User message found; at minimum skip past any Tool messages so we
     // never start with orphaned tool results.
-    search
+    if let Some(offset) = search.iter().position(|m| m.role != Role::Tool) {
+        return tentative + offset;
+    }
+    // The entire window is Tool messages (one assistant message fanned out
+    // more tool calls than the window holds). Walk back to the owning
+    // assistant `tool_calls` message so the invariant above still holds
+    // (DA-12); a slightly larger window beats a guaranteed provider 400.
+    messages[..tentative]
         .iter()
-        .position(|m| m.role != Role::Tool)
-        .map_or(tentative, |offset| tentative + offset)
+        .rposition(|m| m.role != Role::Tool)
+        .unwrap_or(0)
 }
 
 /// Determine which message range (if any) should be compacted into the
@@ -947,7 +955,9 @@ pub(crate) async fn generate_context_summary<L: LlmClient>(
             Role::Assistant if !msg.content.is_empty() => {
                 transcript.push_str("Assistant: ");
                 if msg.content.len() > 2000 {
-                    transcript.push_str(&msg.content[..2000]);
+                    // Char-boundary-safe cut: a naive byte slice panics when
+                    // byte 2000 lands inside a multibyte character (DA-2).
+                    transcript.push_str(&planning::truncate_on_char_boundary(&msg.content, 2000));
                     transcript.push_str("...[truncated]");
                 } else {
                     transcript.push_str(&msg.content);

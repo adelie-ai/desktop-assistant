@@ -1105,8 +1105,34 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // round; this one protects the inner per-tool loop.
                 bail_if_cancelled()?;
 
-                let arguments: serde_json::Value =
-                    serde_json::from_str(&tool_call.arguments).unwrap_or_default();
+                // Parse the model-supplied argument JSON. An empty string is
+                // tolerated as "no arguments" (some providers emit it for
+                // zero-arg calls), but otherwise-malformed JSON must NOT be
+                // silently defaulted to `null` — the tool would run with
+                // garbage arguments and the model would get a confusing
+                // tool-specific error instead of the real cause (DA-13).
+                let arguments: serde_json::Value = if tool_call.arguments.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    match serde_json::from_str(&tool_call.arguments) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                tool = %tool_call.name,
+                                error = %e,
+                                "tool call arguments were not valid JSON"
+                            );
+                            conv.messages.push(Message::tool_result(
+                                &tool_call.id,
+                                format!(
+                                    "Error: the arguments for this tool call were not valid \
+                                     JSON ({e}). Emit valid JSON and call the tool again."
+                                ),
+                            ));
+                            continue;
+                        }
+                    }
+                };
                 tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
 
                 // Step-planning + compaction control (#240) is handled here in
@@ -2230,7 +2256,11 @@ mod tests {
             responses: Mutex::new(vec![
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new("b1", "begin_step", r#"{"goal":"map the plan"}"#)],
+                    vec![ToolCall::new(
+                        "b1",
+                        "begin_step",
+                        r#"{"goal":"map the plan"}"#,
+                    )],
                 ),
                 LlmResponse::text("done"),
             ]),

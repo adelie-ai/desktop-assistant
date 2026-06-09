@@ -76,7 +76,12 @@ impl<L> ProfilingLlmClient<L> {
                     (None, Some(m.content.clone()))
                 } else {
                     let preview = if content_len > 200 {
-                        format!("{}...", &m.content[..200])
+                        // Char-boundary-safe cut (DA-2): a naive byte slice
+                        // panics when byte 200 lands inside a multibyte char.
+                        format!(
+                            "{}...",
+                            crate::planning::truncate_on_char_boundary(&m.content, 200)
+                        )
                     } else {
                         m.content.clone()
                     };
@@ -108,7 +113,11 @@ impl<L> ProfilingLlmClient<L> {
                     (None, Some(response.text.clone()))
                 } else {
                     let preview = if response_text_len > 200 {
-                        format!("{}...", &response.text[..200])
+                        // Char-boundary-safe cut (DA-2), as in log_messages.
+                        format!(
+                            "{}...",
+                            crate::planning::truncate_on_char_boundary(&response.text, 200)
+                        )
                     } else {
                         response.text.clone()
                     };
