@@ -507,6 +507,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Builds a string longer than 200 bytes whose byte 200 falls in the
+    /// middle of a multibyte character, so a naive `&s[..200]` slice panics.
+    fn multibyte_straddling_200() -> String {
+        let mut s = "a".repeat(199);
+        s.push_str(&"é".repeat(5));
+        assert!(s.len() > 200);
+        assert!(!s.is_char_boundary(200));
+        s
+    }
+
+    #[tokio::test]
+    async fn profiling_preview_handles_multibyte_message_content() {
+        // DA-2: preview truncation of an inbound message must land on a char
+        // boundary, not panic mid-character at byte 200.
+        let dir = std::env::temp_dir().join(format!(
+            "llm_profile_mb_msg_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("profile.jsonl");
+
+        let client = ProfilingLlmClient::new(MockLlm, log_path, false);
+        let response = client
+            .stream_completion(
+                vec![Message::new(Role::User, multibyte_straddling_200())],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text, "mock response");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn profiling_preview_handles_multibyte_response_text() {
+        // DA-2: preview truncation of the LLM's response text must land on a
+        // char boundary, not panic mid-character at byte 200.
+        struct LongMultibyteLlm;
+
+        #[async_trait::async_trait]
+        impl LlmClient for LongMultibyteLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(multibyte_straddling_200()))
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "llm_profile_mb_resp_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("profile.jsonl");
+
+        let client = ProfilingLlmClient::new(LongMultibyteLlm, log_path, false);
+        let response = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .unwrap();
+        assert!(response.text.starts_with("aaa"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn maybe_profiled_plain_delegates() {
         let client = MaybeProfiled::Plain(MockLlm);

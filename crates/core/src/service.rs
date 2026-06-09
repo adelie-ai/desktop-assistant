@@ -1869,6 +1869,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_tool_call_arguments_surface_parse_error_to_model() {
+        // DA-13: when the model emits tool-call arguments that are not valid
+        // JSON, the tool must NOT run with defaulted (null) arguments; the
+        // tool result must tell the model its arguments were invalid JSON so
+        // it can correct itself.
+        let tool_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let bad_call = ToolCall::new("call-1", "read_file", "{ this is not json");
+
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![bad_call]),
+            LlmResponse::text("done"),
+        ];
+
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "hello world".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "done");
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.messages[2].role, Role::Tool);
+        let content = &updated.messages[2].content;
+        assert!(
+            content.contains("not valid JSON"),
+            "tool result must report invalid-JSON arguments, got: {content}"
+        );
+        assert!(
+            !content.contains("hello world"),
+            "tool must not execute with defaulted arguments, got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_tool_call_arguments_are_treated_as_empty_object() {
+        // DA-13 unhappy-path guard: some providers emit an empty string for
+        // no-argument tool calls. That must keep executing (as `{}`), not be
+        // rejected as malformed JSON.
+        let tool_def = ToolDefinition::new(
+            "list_files",
+            "List files",
+            serde_json::json!({"type": "object"}),
+        );
+        let empty_call = ToolCall::new("call-1", "list_files", "");
+
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![empty_call]),
+            LlmResponse::text("done"),
+        ];
+
+        let mut tool_results = HashMap::new();
+        tool_results.insert("list_files".to_string(), "a.txt".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.messages[2].role, Role::Tool);
+        assert_eq!(
+            updated.messages[2].content, "a.txt",
+            "empty-string arguments must execute the tool with an empty object"
+        );
+    }
+
     // --- Planning + compaction (#240) ---
 
     /// An in-memory scratchpad backing the write/list closures, plus a handle

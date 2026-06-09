@@ -1326,6 +1326,31 @@ mod tests {
     }
 
     #[test]
+    fn window_start_all_tool_window_never_returns_tool_index() {
+        // DA-12: when the entire candidate window consists of Tool messages
+        // (one assistant message fanning out many tool calls), window_start
+        // must still honour its documented invariant and never return a Tool
+        // index — otherwise every retry sends orphaned tool results and the
+        // provider rejects the request with HTTP 400.
+        let mut msgs = vec![Message::new(Role::User, "initial")];
+        let calls: Vec<ToolCall> = (0..12)
+            .map(|i| ToolCall::new(format!("c{i}"), "tool_a", "{}"))
+            .collect();
+        msgs.push(Message::assistant_with_tool_calls(calls));
+        for i in 0..12 {
+            msgs.push(Message::tool_result(format!("c{i}"), format!("r{i}")));
+        }
+        // max clamps to MIN_CONTEXT_MESSAGES (8); the tail window of 8 is
+        // entirely Tool messages, so both fallback searches find nothing.
+        let start = window_start(&msgs, 2);
+        assert_ne!(
+            msgs[start].role,
+            Role::Tool,
+            "window must never start on a Tool message, got index {start}"
+        );
+    }
+
+    #[test]
     fn compaction_range_returns_none_under_limit() {
         let mut conv = Conversation::new("c1", "Test");
         for i in 0..10 {
@@ -2344,6 +2369,23 @@ mod tests {
         let llm = FailingLlm;
         let result = generate_context_summary("existing summary", &messages, &llm).await;
         assert_eq!(result, "existing summary");
+    }
+
+    #[tokio::test]
+    async fn generate_context_summary_truncates_multibyte_content_on_char_boundary() {
+        // DA-2: an assistant message longer than 2000 bytes whose byte 2000
+        // falls in the middle of a multibyte character must not panic the
+        // summariser. 1999 ASCII bytes followed by 2-byte 'é's puts byte
+        // 2000 mid-character.
+        let mut content = "a".repeat(1999);
+        content.push_str(&"é".repeat(20));
+        assert!(content.len() > 2000);
+        assert!(!content.is_char_boundary(2000));
+
+        let messages = vec![Message::new(Role::Assistant, content)];
+        let llm = MockLlm::new(vec!["summary of long message"]);
+        let result = generate_context_summary("", &messages, &llm).await;
+        assert_eq!(result, "summary of long message");
     }
 
     #[tokio::test]
