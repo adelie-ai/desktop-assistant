@@ -25,12 +25,13 @@ use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
-use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
+use crate::sanitize::sanitize_assistant_text;
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_text, summarize_tool_value,
     tool_set_hash,
 };
 use chrono::{Duration, Local};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Return `Err(CoreError::Cancelled)` if the current task's cancellation
@@ -576,12 +577,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         &self,
         conversation_id: &ConversationId,
         prompt: String,
-        mut on_chunk: ChunkCallback,
+        on_chunk: ChunkCallback,
         mut on_status: StatusCallback,
     ) -> Result<String, CoreError> {
         // Cooperative cancellation checkpoint (issue #109): bail out
         // before any I/O if the caller has already tripped the token.
         bail_if_cancelled()?;
+
+        // The chunk callback must survive every tool round: each round's
+        // stream wrapper gets a proxy into this shared slot instead of
+        // consuming the callback, so the final answer of a tool-calling turn
+        // still streams (DA-9 — rounds after the first used to replace the
+        // callback with a noop and stream nothing).
+        let on_chunk: Arc<std::sync::Mutex<ChunkCallback>> =
+            Arc::new(std::sync::Mutex::new(on_chunk));
 
         let mut conv = self.store.get(conversation_id).await?;
         let is_first_message = conv.messages.is_empty();
@@ -836,9 +845,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 Some(&tool_locality),
                 &estimate,
             );
-            let mut raw_stream = String::new();
-            let mut emitted_visible_len = 0usize;
-            let mut visible_chunk_callback = on_chunk;
+            // Incremental sanitizer: carries think-block parser state across
+            // chunks so each byte is scanned once, instead of re-sanitizing
+            // the full accumulated stream on every chunk (O(n²) per turn).
+            let mut sanitizer = crate::sanitize::StreamSanitizer::new();
+            let visible_chunk_callback = Arc::clone(&on_chunk);
             // Capture a clone of the per-turn cancellation token so the
             // wrapped callback can short-circuit mid-stream by returning
             // `false` — the contract LLM adapters already obey to abort
@@ -852,25 +863,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 if cancellation_token.is_cancelled() {
                     return false;
                 }
-                raw_stream.push_str(&chunk);
-                let sanitized = sanitize_assistant_text_for_stream(&raw_stream);
-
-                if sanitized.len() < emitted_visible_len {
-                    emitted_visible_len = sanitized.len();
-                    return true;
-                }
-
-                if sanitized.len() <= emitted_visible_len {
-                    return true;
-                }
-
-                let visible = sanitized[emitted_visible_len..].to_string();
-                emitted_visible_len = sanitized.len();
+                let visible = sanitizer.push(&chunk);
 
                 if visible.is_empty() {
                     true
                 } else {
-                    visible_chunk_callback(visible)
+                    (visible_chunk_callback.lock().unwrap())(visible)
                 }
             });
 
@@ -933,7 +931,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     // Drop the frames so no later complete_step evicts the wrong
                     // range — the plan todos persist on the scratchpad regardless.
                     step_stack.clear();
-                    on_chunk = Box::new(|_| true);
                     continue;
                 }
                 Err(CoreError::Cancelled) => {
@@ -1049,7 +1046,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                          tools you need. You now have access to `builtin_tool_search` \
                          — call it with a query describing what you need.",
                     ));
-                    on_chunk = Box::new(|_| true);
                     continue;
                 }
 
@@ -1324,10 +1320,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 conv.messages
                     .push(Message::tool_result(&tool_call.id, &stored));
             }
-
-            // Create a new noop callback for subsequent rounds
-            // (the original callback was consumed by stream_completion)
-            on_chunk = Box::new(|_| true);
         }
 
         // If we exhausted all rounds, return what we have

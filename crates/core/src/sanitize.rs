@@ -6,29 +6,32 @@
 //! model has produced its complete output) and for live streaming chunks
 //! (where the closing tag may not yet have arrived).
 
-/// Strip `<think>...</think>` blocks from a fully-formed assistant response,
-/// then trim outer whitespace and collapse triple newlines down to doubles.
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Shared strip loop: remove complete `<think>...</think>` blocks; an
+/// unclosed `<think>` drops the remainder of the text.
 ///
 /// Why a tolerant parser: when a closing `</think>` is missing, the
 /// remainder of the message is treated as part of the thinking block and
 /// dropped. The goal is to never surface internal reasoning to the user;
 /// erring on the side of dropping content matches that goal.
-pub(crate) fn sanitize_assistant_text(text: &str) -> String {
+fn strip_think_blocks(text: &str) -> String {
     let mut remaining = text;
     let mut output = String::with_capacity(text.len());
 
     loop {
-        let Some(start) = remaining.find("<think>") else {
+        let Some(start) = remaining.find(THINK_OPEN) else {
             output.push_str(remaining);
             break;
         };
 
         output.push_str(&remaining[..start]);
-        let after_start = &remaining[start + "<think>".len()..];
+        let after_start = &remaining[start + THINK_OPEN.len()..];
 
-        match after_start.find("</think>") {
+        match after_start.find(THINK_CLOSE) {
             Some(end) => {
-                remaining = &after_start[end + "</think>".len()..];
+                remaining = &after_start[end + THINK_CLOSE.len()..];
             }
             None => {
                 break;
@@ -36,7 +39,13 @@ pub(crate) fn sanitize_assistant_text(text: &str) -> String {
         }
     }
 
-    let mut sanitized = output.trim().to_string();
+    output
+}
+
+/// Strip `<think>...</think>` blocks from a fully-formed assistant response,
+/// then trim outer whitespace and collapse triple newlines down to doubles.
+pub(crate) fn sanitize_assistant_text(text: &str) -> String {
+    let mut sanitized = strip_think_blocks(text).trim().to_string();
     while sanitized.contains("\n\n\n") {
         sanitized = sanitized.replace("\n\n\n", "\n\n");
     }
@@ -50,35 +59,87 @@ pub(crate) fn sanitize_assistant_text(text: &str) -> String {
 /// model produced. Holding back any partial-tag suffix until the next chunk
 /// arrives prevents emitting visible characters that would later be
 /// retroactively wrapped in a thinking block.
+///
+/// Production streaming goes through [`StreamSanitizer`]; this batch
+/// formulation is kept as the test oracle for its equivalence sweep.
+#[cfg(test)]
 pub(crate) fn sanitize_assistant_text_for_stream(text: &str) -> String {
-    let mut remaining = text;
-    let mut output = String::with_capacity(text.len());
+    let mut output = strip_think_blocks(text);
 
-    loop {
-        let Some(start) = remaining.find("<think>") else {
-            output.push_str(remaining);
-            break;
-        };
-
-        output.push_str(&remaining[..start]);
-        let after_start = &remaining[start + "<think>".len()..];
-
-        match after_start.find("</think>") {
-            Some(end) => {
-                remaining = &after_start[end + "</think>".len()..];
-            }
-            None => {
-                break;
-            }
-        }
-    }
-
-    let partial_len = trailing_tag_prefix_len(&output, "<think>");
+    let partial_len = trailing_tag_prefix_len(&output, THINK_OPEN);
     if partial_len > 0 {
         output.truncate(output.len() - partial_len);
     }
 
     output
+}
+
+/// Incremental equivalent of [`sanitize_assistant_text_for_stream`]: feed
+/// chunks as they arrive and get back only the newly-visible sanitized text.
+///
+/// Why it exists: the streaming path used to re-run the batch sanitizer over
+/// the full accumulated text on every chunk — O(n²) over the reply length.
+/// This carries the parser state (inside/outside a think block, plus the
+/// undecided tail that may still become a tag) across chunks, so each byte is
+/// scanned once. The concatenation of every `push` return value is identical
+/// to `sanitize_assistant_text_for_stream` over the concatenated input (the
+/// equivalence test below sweeps chunk boundaries to prove it).
+pub(crate) struct StreamSanitizer {
+    /// Unconsumed tail: either a partial tag prefix (outside a think block)
+    /// or not-yet-closed thinking text awaiting `</think>`.
+    pending: String,
+    in_think: bool,
+}
+
+impl StreamSanitizer {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: String::new(),
+            in_think: false,
+        }
+    }
+
+    /// Feed the next raw chunk; returns the newly-visible sanitized text
+    /// (possibly empty while inside a think block or holding back a partial
+    /// tag prefix).
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        let mut out = String::new();
+        loop {
+            if self.in_think {
+                match self.pending.find(THINK_CLOSE) {
+                    Some(end) => {
+                        self.pending.drain(..end + THINK_CLOSE.len());
+                        self.in_think = false;
+                    }
+                    None => {
+                        // Discard consumed thinking text; keep only a tail
+                        // that could still complete `</think>`.
+                        let keep = trailing_tag_prefix_len(&self.pending, THINK_CLOSE);
+                        self.pending.drain(..self.pending.len() - keep);
+                        return out;
+                    }
+                }
+            } else {
+                match self.pending.find(THINK_OPEN) {
+                    Some(start) => {
+                        out.push_str(&self.pending[..start]);
+                        self.pending.drain(..start + THINK_OPEN.len());
+                        self.in_think = true;
+                    }
+                    None => {
+                        // Emit everything except a tail that could still
+                        // become `<think>`.
+                        let keep = trailing_tag_prefix_len(&self.pending, THINK_OPEN);
+                        let emit = self.pending.len() - keep;
+                        out.push_str(&self.pending[..emit]);
+                        self.pending.drain(..emit);
+                        return out;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Length of the longest non-empty prefix of `tag` that the rendered text
@@ -145,6 +206,61 @@ fn looks_like_secret(core: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod stream_sanitizer_tests {
+    use super::{StreamSanitizer, sanitize_assistant_text_for_stream};
+
+    /// The incremental sanitizer must be byte-identical to the batch
+    /// sanitizer for any chunking of the same input — that is the contract
+    /// that lets the per-chunk O(n²) re-scan be replaced.
+    #[test]
+    fn stream_sanitizer_matches_batch_for_all_chunkings() {
+        let cases = [
+            "",
+            "plain text with no tags at all",
+            "before<think>hidden reasoning</think>after",
+            "a<think>unclosed thinking never ends",
+            "partial open at end <th",
+            "a<think>abc</thi",
+            "<think>a</think>mid<think>b</think>tail",
+            "angle < bracket but <thinker> not a tag",
+            "é<think>ü</think>ñ then partial <t",
+            "<think></think>",
+            "</think>stray close",
+        ];
+        for case in cases {
+            let expected = sanitize_assistant_text_for_stream(case);
+            let chars: Vec<char> = case.chars().collect();
+            for size in 1..=5 {
+                let mut sanitizer = StreamSanitizer::new();
+                let mut out = String::new();
+                for chunk in chars.chunks(size) {
+                    out.push_str(&sanitizer.push(&chunk.iter().collect::<String>()));
+                }
+                assert_eq!(
+                    out, expected,
+                    "incremental output diverged for case {case:?} at chunk size {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_sanitizer_emits_incrementally_outside_think_blocks() {
+        // Plain text must flow through immediately, not be buffered.
+        let mut s = StreamSanitizer::new();
+        assert_eq!(s.push("hello "), "hello ");
+        assert_eq!(s.push("world"), "world");
+    }
+
+    #[test]
+    fn stream_sanitizer_suppresses_think_block_content() {
+        let mut s = StreamSanitizer::new();
+        assert_eq!(s.push("a<think>secret "), "a");
+        assert_eq!(s.push("stuff</think>b"), "b");
+    }
 }
 
 #[cfg(test)]
