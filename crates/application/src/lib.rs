@@ -314,8 +314,21 @@ const STREAM_EVENT_BUFFER: usize = 64;
 /// Forward a streaming event into the per-turn event channel from the core
 /// chunk callback. The boolean return feeds the LLM adapters' cooperative
 /// abort contract: `false` means "the consumer is gone, stop streaming".
+///
+/// DA-3: `Full` and `Closed` must not be conflated. A momentarily full
+/// buffer (slow client, 64-event cap) is backpressure — the delta is
+/// dropped (the final stored message converges the client) but the stream
+/// stays alive. Only a closed channel means the consumer is really gone.
 fn forward_stream_event(tx: &tokio::sync::mpsc::Sender<api::Event>, event: api::Event) -> bool {
-    tx.try_send(event).is_ok()
+    use tokio::sync::mpsc::error::TrySendError;
+    match tx.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            tracing::debug!("stream event buffer full; dropping one delta (client will converge)");
+            true
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
 }
 
 #[cfg(test)]
