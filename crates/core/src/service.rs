@@ -1896,6 +1896,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_answer_streams_after_a_tool_round() {
+        // DA-9: the user-facing chunk callback must keep streaming after the
+        // first tool round — the final answer of a tool-calling turn used to
+        // stream nothing because later rounds replaced the callback with a
+        // noop.
+        let tool_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "read_file", "{}")]),
+            LlmResponse::text("final answer after tools"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "data".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let streamed = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&streamed);
+        let cb: ChunkCallback = Box::new(move |chunk| {
+            sink.lock().unwrap().push_str(&chunk);
+            true
+        });
+
+        handler
+            .send_prompt(&conv.id, "go".into(), cb, noop_status())
+            .await
+            .unwrap();
+
+        let streamed = streamed.lock().unwrap();
+        assert!(
+            streamed.contains("final answer after tools"),
+            "the final answer must be streamed to the caller, got: {streamed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_answer_streams_after_multiple_tool_rounds() {
+        // DA-9 unhappy path: two consecutive tool rounds, then text. Streaming
+        // must survive every round transition, not just the first.
+        let tool_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "read_file", "{}")]),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-2", "read_file", "{}")]),
+            LlmResponse::text("done at last"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "data".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let streamed = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&streamed);
+        let cb: ChunkCallback = Box::new(move |chunk| {
+            sink.lock().unwrap().push_str(&chunk);
+            true
+        });
+
+        handler
+            .send_prompt(&conv.id, "go".into(), cb, noop_status())
+            .await
+            .unwrap();
+
+        let streamed = streamed.lock().unwrap();
+        assert!(
+            streamed.contains("done at last"),
+            "the final answer must be streamed after multiple tool rounds, got: {streamed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_tool_call_arguments_surface_parse_error_to_model() {
         // DA-13: when the model emits tool-call arguments that are not valid
         // JSON, the tool must NOT run with defaulted (null) arguments; the
