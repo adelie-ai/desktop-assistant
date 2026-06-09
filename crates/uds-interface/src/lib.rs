@@ -137,6 +137,11 @@ pub struct UdsServerConfig {
     /// co-location exactly. `None` ⇒ the daemon couldn't resolve its own id, so
     /// co-location falls back to the transport heuristic (UDS ⇒ co-located).
     pub daemon_system_id: Option<String>,
+    /// How long a freshly-accepted connection may take to present its JWT
+    /// handshake frame before the server closes it (review finding DT-7).
+    /// Without this a client that connects and sends nothing pins a
+    /// connection task forever.
+    pub handshake_timeout: std::time::Duration,
 }
 
 impl UdsServerConfig {
@@ -144,12 +149,19 @@ impl UdsServerConfig {
         Self {
             socket_path: socket_path.into(),
             daemon_system_id: None,
+            handshake_timeout: std::time::Duration::from_secs(10),
         }
     }
 
     /// Set the daemon's own system id for the #248 co-location handshake.
     pub fn with_daemon_system_id(mut self, id: Option<String>) -> Self {
         self.daemon_system_id = id;
+        self
+    }
+
+    /// Override the handshake timeout (DT-7); mainly for tests.
+    pub fn with_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 }

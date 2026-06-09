@@ -173,6 +173,58 @@ async fn socket_is_removed_on_shutdown() {
     );
 }
 
+/// DT-13: without a group gate the mint socket must be 0600 — only the
+/// minter's own user may connect. (With a gate the mode is widened so the
+/// gated group can reach `connect()`; membership is still enforced per
+/// request via peer credentials.)
+#[tokio::test]
+async fn mint_socket_permissions_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("tempdir");
+    let socket_path = dir.path().join("perms.sock");
+    let key_path = dir.path().join("key");
+    auth_jwt::ensure_signing_key_at(&key_path).expect("key");
+
+    let mut cfg = MintConfig::with_default_paths();
+    cfg.signing_key_path = key_path;
+
+    let opts = ServerOptions {
+        socket_path: socket_path.clone(),
+        group_gate: None,
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        serve(opts, cfg, async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+
+    for _ in 0..50 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(socket_path.exists(), "socket should exist after bind");
+
+    let mode = std::fs::metadata(&socket_path)
+        .expect("socket metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "mint.sock must be 0600 without a group gate, got {:o}",
+        mode & 0o777
+    );
+
+    tx.send(()).expect("trigger shutdown");
+    serve_task.await.expect("join").expect("serve ok");
+}
+
 #[test]
 fn group_gate_rejects_non_member() {
     // Synthetic GID that's guaranteed not to appear in any real grouplist.

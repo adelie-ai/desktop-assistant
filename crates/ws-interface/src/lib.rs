@@ -649,10 +649,6 @@ pub async fn serve_full_tls_with_system_id<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use hyper_util::server::conn::auto::Builder as ConnBuilder;
-    use hyper_util::service::TowerToHyperService;
-
     let app = router_full_with_system_id(
         handler,
         auth_validator,
@@ -662,13 +658,55 @@ where
         daemon_system_id,
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    serve_tls_accept_loop(listener, tls_acceptor, app, shutdown).await
+}
+
+/// Source of accepted TCP connections for [`serve_tls_accept_loop`].
+///
+/// Exists purely as a test seam: production passes a bound
+/// `tokio::net::TcpListener`; tests inject accept errors to pin down the
+/// loop's survival behaviour (review finding DT-1).
+#[cfg(feature = "tls")]
+trait TcpAcceptSource: Send {
+    fn accept(&mut self) -> impl Future<Output = std::io::Result<tokio::net::TcpStream>> + Send;
+}
+
+#[cfg(feature = "tls")]
+impl TcpAcceptSource for tokio::net::TcpListener {
+    async fn accept(&mut self) -> std::io::Result<tokio::net::TcpStream> {
+        tokio::net::TcpListener::accept(self).await.map(|(s, _)| s)
+    }
+}
+
+/// TLS accept loop, factored out of [`serve_full_tls_with_system_id`] so its
+/// error handling is unit-testable (DT-1).
+///
+/// A failed `accept()` (`ECONNABORTED`, `EMFILE`, …) is transient: it is
+/// logged and the loop keeps serving after a short pause, matching the UDS
+/// listener and the non-TLS axum path, which both survive accept errors.
+/// Before the DT-1 fix a single accept error returned from this function and
+/// permanently killed the WS transport until a daemon restart.
+#[cfg(feature = "tls")]
+async fn serve_tls_accept_loop<A, F>(
+    mut listener: A,
+    tls_acceptor: tokio_rustls::TlsAcceptor,
+    app: Router,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    A: TcpAcceptSource,
+    F: Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::service::TowerToHyperService;
 
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (tcp_stream, _remote_addr) = result?;
+                let tcp_stream = result?;
                 let acceptor = tls_acceptor.clone();
                 let app = app.clone();
 
@@ -696,4 +734,86 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "tls"))]
+mod tls_accept_tests {
+    use super::*;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Accept source that yields one transient error, then pends forever.
+    /// Counts calls so the test can observe whether the loop retried.
+    struct FlakyAccept {
+        yielded_error: bool,
+        calls: StdArc<AtomicUsize>,
+    }
+
+    impl TcpAcceptSource for FlakyAccept {
+        async fn accept(&mut self) -> std::io::Result<tokio::net::TcpStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.yielded_error {
+                self.yielded_error = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "transient accept failure",
+                ));
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key =
+            rustls_pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(StdArc::new(config))
+    }
+
+    /// DT-1: one transient accept error must not end the serve loop. The
+    /// loop should log, pause briefly, and call `accept` again — only the
+    /// shutdown future may end it.
+    #[tokio::test]
+    async fn tls_accept_error_does_not_kill_the_server() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = FlakyAccept {
+            yielded_error: false,
+            calls: StdArc::clone(&calls),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+        };
+
+        let loop_task = tokio::spawn(serve_tls_accept_loop(
+            listener,
+            test_tls_acceptor(),
+            Router::new(),
+            shutdown,
+        ));
+
+        // Give the loop time to observe the accept error and retry.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert!(
+            !loop_task.is_finished(),
+            "a single transient accept error must not end the TLS serve loop"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the loop must call accept again after a transient error"
+        );
+
+        // Clean shutdown still works.
+        let _ = shutdown_tx.send(());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .expect("loop must exit on shutdown")
+            .expect("loop task must not panic");
+        assert!(result.is_ok(), "shutdown exit must be Ok: {result:?}");
+    }
 }
