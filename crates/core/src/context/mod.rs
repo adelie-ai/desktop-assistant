@@ -836,10 +836,31 @@ fn find_largest_tool_result_above(
         .map(|(i, _)| i)
 }
 
+/// Outcome of [`trim_tool_pairs`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TrimResult {
+    /// Total messages removed from the list.
+    total_removed: usize,
+    /// How many of the removed messages lay at indices `< compacted_through`,
+    /// i.e. inside the already-summarized prefix. The caller decrements
+    /// `compacted_through` by exactly this — never by `total_removed` — so the
+    /// marker keeps pointing at the same logical boundary (DA-11 / #298).
+    removed_before_marker: usize,
+}
+
 /// Remove the oldest assistant(tool_calls)+tool_result groups from a message
 /// list to reduce context size. Keeps the first user message and the most
-/// recent tool interaction intact. Returns the number of messages removed.
-fn trim_tool_pairs(messages: &mut Vec<Message>) -> usize {
+/// recent tool interaction intact.
+///
+/// `compacted_through` is the caller's summary boundary: messages at indices
+/// `< compacted_through` have already been folded into the rolling context
+/// summary. Removing them shifts the boundary, but removing messages *after* it
+/// does not — so the returned [`TrimResult::removed_before_marker`] counts only
+/// the removals inside the summarized prefix. The previous code decremented
+/// `compacted_through` by the *total* removed, which re-summarized
+/// already-summarized messages whenever a removed group lay past the marker
+/// (DA-11 / #298).
+fn trim_tool_pairs(messages: &mut Vec<Message>, compacted_through: usize) -> TrimResult {
     // Find ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
     // groups and remove roughly the oldest half.
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
@@ -859,22 +880,25 @@ fn trim_tool_pairs(messages: &mut Vec<Message>) -> usize {
 
     if groups.len() <= 1 {
         // Nothing safe to remove — keep the most recent group
-        return 0;
+        return TrimResult::default();
     }
 
     // Remove the oldest half of groups
     let remove_count = groups.len() / 2;
     let groups_to_remove: Vec<_> = groups[..remove_count].to_vec();
 
-    // Remove in reverse order to keep indices stable
-    let mut removed = 0;
+    // Remove in reverse order to keep indices stable. Count, separately, how
+    // many removed messages sat inside the already-summarized prefix
+    // (`index < compacted_through`) — that, not the total, is the marker shift.
+    let mut result = TrimResult::default();
     for range in groups_to_remove.into_iter().rev() {
-        let len = range.len();
+        result.total_removed += range.len();
+        result.removed_before_marker +=
+            range.clone().filter(|idx| *idx < compacted_through).count();
         messages.drain(range);
-        removed += len;
     }
 
-    removed
+    result
 }
 
 /// Compute the window-start index, snapped forward to a `Role::User` boundary.
@@ -1055,12 +1079,18 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
         return;
     }
 
-    // Step 2: trim oldest tool-pair groups.
-    let removed = trim_tool_pairs(&mut conv.messages);
-    if removed > 0 {
-        conv.compacted_through = conv.compacted_through.saturating_sub(removed);
+    // Step 2: trim oldest tool-pair groups. Decrement `compacted_through` only
+    // by the removals inside the already-summarized prefix — not the total —
+    // so trimming groups that lie *after* the marker doesn't drag it backwards
+    // and re-summarize messages already folded into the summary (DA-11 / #298).
+    let trimmed = trim_tool_pairs(&mut conv.messages, conv.compacted_through);
+    if trimmed.total_removed > 0 {
+        conv.compacted_through = conv
+            .compacted_through
+            .saturating_sub(trimmed.removed_before_marker);
         tracing::warn!(
-            removed,
+            removed = trimmed.total_removed,
+            removed_before_marker = trimmed.removed_before_marker,
             "context overflow — trimmed oldest tool pairs (step 2)"
         );
         return;
@@ -1250,9 +1280,12 @@ mod tests {
             Message::tool_result("c4", "result_4"),
         ];
 
-        let removed = trim_tool_pairs(&mut messages);
+        // compacted_through = 0 → nothing was summarized, so the marker
+        // adjustment is 0 even though 4 messages are removed.
+        let trimmed = trim_tool_pairs(&mut messages, 0);
         // 4 groups, remove oldest half (2 groups = 4 messages)
-        assert_eq!(removed, 4);
+        assert_eq!(trimmed.total_removed, 4);
+        assert_eq!(trimmed.removed_before_marker, 0);
         // Should keep: user + group3 + group4
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].role, Role::User);
@@ -1267,9 +1300,112 @@ mod tests {
             Message::tool_result("c1", "result"),
         ];
 
-        let removed = trim_tool_pairs(&mut messages);
-        assert_eq!(removed, 0);
+        let trimmed = trim_tool_pairs(&mut messages, 0);
+        assert_eq!(trimmed.total_removed, 0);
+        assert_eq!(trimmed.removed_before_marker, 0);
         assert_eq!(messages.len(), 3);
+    }
+
+    // --- DA-11: marker-aware trim so recovery doesn't corrupt compacted_through ---
+
+    #[test]
+    fn trim_counts_only_removals_before_the_marker() {
+        // Marker at index 4: messages 0..4 (the user msg + group 1 + group 2's
+        // first message) are summarized. The two removed groups (1 and 2) span
+        // indices 1..5; of those, indices 1,2,3 lie at < 4, so the marker must
+        // drop by exactly 3 — NOT by the full 4 removed.
+        let mut messages = vec![
+            Message::new(Role::User, "hello"), // 0
+            // Group 1 (indices 1,2) — fully before marker(4)
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]), // 1
+            Message::tool_result("c1", "r1"),                                         // 2
+            // Group 2 (indices 3,4) — straddles the marker(4): index 3 < 4, 4 not
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]), // 3
+            Message::tool_result("c2", "r2"),                                         // 4
+            // Group 3 (indices 5,6) — kept (most-recent half)
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]), // 5
+            Message::tool_result("c3", "r3"),                                         // 6
+            // Group 4 (indices 7,8) — kept
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]), // 7
+            Message::tool_result("c4", "r4"),                                         // 8
+        ];
+        let compacted_through = 4;
+        let trimmed = trim_tool_pairs(&mut messages, compacted_through);
+        assert_eq!(trimmed.total_removed, 4, "two oldest groups removed");
+        assert_eq!(
+            trimmed.removed_before_marker, 3,
+            "indices 1,2 (group1) + index 3 (group2's first msg) lie at < compacted_through(4)"
+        );
+    }
+
+    #[test]
+    fn trim_marker_adjustment_zero_when_all_removals_after_marker() {
+        // Marker at 1: only the leading user message is summarized. Every
+        // removed tool group lies at indices >= 1, so the marker must NOT move,
+        // or already-summarized messages would be re-summarized (the DA-11 bug).
+        let mut messages = vec![
+            Message::new(Role::User, "hello"), // 0
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]), // 1
+            Message::tool_result("c1", "r1"),  // 2
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]), // 3
+            Message::tool_result("c2", "r2"),  // 4
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]), // 5
+            Message::tool_result("c3", "r3"),  // 6
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]), // 7
+            Message::tool_result("c4", "r4"),  // 8
+        ];
+        let trimmed = trim_tool_pairs(&mut messages, 1);
+        assert_eq!(trimmed.total_removed, 4);
+        assert_eq!(
+            trimmed.removed_before_marker, 0,
+            "removals at indices >= compacted_through must not move the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_step2_does_not_drag_marker_back_for_post_marker_trims() {
+        // End-to-end (DA-11 / #298): a conversation whose tool results are all
+        // small (so step 1 doesn't fire) and whose summary marker sits before
+        // the trimmed groups. Step 2 must trim but leave `compacted_through`
+        // pointing at the same logical boundary, not re-summarize already-
+        // summarized messages.
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages = vec![
+            Message::new(Role::User, "hello"), // 0 — summarized
+            // Group 1 (1,2)
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]),
+            Message::tool_result("c1", "small"),
+            // Group 2 (3,4)
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]),
+            Message::tool_result("c2", "small"),
+            // Group 3 (5,6) — kept
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]),
+            Message::tool_result("c3", "small"),
+            // Group 4 (7,8) — kept
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]),
+            Message::tool_result("c4", "small"),
+        ];
+        // Only the leading user message is summarized; every removed group lies
+        // after the marker. Pre-fix this dropped to 0 (4 - 4, saturating);
+        // post-fix it must stay at 1.
+        conv.compacted_through = 1;
+
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        recover_from_overflow(
+            &mut conv,
+            Some(100_000),
+            Some(8_000),
+            &mut target_window,
+            &FailingLlm,
+            &default_estimate,
+        )
+        .await;
+
+        assert_eq!(conv.messages.len(), 5, "two oldest groups trimmed");
+        assert_eq!(
+            conv.compacted_through, 1,
+            "marker must not move when trimmed groups lie after it"
+        );
     }
 
     #[test]
@@ -1279,8 +1415,9 @@ mod tests {
             Message::new(Role::Assistant, "hi there"),
         ];
 
-        let removed = trim_tool_pairs(&mut messages);
-        assert_eq!(removed, 0);
+        let trimmed = trim_tool_pairs(&mut messages, 0);
+        assert_eq!(trimmed.total_removed, 0);
+        assert_eq!(trimmed.removed_before_marker, 0);
         assert_eq!(messages.len(), 2);
     }
 
