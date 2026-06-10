@@ -560,10 +560,21 @@ fn msg_from_row(r: MsgRow) -> Message {
 }
 
 fn parse_timestamp(s: &str) -> chrono::DateTime<chrono::Utc> {
-    // Try parsing the local format "YYYY-MM-DD HH:MM:SS" as UTC
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-        .map(|naive| naive.and_utc())
-        .unwrap_or_else(|_| chrono::Utc::now())
+    // Try parsing the local format "YYYY-MM-DD HH:MM:SS" as UTC.
+    match chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        Ok(naive) => naive.and_utc(),
+        Err(e) => {
+            // DS-9: a malformed timestamp used to silently become `now()`,
+            // which scrambles ordering invisibly. Surface it so corrupt data
+            // is diagnosable rather than masquerading as a fresh row.
+            tracing::warn!(
+                timestamp = %s,
+                error = %e,
+                "failed to parse stored timestamp; falling back to now()"
+            );
+            chrono::Utc::now()
+        }
+    }
 }
 
 fn format_timestamp(dt: chrono::DateTime<chrono::Utc>) -> String {

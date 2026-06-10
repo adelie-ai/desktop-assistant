@@ -624,8 +624,14 @@ impl AnthropicClient {
                                 SseDelta::TextDelta { text } => {
                                     full_response.push_str(text);
                                     if !on_chunk(text.clone()) {
+                                        // DS-8: break (don't early-return) so the
+                                        // tool calls and token usage accumulated so
+                                        // far are assembled into the response below,
+                                        // matching the OpenAI connector. Discarding
+                                        // them here lost executed-tool/billing state
+                                        // on the same cooperative-abort signal.
                                         tracing::debug!("streaming aborted by callback");
-                                        return Ok(LlmResponse::text(full_response));
+                                        break;
                                     }
                                 }
                                 SseDelta::InputJsonDelta { partial_json } => {
@@ -1922,5 +1928,68 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "stream should have aborted promptly on cancellation; took {elapsed:?}"
         );
+    }
+
+    /// DS-8: when the chunk callback aborts the stream, the tool calls and
+    /// token usage accumulated *before* the abort must still be returned —
+    /// matching the OpenAI connector. Previously Anthropic early-returned a
+    /// text-only response, discarding executed-tool intent and billing.
+    #[tokio::test]
+    async fn callback_abort_preserves_accumulated_tool_calls_and_usage() {
+        // SSE order: a tool_use block (with id, name and a full arguments
+        // delta) lands first, then a text delta that the callback rejects.
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"x\",\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_body);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+
+        // Abort on the very first text chunk (the callback's first call,
+        // after "hello" is appended, returns false).
+        let on_chunk = Box::new(move |_chunk: String| false);
+
+        let resp = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                on_chunk,
+            )
+            .await
+            .expect("aborted stream should still return Ok");
+
+        assert_eq!(
+            resp.tool_calls.len(),
+            1,
+            "tool calls accumulated before the abort must be preserved, got: {:?}",
+            resp.tool_calls
+        );
+        assert_eq!(resp.tool_calls[0].name, "get_weather");
+        assert!(
+            resp.usage.is_some(),
+            "token usage seen before the abort must be preserved"
+        );
+        // Only the first chunk made it through before the callback aborted.
+        assert_eq!(resp.text, "hello");
     }
 }
