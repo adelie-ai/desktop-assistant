@@ -41,3 +41,7 @@ tokio-tungstenite = "0.29"
 futures-util = "0.3"
 tokio.workspace = true
 tower = "0.5"
+# Self-signed certs for the TLS accept-loop unit tests (DT-1).
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true

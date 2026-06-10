@@ -233,7 +233,22 @@ pub async fn dispatch_loop<R, W>(
         let req = match item {
             Ok(req) => req,
             Err(e) => {
+                // DT-5: a frame that failed to decode used to be warn-logged
+                // and silently dropped, leaving a request/response client
+                // hanging forever on its reply. Emit an explicit error frame.
+                // The id is empty because the request id is unknowable from
+                // an unparseable frame; the loop keeps serving.
                 warn!("inbound frame decode error: {e}");
+                if out_tx
+                    .send(WsFrame::Error {
+                        id: String::new(),
+                        error: format!("invalid request json: {e}"),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
                 continue;
             }
         };
@@ -457,10 +472,30 @@ pub async fn dispatch_loop<R, W>(
                                 }
                             }
                             Err(RecvError::Lagged(n)) => {
+                                // DT-11: the gap is invisible to the client
+                                // unless we say so — forward a synthetic
+                                // connection-level (empty-id) error frame so
+                                // the client knows to refetch state instead
+                                // of trusting an event stream with a hole in
+                                // it. The loop then resumes at the oldest
+                                // surviving event.
                                 warn!(
                                     "background-task event subscriber lagged \
                                      by {n} events; oldest dropped"
                                 );
+                                if out_tx_for_forwarder
+                                    .send(WsFrame::Error {
+                                        id: String::new(),
+                                        error: format!(
+                                            "{n} events dropped (subscriber lagged); \
+                                             refetch state to resync"
+                                        ),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                                 continue;
                             }
                             Err(RecvError::Closed) => break,

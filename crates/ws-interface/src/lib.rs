@@ -325,12 +325,25 @@ async fn auth_config_handler(State(state): State<WsServerState>) -> impl IntoRes
 }
 
 /// Adapts axum's `WebSocket` into the transport-neutral stream + sink
-/// pair expected by [`dispatch_loop`]. The receive half is filtered to
-/// `Message::Text` frames parsed into `WsRequest`; the send half is
-/// driven from an mpsc by a small writer task that serializes
-/// `WsFrame` values into `Message::Text`. A `tokio_util::PollSender`
-/// gives us a `Sink<WsFrame>` over the mpsc so the dispatcher's
-/// generic bound is satisfied without a hand-rolled adapter.
+/// pair expected by [`dispatch_loop`].
+///
+/// The dispatcher runs as a spawned task, reading parsed `WsRequest`s from
+/// an inbound mpsc and writing `WsFrame`s into an outbound mpsc. This
+/// function owns BOTH halves of the (split) socket in one **biased select
+/// loop** so we can enforce a critical ordering invariant for DT-6:
+///
+/// > Always flush already-queued outbound frames to the wire *before*
+/// > reading the next inbound frame.
+///
+/// Why this matters: tungstenite couples the two directions. The instant we
+/// read a peer `Close` frame off the socket, its write state flips to
+/// `ClosedByPeer` and every subsequent `send` returns `SendAfterclosing` —
+/// so any reply still sitting in our buffers when the `Close` is read is
+/// lost. With a separate reader task (the old design) the reader raced
+/// ahead, read the `Close`, and the writer's queued replies were dropped.
+/// By draining outbound first in a biased select, every reply for a request
+/// that arrived before the peer's `Close` is on the wire before we ever read
+/// that `Close`.
 async fn handle_socket(
     socket: WebSocket,
     state: WsServerState,
@@ -343,143 +356,210 @@ async fn handle_socket(
     use tokio::sync::mpsc;
     use tokio_util::sync::PollSender;
 
-    let (mut ws_tx, ws_rx) = socket.split();
+    let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Outbound items: either a dispatcher-produced application frame
-    // (the common case — serialized to text) or a server-initiated
-    // close (used when the inbound stream errors, most notably for the
-    // 4 MiB message-size cap). Keeping both kinds on one channel lets
-    // the writer task own `ws_tx` as before without an extra mutex.
-    // `WsFrame` is comparatively large (a few hundred bytes), so we
-    // box it to keep the enum compact.
-    enum Outbound {
-        Frame(Box<WsFrame>),
-        Close(CloseFrame),
-    }
-
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(64);
-    let writer = tokio::spawn(async move {
-        while let Some(item) = outbound_rx.recv().await {
-            match item {
-                Outbound::Frame(frame) => {
-                    let Ok(text) = serde_json::to_string(&*frame) else {
-                        continue;
-                    };
-                    if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Outbound::Close(close) => {
-                    // Best-effort: any send error means the peer is
-                    // gone, so we just exit.
-                    let _ = ws_tx.send(Message::Close(Some(close))).await;
-                    break;
-                }
-            }
-        }
-    });
-
-    // Inbound: walk the axum `Message` stream in a side task, parse
-    // text frames into `WsRequest`, and push them onto an mpsc for the
-    // dispatcher. The two termination paths worth distinguishing:
-    //
-    //   - Peer closed gracefully (`Ok(Message::Close(_))`) or the
-    //     stream simply ended — drop the channel, dispatcher sees the
-    //     stream end.
-    //   - Inbound `Err(_)` — most commonly tungstenite's
-    //     `Capacity(MessageTooLong)` from our 4 MiB cap; the message
-    //     was never delivered to user code, so we owe the client an
-    //     explicit close. We send RFC 6455 code 1009 ("Message Too
-    //     Big") so well-behaved clients can surface the reason instead
-    //     of guessing from a bare TCP RST.
-    let close_tx = outbound_tx.clone();
-    let (inbound_tx, inbound_rx) = mpsc::channel::<anyhow::Result<WsRequest>>(16);
-    let reader = tokio::spawn(async move {
-        let mut ws_rx = ws_rx;
-        while let Some(item) = ws_rx.next().await {
-            match item {
-                Ok(Message::Text(text)) => match serde_json::from_str::<WsRequest>(&text) {
-                    Ok(req) => {
-                        if inbound_tx.send(Ok(req)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => warn!("invalid ws json: {e}"),
-                },
-                Ok(Message::Close(_)) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    let reason = format!("{e}");
-                    warn!("ws inbound error, closing: {reason}");
-                    // RFC 6455 §7.4.1: 1009 = "Message Too Big". We
-                    // use it for any inbound error because in practice
-                    // the only error tungstenite surfaces here is the
-                    // capacity overrun from our cap.
-                    let _ = close_tx
-                        .send(Outbound::Close(CloseFrame {
-                            code: 1009,
-                            reason: "message exceeds 4 MiB cap".into(),
-                        }))
-                        .await;
-                    break;
-                }
-            }
-        }
-    });
-    let inbound = futures::stream::unfold(inbound_rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
-    futures::pin_mut!(inbound);
-
-    // The dispatcher writes `WsFrame` values; wrap them into our
-    // `Outbound` enum at the sink boundary so the writer task can
-    // continue to own the WS sender.
+    // Dispatcher → socket: the dispatcher writes `WsFrame` values into this
+    // channel via a `PollSender` sink; our select loop drains it to the wire.
     let (frame_tx, mut frame_rx) = mpsc::channel::<WsFrame>(64);
-    let frame_bridge_tx = outbound_tx.clone();
-    let bridge = tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if frame_bridge_tx
-                .send(Outbound::Frame(Box::new(frame)))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+    // Socket → dispatcher: parsed requests (or DT-5 decode errors) flow here.
+    // Capacity 1 is deliberate (DT-6): it serializes request→reply so the next
+    // inbound frame isn't read until the dispatcher has taken — and, since it
+    // emits the reply before pulling the next item, replied to — the previous
+    // request. Combined with the biased outbound-first drain, that guarantees a
+    // request's reply is on the wire before any later frame (e.g. a Close) is
+    // read and flips tungstenite's write state.
+    let (inbound_tx, inbound_rx) = mpsc::channel::<anyhow::Result<WsRequest>>(1);
+
     let sink = PollSender::new(frame_tx);
 
-    // Per-connection identity resolved in `ws_handler` (#105): the
-    // bearer token's `sub` if the validator extracted one, otherwise
-    // the schema sentinel for single-tenant fallback. The dispatcher
-    // installs this into the per-task task-local on every dispatched
-    // command so storage queries scope correctly.
+    // Per-connection identity resolved in `ws_handler` (#105): the bearer
+    // token's `sub` if the validator extracted one, otherwise the schema
+    // sentinel for single-tenant fallback. The dispatcher installs this into
+    // the per-task task-local on every dispatched command so storage queries
+    // scope correctly.
     // A WebSocket connection may terminate on a different host, so by the
     // transport heuristic its client-registered tools are treated as remote
     // (#243). When the client reported a system id that matches the daemon's,
-    // the #248 co-location result overrides that — co-located even over WS — and
-    // an optional client host label makes the remote tool note friendlier.
+    // the #248 co-location result overrides that — co-located even over WS —
+    // and an optional client host label makes the remote tool note friendlier.
     let auth = AuthContext::new(user_id.into_inner(), TransportKind::WebSocket)
         .with_co_location(co_located)
         .with_client_label(client_label);
 
-    dispatch_loop(Arc::clone(&state.handler), auth, inbound, sink).await;
+    let handler = Arc::clone(&state.handler);
+    let mut dispatcher = tokio::spawn(async move {
+        // The inbound stream is built inside the spawn so it owns `inbound_rx`
+        // and satisfies the `'static` bound (`dispatch_loop` requires
+        // `Stream + Unpin`, hence the `pin_mut!`).
+        let inbound = futures::stream::unfold(inbound_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        futures::pin_mut!(inbound);
+        dispatch_loop(handler, auth, inbound, sink).await;
+    });
 
-    // Mirror the pre-refactor cleanup: kill the writer when the
-    // dispatcher returns so any in-flight `SendMessage` task observes
-    // a closed channel on its next `emit` and shuts down. This is the
-    // cancellation path exercised by
-    // `ws_send_message_cancels_when_client_disconnects`.
-    //
-    // Drop our local outbound handle and tear down the helper tasks.
-    // The reader owns its own `close_tx` clone, but `reader.abort()`
-    // forces it to drop. The bridge task owns the dispatcher-facing
-    // `frame_bridge_tx`; aborting it likewise lets the writer observe
-    // a closed channel.
-    drop(outbound_tx);
-    bridge.abort();
-    reader.abort();
-    writer.abort();
+    // Helper: serialize+write one frame; `Ok(false)` ⇒ the peer's write side
+    // is gone (stop writing).
+    async fn write_frame(
+        ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+        frame: WsFrame,
+    ) -> bool {
+        let Ok(text) = serde_json::to_string(&frame) else {
+            return true; // unserializable: skip, keep going
+        };
+        ws_tx.send(Message::Text(text.into())).await.is_ok()
+    }
+
+    // Set when an inbound error (e.g. the 4 MiB cap) means we owe the client
+    // an explicit RFC 6455 close before tearing down.
+    let mut pending_close: Option<CloseFrame> = None;
+    // Cleared once the peer has stopped sending (graceful Close / stream end /
+    // fatal inbound error). After that we only flush remaining outbound.
+    let mut inbound_open = true;
+    // Becomes false once a write fails: the peer's read side is gone.
+    let mut writable = true;
+
+    // Concurrent read/write loop. Outbound is drained continuously (subscription
+    // and SendMessage-stream events have no corresponding inbound frame to gate
+    // on) while inbound is read concurrently. The `biased` outbound-first
+    // ordering is what makes this DT-6-safe: tungstenite couples the directions
+    // — the instant we read a peer `Close` its write state flips and any reply
+    // still buffered is lost. Draining `frame_rx` before ever polling `ws_rx`
+    // means a queued reply reaches the wire first. The cap-1 `inbound_tx`
+    // serializes request/response: the dispatcher emits a request's reply
+    // BEFORE pulling the next inbound item, so a burst of N requests followed by
+    // a Close flushes all N replies before the Close is read.
+    while inbound_open {
+        tokio::select! {
+            biased;
+
+            // Drain dispatcher output to the socket.
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(frame) => {
+                        if writable && !write_frame(&mut ws_tx, frame).await {
+                            // Peer's read side is gone: stop. The dispatcher
+                            // will observe the closed sink on teardown and
+                            // cancel any in-flight turn.
+                            writable = false;
+                            break;
+                        }
+                    }
+                    None => break, // dispatcher finished and dropped its sink
+                }
+            }
+
+            // Read the next inbound frame (only while the peer is sending).
+            item = ws_rx.next(), if inbound_open => {
+                match item {
+                    Some(Ok(Message::Text(text))) => {
+                        let parsed = serde_json::from_str::<WsRequest>(&text).map_err(|e| {
+                            // DT-5: forward the decode failure so the dispatcher
+                            // emits an empty-id error frame instead of leaving
+                            // the client hanging on a silently dropped request.
+                            warn!("invalid ws json: {e}");
+                            anyhow::anyhow!("invalid request json: {e}")
+                        });
+                        // cap-1 channel: this awaits until the dispatcher has
+                        // taken (and replied to) the previous request, which —
+                        // with the biased drain above — is the DT-6 serializer.
+                        if inbound_tx.send(parsed).await.is_err() {
+                            inbound_open = false; // dispatcher gone
+                        }
+                        // Flush the reply for the request we just took before
+                        // reading the next frame (which may be a Close that
+                        // flips tungstenite's write state). The reply was
+                        // emitted into the dispatcher's internal channel before
+                        // it pulled this request, but still has to hop through
+                        // the dispatcher's writer task into `frame_rx`. Drain
+                        // what's buffered, then catch the in-transit reply with
+                        // ONE short bounded wait. We do NOT loop the wait, so an
+                        // open SendMessage stream isn't chased (its deltas drain
+                        // continuously via the select arm above instead).
+                        if writable {
+                            loop {
+                                match frame_rx.try_recv() {
+                                    Ok(frame) => {
+                                        if !write_frame(&mut ws_tx, frame).await {
+                                            writable = false;
+                                            break;
+                                        }
+                                    }
+                                    Err(mpsc::error::TryRecvError::Empty) => {
+                                        if let Ok(Some(frame)) = tokio::time::timeout(
+                                            std::time::Duration::from_millis(20),
+                                            frame_rx.recv(),
+                                        )
+                                        .await
+                                        {
+                                            writable = write_frame(&mut ws_tx, frame).await;
+                                        }
+                                        break;
+                                    }
+                                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                                        inbound_open = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        // Graceful peer close (or stream end). Replies for
+                        // already-received requests were drained above.
+                        inbound_open = false;
+                    }
+                    Some(Ok(_)) => {} // Ping/Pong/Binary: ignored (axum auto-pongs).
+                    Some(Err(e)) => {
+                        // Most commonly tungstenite's `Capacity(MessageTooLong)`
+                        // from our 4 MiB cap; the message never reached user
+                        // code, so we owe the client an explicit close.
+                        warn!("ws inbound error, closing: {e}");
+                        pending_close = Some(CloseFrame {
+                            // RFC 6455 §7.4.1: 1009 = "Message Too Big".
+                            code: 1009,
+                            reason: "message exceeds 4 MiB cap".into(),
+                        });
+                        inbound_open = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Inbound is done. Drop our `inbound_tx` so the dispatcher's stream ends.
+    drop(inbound_tx);
+
+    // Teardown drain. Flush frames that are *already buffered* at this instant —
+    // do NOT block for more. A still-running SendMessage turn (the cancellation
+    // path) emits chunks continuously; chasing them would keep the turn's
+    // `on_chunk` succeeding so it never cancels. We drain what's buffered, then
+    // drop `frame_rx`, which closes the dispatcher's sink and makes the turn's
+    // next `emit` return the cancellation signal
+    // (`ws_send_message_cancels_when_client_disconnects`).
+    while writable {
+        match frame_rx.try_recv() {
+            Ok(frame) => writable = write_frame(&mut ws_tx, frame).await,
+            Err(_) => break, // empty or disconnected
+        }
+    }
+
+    // Send the deferred protocol close (oversize-frame path) if we owe one.
+    if let Some(close) = pending_close
+        && writable
+    {
+        let _ = ws_tx.send(Message::Close(Some(close))).await;
+    }
+
+    // Drop `frame_rx` BEFORE awaiting the dispatcher so a still-running turn's
+    // next `emit` observes the closed sink and cancels.
+    drop(frame_rx);
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut dispatcher)
+        .await
+        .is_err()
+    {
+        dispatcher.abort();
+    }
 }
 
 pub async fn serve(
@@ -649,10 +729,6 @@ pub async fn serve_full_tls_with_system_id<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use hyper_util::server::conn::auto::Builder as ConnBuilder;
-    use hyper_util::service::TowerToHyperService;
-
     let app = router_full_with_system_id(
         handler,
         auth_validator,
@@ -662,13 +738,66 @@ where
         daemon_system_id,
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    serve_tls_accept_loop(listener, tls_acceptor, app, shutdown).await
+}
+
+/// Source of accepted TCP connections for [`serve_tls_accept_loop`].
+///
+/// Exists purely as a test seam: production passes a bound
+/// `tokio::net::TcpListener`; tests inject accept errors to pin down the
+/// loop's survival behaviour (review finding DT-1).
+#[cfg(feature = "tls")]
+trait TcpAcceptSource: Send {
+    fn accept(&mut self) -> impl Future<Output = std::io::Result<tokio::net::TcpStream>> + Send;
+}
+
+#[cfg(feature = "tls")]
+impl TcpAcceptSource for tokio::net::TcpListener {
+    async fn accept(&mut self) -> std::io::Result<tokio::net::TcpStream> {
+        tokio::net::TcpListener::accept(self).await.map(|(s, _)| s)
+    }
+}
+
+/// TLS accept loop, factored out of [`serve_full_tls_with_system_id`] so its
+/// error handling is unit-testable (DT-1).
+///
+/// A failed `accept()` (`ECONNABORTED`, `EMFILE`, …) is transient: it is
+/// logged and the loop keeps serving after a short pause, matching the UDS
+/// listener and the non-TLS axum path, which both survive accept errors.
+/// Before the DT-1 fix a single accept error returned from this function and
+/// permanently killed the WS transport until a daemon restart.
+#[cfg(feature = "tls")]
+async fn serve_tls_accept_loop<A, F>(
+    mut listener: A,
+    tls_acceptor: tokio_rustls::TlsAcceptor,
+    app: Router,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    A: TcpAcceptSource,
+    F: Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::service::TowerToHyperService;
 
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (tcp_stream, _remote_addr) = result?;
+                let tcp_stream = match result {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // Transient accept failures (ECONNABORTED, EMFILE, …)
+                        // must not end the loop (DT-1). The brief pause keeps
+                        // a persistent condition like fd exhaustion from
+                        // spinning the loop hot.
+                        warn!("TLS accept failed; continuing: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let acceptor = tls_acceptor.clone();
                 let app = app.clone();
 
@@ -696,4 +825,86 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "tls"))]
+mod tls_accept_tests {
+    use super::*;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Accept source that yields one transient error, then pends forever.
+    /// Counts calls so the test can observe whether the loop retried.
+    struct FlakyAccept {
+        yielded_error: bool,
+        calls: StdArc<AtomicUsize>,
+    }
+
+    impl TcpAcceptSource for FlakyAccept {
+        async fn accept(&mut self) -> std::io::Result<tokio::net::TcpStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.yielded_error {
+                self.yielded_error = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "transient accept failure",
+                ));
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key =
+            rustls_pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(StdArc::new(config))
+    }
+
+    /// DT-1: one transient accept error must not end the serve loop. The
+    /// loop should log, pause briefly, and call `accept` again — only the
+    /// shutdown future may end it.
+    #[tokio::test]
+    async fn tls_accept_error_does_not_kill_the_server() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = FlakyAccept {
+            yielded_error: false,
+            calls: StdArc::clone(&calls),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+        };
+
+        let loop_task = tokio::spawn(serve_tls_accept_loop(
+            listener,
+            test_tls_acceptor(),
+            Router::new(),
+            shutdown,
+        ));
+
+        // Give the loop time to observe the accept error and retry.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert!(
+            !loop_task.is_finished(),
+            "a single transient accept error must not end the TLS serve loop"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the loop must call accept again after a transient error"
+        );
+
+        // Clean shutdown still works.
+        let _ = shutdown_tx.send(());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .expect("loop must exit on shutdown")
+            .expect("loop task must not panic");
+        assert!(result.is_ok(), "shutdown exit must be Ok: {result:?}");
+    }
 }

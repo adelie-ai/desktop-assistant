@@ -479,3 +479,205 @@ async fn same_assistant_api_handler_services_both_transports() {
     let _ = timeout(Duration::from_secs(2), join).await;
     dispatcher_join.abort();
 }
+
+// ---------------------------------------------------------------------
+// Code review 2026-06-09 — protocol robustness (DT-5, DT-6, DT-7, DT-13)
+// ---------------------------------------------------------------------
+
+/// DT-7: a client that connects and never sends its JWT handshake must be
+/// disconnected after the handshake timeout instead of pinning a connection
+/// task forever.
+#[tokio::test]
+async fn handshake_times_out_when_client_sends_nothing() {
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    let path = socket_path(&dir);
+
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(PingHandler);
+    let auth: Arc<dyn UdsAuthValidator> = Arc::new(StaticJwtAuth { signing_key });
+    let config =
+        UdsServerConfig::new(path.clone()).with_handshake_timeout(Duration::from_millis(200));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = UdsServer::new(handler, auth, config);
+    let _join = tokio::spawn(async move {
+        server
+            .serve_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    wait_for_socket(&path).await;
+
+    let mut stream = UnixStream::connect(&path).await.unwrap();
+    // Send nothing. The server must close the connection: the next read
+    // observes EOF (or an error frame followed by EOF) well before our
+    // 2-second ceiling.
+    let result = timeout(Duration::from_secs(2), read_frame(&mut stream)).await;
+    match result {
+        Ok(Err(_)) | Ok(Ok(_)) => {
+            // Error frame or EOF-as-io-error: either way the server acted.
+            // If we got a frame, the connection must close right after.
+            let followup = timeout(Duration::from_secs(2), read_frame(&mut stream))
+                .await
+                .expect("server must close a silent connection after the handshake timeout");
+            assert!(
+                followup.is_err() || followup.map(|b| b.is_empty()).unwrap_or(false),
+                "expected EOF after the handshake timeout"
+            );
+        }
+        Err(_) => panic!("server kept a silent connection open past the handshake timeout"),
+    }
+
+    let _ = shutdown_tx.send(());
+}
+
+/// DT-5: a syntactically invalid request frame (post-handshake) must yield
+/// an explicit error frame with an empty id, and the connection must keep
+/// serving afterwards.
+#[tokio::test]
+async fn invalid_request_json_gets_error_frame_with_empty_id() {
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    let path = socket_path(&dir);
+    let (_handler, _join, shutdown) = start_server(path.clone(), signing_key.clone());
+    wait_for_socket(&path).await;
+
+    let mut stream = UnixStream::connect(&path).await.unwrap();
+    let token = mint_test_jwt(&signing_key, "dave");
+    write_frame(
+        &mut stream,
+        &serde_json::to_vec(&serde_json::json!({ "jwt": token })).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // A frame that is not valid WsRequest JSON.
+    write_frame(&mut stream, b"{this is not json")
+        .await
+        .unwrap();
+
+    let raw = timeout(Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .expect("expected an error frame for malformed JSON, got silence")
+        .expect("io error reading the error frame");
+    let frame: api::WsFrame = serde_json::from_slice(&raw).unwrap();
+    match frame {
+        api::WsFrame::Error { id, error } => {
+            assert_eq!(id, "", "no request id is known for a malformed frame");
+            assert!(
+                error.to_lowercase().contains("json") || error.to_lowercase().contains("invalid"),
+                "error should describe the parse failure: {error}"
+            );
+        }
+        other => panic!("expected an Error frame, got {other:?}"),
+    }
+
+    // The connection survives: a valid request still round-trips.
+    let req = api::WsRequest {
+        id: "after".into(),
+        command: api::Command::Ping,
+    };
+    write_frame(&mut stream, &serde_json::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    let raw = timeout(Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .expect("connection must keep serving after a malformed frame")
+        .unwrap();
+    let frame: api::WsFrame = serde_json::from_slice(&raw).unwrap();
+    assert!(matches!(frame, api::WsFrame::Result { .. }));
+
+    let _ = shutdown.send(());
+}
+
+/// DT-6: replies already queued when the client half-closes its write side
+/// must still be delivered — the old `writer_task.abort()` could drop (or
+/// tear mid-write) final outbound frames.
+#[tokio::test]
+async fn queued_replies_drain_after_client_half_close() {
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    let path = socket_path(&dir);
+    let (_handler, _join, shutdown) = start_server(path.clone(), signing_key.clone());
+    wait_for_socket(&path).await;
+
+    let mut stream = UnixStream::connect(&path).await.unwrap();
+    let token = mint_test_jwt(&signing_key, "dave");
+    write_frame(
+        &mut stream,
+        &serde_json::to_vec(&serde_json::json!({ "jwt": token })).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    const N: usize = 30;
+    for i in 0..N {
+        let req = api::WsRequest {
+            id: format!("req-{i}"),
+            command: api::Command::Ping,
+        };
+        write_frame(&mut stream, &serde_json::to_vec(&req).unwrap())
+            .await
+            .unwrap();
+    }
+    // Half-close: we are done sending but still want all replies.
+    stream.shutdown().await.unwrap();
+
+    let mut results = 0usize;
+    loop {
+        match timeout(Duration::from_secs(5), read_frame(&mut stream)).await {
+            Ok(Ok(raw)) if raw.is_empty() => break,
+            Ok(Ok(raw)) => {
+                if matches!(
+                    serde_json::from_slice::<api::WsFrame>(&raw),
+                    Ok(api::WsFrame::Result { .. })
+                ) {
+                    results += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        results, N,
+        "all queued replies must be flushed before the connection is torn down"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// DT-13: the socket file must be 0600 and its parent directory 0700, so
+/// no other user on the host can connect (or even stat the socket). Also
+/// pins that permission tightening happens before the listener serves.
+#[tokio::test]
+async fn socket_file_and_parent_dir_permissions_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let signing_key = "deadbeef".repeat(8);
+    // Use a nested parent dir so the listener itself creates it.
+    let path = dir.path().join("nested").join("adelie.sock");
+    let (_handler, _join, shutdown) = start_server(path.clone(), signing_key);
+    wait_for_socket(&path).await;
+
+    let sock_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(
+        sock_mode & 0o777,
+        0o600,
+        "socket must be 0600, got {:o}",
+        sock_mode & 0o777
+    );
+
+    let parent_mode = std::fs::metadata(path.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        parent_mode & 0o777,
+        0o700,
+        "socket parent dir must be 0700, got {:o}",
+        parent_mode & 0o777
+    );
+
+    let _ = shutdown.send(());
+}

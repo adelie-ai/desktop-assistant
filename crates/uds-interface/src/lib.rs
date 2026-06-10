@@ -137,6 +137,11 @@ pub struct UdsServerConfig {
     /// co-location exactly. `None` ⇒ the daemon couldn't resolve its own id, so
     /// co-location falls back to the transport heuristic (UDS ⇒ co-located).
     pub daemon_system_id: Option<String>,
+    /// How long a freshly-accepted connection may take to present its JWT
+    /// handshake frame before the server closes it (review finding DT-7).
+    /// Without this a client that connects and sends nothing pins a
+    /// connection task forever.
+    pub handshake_timeout: std::time::Duration,
 }
 
 impl UdsServerConfig {
@@ -144,12 +149,19 @@ impl UdsServerConfig {
         Self {
             socket_path: socket_path.into(),
             daemon_system_id: None,
+            handshake_timeout: std::time::Duration::from_secs(10),
         }
     }
 
     /// Set the daemon's own system id for the #248 co-location handshake.
     pub fn with_daemon_system_id(mut self, id: Option<String>) -> Self {
         self.daemon_system_id = id;
+        self
+    }
+
+    /// Override the handshake timeout (DT-7); mainly for tests.
+    pub fn with_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 }
@@ -196,6 +208,12 @@ impl UdsServer {
     {
         // Create the parent directory if missing. Tighten to 0700 on
         // Unix so other users on the host can't even stat the socket.
+        //
+        // DT-13: the 0700 parent is enforced *before* bind and chmod
+        // failures are fatal, not best-effort. The freshly-bound socket
+        // file briefly carries umask-derived perms, but with the parent
+        // already 0700 no other user can traverse to it, so there is no
+        // pre-chmod connect window.
         if let Some(parent) = self.config.socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 anyhow::anyhow!("failed to create uds parent dir {}: {e}", parent.display())
@@ -204,7 +222,14 @@ impl UdsServer {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "failed to tighten uds parent dir {} to 0700: {e}",
+                            parent.display()
+                        )
+                    },
+                )?;
             }
         }
 
@@ -234,14 +259,22 @@ impl UdsServer {
 
         // Tighten the socket file's perms to 0600 so only the daemon's
         // own user can connect. Multi-user hosts that want the minter
-        // group to connect should adjust this in a follow-up.
+        // group to connect should adjust this in a follow-up. Failure is
+        // fatal (DT-13): silently serving a group/world-connectable
+        // socket is worse than refusing to start.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
+            std::fs::set_permissions(
                 &self.config.socket_path,
                 std::fs::Permissions::from_mode(0o600),
-            );
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to tighten uds socket {} to 0600: {e}",
+                    self.config.socket_path.display()
+                )
+            })?;
         }
 
         info!(
@@ -261,9 +294,16 @@ impl UdsServer {
                         let handler = Arc::clone(&handler);
                         let auth = Arc::clone(&auth);
                         let daemon_system_id = Arc::clone(&daemon_system_id);
+                        let handshake_timeout = self.config.handshake_timeout;
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_connection(stream, handler, auth, daemon_system_id).await
+                            if let Err(e) = handle_connection(
+                                stream,
+                                handler,
+                                auth,
+                                daemon_system_id,
+                                handshake_timeout,
+                            )
+                            .await
                             {
                                 debug!("uds connection ended: {e}");
                             }
@@ -310,6 +350,7 @@ async fn handle_connection(
     handler: Arc<dyn AssistantApiHandler>,
     auth: Arc<dyn UdsAuthValidator>,
     daemon_system_id: Arc<Option<String>>,
+    handshake_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -319,7 +360,17 @@ async fn handle_connection(
     // explicit error frame so clients can tell auth from framing problems. An
     // older client sends the bare `{"jwt": "<token>"}`, which still parses (the
     // id fields default to absent).
-    let handshake_raw = read_frame(&mut read_half).await?;
+    //
+    // The read is bounded by `handshake_timeout` (DT-7): a client that
+    // connects and sends nothing must not pin a connection task forever.
+    let handshake_raw =
+        match tokio::time::timeout(handshake_timeout, read_frame(&mut read_half)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = write_error(&mut write_half, "", "handshake timed out").await;
+                return Ok(());
+            }
+        };
     let handshake: api::UdsHandshake = match serde_json::from_slice(&handshake_raw) {
         Ok(v) => v,
         Err(e) => {
@@ -432,11 +483,25 @@ async fn handle_connection(
 
     dispatch_loop(handler, auth_ctx, inbound, sink).await;
 
-    // Dispatcher returned (client disconnected, parse error, or
-    // outbound closed). Tear everything down.
-    drop(outbound_tx);
-    writer_task.abort();
+    // Dispatcher returned (client disconnected, parse error, or outbound
+    // closed). Teardown (DT-6): replies still queued on the outbound
+    // channel must reach a client that half-closed and is waiting for
+    // them — the old `writer_task.abort()` could drop queued frames or
+    // tear one mid-`write_all`. `dispatch_loop` has already awaited its
+    // internal writer, so its `PollSender` clone of `outbound_tx` is
+    // gone; dropping ours leaves the channel senderless and the writer
+    // drains to completion. Only the reader is aborted. A bounded grace
+    // period guards against a peer that stops reading entirely.
     reader_task.abort();
+    drop(outbound_tx);
+    let mut writer_task = writer_task;
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer_task)
+        .await
+        .is_err()
+    {
+        warn!("uds outbound drain timed out; aborting writer");
+        writer_task.abort();
+    }
 
     Ok(())
 }

@@ -724,12 +724,13 @@ async fn ws_frame_size_cap_enforced_on_fragmented_messages() {
 
 #[tokio::test]
 async fn ws_malformed_json_does_not_drop_connection() {
-    // Regression: a malformed JSON payload (well under the cap) must
-    // not panic the server or terminate the socket. It is silently
-    // dropped (the dispatcher has no error frame to address it to —
-    // there is no `id` to echo back), which matches pre-existing
-    // behavior. We send a malformed payload, then a valid Ping and
-    // confirm the Pong still arrives.
+    // Regression: a malformed JSON payload (well under the cap) must not
+    // panic the server or terminate the socket. Since DT-5 the dispatcher
+    // replies with an empty-id `Error` frame (so the client doesn't hang
+    // forever on a silently dropped request); the detailed contract lives
+    // in `robustness::invalid_ws_json_yields_error_frame_with_empty_id`.
+    // Here we just confirm the connection survives: consume the error
+    // frame, then a subsequent valid Ping still gets its Pong.
     let (addr, server) = spawn_server().await;
     let url = format!("ws://{addr}/ws");
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(&url, Some("test-jwt")))
@@ -752,9 +753,22 @@ async fn ws_malformed_json_does_not_drop_connection() {
     .await
     .expect("subsequent valid payload should send");
 
+    // First frame: the empty-id error for the malformed request (DT-5).
     let frame = timeout(Duration::from_secs(5), ws.next())
         .await
         .expect("server should still be alive after malformed payload")
+        .expect("stream should yield")
+        .expect("frame should not error");
+    let parsed: WsFrame = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+    match parsed {
+        WsFrame::Error { id, .. } => assert_eq!(id, "", "malformed frame has no request id"),
+        other => panic!("expected an empty-id error frame, got {other:?}"),
+    }
+
+    // Second frame: the Pong, proving the connection kept serving.
+    let frame = timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("connection must keep serving after a malformed payload")
         .expect("stream should yield")
         .expect("frame should not error");
     let parsed: WsFrame = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
