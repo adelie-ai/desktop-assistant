@@ -601,6 +601,13 @@ impl InMemoryTurnStateStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Number of rows currently retained. Test-only: lets the eviction test
+    /// assert that terminal rows don't accumulate over the daemon's lifetime.
+    #[cfg(test)]
+    fn row_count(&self) -> usize {
+        self.rows.lock().unwrap().len()
+    }
 }
 
 #[async_trait::async_trait]
@@ -677,5 +684,106 @@ impl ClientToolPort for CoordinatorClientToolPort {
             },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn_row(id: &str, status: TurnStatus) -> TurnRow {
+        TurnRow {
+            id: id.to_string(),
+            user_id: "u".to_string(),
+            conversation_id: "c".to_string(),
+            status,
+            state: TurnStateJson::default(),
+            last_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_evicts_the_turn_row() {
+        // DA-14 (#300): a turn driven to a terminal status must not linger in
+        // the in-memory map — otherwise the store grows unbounded over the
+        // daemon's lifetime (mirror of the background-task eviction in #158).
+        let store = InMemoryTurnStateStore::new();
+        store
+            .create_turn(turn_row("t1", TurnStatus::PendingLlm))
+            .await
+            .unwrap();
+        assert_eq!(store.row_count(), 1);
+
+        store
+            .update_turn("t1", TurnStatus::Complete, &TurnStateJson::default(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.row_count(),
+            0,
+            "a Complete turn must be evicted from the map"
+        );
+        assert!(
+            store.get_turn("t1").await.unwrap().is_none(),
+            "the evicted row is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_transition_also_evicts() {
+        let store = InMemoryTurnStateStore::new();
+        store
+            .create_turn(turn_row("t1", TurnStatus::PendingClientTool))
+            .await
+            .unwrap();
+        store
+            .update_turn(
+                "t1",
+                TurnStatus::Failed,
+                &TurnStateJson::default(),
+                Some("cancelled"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.row_count(), 0, "a Failed turn must be evicted too");
+    }
+
+    #[tokio::test]
+    async fn non_terminal_transition_keeps_the_row() {
+        // A mid-turn transition (e.g. suspending on a client tool) must keep
+        // the row so the suspend/resolve dance has its backing record.
+        let store = InMemoryTurnStateStore::new();
+        store
+            .create_turn(turn_row("t1", TurnStatus::PendingLlm))
+            .await
+            .unwrap();
+        store
+            .update_turn(
+                "t1",
+                TurnStatus::PendingClientTool,
+                &TurnStateJson::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.row_count(), 1, "a non-terminal turn row stays");
+        let row = store.get_turn("t1").await.unwrap().unwrap();
+        assert_eq!(row.status, TurnStatus::PendingClientTool);
+    }
+
+    #[tokio::test]
+    async fn updating_a_missing_turn_still_errors() {
+        // Eviction must not turn a genuinely-missing turn into a silent success.
+        let store = InMemoryTurnStateStore::new();
+        let err = store
+            .update_turn(
+                "ghost",
+                TurnStatus::Complete,
+                &TurnStateJson::default(),
+                None,
+            )
+            .await;
+        assert!(err.is_err(), "updating an unknown turn id must still error");
     }
 }

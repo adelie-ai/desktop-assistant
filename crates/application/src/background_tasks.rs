@@ -239,6 +239,18 @@ impl BackgroundTaskRegistry {
         Self::with_config(RegistryConfig::default())
     }
 
+    /// Number of per-user broadcast senders currently retained. Test-only:
+    /// lets the pruning test (DT-12 / #300) assert dead channels don't
+    /// accumulate on a multi-user host.
+    #[cfg(test)]
+    fn channel_count(&self) -> usize {
+        self.inner
+            .user_channels
+            .lock()
+            .expect("channels poisoned")
+            .len()
+    }
+
     /// Build a registry with the supplied configuration.
     pub fn with_config(config: RegistryConfig) -> Self {
         Self {
@@ -1114,6 +1126,62 @@ mod tests {
             }
             other => panic!("expected ScratchpadChanged, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dead_broadcast_senders_are_pruned() {
+        // DT-12 (#300): a user who subscribes then disconnects (drops the
+        // receiver) must not leave an immortal sender behind. After every
+        // receiver for a user is gone, the registry prunes that user's channel
+        // so the map doesn't grow without bound on a multi-user host.
+        let registry = BackgroundTaskRegistry::new();
+
+        // Churn through many short-lived per-user subscriptions.
+        for i in 0..50 {
+            let user = UserId::new(format!("user-{i}"));
+            let rx = registry.subscribe(&user);
+            drop(rx); // disconnect immediately
+        }
+
+        // A subsequent subscribe (the natural prune trigger) plus broadcast
+        // activity must not leave 51 senders pinned forever.
+        let live = UserId::new("live");
+        let _live_rx = registry.subscribe(&live);
+        for i in 0..50 {
+            // Broadcasting to the dead users is the other prune opportunity.
+            registry.notify_scratchpad_changed(&UserId::new(format!("user-{i}")), "c");
+        }
+
+        assert!(
+            registry.channel_count() <= 1,
+            "dead senders must be pruned; only the live subscriber's channel should remain, got {}",
+            registry.channel_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_does_not_drop_a_live_subscribers_channel() {
+        // Pruning must never evict a channel that still has a live receiver.
+        let registry = BackgroundTaskRegistry::new();
+        let alice = UserId::new("alice");
+        let mut alice_rx = registry.subscribe(&alice);
+
+        // Churn dead subscriptions for other users to trigger pruning.
+        for i in 0..20 {
+            drop(registry.subscribe(&UserId::new(format!("dead-{i}"))));
+        }
+        // Force a subscribe (prune trigger).
+        drop(registry.subscribe(&UserId::new("trigger")));
+
+        // Alice's channel must still deliver.
+        registry.notify_scratchpad_changed(&alice, "conv-1");
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), alice_rx.recv()).await,
+                Ok(Ok(api::Event::ScratchpadChanged { .. }))
+            ),
+            "a live subscriber's channel must survive pruning"
+        );
     }
 
     #[tokio::test]

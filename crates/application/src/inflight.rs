@@ -68,6 +68,11 @@ impl InFlightTurn {
         let rx = self.tx.subscribe();
         (buffer.clone(), rx)
     }
+
+    #[cfg(test)]
+    async fn buffer_len(&self) -> usize {
+        self.buffer.lock().await.len()
+    }
 }
 
 /// `EventSink` that mirrors a turn's events to the original caller's sink
@@ -318,6 +323,43 @@ mod tests {
             vec!["x", "y"],
             "x via replay, y via live — exactly once each"
         );
+    }
+
+    #[tokio::test]
+    async fn buffer_is_capped_to_avoid_unbounded_growth() {
+        // DA-14 (#300): a long keyed turn that emits thousands of deltas must
+        // not buffer every one forever — the replay buffer is bounded. A late
+        // re-attacher may miss the oldest deltas but still gets the rest plus
+        // the terminal AssistantCompleted (which carries the full reply).
+        let turn = InFlightTurn::new();
+        for i in 0..(INFLIGHT_BROADCAST_CAP * 4) {
+            turn.emit_event(delta(&format!("chunk-{i}"))).await;
+        }
+        assert!(
+            turn.buffer_len().await <= INFLIGHT_BROADCAST_CAP,
+            "replay buffer must stay bounded, got {}",
+            turn.buffer_len().await
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_buffer_keeps_the_most_recent_events() {
+        // The bound drops the OLDEST events, so the latest one — typically the
+        // terminal event for a late re-attacher — is always retained.
+        let turn = InFlightTurn::new();
+        for i in 0..(INFLIGHT_BROADCAST_CAP * 2) {
+            turn.emit_event(delta(&format!("chunk-{i}"))).await;
+        }
+        let (replay, _rx) = turn.snapshot_and_subscribe().await;
+        let last = replay.last().expect("buffer not empty");
+        match last {
+            api::Event::AssistantDelta { chunk, .. } => assert_eq!(
+                chunk,
+                &format!("chunk-{}", INFLIGHT_BROADCAST_CAP * 2 - 1),
+                "the newest event must be retained"
+            ),
+            other => panic!("unexpected last event: {other:?}"),
+        }
     }
 
     #[test]
