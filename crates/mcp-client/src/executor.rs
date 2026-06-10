@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub use crate::builtin::BuiltinToolService;
 use crate::config::save_mcp_configs;
-use crate::{McpClient, McpError};
+use crate::{ListChangeFlags, McpClient, McpError};
 
 fn default_enabled() -> bool {
     true
@@ -48,11 +48,35 @@ pub struct McpServerStatusInfo {
     pub tool_count: u32,
 }
 
+/// A connected MCP server: the client behind its own lock plus a lock-free
+/// handle to its list-change flags.
+///
+/// DS-1: each client has its OWN mutex so a slow or hung tool call on one
+/// server cannot block tool calls, status checks, or cache refreshes on any
+/// other server. The outer `clients` vector is only ever locked long enough
+/// to clone a handle out of it.
+struct ClientHandle {
+    client: Arc<Mutex<McpClient>>,
+    flags: Arc<ListChangeFlags>,
+}
+
+impl ClientHandle {
+    fn new(client: McpClient) -> Self {
+        let flags = client.list_change_flags();
+        Self {
+            client: Arc::new(Mutex::new(client)),
+            flags,
+        }
+    }
+}
+
 /// Shared mutable state for MCP servers, accessible via `McpControlHandle`.
 pub struct McpExecutorState {
     configs: RwLock<Vec<McpServerConfig>>,
-    /// Connected MCP client instances, indexed by config position.
-    clients: Mutex<Vec<Option<McpClient>>>,
+    /// Connected MCP client instances, indexed by config position. RwLock
+    /// because most accesses only need to clone an `Arc` out of a slot;
+    /// only connect/disconnect/add/remove take the write lock.
+    clients: RwLock<Vec<Option<ClientHandle>>>,
     /// Map from namespaced tool name (`server__original`) to (server index, original tool name).
     tool_routing: Mutex<HashMap<String, (usize, String)>>,
     /// Cached list of all available tools.
@@ -87,20 +111,23 @@ impl McpExecutorState {
 
     async fn maybe_refresh_metadata(&self) -> Result<(), McpError> {
         let (tools_changed, resources_changed, prompts_changed) = {
-            let clients = self.clients.lock().await;
+            // Flags are read through the shared handles, NOT by locking the
+            // clients — a client busy with a slow tool call must not block
+            // this check (DS-1).
+            let clients = self.clients.read().await;
             (
                 clients
                     .iter()
                     .flatten()
-                    .any(|client| client.tools_list_changed()),
+                    .any(|handle| handle.flags.tools_changed()),
                 clients
                     .iter()
                     .flatten()
-                    .any(|client| client.resources_list_changed()),
+                    .any(|handle| handle.flags.resources_changed()),
                 clients
                     .iter()
                     .flatten()
-                    .any(|client| client.prompts_list_changed()),
+                    .any(|handle| handle.flags.prompts_changed()),
             )
         };
 
@@ -129,54 +156,61 @@ impl McpExecutorState {
         Ok(())
     }
 
+    /// Snapshot the currently connected servers as `(config index, name,
+    /// namespace, client)` tuples. Holds the vector/config locks only for
+    /// the duration of the clone, so callers can talk to each server
+    /// without blocking unrelated operations (DS-1).
+    async fn connected_clients(
+        &self,
+    ) -> Vec<(usize, String, Option<String>, Arc<Mutex<McpClient>>)> {
+        let configs = self.configs.read().await;
+        let clients = self.clients.read().await;
+        clients
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let handle = slot.as_ref()?;
+                let config = configs.get(idx)?;
+                Some((
+                    idx,
+                    config.name.clone(),
+                    config.namespace.clone(),
+                    Arc::clone(&handle.client),
+                ))
+            })
+            .collect()
+    }
+
     async fn refresh_tool_cache(&self) -> Result<(), McpError> {
         let mut all_tools = Vec::new();
         let mut new_routing = HashMap::new();
 
-        {
-            let configs = self.configs.read().await;
-            let mut clients = self.clients.lock().await;
-            for (idx, client_slot) in clients.iter_mut().enumerate() {
-                let Some(client) = client_slot.as_mut() else {
-                    continue;
-                };
-
-                match client.list_tools().await {
-                    Ok(tools) => {
-                        tracing::info!(
-                            "MCP server '{}' provides {} tools",
-                            configs[idx].name,
-                            tools.len()
-                        );
-                        let ns = configs[idx].namespace.as_deref();
-                        for tool in tools {
-                            let exposed_name = match ns {
-                                Some(prefix) => format!("{}__{}", prefix, tool.name),
-                                None => tool.name.clone(),
-                            };
-                            if ns.is_some() {
-                                tracing::debug!(
-                                    "  tool: {} (exposed as {})",
-                                    tool.name,
-                                    exposed_name
-                                );
-                            } else {
-                                tracing::debug!("  tool: {}", tool.name);
-                            }
-                            new_routing.insert(exposed_name.clone(), (idx, tool.name.clone()));
-                            all_tools.push(ToolDefinition::new(
-                                exposed_name,
-                                tool.description,
-                                tool.parameters,
-                            ));
+        for (idx, name, namespace, client) in self.connected_clients().await {
+            let mut client = client.lock().await;
+            match client.list_tools().await {
+                Ok(tools) => {
+                    tracing::info!("MCP server '{name}' provides {} tools", tools.len());
+                    let ns = namespace.as_deref();
+                    for tool in tools {
+                        let exposed_name = match ns {
+                            Some(prefix) => format!("{}__{}", prefix, tool.name),
+                            None => tool.name.clone(),
+                        };
+                        if ns.is_some() {
+                            tracing::debug!("  tool: {} (exposed as {})", tool.name, exposed_name);
+                        } else {
+                            tracing::debug!("  tool: {}", tool.name);
                         }
+                        new_routing.insert(exposed_name.clone(), (idx, tool.name.clone()));
+                        all_tools.push(ToolDefinition::new(
+                            exposed_name,
+                            tool.description,
+                            tool.parameters,
+                        ));
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "failed to refresh tools from MCP server '{}': {e}",
-                            configs[idx].name
-                        );
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to refresh tools from MCP server '{name}': {e}");
                 }
             }
         }
@@ -190,33 +224,18 @@ impl McpExecutorState {
     async fn refresh_resources_cache(&self) -> Result<(), McpError> {
         let mut all_resources = Vec::new();
 
-        let configs = self.configs.read().await;
-        let mut clients = self.clients.lock().await;
-        for (idx, client_slot) in clients.iter_mut().enumerate() {
-            let Some(client) = client_slot.as_mut() else {
-                continue;
-            };
-
+        for (_idx, name, _ns, client) in self.connected_clients().await {
+            let mut client = client.lock().await;
             match client.list_resources().await {
                 Ok(resources) => {
-                    tracing::info!(
-                        "MCP server '{}' provides {} resources",
-                        configs[idx].name,
-                        resources.len()
-                    );
+                    tracing::info!("MCP server '{name}' provides {} resources", resources.len());
                     all_resources.extend(resources);
                 }
                 Err(e) if is_method_not_found(&e) => {
-                    tracing::debug!(
-                        "MCP server '{}' does not implement resources/list",
-                        configs[idx].name
-                    );
+                    tracing::debug!("MCP server '{name}' does not implement resources/list");
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "failed to refresh resources from MCP server '{}': {e}",
-                        configs[idx].name
-                    );
+                    tracing::warn!("failed to refresh resources from MCP server '{name}': {e}");
                 }
             }
         }
@@ -228,33 +247,18 @@ impl McpExecutorState {
     async fn refresh_prompts_cache(&self) -> Result<(), McpError> {
         let mut all_prompts = Vec::new();
 
-        let configs = self.configs.read().await;
-        let mut clients = self.clients.lock().await;
-        for (idx, client_slot) in clients.iter_mut().enumerate() {
-            let Some(client) = client_slot.as_mut() else {
-                continue;
-            };
-
+        for (_idx, name, _ns, client) in self.connected_clients().await {
+            let mut client = client.lock().await;
             match client.list_prompts().await {
                 Ok(prompts) => {
-                    tracing::info!(
-                        "MCP server '{}' provides {} prompts",
-                        configs[idx].name,
-                        prompts.len()
-                    );
+                    tracing::info!("MCP server '{name}' provides {} prompts", prompts.len());
                     all_prompts.extend(prompts);
                 }
                 Err(e) if is_method_not_found(&e) => {
-                    tracing::debug!(
-                        "MCP server '{}' does not implement prompts/list",
-                        configs[idx].name
-                    );
+                    tracing::debug!("MCP server '{name}' does not implement prompts/list");
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "failed to refresh prompts from MCP server '{}': {e}",
-                        configs[idx].name
-                    );
+                    tracing::warn!("failed to refresh prompts from MCP server '{name}': {e}");
                 }
             }
         }
@@ -279,8 +283,8 @@ impl McpExecutorState {
         let env = self.resolve_env(config)?;
         match McpClient::connect(&config.command, &config.args, &env).await {
             Ok(client) => {
-                let mut clients = self.clients.lock().await;
-                clients[idx] = Some(client);
+                let mut clients = self.clients.write().await;
+                clients[idx] = Some(ClientHandle::new(client));
                 Ok(())
             }
             Err(e) => {
@@ -292,11 +296,12 @@ impl McpExecutorState {
 
     /// Disconnect a single server by index.
     async fn disconnect_server(&self, idx: usize) {
-        let mut clients = self.clients.lock().await;
-        if let Some(Some(_)) = clients.get_mut(idx) {
-            let client = clients[idx].take().unwrap();
-            drop(clients);
-            client.shutdown().await;
+        let handle = {
+            let mut clients = self.clients.write().await;
+            clients.get_mut(idx).and_then(|slot| slot.take())
+        };
+        if let Some(handle) = handle {
+            handle.client.lock().await.shutdown().await;
         }
     }
 
@@ -320,7 +325,7 @@ impl McpControlHandle {
     /// Get status for one or all servers.
     pub async fn status(&self, server: Option<&str>) -> Vec<McpServerStatusInfo> {
         let configs = self.state.configs.read().await;
-        let clients = self.state.clients.lock().await;
+        let clients = self.state.clients.read().await;
         let routing = self.state.tool_routing.lock().await;
 
         let indices: Vec<usize> = if let Some(name) = server {
@@ -378,7 +383,7 @@ impl McpControlHandle {
 
             // Skip if already connected
             {
-                let clients = self.state.clients.lock().await;
+                let clients = self.state.clients.read().await;
                 if clients[idx].is_some() {
                     continue;
                 }
@@ -405,7 +410,7 @@ impl McpControlHandle {
 
         for idx in indices {
             let was_connected = {
-                let clients = self.state.clients.lock().await;
+                let clients = self.state.clients.read().await;
                 clients[idx].is_some()
             };
 
@@ -452,7 +457,7 @@ impl McpControlHandle {
             let idx = configs.len() - 1;
 
             // Extend clients vec to match
-            let mut clients = self.state.clients.lock().await;
+            let mut clients = self.state.clients.write().await;
             clients.push(None);
 
             idx
@@ -483,7 +488,7 @@ impl McpControlHandle {
             let mut configs = self.state.configs.write().await;
             configs.remove(idx);
 
-            let mut clients = self.state.clients.lock().await;
+            let mut clients = self.state.clients.write().await;
             clients.remove(idx);
         }
 
@@ -569,11 +574,11 @@ impl McpToolExecutor {
         configs: Vec<McpServerConfig>,
         builtin_tools: BuiltinToolService,
     ) -> Self {
-        let clients: Vec<Option<McpClient>> = (0..configs.len()).map(|_| None).collect();
+        let clients: Vec<Option<ClientHandle>> = (0..configs.len()).map(|_| None).collect();
         Self {
             state: Arc::new(McpExecutorState {
                 configs: RwLock::new(configs),
-                clients: Mutex::new(clients),
+                clients: RwLock::new(clients),
                 tool_routing: Mutex::new(HashMap::new()),
                 cached_tools: Mutex::new(Vec::new()),
                 cached_resources: Mutex::new(Vec::new()),
@@ -591,11 +596,11 @@ impl McpToolExecutor {
         config_path: PathBuf,
         secrets: HashMap<String, String>,
     ) -> Self {
-        let clients: Vec<Option<McpClient>> = (0..configs.len()).map(|_| None).collect();
+        let clients: Vec<Option<ClientHandle>> = (0..configs.len()).map(|_| None).collect();
         Self {
             state: Arc::new(McpExecutorState {
                 configs: RwLock::new(configs),
-                clients: Mutex::new(clients),
+                clients: RwLock::new(clients),
                 tool_routing: Mutex::new(HashMap::new()),
                 cached_tools: Mutex::new(Vec::new()),
                 cached_resources: Mutex::new(Vec::new()),
@@ -626,7 +631,7 @@ impl McpToolExecutor {
     pub async fn start(&self) -> Result<(), McpError> {
         {
             let configs = self.state.configs.read().await;
-            let mut clients = self.state.clients.lock().await;
+            let mut clients = self.state.clients.write().await;
 
             for (idx, config) in configs.iter().enumerate() {
                 if !config.enabled {
@@ -646,7 +651,7 @@ impl McpToolExecutor {
                 });
                 match McpClient::connect(&config.command, &config.args, &env).await {
                     Ok(client) => {
-                        clients[idx] = Some(client);
+                        clients[idx] = Some(ClientHandle::new(client));
                     }
                     Err(e) => {
                         tracing::error!("failed to connect to MCP server '{}': {e}", config.name);
@@ -712,11 +717,12 @@ impl McpToolExecutor {
 
     /// Shut down all connected MCP servers.
     pub async fn shutdown(&self) {
-        let mut clients = self.state.clients.lock().await;
-        for client in clients.iter_mut() {
-            if let Some(c) = client.take() {
-                c.shutdown().await;
-            }
+        let handles: Vec<ClientHandle> = {
+            let mut clients = self.state.clients.write().await;
+            clients.iter_mut().filter_map(|slot| slot.take()).collect()
+        };
+        for handle in handles {
+            handle.client.lock().await.shutdown().await;
         }
     }
 }
@@ -847,12 +853,25 @@ impl ToolExecutor for McpToolExecutor {
             .clone();
         drop(routing);
 
-        let mut clients = self.state.clients.lock().await;
-        let client = clients[idx].as_mut().ok_or_else(|| {
-            CoreError::ToolExecution(format!("MCP server for tool '{name}' is not connected"))
-        })?;
+        // DS-1: clone the per-server handle out of the (briefly read-locked)
+        // vector, then await the call holding only THAT server's lock — a
+        // slow tool on one server no longer blocks every other server.
+        let client = {
+            let clients = self.state.clients.read().await;
+            clients
+                .get(idx)
+                .and_then(|slot| slot.as_ref())
+                .map(|handle| Arc::clone(&handle.client))
+                .ok_or_else(|| {
+                    CoreError::ToolExecution(format!(
+                        "MCP server for tool '{name}' is not connected"
+                    ))
+                })?
+        };
 
         client
+            .lock()
+            .await
             .call_tool(&original_name, arguments)
             .await
             .map_err(|e| CoreError::ToolExecution(format!("tool '{name}' failed: {e}")))
