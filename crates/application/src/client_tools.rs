@@ -639,6 +639,14 @@ impl TurnStateStore for InMemoryTurnStateStore {
         row.status = status;
         row.state = state.clone();
         row.last_error = last_error.map(String::from);
+        // A turn driven to a terminal state is done: nothing in this process
+        // reads its row again (the suspend/resolve dance has resolved, and the
+        // startup sweep only cares about *non*-terminal rows). Evict it so the
+        // map doesn't grow unbounded over the daemon's lifetime — the mirror of
+        // the background-task eviction in #158 (DA-14 / #300).
+        if status.is_terminal() {
+            rows.remove(id);
+        }
         Ok(())
     }
 

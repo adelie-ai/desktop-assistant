@@ -538,8 +538,18 @@ impl BackgroundTaskRegistry {
     /// Subscribe to `Event::Task*` events for `user_id`. Slow consumers
     /// drop oldest events (broadcast semantics) — the registry never
     /// applies back-pressure to task bodies.
+    ///
+    /// Doubles as the prune point for dead senders (DT-12 / #300): a user who
+    /// subscribed then disconnected leaves a sender with no receivers, which
+    /// would otherwise live forever and slowly leak on a multi-user host. Each
+    /// subscribe sweeps out every other channel whose `receiver_count()` has
+    /// fallen to zero before handing back the (re)created live receiver.
     pub fn subscribe(&self, user_id: &UserId) -> broadcast::Receiver<api::Event> {
         let mut channels = self.inner.user_channels.lock().expect("channels poisoned");
+        // Prune channels that no longer have any live receiver. The entry for
+        // `user_id` is recreated just below, so dropping a stale one here is
+        // safe.
+        channels.retain(|_, sender| sender.receiver_count() > 0);
         let sender = channels
             .entry(user_id.clone())
             .or_insert_with(|| broadcast::channel(self.inner.config.broadcast_capacity).0);
@@ -887,10 +897,18 @@ struct Inner {
 impl Inner {
     /// Best-effort broadcast: a `SendError` (no live receivers) is normal
     /// and ignored — events that nobody is listening for are dropped.
+    ///
+    /// A failed send also means the sender has no receivers, so this prunes the
+    /// now-dead channel (DT-12 / #300): broadcasting to a user who has since
+    /// disconnected is the natural moment to reclaim their sender, complementing
+    /// the prune-on-subscribe sweep.
     fn broadcast(&self, user_id: &UserId, event: api::Event) {
-        let channels = self.user_channels.lock().expect("channels poisoned");
-        if let Some(sender) = channels.get(user_id) {
-            let _ = sender.send(event);
+        let mut channels = self.user_channels.lock().expect("channels poisoned");
+        if let Some(sender) = channels.get(user_id)
+            && sender.send(event).is_err()
+        {
+            // No live receivers — reclaim the sender.
+            channels.remove(user_id);
         }
     }
 
