@@ -99,9 +99,11 @@ impl StepStack {
     /// `root_counter + 1`. Seeded from the max existing top-level todo key so a
     /// later turn never reuses a key an earlier turn's still-persisted todo
     /// already owns (scratchpad `write` is upsert-by-key, DA-7 / #292).
-    pub fn with_root_counter(_root_counter: u32) -> Self {
-        // STUB (TDD red): ignores the seed so the test sees the bug.
-        Self::default()
+    pub fn with_root_counter(root_counter: u32) -> Self {
+        Self {
+            frames: Vec::new(),
+            root_counter,
+        }
     }
 
     pub fn depth(&self) -> usize {
@@ -162,9 +164,11 @@ impl StepStack {
 /// numbering instead of restarting at `"1"` (DA-7 / #292). Nested keys
 /// (`"1.2"`) and non-numeric keys are ignored.
 pub(crate) fn max_top_level_key<'a>(keys: impl IntoIterator<Item = &'a str>) -> u32 {
-    // STUB (TDD red): always 0 so the seeding test sees the bug.
-    let _ = keys.into_iter().count();
-    0
+    keys.into_iter()
+        .filter(|k| !k.contains('.')) // top-level only
+        .filter_map(|k| k.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Truncate `s` to at most `max_bytes`, landing on a UTF-8 char boundary.
@@ -294,11 +298,27 @@ pub(crate) fn render_plan(
     let mut sorted: Vec<&PlanItem> = items.iter().collect();
     sorted.sort_by_key(|a| dotted_key(a.key));
 
+    // Choose which items to render when there are more than the cap. The naive
+    // head-take dropped the live step into the tail once enough old DONE steps
+    // accumulated (DA-8 / #293), because done steps sort first. Select instead
+    // so the model always sees where it is and what's left:
+    //   1. the current step and every ancestor of it (you-are-here + context),
+    //   2. then the remaining OPEN steps, most-recent first,
+    //   3. then the remaining DONE steps, most-recent first,
+    // filling up to `max_items`. The chosen set is then rendered in tree order
+    // so the indentation still reads as a plan.
+    let elided = sorted.len().saturating_sub(max_items);
+    let chosen: Vec<&PlanItem> = if elided == 0 {
+        sorted.clone()
+    } else {
+        select_plan_items(&sorted, current, max_items)
+    };
+
     let mut out = String::from(
         "Your plan (steps on the scratchpad, with findings so far — keep working it; \
          mark steps done as you go, and roll a step's sub-step findings up into its outcome):",
     );
-    for item in sorted.iter().take(max_items) {
+    for item in &chosen {
         let depth = item.key.matches('.').count();
         let indent = "  ".repeat(depth);
         let check = if item.done { "[x]" } else { "[ ]" };
@@ -314,10 +334,68 @@ pub(crate) fn render_plan(
             out.push_str(&format!("\n{indent}  → {outcome}"));
         }
     }
-    if sorted.len() > max_items {
-        out.push_str(&format!("\n… and {} more.", sorted.len() - max_items));
+    let shown = chosen.len();
+    if sorted.len() > shown {
+        out.push_str(&format!("\n… and {} more.", sorted.len() - shown));
     }
     Some(out)
+}
+
+/// True when `ancestor` is a proper dotted-key prefix of `key`
+/// (e.g. `"3"` and `"3.2"` are ancestors of `"3.2.1"`). A key is not its own
+/// ancestor.
+fn is_ancestor_of(ancestor: &str, key: &str) -> bool {
+    key.len() > ancestor.len()
+        && key.starts_with(ancestor)
+        && key.as_bytes().get(ancestor.len()) == Some(&b'.')
+}
+
+/// Pick at most `max_items` of `sorted` (which is already in tree order),
+/// keeping the chosen set in tree order. Priority: the current step and its
+/// ancestors, then open steps (recent first), then done steps (recent first).
+/// See [`render_plan`] for why. Selection is by position in `sorted`, not by
+/// key, so duplicate keys are never collapsed.
+fn select_plan_items<'a>(
+    sorted: &[&'a PlanItem<'a>],
+    current: Option<&str>,
+    max_items: usize,
+) -> Vec<&'a PlanItem<'a>> {
+    let mut keep = vec![false; sorted.len()];
+    let mut kept = 0usize;
+
+    // 1. Current step + every ancestor of it — always shown, regardless of cap.
+    if let Some(cur) = current {
+        for (i, item) in sorted.iter().enumerate() {
+            if !keep[i] && (item.key == cur || is_ancestor_of(item.key, cur)) {
+                keep[i] = true;
+                kept += 1;
+            }
+        }
+    }
+
+    // 2 & 3. Fill the rest from open-then-done, most-recent first. "Recent" =
+    // later in tree order, so iterate the reverse of `sorted`.
+    let fill = |want_done: bool, keep: &mut [bool], kept: &mut usize| {
+        for i in (0..sorted.len()).rev() {
+            if *kept >= max_items {
+                break;
+            }
+            if !keep[i] && sorted[i].done == want_done {
+                keep[i] = true;
+                *kept += 1;
+            }
+        }
+    };
+    fill(false, &mut keep, &mut kept); // open first
+    fill(true, &mut keep, &mut kept); // then done
+
+    // Render in tree order, including only the chosen positions.
+    sorted
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(i, item)| keep[i].then_some(item))
+        .collect()
 }
 
 /// A scratchpad note as the plan renderer needs it — just the fields it reads,
