@@ -890,14 +890,14 @@ fn trim_tool_pairs(messages: &mut Vec<Message>, compacted_through: usize) -> Tri
     // Remove in reverse order to keep indices stable. Count, separately, how
     // many removed messages sat inside the already-summarized prefix
     // (`index < compacted_through`) — that, not the total, is the marker shift.
-    let _ = compacted_through; // TDD red stub: ignored so the bug is reproduced.
     let mut result = TrimResult::default();
     for range in groups_to_remove.into_iter().rev() {
         result.total_removed += range.len();
+        result.removed_before_marker +=
+            range.clone().filter(|idx| *idx < compacted_through).count();
         messages.drain(range);
     }
-    // STUB (red): the old bug — treat the whole removal as before the marker.
-    result.removed_before_marker = result.total_removed;
+
     result
 }
 
