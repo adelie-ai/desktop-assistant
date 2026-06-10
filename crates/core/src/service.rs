@@ -483,6 +483,37 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .collect();
         planning::render_plan_from_notes(&raw, current_key, planning::MAX_PLAN_ITEMS)
     }
+
+    /// Build the per-turn [`StepStack`], seeding its top-level numbering from the
+    /// conversation's existing `todo` notes (DA-7 / #292).
+    ///
+    /// Each turn used to start a fresh `StepStack` numbering from `"1"`, but the
+    /// scratchpad `write` is upsert-by-key — so a second turn's step `"1"`
+    /// silently overwrote the first turn's note (resetting its content and
+    /// `done`). Seeding the root counter from the highest existing top-level key
+    /// makes a new turn mint the next number instead. Without a lister wired (or
+    /// on a read error), falls back to a fresh stack — the prior behaviour.
+    async fn build_step_stack(&self, conversation_id: &ConversationId) -> StepStack {
+        let Some(list) = self.scratchpad_list.clone() else {
+            return StepStack::new();
+        };
+        // Only `todo`-typed notes are plan steps. Cap generously; only their
+        // keys matter, and a conversation never accrues that many top-level
+        // steps.
+        match list(
+            conversation_id.0.clone(),
+            Some(planning::STEP_NOTE_TYPE.to_string()),
+            planning::MAX_PLAN_ITEMS.saturating_mul(3),
+        )
+        .await
+        {
+            Ok(notes) => {
+                let max = planning::max_top_level_key(notes.iter().map(|n| n.key.as_str()));
+                StepStack::with_root_counter(max)
+            }
+            Err(_) => StepStack::new(),
+        }
+    }
 }
 
 impl<S, L: LlmClient, T> ConversationHandler<S, L, T> {
@@ -745,7 +776,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // Per-turn step stack for the planning + compaction tools (#240).
         // Frames hold watermarks into `conv.messages`; `complete_step` evicts a
         // scope's raw tool results down to a searchable scratchpad pointer.
-        let mut step_stack = StepStack::new();
+        // Seeded from the conversation's existing `todo` keys so a later turn
+        // continues the numbering instead of clobbering an earlier turn's note
+        // via the scratchpad's upsert-by-key write (DA-7 / #292).
+        let mut step_stack = self.build_step_stack(conversation_id).await;
 
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-turns cancellation checkpoint (issue #109): if the
@@ -2192,6 +2226,88 @@ mod tests {
         assert!(todo.done, "the step todo must be checked off");
         let outcome = notes.get("outcome:1").expect("outcome note must exist");
         assert_eq!(outcome.content, "Cary NC 7-day: highs low-80s, rain Tue");
+    }
+
+    #[tokio::test]
+    async fn second_turn_step_keys_do_not_clobber_first_turns_notes() {
+        // DA-7 (#292): a step in turn 2 must continue the numbering ("2"), not
+        // restart at "1" and overwrite turn 1's still-persisted todo via the
+        // scratchpad's upsert-by-key write.
+        let (write, list, sp) = in_memory_scratchpad();
+
+        // Turn 1: one begin_step (mints "1") then a final answer.
+        let turn1 = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "b1",
+                    "begin_step",
+                    r#"{"goal":"first step"}"#,
+                )],
+            ),
+            LlmResponse::text("done one"),
+        ];
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(turn1),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(Arc::clone(&write))
+        .with_scratchpad_list(Arc::clone(&list));
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // After turn 1 the scratchpad has a "1" todo with the first goal.
+        {
+            let notes = sp.lock().unwrap();
+            assert_eq!(notes.get("1").unwrap().content, "first step");
+        }
+
+        // Turn 2 on the SAME conversation: another begin_step. With seeding it
+        // must mint "2"; without the fix it would mint "1" and overwrite the
+        // first goal.
+        let turn2 = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "b2",
+                    "begin_step",
+                    r#"{"goal":"second step"}"#,
+                )],
+            ),
+            LlmResponse::text("done two"),
+        ];
+        let handler2 = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(turn2),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(Arc::clone(&write))
+        .with_scratchpad_list(Arc::clone(&list));
+        // Re-create the conversation in handler2's store and pre-seed nothing;
+        // the scratchpad (the source of step keys) is shared via the closures.
+        let conv2 = handler2.create_conversation("Test".into()).await.unwrap();
+        handler2
+            .send_prompt(&conv2.id, "again".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let notes = sp.lock().unwrap();
+        assert_eq!(
+            notes.get("1").unwrap().content,
+            "first step",
+            "turn 1's note must NOT be clobbered"
+        );
+        assert_eq!(
+            notes.get("2").unwrap().content,
+            "second step",
+            "turn 2's step must mint the next key"
+        );
     }
 
     /// Capturing LLM that records the message list it is handed each round, then

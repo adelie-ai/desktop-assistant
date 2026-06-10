@@ -94,6 +94,18 @@ impl StepStack {
         Self::default()
     }
 
+    /// Create a stack whose top-level numbering continues *after*
+    /// `root_counter` — i.e. the next top-level step begun will be
+    /// `root_counter + 1`. Seeded from the max existing top-level todo key so a
+    /// later turn never reuses a key an earlier turn's still-persisted todo
+    /// already owns (scratchpad `write` is upsert-by-key, DA-7 / #292).
+    pub fn with_root_counter(root_counter: u32) -> Self {
+        Self {
+            frames: Vec::new(),
+            root_counter,
+        }
+    }
+
     pub fn depth(&self) -> usize {
         self.frames.len()
     }
@@ -144,6 +156,19 @@ impl StepStack {
     pub fn clear(&mut self) {
         self.frames.clear();
     }
+}
+
+/// The highest *top-level* (un-dotted) numeric step key among `keys`, or `0`
+/// when there are none. Used to seed [`StepStack::with_root_counter`] from a
+/// conversation's existing `todo` notes so a new turn keeps advancing the
+/// numbering instead of restarting at `"1"` (DA-7 / #292). Nested keys
+/// (`"1.2"`) and non-numeric keys are ignored.
+pub(crate) fn max_top_level_key<'a>(keys: impl IntoIterator<Item = &'a str>) -> u32 {
+    keys.into_iter()
+        .filter(|k| !k.contains('.')) // top-level only
+        .filter_map(|k| k.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Truncate `s` to at most `max_bytes`, landing on a UTF-8 char boundary.
@@ -273,11 +298,27 @@ pub(crate) fn render_plan(
     let mut sorted: Vec<&PlanItem> = items.iter().collect();
     sorted.sort_by_key(|a| dotted_key(a.key));
 
+    // Choose which items to render when there are more than the cap. The naive
+    // head-take dropped the live step into the tail once enough old DONE steps
+    // accumulated (DA-8 / #293), because done steps sort first. Select instead
+    // so the model always sees where it is and what's left:
+    //   1. the current step and every ancestor of it (you-are-here + context),
+    //   2. then the remaining OPEN steps, most-recent first,
+    //   3. then the remaining DONE steps, most-recent first,
+    // filling up to `max_items`. The chosen set is then rendered in tree order
+    // so the indentation still reads as a plan.
+    let elided = sorted.len().saturating_sub(max_items);
+    let chosen: Vec<&PlanItem> = if elided == 0 {
+        sorted.clone()
+    } else {
+        select_plan_items(&sorted, current, max_items)
+    };
+
     let mut out = String::from(
         "Your plan (steps on the scratchpad, with findings so far — keep working it; \
          mark steps done as you go, and roll a step's sub-step findings up into its outcome):",
     );
-    for item in sorted.iter().take(max_items) {
+    for item in &chosen {
         let depth = item.key.matches('.').count();
         let indent = "  ".repeat(depth);
         let check = if item.done { "[x]" } else { "[ ]" };
@@ -293,10 +334,68 @@ pub(crate) fn render_plan(
             out.push_str(&format!("\n{indent}  → {outcome}"));
         }
     }
-    if sorted.len() > max_items {
-        out.push_str(&format!("\n… and {} more.", sorted.len() - max_items));
+    let shown = chosen.len();
+    if sorted.len() > shown {
+        out.push_str(&format!("\n… and {} more.", sorted.len() - shown));
     }
     Some(out)
+}
+
+/// True when `ancestor` is a proper dotted-key prefix of `key`
+/// (e.g. `"3"` and `"3.2"` are ancestors of `"3.2.1"`). A key is not its own
+/// ancestor.
+fn is_ancestor_of(ancestor: &str, key: &str) -> bool {
+    key.len() > ancestor.len()
+        && key.starts_with(ancestor)
+        && key.as_bytes().get(ancestor.len()) == Some(&b'.')
+}
+
+/// Pick at most `max_items` of `sorted` (which is already in tree order),
+/// keeping the chosen set in tree order. Priority: the current step and its
+/// ancestors, then open steps (recent first), then done steps (recent first).
+/// See [`render_plan`] for why. Selection is by position in `sorted`, not by
+/// key, so duplicate keys are never collapsed.
+fn select_plan_items<'a>(
+    sorted: &[&'a PlanItem<'a>],
+    current: Option<&str>,
+    max_items: usize,
+) -> Vec<&'a PlanItem<'a>> {
+    let mut keep = vec![false; sorted.len()];
+    let mut kept = 0usize;
+
+    // 1. Current step + every ancestor of it — always shown, regardless of cap.
+    if let Some(cur) = current {
+        for (i, item) in sorted.iter().enumerate() {
+            if !keep[i] && (item.key == cur || is_ancestor_of(item.key, cur)) {
+                keep[i] = true;
+                kept += 1;
+            }
+        }
+    }
+
+    // 2 & 3. Fill the rest from open-then-done, most-recent first. "Recent" =
+    // later in tree order, so iterate the reverse of `sorted`.
+    let fill = |want_done: bool, keep: &mut [bool], kept: &mut usize| {
+        for i in (0..sorted.len()).rev() {
+            if *kept >= max_items {
+                break;
+            }
+            if !keep[i] && sorted[i].done == want_done {
+                keep[i] = true;
+                *kept += 1;
+            }
+        }
+    };
+    fill(false, &mut keep, &mut kept); // open first
+    fill(true, &mut keep, &mut kept); // then done
+
+    // Render in tree order, including only the chosen positions.
+    sorted
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(i, item)| keep[i].then_some(item))
+        .collect()
 }
 
 /// A scratchpad note as the plan renderer needs it — just the fields it reads,
@@ -474,6 +573,46 @@ mod tests {
         assert_eq!(k, "2");
     }
 
+    // --- DA-7: seed root_counter from existing top-level keys ---
+
+    #[test]
+    fn max_top_level_key_finds_highest_root_ignoring_children() {
+        // Top-level keys are "1", "2", "3"; nested keys ("2.1", "3.4.2") must
+        // not bump the root counter.
+        let keys = ["1", "2", "2.1", "3", "3.4.2"];
+        assert_eq!(max_top_level_key(keys.iter().copied()), 3);
+    }
+
+    #[test]
+    fn max_top_level_key_is_zero_when_no_top_level_keys() {
+        // No top-level keys (empty, or only nested/non-numeric) → 0, so a fresh
+        // stack starts numbering at 1.
+        assert_eq!(max_top_level_key(std::iter::empty()), 0);
+        assert_eq!(max_top_level_key(["1.1", "2.3"].iter().copied()), 0);
+        assert_eq!(max_top_level_key(["abc", "outcome:1"].iter().copied()), 0);
+    }
+
+    #[test]
+    fn seeded_stack_continues_numbering_past_prior_turn_keys() {
+        // A new turn whose conversation already has top-level todos "1" and "2"
+        // must mint "3" next, not clobber "1" via upsert (DA-7).
+        let mut stack = StepStack::with_root_counter(2);
+        let (k, s) = stack.begin("third step", 0);
+        assert_eq!(k, "3");
+        assert_eq!(s, 3);
+        // Children of the seeded step still number from .1.
+        let (k31, _) = stack.begin("sub", 1);
+        assert_eq!(k31, "3.1");
+    }
+
+    #[test]
+    fn new_stack_starts_at_one_unchanged() {
+        // The default (unseeded) stack behaviour is preserved.
+        let mut stack = StepStack::new();
+        let (k, _) = stack.begin("first", 0);
+        assert_eq!(k, "1");
+    }
+
     fn tool_msg(id: &str, content: &str) -> Message {
         Message::tool_result(id, content)
     }
@@ -612,6 +751,112 @@ mod tests {
         let rendered = render_plan(&items, None, 10).unwrap();
         assert!(rendered.contains("1 [x] research"));
         assert!(rendered.contains("→ API is OAuth2, 100 req/min"));
+    }
+
+    // --- DA-8: the live step is always rendered even past the item cap ---
+
+    #[test]
+    fn render_plan_always_includes_current_step_when_over_cap() {
+        // Many old DONE steps that sort first, plus the live (open) current
+        // step that sorts last. With a tiny cap the naive head-take would drop
+        // the current step into the "… and N more" tail; the fix must keep it.
+        let mut items: Vec<PlanItem> = (1..=50)
+            .map(|i| PlanItem {
+                key: leak_key(i),
+                goal: "old done step",
+                done: true,
+                outcome: None,
+            })
+            .collect();
+        items.push(PlanItem {
+            key: "51",
+            goal: "the live step",
+            done: false,
+            outcome: None,
+        });
+        let rendered = render_plan(&items, Some("51"), 5).unwrap();
+        assert!(
+            rendered.contains("51 [ ] the live step"),
+            "the current/live step must always be rendered:\n{rendered}"
+        );
+        assert!(rendered.contains("← you are here"));
+        assert!(rendered.contains("… and"), "the cap still elides the rest");
+    }
+
+    #[test]
+    fn render_plan_includes_current_steps_ancestors() {
+        // Current step is "3.2.1"; its ancestors "3" and "3.2" must be shown
+        // (and indented under each other) even when older done steps would
+        // otherwise consume the whole budget.
+        let mut items: Vec<PlanItem> = (1..=2)
+            .flat_map(|i| {
+                (1..=10).map(move |j| PlanItem {
+                    key: leak_key2(i, j),
+                    goal: "old done step",
+                    done: true,
+                    outcome: None,
+                })
+            })
+            .collect();
+        items.push(PlanItem {
+            key: "3",
+            goal: "ancestor root",
+            done: false,
+            outcome: None,
+        });
+        items.push(PlanItem {
+            key: "3.2",
+            goal: "ancestor mid",
+            done: false,
+            outcome: None,
+        });
+        items.push(PlanItem {
+            key: "3.2.1",
+            goal: "live leaf",
+            done: false,
+            outcome: None,
+        });
+        let rendered = render_plan(&items, Some("3.2.1"), 4).unwrap();
+        assert!(rendered.contains("3 [ ] ancestor root"), "{rendered}");
+        assert!(rendered.contains("3.2 [ ] ancestor mid"), "{rendered}");
+        assert!(rendered.contains("3.2.1 [ ] live leaf"), "{rendered}");
+    }
+
+    #[test]
+    fn render_plan_prefers_open_over_done_when_over_cap() {
+        // A mix of done and open steps with a tight cap: open steps are
+        // preferred over old done ones so the model sees what's left to do.
+        let mut items: Vec<PlanItem> = (1..=8)
+            .map(|i| PlanItem {
+                key: leak_key(i),
+                goal: "done",
+                done: true,
+                outcome: None,
+            })
+            .collect();
+        items.push(PlanItem {
+            key: "9",
+            goal: "still open A",
+            done: false,
+            outcome: None,
+        });
+        items.push(PlanItem {
+            key: "10",
+            goal: "still open B",
+            done: false,
+            outcome: None,
+        });
+        let rendered = render_plan(&items, None, 3).unwrap();
+        assert!(rendered.contains("still open A"), "{rendered}");
+        assert!(rendered.contains("still open B"), "{rendered}");
+    }
+
+    // Tiny helpers to mint 'static keys for the over-cap selection tests.
+    fn leak_key(i: u32) -> &'static str {
+        Box::leak(i.to_string().into_boxed_str())
+    }
+    fn leak_key2(i: u32, j: u32) -> &'static str {
+        Box::leak(format!("{i}.{j}").into_boxed_str())
     }
 
     fn raw(
