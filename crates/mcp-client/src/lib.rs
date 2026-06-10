@@ -6,13 +6,34 @@ pub mod executor;
 mod jsonrpc;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use desktop_assistant_core::domain::ToolDefinition;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
+
+/// Default maximum silent gap while waiting for a response line from an MCP
+/// server. The window resets whenever the server sends *any* line
+/// (notifications count as liveness), so long-running tools that emit
+/// progress notifications are not cut off. Generous because tool calls can
+/// legitimately take minutes (e.g. terminal commands); the point is that a
+/// silently wedged server fails the turn instead of hanging it forever
+/// (DS-3, same standard the LLM providers got in #220).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Cap on the `initialize` handshake: a server that can't even complete the
+/// handshake within this window is treated as broken. Mirrors the LLM
+/// connectors' 30s connect timeout (#220).
+const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum accepted length of a single response line from an MCP server.
+/// Anything larger is a protocol violation (or a runaway tool result) and is
+/// surfaced as an error instead of buffering unbounded memory (DS-4).
+const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Error type for MCP client operations.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +64,9 @@ pub enum McpError {
 
     #[error("MCP client is not connected")]
     NotConnected,
+
+    #[error("MCP request '{method}' timed out after {after:?} of silence")]
+    Timeout { method: String, after: Duration },
 }
 
 /// Characters that could cause unintended behaviour if they appear in the
@@ -67,15 +91,45 @@ fn validate_command(command: &str, _args: &[String]) -> Result<(), McpError> {
     Ok(())
 }
 
+/// "List changed" notification flags, shared between an `McpClient` and the
+/// executor that owns it. Kept behind an `Arc` so the executor can poll the
+/// flags without locking the client itself — a client busy with a slow tool
+/// call must not block status/refresh checks (DS-1).
+#[derive(Default)]
+pub struct ListChangeFlags {
+    tools: AtomicBool,
+    resources: AtomicBool,
+    prompts: AtomicBool,
+}
+
+impl ListChangeFlags {
+    /// True if a tools list change notification was observed since the last
+    /// successful `list_tools` refresh.
+    pub fn tools_changed(&self) -> bool {
+        self.tools.load(Ordering::Relaxed)
+    }
+
+    /// True if a resources list change notification was observed.
+    pub fn resources_changed(&self) -> bool {
+        self.resources.load(Ordering::Relaxed)
+    }
+
+    /// True if a prompts list change notification was observed.
+    pub fn prompts_changed(&self) -> bool {
+        self.prompts.load(Ordering::Relaxed)
+    }
+}
+
 /// Client for a single MCP server process, communicating via JSON-RPC over stdio.
 pub struct McpClient {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: AtomicU64,
-    tools_list_changed: AtomicBool,
-    resources_list_changed: AtomicBool,
-    prompts_list_changed: AtomicBool,
+    flags: Arc<ListChangeFlags>,
+    /// Maximum silent gap while waiting for a response line; see
+    /// [`DEFAULT_REQUEST_TIMEOUT`].
+    request_timeout: Duration,
 }
 
 impl McpClient {
@@ -89,13 +143,28 @@ impl McpClient {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<Self, McpError> {
+        Self::connect_with_request_timeout(command, args, env, DEFAULT_REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::connect`] with an explicit per-request silence timeout.
+    pub async fn connect_with_request_timeout(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
         validate_command(command, args)?;
 
         let mut cmd = Command::new(command);
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            // DS-2: make the kernel reap the server if this client is
+            // dropped without an explicit `shutdown` (panic, cancelled
+            // task, error mid-`connect`). Explicit `shutdown` still kills
+            // gracefully via `Child::kill`.
+            .kill_on_drop(true);
         for (key, value) in env {
             cmd.env(key, value);
         }
@@ -110,15 +179,27 @@ impl McpClient {
             stdin,
             reader,
             next_id: AtomicU64::new(1),
-            tools_list_changed: AtomicBool::new(false),
-            resources_list_changed: AtomicBool::new(false),
-            prompts_list_changed: AtomicBool::new(false),
+            flags: Arc::new(ListChangeFlags::default()),
+            request_timeout,
         };
 
-        // Perform initialize handshake
-        client.initialize().await?;
+        // Perform initialize handshake, bounded so a wedged server fails
+        // startup instead of stalling it (DS-3). On error `client` (and its
+        // `Child`) is dropped here, which kills the process (DS-2).
+        let init_timeout = INIT_TIMEOUT.min(request_timeout);
+        tokio::time::timeout(init_timeout, client.initialize())
+            .await
+            .map_err(|_| McpError::Timeout {
+                method: "initialize".into(),
+                after: init_timeout,
+            })??;
 
         Ok(client)
+    }
+
+    /// Shared handle to this client's list-change notification flags.
+    pub fn list_change_flags(&self) -> Arc<ListChangeFlags> {
+        Arc::clone(&self.flags)
     }
 
     async fn initialize(&mut self) -> Result<(), McpError> {
@@ -156,7 +237,7 @@ impl McpClient {
 
         let raw_tools: Vec<RawToolDef> = serde_json::from_value(tools_value.clone())?;
 
-        self.tools_list_changed.store(false, Ordering::Relaxed);
+        self.flags.tools.store(false, Ordering::Relaxed);
 
         Ok(raw_tools
             .into_iter()
@@ -175,7 +256,7 @@ impl McpClient {
     pub async fn list_resources(&mut self) -> Result<Vec<serde_json::Value>, McpError> {
         let response = self.send_request("resources/list", None).await?;
         let resources = extract_list_field(&response, "resources")?;
-        self.resources_list_changed.store(false, Ordering::Relaxed);
+        self.flags.resources.store(false, Ordering::Relaxed);
         Ok(resources)
     }
 
@@ -183,24 +264,24 @@ impl McpClient {
     pub async fn list_prompts(&mut self) -> Result<Vec<serde_json::Value>, McpError> {
         let response = self.send_request("prompts/list", None).await?;
         let prompts = extract_list_field(&response, "prompts")?;
-        self.prompts_list_changed.store(false, Ordering::Relaxed);
+        self.flags.prompts.store(false, Ordering::Relaxed);
         Ok(prompts)
     }
 
     /// Returns true if this client has observed a tools list change notification
     /// since the last successful `list_tools` refresh.
     pub fn tools_list_changed(&self) -> bool {
-        self.tools_list_changed.load(Ordering::Relaxed)
+        self.flags.tools_changed()
     }
 
     /// Returns true if this client has observed a resources list change notification.
     pub fn resources_list_changed(&self) -> bool {
-        self.resources_list_changed.load(Ordering::Relaxed)
+        self.flags.resources_changed()
     }
 
     /// Returns true if this client has observed a prompts list change notification.
     pub fn prompts_list_changed(&self) -> bool {
-        self.prompts_list_changed.load(Ordering::Relaxed)
+        self.flags.prompts_changed()
     }
 
     /// Call a tool on this MCP server.
@@ -242,7 +323,7 @@ impl McpClient {
     }
 
     /// Shut down the MCP server process gracefully.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&mut self) {
         // Try to kill the child process
         let _ = self.child.kill().await;
     }
@@ -268,88 +349,152 @@ impl McpClient {
         line.push('\n');
 
         tracing::debug!("MCP request: {}", line.trim());
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
 
-        // Read response lines until we get one with matching id
-        loop {
-            let mut buf = String::new();
-            let bytes_read = self.reader.read_line(&mut buf).await?;
-            if bytes_read == 0 {
-                return Err(McpError::UnexpectedResponse(
-                    "MCP server closed stdout".into(),
-                ));
-            }
+        // Write the request and read the response *concurrently* (DS-4):
+        // a request larger than the pipe buffer sent to a server that is
+        // itself blocked writing a large message would otherwise deadlock —
+        // classic stdio pipe deadlock. `try_join!` also short-circuits when
+        // the read side times out, so a wedged exchange resolves into an
+        // error rather than blocking on the unfinished write.
+        let gap = self.request_timeout;
+        let stdin = &mut self.stdin;
+        let reader = &mut self.reader;
+        let flags = Arc::clone(&self.flags);
 
-            let trimmed = buf.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
+        let write_fut = async move {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await?;
+            Ok::<(), McpError>(())
+        };
 
-            tracing::debug!("MCP response: {trimmed}");
+        let read_fut = async move {
+            // Read response lines until we get one with matching id. Each
+            // read is bounded by the request timeout (DS-3); any line from
+            // the server (including notifications) resets the window.
+            loop {
+                let next = tokio::time::timeout(gap, read_line_bounded(reader, MAX_LINE_BYTES))
+                    .await
+                    .map_err(|_| McpError::Timeout {
+                        method: method.to_string(),
+                        after: gap,
+                    })??;
+                let Some(buf) = next else {
+                    return Err(McpError::UnexpectedResponse(
+                        "MCP server closed stdout".into(),
+                    ));
+                };
 
-            let message: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(value) => value,
-                Err(_) => {
-                    tracing::debug!("skipping non-JSON line from MCP server");
+                let trimmed = buf.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-            };
 
-            if let Some(list_kind) = list_kind_from_notification(&message) {
-                tracing::debug!("received {list_kind} list changed notification");
-                self.mark_list_changed_for_kind(list_kind);
-                continue;
-            }
+                tracing::debug!("MCP response: {trimmed}");
 
-            // Try to parse as JSON-RPC response
-            let response: JsonRpcResponse = match serde_json::from_value(message.clone()) {
-                Ok(r) => r,
-                Err(_) => {
-                    // Could be a notification, skip it
-                    tracing::debug!("skipping non-response line from MCP server");
+                let message: serde_json::Value = match serde_json::from_str(trimmed) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tracing::debug!("skipping non-JSON line from MCP server");
+                        continue;
+                    }
+                };
+
+                if let Some(list_kind) = list_kind_from_notification(&message) {
+                    tracing::debug!("received {list_kind} list changed notification");
+                    mark_list_changed_for_kind(&flags, list_kind);
                     continue;
                 }
-            };
 
-            // Check if this response matches our request id
-            if response.id != Some(serde_json::Value::Number(id.into())) {
-                // Not our response, could be a notification or out-of-order
-                tracing::debug!("skipping response with non-matching id");
-                continue;
+                // Try to parse as JSON-RPC response
+                let response: JsonRpcResponse = match serde_json::from_value(message.clone()) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Could be a notification, skip it
+                        tracing::debug!("skipping non-response line from MCP server");
+                        continue;
+                    }
+                };
+
+                // Check if this response matches our request id
+                if response.id != Some(serde_json::Value::Number(id.into())) {
+                    // Not our response, could be a notification or out-of-order
+                    tracing::debug!("skipping response with non-matching id");
+                    continue;
+                }
+
+                if let Some(error) = response.error {
+                    return Err(McpError::ServerError {
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+
+                let result = response.result.unwrap_or(serde_json::Value::Null);
+                if result_has_list_changed(&result) {
+                    mark_list_changed_for_method(&flags, method);
+                }
+
+                return Ok(result);
             }
+        };
 
-            if let Some(error) = response.error {
-                return Err(McpError::ServerError {
-                    code: error.code,
-                    message: error.message,
-                });
-            }
-
-            let result = response.result.unwrap_or(serde_json::Value::Null);
-            if result_has_list_changed(&result) {
-                self.mark_list_changed_for_method(method);
-            }
-
-            return Ok(result);
-        }
+        let ((), result) = tokio::try_join!(write_fut, read_fut)?;
+        Ok(result)
     }
+}
 
-    fn mark_list_changed_for_method(&self, method: &str) {
-        match method {
-            "tools/list" => self.tools_list_changed.store(true, Ordering::Relaxed),
-            "resources/list" => self.resources_list_changed.store(true, Ordering::Relaxed),
-            "prompts/list" => self.prompts_list_changed.store(true, Ordering::Relaxed),
-            _ => {}
-        }
+impl Drop for McpClient {
+    /// Belt-and-suspenders teardown (DS-2). `Command::kill_on_drop(true)`
+    /// already arranges for the runtime to reap the child when this struct
+    /// drops, but that relies on the tokio runtime still being alive to do
+    /// the reaping. Issuing a synchronous `start_kill()` here sends the kill
+    /// signal immediately and unconditionally, so a child is never leaked even
+    /// if the client is dropped on a panic, a cancelled task, or an error
+    /// during `connect`'s `initialize()`. It is harmless if the process has
+    /// already exited or `shutdown()` was called.
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
     }
+}
 
-    fn mark_list_changed_for_kind(&self, list_kind: ListKind) {
-        match list_kind {
-            ListKind::Tools => self.tools_list_changed.store(true, Ordering::Relaxed),
-            ListKind::Resources => self.resources_list_changed.store(true, Ordering::Relaxed),
-            ListKind::Prompts => self.prompts_list_changed.store(true, Ordering::Relaxed),
-        }
+/// Read one newline-terminated line from `reader`, capped at `max` bytes
+/// (DS-4). Returns `Ok(None)` on EOF; a line exceeding the cap is an error —
+/// the stream is no longer parseable at that point, so the connection is
+/// effectively dead.
+async fn read_line_bounded(
+    reader: &mut BufReader<ChildStdout>,
+    max: u64,
+) -> Result<Option<String>, McpError> {
+    let mut buf = Vec::new();
+    let n = (&mut *reader)
+        .take(max + 1)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') && n as u64 > max {
+        return Err(McpError::UnexpectedResponse(format!(
+            "MCP server sent a line exceeding the {max}-byte cap"
+        )));
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+fn mark_list_changed_for_method(flags: &ListChangeFlags, method: &str) {
+    match method {
+        "tools/list" => flags.tools.store(true, Ordering::Relaxed),
+        "resources/list" => flags.resources.store(true, Ordering::Relaxed),
+        "prompts/list" => flags.prompts.store(true, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+fn mark_list_changed_for_kind(flags: &ListChangeFlags, list_kind: ListKind) {
+    match list_kind {
+        ListKind::Tools => flags.tools.store(true, Ordering::Relaxed),
+        ListKind::Resources => flags.resources.store(true, Ordering::Relaxed),
+        ListKind::Prompts => flags.prompts.store(true, Ordering::Relaxed),
     }
 }
 

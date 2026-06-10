@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use desktop_assistant_core::ports::tools::ToolExecutor;
 use desktop_assistant_mcp_client::executor::{McpServerConfig, McpToolExecutor};
 use desktop_assistant_mcp_client::{McpClient, McpError};
-use desktop_assistant_core::ports::tools::ToolExecutor;
 
 /// Unique temp file path for this test process.
 fn temp_path(label: &str) -> PathBuf {
@@ -105,6 +105,11 @@ impl FakeServer {
       ;;
     *'"method":"tools/list"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"echo","description":"echo tool","inputSchema":{{"type":"object"}}}}]}}}}\n' "$id"
+      ;;
+    *'"method":"resources/list"'*|*'"method":"prompts/list"'*)
+      # Not implemented: reply method-not-found (-32601) so the executor's
+      # metadata refresh moves on instead of waiting on a reply forever.
+      printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"method not found"}}}}\n' "$id"
       ;;
     *'"method":"tools/call"'*)
       {call_action}
@@ -219,10 +224,11 @@ async fn silent_initialize_times_out_and_kills_child() {
     )
     .await
     .expect("connect must not hang");
-    assert!(
-        matches!(result, Err(McpError::Timeout { .. })),
-        "expected timeout error, got {result:?}",
-    );
+    match &result {
+        Err(McpError::Timeout { .. }) => {}
+        Err(other) => panic!("expected timeout error, got {other:?}"),
+        Ok(_) => panic!("expected timeout error, got a connected client"),
+    }
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "connect should fail promptly"
@@ -250,13 +256,9 @@ async fn dropped_client_kills_child_process() {
     }
     .write("drop");
 
-    let client = McpClient::connect(
-        "/bin/sh",
-        &[script.display().to_string()],
-        &HashMap::new(),
-    )
-    .await
-    .expect("connect");
+    let client = McpClient::connect("/bin/sh", &[script.display().to_string()], &HashMap::new())
+        .await
+        .expect("connect");
 
     let pid = pid_from_file(&pid_file);
     assert!(pid_running(pid), "server should be alive while connected");
@@ -283,13 +285,10 @@ async fn oversized_response_line_is_an_error() {
     }
     .write("oversize");
 
-    let mut client = McpClient::connect(
-        "/bin/sh",
-        &[script.display().to_string()],
-        &HashMap::new(),
-    )
-    .await
-    .expect("connect");
+    let mut client =
+        McpClient::connect("/bin/sh", &[script.display().to_string()], &HashMap::new())
+            .await
+            .expect("connect");
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
@@ -375,13 +374,10 @@ async fn slow_server_does_not_block_fast_server() {
 async fn call_tool_roundtrip() {
     let script = FakeServer::default().write("roundtrip");
 
-    let mut client = McpClient::connect(
-        "/bin/sh",
-        &[script.display().to_string()],
-        &HashMap::new(),
-    )
-    .await
-    .expect("connect");
+    let mut client =
+        McpClient::connect("/bin/sh", &[script.display().to_string()], &HashMap::new())
+            .await
+            .expect("connect");
 
     let tools = client.list_tools().await.expect("list_tools");
     assert_eq!(tools.len(), 1);
