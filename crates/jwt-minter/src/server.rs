@@ -69,6 +69,23 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = bind_unix_listener(&options.socket_path)?;
+    // DT-13: tighten the socket file mode now that it's bound. Without a
+    // group gate only the minter's own user may connect (0600). With a gate
+    // we widen to group-rw (0660) so a member of the gated group can reach
+    // `connect()`; membership is still enforced per request via peer creds.
+    // Done after bind (the umask-narrowed default could be wider or narrower
+    // than we want) and before we start serving.
+    let mode = if options.group_gate.is_some() {
+        0o660
+    } else {
+        0o600
+    };
+    if let Err(err) = set_socket_permissions(&options.socket_path, mode) {
+        // Hard-fail: a too-permissive mint socket is a security hole, and a
+        // failure to lock it down must not be served past.
+        remove_socket(&options.socket_path);
+        return Err(err);
+    }
     // Load the signing key once at startup — the daemon would do the
     // same. If it doesn't exist yet, generate it; the daemon will pick up
     // the same file on its next startup.
@@ -125,13 +142,25 @@ async fn serve_accept_loop<A: AcceptSource>(
                         });
                     }
                     Err(err) => {
-                        tracing::error!(error = %err, "accept failed");
-                        break Err(anyhow!("accept loop: {err}"));
+                        // DT-8: a transient accept error (ECONNABORTED,
+                        // EMFILE, …) must not take the minter down. Log,
+                        // back off briefly so we don't spin on a persistent
+                        // EMFILE, and keep accepting.
+                        tracing::error!(error = %err, "accept failed; continuing");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
         }
     }
+}
+
+/// Set the mode bits on the bound socket file (DT-13). A failure here is
+/// fatal at the call site — an unprotected mint socket must never be served.
+fn set_socket_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set 0{mode:o} on {}", path.display()))
 }
 
 /// Best-effort cleanup helper; safe to call multiple times.
@@ -175,7 +204,6 @@ pub async fn serve_connection_with_limits(
     group_gate: Option<&GroupGate>,
     limits: ConnectionLimits,
 ) -> anyhow::Result<()> {
-    let _ = limits;
     let identity =
         peer::extract_peer_identity(&stream).context("failed to extract peer credentials")?;
 
@@ -192,19 +220,52 @@ pub async fn serve_connection_with_limits(
         return Ok(());
     }
 
-    let mut buf = String::new();
-    let mut reader = BufReader::new(&mut stream);
-    reader
-        .read_line(&mut buf)
-        .await
-        .context("failed to read request line")?;
-    drop(reader);
+    // DT-7: a request line is a small JSON object. Read it under a timeout
+    // (a silent client must not pin this task forever) and with a hard byte
+    // cap (a peer streaming without a newline must not exhaust memory). The
+    // cap is enforced *during* the read via `take`, so we never buffer more
+    // than the limit even if the newline never arrives.
+    let buf = tokio::time::timeout(
+        limits.read_timeout,
+        read_request_line(&mut stream, limits.max_line_bytes),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out reading request line"))??;
 
     let response = handle_request(&buf, &identity, config, signing_key);
     stream.write_all(response.as_bytes()).await?;
     stream.write_all(b"\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Read a single newline-terminated request line from `stream`, refusing to
+/// buffer more than `max_bytes` (DT-7). The cap is applied by reading through
+/// a `take`-limited reader, so a peer that never sends a newline is bounded by
+/// `max_bytes` rather than by available memory. A line that hits the cap
+/// without a terminator is an error.
+async fn read_request_line(stream: &mut UnixStream, max_bytes: usize) -> anyhow::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    // `+ 1` so we can tell "exactly at the cap, terminated" from "ran past
+    // the cap"; the reader yields at most `max_bytes + 1` bytes total.
+    let mut reader = BufReader::new(stream.take((max_bytes as u64) + 1));
+    let mut buf = Vec::with_capacity(max_bytes.min(1024));
+    reader
+        .read_until(b'\n', &mut buf)
+        .await
+        .context("failed to read request line")?;
+
+    if buf.last() != Some(&b'\n') {
+        // No terminator: either EOF (client closed early) or the cap was hit
+        // before a newline arrived. Either way the request is unusable, and a
+        // too-long line must be rejected without buffering further.
+        return Err(anyhow!(
+            "request line exceeded {max_bytes} bytes or ended without a newline"
+        ));
+    }
+
+    String::from_utf8(buf).context("request line was not valid UTF-8")
 }
 
 fn is_member(identity: &PeerIdentity, gate: &GroupGate) -> anyhow::Result<bool> {

@@ -15,7 +15,8 @@
 //!   `use ∈ { sig, absent }` and `alg ∈ { RS256, absent }` are kept,
 //!   so a key tagged for encryption (`use = enc`) won't accidentally
 //!   verify a signature.
-//! - Discovery + JWKS responses are size-capped to 1 MiB.
+//! - Discovery + JWKS responses are size-capped to 1 MiB, enforced *during*
+//!   the streamed read so an over-cap body is never fully buffered (DT-14).
 //! - HMAC algorithms are explicitly *not* allowed by the validator
 //!   (RS256 only), defending against the JWKS-substitution-via-`alg=HS256`
 //!   class of attacks.
@@ -82,20 +83,42 @@ impl OidcValidator {
         ))
     }
 
-    /// Fetch a JSON document with size limits.
+    /// Fetch a JSON document, enforcing `max_bytes` *during* the read (DT-14).
+    ///
+    /// The previous implementation called `response.bytes()`, which buffers the
+    /// entire body before the size check — a hostile or misconfigured IdP could
+    /// stream gigabytes and exhaust memory before we ever reject it. Here we
+    /// pull the body chunk-by-chunk and bail the moment the accumulated size
+    /// would exceed the cap, so we never hold more than ~`max_bytes` (plus one
+    /// chunk) in memory.
     async fn fetch_oidc_json(
         client: &reqwest::Client,
         url: &str,
+        max_bytes: usize,
     ) -> anyhow::Result<serde_json::Value> {
-        let response = client.get(url).send().await?;
-        let bytes = response.bytes().await?;
-        if bytes.len() > Self::MAX_OIDC_RESPONSE_BYTES {
+        let mut response = client.get(url).send().await?;
+
+        // If the server advertises a content-length over the cap, reject before
+        // reading a single byte of body.
+        if let Some(len) = response.content_length()
+            && len > max_bytes as u64
+        {
             return Err(anyhow!(
-                "OIDC response from {url} exceeds size limit ({} bytes)",
-                bytes.len()
+                "OIDC response from {url} exceeds size limit \
+                 ({len} bytes advertised > {max_bytes})"
             ));
         }
-        Ok(serde_json::from_slice(&bytes)?)
+
+        let mut buf: Vec<u8> = Vec::with_capacity(max_bytes.min(8 * 1024));
+        while let Some(chunk) = response.chunk().await? {
+            if buf.len() + chunk.len() > max_bytes {
+                return Err(anyhow!(
+                    "OIDC response from {url} exceeds size limit ({max_bytes} bytes)"
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(serde_json::from_slice(&buf)?)
     }
 
     /// Fetch JWKS from the IdP and build a validator.
@@ -116,7 +139,9 @@ impl OidcValidator {
                 "{}/.well-known/openid-configuration",
                 oidc.issuer_url.trim_end_matches('/')
             );
-            let discovery = Self::fetch_oidc_json(&client, &discovery_url).await?;
+            let discovery =
+                Self::fetch_oidc_json(&client, &discovery_url, Self::MAX_OIDC_RESPONSE_BYTES)
+                    .await?;
             let resolved = discovery["jwks_uri"]
                 .as_str()
                 .ok_or_else(|| anyhow!("no jwks_uri in OIDC discovery document"))?
@@ -127,7 +152,7 @@ impl OidcValidator {
             oidc.jwks_uri.clone()
         };
 
-        let jwks = Self::fetch_oidc_json(&client, &jwks_uri).await?;
+        let jwks = Self::fetch_oidc_json(&client, &jwks_uri, Self::MAX_OIDC_RESPONSE_BYTES).await?;
 
         let keys = jwks["keys"]
             .as_array()
@@ -259,5 +284,65 @@ impl OidcValidator {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DT-14: an over-cap response body must be rejected by the streamed read
+    /// *without first buffering the whole body*. We serve a body well over a
+    /// small test cap and assert `fetch_oidc_json` errors with a size message.
+    #[tokio::test]
+    async fn fetch_oidc_json_rejects_body_over_cap() {
+        let server = httpmock::MockServer::start_async().await;
+        // 64 KiB body, far above the 1 KiB cap we pass below.
+        let big = "x".repeat(64 * 1024);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(big);
+            })
+            .await;
+
+        let client = OidcValidator::oidc_http_client();
+        let url = format!("{}/jwks", server.base_url());
+        let err = OidcValidator::fetch_oidc_json(&client, &url, 1024)
+            .await
+            .expect_err("an over-cap body must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("size") || msg.contains("limit") || msg.contains("exceed"),
+            "error should describe the size cap, got: {err}"
+        );
+        mock.assert_async().await;
+    }
+
+    /// A well-formed under-cap document parses as JSON.
+    #[tokio::test]
+    async fn fetch_oidc_json_parses_under_cap() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/disc");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"jwks_uri":"https://idp.example.com/keys"}"#);
+            })
+            .await;
+
+        let client = OidcValidator::oidc_http_client();
+        let url = format!("{}/disc", server.base_url());
+        let value = OidcValidator::fetch_oidc_json(&client, &url, 1_048_576)
+            .await
+            .expect("under-cap body should parse");
+        assert_eq!(
+            value["jwks_uri"].as_str(),
+            Some("https://idp.example.com/keys")
+        );
+        mock.assert_async().await;
     }
 }
