@@ -87,6 +87,11 @@ pub(crate) struct PreparedSelect {
     /// rebinding can use it.
     #[allow(dead_code)]
     pub bound_user_id: Option<String>,
+    /// True when the parsed query already carries a `LIMIT` clause, so the
+    /// read path must not wrap it in an auto-LIMIT subquery (DS-7). Derived
+    /// from the AST (`Query.limit_clause`), not a substring scan, so a string
+    /// literal like `'no LIMIT here'` no longer false-positives.
+    pub has_limit: bool,
 }
 
 /// Parse `sql` as a single SELECT and graft `user_id = $1` predicates
@@ -117,6 +122,12 @@ pub(crate) fn prepare_select_for_user(
     let mut grafter = UserIdGrafter::new(user_id);
     grafter.visit_query(&mut query);
 
+    // DS-7: detect an existing LIMIT from the parsed AST rather than a
+    // substring scan of the SQL text. Grafting `user_id` predicates never
+    // adds or removes a top-level LIMIT, so reading it off the query here is
+    // equivalent to reading it off the rewritten output.
+    let has_limit = query.limit_clause.is_some();
+
     // sqlparser's `Display` for `Query` round-trips the AST back to
     // canonical SQL. We don't reformat — Postgres parses it again.
     let sql_out = query.to_string();
@@ -124,6 +135,7 @@ pub(crate) fn prepare_select_for_user(
     Ok(PreparedSelect {
         sql: sql_out,
         bound_user_id: grafter.bound.then(|| user_id.to_string()),
+        has_limit,
     })
 }
 
@@ -596,7 +608,7 @@ pub async fn execute_database_query(
     if is_read {
         let user_id = current_user_id();
         let prepared = prepare_select_for_user(sql_trimmed, user_id.as_str())?;
-        execute_read(pool, &prepared.sql, limit).await
+        execute_read(pool, &prepared.sql, prepared.has_limit, limit).await
     } else {
         validate_write_statement(sql_trimmed)?;
         let upper = sql_trimmed.to_uppercase();
@@ -668,16 +680,15 @@ fn strip_leading_sql_comments(sql: &str) -> &str {
 
 /// Read path — READ ONLY transaction, auto-LIMIT, always rolled back.
 ///
-/// `sql` is the post-rewrite SQL produced by `prepare_select_for_user`.
-/// We re-derive the uppercase view for the `LIMIT` heuristic so the
-/// caller doesn't have to recompute it after the rewrite.
+/// `sql` is the post-rewrite SQL produced by `prepare_select_for_user`;
+/// `has_limit` is that same call's AST-derived flag (DS-7) telling us
+/// whether the query already constrains its row count.
 async fn execute_read(
     pool: &PgPool,
     sql: &str,
+    has_limit: bool,
     limit: usize,
 ) -> Result<serde_json::Value, CoreError> {
-    let has_limit = sql.to_uppercase().contains(" LIMIT ");
-
     let mut tx = pool
         .begin()
         .await
@@ -998,6 +1009,37 @@ mod tests {
     /// Helper for write-path validation — no DB required.
     fn validate_write(sql: &str) -> Result<(), CoreError> {
         super::validate_write_statement(sql).map(|_| ())
+    }
+
+    /// Helper exposing the AST-derived LIMIT flag (DS-7) for a read query.
+    fn prepared_has_limit(sql: &str) -> bool {
+        super::prepare_select_for_user(sql, "alice")
+            .expect("rewrite")
+            .has_limit
+    }
+
+    #[test]
+    fn has_limit_true_for_real_limit_clause() {
+        assert!(prepared_has_limit("SELECT id FROM conversations LIMIT 10"));
+        // Also true with OFFSET attached to the LIMIT clause.
+        assert!(prepared_has_limit(
+            "SELECT id FROM conversations LIMIT 10 OFFSET 5"
+        ));
+    }
+
+    #[test]
+    fn has_limit_false_for_limit_in_string_literal() {
+        // DS-7: the old substring scan for " LIMIT " false-positived on the
+        // literal below, silently skipping the auto-LIMIT wrap. The AST-based
+        // check must report no LIMIT so the read path still caps the rows.
+        assert!(!prepared_has_limit(
+            "SELECT id FROM conversations WHERE title = 'no LIMIT here'"
+        ));
+    }
+
+    #[test]
+    fn has_limit_false_for_plain_select() {
+        assert!(!prepared_has_limit("SELECT id FROM conversations"));
     }
 
     #[test]
