@@ -311,6 +311,77 @@ pub trait EventSink: Send + Sync {
 
 const STREAM_EVENT_BUFFER: usize = 64;
 
+/// Forward a streaming event into the per-turn event channel from the core
+/// chunk callback. The boolean return feeds the LLM adapters' cooperative
+/// abort contract: `false` means "the consumer is gone, stop streaming".
+///
+/// DA-3: `Full` and `Closed` must not be conflated. A momentarily full
+/// buffer (slow client, 64-event cap) is backpressure — the delta is
+/// dropped (the final stored message converges the client) but the stream
+/// stays alive. Only a closed channel means the consumer is really gone.
+fn forward_stream_event(tx: &tokio::sync::mpsc::Sender<api::Event>, event: api::Event) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+    match tx.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            tracing::debug!("stream event buffer full; dropping one delta (client will converge)");
+            true
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
+}
+
+#[cfg(test)]
+mod forward_stream_event_tests {
+    use super::*;
+
+    fn delta(chunk: &str) -> api::Event {
+        api::Event::AssistantDelta {
+            conversation_id: "c1".into(),
+            request_id: "r1".into(),
+            chunk: chunk.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_send_delivers_event_and_continues() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<api::Event>(4);
+        assert!(forward_stream_event(&tx, delta("hello")));
+        match rx.try_recv() {
+            Ok(api::Event::AssistantDelta { chunk, .. }) => assert_eq!(chunk, "hello"),
+            other => panic!("expected the delta to be delivered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_channel_is_backpressure_not_disconnect() {
+        // DA-3: a momentarily full event buffer must NOT be treated as a
+        // client disconnect. Returning `false` makes the LLM adapter abort
+        // the stream cooperatively and the truncated text gets stored as the
+        // final assistant message. The chunk may be dropped (the completed
+        // message converges the client), but the stream must stay alive.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<api::Event>(1);
+        assert!(forward_stream_event(&tx, delta("fills the buffer")));
+        assert!(
+            forward_stream_event(&tx, delta("overflow chunk")),
+            "a full channel must keep the stream alive (drop the chunk), \
+             not abort the turn as if the client disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_channel_aborts_the_stream() {
+        // The receiver is gone for good — this IS a disconnect, and the
+        // adapter should stop streaming.
+        let (tx, rx) = tokio::sync::mpsc::channel::<api::Event>(1);
+        drop(rx);
+        assert!(
+            !forward_stream_event(&tx, delta("nobody listening")),
+            "a closed channel means the consumer is gone; the stream must abort"
+        );
+    }
+}
+
 pub struct DefaultAssistantApiHandler<A, C, S, N, K>
 where
     A: AssistantService + 'static,
@@ -2418,12 +2489,14 @@ where
     let conv_id_for_cb = conversation_id.clone();
     let req_id_for_cb = request_id.clone();
     let callback: desktop_assistant_core::ports::llm::ChunkCallback = Box::new(move |chunk| {
-        tx.try_send(api::Event::AssistantDelta {
-            conversation_id: conv_id_for_cb.clone(),
-            request_id: req_id_for_cb.clone(),
-            chunk,
-        })
-        .is_ok()
+        forward_stream_event(
+            &tx,
+            api::Event::AssistantDelta {
+                conversation_id: conv_id_for_cb.clone(),
+                request_id: req_id_for_cb.clone(),
+                chunk,
+            },
+        )
     });
 
     // Bridge status updates from core callback -> canonical events, and mirror

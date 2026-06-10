@@ -854,17 +854,47 @@ impl<L> RetryingLlmClient<L> {
 }
 
 /// Build a fresh per-attempt callback that forwards into the shared real callback.
-/// The real callback is consumed only once across all retries.
-fn proxy_callback(shared: &Arc<Mutex<Option<ChunkCallback>>>) -> ChunkCallback {
+/// The real callback is consumed only once across all retries. `forwarded` is
+/// flipped the moment any chunk reaches the real callback, so the retry
+/// predicate can refuse to replay a stream the consumer already saw (DA-10).
+fn proxy_callback(
+    shared: &Arc<Mutex<Option<ChunkCallback>>>,
+    forwarded: &Arc<std::sync::atomic::AtomicBool>,
+) -> ChunkCallback {
     let cb_ref = Arc::clone(shared);
+    let forwarded = Arc::clone(forwarded);
     Box::new(move |chunk: String| -> bool {
         let mut guard = cb_ref.lock().unwrap();
         if let Some(ref mut cb) = *guard {
+            forwarded.store(true, std::sync::atomic::Ordering::Relaxed);
             cb(chunk)
         } else {
             false
         }
     })
+}
+
+/// Retry predicate shared by both streaming entry points: a transient error
+/// is retryable only while nothing has been emitted downstream. Once chunks
+/// were delivered, a replay would duplicate the already-rendered prefix (the
+/// chunk consumer is append-only), so the error must surface instead (DA-10).
+fn retry_unless_stream_started(
+    forwarded: &Arc<std::sync::atomic::AtomicBool>,
+) -> impl Fn(&CoreError) -> bool {
+    let forwarded = Arc::clone(forwarded);
+    move |e: &CoreError| {
+        if !is_retryable_error(e) {
+            return false;
+        }
+        if forwarded.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "retryable LLM error after chunks were already streamed — \
+                 surfacing the error instead of replaying the stream: {e}"
+            );
+            return false;
+        }
+        true
+    }
 }
 
 fn log_retry(err: &CoreError, dur: Duration) {
@@ -905,6 +935,7 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let shared_cb: Arc<Mutex<Option<ChunkCallback>>> = Arc::new(Mutex::new(Some(on_chunk)));
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         (|| async {
             self.inner
@@ -912,12 +943,12 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
                     messages.clone(),
                     tools,
                     reasoning,
-                    proxy_callback(&shared_cb),
+                    proxy_callback(&shared_cb, &forwarded),
                 )
                 .await
         })
         .retry(self.backoff())
-        .when(is_retryable_error)
+        .when(retry_unless_stream_started(&forwarded))
         .notify(log_retry)
         .await
     }
@@ -935,6 +966,7 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         let shared_cb: Arc<Mutex<Option<ChunkCallback>>> = Arc::new(Mutex::new(Some(on_chunk)));
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         (|| async {
             self.inner
@@ -943,12 +975,12 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
                     core_tools,
                     namespaces,
                     reasoning,
-                    proxy_callback(&shared_cb),
+                    proxy_callback(&shared_cb, &forwarded),
                 )
                 .await
         })
         .retry(self.backoff())
-        .when(is_retryable_error)
+        .when(retry_unless_stream_started(&forwarded))
         .notify(log_retry)
         .await
     }
@@ -1145,6 +1177,78 @@ mod tests {
             on_chunk("ok".into());
             Ok(LlmResponse::text("ok"))
         }
+    }
+
+    #[tokio::test]
+    async fn mid_stream_retry_does_not_duplicate_emitted_text() {
+        // DA-10: a retryable error AFTER chunks were already delivered must
+        // not replay the stream — the consumer has already rendered (and the
+        // turn accumulator already holds) the emitted prefix, so a replay
+        // appends it twice. Once anything was emitted, the only safe move is
+        // to surface the error instead of retrying.
+        tokio::time::pause();
+
+        struct FailMidStreamLlm {
+            attempts: Mutex<u32>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for FailMidStreamLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                mut on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                let mut attempts = self.attempts.lock().unwrap();
+                *attempts += 1;
+                if *attempts == 1 {
+                    // First attempt: emit a prefix, then die retryably
+                    // (Anthropic mid-SSE `overloaded` shape).
+                    on_chunk("Hello, ".into());
+                    return Err(CoreError::RateLimited {
+                        retry_after: None,
+                        detail: "overloaded mid-stream".into(),
+                    });
+                }
+                on_chunk("Hello, ".into());
+                on_chunk("world".into());
+                Ok(LlmResponse::text("Hello, world"))
+            }
+        }
+
+        let client = RetryingLlmClient::new(
+            FailMidStreamLlm {
+                attempts: Mutex::new(0),
+            },
+            3,
+        );
+
+        let received = Arc::new(Mutex::new(String::new()));
+        let received_clone = Arc::clone(&received);
+        let result = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(move |chunk| {
+                    received_clone.lock().unwrap().push_str(&chunk);
+                    true
+                }),
+            )
+            .await;
+
+        let received = received.lock().unwrap();
+        assert_eq!(
+            *received, "Hello, ",
+            "already-emitted text must never be replayed to the consumer"
+        );
+        assert!(
+            result.is_err(),
+            "a mid-stream failure after emitted chunks must surface the error, \
+             not silently return a spliced response"
+        );
     }
 
     #[tokio::test]

@@ -25,12 +25,13 @@ use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
-use crate::sanitize::{sanitize_assistant_text, sanitize_assistant_text_for_stream};
+use crate::sanitize::sanitize_assistant_text;
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_text, summarize_tool_value,
     tool_set_hash,
 };
 use chrono::{Duration, Local};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Return `Err(CoreError::Cancelled)` if the current task's cancellation
@@ -576,12 +577,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         &self,
         conversation_id: &ConversationId,
         prompt: String,
-        mut on_chunk: ChunkCallback,
+        on_chunk: ChunkCallback,
         mut on_status: StatusCallback,
     ) -> Result<String, CoreError> {
         // Cooperative cancellation checkpoint (issue #109): bail out
         // before any I/O if the caller has already tripped the token.
         bail_if_cancelled()?;
+
+        // The chunk callback must survive every tool round: each round's
+        // stream wrapper gets a proxy into this shared slot instead of
+        // consuming the callback, so the final answer of a tool-calling turn
+        // still streams (DA-9 — rounds after the first used to replace the
+        // callback with a noop and stream nothing).
+        let on_chunk: Arc<std::sync::Mutex<ChunkCallback>> =
+            Arc::new(std::sync::Mutex::new(on_chunk));
 
         let mut conv = self.store.get(conversation_id).await?;
         let is_first_message = conv.messages.is_empty();
@@ -836,9 +845,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 Some(&tool_locality),
                 &estimate,
             );
-            let mut raw_stream = String::new();
-            let mut emitted_visible_len = 0usize;
-            let mut visible_chunk_callback = on_chunk;
+            // Incremental sanitizer: carries think-block parser state across
+            // chunks so each byte is scanned once, instead of re-sanitizing
+            // the full accumulated stream on every chunk (O(n²) per turn).
+            let mut sanitizer = crate::sanitize::StreamSanitizer::new();
+            let visible_chunk_callback = Arc::clone(&on_chunk);
             // Capture a clone of the per-turn cancellation token so the
             // wrapped callback can short-circuit mid-stream by returning
             // `false` — the contract LLM adapters already obey to abort
@@ -852,25 +863,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 if cancellation_token.is_cancelled() {
                     return false;
                 }
-                raw_stream.push_str(&chunk);
-                let sanitized = sanitize_assistant_text_for_stream(&raw_stream);
-
-                if sanitized.len() < emitted_visible_len {
-                    emitted_visible_len = sanitized.len();
-                    return true;
-                }
-
-                if sanitized.len() <= emitted_visible_len {
-                    return true;
-                }
-
-                let visible = sanitized[emitted_visible_len..].to_string();
-                emitted_visible_len = sanitized.len();
+                let visible = sanitizer.push(&chunk);
 
                 if visible.is_empty() {
                     true
                 } else {
-                    visible_chunk_callback(visible)
+                    (visible_chunk_callback.lock().unwrap())(visible)
                 }
             });
 
@@ -933,7 +931,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     // Drop the frames so no later complete_step evicts the wrong
                     // range — the plan todos persist on the scratchpad regardless.
                     step_stack.clear();
-                    on_chunk = Box::new(|_| true);
                     continue;
                 }
                 Err(CoreError::Cancelled) => {
@@ -1049,7 +1046,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                          tools you need. You now have access to `builtin_tool_search` \
                          — call it with a query describing what you need.",
                     ));
-                    on_chunk = Box::new(|_| true);
                     continue;
                 }
 
@@ -1105,8 +1101,34 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // round; this one protects the inner per-tool loop.
                 bail_if_cancelled()?;
 
-                let arguments: serde_json::Value =
-                    serde_json::from_str(&tool_call.arguments).unwrap_or_default();
+                // Parse the model-supplied argument JSON. An empty string is
+                // tolerated as "no arguments" (some providers emit it for
+                // zero-arg calls), but otherwise-malformed JSON must NOT be
+                // silently defaulted to `null` — the tool would run with
+                // garbage arguments and the model would get a confusing
+                // tool-specific error instead of the real cause (DA-13).
+                let arguments: serde_json::Value = if tool_call.arguments.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    match serde_json::from_str(&tool_call.arguments) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                tool = %tool_call.name,
+                                error = %e,
+                                "tool call arguments were not valid JSON"
+                            );
+                            conv.messages.push(Message::tool_result(
+                                &tool_call.id,
+                                format!(
+                                    "Error: the arguments for this tool call were not valid \
+                                     JSON ({e}). Emit valid JSON and call the tool again."
+                                ),
+                            ));
+                            continue;
+                        }
+                    }
+                };
                 tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
 
                 // Step-planning + compaction control (#240) is handled here in
@@ -1298,10 +1320,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 conv.messages
                     .push(Message::tool_result(&tool_call.id, &stored));
             }
-
-            // Create a new noop callback for subsequent rounds
-            // (the original callback was consumed by stream_completion)
-            on_chunk = Box::new(|_| true);
         }
 
         // If we exhausted all rounds, return what we have
@@ -1869,6 +1887,164 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn final_answer_streams_after_a_tool_round() {
+        // DA-9: the user-facing chunk callback must keep streaming after the
+        // first tool round — the final answer of a tool-calling turn used to
+        // stream nothing because later rounds replaced the callback with a
+        // noop.
+        let tool_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "read_file", "{}")]),
+            LlmResponse::text("final answer after tools"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "data".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let streamed = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&streamed);
+        let cb: ChunkCallback = Box::new(move |chunk| {
+            sink.lock().unwrap().push_str(&chunk);
+            true
+        });
+
+        handler
+            .send_prompt(&conv.id, "go".into(), cb, noop_status())
+            .await
+            .unwrap();
+
+        let streamed = streamed.lock().unwrap();
+        assert!(
+            streamed.contains("final answer after tools"),
+            "the final answer must be streamed to the caller, got: {streamed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_answer_streams_after_multiple_tool_rounds() {
+        // DA-9 unhappy path: two consecutive tool rounds, then text. Streaming
+        // must survive every round transition, not just the first.
+        let tool_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "read_file", "{}")]),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-2", "read_file", "{}")]),
+            LlmResponse::text("done at last"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "data".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let streamed = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&streamed);
+        let cb: ChunkCallback = Box::new(move |chunk| {
+            sink.lock().unwrap().push_str(&chunk);
+            true
+        });
+
+        handler
+            .send_prompt(&conv.id, "go".into(), cb, noop_status())
+            .await
+            .unwrap();
+
+        let streamed = streamed.lock().unwrap();
+        assert!(
+            streamed.contains("done at last"),
+            "the final answer must be streamed after multiple tool rounds, got: {streamed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_call_arguments_surface_parse_error_to_model() {
+        // DA-13: when the model emits tool-call arguments that are not valid
+        // JSON, the tool must NOT run with defaulted (null) arguments; the
+        // tool result must tell the model its arguments were invalid JSON so
+        // it can correct itself.
+        let tool_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let bad_call = ToolCall::new("call-1", "read_file", "{ this is not json");
+
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![bad_call]),
+            LlmResponse::text("done"),
+        ];
+
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "hello world".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "done");
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.messages[2].role, Role::Tool);
+        let content = &updated.messages[2].content;
+        assert!(
+            content.contains("not valid JSON"),
+            "tool result must report invalid-JSON arguments, got: {content}"
+        );
+        assert!(
+            !content.contains("hello world"),
+            "tool must not execute with defaulted arguments, got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_tool_call_arguments_are_treated_as_empty_object() {
+        // DA-13 unhappy-path guard: some providers emit an empty string for
+        // no-argument tool calls. That must keep executing (as `{}`), not be
+        // rejected as malformed JSON.
+        let tool_def = ToolDefinition::new(
+            "list_files",
+            "List files",
+            serde_json::json!({"type": "object"}),
+        );
+        let empty_call = ToolCall::new("call-1", "list_files", "");
+
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![empty_call]),
+            LlmResponse::text("done"),
+        ];
+
+        let mut tool_results = HashMap::new();
+        tool_results.insert("list_files".to_string(), "a.txt".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(updated.messages[2].role, Role::Tool);
+        assert_eq!(
+            updated.messages[2].content, "a.txt",
+            "empty-string arguments must execute the tool with an empty object"
+        );
+    }
+
     // --- Planning + compaction (#240) ---
 
     /// An in-memory scratchpad backing the write/list closures, plus a handle
@@ -2151,7 +2327,11 @@ mod tests {
             responses: Mutex::new(vec![
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new("b1", "begin_step", r#"{"goal":"map the plan"}"#)],
+                    vec![ToolCall::new(
+                        "b1",
+                        "begin_step",
+                        r#"{"goal":"map the plan"}"#,
+                    )],
                 ),
                 LlmResponse::text("done"),
             ]),

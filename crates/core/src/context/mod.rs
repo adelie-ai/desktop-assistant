@@ -24,6 +24,7 @@ use crate::domain::{
     Conversation, Message, MessageSummary, Role, ToolDefinition, ToolLocality, ToolNamespace,
     TransportKind,
 };
+use crate::planning;
 use crate::ports::llm::{ContextBudget, LlmClient, ReasoningConfig};
 
 /// Default maximum number of conversation messages sent to the LLM per turn.
@@ -898,10 +899,17 @@ pub(crate) fn window_start(messages: &[Message], max_messages: usize) -> usize {
     }
     // No User message found; at minimum skip past any Tool messages so we
     // never start with orphaned tool results.
-    search
+    if let Some(offset) = search.iter().position(|m| m.role != Role::Tool) {
+        return tentative + offset;
+    }
+    // The entire window is Tool messages (one assistant message fanned out
+    // more tool calls than the window holds). Walk back to the owning
+    // assistant `tool_calls` message so the invariant above still holds
+    // (DA-12); a slightly larger window beats a guaranteed provider 400.
+    messages[..tentative]
         .iter()
-        .position(|m| m.role != Role::Tool)
-        .map_or(tentative, |offset| tentative + offset)
+        .rposition(|m| m.role != Role::Tool)
+        .unwrap_or(0)
 }
 
 /// Determine which message range (if any) should be compacted into the
@@ -947,7 +955,9 @@ pub(crate) async fn generate_context_summary<L: LlmClient>(
             Role::Assistant if !msg.content.is_empty() => {
                 transcript.push_str("Assistant: ");
                 if msg.content.len() > 2000 {
-                    transcript.push_str(&msg.content[..2000]);
+                    // Char-boundary-safe cut: a naive byte slice panics when
+                    // byte 2000 lands inside a multibyte character (DA-2).
+                    transcript.push_str(&planning::truncate_on_char_boundary(&msg.content, 2000));
                     transcript.push_str("...[truncated]");
                 } else {
                     transcript.push_str(&msg.content);
@@ -1323,6 +1333,31 @@ mod tests {
         // around 30 - 8 = 22, snapped forward to a User boundary.
         assert!(start >= 30 - MIN_CONTEXT_MESSAGES);
         assert!(matches!(msgs[start].role, Role::User | Role::Assistant));
+    }
+
+    #[test]
+    fn window_start_all_tool_window_never_returns_tool_index() {
+        // DA-12: when the entire candidate window consists of Tool messages
+        // (one assistant message fanning out many tool calls), window_start
+        // must still honour its documented invariant and never return a Tool
+        // index — otherwise every retry sends orphaned tool results and the
+        // provider rejects the request with HTTP 400.
+        let mut msgs = vec![Message::new(Role::User, "initial")];
+        let calls: Vec<ToolCall> = (0..12)
+            .map(|i| ToolCall::new(format!("c{i}"), "tool_a", "{}"))
+            .collect();
+        msgs.push(Message::assistant_with_tool_calls(calls));
+        for i in 0..12 {
+            msgs.push(Message::tool_result(format!("c{i}"), format!("r{i}")));
+        }
+        // max clamps to MIN_CONTEXT_MESSAGES (8); the tail window of 8 is
+        // entirely Tool messages, so both fallback searches find nothing.
+        let start = window_start(&msgs, 2);
+        assert_ne!(
+            msgs[start].role,
+            Role::Tool,
+            "window must never start on a Tool message, got index {start}"
+        );
     }
 
     #[test]
@@ -2344,6 +2379,23 @@ mod tests {
         let llm = FailingLlm;
         let result = generate_context_summary("existing summary", &messages, &llm).await;
         assert_eq!(result, "existing summary");
+    }
+
+    #[tokio::test]
+    async fn generate_context_summary_truncates_multibyte_content_on_char_boundary() {
+        // DA-2: an assistant message longer than 2000 bytes whose byte 2000
+        // falls in the middle of a multibyte character must not panic the
+        // summariser. 1999 ASCII bytes followed by 2-byte 'é's puts byte
+        // 2000 mid-character.
+        let mut content = "a".repeat(1999);
+        content.push_str(&"é".repeat(20));
+        assert!(content.len() > 2000);
+        assert!(!content.is_char_boundary(2000));
+
+        let messages = vec![Message::new(Role::Assistant, content)];
+        let llm = MockLlm::new(vec!["summary of long message"]);
+        let result = generate_context_summary("", &messages, &llm).await;
+        assert_eq!(result, "summary of long message");
     }
 
     #[tokio::test]
