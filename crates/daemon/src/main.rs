@@ -765,6 +765,25 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // DT-3 (#269): operator escape hatch. `desktop-assistant --revoke-token
+    // <jwt>` adds the token's `jti` to the WS JWT revocation deny-list and
+    // exits without starting the daemon, so a leaked short-lived token can be
+    // killed before its 1h expiry. The token must still be a valid,
+    // unexpired, daemon-signed JWT (we read its jti/exp); garbage is rejected.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = args.iter().position(|a| a == "--revoke-token") {
+            let token = args
+                .get(pos + 1)
+                .ok_or_else(|| anyhow::anyhow!("--revoke-token requires a JWT argument"))?;
+            config::revoke_ws_jwt(token)
+                .map_err(|e| anyhow::anyhow!("failed to revoke token: {e}"))?;
+            tracing::info!("ws jwt revoked");
+            println!("token revoked");
+            return Ok(());
+        }
+    }
+
     tracing::info!("desktop-assistant starting");
 
     // Install the rustls crypto provider for TLS support. Returns Err if a
@@ -799,6 +818,11 @@ async fn main() -> Result<()> {
             tracing::warn!("Secret Service store init task failed: {error}");
         }
     }
+
+    // DT-3 (#269): drop WS JWT revocation entries whose own `exp` has already
+    // passed (they're rejected by the exp check anyway), so the deny-list file
+    // can't grow without bound across restarts.
+    config::prune_revocations();
 
     // Build the LLM client from daemon.toml + KWallet (fallback to env)
     let config_path = config::default_daemon_config_path();

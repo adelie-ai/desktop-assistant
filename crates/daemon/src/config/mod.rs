@@ -34,7 +34,10 @@ pub use views::{
 // Re-export the JWT + OIDC public API at the `config::` path so existing
 // callers (`config::generate_ws_jwt`, `config::OidcValidator`, etc.)
 // keep working unchanged.
-pub use jwt::{current_username, generate_ws_jwt, validate_ws_jwt, ws_jwt_sub};
+pub use jwt::{
+    current_username, generate_ws_jwt, prune_revocations, revoke_ws_jwt, validate_ws_jwt,
+    ws_jwt_sub,
+};
 pub use oidc::OidcValidator;
 
 // Resolution helpers — public API stays at `config::` for callers in
@@ -1995,8 +1998,8 @@ y = 2
 
             // Read the revocation file straight from disk and confirm the jti
             // is recorded (persistence, not just a cached set).
-            let claims = jwt::decode_ws_jwt_claims_ignoring_revocation(&token)
-                .expect("decode for jti");
+            let claims =
+                jwt::decode_ws_jwt_claims_ignoring_revocation(&token).expect("decode for jti");
             assert!(
                 jwt::is_jti_revoked(&claims.jti),
                 "revoked jti must be readable from the persisted list"
