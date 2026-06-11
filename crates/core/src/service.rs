@@ -1921,6 +1921,187 @@ mod tests {
         );
     }
 
+    // --- TOOL_ALLOWLIST dispatch enforcement (issue #291 / #133) --------
+    //
+    // The `TOOL_ALLOWLIST` task-local (#113) is read at the dispatch
+    // chokepoint: a tool call whose name is NOT on the allowlist is
+    // rejected with a recoverable tool_result error and the executor is
+    // never invoked. `None` means "no restriction"; an empty allowlist
+    // means "no tools".
+
+    #[tokio::test]
+    async fn dispatch_rejects_tool_not_on_allowlist() {
+        // A subagent is given `tools: ["read_file"]` but the LLM tries to
+        // call `delete_file`. The call must be rejected with a recoverable
+        // error folded into the tool_result, and the executor must NOT run
+        // the disallowed tool (it would have returned "boom" if it had).
+        let read_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let delete_def = ToolDefinition::new(
+            "delete_file",
+            "Delete a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let bad_call = ToolCall::new("call-1", "delete_file", r#"{"path": "/etc/passwd"}"#);
+
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![bad_call]),
+            LlmResponse::text("done"),
+        ];
+        let mut tool_results = HashMap::new();
+        // If dispatch wrongly executes the disallowed tool, this is what it
+        // would return — its absence from the history proves enforcement.
+        tool_results.insert("delete_file".to_string(), "boom".to_string());
+
+        let handler = make_tool_handler(responses, vec![read_def, delete_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = crate::ports::llm::with_tool_allowlist(
+            vec!["read_file".to_string()],
+            handler.send_prompt(
+                &conv.id,
+                "delete the file".into(),
+                noop_callback(),
+                noop_status(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "done");
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let tool_msg = updated
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool_result must be recorded for the rejected call");
+        assert!(
+            tool_msg.content.contains("not permitted")
+                || tool_msg.content.to_lowercase().contains("not allowed"),
+            "rejection text should explain the tool is not on the allowlist, got: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains("delete_file"),
+            "rejection should name the disallowed tool, got: {}",
+            tool_msg.content
+        );
+        assert!(
+            !tool_msg.content.contains("boom"),
+            "the disallowed tool must NOT have executed, got: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_allows_tool_on_allowlist() {
+        // Baseline: an allowed tool dispatches normally under an allowlist.
+        let read_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let good_call = ToolCall::new("call-1", "read_file", r#"{"path": "/tmp/ok"}"#);
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![good_call]),
+            LlmResponse::text("read it"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "hello world".to_string());
+
+        let handler = make_tool_handler(responses, vec![read_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let result = crate::ports::llm::with_tool_allowlist(
+            vec!["read_file".to_string()],
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "read it");
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let tool_msg = updated
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool_result must be recorded");
+        assert_eq!(
+            tool_msg.content, "hello world",
+            "an allowlisted tool must execute normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_empty_allowlist_rejects_every_tool() {
+        // An empty allowlist (distinct from None) means "no tools": every
+        // tool call is rejected.
+        let read_def = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let call = ToolCall::new("call-1", "read_file", r#"{"path": "/tmp/ok"}"#);
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![call]),
+            LlmResponse::text("done"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "hello world".to_string());
+
+        let handler = make_tool_handler(responses, vec![read_def], tool_results);
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        // Re-run under an empty allowlist via a fresh conversation/handler so
+        // the assertion is unambiguous.
+        let read_def2 = ToolDefinition::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({"type": "object"}),
+        );
+        let call2 = ToolCall::new("call-1", "read_file", r#"{"path": "/tmp/ok"}"#);
+        let responses2 = vec![
+            LlmResponse::with_tool_calls("", vec![call2]),
+            LlmResponse::text("done"),
+        ];
+        let mut tr2 = HashMap::new();
+        tr2.insert("read_file".to_string(), "hello world".to_string());
+        let handler2 = make_tool_handler(responses2, vec![read_def2], tr2);
+        let conv2 = handler2.create_conversation("Test".into()).await.unwrap();
+
+        crate::ports::llm::with_tool_allowlist(
+            Vec::new(),
+            handler2.send_prompt(&conv2.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .unwrap();
+
+        let updated = handler2.get_conversation(&conv2.id).await.unwrap();
+        let tool_msg = updated
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool_result must be recorded for the rejected call");
+        assert!(
+            !tool_msg.content.contains("hello world"),
+            "an empty allowlist must reject every tool, got: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains("not permitted")
+                || tool_msg.content.to_lowercase().contains("not allowed"),
+            "rejection text expected, got: {}",
+            tool_msg.content
+        );
+    }
+
     #[tokio::test]
     async fn final_answer_streams_after_a_tool_round() {
         // DA-9: the user-facing chunk callback must keep streaming after the
