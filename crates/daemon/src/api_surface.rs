@@ -1626,6 +1626,109 @@ mod tests {
         assert_eq!(i.effort, Some(Effort::Medium));
     }
 
+    // ----- RegistryHandle lock robustness (DT-9 / #276) ----------------
+    //
+    // Two invariants:
+    //  1. A panic while a holder has the lock must NOT poison it — every
+    //     subsequent acquirer must still succeed (no daemon-wide cascade).
+    //  2. `mutate_config` must NOT hold the data lock across its blocking
+    //     file I/O + registry rebuild — concurrent readers must not stall
+    //     for the duration of the disk write.
+
+    /// A panicking lock holder must not poison the lock: the next acquirer
+    /// (here a `snapshot_config` read) must still succeed rather than
+    /// inheriting a poisoned-lock panic.
+    #[test]
+    fn panicked_holder_does_not_poison_lock() {
+        let cfg = config_with_connections(&[("local", ollama_local())]);
+        let handle = make_handle_with(cfg);
+
+        // Spawn a thread that panics from *inside* `mutate_config`'s
+        // closure — i.e. while the write lock is held in the old code. With
+        // a poisoning std::RwLock this leaves the lock permanently poisoned.
+        let h = Arc::clone(&handle);
+        let res = std::thread::spawn(move || {
+            let _ = h.mutate_config(|_cfg| {
+                panic!("holder panicked while holding the write lock");
+            });
+        })
+        .join();
+        assert!(res.is_err(), "the holder thread should have panicked");
+
+        // With a poisoning std::RwLock this read would itself panic
+        // (poison cascade). It must succeed.
+        let snap = handle.snapshot_config();
+        assert!(snap.connections.contains_key("local"));
+
+        // A subsequent mutate must also still work.
+        let svc = DaemonConnectionsService::new(Arc::clone(&handle));
+        // mutate via set_personality (cheap, no connection rebuild needed)
+        handle
+            .set_personality(snap.personality)
+            .expect("mutate after a poisoned-holder panic must still succeed");
+        // and a read path through the service:
+        let _ = svc; // service constructed fine; lock usable
+    }
+
+    /// `mutate_config` must drop the data lock before doing its blocking
+    /// file write + registry rebuild. We prove it by pointing the config
+    /// path at a FIFO with no reader: `save_daemon_config`'s `open(O_WRONLY)`
+    /// blocks forever. A concurrent `snapshot_config` read must still
+    /// complete promptly — it would hang if the write lock were held across
+    /// the I/O.
+    #[cfg(unix)]
+    #[test]
+    fn mutate_config_does_not_hold_lock_across_blocking_io() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Build a FIFO path. open(O_WRONLY) on a FIFO blocks until a reader
+        // appears, which never happens here — a deterministic "slow I/O".
+        let dir = std::env::temp_dir();
+        let fifo = dir.join(format!(
+            "da-test-fifo-{}.toml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cstr = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let cfg = config_with_connections(&[("local", ollama_local())]);
+        let registry = build_registry(&cfg);
+        let handle =
+            Arc::new(RegistryHandle::new(cfg, registry).with_config_path(fifo.clone()));
+
+        // Writer thread: this mutate will block inside the file write
+        // (open on the readerless FIFO) and never return.
+        let writer = Arc::clone(&handle);
+        std::thread::spawn(move || {
+            let _ = writer.set_personality(
+                desktop_assistant_core::prompts::Personality::default(),
+            );
+        });
+
+        // Give the writer time to reach (and block in) the file write.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Reader: must complete promptly. If the write lock were held across
+        // the blocked I/O, this read would hang and the recv would time out.
+        let reader = Arc::clone(&handle);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let snap = reader.snapshot_config();
+            let _ = tx.send(snap.connections.contains_key("local"));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(found) => assert!(found, "reader saw the expected config"),
+            Err(_) => panic!(
+                "snapshot_config hung — the write lock is held across blocking I/O"
+            ),
+        }
+
+        let _ = std::fs::remove_file(&fifo);
+    }
+
     #[test]
     fn anthropic_effort_mapping_table() {
         assert_eq!(map_anthropic_thinking_budget(Effort::Low), 0);
