@@ -315,11 +315,6 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// `Arc<tokio::sync::Mutex<()>>`; the caller `.lock().await`s it and holds
     /// the guard across the turn body. The `std::sync::Mutex` is held only for
     /// this upgrade/insert/prune — never across an `.await`.
-    // RED-COMMIT NOTE: defined here but not yet wired into `send_prompt`; the
-    // fix commit adds the acquisition. `#[allow(dead_code)]` for the TDD red
-    // commit so the concurrency tests compile-and-fail rather than fail to
-    // build; the attribute is removed in the fix commit.
-    #[allow(dead_code)]
     fn turn_lock_for(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.turn_locks.lock().expect("turn_locks mutex poisoned");
         // Opportunistic prune: drop entries whose Arc is gone. Bounded work —
@@ -622,6 +617,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         id: &ConversationId,
         title: String,
     ) -> Result<(), CoreError> {
+        // Rename is itself a whole-conversation read-modify-write (get → set
+        // title → full `store.update`), so a rename racing an active turn would
+        // load a stale snapshot and clobber the turn's messages. Take the same
+        // per-conversation lock as `send_prompt` (#282); it's quick, so queueing
+        // it behind a turn is invisible. `archive`/`unarchive`/`delete` don't
+        // load-and-rewrite message rows, so they need no lock.
+        let turn_lock = self.turn_lock_for(&id.0);
+        let _turn_guard = turn_lock.lock().await;
         let mut conv = self.store.get(id).await?;
         conv.title = title;
         conv.updated_at = now_timestamp();
@@ -657,6 +660,47 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
     ) -> Result<String, CoreError> {
         // Cooperative cancellation checkpoint (issue #109): bail out
         // before any I/O if the caller has already tripped the token.
+        bail_if_cancelled()?;
+
+        // Per-conversation turn serialization (#282). Concurrent turns on the
+        // SAME conversation are a read-modify-write race: each does
+        // `store.get` → mutate `conv.messages` → `store.update`, so a late
+        // `update` clobbers a turn that completed in between, silently losing
+        // its user prompt + reply. We serialize turn bodies per conversation
+        // id by holding a per-conversation async mutex across the WHOLE turn.
+        //
+        // The guard is the first local, so RAII releases it on every return
+        // path — `?`, error arms, and panics alike (no poisoning:
+        // `tokio::sync::Mutex` guards are plain RAII). Different conversation
+        // ids take different mutexes and never contend.
+        //
+        // INVARIANT (deadlock-freedom): a turn holding conversation X's lock
+        // must never dispatch another turn to X. The only re-entrant turn path
+        // is `spawn_subagent`, which always targets a FRESH child conversation
+        // (lock order is strictly parent→fresh-child, acyclic). `begin_step` /
+        // `complete_step` are handled inline in this dispatch loop and never
+        // re-enter `send_prompt`.
+        //
+        // The wait itself is cancellable so a turn QUEUED behind a long
+        // agentic turn can be cancelled while it waits (not just at the next
+        // checkpoint): we `select!` the lock acquisition against the
+        // cancellation token. Dropping the losing `lock()` future removes the
+        // waiter from the mutex's FIFO queue without disturbing the running
+        // turn.
+        let turn_lock = self.turn_lock_for(&conversation_id.0);
+        let _turn_guard = match current_cancellation_token() {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(CoreError::Cancelled),
+                    guard = turn_lock.lock() => guard,
+                }
+            }
+            None => turn_lock.lock().await,
+        };
+        // Re-check after acquiring: the wait may have been long (a multi-minute
+        // agentic turn ahead of us), and the token may have tripped just as we
+        // won the lock.
         bail_if_cancelled()?;
 
         // The chunk callback must survive every tool round: each round's
@@ -5366,13 +5410,33 @@ mod concurrency_tests {
         Box::new(|_| {})
     }
 
+    /// Marker content for the pre-seeded history message (see below).
+    const SEED_MARKER: &str = "__seed__";
+
+    /// Seed a conversation that already has one prior assistant message. This
+    /// makes `is_first_message` false, so a turn does NOT trigger title
+    /// generation — which would otherwise be a *second* LLM call per turn and
+    /// require a second gate permit, confounding the permit-based timing these
+    /// tests rely on. Assertions filter out `SEED_MARKER` so the seed is
+    /// invisible to message-count checks.
     fn seed_conv(store: &SharedStore, id: &str) -> ConversationId {
         let mut conv = Conversation::new(id, "Chat");
         let ts = now_timestamp();
         conv.created_at = ts.clone();
         conv.updated_at = ts;
+        conv.messages
+            .push(Message::new(Role::Assistant, SEED_MARKER));
         store.data.lock().unwrap().insert(id.to_string(), conv);
         ConversationId(id.to_string())
+    }
+
+    /// Messages excluding the pre-seeded history marker (see `seed_conv`).
+    fn real_messages(conv: &Conversation) -> Vec<(Role, String)> {
+        conv.messages
+            .iter()
+            .filter(|m| m.content != SEED_MARKER)
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
     }
 
     /// AC1: two concurrent turns on ONE conversation must both persist — both
@@ -5412,30 +5476,22 @@ mod concurrency_tests {
         t2.await.unwrap().unwrap();
 
         let conv = store.data.lock().unwrap().get("c1").cloned().unwrap();
-        let users: Vec<String> = conv
-            .messages
+        let real = real_messages(&conv);
+        let users: Vec<&String> = real
             .iter()
-            .filter(|m| m.role == Role::User)
-            .map(|m| m.content.clone())
+            .filter(|(r, _)| *r == Role::User)
+            .map(|(_, c)| c)
             .collect();
-        let assistants = conv
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::Assistant)
-            .count();
+        let assistants = real.iter().filter(|(r, _)| *r == Role::Assistant).count();
         assert!(
-            users.contains(&"first".to_string()) && users.contains(&"second".to_string()),
-            "both user prompts must survive, got: {:?}",
-            conv.messages
-                .iter()
-                .map(|m| (m.role.clone(), m.content.clone()))
-                .collect::<Vec<_>>()
+            users.contains(&&"first".to_string()) && users.contains(&&"second".to_string()),
+            "both user prompts must survive, got: {real:?}"
         );
         assert_eq!(
             assistants, 2,
-            "both assistant replies must survive (4 messages total)"
+            "both assistant replies must survive (4 real messages total), got: {real:?}"
         );
-        assert_eq!(conv.messages.len(), 4);
+        assert_eq!(real.len(), 4);
     }
 
     /// AC2: turns on DIFFERENT conversations must not serialize. The gated LLM
@@ -5675,15 +5731,16 @@ mod concurrency_tests {
 
         let conv = store.data.lock().unwrap().get("c1").cloned().unwrap();
         assert_eq!(conv.title, "New Title", "rename must take effect");
+        let real = real_messages(&conv);
         assert!(
-            conv.messages.iter().any(|m| m.content == "hello"),
-            "the turn's user message must survive the rename, got: {:?}",
-            conv.messages
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>()
+            real.iter().any(|(_, c)| c == "hello"),
+            "the turn's user message must survive the rename, got: {real:?}"
         );
-        assert_eq!(conv.messages.len(), 2, "user + assistant must both survive");
+        assert_eq!(
+            real.len(),
+            2,
+            "user + assistant must both survive the rename, got: {real:?}"
+        );
     }
 
     /// AC: the lock map must not grow unboundedly — entries are weak and pruned,
