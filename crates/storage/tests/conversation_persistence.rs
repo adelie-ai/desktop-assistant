@@ -71,7 +71,9 @@ impl Fixture {
             .await
             .expect("connect per-test pool");
 
-        run_migrations(&pool).await.expect("run_migrations succeeds");
+        run_migrations(&pool)
+            .await
+            .expect("run_migrations succeeds");
 
         Some(Self {
             pool,
@@ -116,8 +118,13 @@ fn conversation_with_messages(id: &str, count: usize) -> Conversation {
     conv.created_at = "2026-01-01 00:00:00".to_string();
     conv.updated_at = "2026-01-01 00:00:00".to_string();
     for i in 0..count {
-        let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
-        conv.messages.push(Message::new(role, format!("message {i}")));
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        conv.messages
+            .push(Message::new(role, format!("message {i}")));
     }
     conv
 }
@@ -125,13 +132,12 @@ fn conversation_with_messages(id: &str, count: usize) -> Conversation {
 /// Row ids in ordinal order, fetched directly so the assertion is on the
 /// actual persisted rows.
 async fn message_ids(pool: &PgPool, conversation_id: &str) -> Vec<String> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM messages WHERE conversation_id = $1 ORDER BY ordinal",
-    )
-    .bind(conversation_id)
-    .fetch_all(pool)
-    .await
-    .expect("fetch message ids");
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM messages WHERE conversation_id = $1 ORDER BY ordinal")
+            .bind(conversation_id)
+            .fetch_all(pool)
+            .await
+            .expect("fetch message ids");
     rows.into_iter().map(|(id,)| id).collect()
 }
 
@@ -215,51 +221,54 @@ async fn noop_update_keeps_all_ids() {
 
 #[tokio::test]
 async fn summary_assignment_updates_rows_in_place() {
-    with_fixture("summary_assignment_updates_rows_in_place", |fx| async move {
-        let store = PgConversationStore::new(fx.pool.clone());
-        let mut conv = conversation_with_messages("conv-summary", 10);
+    with_fixture(
+        "summary_assignment_updates_rows_in_place",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
+            let mut conv = conversation_with_messages("conv-summary", 10);
 
-        with_user_id(UserId::new("u1"), async {
-            store.create(conv.clone()).await.expect("create");
-        })
-        .await;
-        let before = message_ids(&fx.pool, "conv-summary").await;
+            with_user_id(UserId::new("u1"), async {
+                store.create(conv.clone()).await.expect("create");
+            })
+            .await;
+            let before = message_ids(&fx.pool, "conv-summary").await;
 
-        // Simulate compaction assigning a summary id to the first 4 messages
-        // through the normal whole-conversation update path. (The summary row
-        // itself isn't needed for the messages-table assertion.)
-        for msg in conv.messages.iter_mut().take(4) {
-            msg.summary_id = Some("summary-1".to_string());
-        }
-        // messages.summary_id has an FK to message_summaries — create the row.
-        sqlx::query(
-            "INSERT INTO message_summaries \
+            // Simulate compaction assigning a summary id to the first 4 messages
+            // through the normal whole-conversation update path. (The summary row
+            // itself isn't needed for the messages-table assertion.)
+            for msg in conv.messages.iter_mut().take(4) {
+                msg.summary_id = Some("summary-1".to_string());
+            }
+            // messages.summary_id has an FK to message_summaries — create the row.
+            sqlx::query(
+                "INSERT INTO message_summaries \
                 (id, user_id, conversation_id, summary, start_ordinal, end_ordinal) \
              VALUES ('summary-1', 'u1', 'conv-summary', 's', 0, 3)",
-        )
-        .execute(&fx.pool)
-        .await
-        .expect("insert summary row");
+            )
+            .execute(&fx.pool)
+            .await
+            .expect("insert summary row");
 
-        with_user_id(UserId::new("u1"), async {
-            store.update(conv.clone()).await.expect("update");
-        })
-        .await;
+            with_user_id(UserId::new("u1"), async {
+                store.update(conv.clone()).await.expect("update");
+            })
+            .await;
 
-        let after = message_ids(&fx.pool, "conv-summary").await;
-        assert_eq!(before, after, "metadata-only change must keep all row ids");
+            let after = message_ids(&fx.pool, "conv-summary").await;
+            assert_eq!(before, after, "metadata-only change must keep all row ids");
 
-        let summary_col = summary_ids_column(&fx.pool, "conv-summary").await;
-        assert!(
-            summary_col[..4]
-                .iter()
-                .all(|s| s.as_deref() == Some("summary-1")),
-            "summary_id must be persisted on the first 4 rows: {summary_col:?}"
-        );
-        assert!(summary_col[4..].iter().all(|s| s.is_none()));
+            let summary_col = summary_ids_column(&fx.pool, "conv-summary").await;
+            assert!(
+                summary_col[..4]
+                    .iter()
+                    .all(|s| s.as_deref() == Some("summary-1")),
+                "summary_id must be persisted on the first 4 rows: {summary_col:?}"
+            );
+            assert!(summary_col[4..].iter().all(|s| s.is_none()));
 
-        fx
-    })
+            fx
+        },
+    )
     .await;
 }
 
@@ -337,9 +346,12 @@ async fn update_round_trips_tool_calls_and_tool_results() {
         |fx| async move {
             let store = PgConversationStore::new(fx.pool.clone());
             let mut conv = conversation_with_messages("conv-tools", 2);
-            conv.messages.push(Message::assistant_with_tool_calls(vec![
-                ToolCall::new("call-1", "read_file", r#"{"path":"/tmp/x"}"#),
-            ]));
+            conv.messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    "call-1",
+                    "read_file",
+                    r#"{"path":"/tmp/x"}"#,
+                )]));
             conv.messages
                 .push(Message::tool_result("call-1", "file contents"));
 

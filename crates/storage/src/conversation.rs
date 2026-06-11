@@ -366,18 +366,56 @@ impl ConversationStore for PgConversationStore {
             return Err(CoreError::ConversationNotFound(conv.id.0.clone()));
         }
 
-        // Replace all messages: delete existing, re-insert. Scoped by
-        // user_id as defense-in-depth — the UPDATE above already
-        // proved the conversation belongs to this user.
-        sqlx::query("DELETE FROM messages WHERE user_id = $1 AND conversation_id = $2")
+        // Structural diff-and-write (DS-5): load the existing rows in this
+        // same transaction (which already proved ownership) and write only
+        // what actually changed, keeping row ids stable per (conversation,
+        // ordinal) slot. The dominant cases — append-only turns and
+        // compaction stamping `summary_id` — touch no prior rows, so their
+        // tsvectors are not regenerated. Every statement stays scoped by
+        // user_id as defense-in-depth.
+        let existing: Vec<ExistingMsgRow> = sqlx::query_as(
+            "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id \
+             FROM messages \
+             WHERE user_id = $1 AND conversation_id = $2 \
+             ORDER BY ordinal",
+        )
+        .bind(user_id.as_str())
+        .bind(&conv.id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        for (ordinal, msg) in conv.messages.iter().enumerate() {
+            match existing.get(ordinal) {
+                // Row at this slot is structurally identical — no write at
+                // all, so its id and tsvector are untouched.
+                Some(row) if row.matches(msg) => {}
+                // Row exists but differs (e.g. summary_id stamped, or
+                // content shifted up by a mid-history removal): UPDATE in
+                // place, preserving the row id.
+                Some(_) => {
+                    update_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
+                }
+                // No row at this slot — a genuinely new (appended) message.
+                None => {
+                    insert_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
+                }
+            }
+        }
+
+        // Tail truncation: drop any persisted rows past the new length in a
+        // single ranged DELETE.
+        if existing.len() > conv.messages.len() {
+            sqlx::query(
+                "DELETE FROM messages \
+                 WHERE user_id = $1 AND conversation_id = $2 AND ordinal >= $3",
+            )
             .bind(user_id.as_str())
             .bind(&conv.id.0)
+            .bind(conv.messages.len() as i32)
             .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        for (ordinal, msg) in conv.messages.iter().enumerate() {
-            insert_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
         }
 
         tx.commit()
@@ -512,6 +550,17 @@ impl ConversationStore for PgConversationStore {
     }
 }
 
+/// JSONB representation of a message's tool calls. Empty tool calls map to
+/// SQL `NULL` (the historical `insert_message` behavior), so the unchanged-row
+/// comparison in `ExistingMsgRow::matches` stays consistent.
+fn tool_calls_json(msg: &Message) -> Option<serde_json::Value> {
+    if msg.tool_calls.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(&msg.tool_calls).unwrap_or_default())
+    }
+}
+
 async fn insert_message(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: &str,
@@ -519,11 +568,7 @@ async fn insert_message(
     ordinal: usize,
     msg: &Message,
 ) -> Result<(), CoreError> {
-    let tool_calls_json = if msg.tool_calls.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_value(&msg.tool_calls).unwrap_or_default())
-    };
+    let tool_calls_json = tool_calls_json(msg);
 
     sqlx::query(
         "INSERT INTO messages \
@@ -532,6 +577,40 @@ async fn insert_message(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(uuid::Uuid::now_v7().to_string())
+    .bind(user_id)
+    .bind(conversation_id)
+    .bind(ordinal as i32)
+    .bind(role_to_str(&msg.role))
+    .bind(&msg.content)
+    .bind(tool_calls_json)
+    .bind(&msg.tool_call_id)
+    .bind(&msg.summary_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+    Ok(())
+}
+
+/// In-place UPDATE of the message occupying `(conversation_id, ordinal)`,
+/// preserving its row id (and so its primary-key identity). Only called when
+/// the slot's content differs from what's persisted, so the regenerated
+/// tsvector cost is paid only for genuinely changed rows.
+async fn update_message(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
+    conversation_id: &str,
+    ordinal: usize,
+    msg: &Message,
+) -> Result<(), CoreError> {
+    let tool_calls_json = tool_calls_json(msg);
+
+    sqlx::query(
+        "UPDATE messages \
+         SET role = $4, content = $5, tool_calls = $6, \
+             tool_call_id = $7, summary_id = $8 \
+         WHERE user_id = $1 AND conversation_id = $2 AND ordinal = $3",
+    )
     .bind(user_id)
     .bind(conversation_id)
     .bind(ordinal as i32)
@@ -608,4 +687,34 @@ struct MsgRow {
 struct SummaryRow {
     id: String,
     summary: String,
+}
+
+/// An existing persisted message row, loaded inside `update`'s transaction to
+/// drive the structural diff. Carries exactly the columns `insert_message`
+/// writes (minus the id, which is what we are preserving) so a row can be
+/// compared structurally against an in-memory `Message`.
+#[derive(sqlx::FromRow)]
+struct ExistingMsgRow {
+    #[allow(dead_code)]
+    ordinal: i32,
+    role: String,
+    content: String,
+    tool_calls: Option<serde_json::Value>,
+    tool_call_id: Option<String>,
+    summary_id: Option<String>,
+}
+
+impl ExistingMsgRow {
+    /// Whether this persisted row is structurally identical to `msg`, i.e. a
+    /// re-insert would produce the same data. `tool_calls` is compared as a
+    /// `serde_json::Value` so JSONB key-order normalization cannot cause a
+    /// false mismatch; empty tool calls are stored as SQL `NULL` on both sides
+    /// (see `tool_calls_json`).
+    fn matches(&self, msg: &Message) -> bool {
+        self.role == role_to_str(&msg.role)
+            && self.content == msg.content
+            && self.tool_call_id == msg.tool_call_id
+            && self.summary_id == msg.summary_id
+            && self.tool_calls == tool_calls_json(msg)
+    }
 }
