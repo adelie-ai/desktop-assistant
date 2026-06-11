@@ -1890,6 +1890,152 @@ y = 2
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // DT-3 (#269): saner default TTL + jti revocation
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Run `body` with `XDG_DATA_HOME` pointed at a fresh unique temp dir so
+    /// the signing key and revocation list live in isolation. Serialised
+    /// against the other JWT tests via `ws_jwt_env_lock`.
+    fn with_isolated_jwt_store<F: FnOnce()>(tag: &str, body: F) {
+        let _guard = ws_jwt_env_lock();
+        let test_dir =
+            std::env::temp_dir().join(format!("da-test-ws-jwt-{tag}-{}", uuid::Uuid::new_v4()));
+        let data_home = test_dir.join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        // SAFETY: serialised against other JWT tests via `ws_jwt_env_lock`;
+        // the temp dir is unique per run (UUID-suffixed).
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+        body();
+        // SAFETY: same scope as the matching `set_var` above.
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(&test_dir).ok();
+    }
+
+    #[test]
+    fn default_ws_jwt_ttl_is_one_hour() {
+        // DT-3: the daemon default must align with the minter's 1h, not the
+        // old 30-day window. Clients re-mint on expiry.
+        assert_eq!(
+            jwt::default_ws_jwt_ttl_seconds(),
+            60 * 60,
+            "default WS JWT TTL must be 1 hour"
+        );
+    }
+
+    #[test]
+    fn valid_token_is_accepted() {
+        with_isolated_jwt_store("valid", || {
+            let token = generate_ws_jwt(Some("tui".to_string())).expect("generate jwt");
+            assert!(validate_ws_jwt(&token).expect("validate"));
+            assert_eq!(ws_jwt_sub(&token).as_deref(), Some("tui"));
+        });
+    }
+
+    #[test]
+    fn expired_token_is_rejected() {
+        with_isolated_jwt_store("expired", || {
+            // Forge a token whose exp is in the past (re-signed with the real
+            // key so only the clock, not the signature, rejects it).
+            let token = generate_ws_jwt(Some("tui".to_string())).expect("generate jwt");
+            let mut claims = jwt::decode_ws_jwt_claims(&token).expect("decode");
+            claims.exp = claims.iat.saturating_sub(3600);
+            let expired = jwt::encode_ws_jwt(&claims).expect("re-encode expired");
+
+            assert!(!validate_ws_jwt(&expired).expect("validate expired"));
+            assert!(ws_jwt_sub(&expired).is_none());
+        });
+    }
+
+    #[test]
+    fn revoked_token_is_rejected() {
+        with_isolated_jwt_store("revoked", || {
+            let token = generate_ws_jwt(Some("tui".to_string())).expect("generate jwt");
+            // Valid before revocation.
+            assert!(validate_ws_jwt(&token).expect("validate pre-revoke"));
+
+            revoke_ws_jwt(&token).expect("revoke token");
+
+            // Rejected by BOTH chokepoints after revocation.
+            assert!(
+                !validate_ws_jwt(&token).expect("validate post-revoke"),
+                "revoked token must not validate"
+            );
+            assert!(
+                ws_jwt_sub(&token).is_none(),
+                "revoked token must not yield a sub"
+            );
+        });
+    }
+
+    #[test]
+    fn revoking_one_token_does_not_affect_another() {
+        with_isolated_jwt_store("revoke-isolation", || {
+            let a = generate_ws_jwt(Some("tui".to_string())).expect("token a");
+            let b = generate_ws_jwt(Some("plasmoid".to_string())).expect("token b");
+
+            revoke_ws_jwt(&a).expect("revoke a");
+
+            assert!(!validate_ws_jwt(&a).expect("a rejected"));
+            assert!(validate_ws_jwt(&b).expect("b still valid"));
+        });
+    }
+
+    #[test]
+    fn revocation_survives_a_fresh_decode_path() {
+        // The deny-list must be persisted, not just held in memory: a second
+        // logical "process" (a fresh read of the list from disk) still
+        // rejects the revoked jti.
+        with_isolated_jwt_store("revoke-persist", || {
+            let token = generate_ws_jwt(Some("tui".to_string())).expect("generate jwt");
+            revoke_ws_jwt(&token).expect("revoke");
+
+            // Read the revocation file straight from disk and confirm the jti
+            // is recorded (persistence, not just a cached set).
+            let claims = jwt::decode_ws_jwt_claims_ignoring_revocation(&token)
+                .expect("decode for jti");
+            assert!(
+                jwt::is_jti_revoked(&claims.jti),
+                "revoked jti must be readable from the persisted list"
+            );
+        });
+    }
+
+    #[test]
+    fn revoking_unparseable_token_is_an_error_not_a_silent_noop() {
+        // Unhappy path: revoking garbage must surface an error so an operator
+        // isn't lulled into thinking a bad token id was revoked.
+        with_isolated_jwt_store("revoke-malformed", || {
+            assert!(revoke_ws_jwt("not-a-jwt").is_err());
+            assert!(revoke_ws_jwt("").is_err());
+        });
+    }
+
+    #[test]
+    fn expired_revocation_entries_are_pruned() {
+        // The deny-list must self-prune: an entry whose exp has passed is
+        // dropped so the file can't grow without bound. We revoke a token,
+        // then prove a manually-aged entry is gone after a prune cycle.
+        with_isolated_jwt_store("revoke-prune", || {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            // Record a long-dead jti directly, then prune.
+            jwt::record_revocation_for_test("dead-jti", now.saturating_sub(10_000));
+            jwt::record_revocation_for_test("live-jti", now + 10_000);
+
+            jwt::prune_revocations();
+
+            assert!(!jwt::is_jti_revoked("dead-jti"), "expired entry pruned");
+            assert!(jwt::is_jti_revoked("live-jti"), "live entry retained");
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // Purpose-aware LLM config resolution
     // ─────────────────────────────────────────────────────────────────────
 
