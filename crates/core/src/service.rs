@@ -15,7 +15,7 @@ use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
-    current_context_budget, current_system_refinement,
+    current_context_budget, current_system_refinement, current_tool_allowlist,
 };
 use crate::ports::scratchpad::{
     MAX_NOTE_BYTES, NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn, ScratchpadListFn,
@@ -818,6 +818,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 tool_defs.push(planning::complete_step_tool());
             }
 
+            // Restrict the advertised tool set to the caller's allowlist
+            // (issues #291 / #133) so a restricted subagent's LLM only ever
+            // sees the tools it may use. `None` ⇒ no restriction; an empty
+            // allowlist ⇒ no tools. The core-loop step-planning tools are
+            // exempt — they're the loop's own control surface, not delegable
+            // capabilities, and dispatch also re-checks the allowlist below.
+            if let Some(allowed) = current_tool_allowlist() {
+                tool_defs.retain(|t| {
+                    t.name == planning::BEGIN_STEP_TOOL
+                        || t.name == planning::COMPLETE_STEP_TOOL
+                        || allowed.iter().any(|a| a == &t.name)
+                });
+            }
+
             let deferred_ns: &[ToolNamespace] = if !hosted_search_demoted {
                 &namespaces
             } else {
@@ -1201,6 +1215,45 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         .await;
                     conv.messages
                         .push(Message::tool_result(&tool_call.id, &ack));
+                    continue;
+                }
+
+                // Tool allowlist enforcement (issues #291 / #133). A subagent
+                // (or any caller) may install a `TOOL_ALLOWLIST` task-local
+                // restricting which tools it can invoke. The allowlist is also
+                // applied at advertisement time below (the LLM only sees the
+                // permitted set), but enforce it here at the dispatch
+                // chokepoint too: a call to a non-allowlisted name — whether the
+                // model hallucinated it or it leaked in from history — is
+                // rejected with a recoverable error folded into the tool_result,
+                // and no executor runs. `None` means "no restriction"; an empty
+                // allowlist means "no tools". The core-loop step-planning tools
+                // handled above are intentionally exempt (they aren't real tool
+                // work and were never advertised through the allowlist).
+                if let Some(allowed) = current_tool_allowlist()
+                    && !allowed.iter().any(|t| t == &tool_call.name)
+                {
+                    tracing::warn!(
+                        tool = %tool_call.name,
+                        "tool call rejected: not on the subagent's allowlist"
+                    );
+                    let rejection = format!(
+                        "Error: the tool '{}' is not permitted for this subagent — it is not \
+                         on the configured tool allowlist. Choose a tool from your available \
+                         set, or answer without it.",
+                        tool_call.name
+                    );
+                    notify_tool_event(ToolEvent::Started {
+                        name: tool_call.name.clone(),
+                        args: summarize_tool_value(&arguments),
+                    });
+                    notify_tool_event(ToolEvent::Finished {
+                        name: tool_call.name.clone(),
+                        ok: false,
+                        output: "rejected: not on allowlist".to_string(),
+                    });
+                    conv.messages
+                        .push(Message::tool_result(&tool_call.id, &rejection));
                     continue;
                 }
 

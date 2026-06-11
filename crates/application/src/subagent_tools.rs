@@ -69,6 +69,16 @@ pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 /// Tool name (LLM-visible) for polling a previously-spawned subagent.
 pub const TOOL_GET_SUBAGENT_STATUS: &str = "get_subagent_status";
 
+/// Maximum subagent recursion depth (issue #291). Depth is the number of
+/// `Subagent` ancestors a task would have: a top-level conversation
+/// spawning a subagent produces depth 1, that subagent spawning another
+/// produces depth 2, and so on. A `spawn_subagent` whose resulting child
+/// would exceed this cap is rejected with a recoverable error, bounding
+/// recursive fan-out (a "restricted" subagent could otherwise spawn
+/// subagents — including itself — without limit). 8 is generous enough for
+/// legitimate multi-level delegation while preventing runaway recursion.
+pub const MAX_SUBAGENT_DEPTH: usize = 8;
+
 /// Generic-over-`ConversationService` wrapper that publishes the two
 /// builtin tools and dispatches them. Cheap to `Clone` — only holds
 /// `Arc`s.
@@ -195,6 +205,34 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
         }
     }
 
+    /// Count how many `Subagent` tasks are on the chain from `task_id` up
+    /// to the root (inclusive of `task_id` itself when it is a subagent).
+    /// This is the number of subagent levels already nested above the child
+    /// a spawn would create. A defensive cap on the walk length guards
+    /// against a corrupted/cyclic parent chain so this can never loop
+    /// unboundedly — a cycle would itself be treated as "too deep".
+    fn subagent_depth(
+        &self,
+        user_id: &desktop_assistant_auth_jwt::UserId,
+        task_id: &api::TaskId,
+    ) -> usize {
+        let mut depth = 0usize;
+        let mut current = Some(task_id.clone());
+        // Walk at most MAX_SUBAGENT_DEPTH + 1 hops; past that we already know
+        // the child would exceed the cap, so the exact count no longer matters.
+        for _ in 0..=MAX_SUBAGENT_DEPTH {
+            let Some(id) = current else { break };
+            let Some(view) = self.registry.get(user_id, &id) else {
+                break;
+            };
+            if matches!(view.kind, api::TaskKind::Subagent { .. }) {
+                depth += 1;
+            }
+            current = view.parent;
+        }
+        depth
+    }
+
     async fn spawn(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let name = required_string(&arguments, "name")?;
         let prompt = required_string(&arguments, "prompt")?;
@@ -217,6 +255,21 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
                     .to_string(),
             )
         })?;
+
+        // Recursion depth limit (issue #291). Walk the parent chain to count
+        // how many `Subagent` ancestors the about-to-be-spawned child would
+        // have; the child's own depth is that count + 1. Reject the spawn when
+        // it would exceed `MAX_SUBAGENT_DEPTH` so a subagent cannot recurse
+        // (or self-spawn) unboundedly. Done before any side effects (no child
+        // conversation is created) so a rejected spawn leaves no orphan state.
+        let child_depth = self.subagent_depth(&user_id, &parent_task_id) + 1;
+        if child_depth > MAX_SUBAGENT_DEPTH {
+            return Err(CoreError::ToolExecution(format!(
+                "spawn_subagent rejected: subagent recursion depth limit ({MAX_SUBAGENT_DEPTH}) \
+                 reached. This subagent is already nested too deeply to spawn another. Complete \
+                 the work directly instead of delegating further."
+            )));
+        }
 
         // Create the child conversation. The title doubles as the
         // subagent label so the UI can show it without destructuring
