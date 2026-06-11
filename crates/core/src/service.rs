@@ -542,10 +542,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         max_age_days: Option<u32>,
         include_archived: bool,
     ) -> Result<Vec<ConversationSummary>, CoreError> {
+        // DS-6 (#295): `store.list()` already returns the light
+        // `ConversationSummary` projection (no message bodies); this method
+        // only filters and sorts it.
         let mut convs = self.store.list().await?;
 
         if !include_archived {
-            convs.retain(|conv| conv.archived_at.is_none());
+            convs.retain(|conv| !conv.archived);
         }
 
         if let Some(days) = max_age_days.filter(|days| *days > 0) {
@@ -562,7 +565,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .then_with(|| left.id.0.cmp(&right.id.0))
         });
 
-        Ok(convs.iter().map(ConversationSummary::from).collect())
+        Ok(convs)
     }
 
     async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
@@ -1401,8 +1404,14 @@ mod tests {
                 .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
         }
 
-        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
-            Ok(self.data.lock().unwrap().values().cloned().collect())
+        async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .values()
+                .map(ConversationSummary::from)
+                .collect())
         }
 
         async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
@@ -1533,8 +1542,12 @@ mod tests {
             Err(CoreError::ConversationNotFound("unused".to_string()))
         }
 
-        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
-            Ok(self.conversations.clone())
+        async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(self
+                .conversations
+                .iter()
+                .map(ConversationSummary::from)
+                .collect())
         }
 
         async fn update(&self, _conv: Conversation) -> Result<(), CoreError> {

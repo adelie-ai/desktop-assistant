@@ -114,43 +114,46 @@ fn conversation_with_messages(id: &str, title: &str, body_count: usize) -> Conve
 /// would still pass this, so it is paired with `list_does_not_load_bodies`.
 #[tokio::test]
 async fn list_reports_message_count_per_conversation() {
-    with_fixture("list_reports_message_count_per_conversation", |fx| async move {
-        let store = PgConversationStore::new(fx.pool.clone());
+    with_fixture(
+        "list_reports_message_count_per_conversation",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
 
-        with_user_id(UserId::new("alice"), async {
-            store
-                .create(conversation_with_messages("conv-0", "zero", 0))
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create(conversation_with_messages("conv-0", "zero", 0))
+                    .await
+                    .expect("create conv-0");
+                store
+                    .create(conversation_with_messages("conv-3", "three", 3))
+                    .await
+                    .expect("create conv-3");
+                store
+                    .create(conversation_with_messages("conv-7", "seven", 7))
+                    .await
+                    .expect("create conv-7");
+            })
+            .await;
+
+            let list = with_user_id(UserId::new("alice"), async { store.list().await })
                 .await
-                .expect("create conv-0");
-            store
-                .create(conversation_with_messages("conv-3", "three", 3))
-                .await
-                .expect("create conv-3");
-            store
-                .create(conversation_with_messages("conv-7", "seven", 7))
-                .await
-                .expect("create conv-7");
-        })
-        .await;
+                .expect("alice list");
 
-        let list = with_user_id(UserId::new("alice"), async { store.list().await })
-            .await
-            .expect("alice list");
+            assert_eq!(list.len(), 3, "exactly three conversations");
 
-        assert_eq!(list.len(), 3, "exactly three conversations");
+            let count_for = |id: &str| {
+                list.iter()
+                    .find(|s| s.id.0 == id)
+                    .unwrap_or_else(|| panic!("missing {id} in list"))
+                    .message_count
+            };
+            assert_eq!(count_for("conv-0"), 0, "empty conversation -> 0");
+            assert_eq!(count_for("conv-3"), 3);
+            assert_eq!(count_for("conv-7"), 7);
 
-        let count_for = |id: &str| {
-            list.iter()
-                .find(|s| s.id.0 == id)
-                .unwrap_or_else(|| panic!("missing {id} in list"))
-                .message_count
-        };
-        assert_eq!(count_for("conv-0"), 0, "empty conversation -> 0");
-        assert_eq!(count_for("conv-3"), 3);
-        assert_eq!(count_for("conv-7"), 7);
-
-        fx
-    })
+            fx
+        },
+    )
     .await;
 }
 
@@ -218,9 +221,9 @@ async fn list_empty_store_is_empty() {
     .await;
 }
 
-/// Cross-tenant: bob's aggregate count never includes alice's messages even
-/// when both have a conversation with the same id-shape. Proves the COUNT
-/// join is user-scoped, not a global aggregate.
+/// Cross-tenant: bob's aggregate count never includes alice's messages.
+/// Proves the COUNT join is user-scoped (`m.user_id = c.user_id`), not a
+/// global aggregate that would sum every user's messages onto each row.
 #[tokio::test]
 async fn list_count_is_user_scoped() {
     with_fixture("list_count_is_user_scoped", |fx| async move {
@@ -228,14 +231,14 @@ async fn list_count_is_user_scoped() {
 
         with_user_id(UserId::new("alice"), async {
             store
-                .create(conversation_with_messages("shared-id", "alice", 5))
+                .create(conversation_with_messages("alice-conv", "alice", 5))
                 .await
                 .expect("alice create");
         })
         .await;
         with_user_id(UserId::new("bob"), async {
             store
-                .create(conversation_with_messages("shared-id", "bob", 2))
+                .create(conversation_with_messages("bob-conv", "bob", 2))
                 .await
                 .expect("bob create");
         })
@@ -248,9 +251,14 @@ async fn list_count_is_user_scoped() {
             .await
             .expect("bob list");
 
-        assert_eq!(alices.len(), 1);
+        // Each user sees only their own conversation, and its count reflects
+        // only their own messages — a global (un-scoped) COUNT join would
+        // report 7 (5 + 2) for whichever row it touched.
+        assert_eq!(alices.len(), 1, "alice sees only her conversation");
+        assert_eq!(alices[0].id.0, "alice-conv");
         assert_eq!(alices[0].message_count, 5, "alice's count is hers alone");
-        assert_eq!(bobs.len(), 1);
+        assert_eq!(bobs.len(), 1, "bob sees only his conversation");
+        assert_eq!(bobs[0].id.0, "bob-conv");
         assert_eq!(bobs[0].message_count, 2, "bob's count is his alone");
 
         fx
