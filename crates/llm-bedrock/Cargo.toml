@@ -12,6 +12,7 @@ aws-sdk-bedrock = "1"
 aws-sdk-bedrockruntime = "1"
 aws-smithy-types = "1"
 desktop-assistant-core.workspace = true
+desktop-assistant-llm-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

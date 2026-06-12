@@ -19,6 +19,7 @@ use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
     TokenUsage, current_model_override,
 };
+use desktop_assistant_llm_http::{STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1268,8 +1269,11 @@ impl BedrockClient {
         // of hanging forever (#214). `stream.recv()` and `send()` have no
         // built-in timeout; gpt-oss on Bedrock was observed accepting a
         // tool-history follow-up request and then never emitting an event.
-        const BEDROCK_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        const BEDROCK_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        // The budgets are shared with the reqwest connectors (#302); Bedrock's
+        // AWS-SDK stream can't reuse the `tokio_stream`-typed `next_step`, but
+        // it keeps the same constants so the timeouts can't drift apart.
+        const BEDROCK_CONNECT_TIMEOUT: std::time::Duration = STREAM_CONNECT_TIMEOUT;
+        const BEDROCK_EVENT_TIMEOUT: std::time::Duration = STREAM_EVENT_TIMEOUT;
 
         // Race connection establishment against cancellation and a timeout. If
         // the user cancels mid-handshake we drop the in-flight request (the
