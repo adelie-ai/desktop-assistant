@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -48,7 +49,7 @@ pub async fn run_consolidation_phase(
     llm_fn: &DreamingLlmFn,
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
-) -> Result<ConsolidationStats, String> {
+) -> Result<ConsolidationStats, CoreError> {
     // Load focals across all users, grouped by user. The cross-user
     // scan is audit-allowlisted (background-worker entry point); from
     // here on every per-user batch installs a `with_user_id` scope so
@@ -92,7 +93,7 @@ async fn consolidate_user_focals(
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
     focals: Vec<KbRow>,
-) -> Result<ConsolidationStats, String> {
+) -> Result<ConsolidationStats, CoreError> {
     let mut buffer = OpBuffer::new();
 
     for focal in &focals {
@@ -167,7 +168,7 @@ async fn consolidate_user_focals(
 
 async fn load_entries_needing_review_by_user(
     pool: &PgPool,
-) -> Result<Vec<(String, Vec<KbRow>)>, String> {
+) -> Result<Vec<(String, Vec<KbRow>)>, CoreError> {
     // Audit-allowlisted: cross-user scan in the dreaming background
     // worker. The caller groups by user_id and installs a per-user
     // task-local scope before doing anything else with each row.
@@ -184,7 +185,7 @@ async fn load_entries_needing_review_by_user(
     .bind(MAX_REVIEWS_PER_CYCLE)
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("dreaming: load focals failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: load focals failed: {e}")))?;
 
     let mut grouped: BTreeMap<String, Vec<KbRow>> = BTreeMap::new();
     for (user_id, id, content, tags, metadata_json) in rows {
@@ -203,7 +204,7 @@ async fn load_entries_needing_review_by_user(
 /// the same factory shape.
 #[cfg(test)]
 #[allow(dead_code)]
-async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, String> {
+async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, CoreError> {
     let user_id = current_user_id();
     let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
         "SELECT id, content, tags, metadata \
@@ -220,7 +221,7 @@ async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, String
     .bind(MAX_REVIEWS_PER_CYCLE)
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("dreaming: load focals failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: load focals failed: {e}")))?;
 
     Ok(rows
         .into_iter()
@@ -234,7 +235,7 @@ async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, String
         .collect())
 }
 
-async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, String> {
+async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, CoreError> {
     let user_id = current_user_id();
     // Pull the focal's first embedding chunk to use as the similarity probe.
     let focal_chunk: Option<(Vec<Vector>,)> =
@@ -243,7 +244,9 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
             .bind(&focal.id)
             .fetch_optional(pool)
             .await
-            .map_err(|e| format!("dreaming: load focal embedding failed: {e}"))?;
+            .map_err(|e| {
+                CoreError::Storage(format!("dreaming: load focal embedding failed: {e}"))
+            })?;
 
     let probe = match focal_chunk.and_then(|(v,)| v.into_iter().next()) {
         Some(v) => v,
@@ -278,7 +281,7 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
         .bind(user_id.as_str())
         .fetch_all(pool)
         .await
-        .map_err(|e| format!("dreaming: tag-overlap retrieve failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: tag-overlap retrieve failed: {e}")))?;
 
         for (id, content, tags, metadata_json, distance) in tag_rows {
             by_id.insert(
@@ -315,7 +318,7 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
     .bind(user_id.as_str())
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("dreaming: embedding retrieve failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: embedding retrieve failed: {e}")))?;
 
     for (id, content, tags, metadata_json, distance) in emb_rows {
         let entry = KbRow {
@@ -345,7 +348,7 @@ async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>,
     Ok(combined)
 }
 
-async fn retrieve_by_tags_only(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, String> {
+async fn retrieve_by_tags_only(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, CoreError> {
     if focal.tags.is_empty() {
         return Ok(Vec::new());
     }
@@ -364,7 +367,7 @@ async fn retrieve_by_tags_only(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow
     .bind(user_id.as_str())
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("dreaming: tag-only retrieve failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: tag-only retrieve failed: {e}")))?;
 
     Ok(rows
         .into_iter()
@@ -420,11 +423,13 @@ async fn review_focal(
     focal: &KbRow,
     candidates: &[KbRow],
     transcript_included: bool,
-) -> Result<Vec<ReviewAction>, String> {
+) -> Result<Vec<ReviewAction>, CoreError> {
     let system_prompt = build_review_system_prompt();
     let user_prompt = build_review_user_prompt(focal, candidates, None);
 
-    let response = llm_fn(system_prompt.clone(), user_prompt).await?;
+    let response = llm_fn(system_prompt.clone(), user_prompt)
+        .await
+        .map_err(CoreError::Storage)?;
     let actions = parse_review_response(&response);
 
     // If the LLM asked for the source and we haven't already provided it,
@@ -455,7 +460,9 @@ async fn review_focal(
 
         let user_prompt_with_source =
             build_review_user_prompt(focal, candidates, Some(&transcript));
-        let response = llm_fn(system_prompt, user_prompt_with_source).await?;
+        let response = llm_fn(system_prompt, user_prompt_with_source)
+            .await
+            .map_err(CoreError::Storage)?;
         return Ok(parse_review_response(&response)
             .into_iter()
             .filter(|a| !matches!(a, ReviewAction::FetchSource))
@@ -761,15 +768,17 @@ async fn synthesize_cluster(
     llm_fn: &DreamingLlmFn,
     cluster: &BTreeSet<String>,
     id_to_focal: &HashMap<String, &KbRow>,
-) -> Result<SynthesizedMerge, String> {
+) -> Result<SynthesizedMerge, CoreError> {
     let members = load_cluster_members(pool, cluster, id_to_focal).await;
     if members.len() < 2 {
-        return Err("synthesize: fewer than 2 members".to_string());
+        return Err(CoreError::Storage(
+            "synthesize: fewer than 2 members".to_string(),
+        ));
     }
 
     let canonical_id = OpBuffer::canonical_of(cluster)
         .cloned()
-        .ok_or_else(|| "synthesize: empty cluster".to_string())?;
+        .ok_or_else(|| CoreError::Storage("synthesize: empty cluster".to_string()))?;
 
     let mut user = String::from(
         "Merge the following entries into a single unified knowledge-base \
@@ -797,18 +806,18 @@ async fn synthesize_cluster(
         phrasing; keep the entry self-contained and concise.",
     );
 
-    let response = llm_fn(system, user).await?;
+    let response = llm_fn(system, user).await.map_err(CoreError::Storage)?;
     let payload = extract_json_payload(response.trim());
     let parsed: serde_json::Value = serde_json::from_str(&payload)
-        .map_err(|e| format!("synthesize: response not JSON: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("synthesize: response not JSON: {e}")))?;
 
     let new_content = parsed
         .get("content")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
-        .ok_or_else(|| "synthesize: missing content".to_string())?;
+        .ok_or_else(|| CoreError::Storage("synthesize: missing content".to_string()))?;
     if new_content.is_empty() {
-        return Err("synthesize: empty content".to_string());
+        return Err(CoreError::Storage("synthesize: empty content".to_string()));
     }
 
     let new_scope = match parsed.get("scope") {

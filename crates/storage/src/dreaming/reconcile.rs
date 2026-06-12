@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use desktop_assistant_core::ports::auth::current_user_id;
 use pgvector::Vector;
@@ -184,14 +185,14 @@ pub async fn apply_ops(
     buffer: &OpBuffer,
     synthesized: &[SynthesizedMerge],
     soft_delete_ttl_days: i32,
-) -> Result<ConsolidationStats, String> {
+) -> Result<ConsolidationStats, CoreError> {
     let user_id = current_user_id();
     let mut stats = ConsolidationStats::default();
 
     let mut tx = pool
         .begin()
         .await
-        .map_err(|e| format!("dreaming: begin tx failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: begin tx failed: {e}")))?;
 
     // First, reap any soft-deleted entries past their TTL. Cheap, and
     // happens in the same tx so a single cycle stays atomic. Scoped to
@@ -207,12 +208,12 @@ pub async fn apply_ops(
     .bind(user_id.as_str())
     .execute(&mut *tx)
     .await
-    .map_err(|e| format!("dreaming: TTL reap failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: TTL reap failed: {e}")))?;
 
     // Apply merges: update canonical row, soft-delete cluster members.
     for merge in synthesized {
         let chunks = chunk_text(&merge.new_content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        let embeddings = embed_fn(chunks).await?;
+        let embeddings = embed_fn(chunks).await.map_err(CoreError::Storage)?;
         if embeddings.is_empty() {
             tracing::warn!(
                 "dreaming: synthesis embedding empty for cluster canonical {}",
@@ -230,7 +231,7 @@ pub async fn apply_ops(
                 .bind(&merge.canonical_id)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| format!("dreaming: metadata fetch failed: {e}"))?;
+                .map_err(|e| CoreError::Storage(format!("dreaming: metadata fetch failed: {e}")))?;
 
         let mut metadata = existing_metadata
             .map(|(v,)| KbMetadata::from_json(&v))
@@ -254,7 +255,7 @@ pub async fn apply_ops(
         .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("dreaming: merge canonical update failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: merge canonical update failed: {e}")))?;
 
         // Soft-delete the rest of the cluster.
         let to_delete: Vec<String> = merge
@@ -273,7 +274,9 @@ pub async fn apply_ops(
             .bind(user_id.as_str())
             .execute(&mut *tx)
             .await
-            .map_err(|e| format!("dreaming: cluster soft-delete failed: {e}"))?;
+            .map_err(|e| {
+                CoreError::Storage(format!("dreaming: cluster soft-delete failed: {e}"))
+            })?;
             stats.soft_deleted += to_delete.len();
         }
 
@@ -283,7 +286,7 @@ pub async fn apply_ops(
     // Standalone updates (not in any merge cluster).
     for (id, new_content) in buffer.standalone_updates() {
         let chunks = chunk_text(&new_content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        let embeddings = embed_fn(chunks).await?;
+        let embeddings = embed_fn(chunks).await.map_err(CoreError::Storage)?;
         if embeddings.is_empty() {
             continue;
         }
@@ -305,7 +308,7 @@ pub async fn apply_ops(
         .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("dreaming: update failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: update failed: {e}")))?;
         stats.updated += 1;
     }
 
@@ -317,7 +320,9 @@ pub async fn apply_ops(
                 .bind(&id)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| format!("dreaming: scope-add metadata fetch failed: {e}"))?;
+                .map_err(|e| {
+                    CoreError::Storage(format!("dreaming: scope-add metadata fetch failed: {e}"))
+                })?;
 
         if let Some((value,)) = existing {
             let mut metadata = KbMetadata::from_json(&value);
@@ -332,7 +337,7 @@ pub async fn apply_ops(
             .bind(user_id.as_str())
             .execute(&mut *tx)
             .await
-            .map_err(|e| format!("dreaming: scope-add update failed: {e}"))?;
+            .map_err(|e| CoreError::Storage(format!("dreaming: scope-add update failed: {e}")))?;
             stats.scope_added += 1;
         }
     }
@@ -348,7 +353,7 @@ pub async fn apply_ops(
         .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("dreaming: soft-delete failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: soft-delete failed: {e}")))?;
         stats.soft_deleted += 1;
     }
 
@@ -365,13 +370,13 @@ pub async fn apply_ops(
         .bind(user_id.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("dreaming: reviewed_at update failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: reviewed_at update failed: {e}")))?;
         stats.reviewed = touched.len();
     }
 
     tx.commit()
         .await
-        .map_err(|e| format!("dreaming: commit failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: commit failed: {e}")))?;
 
     Ok(stats)
 }
