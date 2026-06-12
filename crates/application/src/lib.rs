@@ -20,14 +20,13 @@ use desktop_assistant_core::ports::inbound::{
     ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
     PromptSelectionOverride, PurposeConfigPayload, SettingsService,
 };
+use desktop_assistant_core::ports::request_scope::RequestScope;
 use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
     ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
-use desktop_assistant_core::ports::session::{current_session_id, with_session_id};
 use desktop_assistant_core::ports::store::{IdempotencyKeyStore, TurnStateStore};
 use desktop_assistant_core::ports::tool_observer::{ToolEvent, ToolObserver, with_tool_observer};
-use desktop_assistant_core::ports::transport::{current_transport_kind, with_transport_kind};
 use thiserror::Error;
 use tracing::warn;
 
@@ -1961,26 +1960,19 @@ where
         let conv_id_for_body = conversation_id.clone();
         let conv_id_for_cleanup = conversation_id.clone();
         let request_id_for_body = request_id.clone();
-        let user_id_for_body = user_id.clone();
         let user_id_for_cleanup = user_id.clone();
-        // Capture the connection's transport before the spawn (#243). Read here
-        // while still inside the dispatcher's `with_transport_kind` scope, then
-        // re-install in the spawned body — `task_local`s don't cross
-        // `tokio::spawn`, so this mirrors the `with_user_id` re-install.
-        let transport_for_body = current_transport_kind();
-        // The connection's login session (#261): captured here while still in
-        // the dispatcher's `with_session_id` scope and re-installed in the
-        // spawned body so the per-turn `CoordinatorClientToolPort` resolves
-        // *this connection's* registered client tools — not the unscoped
-        // bucket. Without this the registry path (used by voice) would offer
-        // the turn no client tools at all.
-        let session_for_body = current_session_id();
+        // Capture every request-scoped task-local before the spawn (#305 item
+        // 4). `task_local`s don't cross `tokio::spawn`, so the body re-installs
+        // the whole bundle in one call — user id (#105/#154), login session
+        // (#261, so the per-turn `CoordinatorClientToolPort` resolves *this*
+        // connection's registered client tools rather than the unscoped
+        // bucket), transport + co-location + client label (#243/#248, so the
+        // tool note tags localities). Bundling them removes the
+        // missed-re-install bug class (#261) at this site.
+        let request_scope = RequestScope::capture();
 
         // `registry.spawn` is sync; the body runs on its own `tokio::spawn` so
-        // we can return the new task id immediately. `tokio::spawn` doesn't
-        // propagate task-locals, so the body re-installs `with_user_id` (and
-        // `with_transport_kind`, #243; `with_session_id`, #261) for the
-        // queries / tool-note / client-tool lookup inside `run_send_turn`.
+        // we can return the new task id immediately.
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             ctx.logs.append(
                 api::LogLevel::Info,
@@ -2005,29 +1997,21 @@ where
                     as Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>
             });
 
-            let result = with_transport_kind(
-                transport_for_body,
-                with_user_id(
-                    user_id_for_body,
-                    with_session_id(
-                        session_for_body,
-                        run_send_turn(
-                            conversations,
-                            conv_id_for_body,
-                            content,
-                            override_selection,
-                            system_refinement,
-                            request_id_for_body,
-                            idempotency,
-                            turn_sink,
-                            ctx.token.clone(),
-                            client_tool_port,
-                            Some(ctx.clone()),
-                        ),
-                    ),
-                ),
-            )
-            .await;
+            let result = request_scope
+                .scope(run_send_turn(
+                    conversations,
+                    conv_id_for_body,
+                    content,
+                    override_selection,
+                    system_refinement,
+                    request_id_for_body,
+                    idempotency,
+                    turn_sink,
+                    ctx.token.clone(),
+                    client_tool_port,
+                    Some(ctx.clone()),
+                ))
+                .await;
 
             // Free the in-flight slot now the turn is done. `run_send_turn` has
             // returned, so its `TeeSink` (the other hub owner) is dropped here
@@ -2098,23 +2082,13 @@ where
         let conv_id_for_body = conversation_id.clone();
         let request_id_for_body = request_id.clone();
         let sink_for_body = Arc::clone(&sink);
-        let user_id_for_body = user_id.clone();
-        // Capture the connection's transport before the spawn and re-install it
-        // in the body (#243), the same way `user_id` is threaded across the
-        // `tokio::spawn` boundary.
-        let transport_for_body = current_transport_kind();
-        // The connection's login session (#261), re-installed in the body so
-        // the per-turn client-tool port resolves this connection's registered
-        // tools rather than the unscoped bucket — same reason as `user_id`.
-        let session_for_body = current_session_id();
+        // Capture every request-scoped task-local before the spawn (#305 item
+        // 4): `task_local`s don't cross `tokio::spawn`, so the body re-installs
+        // the whole bundle in one call — user id (#154), login session (#261),
+        // transport + co-location + client label (#243/#248). `system_refinement`
+        // is moved into the closure as an explicit value for the same reason.
+        let request_scope = RequestScope::capture();
 
-        // `tokio::spawn` does not propagate task-locals, so the body
-        // must re-install `with_user_id` for storage queries inside
-        // `run_send_turn` to scope to the right user (#154),
-        // `with_transport_kind` so the tool note tags localities (#243), and
-        // `with_session_id` so client-tool lookup is per-connection (#261). The
-        // `system_refinement` is moved into the closure as an explicit
-        // value for the same reason (task-locals don't cross the spawn).
         let task_id = registry.spawn(user_id, kind, title, move |ctx| async move {
             // Lifecycle log so the UI knows the foreground turn is
             // tracked — Status category keeps it distinct from the
@@ -2138,29 +2112,21 @@ where
                     as Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>
             });
 
-            let result = with_transport_kind(
-                transport_for_body,
-                with_user_id(
-                    user_id_for_body,
-                    with_session_id(
-                        session_for_body,
-                        run_send_turn(
-                            conversations,
-                            conv_id_for_body,
-                            content,
-                            override_selection,
-                            system_refinement,
-                            request_id_for_body,
-                            idempotency,
-                            sink_for_body,
-                            ctx.token.clone(),
-                            client_tool_port,
-                            Some(ctx.clone()),
-                        ),
-                    ),
-                ),
-            )
-            .await;
+            let result = request_scope
+                .scope(run_send_turn(
+                    conversations,
+                    conv_id_for_body,
+                    content,
+                    override_selection,
+                    system_refinement,
+                    request_id_for_body,
+                    idempotency,
+                    sink_for_body,
+                    ctx.token.clone(),
+                    client_tool_port,
+                    Some(ctx.clone()),
+                ))
+                .await;
 
             match result {
                 Ok(()) => Ok(()),
