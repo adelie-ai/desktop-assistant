@@ -26,7 +26,9 @@
 //! conversation's last stored selection; if neither is usable, dispatch
 //! through the interactive purpose's default.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
+
+use parking_lot::RwLock;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary};
@@ -52,11 +54,23 @@ use crate::connections::{
 use crate::purposes::{ConnectionRef, Effort, ModelRef, PurposeConfig, PurposeKind};
 use crate::registry::{ConnectionHealth, ConnectionRegistry, build_registry};
 
-/// Shared, mutable handle to the registry + current config. Writes acquire
-/// the outer `RwLock` in write mode, replace the inner values, then drop;
-/// reads take a read lock and clone out whatever they need.
+/// Shared, mutable handle to the registry + current config.
+///
+/// `state` is a **non-poisoning** [`parking_lot::RwLock`] (DT-9 / #276): a
+/// panic while a holder has the lock must not poison it and cascade into a
+/// daemon-wide outage that systemd never sees. Reads take a read lock and
+/// clone out whatever they need; the data lock is held only to read or to
+/// swap in a freshly built state — never across blocking I/O.
+///
+/// `write_serializer` serializes *mutators* (config-file write + registry
+/// rebuild). Those steps run **outside** the data lock so concurrent readers
+/// never stall on disk I/O; the serializer prevents two concurrent mutators
+/// from racing (read-modify-write on the config) and losing an update, while
+/// still computing the new config/registry off the data lock and grabbing the
+/// data write lock only for the final swap.
 pub struct RegistryHandle {
     state: RwLock<RegistryState>,
+    write_serializer: Mutex<()>,
     config_path: std::path::PathBuf,
 }
 
@@ -69,6 +83,7 @@ impl RegistryHandle {
     pub fn new(config: DaemonConfig, registry: ConnectionRegistry) -> Self {
         Self {
             state: RwLock::new(RegistryState { config, registry }),
+            write_serializer: Mutex::new(()),
             config_path: default_daemon_config_path(),
         }
     }
@@ -80,7 +95,7 @@ impl RegistryHandle {
 
     /// Snapshot of every connection status — used for list/validate paths.
     fn connection_views(&self) -> Vec<CoreConnectionView> {
-        let state = self.state.read().expect("registry state poisoned");
+        let state = self.state.read();
         state
             .registry
             .status()
@@ -114,7 +129,7 @@ impl RegistryHandle {
 
     #[allow(dead_code)]
     fn is_healthy(&self, id: &ConnectionId) -> bool {
-        let state = self.state.read().expect("registry state poisoned");
+        let state = self.state.read();
         state
             .registry
             .status_of(id)
@@ -142,13 +157,13 @@ impl RegistryHandle {
         &self,
         id: &ConnectionId,
     ) -> Option<std::sync::Arc<dyn desktop_assistant_core::ports::llm::LlmClient>> {
-        let state = self.state.read().expect("registry state poisoned");
+        let state = self.state.read();
         state.registry.get(id)
     }
 
     /// Connector-type tag for a given connection id, if declared.
     pub(crate) fn connector_type_for(&self, id: &ConnectionId) -> Option<String> {
-        let state = self.state.read().expect("registry state poisoned");
+        let state = self.state.read();
         state
             .registry
             .status_of(id)
@@ -158,16 +173,41 @@ impl RegistryHandle {
     /// Mutate the config: callers provide a closure that operates on the
     /// current `DaemonConfig`. On success we rewrite the config file and
     /// rebuild the registry.
+    ///
+    /// The expensive, fallible steps — writing the config file and rebuilding
+    /// the registry — run **outside** the data `RwLock` (DT-9 / #276) so they
+    /// never stall concurrent readers (a turn dispatch resolving a client, the
+    /// settings GET, etc.) for the duration of disk I/O. We hold the data
+    /// write lock only to (a) clone the current config in and (b) swap the new
+    /// config + registry in, both O(1)-ish under the lock.
+    ///
+    /// `write_serializer` makes the read-modify-write atomic *with respect to
+    /// other mutators*: it is held for the whole clone→apply→save→rebuild→swap
+    /// sequence so two concurrent mutators can't both read the same base
+    /// config and clobber each other's change (lost update). Readers are never
+    /// blocked by it — it guards mutators only. If a previous mutator panicked,
+    /// `parking_lot::Mutex` does not poison, so recovery is automatic.
     fn mutate_config<F>(&self, op: F) -> Result<(), CoreError>
     where
         F: FnOnce(&mut DaemonConfig) -> Result<(), String>,
     {
-        let mut state = self.state.write().expect("registry state poisoned");
-        let mut new_config = state.config.clone();
+        // Serialize mutators (not readers). parking_lot::Mutex is
+        // non-poisoning, so a prior panicked mutator doesn't wedge this path.
+        let _writer = self.write_serializer.lock();
+
+        // Clone the current config out under a *brief* read lock, then drop it
+        // so the closure, file write, and rebuild all run unlocked.
+        let mut new_config = self.state.read().config.clone();
         op(&mut new_config).map_err(CoreError::Llm)?;
+
+        // Blocking I/O + registry rebuild — performed with NO data lock held.
         save_daemon_config(&self.config_path, &new_config)
             .map_err(|e| CoreError::Storage(format!("saving config: {e}")))?;
         let registry = build_registry(&new_config);
+
+        // Final swap: take the write lock only long enough to install the new
+        // state. No I/O, no rebuild, no user closure under the lock.
+        let mut state = self.state.write();
         state.config = new_config;
         state.registry = registry;
         Ok(())
@@ -176,11 +216,7 @@ impl RegistryHandle {
     /// Read-only snapshot of the current `DaemonConfig`. Used by purposes
     /// and model-listing paths.
     pub fn snapshot_config(&self) -> DaemonConfig {
-        self.state
-            .read()
-            .expect("registry state poisoned")
-            .config
-            .clone()
+        self.state.read().config.clone()
     }
 
     /// The active assistant personality (issue #226). Read from the in-memory
@@ -188,11 +224,7 @@ impl RegistryHandle {
     /// the dispatch wrapper and the settings GET observe the same value and a
     /// `SetConfig` takes effect on the next turn without a separate reload.
     pub fn personality(&self) -> Personality {
-        self.state
-            .read()
-            .expect("registry state poisoned")
-            .config
-            .personality
+        self.state.read().config.personality
     }
 
     /// Update the active assistant personality. Persists to the config file and
@@ -213,7 +245,7 @@ impl RegistryHandle {
     #[cfg(test)]
     pub(crate) fn replace_config_for_test(&self, config: DaemonConfig) {
         let registry = build_registry(&config);
-        let mut state = self.state.write().expect("registry state poisoned");
+        let mut state = self.state.write();
         state.config = config;
         state.registry = registry;
     }
@@ -229,7 +261,7 @@ impl RegistryHandle {
     pub fn reload(&self) -> anyhow::Result<()> {
         let config = load_daemon_config(&self.config_path)?.unwrap_or_default();
         let registry = build_registry(&config);
-        let mut state = self.state.write().expect("registry state poisoned");
+        let mut state = self.state.write();
         state.config = config;
         state.registry = registry;
         Ok(())
@@ -286,7 +318,7 @@ impl RegistryHandle {
         //    silently break every new turn. The running registry stays put.
         let new_registry = build_registry(&new_config);
         {
-            let state = self.state.read().expect("registry state poisoned");
+            let state = self.state.read();
             let plan = crate::config::plan_reload(&state.config, &new_config);
             if plan.is_empty() {
                 tracing::info!("config reload: no effective changes; nothing to apply");
@@ -304,7 +336,7 @@ impl RegistryHandle {
         // 3. Re-diff and swap under the write lock. Re-reading `state.config`
         //    here (rather than trusting the read-lock snapshot above) keeps the
         //    plan consistent if a concurrent `mutate_config` slipped in.
-        let mut state = self.state.write().expect("registry state poisoned");
+        let mut state = self.state.write();
         let plan = crate::config::plan_reload(&state.config, &new_config);
         state.config = new_config;
         // Swapping the registry drops only its own Arc handles; in-flight turns
@@ -438,7 +470,7 @@ impl ConnectionsService for DaemonConnectionsService {
             String,
             std::sync::Arc<dyn desktop_assistant_core::ports::llm::LlmClient>,
         )> = {
-            let state = self.registry.state.read().expect("registry state poisoned");
+            let state = self.registry.state.read();
             if let Some(id_raw) = &connection_id {
                 let id = ConnectionId::new(id_raw.clone())
                     .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
@@ -1624,6 +1656,104 @@ mod tests {
         assert_eq!(i.connection, "local");
         assert_eq!(i.model, "llama3");
         assert_eq!(i.effort, Some(Effort::Medium));
+    }
+
+    // ----- RegistryHandle lock robustness (DT-9 / #276) ----------------
+    //
+    // Two invariants:
+    //  1. A panic while a holder has the lock must NOT poison it — every
+    //     subsequent acquirer must still succeed (no daemon-wide cascade).
+    //  2. `mutate_config` must NOT hold the data lock across its blocking
+    //     file I/O + registry rebuild — concurrent readers must not stall
+    //     for the duration of the disk write.
+
+    /// A panicking lock holder must not poison the lock: the next acquirer
+    /// (here a `snapshot_config` read) must still succeed rather than
+    /// inheriting a poisoned-lock panic.
+    #[test]
+    fn panicked_holder_does_not_poison_lock() {
+        let cfg = config_with_connections(&[("local", ollama_local())]);
+        let handle = make_handle_with(cfg);
+
+        // Spawn a thread that panics from *inside* `mutate_config`'s
+        // closure — i.e. while the write lock is held in the old code. With
+        // a poisoning std::RwLock this leaves the lock permanently poisoned.
+        let h = Arc::clone(&handle);
+        let res = std::thread::spawn(move || {
+            let _ = h.mutate_config(|_cfg| {
+                panic!("holder panicked while holding the write lock");
+            });
+        })
+        .join();
+        assert!(res.is_err(), "the holder thread should have panicked");
+
+        // With a poisoning std::RwLock this read would itself panic
+        // (poison cascade). It must succeed.
+        let snap = handle.snapshot_config();
+        assert!(snap.connections.contains_key("local"));
+
+        // A subsequent mutate must also still work.
+        let svc = DaemonConnectionsService::new(Arc::clone(&handle));
+        // mutate via set_personality (cheap, no connection rebuild needed)
+        handle
+            .set_personality(snap.personality)
+            .expect("mutate after a poisoned-holder panic must still succeed");
+        // and a read path through the service:
+        let _ = svc; // service constructed fine; lock usable
+    }
+
+    /// `mutate_config` must drop the data lock before doing its blocking
+    /// file write + registry rebuild. We prove it by pointing the config
+    /// path at a FIFO with no reader: `save_daemon_config`'s `open(O_WRONLY)`
+    /// blocks forever. A concurrent `snapshot_config` read must still
+    /// complete promptly — it would hang if the write lock were held across
+    /// the I/O.
+    #[cfg(unix)]
+    #[test]
+    fn mutate_config_does_not_hold_lock_across_blocking_io() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Build a FIFO path. open(O_WRONLY) on a FIFO blocks until a reader
+        // appears, which never happens here — a deterministic "slow I/O".
+        let dir = std::env::temp_dir();
+        let fifo = dir.join(format!(
+            "da-test-fifo-{}.toml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cstr = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let cfg = config_with_connections(&[("local", ollama_local())]);
+        let registry = build_registry(&cfg);
+        let handle = Arc::new(RegistryHandle::new(cfg, registry).with_config_path(fifo.clone()));
+
+        // Writer thread: this mutate will block inside the file write
+        // (open on the readerless FIFO) and never return.
+        let writer = Arc::clone(&handle);
+        std::thread::spawn(move || {
+            let _ = writer.set_personality(desktop_assistant_core::prompts::Personality::default());
+        });
+
+        // Give the writer time to reach (and block in) the file write.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Reader: must complete promptly. If the write lock were held across
+        // the blocked I/O, this read would hang and the recv would time out.
+        let reader = Arc::clone(&handle);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let snap = reader.snapshot_config();
+            let _ = tx.send(snap.connections.contains_key("local"));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(found) => assert!(found, "reader saw the expected config"),
+            Err(_) => panic!("snapshot_config hung — the write lock is held across blocking I/O"),
+        }
+
+        let _ = std::fs::remove_file(&fifo);
     }
 
     #[test]

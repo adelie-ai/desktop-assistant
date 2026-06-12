@@ -28,6 +28,9 @@ serde_json.workspace = true
 toml = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
 indexmap = { version = "2", features = ["serde"] }
+# Non-poisoning RwLock for RegistryHandle (DT-9 / #276): a panic while a
+# holder has the lock must not poison it and cascade into every later access.
+parking_lot = "0.12"
 chrono.workspace = true
 async-trait.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
