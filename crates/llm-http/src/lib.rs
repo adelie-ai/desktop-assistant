@@ -12,6 +12,10 @@
 //! (`ContextOverflow`, `RateLimited`, `QuotaExceeded`, `ModelLoading`,
 //! `ToolsUnsupported`) and aren't worth shoehorning into one helper.
 
+mod models;
+
+pub use models::merge_curated_with_live;
+
 use desktop_assistant_core::CoreError;
 use reqwest::Response;
 
