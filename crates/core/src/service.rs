@@ -31,7 +31,8 @@ use crate::tools::{
     tool_set_hash,
 };
 use chrono::{Duration, Local};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use tokio_util::sync::CancellationToken;
 
 /// Return `Err(CoreError::Cancelled)` if the current task's cancellation
@@ -199,6 +200,16 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// [`DEFAULT_HOST_LABEL`] so callers that don't set it (tests, background
     /// jobs) still produce a coherent note.
     host: String,
+    /// Per-conversation turn serialization (#282). Maps a conversation id to a
+    /// `Weak`-referenced async mutex; a turn upgrades-or-inserts the entry, holds
+    /// the `Arc<Mutex<()>>` guard across its whole body, then drops it. Entries
+    /// are `Weak`, so once no turn holds the `Arc` the entry dangles and is
+    /// pruned opportunistically on the next get-or-insert — the map stays bounded
+    /// by the number of *concurrently active* conversations (typically single
+    /// digits). The outer `std::sync::Mutex` is only ever held for the
+    /// upgrade/insert/prune of the `Arc` — never across an `.await`. Different
+    /// conversation ids never contend; same-id turns serialize FIFO.
+    turn_locks: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 /// Fallback `host` label for [`ConversationHandler`] when the daemon does not
@@ -220,6 +231,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             scratchpad_list: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
+            turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -243,6 +255,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             scratchpad_list: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
+            turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -294,6 +307,32 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     pub fn with_max_tool_result_bytes(mut self, max_bytes: usize) -> Self {
         self.max_tool_result_bytes = max_bytes;
         self
+    }
+
+    /// Get-or-insert the per-conversation turn lock (#282), pruning dangling
+    /// weak entries in the same critical section so the map stays bounded by the
+    /// number of *concurrently active* conversations. Returns an owned
+    /// `Arc<tokio::sync::Mutex<()>>`; the caller `.lock().await`s it and holds
+    /// the guard across the turn body. The `std::sync::Mutex` is held only for
+    /// this upgrade/insert/prune — never across an `.await`.
+    fn turn_lock_for(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.turn_locks.lock().expect("turn_locks mutex poisoned");
+        // Opportunistic prune: drop entries whose Arc is gone. Bounded work —
+        // the map only ever holds entries for concurrently-active conversations.
+        map.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(existing) = map.get(conversation_id).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let arc = Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(conversation_id.to_string(), Arc::downgrade(&arc));
+        arc
+    }
+
+    /// Test-only: current number of entries in the turn-lock map (#282), used to
+    /// assert the weak-entry map does not grow unboundedly.
+    #[cfg(test)]
+    fn turn_lock_map_len(&self) -> usize {
+        self.turn_locks.lock().unwrap().len()
     }
 
     /// Handle a `begin_step` / `complete_step` control call (#240).
@@ -578,6 +617,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         id: &ConversationId,
         title: String,
     ) -> Result<(), CoreError> {
+        // Rename is itself a whole-conversation read-modify-write (get → set
+        // title → full `store.update`), so a rename racing an active turn would
+        // load a stale snapshot and clobber the turn's messages. Take the same
+        // per-conversation lock as `send_prompt` (#282); it's quick, so queueing
+        // it behind a turn is invisible. `archive`/`unarchive`/`delete` don't
+        // load-and-rewrite message rows, so they need no lock.
+        let turn_lock = self.turn_lock_for(&id.0);
+        let _turn_guard = turn_lock.lock().await;
         let mut conv = self.store.get(id).await?;
         conv.title = title;
         conv.updated_at = now_timestamp();
@@ -613,6 +660,47 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
     ) -> Result<String, CoreError> {
         // Cooperative cancellation checkpoint (issue #109): bail out
         // before any I/O if the caller has already tripped the token.
+        bail_if_cancelled()?;
+
+        // Per-conversation turn serialization (#282). Concurrent turns on the
+        // SAME conversation are a read-modify-write race: each does
+        // `store.get` → mutate `conv.messages` → `store.update`, so a late
+        // `update` clobbers a turn that completed in between, silently losing
+        // its user prompt + reply. We serialize turn bodies per conversation
+        // id by holding a per-conversation async mutex across the WHOLE turn.
+        //
+        // The guard is the first local, so RAII releases it on every return
+        // path — `?`, error arms, and panics alike (no poisoning:
+        // `tokio::sync::Mutex` guards are plain RAII). Different conversation
+        // ids take different mutexes and never contend.
+        //
+        // INVARIANT (deadlock-freedom): a turn holding conversation X's lock
+        // must never dispatch another turn to X. The only re-entrant turn path
+        // is `spawn_subagent`, which always targets a FRESH child conversation
+        // (lock order is strictly parent→fresh-child, acyclic). `begin_step` /
+        // `complete_step` are handled inline in this dispatch loop and never
+        // re-enter `send_prompt`.
+        //
+        // The wait itself is cancellable so a turn QUEUED behind a long
+        // agentic turn can be cancelled while it waits (not just at the next
+        // checkpoint): we `select!` the lock acquisition against the
+        // cancellation token. Dropping the losing `lock()` future removes the
+        // waiter from the mutex's FIFO queue without disturbing the running
+        // turn.
+        let turn_lock = self.turn_lock_for(&conversation_id.0);
+        let _turn_guard = match current_cancellation_token() {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(CoreError::Cancelled),
+                    guard = turn_lock.lock() => guard,
+                }
+            }
+            None => turn_lock.lock().await,
+        };
+        // Re-check after acquiring: the wait may have been long (a multi-minute
+        // agentic turn ahead of us), and the token may have tripped just as we
+        // won the lock.
         bail_if_cancelled()?;
 
         // The chunk callback must survive every tool round: each round's
@@ -5070,6 +5158,619 @@ mod tests {
         assert!(
             !no_scope.contains(REFINEMENT_MARKER),
             "no refinement marker should leak into the baseline prompt"
+        );
+    }
+}
+
+/// Concurrency tests for per-conversation turn serialization (DA-1, #282).
+///
+/// These exercise the bug directly: two turns racing the *same* conversation
+/// must both persist (no lost messages), turns on *different* conversations
+/// must stay concurrent, queued turns must run FIFO, a queued turn must be
+/// cancellable while it waits, an erroring turn must release the lock, a
+/// rename racing a turn must not clobber messages, and the lock map must not
+/// grow unboundedly.
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use crate::domain::ToolDefinition;
+    use crate::ports::llm::{LlmResponse, with_cancellation_token};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration as StdDuration;
+
+    // In-memory store mirroring the test `MockStore`, but cloneable via Arc so
+    // it can back several concurrent handler calls. Read-modify-write is the
+    // same shape as the real Postgres store: `get` clones out, the caller
+    // mutates, `update` replaces the whole row — so without serialization a
+    // late `update` clobbers a turn that finished in between.
+    #[derive(Clone)]
+    struct SharedStore {
+        data: Arc<StdMutex<HashMap<String, Conversation>>>,
+    }
+
+    impl SharedStore {
+        fn new() -> Self {
+            Self {
+                data: Arc::new(StdMutex::new(HashMap::new())),
+            }
+        }
+    }
+
+    impl ConversationStore for SharedStore {
+        async fn create(&self, conv: Conversation) -> Result<(), CoreError> {
+            self.data.lock().unwrap().insert(conv.id.0.clone(), conv);
+            Ok(())
+        }
+
+        async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&id.0)
+                .cloned()
+                .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+        }
+
+        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+            Ok(self.data.lock().unwrap().values().cloned().collect())
+        }
+
+        async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
+            let mut data = self.data.lock().unwrap();
+            if data.contains_key(&conv.id.0) {
+                data.insert(conv.id.0.clone(), conv);
+                Ok(())
+            } else {
+                Err(CoreError::ConversationNotFound(conv.id.0.clone()))
+            }
+        }
+
+        async fn delete(&self, id: &ConversationId) -> Result<(), CoreError> {
+            self.data
+                .lock()
+                .unwrap()
+                .remove(&id.0)
+                .map(|_| ())
+                .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+        }
+
+        async fn archive(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn unarchive(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn create_summary(
+            &self,
+            _conversation_id: &ConversationId,
+            _summary: String,
+            _start_ordinal: usize,
+            _end_ordinal: usize,
+        ) -> Result<String, CoreError> {
+            Ok("mock-summary".to_string())
+        }
+
+        async fn expand_summary(&self, _summary_id: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// LLM whose `stream_completion` blocks until released, so a test can hold
+    /// several turns simultaneously *inside* their turn bodies and force the
+    /// interleaving that the race needs. Each call increments `in_flight`, then
+    /// waits for a `permits` token before returning the reply. Tests observe
+    /// in-flight state by polling `in_flight`.
+    ///
+    /// `permits` is a token *count* (not a `Notify`), so `open_gate()` called
+    /// before a turn parks still releases it — no notify/park race. Tests call
+    /// `open_gate()` in a poll loop and each call grants one more turn passage.
+    #[derive(Clone)]
+    struct GatedLlm {
+        reply: String,
+        in_flight: Arc<AtomicUsize>,
+        permits: Arc<AtomicUsize>,
+    }
+
+    impl GatedLlm {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_string(),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                permits: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Grant one more turn passage through the gate. Permit-based, so order
+        /// vs a turn's parking does not matter.
+        fn open_gate(&self) {
+            self.permits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for GatedLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            // Spin-wait for a permit. Cheap for tests; yields so other tasks run.
+            loop {
+                let cur = self.permits.load(Ordering::SeqCst);
+                if cur > 0
+                    && self
+                        .permits
+                        .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(2)).await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(LlmResponse::text(self.reply.clone()))
+        }
+    }
+
+    /// Trivial LLM returning a fixed reply, for tests where the LLM is not the
+    /// thing under test (the store's first `update` is forced to fail instead).
+    struct FixedLlm(String);
+
+    #[async_trait::async_trait]
+    impl LlmClient for FixedLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse::text(self.0.clone()))
+        }
+    }
+
+    /// Store whose first `update` fails (then succeeds), so `send_prompt`
+    /// returns `Err` via `?` mid-turn — exercising RAII lock release on an early
+    /// error return.
+    #[derive(Clone)]
+    struct FailFirstUpdateStore {
+        inner: SharedStore,
+        fail_updates: Arc<AtomicUsize>,
+    }
+
+    impl ConversationStore for FailFirstUpdateStore {
+        async fn create(&self, conv: Conversation) -> Result<(), CoreError> {
+            self.inner.create(conv).await
+        }
+        async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            self.inner.get(id).await
+        }
+        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+            self.inner.list().await
+        }
+        async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
+            if self.fail_updates.load(Ordering::SeqCst) > 0 {
+                self.fail_updates.fetch_sub(1, Ordering::SeqCst);
+                return Err(CoreError::Llm("update boom".to_string()));
+            }
+            self.inner.update(conv).await
+        }
+        async fn delete(&self, id: &ConversationId) -> Result<(), CoreError> {
+            self.inner.delete(id).await
+        }
+        async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            self.inner.archive(id).await
+        }
+        async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            self.inner.unarchive(id).await
+        }
+        async fn create_summary(
+            &self,
+            conversation_id: &ConversationId,
+            summary: String,
+            start_ordinal: usize,
+            end_ordinal: usize,
+        ) -> Result<String, CoreError> {
+            self.inner
+                .create_summary(conversation_id, summary, start_ordinal, end_ordinal)
+                .await
+        }
+        async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+            self.inner.expand_summary(summary_id).await
+        }
+    }
+
+    fn make_handler_with<S: ConversationStore, L: LlmClient>(
+        store: S,
+        llm: L,
+    ) -> ConversationHandler<S, L> {
+        let counter = Arc::new(AtomicU64::new(0));
+        ConversationHandler::new(
+            store,
+            llm,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        )
+    }
+
+    fn noop_callback() -> ChunkCallback {
+        Box::new(|_| true)
+    }
+
+    fn noop_status() -> StatusCallback {
+        Box::new(|_| {})
+    }
+
+    /// Marker content for the pre-seeded history message (see below).
+    const SEED_MARKER: &str = "__seed__";
+
+    /// Seed a conversation that already has one prior assistant message. This
+    /// makes `is_first_message` false, so a turn does NOT trigger title
+    /// generation — which would otherwise be a *second* LLM call per turn and
+    /// require a second gate permit, confounding the permit-based timing these
+    /// tests rely on. Assertions filter out `SEED_MARKER` so the seed is
+    /// invisible to message-count checks.
+    fn seed_conv(store: &SharedStore, id: &str) -> ConversationId {
+        let mut conv = Conversation::new(id, "Chat");
+        let ts = now_timestamp();
+        conv.created_at = ts.clone();
+        conv.updated_at = ts;
+        conv.messages
+            .push(Message::new(Role::Assistant, SEED_MARKER));
+        store.data.lock().unwrap().insert(id.to_string(), conv);
+        ConversationId(id.to_string())
+    }
+
+    /// Messages excluding the pre-seeded history marker (see `seed_conv`).
+    fn real_messages(conv: &Conversation) -> Vec<(Role, String)> {
+        conv.messages
+            .iter()
+            .filter(|m| m.content != SEED_MARKER)
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
+    }
+
+    /// AC1: two concurrent turns on ONE conversation must both persist — both
+    /// user prompts and both replies present afterwards. This is the data-loss
+    /// bug: before serialization, the late `update` clobbers the early one.
+    #[tokio::test]
+    async fn concurrent_send_prompts_same_conversation_lose_nothing() {
+        let store = SharedStore::new();
+        let id = seed_conv(&store, "c1");
+        let llm = GatedLlm::new("reply");
+        let handler = Arc::new(make_handler_with(store.clone(), llm.clone()));
+
+        let h1 = handler.clone();
+        let id1 = id.clone();
+        let t1 = tokio::spawn(async move {
+            h1.send_prompt(&id1, "first".into(), noop_callback(), noop_status())
+                .await
+        });
+        let h2 = handler.clone();
+        let id2 = id.clone();
+        let t2 = tokio::spawn(async move {
+            h2.send_prompt(&id2, "second".into(), noop_callback(), noop_status())
+                .await
+        });
+
+        // Repeatedly open the gate so each turn proceeds as it acquires the
+        // lock (with serialization only one is in-flight at a time).
+        for _ in 0..60 {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+            llm.open_gate();
+            if t1.is_finished() && t2.is_finished() {
+                break;
+            }
+        }
+
+        t1.await.unwrap().unwrap();
+        t2.await.unwrap().unwrap();
+
+        let conv = store.data.lock().unwrap().get("c1").cloned().unwrap();
+        let real = real_messages(&conv);
+        let users: Vec<&String> = real
+            .iter()
+            .filter(|(r, _)| *r == Role::User)
+            .map(|(_, c)| c)
+            .collect();
+        let assistants = real.iter().filter(|(r, _)| *r == Role::Assistant).count();
+        assert!(
+            users.contains(&&"first".to_string()) && users.contains(&&"second".to_string()),
+            "both user prompts must survive, got: {real:?}"
+        );
+        assert_eq!(
+            assistants, 2,
+            "both assistant replies must survive (4 real messages total), got: {real:?}"
+        );
+        assert_eq!(real.len(), 4);
+    }
+
+    /// AC2: turns on DIFFERENT conversations must not serialize. The gated LLM
+    /// only releases once both turns are simultaneously in-flight; a global or
+    /// cross-conversation lock would let only one enter and this would time out.
+    #[tokio::test]
+    async fn concurrent_turns_on_different_conversations_run_in_parallel() {
+        let store = SharedStore::new();
+        let id_a = seed_conv(&store, "a");
+        let id_b = seed_conv(&store, "b");
+        let llm = GatedLlm::new("reply");
+        let handler = Arc::new(make_handler_with(store.clone(), llm.clone()));
+
+        let h1 = handler.clone();
+        let t1 = tokio::spawn(async move {
+            h1.send_prompt(&id_a, "qa".into(), noop_callback(), noop_status())
+                .await
+        });
+        let h2 = handler.clone();
+        let t2 = tokio::spawn(async move {
+            h2.send_prompt(&id_b, "qb".into(), noop_callback(), noop_status())
+                .await
+        });
+
+        // Wait until BOTH turns are inside the LLM at the same time.
+        let both_in_flight = async {
+            loop {
+                if llm.in_flight.load(Ordering::SeqCst) >= 2 {
+                    return;
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(StdDuration::from_secs(5), both_in_flight)
+            .await
+            .expect("different conversations must run concurrently, not serialize");
+
+        // Drain.
+        for _ in 0..50 {
+            llm.open_gate();
+            if t1.is_finished() && t2.is_finished() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        t1.await.unwrap().unwrap();
+        t2.await.unwrap().unwrap();
+    }
+
+    /// AC: queued turns on one conversation run in submission (FIFO) order.
+    #[tokio::test]
+    async fn queued_turns_run_in_fifo_order() {
+        let store = SharedStore::new();
+        let id = seed_conv(&store, "c1");
+        let llm = GatedLlm::new("r");
+        let handler = Arc::new(make_handler_with(store.clone(), llm.clone()));
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let h = handler.clone();
+            let id = id.clone();
+            let prompt = format!("p{i}");
+            handles.push(tokio::spawn(async move {
+                h.send_prompt(&id, prompt, noop_callback(), noop_status())
+                    .await
+            }));
+            // Stagger submission so arrival order at the lock is deterministic.
+            tokio::time::sleep(StdDuration::from_millis(30)).await;
+        }
+
+        for _ in 0..80 {
+            llm.open_gate();
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+            if handles.iter().all(|h| h.is_finished()) {
+                break;
+            }
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        let conv = store.data.lock().unwrap().get("c1").cloned().unwrap();
+        let users: Vec<String> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            users,
+            vec!["p0", "p1", "p2"],
+            "queued turns must persist in FIFO submission order"
+        );
+    }
+
+    /// AC: a turn queued behind an active turn can be cancelled WHILE it waits;
+    /// it returns `Cancelled` promptly, the running turn is unaffected, and only
+    /// the running turn's messages persist.
+    #[tokio::test]
+    async fn cancelling_a_queued_turn_releases_it_while_waiting() {
+        let store = SharedStore::new();
+        let id = seed_conv(&store, "c1");
+        let llm = GatedLlm::new("reply");
+        let handler = Arc::new(make_handler_with(store.clone(), llm.clone()));
+
+        // Turn A acquires the lock and parks inside the LLM.
+        let ha = handler.clone();
+        let id_a = id.clone();
+        let ta = tokio::spawn(async move {
+            ha.send_prompt(&id_a, "A".into(), noop_callback(), noop_status())
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while llm.in_flight.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("turn A should enter the LLM");
+
+        // Turn B queues behind A under its own cancellation token.
+        let token = CancellationToken::new();
+        let hb = handler.clone();
+        let id_b = id.clone();
+        let token_for_b = token.clone();
+        let tb = tokio::spawn(async move {
+            with_cancellation_token(token_for_b, async move {
+                hb.send_prompt(&id_b, "B".into(), noop_callback(), noop_status())
+                    .await
+            })
+            .await
+        });
+
+        // Give B time to reach the lock wait, then cancel it.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        token.cancel();
+
+        let b_result = tokio::time::timeout(StdDuration::from_secs(5), tb)
+            .await
+            .expect("cancelled queued turn must return promptly while waiting")
+            .unwrap();
+        assert!(
+            matches!(b_result, Err(CoreError::Cancelled)),
+            "queued-then-cancelled turn must return Cancelled, got {b_result:?}"
+        );
+
+        // A still completes fine.
+        llm.open_gate();
+        ta.await.unwrap().unwrap();
+
+        let conv = store.data.lock().unwrap().get("c1").cloned().unwrap();
+        let users: Vec<String> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            users,
+            vec!["A".to_string()],
+            "only the running turn should persist"
+        );
+    }
+
+    /// AC: an erroring turn releases the lock (RAII / no poisoning) so a queued
+    /// turn proceeds normally afterwards.
+    #[tokio::test]
+    async fn turn_error_releases_the_lock() {
+        let inner = SharedStore::new();
+        let id = seed_conv(&inner, "c1");
+        let store = FailFirstUpdateStore {
+            inner: inner.clone(),
+            fail_updates: Arc::new(AtomicUsize::new(1)),
+        };
+        let handler = make_handler_with(store, FixedLlm("ok".to_string()));
+
+        // First turn errors mid-persist (store.update fails) → Err via `?`.
+        let first = handler
+            .send_prompt(&id, "boom".into(), noop_callback(), noop_status())
+            .await;
+        assert!(first.is_err(), "first turn should error, got {first:?}");
+
+        // Second turn must proceed (lock released despite the early error).
+        let second = handler
+            .send_prompt(&id, "after".into(), noop_callback(), noop_status())
+            .await;
+        assert!(
+            second.is_ok(),
+            "lock must be released after an error so the next turn proceeds: {second:?}"
+        );
+        let conv = inner.data.lock().unwrap().get("c1").cloned().unwrap();
+        assert!(
+            conv.messages.iter().any(|m| m.content == "after"),
+            "the post-error turn must persist"
+        );
+    }
+
+    /// AC (§1.2): a rename racing an active turn must not clobber the turn's
+    /// messages — the final state has the new title AND the turn's messages.
+    #[tokio::test]
+    async fn rename_during_active_turn_does_not_clobber_messages() {
+        let store = SharedStore::new();
+        let id = seed_conv(&store, "c1");
+        let llm = GatedLlm::new("reply");
+        let handler = Arc::new(make_handler_with(store.clone(), llm.clone()));
+
+        // Start a turn that parks in the LLM (holding the lock).
+        let h_turn = handler.clone();
+        let id_turn = id.clone();
+        let turn = tokio::spawn(async move {
+            h_turn
+                .send_prompt(&id_turn, "hello".into(), noop_callback(), noop_status())
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while llm.in_flight.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("turn should enter the LLM");
+
+        // Rename queues behind the turn (load conv, set title, write).
+        let h_rename = handler.clone();
+        let id_rename = id.clone();
+        let rename = tokio::spawn(async move {
+            h_rename
+                .rename_conversation(&id_rename, "New Title".into())
+                .await
+        });
+
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        // Release the turn; rename should run after it, on fresh state.
+        llm.open_gate();
+        turn.await.unwrap().unwrap();
+        rename.await.unwrap().unwrap();
+
+        let conv = store.data.lock().unwrap().get("c1").cloned().unwrap();
+        assert_eq!(conv.title, "New Title", "rename must take effect");
+        let real = real_messages(&conv);
+        assert!(
+            real.iter().any(|(_, c)| c == "hello"),
+            "the turn's user message must survive the rename, got: {real:?}"
+        );
+        assert_eq!(
+            real.len(),
+            2,
+            "user + assistant must both survive the rename, got: {real:?}"
+        );
+    }
+
+    /// AC: the lock map must not grow unboundedly — entries are weak and pruned,
+    /// so after N sequential turns across N conversations the map is bounded
+    /// (dangling weak entries removed once no turn holds the Arc).
+    #[tokio::test]
+    async fn lock_map_does_not_grow_unboundedly() {
+        let store = SharedStore::new();
+        let llm = GatedLlm::new("r");
+        let handler = make_handler_with(store.clone(), llm.clone());
+
+        for i in 0..20 {
+            let cid = format!("c{i}");
+            let id = seed_conv(&store, &cid);
+            let fut = handler.send_prompt(&id, format!("p{i}"), noop_callback(), noop_status());
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    r = &mut fut => { r.unwrap(); break; }
+                    _ = tokio::time::sleep(StdDuration::from_millis(5)) => { llm.open_gate(); }
+                }
+            }
+        }
+
+        // After all turns complete, no Arc is held, so weak entries must have
+        // been pruned: the map is far smaller than the 20 conversations touched.
+        let len = handler.turn_lock_map_len();
+        assert!(
+            len <= 1,
+            "lock map should be pruned of dangling weak entries, len = {len}"
         );
     }
 }
