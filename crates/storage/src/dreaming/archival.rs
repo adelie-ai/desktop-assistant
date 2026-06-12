@@ -16,6 +16,7 @@
 use sqlx::PgPool;
 
 use desktop_assistant_auth_jwt::DEFAULT_USER_ID;
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::current_user_id;
 
 /// Archive conversations not touched in `days` days. Returns rows archived.
@@ -25,7 +26,7 @@ use desktop_assistant_core::ports::auth::current_user_id;
 /// single-tenant deploys, IS the whole table. In multi-tenant deploys
 /// archival is normally driven from inside a per-user consolidation
 /// cycle, so the scope picks the right partition automatically.
-pub async fn run_archival_phase(pool: &PgPool, days: u32) -> Result<usize, String> {
+pub async fn run_archival_phase(pool: &PgPool, days: u32) -> Result<usize, CoreError> {
     let user_id = current_user_id();
     if user_id.as_str() == DEFAULT_USER_ID {
         // Audit-allowlisted: when no per-user scope is installed (e.g.
@@ -41,7 +42,7 @@ pub async fn run_archival_phase(pool: &PgPool, days: u32) -> Result<usize, Strin
         .bind(days as i32)
         .execute(pool)
         .await
-        .map_err(|e| format!("dreaming: archival query failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: archival query failed: {e}")))?;
         Ok(result.rows_affected() as usize)
     } else {
         let result = sqlx::query(
@@ -55,7 +56,7 @@ pub async fn run_archival_phase(pool: &PgPool, days: u32) -> Result<usize, Strin
         .bind(user_id.as_str())
         .execute(pool)
         .await
-        .map_err(|e| format!("dreaming: archival query failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: archival query failed: {e}")))?;
         Ok(result.rows_affected() as usize)
     }
 }

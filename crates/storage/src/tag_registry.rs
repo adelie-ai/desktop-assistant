@@ -12,6 +12,7 @@
 //! `name + description` for similarity dedup, and a `deprecated_for_tag`
 //! chain so a retired tag can point at its replacement.
 
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::current_user_id;
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -60,7 +61,7 @@ pub enum CreateTagOutcome {
 /// the primary consumer, runs per conversation and inherits each
 /// conversation's `user_id` via [`with_user_id`] — see #105 for the
 /// threading contract.
-pub async fn list_active_tags(pool: &PgPool) -> Result<Vec<TagRecord>, String> {
+pub async fn list_active_tags(pool: &PgPool) -> Result<Vec<TagRecord>, CoreError> {
     let user_id = current_user_id();
     let rows: Vec<(String, String, serde_json::Value, Vec<String>)> = sqlx::query_as(
         "SELECT name, description, examples, distinguish_from \
@@ -71,14 +72,14 @@ pub async fn list_active_tags(pool: &PgPool) -> Result<Vec<TagRecord>, String> {
     .bind(user_id.as_str())
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("tag_registry: list failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("tag_registry: list failed: {e}")))?;
 
     Ok(rows.into_iter().map(row_to_record).collect())
 }
 
 /// Look up a single tag by name (active or deprecated). Scoped to the
 /// current task-local user.
-pub async fn get_tag(pool: &PgPool, name: &str) -> Result<Option<TagRecord>, String> {
+pub async fn get_tag(pool: &PgPool, name: &str) -> Result<Option<TagRecord>, CoreError> {
     let user_id = current_user_id();
     let row: Option<(String, String, serde_json::Value, Vec<String>)> = sqlx::query_as(
         "SELECT name, description, examples, distinguish_from \
@@ -88,7 +89,7 @@ pub async fn get_tag(pool: &PgPool, name: &str) -> Result<Option<TagRecord>, Str
     .bind(name)
     .fetch_optional(pool)
     .await
-    .map_err(|e| format!("tag_registry: get failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("tag_registry: get failed: {e}")))?;
 
     Ok(row.map(row_to_record))
 }
@@ -99,7 +100,7 @@ pub async fn get_tag(pool: &PgPool, name: &str) -> Result<Option<TagRecord>, Str
 /// terminates at a missing tag (shouldn't happen given the FK, but graceful).
 /// The chain is followed within a single user's tag partition; cross-user
 /// pointers are forbidden by the FK in #102's migration.
-pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<String>, String> {
+pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<String>, CoreError> {
     let user_id = current_user_id();
     let mut current = name.to_string();
     for _ in 0..16 {
@@ -111,14 +112,16 @@ pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<Str
         .bind(&current)
         .fetch_optional(pool)
         .await
-        .map_err(|e| format!("tag_registry: resolve failed: {e}"))?;
+        .map_err(|e| CoreError::Storage(format!("tag_registry: resolve failed: {e}")))?;
         match row {
             None => return Ok(None),
             Some((None,)) => return Ok(Some(current)),
             Some((Some(next),)) => current = next,
         }
     }
-    Err("tag_registry: deprecation chain too deep (cycle?)".to_string())
+    Err(CoreError::Storage(
+        "tag_registry: deprecation chain too deep (cycle?)".to_string(),
+    ))
 }
 
 /// Create a new tag, or redirect to an existing similar one.
@@ -135,7 +138,7 @@ pub async fn create_or_match_tag(
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
     proposal: TagProposal,
-) -> Result<CreateTagOutcome, String> {
+) -> Result<CreateTagOutcome, CoreError> {
     let user_id = current_user_id();
     let normalized = normalize_tag_name(&proposal.name);
 
@@ -148,11 +151,13 @@ pub async fn create_or_match_tag(
     }
 
     let embed_text = format!("{}: {}", normalized, proposal.description);
-    let embeddings = embed_fn(vec![embed_text]).await?;
+    let embeddings = embed_fn(vec![embed_text])
+        .await
+        .map_err(CoreError::Storage)?;
     let vector = embeddings
         .into_iter()
         .next()
-        .ok_or_else(|| "tag_registry: embed returned no vectors".to_string())?;
+        .ok_or_else(|| CoreError::Storage("tag_registry: embed returned no vectors".to_string()))?;
     let query_vec = Vector::from(vector);
 
     let nearest: Option<(String, String, serde_json::Value, Vec<String>, f64)> = sqlx::query_as(
@@ -166,7 +171,7 @@ pub async fn create_or_match_tag(
     .bind(user_id.as_str())
     .fetch_optional(pool)
     .await
-    .map_err(|e| format!("tag_registry: nearest search failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("tag_registry: nearest search failed: {e}")))?;
 
     if let Some((name, description, examples, distinguish_from, distance)) = nearest
         && distance < TAG_DEDUP_DISTANCE_THRESHOLD
@@ -200,7 +205,7 @@ pub async fn create_or_match_tag(
     .bind(embedding_model)
     .execute(pool)
     .await
-    .map_err(|e| format!("tag_registry: insert failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("tag_registry: insert failed: {e}")))?;
 
     Ok(CreateTagOutcome::Created(TagRecord {
         name: normalized,

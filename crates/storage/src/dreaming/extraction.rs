@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use pgvector::Vector;
@@ -36,7 +37,7 @@ pub async fn run_extraction_phase(
     llm_fn: &DreamingLlmFn,
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
-) -> Result<usize, String> {
+) -> Result<usize, CoreError> {
     let conversations = find_conversations_with_new_messages(pool).await?;
     if conversations.is_empty() {
         tracing::debug!("dreaming: no conversations with new messages");
@@ -96,7 +97,7 @@ async fn process_one_conversation_for_extraction(
     conv_id: &str,
     watermark: i32,
     context_summary: &str,
-) -> Result<usize, String> {
+) -> Result<usize, CoreError> {
     // Tag registry is per-user (#102 PK is `(user_id, name)`); the
     // task-local scope already picks the right partition.
     let registry = tag_registry::list_active_tags(pool).await?;
@@ -278,7 +279,7 @@ async fn write_extracted_fact(
     source_conversation_id: &str,
     proposal: ExtractedFactProposal,
     registry_names: &BTreeSet<String>,
-) -> Result<bool, String> {
+) -> Result<bool, CoreError> {
     let mut final_tags: BTreeSet<String> = BTreeSet::new();
 
     // Existing tags: keep only those present in the active registry.
@@ -323,9 +324,11 @@ async fn write_extracted_fact(
 
     // Embed content for the row's `embedding` array.
     let chunks = chunk_text(&proposal.content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-    let embeddings = embed_fn(chunks).await?;
+    let embeddings = embed_fn(chunks).await.map_err(CoreError::Storage)?;
     if embeddings.is_empty() {
-        return Err("dreaming: embedding returned no vectors".to_string());
+        return Err(CoreError::Storage(
+            "dreaming: embedding returned no vectors".to_string(),
+        ));
     }
     let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
 
@@ -347,7 +350,7 @@ async fn write_extracted_fact(
     .bind(embedding_model)
     .execute(pool)
     .await
-    .map_err(|e| format!("dreaming: insert fact failed: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: insert fact failed: {e}")))?;
 
     tracing::info!(
         "dreaming: wrote fact id={id} (scope={:?}): {}",

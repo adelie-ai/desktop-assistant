@@ -22,6 +22,7 @@ mod extraction;
 mod reconcile;
 mod types;
 
+use desktop_assistant_core::CoreError;
 use sqlx::PgPool;
 
 pub use types::{BackfillEmbedFn, ConsolidationStats, DreamingLlmFn};
@@ -35,7 +36,7 @@ pub async fn run_dreaming_scan(
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
     archive_after_days: u32,
-) -> Result<usize, String> {
+) -> Result<usize, CoreError> {
     tracing::info!("dreaming: phase 1/3 extraction");
     let new_facts =
         extraction::run_extraction_phase(pool, llm_fn, embed_fn, embedding_model).await?;

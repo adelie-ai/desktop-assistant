@@ -71,22 +71,13 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     "scratchpads",
 ];
 
-/// Output of `prepare_select_for_user` — the rewritten SELECT plus the
-/// caller's user_id ready to bind as `$1` when grafting added a
-/// `user_id = $1` predicate. When no personal-data table was
-/// referenced (e.g. `SELECT now()` or a query over
-/// `information_schema`), `bound_user_id` is `None` and the SQL is
+/// Output of `prepare_select_for_user` — the rewritten SELECT (with
+/// `user_id = '<user_id>'` predicates grafted onto every personal-data
+/// table reference). When no personal-data table was referenced (e.g.
+/// `SELECT now()` or a query over `information_schema`), the SQL is
 /// returned essentially unchanged.
 pub(crate) struct PreparedSelect {
     pub sql: String,
-    /// `Some(user_id)` when the rewriter grafted at least one
-    /// `user_id = '<user_id>'` predicate; `None` when the query did
-    /// not reference any personal-data table. Currently informational
-    /// (the value is inlined as a SQL literal so there's no bind to
-    /// perform), but exposed so a future migration to parameter-
-    /// rebinding can use it.
-    #[allow(dead_code)]
-    pub bound_user_id: Option<String>,
     /// True when the parsed query already carries a `LIMIT` clause, so the
     /// read path must not wrap it in an auto-LIMIT subquery (DS-7). Derived
     /// from the AST (`Query.limit_clause`), not a substring scan, so a string
@@ -134,7 +125,6 @@ pub(crate) fn prepare_select_for_user(
 
     Ok(PreparedSelect {
         sql: sql_out,
-        bound_user_id: grafter.bound.then(|| user_id.to_string()),
         has_limit,
     })
 }
@@ -414,17 +404,11 @@ impl PersonalDataTableFinder {
 /// scoping.
 struct UserIdGrafter<'a> {
     user_id: &'a str,
-    /// Tracks whether at least one graft happened — when true, the
-    /// resulting `PreparedSelect.bound_user_id` is `Some(user_id)`.
-    bound: bool,
 }
 
 impl<'a> UserIdGrafter<'a> {
     fn new(user_id: &'a str) -> Self {
-        Self {
-            user_id,
-            bound: false,
-        }
+        Self { user_id }
     }
 
     fn visit_query(&mut self, q: &mut Query) {
@@ -476,7 +460,6 @@ impl<'a> UserIdGrafter<'a> {
                 },
                 None => predicate,
             });
-            self.bound = true;
         }
     }
 

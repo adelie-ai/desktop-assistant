@@ -21,6 +21,7 @@
 use sqlx::PgPool;
 
 use super::types::{MAX_CONVERSATIONS_PER_SCAN, MAX_MESSAGE_CHARS};
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::current_user_id;
 
 /// Conversations that have messages beyond their watermark, with their
@@ -33,7 +34,7 @@ use desktop_assistant_core::ports::auth::current_user_id;
 /// allowlist.
 pub async fn find_conversations_with_new_messages(
     pool: &PgPool,
-) -> Result<Vec<(String, String, i32, String)>, String> {
+) -> Result<Vec<(String, String, i32, String)>, CoreError> {
     // Audit-allowlisted: cross-user scan in the dreaming background
     // worker. The returned `user_id` column is consumed by the worker
     // to install a per-user scope before any subsequent query runs.
@@ -57,7 +58,7 @@ pub async fn find_conversations_with_new_messages(
     .bind(MAX_CONVERSATIONS_PER_SCAN)
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("dreaming: failed to find conversations: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: failed to find conversations: {e}")))?;
 
     Ok(rows)
 }
@@ -69,7 +70,7 @@ pub async fn load_new_transcript(
     pool: &PgPool,
     conversation_id: &str,
     from_ordinal: i32,
-) -> Result<String, String> {
+) -> Result<String, CoreError> {
     let user_id = current_user_id();
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT role, content FROM messages \
@@ -82,7 +83,7 @@ pub async fn load_new_transcript(
     .bind(from_ordinal)
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("dreaming: failed to load transcript: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: failed to load transcript: {e}")))?;
 
     let mut transcript = String::new();
     for (role, content) in rows {
@@ -104,7 +105,10 @@ pub async fn load_new_transcript(
 /// Returns an empty string if the conversation has been hard-deleted —
 /// callers must handle that case (consolidation falls through to KB-only
 /// judgment). Scoped to the task-local user id.
-pub async fn load_full_transcript(pool: &PgPool, conversation_id: &str) -> Result<String, String> {
+pub async fn load_full_transcript(
+    pool: &PgPool,
+    conversation_id: &str,
+) -> Result<String, CoreError> {
     let user_id = current_user_id();
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT role, content FROM messages \
@@ -116,7 +120,7 @@ pub async fn load_full_transcript(pool: &PgPool, conversation_id: &str) -> Resul
     .bind(conversation_id)
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("dreaming: failed to load full transcript: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: failed to load full transcript: {e}")))?;
 
     let mut transcript = String::new();
     for (role, content) in rows {
@@ -133,7 +137,7 @@ pub async fn load_full_transcript(pool: &PgPool, conversation_id: &str) -> Resul
 
 /// Get the maximum message ordinal for a conversation. Scoped to the
 /// task-local user id.
-pub async fn get_max_ordinal(pool: &PgPool, conversation_id: &str) -> Result<i32, String> {
+pub async fn get_max_ordinal(pool: &PgPool, conversation_id: &str) -> Result<i32, CoreError> {
     let user_id = current_user_id();
     let row: (Option<i32>,) = sqlx::query_as(
         "SELECT MAX(ordinal) FROM messages \
@@ -143,7 +147,7 @@ pub async fn get_max_ordinal(pool: &PgPool, conversation_id: &str) -> Result<i32
     .bind(conversation_id)
     .fetch_one(pool)
     .await
-    .map_err(|e| format!("dreaming: failed to get max ordinal: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: failed to get max ordinal: {e}")))?;
 
     Ok(row.0.unwrap_or(0))
 }
@@ -155,7 +159,7 @@ pub async fn update_watermark(
     pool: &PgPool,
     conversation_id: &str,
     ordinal: i32,
-) -> Result<(), String> {
+) -> Result<(), CoreError> {
     let user_id = current_user_id();
     sqlx::query(
         "INSERT INTO dreaming_watermarks \
@@ -171,7 +175,7 @@ pub async fn update_watermark(
     .bind(ordinal)
     .execute(pool)
     .await
-    .map_err(|e| format!("dreaming: failed to update watermark: {e}"))?;
+    .map_err(|e| CoreError::Storage(format!("dreaming: failed to update watermark: {e}")))?;
 
     Ok(())
 }
