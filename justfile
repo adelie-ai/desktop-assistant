@@ -133,7 +133,7 @@ backend-restart:
 
 # Rebuild + reinstall daemon binary used by systemd service, then restart it
 backend-reinstall:
-    cargo install --path crates/daemon --force
+    cargo install --path crates/daemon --force --locked
     systemctl --user restart {{service_name}}
     systemctl --user is-active {{service_name}}
 

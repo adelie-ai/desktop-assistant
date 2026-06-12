@@ -50,7 +50,11 @@ rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
-time = "0.3"
+# 0.3.48 emits conflicting `From` impls that break coherence (E0119) against any
+# blanket `impl<T> From<T>` (e.g. aws-smithy-types CanDisable, rcgen DnValue).
+# cargo unifies `time` to one version graph-wide, so this bound guards all crates.
+# Re-widen once a fixed release (>=0.3.49) is out.
+time = ">=0.3, <0.3.48"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
