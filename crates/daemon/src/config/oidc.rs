@@ -1,5 +1,5 @@
 //! OIDC token validator. Fetches the IdP's JWKS at startup, builds an
-//! RS256 validator with the issuer (and optional audience) pinned, then
+//! RS256 validator with the issuer and (required) audience pinned, then
 //! decides locally whether a presented token is valid.
 //!
 //! Extracted from `config.rs` (#41).
@@ -20,28 +20,85 @@
 //! - HMAC algorithms are explicitly *not* allowed by the validator
 //!   (RS256 only), defending against the JWKS-substitution-via-`alg=HS256`
 //!   class of attacks.
+//! - Audience validation is **required** (DT-2 #268). `from_config` refuses
+//!   to build a validator when `oidc.audience` is empty, because an empty
+//!   audience disables the `aud` check and accepts any token the issuer ever
+//!   minted (for any other service). This only ever narrows acceptance.
+//! - The JWKS is **refreshed** (DT-2 #268), not frozen at startup, so IdP key
+//!   rotation no longer silently locks every user out until a daemon restart:
+//!   a token presenting an unknown `kid` triggers a rate-limited refetch from
+//!   the *same* configured `jwks_uri`. Refresh only ever *adds* keys from the
+//!   pinned URI — the issuer, audience, and algorithm rules are unchanged — so
+//!   it can never widen acceptance. The rate limit (a minimum interval between
+//!   refetch attempts) means a flood of garbage `kid`s can't hammer the IdP.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
+use tokio::sync::{Mutex, RwLock};
 
 use super::OidcConfig;
 
-/// Cached JWKS key set for validating external OIDC tokens.
+/// Minimum spacing between unknown-`kid` JWKS refetch attempts.
 ///
-/// Keys with a `kid` are stored in [`Self::keys_by_kid`] for direct
-/// lookup; keys without a `kid` go into [`Self::kidless_keys`] and are
-/// the fallback iterate-and-try set. A presented token with a `kid`
-/// header is matched against `keys_by_kid` first; on miss (or for
-/// tokens whose header has no `kid`) we fall through to the kid-less
-/// list. The fallback exists because some IdPs serve unkeyed tokens
-/// during a key rotation, so a strict kid-only path would briefly
-/// reject otherwise valid tokens (#36).
-pub struct OidcValidator {
+/// An unknown `kid` is the signal "the IdP may have rotated keys"; we refetch
+/// so a freshly-rotated key is picked up without a daemon restart. But a flood
+/// of tokens carrying garbage `kid`s would otherwise hammer the IdP once per
+/// request — so refetch attempts are throttled to at most one per this
+/// interval. A genuine rotation is picked up within one interval; garbage
+/// `kid`s cost at most one refetch per interval regardless of volume.
+const JWKS_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The decoding keys parsed from a JWKS document, split by whether the source
+/// JWK carried a `kid`.
+#[derive(Default)]
+struct KeySet {
     keys_by_kid: HashMap<String, DecodingKey>,
     kidless_keys: Vec<DecodingKey>,
+}
+
+impl KeySet {
+    fn is_empty(&self) -> bool {
+        self.keys_by_kid.is_empty() && self.kidless_keys.is_empty()
+    }
+}
+
+/// Tracks the last JWKS refetch attempt so refreshes can be rate-limited.
+struct RefreshState {
+    /// When the last refetch was *attempted* (success or failure), used to
+    /// throttle. `None` until the first refetch.
+    last_attempt: Option<Instant>,
+    /// Minimum spacing between refetch attempts.
+    min_interval: Duration,
+}
+
+/// Cached JWKS key set for validating external OIDC tokens.
+///
+/// Keys with a `kid` are stored in [`KeySet::keys_by_kid`] for direct lookup;
+/// keys without a `kid` go into [`KeySet::kidless_keys`] and are the fallback
+/// iterate-and-try set. A presented token with a `kid` header is matched
+/// against `keys_by_kid` first; on miss (or for tokens whose header has no
+/// `kid`) we fall through to the kid-less list. The fallback exists because
+/// some IdPs serve unkeyed tokens during a key rotation, so a strict kid-only
+/// path would briefly reject otherwise valid tokens (#36).
+///
+/// The key set lives behind an `RwLock` so the validator can refresh it when a
+/// token presents an unknown `kid` (DT-2 #268). Refresh refetches from the
+/// pinned [`Self::jwks_uri`] only; the [`Self::validation`] rules never change.
+pub struct OidcValidator {
+    keys: Arc<RwLock<KeySet>>,
     validation: Validation,
+    /// HTTP client reused for refresh refetches.
+    client: reqwest::Client,
+    /// The resolved (and scheme-validated) JWKS URI. Refresh refetches keys
+    /// from *exactly* this URI, so a refresh can never introduce keys from a
+    /// different origin.
+    jwks_uri: String,
+    /// Rate-limit state for unknown-`kid`-triggered refetches.
+    refresh_state: Mutex<RefreshState>,
 }
 
 impl OidcValidator {
@@ -121,45 +178,15 @@ impl OidcValidator {
         Ok(serde_json::from_slice(&buf)?)
     }
 
-    /// Fetch JWKS from the IdP and build a validator.
-    pub async fn from_config(oidc: &OidcConfig) -> anyhow::Result<Self> {
-        let client = Self::oidc_http_client();
-
-        // JWKS must travel over a confidential channel — plaintext fetch lets
-        // an attacker swap keys and forge tokens. Permit http only for explicit
-        // loopback (development). The jwks_uri override is checked for the
-        // same reason.
-        Self::require_https_or_loopback(&oidc.issuer_url, "issuer_url")?;
-        if !oidc.jwks_uri.is_empty() {
-            Self::require_https_or_loopback(&oidc.jwks_uri, "jwks_uri")?;
-        }
-
-        let jwks_uri = if oidc.jwks_uri.is_empty() {
-            let discovery_url = format!(
-                "{}/.well-known/openid-configuration",
-                oidc.issuer_url.trim_end_matches('/')
-            );
-            let discovery =
-                Self::fetch_oidc_json(&client, &discovery_url, Self::MAX_OIDC_RESPONSE_BYTES)
-                    .await?;
-            let resolved = discovery["jwks_uri"]
-                .as_str()
-                .ok_or_else(|| anyhow!("no jwks_uri in OIDC discovery document"))?
-                .to_string();
-            Self::require_https_or_loopback(&resolved, "discovered jwks_uri")?;
-            resolved
-        } else {
-            oidc.jwks_uri.clone()
-        };
-
-        let jwks = Self::fetch_oidc_json(&client, &jwks_uri, Self::MAX_OIDC_RESPONSE_BYTES).await?;
-
+    /// Parse a JWKS JSON document into a [`KeySet`], applying the usage /
+    /// algorithm / `kty` filters. Errors only when the document has no `keys`
+    /// array at all; individual unusable keys are skipped.
+    fn parse_jwks(jwks: &serde_json::Value) -> anyhow::Result<KeySet> {
         let keys = jwks["keys"]
             .as_array()
             .ok_or_else(|| anyhow!("no keys in JWKS response"))?;
 
-        let mut keys_by_kid: HashMap<String, DecodingKey> = HashMap::new();
-        let mut kidless_keys: Vec<DecodingKey> = Vec::new();
+        let mut set = KeySet::default();
         for key in keys {
             if key["kty"].as_str() != Some("RSA") {
                 continue;
@@ -189,101 +216,230 @@ impl OidcValidator {
             };
             match key["kid"].as_str().map(str::to_string) {
                 Some(kid) if !kid.is_empty() => {
-                    keys_by_kid.insert(kid, dk);
+                    set.keys_by_kid.insert(kid, dk);
                 }
-                _ => kidless_keys.push(dk),
+                _ => set.kidless_keys.push(dk),
             }
         }
+        Ok(set)
+    }
 
-        if keys_by_kid.is_empty() && kidless_keys.is_empty() {
+    /// Fetch JWKS from the IdP and build a validator.
+    pub async fn from_config(oidc: &OidcConfig) -> anyhow::Result<Self> {
+        let client = Self::oidc_http_client();
+
+        // Audience validation is mandatory (DT-2 #268). An empty audience
+        // disables the `aud` check entirely, so the validator would accept any
+        // token the issuer minted for *any* relying party. Refuse to start in
+        // that posture rather than silently widen acceptance.
+        if oidc.audience.trim().is_empty() {
+            return Err(anyhow!(
+                "OIDC audience is required: set `oidc.audience` to this service's \
+                 expected `aud` value. An empty audience would accept any token \
+                 from the issuer, including tokens minted for other services."
+            ));
+        }
+
+        // JWKS must travel over a confidential channel — plaintext fetch lets
+        // an attacker swap keys and forge tokens. Permit http only for explicit
+        // loopback (development). The jwks_uri override is checked for the
+        // same reason.
+        Self::require_https_or_loopback(&oidc.issuer_url, "issuer_url")?;
+        if !oidc.jwks_uri.is_empty() {
+            Self::require_https_or_loopback(&oidc.jwks_uri, "jwks_uri")?;
+        }
+
+        let jwks_uri = if oidc.jwks_uri.is_empty() {
+            let discovery_url = format!(
+                "{}/.well-known/openid-configuration",
+                oidc.issuer_url.trim_end_matches('/')
+            );
+            let discovery =
+                Self::fetch_oidc_json(&client, &discovery_url, Self::MAX_OIDC_RESPONSE_BYTES)
+                    .await?;
+            let resolved = discovery["jwks_uri"]
+                .as_str()
+                .ok_or_else(|| anyhow!("no jwks_uri in OIDC discovery document"))?
+                .to_string();
+            Self::require_https_or_loopback(&resolved, "discovered jwks_uri")?;
+            resolved
+        } else {
+            oidc.jwks_uri.clone()
+        };
+
+        let jwks = Self::fetch_oidc_json(&client, &jwks_uri, Self::MAX_OIDC_RESPONSE_BYTES).await?;
+        let set = Self::parse_jwks(&jwks)?;
+
+        if set.is_empty() {
             anyhow::bail!("no usable RSA keys found in JWKS");
         }
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = true;
         validation.set_issuer(&[&oidc.issuer_url]);
-        if !oidc.audience.is_empty() {
-            validation.set_audience(&[&oidc.audience]);
-        }
+        // Non-empty (checked above), so this enables the mandatory `aud` check.
+        validation.set_audience(&[&oidc.audience]);
 
         Ok(Self {
-            keys_by_kid,
-            kidless_keys,
+            keys: Arc::new(RwLock::new(set)),
             validation,
+            client,
+            jwks_uri,
+            refresh_state: Mutex::new(RefreshState {
+                last_attempt: None,
+                min_interval: JWKS_REFRESH_MIN_INTERVAL,
+            }),
         })
     }
 
-    /// Decode and validate `token`, then return the `sub` claim from
-    /// it. Returns `None` for tokens this validator would reject.
-    /// Mirrors [`Self::validate_token`]'s kid/kidless resolution order
-    /// so a token that validates here will also validate there, and a
-    /// successfully-decoded payload yields its `sub` string.
+    /// Refetch the JWKS from the pinned [`Self::jwks_uri`] and replace the
+    /// cached key set, *if* the rate-limit window has elapsed.
     ///
-    /// Used by the WS auth path (#105) to map a validated OIDC bearer
-    /// token to the `user_id` that scopes storage queries.
-    pub fn extract_sub(&self, token: &str) -> Option<String> {
-        let header_kid = decode_header(token).ok().and_then(|h| h.kid);
-
-        if let Some(kid) = header_kid.as_deref()
-            && let Some(key) = self.keys_by_kid.get(kid)
-            && let Ok(data) =
-                jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation)
+    /// Returns `Ok(true)` when a refetch was performed (and the cache updated),
+    /// `Ok(false)` when the call was throttled (too soon since the last
+    /// attempt), and `Err(_)` when a refetch was attempted but failed (network
+    /// error, oversized body, no usable keys). A failed refetch leaves the
+    /// existing cache untouched, so transient IdP errors never *remove* a key
+    /// that was working.
+    ///
+    /// Hard rule (DT-2 #268): this only ever refetches from the same configured
+    /// URI and re-applies the exact same key filters, so it can add keys but
+    /// never relax validation.
+    async fn refresh(&self) -> anyhow::Result<bool> {
         {
-            return data
-                .claims
-                .get("sub")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let mut state = self.refresh_state.lock().await;
+            if let Some(last) = state.last_attempt
+                && last.elapsed() < state.min_interval
+            {
+                return Ok(false);
+            }
+            // Record the attempt *before* the network call so concurrent
+            // unknown-`kid` requests don't all fire a refetch at once.
+            state.last_attempt = Some(Instant::now());
         }
 
-        for key in &self.kidless_keys {
+        let jwks =
+            Self::fetch_oidc_json(&self.client, &self.jwks_uri, Self::MAX_OIDC_RESPONSE_BYTES)
+                .await?;
+        let set = Self::parse_jwks(&jwks)?;
+        if set.is_empty() {
+            return Err(anyhow!(
+                "JWKS refresh from {} returned no usable RSA keys; keeping existing keys",
+                self.jwks_uri
+            ));
+        }
+
+        *self.keys.write().await = set;
+        Ok(true)
+    }
+
+    /// Decode `token` against the currently-cached key set, returning the
+    /// decoded claims on success. Mirrors the kid/kidless resolution order used
+    /// by [`Self::validate_token`].
+    ///
+    /// `header_kid` is the (already-parsed) `kid` from the token header, if any.
+    /// `kid_known` is set to whether that `kid` matched a cached key, so the
+    /// caller can decide whether an unknown `kid` warrants a refresh.
+    async fn try_decode(
+        &self,
+        token: &str,
+        header_kid: Option<&str>,
+        kid_known: &mut bool,
+    ) -> Option<serde_json::Value> {
+        let keys = self.keys.read().await;
+        *kid_known = false;
+
+        if let Some(kid) = header_kid
+            && let Some(key) = keys.keys_by_kid.get(kid)
+        {
+            *kid_known = true;
             if let Ok(data) =
                 jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation)
             {
-                return data
-                    .claims
-                    .get("sub")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                return Some(data.claims);
+            }
+        }
+
+        for key in &keys.kidless_keys {
+            if let Ok(data) =
+                jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation)
+            {
+                return Some(data.claims);
             }
         }
         None
     }
 
-    pub fn validate_token(&self, token: &str) -> bool {
-        // Resolution order:
-        //
-        // 1. Parse the JWT header. If it carries a `kid`, look that key
-        //    up directly in `keys_by_kid` and try only that one. A
-        //    direct hit short-circuits the rest of the verifier set,
-        //    so a JWKS with rotated-out keys can't slow validation
-        //    down to O(N) and a deliberately-mislabelled `kid` can't
-        //    reach a key it isn't authorised against.
-        // 2. If the header has no `kid`, OR the `kid` doesn't match
-        //    any cached key, fall through to the kid-less keys (the
-        //    legacy iterate-and-try set). Some IdPs serve unkeyed
-        //    tokens during a brief rotation window, so a strict
-        //    kid-only path would briefly reject otherwise-valid
-        //    tokens (#36).
-        // 3. If header parsing itself fails, the token is malformed —
-        //    skip step 1 and fall through to the same fallback set.
-        //    `jsonwebtoken::decode` will then reject the malformed
-        //    token consistently.
+    /// Decode and validate `token`, returning its claims, refreshing the JWKS
+    /// once (rate-limited) if the token carries a `kid` we don't recognise.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. Parse the JWT header. If it carries a `kid`, look that key up
+    ///    directly in the cached set and try only that one. A direct hit
+    ///    short-circuits the rest of the verifier set, so a JWKS with
+    ///    rotated-out keys can't slow validation down to O(N) and a
+    ///    deliberately-mislabelled `kid` can't reach a key it isn't authorised
+    ///    against.
+    /// 2. If the header has no `kid`, OR the `kid` doesn't match any cached
+    ///    key, fall through to the kid-less keys (the legacy iterate-and-try
+    ///    set). Some IdPs serve unkeyed tokens during a brief rotation window,
+    ///    so a strict kid-only path would briefly reject otherwise-valid tokens
+    ///    (#36).
+    /// 3. If both fail *and* the token presented a `kid` we don't have cached,
+    ///    the IdP may have rotated keys: refetch the JWKS (rate-limited) and
+    ///    retry once. A token with no `kid`, or a `kid` we already know, does
+    ///    not trigger a refetch (a known `kid` that fails is a bad token, not a
+    ///    rotation).
+    async fn decode_claims(&self, token: &str) -> Option<serde_json::Value> {
         let header_kid = decode_header(token).ok().and_then(|h| h.kid);
 
-        if let Some(kid) = header_kid.as_deref()
-            && let Some(key) = self.keys_by_kid.get(kid)
-            && jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation).is_ok()
+        let mut kid_known = false;
+        if let Some(claims) = self
+            .try_decode(token, header_kid.as_deref(), &mut kid_known)
+            .await
         {
-            return true;
+            return Some(claims);
         }
 
-        for key in &self.kidless_keys {
-            if jsonwebtoken::decode::<serde_json::Value>(token, key, &self.validation).is_ok() {
-                return true;
+        // Only an unknown `kid` is a rotation signal worth a refetch. A token
+        // with no `kid`, or with a `kid` we already cache, has already been
+        // given every chance above.
+        let unknown_kid = header_kid.is_some() && !kid_known;
+        if !unknown_kid {
+            return None;
+        }
+
+        match self.refresh().await {
+            Ok(true) => {
+                let mut kid_known_after = false;
+                self.try_decode(token, header_kid.as_deref(), &mut kid_known_after)
+                    .await
+            }
+            Ok(false) => None, // throttled; no new keys to try
+            Err(error) => {
+                tracing::warn!(jwks_uri = %self.jwks_uri, %error, "OIDC JWKS refresh failed");
+                None
             }
         }
-        false
+    }
+
+    /// Decode and validate `token`, then return the `sub` claim from it.
+    /// Returns `None` for tokens this validator would reject. A
+    /// successfully-decoded payload yields its `sub` string.
+    ///
+    /// Used by the WS auth path (#105) to map a validated OIDC bearer token to
+    /// the `user_id` that scopes storage queries.
+    pub async fn extract_sub(&self, token: &str) -> Option<String> {
+        self.decode_claims(token)
+            .await?
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
+    pub async fn validate_token(&self, token: &str) -> bool {
+        self.decode_claims(token).await.is_some()
     }
 }
 
@@ -380,9 +536,12 @@ mod tests {
             jwks_uri: "https://idp.example.com/jwks".to_string(),
             audience: "   ".to_string(), // whitespace-only == empty
         };
-        let err = OidcValidator::from_config(&oidc)
-            .await
-            .expect_err("empty audience must be rejected");
+        // `OidcValidator` deliberately doesn't derive `Debug` (it holds
+        // decoding keys), so match rather than `expect_err`.
+        let err = match OidcValidator::from_config(&oidc).await {
+            Ok(_) => panic!("empty audience must be rejected"),
+            Err(err) => err,
+        };
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("audience"),
@@ -483,7 +642,7 @@ mod tests {
             "a token signed by the rotated key must validate after JWKS refresh"
         );
         assert!(
-            jwks_v2.hits_async().await >= 1,
+            jwks_v2.calls_async().await >= 1,
             "an unknown kid must trigger a JWKS refetch"
         );
     }
@@ -524,13 +683,16 @@ mod tests {
         );
         // First use: unknown kid → one refetch → validates.
         assert!(validator.validate_token(&token).await);
-        let hits_after_first = jwks_v2.hits_async().await;
-        assert_eq!(hits_after_first, 1, "first unknown kid refetches exactly once");
+        let hits_after_first = jwks_v2.calls_async().await;
+        assert_eq!(
+            hits_after_first, 1,
+            "first unknown kid refetches exactly once"
+        );
 
         // Second use of the now-known kid must not refetch again.
         assert!(validator.validate_token(&token).await);
         assert_eq!(
-            jwks_v2.hits_async().await,
+            jwks_v2.calls_async().await,
             hits_after_first,
             "a now-cached kid must not trigger another refetch"
         );
@@ -551,7 +713,7 @@ mod tests {
             .await;
         let validator = validator_for(&server).await;
         // One startup fetch so far.
-        let baseline = jwks.hits_async().await;
+        let baseline = jwks.calls_async().await;
         assert_eq!(baseline, 1);
 
         // Hammer with many tokens carrying distinct, never-cached `kid`s. Each
@@ -571,7 +733,7 @@ mod tests {
 
         // The first unknown kid fired one refetch; the rest were throttled by
         // the rate limiter, so total fetches are well under 20.
-        let total = jwks.hits_async().await;
+        let total = jwks.calls_async().await;
         assert!(
             total <= baseline + 1,
             "rate limiter must cap refetches: saw {total} fetches for 20 unknown kids"

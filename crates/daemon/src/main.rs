@@ -84,7 +84,7 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
             return true;
         }
         // Fall back to OIDC RS256 validation
-        self.oidc_validator.validate_token(token)
+        self.oidc_validator.validate_token(token).await
     }
 
     async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
@@ -97,6 +97,7 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
         }
         self.oidc_validator
             .extract_sub(token)
+            .await
             .map(desktop_assistant_application::UserId::from)
     }
 }
