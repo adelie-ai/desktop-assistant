@@ -88,17 +88,25 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
     }
 
     async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
-        // Resolution order mirrors `validate_bearer_token`: prefer the
-        // local HS256 mint (single-tenant desktop primary path), then
-        // fall through to OIDC RS256 (multi-tenant deploys). Whichever
-        // one accepts the token also yields its `sub`.
-        if let Some(uid) = self.local.extract_user_id(token).await {
-            return Some(uid);
+        // Identity extraction must follow *acceptance*, not run independently
+        // of it (#279 item 6). Each validator's `sub` is trusted only when
+        // that same validator accepted the token: gate the local HS256
+        // extraction on the local validator accepting, and likewise for OIDC.
+        // Order mirrors `validate_bearer_token` — local HS256 mint first
+        // (single-tenant desktop primary path), then OIDC RS256 (multi-tenant
+        // deploys) — so the validator that would accept the token is the one
+        // that yields its `sub`.
+        if self.local.validate_bearer_token(token).await {
+            return self.local.extract_user_id(token).await;
         }
-        self.oidc_validator
-            .extract_sub(token)
-            .await
-            .map(desktop_assistant_application::UserId::from)
+        if self.oidc_validator.validate_token(token).await {
+            return self
+                .oidc_validator
+                .extract_sub(token)
+                .await
+                .map(desktop_assistant_application::UserId::from);
+        }
+        None
     }
 }
 
