@@ -487,7 +487,10 @@ fn convert_tools(
 
     let mut cfg_builder = ToolConfiguration::builder();
     for tool in tools {
-        let input_doc = json_to_document(tool.parameters.clone());
+        // Defensively strip top-level oneOf/anyOf/allOf, which Bedrock rejects
+        // and which would otherwise 400 the whole request (taking every other
+        // tool down with the one offender). See `sanitize_tool_schema`.
+        let input_doc = json_to_document(sanitize_tool_schema(tool.parameters.clone()));
         // Sanitize the tool-spec name to Bedrock's `^[a-zA-Z0-9_-]+$`. Must
         // match the sanitization applied to history `toolUse` names so the
         // model's response correlates back to the right tool.
@@ -1617,6 +1620,59 @@ fn sanitize_tool_input(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Defensively strip composite keywords Bedrock's Converse API rejects at the
+/// **top level** of a tool `input_schema`.
+///
+/// Bedrock returns
+/// `tools.N.custom.input_schema: input_schema does not support oneOf, allOf,
+/// or anyOf at the top level` and fails the *entire* request — every other
+/// tool in the turn goes down with the one offender. Since the daemon passes
+/// MCP tool schemas straight through, a single misbehaving server can 400 every
+/// LLM turn. This guard ensures no server can do that.
+///
+/// Behavior:
+/// - Only acts on a JSON **object** schema; any other value (`true`, a string,
+///   etc.) is returned untouched.
+/// - Removes top-level `oneOf`, `anyOf`, `allOf` only. `not` is left alone —
+///   the reported Bedrock failure is specific to those three composites.
+/// - Does **not** recurse into `properties.*` (or anywhere else). Nested
+///   composites inside property subschemas are legal in Bedrock and are
+///   commonly used; recursing could corrupt valid schemas.
+/// - If stripping leaves the object without a `type`, sets `"type": "object"`
+///   so the result is still a valid object schema. `properties`, `required`,
+///   `description`, etc. are preserved untouched.
+/// - A no-op for schemas that don't carry those keys.
+///
+/// This is the schema-level analogue of the tool-*name* sanitization in
+/// [`tool_names`]: a defensive, last-resort fixup on the Bedrock request path,
+/// leaving the Anthropic-API path and the schemas sent to MCP servers untouched.
+fn sanitize_tool_schema(schema: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut map) = schema else {
+        // Non-object schema (`true`/`false`/string/etc.) — nothing to strip,
+        // and we must not wrap it. Return as-is.
+        return schema;
+    };
+
+    let mut removed_any = false;
+    for key in ["oneOf", "anyOf", "allOf"] {
+        if map.remove(key).is_some() {
+            removed_any = true;
+        }
+    }
+
+    // Only ensure a `type` when we actually altered the schema and left it
+    // without one — a clean schema that legitimately omits `type` is left
+    // exactly as the server sent it.
+    if removed_any && !map.contains_key("type") {
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+    }
+
+    serde_json::Value::Object(map)
+}
+
 fn json_to_document(value: serde_json::Value) -> Document {
     match value {
         serde_json::Value::Null => Document::Null,
@@ -1650,6 +1706,135 @@ mod tests {
         ConverseStreamOutput, ToolUseBlockDelta, ToolUseBlockStart,
     };
     use std::sync::{Arc, Mutex};
+
+    // --- tool input_schema sanitization (top-level oneOf/anyOf/allOf) -----
+
+    #[test]
+    fn sanitize_schema_strips_top_level_one_of() {
+        let got = sanitize_tool_schema(serde_json::json!({
+            "type": "object",
+            "description": "a tool",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"],
+            "oneOf": [{"required": ["x"]}],
+        }));
+        // oneOf is gone...
+        assert!(got.get("oneOf").is_none(), "oneOf must be stripped");
+        // ...and everything else is preserved.
+        assert_eq!(got["type"], "object");
+        assert_eq!(got["description"], "a tool");
+        assert_eq!(got["properties"]["x"]["type"], "string");
+        assert_eq!(got["required"], serde_json::json!(["x"]));
+    }
+
+    #[test]
+    fn sanitize_schema_strips_top_level_any_of() {
+        let got = sanitize_tool_schema(serde_json::json!({
+            "type": "object",
+            "anyOf": [{"type": "object"}, {"type": "null"}],
+        }));
+        assert!(got.get("anyOf").is_none(), "anyOf must be stripped");
+        assert_eq!(got["type"], "object");
+    }
+
+    #[test]
+    fn sanitize_schema_strips_top_level_all_of() {
+        let got = sanitize_tool_schema(serde_json::json!({
+            "type": "object",
+            "allOf": [{"required": ["a"]}, {"required": ["b"]}],
+        }));
+        assert!(got.get("allOf").is_none(), "allOf must be stripped");
+        assert_eq!(got["type"], "object");
+    }
+
+    #[test]
+    fn sanitize_schema_adds_type_when_missing_after_stripping() {
+        // A schema whose only top-level shape was a composite must still be a
+        // valid object schema after stripping.
+        let got = sanitize_tool_schema(serde_json::json!({
+            "oneOf": [{"type": "object"}, {"type": "string"}],
+        }));
+        assert!(got.get("oneOf").is_none());
+        assert_eq!(got["type"], "object", "missing type must default to object");
+    }
+
+    #[test]
+    fn sanitize_schema_clean_schema_is_unchanged() {
+        // No composites -> exact passthrough, including a schema that omits
+        // `type` (we must not inject one when we didn't strip anything).
+        let clean = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+        });
+        assert_eq!(sanitize_tool_schema(clean.clone()), clean);
+
+        let no_type = serde_json::json!({
+            "properties": {"a": {"type": "integer"}},
+        });
+        assert_eq!(sanitize_tool_schema(no_type.clone()), no_type);
+    }
+
+    #[test]
+    fn sanitize_schema_does_not_recurse_into_properties() {
+        // A nested anyOf inside a property subschema is legal in Bedrock and
+        // must be preserved — we only touch the top level.
+        let got = sanitize_tool_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "foo": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+        }));
+        assert_eq!(
+            got["properties"]["foo"]["anyOf"],
+            serde_json::json!([{"type": "string"}, {"type": "null"}]),
+            "nested anyOf must be preserved"
+        );
+    }
+
+    #[test]
+    fn sanitize_schema_non_object_values_pass_through() {
+        // `true`/`false`/string/number/null are valid JSON-Schema values that
+        // are not objects; handle them without panicking and without wrapping.
+        assert_eq!(
+            sanitize_tool_schema(serde_json::json!(true)),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            sanitize_tool_schema(serde_json::json!("a string")),
+            serde_json::json!("a string")
+        );
+        assert_eq!(
+            sanitize_tool_schema(serde_json::Value::Null),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn convert_tools_strips_top_level_composite_from_schema() {
+        // End-to-end: a tool whose schema carries a top-level oneOf converts
+        // without that key reaching the Bedrock spec.
+        let tools = vec![ToolDefinition::new(
+            "terminal_execute",
+            "run",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "oneOf": [{"required": ["cmd"]}],
+            }),
+        )];
+        let map = ToolNameMap::from_names(tools.iter().map(|t| t.name.as_str()));
+        let cfg = convert_tools(&tools, &map).expect("ok").expect("some");
+        let schema = tool_spec_schema(&cfg, "terminal_execute");
+        let Document::Object(obj) = schema else {
+            panic!("expected object schema, got {schema:?}");
+        };
+        assert!(
+            !obj.contains_key("oneOf"),
+            "oneOf must not reach the Bedrock spec"
+        );
+        assert!(obj.contains_key("type"), "type must be present");
+        assert!(obj.contains_key("properties"), "properties preserved");
+    }
 
     // --- toolUse.input sanitization (#214) -------------------------------
 
@@ -2608,6 +2793,20 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Fetch the `input_schema` JSON document for the spec with the given
+    /// (already-sanitized) name. Panics if not found — test helper.
+    fn tool_spec_schema(cfg: &ToolConfiguration, name: &str) -> Document {
+        for t in cfg.tools() {
+            if let Tool::ToolSpec(spec) = t
+                && spec.name() == name
+                && let Some(ToolInputSchema::Json(doc)) = spec.input_schema()
+            {
+                return doc.clone();
+            }
+        }
+        panic!("no spec named {name:?} with a JSON input schema");
     }
 
     /// Collect every `toolUse` name across all assistant messages.
