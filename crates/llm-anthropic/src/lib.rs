@@ -678,10 +678,15 @@ impl AnthropicClient {
 /// Anthropic does offer a `GET /v1/models` endpoint, but it returns raw
 /// model IDs without capability metadata (context window, vision/tool
 /// support, reasoning) so the picker still needs a curated source of
-/// truth. Keeping the list hand-maintained here is intentional until we
-/// add a hybrid resolver that merges the API response with this table.
-// TODO(#7): hit `/v1/models` and merge with this curated table so newly
-// released models appear automatically.
+/// truth. Keeping the list hand-maintained here is intentional.
+///
+/// `list_models` routes this table through the shared
+/// [`merge_curated_with_live`](desktop_assistant_llm_http::merge_curated_with_live)
+/// resolver (issue #304). Today it passes an empty live list, so the curated
+/// table is returned unchanged; when we start fetching `GET /v1/models` the
+/// live ids slot in as the resolver's `live` argument — curated metadata wins
+/// on overlap, unknown live ids are appended — with no merge policy to
+/// re-derive here.
 fn curated_anthropic_models() -> Vec<ModelInfo> {
     let claude_caps = ModelCapabilities {
         reasoning: false,
@@ -753,7 +758,13 @@ impl LlmClient for AnthropicClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        Ok(curated_anthropic_models())
+        // No live `/v1/models` fetch yet; the empty live list returns the
+        // curated table unchanged. Routing through the shared resolver keeps
+        // the merge policy in one place for when a live fetch lands (#304).
+        Ok(desktop_assistant_llm_http::merge_curated_with_live(
+            curated_anthropic_models(),
+            Vec::new(),
+        ))
     }
 
     async fn stream_completion(
@@ -1508,6 +1519,15 @@ mod tests {
             !json.contains("thinking"),
             "thinking field must be omitted when reasoning is off; got: {json}"
         );
+    }
+
+    /// The shared-resolver path with an empty live list must return exactly
+    /// the curated table — proves the #304 refactor is behavior-preserving.
+    #[tokio::test]
+    async fn list_models_matches_curated_table_via_resolver() {
+        let client = AnthropicClient::new("key".into());
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models, curated_anthropic_models());
     }
 
     #[tokio::test]
