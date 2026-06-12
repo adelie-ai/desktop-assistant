@@ -228,14 +228,23 @@ pub(crate) fn llm_messages_for_turn_with_plan(
     };
 
     // Pre-flight token estimate: sum the cost of every assembled message's
-    // body. The threshold mirrors `COMPACTION_TOKEN_RATIO` used by the
-    // post-call token-pressure path so the two checks agree on what
-    // counts as "near the limit".
+    // body, plus the active tool schemas. The threshold mirrors
+    // `COMPACTION_TOKEN_RATIO` used by the post-call token-pressure path so
+    // the two checks agree on what counts as "near the limit".
+    //
+    // Tool schemas are sent to the model out-of-band (the `tools` array, not
+    // a message body), so summing message bodies alone undercounts: namespace
+    // activation can inject tens of KB of JSON Schema the budget never sees
+    // (issue #305 item 7). Account for it explicitly. The cost is constant
+    // across shrink iterations (shrinking only drops *messages*), so it is
+    // computed once here.
     let max_input_tokens = budget.max_input_tokens;
     let threshold = (max_input_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
+    let tool_schema_tokens = tool_schema_estimate(tool_defs, deferred_namespaces, estimate);
 
     for _ in 0..MAX_PREFLIGHT_SHRINK_ITERATIONS {
-        let assembled_tokens: u64 = assembled.iter().map(|m| estimate(&m.content)).sum();
+        let message_tokens: u64 = assembled.iter().map(|m| estimate(&m.content)).sum();
+        let assembled_tokens = message_tokens + tool_schema_tokens;
         if assembled_tokens <= threshold {
             return assembled;
         }
@@ -273,6 +282,48 @@ pub(crate) fn llm_messages_for_turn_with_plan(
     }
 
     assembled
+}
+
+/// Estimate the prompt-token cost of the tool schemas sent alongside the
+/// messages on each turn.
+///
+/// The model is billed for the `tools` array — every active tool's name,
+/// description, and JSON Schema parameters — which never appears in a message
+/// body, so the preflight's message-body sum would otherwise miss it entirely
+/// (issue #305 item 7). A single namespace activation can add tens of KB.
+///
+/// Deferred namespaces (sent with `defer_loading` so the model fetches them on
+/// demand) are *not* counted: their schemas are not in the active context
+/// window until activated, and once activated they arrive as `tool_defs`. We
+/// count only their lightweight namespace name/description stubs, which are
+/// what the provider keeps resident.
+///
+/// Estimation reuses the same `estimate` closure as message bodies so the
+/// units agree. We serialize each tool's parameters once and weigh name +
+/// description + schema together.
+fn tool_schema_estimate(
+    tool_defs: &[ToolDefinition],
+    deferred_namespaces: &[ToolNamespace],
+    estimate: &dyn Fn(&str) -> u64,
+) -> u64 {
+    let tool_cost = |t: &ToolDefinition| -> u64 {
+        // Name and description are short; the schema dominates. Serialize the
+        // parameters compactly — the absolute count only needs to track the
+        // real payload's order of magnitude for the budget check.
+        let schema = t.parameters.to_string();
+        estimate(&t.name) + estimate(&t.description) + estimate(&schema)
+    };
+
+    let active: u64 = tool_defs.iter().map(tool_cost).sum();
+
+    // Deferred namespaces contribute only their stub (name + description); the
+    // per-tool schemas are off-context until the model activates them.
+    let deferred: u64 = deferred_namespaces
+        .iter()
+        .map(|ns| estimate(&ns.name) + estimate(&ns.description))
+        .sum();
+
+    active + deferred
 }
 
 /// Per-turn tool execution-locality context (issue #243, refined in #248).
@@ -1879,6 +1930,100 @@ mod tests {
             result.len() < MAX_CONTEXT_MESSAGES + 1,
             "expected pre-flight shrink, got {} messages",
             result.len()
+        );
+    }
+
+    #[test]
+    fn tool_schema_estimate_counts_active_schema_and_deferred_stubs() {
+        let one_per_char = |s: &str| s.chars().count() as u64;
+
+        let schema = serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let schema_cost = schema.to_string().chars().count() as u64;
+        let tool = ToolDefinition::new("search", "Find things", schema);
+        let active_expected = "search".len() as u64 + "Find things".len() as u64 + schema_cost;
+
+        // A deferred namespace contributes only its name + description stub,
+        // never its per-tool schemas (those are off-context until activated).
+        let ns = ToolNamespace::new(
+            "calendar",
+            "Calendar tools",
+            vec![ToolDefinition::new(
+                "list",
+                "List events",
+                serde_json::json!({"type": "object"}),
+            )],
+        );
+        let deferred_expected = "calendar".len() as u64 + "Calendar tools".len() as u64;
+
+        let got = tool_schema_estimate(&[tool], &[ns], &one_per_char);
+        assert_eq!(got, active_expected + deferred_expected);
+    }
+
+    #[test]
+    fn assembly_shrinks_when_tool_schemas_push_over_budget() {
+        use crate::ports::llm::BudgetSource;
+        // Isolate the schema cost: both calls carry a tool with the SAME name
+        // and description (so the rendered tool note in the system instruction
+        // is byte-identical), differing only in the size of the JSON Schema
+        // parameters — which never appear in a message body. The old preflight
+        // (message bodies only) would shrink both windows identically; the new
+        // one charges for the fat schema and shrinks it harder (issue #305
+        // item 7).
+        let chunk = "x".repeat(30);
+        let count = MAX_CONTEXT_MESSAGES + 20;
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, chunk.clone())
+                } else {
+                    Message::new(Role::Assistant, chunk.clone())
+                }
+            })
+            .collect();
+
+        let tiny = ToolDefinition::new("tool", "A tool", serde_json::json!({"type": "object"}));
+        // Fat schema large enough that, added to the (otherwise identical)
+        // turn, it crosses the threshold the tiny turn sits just under.
+        let fat = ToolDefinition::new(
+            "tool",
+            "A tool",
+            serde_json::json!({"type": "object", "description": "z".repeat(20_000)}),
+        );
+
+        // The base system prompt dominates (~13.7k chars); size the budget so
+        // its threshold (0.85 * budget) clears the full tiny-schema turn but
+        // not the fat-schema one (+20k schema chars).
+        let budget = ContextBudget {
+            max_input_tokens: 22_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        let one_per_char = |s: &str| s.chars().count() as u64;
+
+        let assemble = |tool: &ToolDefinition| {
+            llm_messages_for_turn(
+                &msgs,
+                &[],
+                std::slice::from_ref(tool),
+                &[],
+                "",
+                MAX_CONTEXT_MESSAGES,
+                None,
+                0,
+                "",
+                Some(budget),
+                None,
+                &one_per_char,
+            )
+        };
+
+        let with_tiny = assemble(&tiny);
+        let with_fat = assemble(&fat);
+
+        assert!(
+            with_fat.len() < with_tiny.len(),
+            "fat tool schema should force a stronger shrink: fat={}, tiny={}",
+            with_fat.len(),
+            with_tiny.len()
         );
     }
 

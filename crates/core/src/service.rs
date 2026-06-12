@@ -170,6 +170,18 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// stored one. The hash covers tool names AND descriptions, so any
     /// edit to either triggers a fresh categorization.
     namespace_cache: std::sync::Mutex<Option<(u64, Vec<ToolNamespace>)>>,
+    /// Single-flight guard for the categorization LLM call (issue #305 item 8).
+    ///
+    /// `namespace_cache` answers cache *hits* with a cheap sync lock, but two
+    /// concurrent first turns (cold cache) would both miss and each pay the
+    /// categorization round-trip — the "thundering herd". This async mutex
+    /// serializes the *miss path*: the winner runs categorization and populates
+    /// the cache; losers wait here, then re-check the cache and find the result
+    /// already there. Held only across the categorization await on a miss, never
+    /// on a hit, so steady-state turns are unaffected. A single guard suffices —
+    /// the tool set has one hash at a time, and a hash change just means the next
+    /// miss recomputes under the same guard.
+    categorize_lock: tokio::sync::Mutex<()>,
     /// Optional reader for the reserved scratchpad `goal` note. When set, the
     /// dispatch loop reads it each round and prefers it over the verbatim
     /// user prompt as the task anchor, so a model-maintained goal survives
@@ -226,6 +238,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             tools: NoopToolExecutor,
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
+            categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_goal_read: None,
             scratchpad_write: None,
             scratchpad_list: None,
@@ -250,6 +263,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             tools,
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
+            categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_goal_read: None,
             scratchpad_write: None,
             scratchpad_list: None,
@@ -759,6 +773,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 vec![]
             } else {
                 let hash = tool_set_hash(&raw_namespaces);
+                // Fast path: a populated cache for this hash answers without
+                // touching the single-flight guard, so steady-state turns never
+                // serialize.
                 let cached_hit = {
                     let cached = self.namespace_cache.lock().unwrap();
                     cached
@@ -774,15 +791,38 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     );
                     ns
                 } else {
-                    tracing::debug!(hash, "tool categorization cache miss; invoking LLM");
-                    let result = categorize_tool_namespaces(
-                        raw_namespaces,
-                        self.task_llm(),
-                        current_context_budget(),
-                    )
-                    .await;
-                    *self.namespace_cache.lock().unwrap() = Some((hash, result.clone()));
-                    result
+                    // Miss: take the single-flight guard so concurrent cold
+                    // turns coalesce into one categorization LLM call (issue
+                    // #305 item 8). Only the winner runs the call; losers wake,
+                    // re-check the cache, and reuse its result.
+                    let _flight = self.categorize_lock.lock().await;
+                    // Double-check: a peer may have populated the cache for this
+                    // hash while we waited for the guard.
+                    let recheck = {
+                        let cached = self.namespace_cache.lock().unwrap();
+                        cached
+                            .as_ref()
+                            .filter(|(h, _)| *h == hash)
+                            .map(|(_, ns)| ns.clone())
+                    };
+                    if let Some(ns) = recheck {
+                        tracing::debug!(
+                            hash,
+                            namespace_count = ns.len(),
+                            "tool categorization cache hit after single-flight wait"
+                        );
+                        ns
+                    } else {
+                        tracing::debug!(hash, "tool categorization cache miss; invoking LLM");
+                        let result = categorize_tool_namespaces(
+                            raw_namespaces,
+                            self.task_llm(),
+                            current_context_budget(),
+                        )
+                        .await;
+                        *self.namespace_cache.lock().unwrap() = Some((hash, result.clone()));
+                        result
+                    }
                 }
             }
         } else {
@@ -4783,6 +4823,9 @@ mod tests {
     struct CategorizingLlm {
         categorization_calls: Arc<AtomicU32>,
         category_payload: Mutex<String>,
+        /// Artificial delay applied inside the categorization branch so a test
+        /// can widen the window two concurrent cold turns overlap in.
+        categorization_delay: std::time::Duration,
     }
 
     impl CategorizingLlm {
@@ -4790,7 +4833,13 @@ mod tests {
             Self {
                 categorization_calls: Arc::new(AtomicU32::new(0)),
                 category_payload: Mutex::new(category_payload),
+                categorization_delay: std::time::Duration::ZERO,
             }
+        }
+
+        fn with_categorization_delay(mut self, delay: std::time::Duration) -> Self {
+            self.categorization_delay = delay;
+            self
         }
 
         fn calls(&self) -> Arc<AtomicU32> {
@@ -4816,6 +4865,9 @@ mod tests {
             });
             if is_categorization {
                 self.categorization_calls.fetch_add(1, Ordering::SeqCst);
+                if !self.categorization_delay.is_zero() {
+                    tokio::time::sleep(self.categorization_delay).await;
+                }
                 let payload = self.category_payload.lock().unwrap().clone();
                 return Ok(LlmResponse::text(payload));
             }
@@ -5011,6 +5063,48 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "tool addition must invalidate the categorization cache"
+        );
+    }
+
+    /// Item 8: two concurrent cold turns (different conversations, shared
+    /// handler) must coalesce into ONE categorization LLM call. A categorization
+    /// delay guarantees both turns are simultaneously past the cache-miss check;
+    /// without the single-flight guard both would invoke the categorizer.
+    #[tokio::test]
+    async fn concurrent_cold_turns_coalesce_categorization() {
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count))
+            .with_categorization_delay(std::time::Duration::from_millis(100));
+        let calls = llm.calls();
+        let handler = Arc::new(build_categorization_handler(executor, llm));
+
+        // Two distinct conversations so the turns take different per-conversation
+        // turn locks and genuinely run in parallel (only the categorization
+        // single-flight may serialize them).
+        let conv_a = handler.create_conversation("A".into()).await.unwrap();
+        let conv_b = handler.create_conversation("B".into()).await.unwrap();
+
+        let h1 = handler.clone();
+        let ida = conv_a.id.clone();
+        let t1 = tokio::spawn(async move {
+            h1.send_prompt(&ida, "a".into(), noop_callback(), noop_status())
+                .await
+        });
+        let h2 = handler.clone();
+        let idb = conv_b.id.clone();
+        let t2 = tokio::spawn(async move {
+            h2.send_prompt(&idb, "b".into(), noop_callback(), noop_status())
+                .await
+        });
+
+        t1.await.unwrap().expect("turn a succeeds");
+        t2.await.unwrap().expect("turn b succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent cold turns must coalesce into one categorization call"
         );
     }
 

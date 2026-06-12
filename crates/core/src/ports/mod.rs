@@ -51,6 +51,13 @@ pub mod transport;
 /// executors can scope per-conversation side state (e.g. the scratchpad).
 pub mod conversation_ctx;
 
+/// Bundle of the request-scoped task-locals that must cross a `tokio::spawn`
+/// boundary ([`request_scope::RequestScope`]) — captured before the spawn and
+/// re-installed in one call inside the spawned turn body, so a new
+/// spawn-crossing local can never be silently dropped at a re-install site
+/// (the #261 leak class, issue #305 item 4).
+pub mod request_scope;
+
 /// Client-side tool execution port — outbound trait the turn loop uses to
 /// consult the current user's registered client-local tools and suspend the
 /// turn on a client-tool call (#107 / #234).
