@@ -1,6 +1,6 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
-    Conversation, ConversationId, Message, MessageSummary, Role, ToolCall,
+    Conversation, ConversationId, ConversationSummary, Message, MessageSummary, Role, ToolCall,
 };
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::inbound::ConversationModelSelection;
@@ -270,71 +270,40 @@ impl ConversationStore for PgConversationStore {
         })
     }
 
-    async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+    async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+        // DS-6 (#295): a single aggregate query. The previous implementation
+        // ran 1 + 2N queries (a per-conversation message fetch and a
+        // per-conversation summary fetch) and loaded every message body just
+        // to produce a list. `list` only needs metadata plus a count, so we
+        // LEFT JOIN messages and GROUP BY to compute `message_count` in one
+        // round trip — no bodies leave the database.
         let user_id = current_user_id();
-        let rows: Vec<ConvRow> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, context_summary, \
-                    compacted_through, archived_at, active_task \
-             FROM conversations \
-             WHERE user_id = $1 \
-             ORDER BY updated_at DESC",
+        let rows: Vec<ConvListRow> = sqlx::query_as(
+            "SELECT c.id, c.title, c.created_at, c.updated_at, \
+                    c.archived_at, COUNT(m.id) AS message_count \
+             FROM conversations c \
+             LEFT JOIN messages m \
+                    ON m.user_id = c.user_id AND m.conversation_id = c.id \
+             WHERE c.user_id = $1 \
+             GROUP BY c.id, c.title, c.created_at, c.updated_at, c.archived_at \
+             ORDER BY c.updated_at DESC",
         )
         .bind(user_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        let mut conversations = Vec::with_capacity(rows.len());
-        for row in rows {
-            let msg_rows: Vec<MsgRow> = sqlx::query_as(
-                "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id \
-                 FROM messages \
-                 WHERE user_id = $1 AND conversation_id = $2 \
-                 ORDER BY ordinal",
-            )
-            .bind(user_id.as_str())
-            .bind(&row.id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-            let messages = msg_rows.into_iter().map(msg_from_row).collect();
-
-            let summary_rows: Vec<SummaryRow> = sqlx::query_as(
-                "SELECT id, summary \
-                 FROM message_summaries \
-                 WHERE user_id = $1 AND conversation_id = $2 \
-                 ORDER BY start_ordinal",
-            )
-            .bind(user_id.as_str())
-            .bind(&row.id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-            let summaries = summary_rows
-                .into_iter()
-                .map(|r| MessageSummary {
-                    id: r.id,
-                    summary: r.summary,
-                })
-                .collect();
-
-            conversations.push(Conversation {
+        Ok(rows
+            .into_iter()
+            .map(|row| ConversationSummary {
                 id: ConversationId(row.id),
                 title: row.title,
                 created_at: format_timestamp(row.created_at),
                 updated_at: format_timestamp(row.updated_at),
-                messages,
-                context_summary: row.context_summary,
-                compacted_through: row.compacted_through as usize,
-                summaries,
-                archived_at: row.archived_at.map(format_timestamp),
-                active_task: row.active_task,
-            });
-        }
-
-        Ok(conversations)
+                message_count: row.message_count.max(0) as usize,
+                archived: row.archived_at.is_some(),
+            })
+            .collect())
     }
 
     async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
@@ -591,6 +560,18 @@ struct ConvRow {
     compacted_through: i32,
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
     active_task: Option<String>,
+}
+
+/// Light projection for [`ConversationStore::list`] (DS-6 #295): conversation
+/// metadata plus an aggregate `message_count`, with no message bodies.
+#[derive(sqlx::FromRow)]
+struct ConvListRow {
+    id: String,
+    title: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    message_count: i64,
 }
 
 #[derive(sqlx::FromRow)]

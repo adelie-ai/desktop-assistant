@@ -1,5 +1,5 @@
 use crate::CoreError;
-use crate::domain::{Conversation, ConversationId};
+use crate::domain::{Conversation, ConversationId, ConversationSummary};
 use serde::{Deserialize, Serialize};
 
 // `BackgroundTaskRow` (#115) is defined in this module rather than in
@@ -352,9 +352,16 @@ pub trait ConversationStore: Send + Sync {
         id: &ConversationId,
     ) -> impl std::future::Future<Output = Result<Conversation, CoreError>> + Send;
 
+    /// List conversation metadata for the current user.
+    ///
+    /// DS-6 (#295): returns a light projection — id, title, timestamps,
+    /// archived flag, and a SQL-computed `message_count` — and never loads
+    /// message bodies. A Postgres adapter MUST satisfy this with a single
+    /// aggregate query (one `LEFT JOIN ... GROUP BY` over `messages`), not a
+    /// per-conversation fetch. Callers that need full bodies use [`get`].
     fn list(
         &self,
-    ) -> impl std::future::Future<Output = Result<Vec<Conversation>, CoreError>> + Send;
+    ) -> impl std::future::Future<Output = Result<Vec<ConversationSummary>, CoreError>> + Send;
 
     fn update(
         &self,
@@ -480,8 +487,14 @@ mod tests {
                 .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
         }
 
-        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
-            Ok(self.data.lock().unwrap().values().cloned().collect())
+        async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .values()
+                .map(ConversationSummary::from)
+                .collect())
         }
 
         async fn update(&self, conv: Conversation) -> Result<(), CoreError> {

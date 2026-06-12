@@ -493,7 +493,9 @@ impl desktop_assistant_core::ports::store::ConversationStore for AnyConversation
         }
     }
 
-    async fn list(&self) -> Result<Vec<desktop_assistant_core::domain::Conversation>, CoreError> {
+    async fn list(
+        &self,
+    ) -> Result<Vec<desktop_assistant_core::domain::ConversationSummary>, CoreError> {
         match self {
             Self::Json(s) => s.list().await,
             Self::Postgres(s) => s.list().await,
@@ -592,7 +594,9 @@ impl desktop_assistant_core::ports::store::ConversationStore for SharedConversat
         self.0.get(id).await
     }
 
-    async fn list(&self) -> Result<Vec<desktop_assistant_core::domain::Conversation>, CoreError> {
+    async fn list(
+        &self,
+    ) -> Result<Vec<desktop_assistant_core::domain::ConversationSummary>, CoreError> {
         self.0.list().await
     }
 

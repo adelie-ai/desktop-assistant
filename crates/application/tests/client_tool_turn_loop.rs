@@ -63,13 +63,15 @@ impl ConversationStore for MockStore {
             .cloned()
             .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
     }
-    async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+    async fn list(
+        &self,
+    ) -> Result<Vec<desktop_assistant_core::domain::ConversationSummary>, CoreError> {
         Ok(self
             .conversations
             .lock()
             .unwrap()
             .values()
-            .cloned()
+            .map(desktop_assistant_core::domain::ConversationSummary::from)
             .collect())
     }
     async fn update(&self, conv: Conversation) -> Result<(), CoreError> {

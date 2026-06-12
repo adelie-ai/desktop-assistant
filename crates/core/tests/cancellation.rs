@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
-    Conversation, ConversationId, Message, ToolCall, ToolDefinition, ToolNamespace,
+    Conversation, ConversationId, ConversationSummary, Message, ToolCall, ToolDefinition,
+    ToolNamespace,
 };
 use desktop_assistant_core::ports::inbound::{ConversationService, PromptDispatchOutcome};
 use desktop_assistant_core::ports::llm::{
@@ -56,8 +57,14 @@ impl ConversationStore for MemStore {
             .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
     }
 
-    async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
-        Ok(self.data.lock().unwrap().values().cloned().collect())
+    async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+        Ok(self
+            .data
+            .lock()
+            .unwrap()
+            .values()
+            .map(ConversationSummary::from)
+            .collect())
     }
 
     async fn update(&self, conv: Conversation) -> Result<(), CoreError> {

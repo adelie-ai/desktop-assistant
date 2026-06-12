@@ -48,8 +48,16 @@ impl ConversationStore for TestStore {
             .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
     }
 
-    async fn list(&self) -> Result<Vec<desktop_assistant_core::domain::Conversation>, CoreError> {
-        Ok(self.data.lock().unwrap().values().cloned().collect())
+    async fn list(
+        &self,
+    ) -> Result<Vec<desktop_assistant_core::domain::ConversationSummary>, CoreError> {
+        Ok(self
+            .data
+            .lock()
+            .unwrap()
+            .values()
+            .map(desktop_assistant_core::domain::ConversationSummary::from)
+            .collect())
     }
 
     async fn update(
