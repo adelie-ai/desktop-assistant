@@ -119,7 +119,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                 FROM vector_ranked v
                 FULL OUTER JOIN text_ranked t ON v.id = t.id
             )
-            SELECT id, content, tags, metadata, created_at, updated_at, rrf_score
+            SELECT id, content, tags, metadata, created_at, updated_at
             FROM fused ORDER BY rrf_score DESC LIMIT $5",
         )
         .bind(embedding_vec)
@@ -251,8 +251,6 @@ struct KbSearchRow {
     metadata: serde_json::Value,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
-    #[allow(dead_code)]
-    rrf_score: Option<f64>,
 }
 
 impl KbSearchRow {
