@@ -18,7 +18,6 @@ use std::time::Duration;
 use desktop_assistant_api_model as api;
 use serde::Serialize;
 use std::collections::HashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -315,40 +314,12 @@ impl BridgeTransport for UdsBridgeTransport {
     }
 }
 
-/// Read one length-prefixed frame; matches `uds-interface`'s framing.
-pub async fn read_frame<R>(reader: &mut R) -> std::io::Result<Vec<u8>>
-where
-    R: AsyncReadExt + Unpin,
-{
-    const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
-
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf);
-    if len > MAX_FRAME_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame length {len} exceeds cap {MAX_FRAME_LEN}"),
-        ));
-    }
-    let mut body = vec![0u8; len as usize];
-    if len > 0 {
-        reader.read_exact(&mut body).await?;
-    }
-    Ok(body)
-}
-
-/// Write one length-prefixed frame.
-pub async fn write_frame<W>(writer: &mut W, body: &[u8]) -> std::io::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let len = body.len() as u32;
-    writer.write_all(&len.to_le_bytes()).await?;
-    writer.write_all(body).await?;
-    writer.flush().await?;
-    Ok(())
-}
+// The length-prefixed frame codec is shared with `uds-interface` and the
+// clients via `desktop-assistant-frame-codec` so the 4 MB frame cap and the
+// framing rules can never drift between transports (#279/#280). Re-exported
+// here under the historical `read_frame`/`write_frame` names this crate's
+// integration tests import.
+pub use desktop_assistant_frame_codec::{read_frame, write_frame};
 
 /// Path helper for binding test sockets so tests don't have to inline
 /// the same `XDG_RUNTIME_DIR` dance everywhere.
