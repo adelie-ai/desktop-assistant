@@ -578,7 +578,10 @@ async fn connector_reconnects_and_replays_tools_after_daemon_restart() {
     // replays the registration. Poll until the reconnect+replay lands.
     let replayed = wait_until(Duration::from_secs(10), || {
         let coord = Arc::clone(&server2.coord);
-        async move { coord.is_client_registered("stop_listening").await }
+        // The replay lands under the reconnected connection's server-minted
+        // `(user, session_id)` bucket (#261), which the test can't name from
+        // out here; assert across all sessions instead.
+        async move { coord.is_registered_in_any_session("stop_listening").await }
     })
     .await;
     assert!(
@@ -773,7 +776,10 @@ async fn idle_connector_does_not_spuriously_reconnect() {
     // The tool is still registered on the SAME daemon (no restart happened);
     // and a turn still streams on the original, never-dropped connection.
     assert!(
-        server.coord.is_client_registered("noop").await,
+        // Registered under the connection's server-minted `(user, session_id)`
+        // bucket (#261); the test can't name that session from out here, so
+        // assert across all sessions.
+        server.coord.is_registered_in_any_session("noop").await,
         "an idle connection must not have dropped/reconnected (tool would survive either way, \
          but a teardown would break the turn below)"
     );
