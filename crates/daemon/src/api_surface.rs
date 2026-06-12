@@ -250,23 +250,6 @@ impl RegistryHandle {
         state.registry = registry;
     }
 
-    /// Reload the registry (and re-read the config from disk). Used when
-    /// external tools mutate the config file.
-    ///
-    /// Prefer [`RegistryHandle::apply_reload`] for the live hot-reload path:
-    /// it validates the new config and classifies what changed before
-    /// swapping. This method is the unconditional swap retained for callers
-    /// that already hold a known-good config.
-    #[allow(dead_code)]
-    pub fn reload(&self) -> anyhow::Result<()> {
-        let config = load_daemon_config(&self.config_path)?.unwrap_or_default();
-        let registry = build_registry(&config);
-        let mut state = self.state.write();
-        state.config = config;
-        state.registry = registry;
-        Ok(())
-    }
-
     /// Validate the on-disk config and, if it parses and the registry
     /// rebuilds, swap it in under the lock — a state-preserving hot reload
     /// (#222).

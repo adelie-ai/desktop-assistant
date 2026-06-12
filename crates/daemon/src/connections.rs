@@ -6,10 +6,7 @@
 //! `[llm]` block which hard-coded one global connector.
 //!
 //! Schema-only: migration lives in [`super::config`] so it can share I/O
-//! helpers with the wider config layer. The blanket `#[allow(dead_code)]`
-//! covers a handful of `ConnectionsMap` accessors that are exposed for
-//! symmetry but have no current call site.
-#![allow(dead_code)]
+//! helpers with the wider config layer.
 
 use std::fmt;
 
@@ -382,29 +379,9 @@ impl ConnectionsMap {
         Ok(Self(map))
     }
 
-    /// Borrow the underlying `IndexMap`.
-    pub fn as_map(&self) -> &IndexMap<ConnectionId, ConnectionConfig> {
-        &self.0
-    }
-
-    /// Consume and return the underlying `IndexMap`.
-    pub fn into_map(self) -> IndexMap<ConnectionId, ConnectionConfig> {
-        self.0
-    }
-
     /// Iterate connection id / config pairs in declaration order.
     pub fn iter(&self) -> indexmap::map::Iter<'_, ConnectionId, ConnectionConfig> {
         self.0.iter()
-    }
-
-    /// Number of configured connections.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether there are any connections.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     /// Look up a connection by id.

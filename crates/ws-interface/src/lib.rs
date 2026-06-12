@@ -85,36 +85,147 @@ pub trait WsAuthDiscovery: Send + Sync {
     async fn auth_config(&self) -> serde_json::Value;
 }
 
+/// Builder for the WebSocket server's router and `serve` entry points.
+///
+/// Replaces the old `router_*` / `serve_*` parameter ladders (#279 item 1):
+/// every optional collaborator — the login service, auth discovery, the
+/// browser-origin allowlist, and the daemon's per-machine system id (#248) —
+/// is a `with_*` setter that defaults to off. The two required collaborators
+/// (the API `handler` and the bearer-token `auth_validator`) are passed to
+/// [`WsServeConfig::new`].
+///
+/// ```ignore
+/// WsServeConfig::new(handler, auth_validator)
+///     .with_allowed_origins(origins)
+///     .with_daemon_system_id(Some(system_id))
+///     .serve(bind, shutdown)
+///     .await?;
+/// ```
+pub struct WsServeConfig {
+    handler: Arc<dyn AssistantApiHandler>,
+    auth_validator: Arc<dyn WsAuthValidator>,
+    login_service: Option<Arc<dyn WsLoginService>>,
+    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
+    allowed_origins: Vec<String>,
+    daemon_system_id: Option<String>,
+}
+
+impl WsServeConfig {
+    /// Start from the two required collaborators; everything else defaults off.
+    pub fn new(
+        handler: Arc<dyn AssistantApiHandler>,
+        auth_validator: Arc<dyn WsAuthValidator>,
+    ) -> Self {
+        Self {
+            handler,
+            auth_validator,
+            login_service: None,
+            auth_discovery: None,
+            allowed_origins: Vec::new(),
+            daemon_system_id: None,
+        }
+    }
+
+    /// Wire a password-login service backing `POST /login`.
+    pub fn with_login_service(mut self, login_service: Option<Arc<dyn WsLoginService>>) -> Self {
+        self.login_service = login_service;
+        self
+    }
+
+    /// Wire an auth-discovery provider backing `GET /auth/config`.
+    pub fn with_auth_discovery(mut self, auth_discovery: Option<Arc<dyn WsAuthDiscovery>>) -> Self {
+        self.auth_discovery = auth_discovery;
+        self
+    }
+
+    /// Set the browser-`Origin` allowlist. Empty (the default) rejects every
+    /// request that carries an `Origin` header; native clients send none.
+    pub fn with_allowed_origins(mut self, allowed_origins: Vec<String>) -> Self {
+        self.allowed_origins = allowed_origins;
+        self
+    }
+
+    /// Wire the daemon's own per-machine system id (#248) so the `/ws` handler
+    /// can compute exact tool-locality co-location from the client's
+    /// `x-adelie-system-id` upgrade header. `None` reproduces the
+    /// transport-heuristic-only behaviour.
+    pub fn with_daemon_system_id(mut self, daemon_system_id: Option<String>) -> Self {
+        self.daemon_system_id = daemon_system_id;
+        self
+    }
+
+    /// Build the axum [`Router`] for these settings.
+    pub fn into_router(self) -> Router {
+        let state = WsServerState {
+            handler: self.handler,
+            auth_validator: self.auth_validator,
+            login_service: self.login_service,
+            auth_discovery: self.auth_discovery,
+            allowed_origins: Arc::new(self.allowed_origins),
+            daemon_system_id: Arc::new(self.daemon_system_id),
+        };
+
+        Router::new()
+            .route("/ws", get(ws_handler))
+            .route("/login", post(login_handler))
+            .route("/auth/config", get(auth_config_handler))
+            .with_state(state)
+    }
+
+    /// Bind `bind` and serve until `shutdown` resolves (plaintext).
+    pub async fn serve<F>(self, bind: SocketAddr, shutdown: F) -> anyhow::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let app = self.into_router();
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+        Ok(())
+    }
+
+    /// Bind `bind` and serve over TLS until `shutdown` resolves.
+    #[cfg(feature = "tls")]
+    pub async fn serve_tls<F>(
+        self,
+        tls_acceptor: tokio_rustls::TlsAcceptor,
+        bind: SocketAddr,
+        shutdown: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let app = self.into_router();
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        serve_tls_accept_loop(listener, tls_acceptor, app, shutdown).await
+    }
+}
+
+/// Build a router from just the required collaborators (no login, no auth
+/// discovery, no origin allowlist, transport-heuristic co-location). Thin
+/// shim over [`WsServeConfig`] kept for the test suite's many call sites.
 pub fn router(
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
 ) -> Router {
-    router_with_login(handler, auth_validator, None)
+    WsServeConfig::new(handler, auth_validator).into_router()
 }
 
+/// Build a router with an optional login service. Thin shim over
+/// [`WsServeConfig`].
 pub fn router_with_login(
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
     login_service: Option<Arc<dyn WsLoginService>>,
 ) -> Router {
-    router_with_auth(handler, auth_validator, login_service, None)
+    WsServeConfig::new(handler, auth_validator)
+        .with_login_service(login_service)
+        .into_router()
 }
 
-pub fn router_with_auth(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
-) -> Router {
-    router_full(
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        vec![],
-    )
-}
-
+/// Build a router with optional login service, auth discovery, and an origin
+/// allowlist. Thin shim over [`WsServeConfig`].
 pub fn router_full(
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
@@ -122,45 +233,11 @@ pub fn router_full(
     auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
     allowed_origins: Vec<String>,
 ) -> Router {
-    router_full_with_system_id(
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        allowed_origins,
-        None,
-    )
-}
-
-/// Like [`router_full`] but also wires the daemon's own per-machine system id
-/// (#248) so the `/ws` handler can compute exact tool-locality co-location from
-/// the client's `x-adelie-system-id` upgrade header. `None` reproduces the
-/// transport-heuristic-only behaviour of [`router_full`].
-// One distinct collaborator per argument; a config struct would be an
-// out-of-scope refactor of the public router API.
-#[allow(clippy::too_many_arguments)]
-pub fn router_full_with_system_id(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
-    allowed_origins: Vec<String>,
-    daemon_system_id: Option<String>,
-) -> Router {
-    let state = WsServerState {
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        allowed_origins: Arc::new(allowed_origins),
-        daemon_system_id: Arc::new(daemon_system_id),
-    };
-
-    Router::new()
-        .route("/ws", get(ws_handler))
-        .route("/login", post(login_handler))
-        .route("/auth/config", get(auth_config_handler))
-        .with_state(state)
+    WsServeConfig::new(handler, auth_validator)
+        .with_login_service(login_service)
+        .with_auth_discovery(auth_discovery)
+        .with_allowed_origins(allowed_origins)
+        .into_router()
 }
 
 /// Validates the `Origin` header against the allowed origins list.
@@ -562,6 +639,8 @@ async fn handle_socket(
     }
 }
 
+/// Serve with the minimal config until the process is killed. Thin shim over
+/// [`WsServeConfig::serve`].
 pub async fn serve(
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
@@ -570,6 +649,8 @@ pub async fn serve(
     serve_with_shutdown(handler, auth_validator, bind, pending::<()>()).await
 }
 
+/// Serve with the minimal config until `shutdown` resolves. Thin shim over
+/// [`WsServeConfig::serve`] kept for the test suite.
 pub async fn serve_with_shutdown<F>(
     handler: Arc<dyn AssistantApiHandler>,
     auth_validator: Arc<dyn WsAuthValidator>,
@@ -579,166 +660,9 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    serve_with_shutdown_and_login(handler, auth_validator, None, bind, shutdown).await
-}
-
-pub async fn serve_with_shutdown_and_login<F>(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    bind: SocketAddr,
-    shutdown: F,
-) -> anyhow::Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    serve_with_shutdown_and_auth(handler, auth_validator, login_service, None, bind, shutdown).await
-}
-
-pub async fn serve_with_shutdown_and_auth<F>(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
-    bind: SocketAddr,
-    shutdown: F,
-) -> anyhow::Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    serve_full(
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        vec![],
-        bind,
-        shutdown,
-    )
-    .await
-}
-
-pub async fn serve_full<F>(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
-    allowed_origins: Vec<String>,
-    bind: SocketAddr,
-    shutdown: F,
-) -> anyhow::Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    serve_full_with_system_id(
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        allowed_origins,
-        None,
-        bind,
-        shutdown,
-    )
-    .await
-}
-
-/// Like [`serve_full`] but also wires the daemon's own per-machine system id
-/// (#248) so co-location can be computed from the client's upgrade header.
-// One distinct collaborator per argument; a config struct would be an
-// out-of-scope refactor of the public serve API.
-#[allow(clippy::too_many_arguments)]
-pub async fn serve_full_with_system_id<F>(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
-    allowed_origins: Vec<String>,
-    daemon_system_id: Option<String>,
-    bind: SocketAddr,
-    shutdown: F,
-) -> anyhow::Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let app = router_full_with_system_id(
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        allowed_origins,
-        daemon_system_id,
-    );
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
-    Ok(())
-}
-
-// Server wiring entry point: each argument is a distinct collaborator
-// (handler, validators, origins, TLS acceptor, bind, shutdown). Bundling
-// them into a config struct would be an out-of-scope refactor of the
-// public serve API.
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "tls")]
-pub async fn serve_full_tls<F>(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
-    allowed_origins: Vec<String>,
-    tls_acceptor: tokio_rustls::TlsAcceptor,
-    bind: SocketAddr,
-    shutdown: F,
-) -> anyhow::Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    serve_full_tls_with_system_id(
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        allowed_origins,
-        None,
-        tls_acceptor,
-        bind,
-        shutdown,
-    )
-    .await
-}
-
-/// Like [`serve_full_tls`] but also wires the daemon's own per-machine system id
-/// (#248) for co-location from the client's upgrade header.
-// One distinct collaborator per argument; a config struct would be an
-// out-of-scope refactor of the public serve API.
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "tls")]
-pub async fn serve_full_tls_with_system_id<F>(
-    handler: Arc<dyn AssistantApiHandler>,
-    auth_validator: Arc<dyn WsAuthValidator>,
-    login_service: Option<Arc<dyn WsLoginService>>,
-    auth_discovery: Option<Arc<dyn WsAuthDiscovery>>,
-    allowed_origins: Vec<String>,
-    daemon_system_id: Option<String>,
-    tls_acceptor: tokio_rustls::TlsAcceptor,
-    bind: SocketAddr,
-    shutdown: F,
-) -> anyhow::Result<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let app = router_full_with_system_id(
-        handler,
-        auth_validator,
-        login_service,
-        auth_discovery,
-        allowed_origins,
-        daemon_system_id,
-    );
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    serve_tls_accept_loop(listener, tls_acceptor, app, shutdown).await
+    WsServeConfig::new(handler, auth_validator)
+        .serve(bind, shutdown)
+        .await
 }
 
 /// Source of accepted TCP connections for [`serve_tls_accept_loop`].
@@ -758,7 +682,7 @@ impl TcpAcceptSource for tokio::net::TcpListener {
     }
 }
 
-/// TLS accept loop, factored out of [`serve_full_tls_with_system_id`] so its
+/// TLS accept loop, factored out of [`WsServeConfig::serve_tls`] so its
 /// error handling is unit-testable (DT-1).
 ///
 /// A failed `accept()` (`ECONNABORTED`, `EMFILE`, …) is transient: it is

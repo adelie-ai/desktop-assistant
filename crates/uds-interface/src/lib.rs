@@ -40,7 +40,7 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_application::AssistantApiHandler;
 use desktop_assistant_transport_dispatch::{AuthContext, TransportKind, dispatch_loop};
 use futures::stream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::PollSender;
 use tracing::{debug, info, warn};
@@ -522,42 +522,9 @@ where
     Ok(())
 }
 
-/// Read one length-prefixed frame.
-///
-/// The header is a 4-byte little-endian `u32` length. We `read_exact`
-/// the header, allocate the body, then `read_exact` the body. The
-/// 4 MB cap (`MAX_FRAME_LEN`) keeps a hostile client from triggering
-/// an OOM by claiming a multi-GB length.
-pub async fn read_frame<R>(read_half: &mut R) -> std::io::Result<Vec<u8>>
-where
-    R: AsyncReadExt + Unpin,
-{
-    const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
-
-    let mut len_buf = [0u8; 4];
-    read_half.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf);
-    if len > MAX_FRAME_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame length {len} exceeds cap {MAX_FRAME_LEN}"),
-        ));
-    }
-    let mut body = vec![0u8; len as usize];
-    if len > 0 {
-        read_half.read_exact(&mut body).await?;
-    }
-    Ok(body)
-}
-
-/// Write one length-prefixed frame.
-pub async fn write_frame<W>(write_half: &mut W, body: &[u8]) -> std::io::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let len = body.len() as u32;
-    write_half.write_all(&len.to_le_bytes()).await?;
-    write_half.write_all(body).await?;
-    write_half.flush().await?;
-    Ok(())
-}
+// The length-prefixed frame codec is shared with the D-Bus bridge and the
+// clients via `desktop-assistant-frame-codec` so the 4 MB frame cap and the
+// framing rules can never drift between transports (#279/#280). Re-exported
+// here under the historical `read_frame`/`write_frame` names this crate's
+// integration tests import.
+pub use desktop_assistant_frame_codec::{read_frame, write_frame};
