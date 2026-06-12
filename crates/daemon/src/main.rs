@@ -42,7 +42,6 @@ use store::PersistentConversationStore;
 use transports::{
     OidcAwareAuth, WsAsUdsAuth, WsAuthDiscoveryProvider, WsBasicLogin, WsLoginMode, WsSettingsAuth,
     daemon_host_label, env_bool, resolve_uds_socket_path, resolve_ws_login_mode,
-    transport_defaults,
 };
 
 async fn shutdown_signal() {
@@ -562,6 +561,14 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // Transport enable/bind config (#279 item 3): the `[transports]` table is
+    // the baseline; the matching `DESKTOP_ASSISTANT_*` env var overrides each
+    // field when set. Absent table => historical defaults.
+    let transports_config = daemon_config
+        .as_ref()
+        .map(|c| c.transports.clone())
+        .unwrap_or_default();
 
     let profiling = daemon_config
         .as_ref()
@@ -1644,10 +1651,10 @@ async fn main() -> Result<()> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "org.desktopAssistant".to_string());
+        .unwrap_or_else(|| transports_config.dbus_service.clone());
     let dbus_required = env_bool(
         "DESKTOP_ASSISTANT_DBUS_REQUIRED",
-        transport_defaults::DBUS_REQUIRED,
+        transports_config.dbus_required,
     );
     tracing::info!("D-Bus well-known name={dbus_service_name}");
     tracing::info!("D-Bus required={dbus_required}");
@@ -1801,16 +1808,13 @@ async fn main() -> Result<()> {
     // local-first (D-Bus minter + UDS), so the remote WebSocket endpoint —
     // and its TLS/login/origin machinery — is opt-in via
     // DESKTOP_ASSISTANT_WS_ENABLED=true.
-    let ws_enabled = env_bool(
-        "DESKTOP_ASSISTANT_WS_ENABLED",
-        transport_defaults::WS_ENABLED,
-    );
+    let ws_enabled = env_bool("DESKTOP_ASSISTANT_WS_ENABLED", transports_config.ws_enabled);
     let (ws_shutdown_tx, ws_task) = if ws_enabled {
         let ws_bind = std::env::var("DESKTOP_ASSISTANT_WS_BIND")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "127.0.0.1:11339".to_string());
+            .unwrap_or_else(|| transports_config.ws_bind.clone());
         let ws_addr: std::net::SocketAddr = ws_bind
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid DESKTOP_ASSISTANT_WS_BIND '{ws_bind}': {e}"))?;
@@ -1942,10 +1946,10 @@ async fn main() -> Result<()> {
     // or by setting DESKTOP_ASSISTANT_UDS_SOCKET to empty.
     let uds_enabled = env_bool(
         "DESKTOP_ASSISTANT_UDS_ENABLED",
-        transport_defaults::uds_enabled(),
+        transports_config.uds_enabled,
     );
     let uds_path = if uds_enabled {
-        resolve_uds_socket_path()
+        resolve_uds_socket_path(transports_config.uds_socket.as_deref())
     } else {
         None
     };

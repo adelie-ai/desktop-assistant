@@ -126,6 +126,18 @@ pub struct DaemonConfig {
     pub ws_auth: WsAuthConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Which transports the daemon serves and how they bind (#279 item 3).
+    /// Source of truth for the WS/UDS/D-Bus enable + bind/socket/name knobs
+    /// that previously lived only in `DESKTOP_ASSISTANT_*` env vars. The env
+    /// vars still work and take precedence when set, so existing setups are
+    /// unaffected; this table just gives the same knobs a home alongside the
+    /// rest of daemon.toml (and hot reload / the planned health report).
+    ///
+    /// Skipped on serialize when it equals the default so migration output and
+    /// freshly written configs stay minimal — an absent `[transports]` table
+    /// already means "all defaults".
+    #[serde(default, skip_serializing_if = "TransportsConfig::is_default")]
+    pub transports: TransportsConfig,
     /// Configurable assistant disposition (issue #226, Phase 1: global). The
     /// resolved value is installed as a task-local on every send and rendered
     /// into a system-prompt blurb. Defaults to the Expressive-7 table when the
@@ -228,6 +240,63 @@ fn default_true() -> bool {
 
 fn default_ws_auth_methods() -> Vec<String> {
     vec!["password".to_string()]
+}
+
+/// Transport enable/bind configuration (#279 item 3).
+///
+/// Defaults are local-first and identical to the historical
+/// `DESKTOP_ASSISTANT_*` env-var defaults: WebSocket off, D-Bus best-effort,
+/// UDS on (Unix). The matching env var still overrides each field when set, so
+/// this table is purely additive — a config without a `[transports]` section
+/// behaves exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TransportsConfig {
+    /// Serve the remote WebSocket endpoint. Env: `DESKTOP_ASSISTANT_WS_ENABLED`.
+    pub ws_enabled: bool,
+    /// WebSocket bind address. Env: `DESKTOP_ASSISTANT_WS_BIND`.
+    pub ws_bind: String,
+    /// Serve the local Unix-domain-socket endpoint (Unix only). Env:
+    /// `DESKTOP_ASSISTANT_UDS_ENABLED`.
+    pub uds_enabled: bool,
+    /// Override the UDS socket path. Empty = use the default path. Env:
+    /// `DESKTOP_ASSISTANT_UDS_SOCKET`.
+    pub uds_socket: Option<String>,
+    /// Fail startup if the session D-Bus is unavailable. Env:
+    /// `DESKTOP_ASSISTANT_DBUS_REQUIRED`.
+    pub dbus_required: bool,
+    /// D-Bus well-known name to claim. Env: `DESKTOP_ASSISTANT_DBUS_SERVICE`.
+    pub dbus_service: String,
+}
+
+/// Local-first WebSocket-off default, mirroring the historical env defaults.
+pub const DEFAULT_WS_ENABLED: bool = false;
+/// Historical default WebSocket bind address.
+pub const DEFAULT_WS_BIND: &str = "127.0.0.1:11339";
+/// D-Bus best-effort by default (a missing bus logs and the daemon continues).
+pub const DEFAULT_DBUS_REQUIRED: bool = false;
+/// Historical default D-Bus well-known name.
+pub const DEFAULT_DBUS_SERVICE: &str = "org.desktopAssistant";
+
+impl Default for TransportsConfig {
+    fn default() -> Self {
+        Self {
+            ws_enabled: DEFAULT_WS_ENABLED,
+            ws_bind: DEFAULT_WS_BIND.to_string(),
+            uds_enabled: cfg!(unix),
+            uds_socket: None,
+            dbus_required: DEFAULT_DBUS_REQUIRED,
+            dbus_service: DEFAULT_DBUS_SERVICE.to_string(),
+        }
+    }
+}
+
+impl TransportsConfig {
+    /// True when every field equals the default, so serialization can skip the
+    /// whole `[transports]` table.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -761,6 +830,50 @@ mod tests {
     fn ws_jwt_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn transports_config_absent_table_is_default() {
+        // A config with no `[transports]` section deserializes to all defaults.
+        let cfg: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.transports, TransportsConfig::default());
+    }
+
+    #[test]
+    fn transports_config_roundtrips_overrides() {
+        let src = r#"
+[transports]
+ws_enabled = true
+ws_bind = "0.0.0.0:8080"
+uds_enabled = false
+uds_socket = "/tmp/adelie.sock"
+dbus_required = true
+dbus_service = "org.example.Adelie"
+"#;
+        let cfg: DaemonConfig = toml::from_str(src).unwrap();
+        let t = &cfg.transports;
+        assert!(t.ws_enabled);
+        assert_eq!(t.ws_bind, "0.0.0.0:8080");
+        assert!(!t.uds_enabled);
+        assert_eq!(t.uds_socket.as_deref(), Some("/tmp/adelie.sock"));
+        assert!(t.dbus_required);
+        assert_eq!(t.dbus_service, "org.example.Adelie");
+
+        // Non-default => the table is serialized back out.
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("[transports]"));
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.transports, cfg.transports);
+    }
+
+    #[test]
+    fn transports_config_default_is_skipped_on_serialize() {
+        let cfg = DaemonConfig::default();
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(
+            !serialized.contains("[transports]"),
+            "default transports table must be skipped: {serialized}"
+        );
     }
 
     #[test]

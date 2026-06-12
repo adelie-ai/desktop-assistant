@@ -125,9 +125,20 @@ impl uds::UdsAuthValidator for WsAsUdsAuth {
     }
 }
 
-pub(crate) fn resolve_uds_socket_path() -> Option<std::path::PathBuf> {
+/// Resolve the UDS socket path. Precedence: the
+/// `DESKTOP_ASSISTANT_UDS_SOCKET` env var (an empty value disables the socket),
+/// then the `[transports].uds_socket` config override (`config_socket`; empty
+/// disables), then the default desktop socket path.
+pub(crate) fn resolve_uds_socket_path(config_socket: Option<&str>) -> Option<std::path::PathBuf> {
     if let Some(explicit) = std::env::var_os("DESKTOP_ASSISTANT_UDS_SOCKET") {
         let s = explicit.to_string_lossy().trim().to_string();
+        if s.is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(s));
+    }
+    if let Some(configured) = config_socket {
+        let s = configured.trim();
         if s.is_empty() {
             return None;
         }
@@ -238,23 +249,6 @@ pub(crate) fn parse_env_bool(value: Option<&str>, default: bool) -> bool {
     }
 }
 
-/// Local-first transport defaults. Out of the box the daemon serves the local
-/// transports (the D-Bus minter + UDS) and leaves the remote WebSocket
-/// endpoint off until explicitly enabled. Each is overridable via the matching
-/// `DESKTOP_ASSISTANT_*` env var; centralized here so the policy is documented
-/// and pinned by tests.
-pub(crate) mod transport_defaults {
-    /// WebSocket listener is OFF by default (`DESKTOP_ASSISTANT_WS_ENABLED`).
-    pub const WS_ENABLED: bool = false;
-    /// D-Bus is best-effort by default — a missing/unavailable bus logs and
-    /// the daemon continues (`DESKTOP_ASSISTANT_DBUS_REQUIRED`).
-    pub const DBUS_REQUIRED: bool = false;
-    /// UDS is ON by default on Unix targets (`DESKTOP_ASSISTANT_UDS_ENABLED`).
-    pub fn uds_enabled() -> bool {
-        cfg!(unix)
-    }
-}
-
 pub(crate) fn is_container_environment() -> bool {
     std::env::var("container")
         .ok()
@@ -308,7 +302,8 @@ pub(crate) fn resolve_ws_login_mode() -> Option<(String, WsLoginMode)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WsLoginMode, parse_env_bool, resolve_ws_login_mode_decision, transport_defaults};
+    use super::{WsLoginMode, parse_env_bool, resolve_ws_login_mode_decision};
+    use crate::config::TransportsConfig;
 
     #[test]
     fn parse_env_bool_recognizes_truthy_and_falsy() {
@@ -331,25 +326,21 @@ mod tests {
 
     #[test]
     fn transport_defaults_are_local_first() {
-        // Local-first policy: WebSocket off, D-Bus best-effort (not required),
-        // UDS on (Unix). Bind to locals so the asserts are runtime checks of
-        // the policy constants rather than constant-folded tautologies.
-        let ws_enabled = transport_defaults::WS_ENABLED;
-        let dbus_required = transport_defaults::DBUS_REQUIRED;
-        assert!(!ws_enabled, "WS must default off");
-        assert!(!dbus_required, "D-Bus must be optional by default");
-        assert_eq!(transport_defaults::uds_enabled(), cfg!(unix));
+        // Local-first policy lives in `[transports]` (#279 item 3): WebSocket
+        // off, D-Bus best-effort (not required), UDS on (Unix). Bind to locals
+        // so the asserts are runtime checks rather than constant-folded
+        // tautologies.
+        let defaults = TransportsConfig::default();
+        assert!(!defaults.ws_enabled, "WS must default off");
+        assert!(!defaults.dbus_required, "D-Bus must be optional by default");
+        assert_eq!(defaults.uds_enabled, cfg!(unix));
+        assert_eq!(defaults.ws_bind, "127.0.0.1:11339");
+        assert_eq!(defaults.dbus_service, "org.desktopAssistant");
 
-        // The env knobs still flip each policy.
-        assert!(parse_env_bool(Some("true"), transport_defaults::WS_ENABLED));
-        assert!(parse_env_bool(
-            Some("true"),
-            transport_defaults::DBUS_REQUIRED
-        ));
-        assert!(!parse_env_bool(
-            Some("false"),
-            transport_defaults::uds_enabled()
-        ));
+        // The env knobs (via `parse_env_bool`) still flip each policy.
+        assert!(parse_env_bool(Some("true"), defaults.ws_enabled));
+        assert!(parse_env_bool(Some("true"), defaults.dbus_required));
+        assert!(!parse_env_bool(Some("false"), defaults.uds_enabled));
     }
 
     #[test]
