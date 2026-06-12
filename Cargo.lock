@@ -1266,6 +1266,7 @@ dependencies = [
  "desktop-assistant-application",
  "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
+ "desktop-assistant-frame-codec",
  "desktop-assistant-uds",
  "futures",
  "reqwest",
@@ -1384,6 +1385,13 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zbus",
+]
+
+[[package]]
+name = "desktop-assistant-frame-codec"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

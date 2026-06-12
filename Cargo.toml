@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/api-model",
     "crates/application",
+    "crates/frame-codec",
     "crates/auth-jwt",
     "crates/ws-interface",
     "crates/core",
@@ -47,6 +48,7 @@ desktop-assistant-storage = { path = "crates/storage" }
 desktop-assistant-client-common = { path = "crates/client-common" }
 desktop-assistant-transport-dispatch = { path = "crates/transport-dispatch" }
 desktop-assistant-uds = { path = "crates/uds-interface" }
+desktop-assistant-frame-codec = { path = "crates/frame-codec" }
 serde_json = "1"
 toml = "1"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
