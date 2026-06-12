@@ -229,6 +229,19 @@ impl ClientToolCoordinator {
             .unwrap_or(false)
     }
 
+    /// Test/diagnostic helper: true iff `name` is registered in **any**
+    /// `(user, session)` bucket. Production code must use
+    /// [`is_client_registered`], which is correctly scoped to the calling
+    /// connection's session (#261). This exists for out-of-band callers
+    /// (integration tests, diagnostics) that need to assert a registration
+    /// landed without knowing the server-minted `session_id` of the
+    /// connection that registered it — a session id that is never visible to
+    /// a caller outside that connection's request scope.
+    pub async fn is_registered_in_any_session(&self, name: &str) -> bool {
+        let regs = self.registrations.lock().unwrap();
+        regs.values().any(|set| set.contains_key(name))
+    }
+
     /// The tool definitions registered as client-local for the current
     /// connection's session, in the shape the LLM tool list expects (#234).
     /// Maps each [`api::ClientToolRegistration`] to a core [`ToolDefinition`]
