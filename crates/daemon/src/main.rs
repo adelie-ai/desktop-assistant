@@ -2198,33 +2198,17 @@ async fn main() -> Result<()> {
                 let shutdown = async {
                     let _ = ws_shutdown_rx.await;
                 };
+                let ws_config = ws::WsServeConfig::new(api_handler, ws_auth)
+                    .with_login_service(ws_login_service)
+                    .with_auth_discovery(auth_discovery)
+                    .with_allowed_origins(allowed_origins)
+                    .with_daemon_system_id(ws_daemon_system_id);
                 let result = if let Some(acceptor) = tls_acceptor {
                     tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
-                    ws::serve_full_tls_with_system_id(
-                        api_handler,
-                        ws_auth,
-                        ws_login_service,
-                        auth_discovery,
-                        allowed_origins,
-                        ws_daemon_system_id,
-                        acceptor,
-                        ws_addr,
-                        shutdown,
-                    )
-                    .await
+                    ws_config.serve_tls(acceptor, ws_addr, shutdown).await
                 } else {
                     tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
-                    ws::serve_full_with_system_id(
-                        api_handler,
-                        ws_auth,
-                        ws_login_service,
-                        auth_discovery,
-                        allowed_origins,
-                        ws_daemon_system_id,
-                        ws_addr,
-                        shutdown,
-                    )
-                    .await
+                    ws_config.serve(ws_addr, shutdown).await
                 };
                 if let Err(e) = result {
                     tracing::error!("WebSocket server error: {e}");
