@@ -7,11 +7,11 @@
 //! request/response multiplexing and shares every typed command via
 //! [`AssistantCommands`]; only the connect step and the framing differ.
 //!
-//! The framing functions below are a deliberate re-implementation of the
-//! server's `read_frame`/`write_frame` (identical wire format — see
-//! `crates/uds-interface/src/lib.rs`). Depending on that crate would drag the
-//! entire daemon stack into every client binary, so the ~20 lines are
-//! duplicated on purpose.
+//! The framing is shared with the server via the dependency-light
+//! [`desktop_assistant_frame_codec`] crate (`read_frame`/`write_frame`), so the
+//! frame cap and framing rules can never drift between client and server.
+//! That crate carries only the `tokio` async I/O traits, so it doesn't drag
+//! the daemon stack into client binaries.
 //!
 //! ## Reconnect (#246)
 //!
@@ -25,7 +25,6 @@
 //! the event stream.
 
 use std::collections::HashMap;
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +33,7 @@ use anyhow::{Result, anyhow};
 use api::{WsFrame, WsRequest};
 use async_trait::async_trait;
 use desktop_assistant_api_model as api;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use desktop_assistant_frame_codec::{read_frame, write_frame};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -42,10 +41,6 @@ use crate::commands::{AssistantCommands, PendingResult};
 use crate::signal::SignalEvent;
 use crate::timeouts::DISPATCH_TIMEOUT;
 use crate::ws_client::map_event_to_signal;
-
-/// 4 MB cap, matching the server. Keeps a buggy/hostile peer from claiming a
-/// multi-GB frame length and forcing an allocation blow-up.
-const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
 
 /// In-flight requests plus a terminal "closed" marker, behind a single mutex.
 ///
@@ -332,38 +327,4 @@ impl AssistantCommands for UdsClient {
             }
         }
     }
-}
-
-/// Read one length-prefixed frame: a 4-byte little-endian `u32` length followed
-/// by that many body bytes. A 0-length frame signals a clean close.
-async fn read_frame<R>(read_half: &mut R) -> io::Result<Vec<u8>>
-where
-    R: AsyncReadExt + Unpin,
-{
-    let mut len_buf = [0u8; 4];
-    read_half.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf);
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame length {len} exceeds cap {MAX_FRAME_LEN}"),
-        ));
-    }
-    let mut body = vec![0u8; len as usize];
-    if len > 0 {
-        read_half.read_exact(&mut body).await?;
-    }
-    Ok(body)
-}
-
-/// Write one length-prefixed frame.
-async fn write_frame<W>(write_half: &mut W, body: &[u8]) -> io::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let len = body.len() as u32;
-    write_half.write_all(&len.to_le_bytes()).await?;
-    write_half.write_all(body).await?;
-    write_half.flush().await?;
-    Ok(())
 }

@@ -1,0 +1,11 @@
+[package]
+name = "desktop-assistant-frame-codec"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
