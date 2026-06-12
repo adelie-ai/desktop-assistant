@@ -290,6 +290,321 @@ impl OidcValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{EncodingKey, Header};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Two pre-generated 2048-bit RSA keypairs, embedded so the tests don't
+    // depend on an `rsa` dev-dep or runtime keygen. `KEY*_PEM` is the PKCS#8
+    // private key (for signing test tokens); `KEY*_N`/`KEY*_E` are the
+    // base64url JWKS modulus/exponent for the matching public key.
+    const KEY1_PEM: &str = include_str!("testdata/oidc_test_key1.pem");
+    const KEY2_PEM: &str = include_str!("testdata/oidc_test_key2.pem");
+    const KEY1_N: &str = "tsvRqmnpGiItl1UWXeD_w534wbRkd2Z4yfgLTlrWcLo1e-Ch3LrU96iq6aK5bGbqC4LXyict8e90KVflNVbOfjPxwdPIR-bCPZSZUhMmk9HyRkk9paHJ0MJ0_hFHZBSW3ghxtXWui20b9AzVRnlEVQPGZCnLNogoz9zXa9EbNFz_WVePJ9EeyxpJpwdRtGkyi462JbcAYv3Kx6JqXVOPOVTfxo2W9Xps1lkRZvfwr-SH2_JOmV3fct1B4JXu-_-zxNeZOA2VWb9XcoEGXm0Twitf9PJ8bRjBJ6Lwq89pRIkC6JemsF1VzW8Ym3eepdSw_ebvHaRac8vkOeD7gufcNQ";
+    const KEY2_N: &str = "6O3wENWDW2t8PKSAivkyqoAjuvd1_OQeuEvbNVPH9wBY4AYZxiwFYyPXr-uebqn-qNJm2Ne_eFb579CKDr0h7oz91ZerapZm2ZqO3VRoY_bhBGSkWUn91IWLP4eDevszqJUdGPZfGG3lJmz7NTkfsTWguaP6KNuFbabOZG3rku3R4B9D2eY_KccPiKHsg_ZsPy-mWdzjWyQQkXdnS8Ajse7fugbTlUXW2F5udTWJ8VdpRKGOZPL2Oqsns6yli1dHdmHPbK3ilVXHfn9y5JdEGpYCdkDcyreCEAiSuX55owlBZU0dc5J3Fs--Gu52jutiayvcImWo2TsJD6GRZhnM5w";
+    const KEY_E: &str = "AQAB";
+
+    const TEST_ISSUER: &str = "https://idp.example.com";
+    const TEST_AUDIENCE: &str = "desktop-assistant";
+
+    #[derive(serde::Serialize)]
+    struct TestClaims {
+        sub: String,
+        iss: String,
+        aud: String,
+        exp: u64,
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Mint a signed RS256 token with the given `kid`, issuer, and audience.
+    fn mint_token(pem: &str, kid: Option<&str>, iss: &str, aud: &str, exp: u64) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = kid.map(String::from);
+        let claims = TestClaims {
+            sub: "user-123".into(),
+            iss: iss.into(),
+            aud: aud.into(),
+            exp,
+        };
+        let key = EncodingKey::from_rsa_pem(pem.as_bytes()).expect("valid test RSA pem");
+        jsonwebtoken::encode(&header, &claims, &key).expect("encode test token")
+    }
+
+    /// A single-key JWKS document with the given `kid`, modulus, and exponent.
+    fn jwks_body(kid: &str, n: &str, e: &str) -> String {
+        serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": kid,
+                "n": n,
+                "e": e,
+            }]
+        })
+        .to_string()
+    }
+
+    /// Build a validator bound to `server`'s `jwks_uri`, with audience pinned.
+    async fn validator_for(server: &httpmock::MockServer) -> OidcValidator {
+        let oidc = OidcConfig {
+            issuer_url: TEST_ISSUER.to_string(),
+            authorization_endpoint: String::new(),
+            token_endpoint: String::new(),
+            client_id: "test-client".to_string(),
+            scopes: "openid".to_string(),
+            jwks_uri: format!("{}/jwks", server.base_url()),
+            audience: TEST_AUDIENCE.to_string(),
+        };
+        OidcValidator::from_config(&oidc)
+            .await
+            .expect("validator builds against mock JWKS")
+    }
+
+    /// DT-2 #268: audience is mandatory. A config with an empty audience must
+    /// be rejected at build time — an empty audience would accept any token
+    /// the issuer minted, for any relying party.
+    #[tokio::test]
+    async fn from_config_rejects_empty_audience() {
+        let oidc = OidcConfig {
+            issuer_url: TEST_ISSUER.to_string(),
+            authorization_endpoint: String::new(),
+            token_endpoint: String::new(),
+            client_id: "test-client".to_string(),
+            scopes: "openid".to_string(),
+            jwks_uri: "https://idp.example.com/jwks".to_string(),
+            audience: "   ".to_string(), // whitespace-only == empty
+        };
+        let err = OidcValidator::from_config(&oidc)
+            .await
+            .expect_err("empty audience must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("audience"),
+            "error should explain the audience requirement, got: {err}"
+        );
+    }
+
+    /// DT-2 #268: a token whose `aud` doesn't match the configured audience is
+    /// rejected, even when its signature, issuer, and expiry are all valid.
+    #[tokio::test]
+    async fn token_with_wrong_audience_is_rejected() {
+        let server = httpmock::MockServer::start_async().await;
+        let jwks = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(jwks_body("key1", KEY1_N, KEY_E));
+            })
+            .await;
+
+        let validator = validator_for(&server).await;
+        jwks.assert_async().await;
+
+        // Correctly signed, correct issuer, not expired — but minted for a
+        // *different* audience.
+        let token = mint_token(
+            KEY1_PEM,
+            Some("key1"),
+            TEST_ISSUER,
+            "some-other-service",
+            now_secs() + 3600,
+        );
+        assert!(
+            !validator.validate_token(&token).await,
+            "a token for a different audience must be rejected"
+        );
+
+        // Sanity: the same key with the *right* audience is accepted, proving
+        // the rejection above is the audience check, not a setup error.
+        let good = mint_token(
+            KEY1_PEM,
+            Some("key1"),
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now_secs() + 3600,
+        );
+        assert!(
+            validator.validate_token(&good).await,
+            "a token for the configured audience must be accepted"
+        );
+    }
+
+    /// DT-2 #268: after IdP key rotation, a token signed by the *new* key is
+    /// picked up via an unknown-`kid` refetch — no daemon restart required.
+    #[tokio::test]
+    async fn rotated_key_is_picked_up_after_refresh() {
+        let server = httpmock::MockServer::start_async().await;
+
+        // Startup JWKS serves only key1.
+        let jwks_v1 = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(jwks_body("key1", KEY1_N, KEY_E));
+            })
+            .await;
+
+        let validator = validator_for(&server).await;
+        jwks_v1.assert_async().await;
+
+        // A token signed by the as-yet-unknown rotated key2 is initially
+        // unverifiable.
+        let rotated = mint_token(
+            KEY2_PEM,
+            Some("key2"),
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now_secs() + 3600,
+        );
+
+        // IdP rotates: the JWKS now serves key2 instead. Replace the mock.
+        jwks_v1.delete_async().await;
+        let jwks_v2 = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(jwks_body("key2", KEY2_N, KEY_E));
+            })
+            .await;
+
+        // The unknown `kid=key2` triggers a refetch, which now returns key2,
+        // so the rotated token validates.
+        assert!(
+            validator.validate_token(&rotated).await,
+            "a token signed by the rotated key must validate after JWKS refresh"
+        );
+        assert!(
+            jwks_v2.hits_async().await >= 1,
+            "an unknown kid must trigger a JWKS refetch"
+        );
+    }
+
+    /// DT-2 #268: an unknown `kid` triggers exactly one refetch; the cache is
+    /// updated so a *second* token with the same now-known `kid` does NOT
+    /// refetch again.
+    #[tokio::test]
+    async fn unknown_kid_triggers_refetch_then_caches() {
+        let server = httpmock::MockServer::start_async().await;
+        let jwks_v1 = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(jwks_body("key1", KEY1_N, KEY_E));
+            })
+            .await;
+        let validator = validator_for(&server).await;
+        jwks_v1.assert_async().await;
+        jwks_v1.delete_async().await;
+
+        let jwks_v2 = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(jwks_body("key2", KEY2_N, KEY_E));
+            })
+            .await;
+
+        let token = mint_token(
+            KEY2_PEM,
+            Some("key2"),
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now_secs() + 3600,
+        );
+        // First use: unknown kid → one refetch → validates.
+        assert!(validator.validate_token(&token).await);
+        let hits_after_first = jwks_v2.hits_async().await;
+        assert_eq!(hits_after_first, 1, "first unknown kid refetches exactly once");
+
+        // Second use of the now-known kid must not refetch again.
+        assert!(validator.validate_token(&token).await);
+        assert_eq!(
+            jwks_v2.hits_async().await,
+            hits_after_first,
+            "a now-cached kid must not trigger another refetch"
+        );
+    }
+
+    /// DT-2 #268: a flood of distinct unknown `kid`s must not hammer the IdP —
+    /// refetches are rate-limited to at most one per the minimum interval.
+    #[tokio::test]
+    async fn refetch_is_rate_limited() {
+        let server = httpmock::MockServer::start_async().await;
+        let jwks = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(jwks_body("key1", KEY1_N, KEY_E));
+            })
+            .await;
+        let validator = validator_for(&server).await;
+        // One startup fetch so far.
+        let baseline = jwks.hits_async().await;
+        assert_eq!(baseline, 1);
+
+        // Hammer with many tokens carrying distinct, never-cached `kid`s. Each
+        // is signed by key2 (which the JWKS never serves) so it never validates
+        // and every call sees an unknown kid.
+        for i in 0..20 {
+            let kid = format!("garbage-{i}");
+            let token = mint_token(
+                KEY2_PEM,
+                Some(&kid),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                now_secs() + 3600,
+            );
+            assert!(!validator.validate_token(&token).await);
+        }
+
+        // The first unknown kid fired one refetch; the rest were throttled by
+        // the rate limiter, so total fetches are well under 20.
+        let total = jwks.hits_async().await;
+        assert!(
+            total <= baseline + 1,
+            "rate limiter must cap refetches: saw {total} fetches for 20 unknown kids"
+        );
+    }
+
+    /// An expired token is rejected even when signed by a cached key.
+    #[tokio::test]
+    async fn expired_token_is_rejected() {
+        let server = httpmock::MockServer::start_async().await;
+        let jwks = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/jwks");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(jwks_body("key1", KEY1_N, KEY_E));
+            })
+            .await;
+        let validator = validator_for(&server).await;
+        jwks.assert_async().await;
+
+        let expired = mint_token(
+            KEY1_PEM,
+            Some("key1"),
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            now_secs().saturating_sub(3600),
+        );
+        assert!(
+            !validator.validate_token(&expired).await,
+            "an expired token must be rejected"
+        );
+    }
 
     /// DT-14: an over-cap response body must be rejected by the streamed read
     /// *without first buffering the whole body*. We serve a body well over a
