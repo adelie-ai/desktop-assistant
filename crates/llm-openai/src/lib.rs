@@ -815,15 +815,19 @@ fn parse_openai_context_length_message(message: &str) -> (Option<u64>, Option<u6
 /// Curated list of OpenAI models exposed through this connector.
 ///
 /// OpenAI's `/v1/models` endpoint returns a firehose of model IDs
-/// (including retired and fine-tune variants) with no capability metadata.
-/// Until we ship a resolver that merges the live list with this curated
-/// table, we hand-maintain the set that the model picker should offer.
+/// (including retired and fine-tune variants) with no capability metadata,
+/// so this hand-maintained table is the set the model picker should offer.
+///
+/// `list_models` routes this table through the shared
+/// [`merge_curated_with_live`](desktop_assistant_llm_http::merge_curated_with_live)
+/// resolver (issue #304). Today it passes an empty live list, so the curated
+/// table is returned unchanged; when we start fetching `/v1/models` the live
+/// ids slot in as the resolver's `live` argument — curated metadata wins on
+/// overlap, unknown live ids are appended.
 ///
 /// To extend: append a `ModelInfo` entry here with the right
 /// `ModelCapabilities` flags. `reasoning: true` belongs on the o-series
 /// (o1, o3, o4) and any GPT-5 variant that exposes reasoning traces.
-// TODO(#7): fetch `/v1/models` and merge with this table so newly
-// released models surface automatically.
 /// True when `model` is one of the curated OpenAI models flagged as
 /// reasoning-capable. Used to gate the `reasoning.effort` field on
 /// requests — sending it for non-reasoning models (e.g. `gpt-4o`) is a
@@ -952,7 +956,13 @@ impl LlmClient for OpenAiClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        Ok(curated_openai_models())
+        // No live `/v1/models` fetch yet; the empty live list returns the
+        // curated table unchanged. Routing through the shared resolver keeps
+        // the merge policy in one place for when a live fetch lands (#304).
+        Ok(desktop_assistant_llm_http::merge_curated_with_live(
+            curated_openai_models(),
+            Vec::new(),
+        ))
     }
 
     async fn stream_completion(
@@ -1513,6 +1523,15 @@ mod tests {
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
         let result = OpenAiClient::from_env();
         assert!(matches!(result, Err(CoreError::Llm(_))));
+    }
+
+    /// The shared-resolver path with an empty live list must return exactly
+    /// the curated table — proves the #304 refactor is behavior-preserving.
+    #[tokio::test]
+    async fn list_models_matches_curated_table_via_resolver() {
+        let client = OpenAiClient::new("key".into());
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models, curated_openai_models());
     }
 
     #[tokio::test]
