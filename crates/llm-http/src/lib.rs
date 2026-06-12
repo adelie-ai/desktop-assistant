@@ -13,8 +13,13 @@
 //! `ToolsUnsupported`) and aren't worth shoehorning into one helper.
 
 mod models;
+pub mod streaming;
 
 pub use models::merge_curated_with_live;
+pub use streaming::{
+    STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
+    parse_retry_after_header,
+};
 
 use desktop_assistant_core::CoreError;
 use reqwest::Response;

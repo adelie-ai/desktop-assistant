@@ -1432,6 +1432,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
  "desktop-assistant-core",
+ "desktop-assistant-llm-http",
  "serde",
  "serde_json",
  "tokio",
@@ -1446,7 +1447,10 @@ dependencies = [
  "desktop-assistant-core",
  "httpmock",
  "reqwest",
+ "serde_json",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]
