@@ -1207,3 +1207,214 @@ async fn current_task_id_outside_registry_is_none_inside_is_some() {
         .expect("wait() must resolve once the task finalizes, not hang");
     assert!(seen.load(Ordering::SeqCst));
 }
+
+// --------------------------------------------------------------------
+// 14. recursion depth limit (issue #291)
+// --------------------------------------------------------------------
+
+/// Register a chain of nested `Subagent` tasks `depth` levels deep
+/// (level 0's parent is a `Conversation` task) and run `body` inside the
+/// deepest one, where `current_task_id()` resolves to that level's id and
+/// the registry holds the full parent chain. Returns the body's value.
+///
+/// Used by the depth-limit tests: they drive `tools.spawn(..)` from deep
+/// inside a real Subagent chain so the dispatch-time depth check has a
+/// genuine ancestry to walk.
+async fn under_subagent_chain<F, Fut, T>(
+    registry: &Arc<BackgroundTaskRegistry>,
+    user: UserId,
+    depth: usize,
+    body: F,
+) -> T
+where
+    F: FnOnce(api::TaskId) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    // First register the root Conversation parent so the chain hangs off
+    // a real ancestor.
+    let result_slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let result_for_body = Arc::clone(&result_slot);
+    let registry_outer = Arc::clone(registry);
+    let user_outer = user.clone();
+
+    let root_id = registry.spawn(
+        user.clone(),
+        api::TaskKind::Conversation {
+            conversation_id: "root-conv".into(),
+        },
+        "root".into(),
+        move |ctx| {
+            let registry = registry_outer;
+            let user = user_outer;
+            let result_for_body = result_for_body;
+            async move {
+                with_user_id(user.clone(), async move {
+                    let token = ctx.token.clone();
+                    desktop_assistant_core::ports::llm::with_cancellation_token(
+                        token,
+                        async move {
+                            let parent = ctx.task_id.clone();
+                            let value = spawn_nested(&registry, user, parent, depth, body).await;
+                            *result_for_body.lock().unwrap() = Some(value);
+                        },
+                    )
+                    .await;
+                    Ok(())
+                })
+                .await
+            }
+        },
+    );
+    timeout(Duration::from_secs(10), registry.wait(&root_id))
+        .await
+        .expect("subagent chain must finish, not hang");
+    result_slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("chain body produced a value")
+}
+
+/// Spawn one more `Subagent` level under `parent`; recurse until
+/// `remaining == 0`, then run `body` inside the deepest body.
+fn spawn_nested<F, Fut, T>(
+    registry: &Arc<BackgroundTaskRegistry>,
+    user: UserId,
+    parent: api::TaskId,
+    remaining: usize,
+    body: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>
+where
+    F: FnOnce(api::TaskId) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let registry = Arc::clone(registry);
+    Box::pin(async move {
+        let result_slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let result_for_body = Arc::clone(&result_slot);
+        let registry_inner = Arc::clone(&registry);
+        let user_inner = user.clone();
+        let parent_for_kind = parent.clone();
+        let child_id = registry.spawn(
+            user.clone(),
+            api::TaskKind::Subagent {
+                parent_task_id: parent_for_kind,
+                conversation_id: format!("sub-conv-{remaining}"),
+                name: format!("level-{remaining}"),
+            },
+            format!("level-{remaining}"),
+            move |ctx| {
+                let registry = registry_inner;
+                let user = user_inner;
+                let result_for_body = result_for_body;
+                async move {
+                    with_user_id(user.clone(), async move {
+                        let token = ctx.token.clone();
+                        desktop_assistant_core::ports::llm::with_cancellation_token(
+                            token,
+                            async move {
+                                let me = ctx.task_id.clone();
+                                let value = if remaining <= 1 {
+                                    body(me).await
+                                } else {
+                                    spawn_nested(&registry, user, me, remaining - 1, body).await
+                                };
+                                *result_for_body.lock().unwrap() = Some(value);
+                            },
+                        )
+                        .await;
+                        Ok(())
+                    })
+                    .await
+                }
+            },
+        );
+        timeout(Duration::from_secs(10), registry.wait(&child_id))
+            .await
+            .expect("nested subagent level must finish, not hang");
+        result_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("nested body produced a value")
+    })
+}
+
+#[tokio::test]
+async fn spawn_subagent_rejected_past_recursion_depth_limit() {
+    use desktop_assistant_application::subagent_tools::MAX_SUBAGENT_DEPTH;
+
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let conversations = Arc::new(FakeConversations::new("child text"));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("deep");
+
+    // Run from inside a Subagent chain already at MAX_SUBAGENT_DEPTH
+    // Subagent ancestors. Spawning one more would exceed the cap, so the
+    // tool must refuse with a recoverable error and create no child task.
+    let tools_for_body = tools.clone();
+    let result: Result<String, CoreError> = under_subagent_chain(
+        &registry,
+        user.clone(),
+        MAX_SUBAGENT_DEPTH,
+        move |_deepest| async move {
+            tools_for_body
+                .execute_tool(
+                    TOOL_SPAWN_SUBAGENT,
+                    serde_json::json!({
+                        "name": "too-deep",
+                        "prompt": "go deeper",
+                        "wait": true,
+                    }),
+                )
+                .await
+        },
+    )
+    .await;
+
+    let err = result.expect_err("spawn past the depth cap must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("depth"),
+        "rejection should mention the depth limit, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn spawn_subagent_allowed_within_recursion_depth_limit() {
+    use desktop_assistant_application::subagent_tools::MAX_SUBAGENT_DEPTH;
+
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let conversations = Arc::new(FakeConversations::new("child text"));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("shallow");
+
+    // One level below the cap: a spawn here is still permitted, proving
+    // the limit doesn't fire prematurely.
+    let tools_for_body = tools.clone();
+    let result: Result<String, CoreError> = under_subagent_chain(
+        &registry,
+        user.clone(),
+        MAX_SUBAGENT_DEPTH - 1,
+        move |_deepest| async move {
+            tools_for_body
+                .execute_tool(
+                    TOOL_SPAWN_SUBAGENT,
+                    serde_json::json!({
+                        "name": "still-ok",
+                        "prompt": "one more",
+                        "wait": true,
+                    }),
+                )
+                .await
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result.expect("a spawn within the depth limit must succeed"),
+        "child text"
+    );
+}
