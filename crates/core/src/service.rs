@@ -5460,8 +5460,14 @@ mod concurrency_tests {
                 .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
         }
 
-        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
-            Ok(self.data.lock().unwrap().values().cloned().collect())
+        async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .values()
+                .map(ConversationSummary::from)
+                .collect())
         }
 
         async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
@@ -5599,7 +5605,7 @@ mod concurrency_tests {
         async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
             self.inner.get(id).await
         }
-        async fn list(&self) -> Result<Vec<Conversation>, CoreError> {
+        async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
             self.inner.list().await
         }
         async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
