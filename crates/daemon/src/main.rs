@@ -1355,6 +1355,61 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Spawn the interactive-model keep-warm task. When the interactive
+    // purpose resolves to an Ollama connection with `keep_warm = true`, a
+    // light background loop re-loads that one model into Ollama's memory on a
+    // cadence shorter than Ollama's idle-unload window, so a chat reply isn't
+    // preceded by a cold (CPU-bound, possibly minutes-long) model load. Only
+    // the interactive model is kept warm; background purposes are left to
+    // unload when idle. No-op for non-Ollama interactive connections.
+    let (keep_warm_shutdown_tx, mut keep_warm_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let keep_warm_task = {
+        let resolved_interactive = api_surface::resolve_purpose_dispatch(
+            daemon_config.as_ref(),
+            purposes::PurposeKind::Interactive,
+        )
+        .map(|(r, _)| r);
+        match resolved_interactive {
+            Some(r) if r.connector == "ollama" && r.keep_warm => {
+                let base_url = r.base_url.clone();
+                let model = r.model.clone();
+                // Re-load well within Ollama's default 5-minute idle-unload
+                // window (an interactive turn resets keep_alive to that
+                // default), so the model never lapses between turns.
+                const KEEP_WARM_INTERVAL_SECS: u64 = 240;
+                tracing::info!(
+                    model = %model,
+                    base_url = %base_url,
+                    interval_secs = KEEP_WARM_INTERVAL_SECS,
+                    "ollama keep-warm enabled for interactive model"
+                );
+                Some(tokio::spawn(async move {
+                    let client = desktop_assistant_llm_ollama::OllamaClient::new(
+                        base_url,
+                        model.clone(),
+                    );
+                    loop {
+                        client.warm_model(&model).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                KEEP_WARM_INTERVAL_SECS,
+                            )) => {}
+                            _ = &mut keep_warm_shutdown_rx => {
+                                tracing::info!("ollama keep-warm: shutdown signal received");
+                                break;
+                            }
+                        }
+                    }
+                }))
+            }
+            _ => {
+                drop(keep_warm_shutdown_rx);
+                None
+            }
+        }
+    };
+
     // Build the conversation service with tool support. The store is shared
     // between the core `ConversationHandler` (for CRUD + append) and the
     // `RoutingConversationHandler` wrapper (for the per-conversation model
@@ -2019,6 +2074,13 @@ async fn main() -> Result<()> {
         && let Err(e) = task.await
     {
         tracing::warn!("dreaming task join error during shutdown: {e}");
+    }
+
+    let _ = keep_warm_shutdown_tx.send(());
+    if let Some(task) = keep_warm_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("keep-warm task join error during shutdown: {e}");
     }
 
     if let Some(tx) = ws_shutdown_tx {

@@ -50,6 +50,14 @@ pub struct AnthropicClient {
     temperature: Option<f64>,
     top_p: Option<f64>,
     hosted_tool_search: bool,
+    /// First-response (connect) stall budget; defaults to
+    /// [`ANTHROPIC_CONNECT_TIMEOUT`], overridable per-connection.
+    connect_timeout: std::time::Duration,
+    /// Per-chunk stall budget; defaults to [`ANTHROPIC_EVENT_TIMEOUT`].
+    event_timeout: std::time::Duration,
+    /// Per-connection context-window hard cap, in tokens. `None` = "max
+    /// available". Folded with the curated table in `max_context_tokens`.
+    context_cap: Option<u64>,
 }
 
 impl AnthropicClient {
@@ -71,7 +79,37 @@ impl AnthropicClient {
             temperature: None,
             top_p: None,
             hosted_tool_search: true,
+            connect_timeout: ANTHROPIC_CONNECT_TIMEOUT,
+            event_timeout: ANTHROPIC_EVENT_TIMEOUT,
+            context_cap: None,
         }
+    }
+
+    /// Set the per-connection context-window hard cap, in tokens. `None`/
+    /// `Some(0)` = "max available". Clamps the daemon's input budget (no
+    /// `num_ctx` to pin), useful for bounding spend. See
+    /// `desktop_assistant_llm_http::apply_context_cap`.
+    pub fn with_max_context_tokens(mut self, max: Option<u64>) -> Self {
+        self.context_cap = max.filter(|m| *m > 0);
+        self
+    }
+
+    /// Override the first-response (connect) stall budget. `None`/`Some(0)`
+    /// keeps the [`ANTHROPIC_CONNECT_TIMEOUT`] default. Seconds.
+    pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.connect_timeout = std::time::Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the per-chunk stall budget. `None`/`Some(0)` keeps the
+    /// [`ANTHROPIC_EVENT_TIMEOUT`] default. Seconds.
+    pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.event_timeout = std::time::Duration::from_secs(s);
+        }
+        self
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -477,9 +515,9 @@ impl AnthropicClient {
         // fails the turn instead of hanging forever (#220).
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-            _ = tokio::time::sleep(ANTHROPIC_CONNECT_TIMEOUT) => {
+            _ = tokio::time::sleep(self.connect_timeout) => {
                 tracing::error!(
-                    timeout_s = ANTHROPIC_CONNECT_TIMEOUT.as_secs(),
+                    timeout_s = self.connect_timeout.as_secs(),
                     "Anthropic request send() timed out (no response headers)"
                 );
                 return Err(CoreError::Llm("Anthropic stream stalled".into()));
@@ -544,7 +582,7 @@ impl AnthropicClient {
             // underlying reqwest body stream) so the HTTP connection is closed
             // rather than left orphaned in the connection pool. The stall
             // window resets on every received event (#220).
-            let event = match next_step(&mut events, &cancellation, ANTHROPIC_EVENT_TIMEOUT).await {
+            let event = match next_step(&mut events, &cancellation, self.event_timeout).await {
                 StreamStep::Item(ev) => ev,
                 StreamStep::Done => break,
                 StreamStep::Cancelled => {
@@ -554,7 +592,7 @@ impl AnthropicClient {
                 }
                 StreamStep::Stalled => {
                     tracing::error!(
-                        timeout_s = ANTHROPIC_EVENT_TIMEOUT.as_secs(),
+                        timeout_s = self.event_timeout.as_secs(),
                         "Anthropic stream stalled — no further event"
                     );
                     drop(events);
@@ -717,7 +755,9 @@ impl LlmClient for AnthropicClient {
 
     fn max_context_tokens(&self) -> Option<u64> {
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
-        context_limit_for_model(&model)
+        // Fold the per-connection hard cap into the curated window so the
+        // daemon budgets against the capped value (e.g. to bound spend).
+        desktop_assistant_llm_http::apply_context_cap(self.context_cap, context_limit_for_model(&model))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {

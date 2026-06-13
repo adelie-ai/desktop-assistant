@@ -280,10 +280,14 @@ pub const DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS: u64 = 200_000;
 ///
 /// Resolution order:
 ///   1. The purpose's `max_context_tokens` override, if explicitly set —
-///      the user always wins. Tagged [`BudgetSource::PurposeOverride`].
-///   2. The connector's curated table for the configured model, surfaced
-///      via `LlmClient::max_context_tokens()` (or any equivalent the
-///      caller passes through `connector_max`). Tagged
+///      the user always wins. Tagged [`BudgetSource::PurposeOverride`]. For
+///      Ollama this same value is read back via the per-turn budget and
+///      provisioned as `num_ctx` (clamped to the model ceiling and the
+///      per-connection hard cap), so budget and runtime window agree.
+///   2. The connector's effective window for the configured model, surfaced
+///      via `LlmClient::max_context_tokens()` (or any equivalent the caller
+///      passes through `connector_max`). For Ollama this already folds the
+///      per-connection `max_context_tokens` hard cap. Tagged
 ///      [`BudgetSource::ConnectorTable`].
 ///   3. [`DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS`] — a conservative universal
 ///      fallback so token-based compaction stays on for non-curated
@@ -293,6 +297,14 @@ pub const DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS: u64 = 200_000;
 /// `purpose_override` carries tier 1; `connector_max` carries tier 2.
 /// Both are optional so callers without a live value can pass `None` and
 /// still get the fallback.
+///
+/// Note: a purpose override is deliberately *not* clamped to `connector_max`
+/// here — `connector_max` is read before the per-turn budget is installed, so
+/// for Ollama it reflects the default window, not the override. Clamping would
+/// wrongly cap an override down to that default. The model's real ceiling and
+/// the per-connection hard cap bind at the connector (`effective_num_ctx`)
+/// instead, and the learned-overflow safety-net catches a genuinely over-long
+/// prompt.
 ///
 /// Why a typed [`ContextBudget`]: the previous `u64`-only signature lost
 /// the tier provenance, so callers couldn't tell whether the value came
@@ -450,6 +462,13 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
         max_tokens,
         hosted_tool_search,
         aws_profile,
+        // Legacy `[llm]` block has no per-connection timeout / context-cap
+        // fields; connectors fall back to their shared stall-budget defaults
+        // and "max available" context.
+        connect_timeout_secs: None,
+        stream_timeout_secs: None,
+        keep_warm: false,
+        max_context_tokens: None,
     }
 }
 
@@ -485,19 +504,22 @@ pub fn resolve_connection_llm_config(
             base_url,
             api_key_env,
             secret,
+            ..
         })
         | ConnectionConfig::Anthropic(AnthropicConnection {
             base_url,
             api_key_env,
             secret,
+            ..
         }) => (base_url.clone(), api_key_env.clone(), secret.clone(), None),
-        ConnectionConfig::Ollama(OllamaConnection { base_url }) => {
+        ConnectionConfig::Ollama(OllamaConnection { base_url, .. }) => {
             (base_url.clone(), None, None, None)
         }
         ConnectionConfig::Bedrock(BedrockConnection {
             aws_profile,
             region,
             base_url,
+            ..
         }) => {
             // Bedrock historically used `base_url` to encode the region when
             // no explicit URL was set. Preserve that shape: prefer `base_url`,
@@ -555,6 +577,38 @@ pub fn resolve_connection_llm_config(
             .and_then(|c| c.aws_profile.clone())
     });
 
+    // Per-connection knobs present on every variant: streaming stall budgets
+    // (`None` keeps the connector's shared default) and the context-window hard
+    // cap (`None` = "max available"). `keep_warm` is Ollama-only and off
+    // everywhere else.
+    let (connect_timeout_secs, stream_timeout_secs, keep_warm, max_context_tokens) =
+        match connection {
+            ConnectionConfig::Anthropic(c) => (
+                c.connect_timeout_secs,
+                c.stream_timeout_secs,
+                false,
+                c.max_context_tokens,
+            ),
+            ConnectionConfig::OpenAi(c) => (
+                c.connect_timeout_secs,
+                c.stream_timeout_secs,
+                false,
+                c.max_context_tokens,
+            ),
+            ConnectionConfig::Bedrock(c) => (
+                c.connect_timeout_secs,
+                c.stream_timeout_secs,
+                false,
+                c.max_context_tokens,
+            ),
+            ConnectionConfig::Ollama(c) => (
+                c.connect_timeout_secs,
+                c.stream_timeout_secs,
+                c.keep_warm.unwrap_or(false),
+                c.max_context_tokens,
+            ),
+        };
+
     ResolvedLlmConfig {
         connector,
         model,
@@ -565,5 +619,9 @@ pub fn resolve_connection_llm_config(
         max_tokens,
         hosted_tool_search,
         aws_profile,
+        connect_timeout_secs,
+        stream_timeout_secs,
+        keep_warm,
+        max_context_tokens,
     }
 }

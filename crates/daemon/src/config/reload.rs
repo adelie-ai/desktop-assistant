@@ -115,6 +115,7 @@ mod tests {
             id.to_string(),
             ConnectionConfig::Ollama(OllamaConnection {
                 base_url: Some(base.to_string()),
+                ..Default::default()
             }),
         );
         cfg
@@ -152,6 +153,7 @@ mod tests {
             "b".to_string(),
             ConnectionConfig::Ollama(OllamaConnection {
                 base_url: Some("http://localhost:11435".to_string()),
+                ..Default::default()
             }),
         );
         let plan = plan_reload(&old, &new);

@@ -303,6 +303,26 @@ pub struct AnthropicConnection {
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<SecretConfig>,
+    /// Seconds to wait for the first streaming response (headers/first event)
+    /// before treating the request as stalled. Overrides the connector-shared
+    /// [`STREAM_CONNECT_TIMEOUT`](desktop_assistant_llm_http::STREAM_CONNECT_TIMEOUT)
+    /// default (30s). Useful for slow local models (e.g. a large GGUF doing a
+    /// long prompt-eval on CPU).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait between streaming chunks before treating the stream as
+    /// stalled. Overrides the connector-shared
+    /// [`STREAM_EVENT_TIMEOUT`](desktop_assistant_llm_http::STREAM_EVENT_TIMEOUT)
+    /// default (60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout_secs: Option<u64>,
+    /// Hard ceiling on the effective context window, in tokens. `None` = "max
+    /// available" (use the model's curated/reported maximum). `Some(n)` clamps
+    /// the daemon's input budget to `min(n, reported)` — e.g. to bound prompt
+    /// size for billing. Cloud connectors have no `num_ctx` to pin, so this
+    /// only constrains how much input the daemon packs per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// OpenAI-compatible connection fields.
@@ -315,6 +335,19 @@ pub struct OpenAiConnection {
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<SecretConfig>,
+    /// Seconds to wait for the first streaming response before treating the
+    /// request as stalled. Overrides the shared 30s default. See
+    /// [`AnthropicConnection::connect_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait between streaming chunks. Overrides the shared 60s
+    /// default. See [`AnthropicConnection::stream_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout_secs: Option<u64>,
+    /// Hard ceiling on the effective context window, in tokens. `None` = "max
+    /// available". See [`AnthropicConnection::max_context_tokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// AWS Bedrock connection fields.
@@ -329,6 +362,19 @@ pub struct BedrockConnection {
     /// endpoint. The AWS SDK default is usually correct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Seconds to wait for the first streaming response before treating the
+    /// request as stalled. Overrides the shared 30s default. See
+    /// [`AnthropicConnection::connect_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait between streaming chunks. Overrides the shared 60s
+    /// default. See [`AnthropicConnection::stream_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout_secs: Option<u64>,
+    /// Hard ceiling on the effective context window, in tokens. `None` = "max
+    /// available". See [`AnthropicConnection::max_context_tokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// Ollama (local or self-hosted) connection fields.
@@ -337,6 +383,31 @@ pub struct BedrockConnection {
 pub struct OllamaConnection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Seconds to wait for the first streaming response (Ollama's prompt-eval
+    /// can be very slow for large models on CPU) before treating the request
+    /// as stalled. Overrides the shared 30s default. See
+    /// [`AnthropicConnection::connect_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait between streaming chunks. Overrides the shared 60s
+    /// default. See [`AnthropicConnection::stream_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout_secs: Option<u64>,
+    /// When `true`, the daemon keeps this connection's **interactive-purpose**
+    /// model resident in Ollama's memory by periodically re-loading it, so a
+    /// chat reply isn't preceded by a cold model load. Only the interactive
+    /// model is kept warm — background purposes (dreaming/titling) are allowed
+    /// to be unloaded when idle. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_warm: Option<bool>,
+    /// User-imposed hard ceiling on the context window, in tokens. `None`
+    /// means **"max available"** — float to whatever the model reports via
+    /// `/api/show` (e.g. 32768 for qwen2.5). `Some(n)` clamps the effective
+    /// window (and the `num_ctx` sent to Ollama, and the daemon's input
+    /// budget) to `min(n, reported)`, e.g. to fit a machine that can't afford
+    /// the model's full KV cache on CPU. Defaults to "max available".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// Errors raised while validating the `[connections]` map.
@@ -401,9 +472,11 @@ pub(crate) fn connection_from_legacy_llm(llm: &LlmConfig) -> ConnectionConfig {
             base_url: llm.base_url.clone(),
             api_key_env: llm.api_key_env.clone(),
             secret: llm.secret.clone(),
+            ..Default::default()
         }),
         "ollama" => ConnectionConfig::Ollama(OllamaConnection {
             base_url: llm.base_url.clone(),
+            ..Default::default()
         }),
         "bedrock" | "aws-bedrock" => ConnectionConfig::Bedrock(BedrockConnection {
             aws_profile: llm.aws_profile.clone(),
@@ -416,12 +489,14 @@ pub(crate) fn connection_from_legacy_llm(llm: &LlmConfig) -> ConnectionConfig {
                 .filter(|v| !v.trim().is_empty() && !v.contains("://"))
                 .cloned(),
             base_url: llm.base_url.as_ref().filter(|v| v.contains("://")).cloned(),
+            ..Default::default()
         }),
         // Anything else (including the legacy default "openai") maps to OpenAI.
         _ => ConnectionConfig::OpenAi(OpenAiConnection {
             base_url: llm.base_url.clone(),
             api_key_env: llm.api_key_env.clone(),
             secret: llm.secret.clone(),
+            ..Default::default()
         }),
     }
 }
