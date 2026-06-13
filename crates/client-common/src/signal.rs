@@ -53,6 +53,13 @@ pub enum SignalEvent {
         conversation_id: String,
         title: String,
     },
+    /// The user's conversation list changed elsewhere — a conversation was
+    /// created, renamed, deleted, or (un)archived by another client or the
+    /// voice daemon (#1). The client re-fetches its conversation list so its
+    /// sidebar stays in sync. Carries only the affected `conversation_id`.
+    ConversationListChanged {
+        conversation_id: String,
+    },
     /// One-time advisory emitted by the daemon (e.g. the conversation's
     /// stored model selection no longer resolves and was cleared).
     ConversationWarning {

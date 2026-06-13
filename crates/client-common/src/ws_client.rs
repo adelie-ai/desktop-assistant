@@ -433,6 +433,9 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             conversation_id,
             title,
         }),
+        api::Event::ConversationListChanged { conversation_id } => {
+            Some(SignalEvent::ConversationListChanged { conversation_id })
+        }
         api::Event::AssistantStatus {
             conversation_id,
             request_id,
