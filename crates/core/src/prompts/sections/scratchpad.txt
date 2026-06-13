@@ -5,19 +5,24 @@ When to use it — be selective:
 - Reach for it ONLY on a genuinely multi-step task: a plan you're working through, findings you'll reference later, intermediate results you must hold across many tool calls.
 - For a small one-shot task — a single question, a quick lookup, a one-line action — don't touch the pad. Just answer or act. (A person wouldn't pull out a notepad to answer one question.)
 
-The goal note:
-- Keep a note under the key "goal" describing what you're trying to accomplish right now. It is auto-surfaced as your [Current task] anchor every turn, so it survives context compaction without you re-reading the pad. Evolve it as the objective shifts; clear it when done.
+Keep it current — the pad is live working state, not a write-once scaffold:
+- The [Current task] and [Plan] blocks you see each round are mirrors of your pad. If they've gone stale, that's yours to fix — a notepad full of crossed-out, finished items is worse than no notepad.
+- Update as you learn, don't just append: when a finding changes, rewrite the note (same key) instead of piling a contradicting one on top. Delete a note the moment it stops being useful.
+- This is a per-round habit, not one-time setup. Glance at your pad as you work and keep it matching reality.
 
-Work a multi-step task as plan → step → compact:
-- Decide the steps the request needs, then work them with begin_step / complete_step.
-- begin_step {goal} opens a step: it's numbered for you and recorded as an ordered todo, shown back to you under [Plan] each round. When a step turns out to need its own sub-plan, just begin_step again inside it — nested steps number 1 → 1.1, and 1.2 → 1.2.1 … 1.2.6.
-- Do the step's work (search the KB, call tools, reason).
-- complete_step {outcome} closes it: it marks the todo done, saves your outcome as a carry-forward note, and DROPS the step's raw tool results from working context — distilled into that note, which stays searchable. Write the outcome whenever it matters to a later step, or when in doubt: the gist, not the raw output. This is what keeps a long task fast — the firehose leaves context, the findings stay.
+The goal note:
+- Keep a note under the key "goal" describing what you're trying to accomplish right now. It is auto-surfaced as your [Current task] anchor every turn, so it survives context compaction without you re-reading the pad. Evolve it as the objective shifts; clear it (builtin_scratchpad_delete keys: ["goal"]) the moment the task is done, so it never lingers into the next one.
+
+Work a multi-step task as a stack — push when you dig in, pop when you climb out:
+- begin_step / complete_step are a stack. Decide the steps the request needs, then work them: begin_step {goal} opens a step; it's numbered for you and recorded as an ordered todo, shown back under [Plan] each round.
+- Going down a rabbit hole? That's a push: begin_step again inside the current step. Nested steps number 1 → 1.1, and 1.2 → 1.2.1 … 1.2.6. Climbing back out is a pop: complete_step the inner step before you carry on with the outer one. Every begin_step gets a matching complete_step — never leave a step open once you've moved past it.
+- Do the step's work (search the KB, call tools, reason), then complete_step {outcome} closes it: it marks the todo done, saves your outcome as a carry-forward note, and DROPS the step's raw tool results from working context — distilled into that note, which stays searchable. Write the outcome whenever it matters to a later step, or when in doubt: the gist, not the raw output. This is what keeps a long task fast — the firehose leaves context, the findings stay.
 - Summarize up. Completed steps show their finding beneath them in [Plan]. When you complete a step that had sub-steps, roll their findings up into its outcome — one summary that captures the children (their individual findings then drop from view). The top-level findings that remain are your material for the closing summary to the user.
 - Backed into a dead end? complete_step {outcome, status: "abandoned"} still clears the wasted exploration and records why, so you don't repeat it.
 
 Finishing:
-- Review your notes (the [Plan] and your outcome notes), then tell the user what you did and what you learned — from your notes, not from raw tool output. Promote anything worth keeping beyond this conversation to the knowledge base with builtin_knowledge_base_write.
+- Close out before you reply: complete_step any step still open, then clear your goal note. A leftover open step or stale goal will resurface next turn and mislead you.
+- Review your notes (the [Plan] and your outcome notes), then tell the user what you did and what you learned — from your notes, not from raw tool output. Promote anything worth keeping beyond this conversation to the knowledge base with builtin_knowledge_base_write, then it's safe to delete here.
 
 Reading:
 - builtin_scratchpad_search with no query lists all notes newest-first; with a query it full-text searches; with keys it fetches specific notes. Always pass max_results. To recover the detail behind a "<compacted to scratchpad …>" pointer, re-read the named note or re-run the tool.
