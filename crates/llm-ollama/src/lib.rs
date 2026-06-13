@@ -1400,9 +1400,12 @@ mod tests {
     // --- max_context_tokens / context-length cache tests ---
 
     #[test]
-    fn max_context_tokens_is_none_before_warmup() {
+    fn max_context_tokens_before_warmup_is_configured_default() {
+        // Pre-#342 this returned `None`; now an un-warmed connector reports
+        // its configured/default num_ctx so budget never falls through to the
+        // daemon's 200K universal fallback on a local model.
         let client = OllamaClient::new("http://localhost:11434", "llama3.2");
-        assert_eq!(client.max_context_tokens(), None);
+        assert_eq!(client.max_context_tokens(), Some(DEFAULT_OLLAMA_NUM_CTX));
     }
 
     #[tokio::test]
@@ -1434,8 +1437,11 @@ mod tests {
 
         let client = OllamaClient::new(server.url(""), "mystery");
         let warmed = client.warm_context_length().await;
+        // The /api/show *ceiling* probe failed → cached as None (no clamp).
         assert_eq!(warmed, None);
-        assert_eq!(client.max_context_tokens(), None);
+        // But the connector still reports its configured-default num_ctx
+        // (unclamped, since the ceiling is unknown) — never None (#342).
+        assert_eq!(client.max_context_tokens(), Some(DEFAULT_OLLAMA_NUM_CTX));
     }
 
     #[tokio::test]
@@ -1460,7 +1466,9 @@ mod tests {
                 .body(r#"{"model_info":{"qwen2.context_length":32768}}"#);
         });
 
-        let client = OllamaClient::new(server.url(""), "llama3.2");
+        // Configure a num_ctx above both ceilings so the per-model clamp
+        // surfaces each model's distinct ceiling as the reported window.
+        let client = OllamaClient::new(server.url(""), "llama3.2").with_num_ctx(Some(1_000_000));
 
         // Warm both models — `warm_context_length` defaults to `self.model`,
         // and `warm_context_length_for` covers the override target.
@@ -1487,14 +1495,18 @@ mod tests {
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);
         });
 
-        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let client =
+            OllamaClient::new(server.url(""), "llama3.2").with_num_ctx(Some(DEFAULT_OLLAMA_NUM_CTX));
         let _ = client.warm_context_length().await;
 
-        // Override targets a model that hasn't been warmed: returns None
-        // (cache miss is the safe answer).
+        // Override targets a model whose ceiling hasn't been warmed: the
+        // ceiling is unknown so no clamp applies, and the connector reports its
+        // configured num_ctx unclamped (never None — #342). The safe answer is
+        // still bounded by the configured window, not the daemon's 200K
+        // fallback.
         let observed =
             with_model_override("never-warmed".into(), async { client.max_context_tokens() }).await;
-        assert_eq!(observed, None);
+        assert_eq!(observed, Some(DEFAULT_OLLAMA_NUM_CTX));
     }
 
     // --- Context-overflow detection (issue #59) --------------------------
@@ -1814,5 +1826,251 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "stream should abort promptly on cancellation; took {elapsed:?}"
         );
+    }
+
+    // --- num_ctx / effective context window (issue #342) -----------------
+
+    #[test]
+    fn max_context_tokens_reports_configured_default_not_none() {
+        // Issue #342, cause 1: Ollama must never report `None` (which falls
+        // through to the daemon's 200K universal fallback). With no warmup and
+        // no explicit num_ctx, it reports the connector's sane default — a real
+        // runtime window, well above Ollama's own 2048 default.
+        let client = OllamaClient::new("http://localhost:11434", "llama3.2");
+        assert_eq!(client.max_context_tokens(), Some(DEFAULT_OLLAMA_NUM_CTX));
+        assert!(
+            DEFAULT_OLLAMA_NUM_CTX > 2048,
+            "default num_ctx must exceed Ollama's 2048 default"
+        );
+    }
+
+    #[test]
+    fn max_context_tokens_reports_explicit_num_ctx() {
+        let client =
+            OllamaClient::new("http://localhost:11434", "llama3.2").with_num_ctx(Some(16_384));
+        assert_eq!(client.max_context_tokens(), Some(16_384));
+    }
+
+    #[tokio::test]
+    async fn effective_num_ctx_clamps_configured_to_ceiling() {
+        // A configured num_ctx larger than the model's architecture ceiling
+        // (from /api/show) is clamped down to the ceiling — Ollama would
+        // silently truncate above it.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show").body_includes("tiny");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":4096}}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "tiny").with_num_ctx(Some(32_768));
+        client.warm_context_length().await;
+        // min(32_768 configured, 4096 ceiling) == 4096.
+        assert_eq!(client.max_context_tokens(), Some(4_096));
+    }
+
+    #[tokio::test]
+    async fn effective_num_ctx_keeps_configured_below_ceiling() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show").body_includes("big");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":131072}}"#);
+        });
+
+        let client = OllamaClient::new(server.url(""), "big").with_num_ctx(Some(8_192));
+        client.warm_context_length().await;
+        // min(8_192 configured, 131_072 ceiling) == 8_192.
+        assert_eq!(client.max_context_tokens(), Some(8_192));
+    }
+
+    #[test]
+    fn effective_num_ctx_degrades_when_ceiling_unknown() {
+        // No /api/show warmup → ceiling unknown → use configured value
+        // unclamped rather than guessing or returning None.
+        let client =
+            OllamaClient::new("http://localhost:11434", "llama3.2").with_num_ctx(Some(24_000));
+        assert_eq!(client.max_context_tokens(), Some(24_000));
+    }
+
+    #[tokio::test]
+    async fn stream_completion_sends_num_ctx_in_options() {
+        // Issue #342, cause 2: the chat request must carry an explicit
+        // `num_ctx` in `options` so Ollama doesn't silently run at 2048.
+        let server = MockServer::start();
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let chat = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/chat")
+                .body_includes(r#""num_ctx":12345"#);
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2").with_num_ctx(Some(12_345));
+        client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect("dispatch must succeed");
+        chat.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn num_ctx_in_request_matches_reported_max_context_tokens() {
+        // The two must agree: the num_ctx sent on the wire equals what
+        // max_context_tokens() reports (after the ceiling clamp).
+        let server = MockServer::start();
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"clamped:latest"}]}"#);
+        });
+        let _show = server.mock(|when, then| {
+            when.method(POST).path("/api/show").body_includes("clamped");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":4096}}"#);
+        });
+        let chat = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/chat")
+                .body_includes(r#""num_ctx":4096"#);
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+
+        let client = OllamaClient::new(server.url(""), "clamped").with_num_ctx(Some(65_536));
+        client.warm_context_length().await;
+        let reported = client.max_context_tokens();
+        assert_eq!(reported, Some(4_096), "reported window is clamped to ceiling");
+
+        client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect("dispatch must succeed");
+        // The request carried num_ctx == reported max_context_tokens.
+        chat.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn purpose_override_drives_num_ctx_via_context_budget() {
+        // Issue #342: a `purposes.<kind>.max_context_tokens` override installed
+        // as the per-turn ContextBudget must be applied as the request num_ctx
+        // (clamped to ceiling), not just used for budget accounting.
+        use desktop_assistant_core::ports::llm::{
+            BudgetSource, ContextBudget, with_context_budget,
+        };
+
+        let server = MockServer::start();
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let _show = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/show")
+                .body_includes("llama3.2");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":131072}}"#);
+        });
+        let chat = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/chat")
+                .body_includes(r#""num_ctx":40000"#);
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+
+        // Connector default is small; the purpose override is larger and must win.
+        let client = OllamaClient::new(server.url(""), "llama3.2").with_num_ctx(Some(8_192));
+        client.warm_context_length().await;
+
+        let budget = ContextBudget {
+            max_input_tokens: 40_000,
+            source: BudgetSource::PurposeOverride,
+        };
+        with_context_budget(budget, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("dispatch must succeed");
+        })
+        .await;
+        chat.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn connector_table_budget_does_not_override_num_ctx() {
+        // A ContextBudget tagged ConnectorTable is the connector's OWN reported
+        // value echoed back by the daemon — it must NOT be re-read as an
+        // override (that would be circular). num_ctx stays the connector's
+        // effective value.
+        use desktop_assistant_core::ports::llm::{
+            BudgetSource, ContextBudget, with_context_budget,
+        };
+
+        let server = MockServer::start();
+        let _tags = server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        let chat = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/chat")
+                .body_includes(r#""num_ctx":8192"#);
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2").with_num_ctx(Some(8_192));
+        let budget = ContextBudget {
+            max_input_tokens: 999_999,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("dispatch must succeed");
+        })
+        .await;
+        chat.assert_calls(1);
     }
 }
