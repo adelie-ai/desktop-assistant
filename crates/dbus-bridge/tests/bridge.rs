@@ -464,6 +464,19 @@ async fn event_translator_marks_unhandled_variants_explicitly() {
             },
             "conversation_title_changed",
         ),
+        (
+            // Context-usage (issue #341) is a UDS/WS concern; the D-Bus
+            // client (voice) shows no context indicator, so it is a
+            // deliberate ignore here rather than a missed translation.
+            api::Event::ContextUsage {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                used_tokens: 12_000,
+                budget_tokens: 32_000,
+                compaction_active: false,
+            },
+            "context_usage",
+        ),
     ];
     for (event, expected_kind) in cases {
         match translate(event) {
