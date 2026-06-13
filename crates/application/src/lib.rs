@@ -1127,6 +1127,7 @@ where
                         .messages
                         .into_iter()
                         .map(|m| api::MessageView {
+                            id: m.id,
                             role: format!("{:?}", m.role).to_lowercase(),
                             content: m.content,
                         })

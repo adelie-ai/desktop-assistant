@@ -729,6 +729,12 @@ pub enum ConversationWarning {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageView {
+    /// Stable monotonic UUIDv7 message id (#1). Clients use it as the message's
+    /// identity (dedupe live vs snapshot), ordering key (it sorts by time), and
+    /// the high-water cursor for live subscription + back-paging. `serde(default)`
+    /// keeps older peers that don't send it deserializable.
+    #[serde(default)]
+    pub id: String,
     pub role: String,
     pub content: String,
 }

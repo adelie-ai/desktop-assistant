@@ -196,6 +196,50 @@ async fn append_one_message_inserts_exactly_one_row_and_keeps_ids() {
 }
 
 #[tokio::test]
+async fn message_ids_round_trip_through_get_and_are_ascending() {
+    // #1: the persisted UUIDv7 id must round-trip onto each domain `Message`
+    // via `get` (the new `msg_from_row` read path), be non-empty + distinct, and
+    // already be in ascending order — so a client can take `max(id)` as a
+    // high-water cursor for live subscription and back-paging.
+    with_fixture(
+        "message_ids_round_trip_through_get_and_are_ascending",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
+            let conv = conversation_with_messages("conv-ids", 5);
+            let created: Vec<String> = conv.messages.iter().map(|m| m.id.clone()).collect();
+
+            with_user_id(UserId::new("u1"), async {
+                store.create(conv.clone()).await.expect("create");
+                let loaded = store
+                    .get(&ConversationId::from("conv-ids"))
+                    .await
+                    .expect("get");
+                let loaded_ids: Vec<String> =
+                    loaded.messages.iter().map(|m| m.id.clone()).collect();
+                assert_eq!(
+                    loaded_ids, created,
+                    "each message's persisted id must round-trip through get"
+                );
+                assert!(
+                    loaded_ids.iter().all(|id| !id.is_empty()),
+                    "no empty ids: {loaded_ids:?}"
+                );
+                let mut sorted = loaded_ids.clone();
+                sorted.sort();
+                assert_eq!(
+                    sorted, loaded_ids,
+                    "monotonic v7 ids must come back in ascending order"
+                );
+            })
+            .await;
+
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn noop_update_keeps_all_ids() {
     with_fixture("noop_update_keeps_all_ids", |fx| async move {
         let store = PgConversationStore::new(fx.pool.clone());
