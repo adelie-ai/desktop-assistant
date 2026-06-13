@@ -340,6 +340,56 @@ pub trait ErrorClassificationStore: Send + Sync {
     async fn record(&self, connector: &str, signature: &str, cause: &str) -> Result<(), CoreError>;
 }
 
+/// A learned effective context-window observation (issue #343): the smallest
+/// provider-rejected window we have seen for a `(connector, model)` pair, paired
+/// with the configured window that was in force when we saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LearnedWindow {
+    /// The provider-reported `max_tokens` from an overflow error — a window we
+    /// observed reject a prompt, so the real ceiling is at most this.
+    pub observed_limit: u64,
+    /// The effective configured budget in force when the overflow happened.
+    /// Used for invalidation: a row whose `configured_window` differs from the
+    /// current effective budget is stale and must be ignored, so a config bump
+    /// starts fresh from the new ceiling rather than the old observation.
+    pub configured_window: u64,
+}
+
+/// Outbound port for the learned context-window cache (issue #343) — the
+/// reactive safety net that complements #342's proactive window provisioning.
+///
+/// Like [`ErrorClassificationStore`] this store is **global, not per-user**: it
+/// records how large a window a hosted model actually accepts (connector/model
+/// knowledge), not personal data, so it deliberately does not scope by
+/// `current_user_id()`.
+///
+/// The learned value is only ever applied as a `min()` CAP and only ratchets
+/// DOWN — raising a window is a deliberate config action (#342), never inferred.
+#[async_trait::async_trait]
+pub trait LearnedWindowStore: Send + Sync {
+    /// Return the learned observation for `(connector, model)`, or `Ok(None)` on
+    /// a miss. The caller is responsible for invalidation (comparing
+    /// `configured_window` against the current effective budget).
+    async fn lookup(
+        &self,
+        connector: &str,
+        model: &str,
+    ) -> Result<Option<LearnedWindow>, CoreError>;
+
+    /// Record an observed overflow ceiling for `(connector, model)` under the
+    /// given `configured_window`. Implementations enforce the down-only ratchet:
+    /// when an existing row shares the same `configured_window`, only a SMALLER
+    /// `observed_limit` overwrites it; a new (higher or equal) configured window
+    /// replaces the row entirely (a deliberate window change starts fresh).
+    async fn record(
+        &self,
+        connector: &str,
+        model: &str,
+        observed_limit: u64,
+        configured_window: u64,
+    ) -> Result<(), CoreError>;
+}
+
 /// Outbound port for persisting conversations.
 pub trait ConversationStore: Send + Sync {
     fn create(

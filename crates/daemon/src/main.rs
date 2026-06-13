@@ -1466,9 +1466,17 @@ async fn main() -> Result<()> {
                 Arc::clone(&registry_handle),
                 purposes::PurposeKind::Titling,
             ));
+        // #343: the learned context-window cache (DOWN-only safety net). Shares
+        // the same pool; absent without a database (window learning off, tier-1
+        // classification still works).
+        let window_store: Arc<dyn desktop_assistant_core::ports::store::LearnedWindowStore> =
+            Arc::new(desktop_assistant_storage::PgLearnedWindowStore::new(
+                pool.clone(),
+            ));
         classifying_llm::install_classification_deps(classifying_llm::ClassificationDeps {
             store,
             classifier: Some(classifier),
+            window_store: Some(window_store),
         });
     }
 
@@ -1556,12 +1564,22 @@ async fn main() -> Result<()> {
     // can call `send_prompt_with_override` and have the override/stored-
     // selection priority path applied.
     let inner_conv = Arc::new(handler);
-    let routing_conv = Arc::new(api_surface::RoutingConversationHandler::new(
+    // #343: the learned context-window cache also feeds budget resolution
+    // (caps DOWN to an observed-overflow ceiling). Same pool as the classifier
+    // side; absent without a database (safety net off, resolution unchanged).
+    let mut routing_conv = api_surface::RoutingConversationHandler::new(
         Arc::clone(&inner_conv),
         Arc::new(conversation_store),
         Arc::clone(&registry_handle),
-    ));
-    let conversation_service = routing_conv;
+    );
+    if let Some(pool) = &pg_pool {
+        let window_store: Arc<dyn desktop_assistant_core::ports::store::LearnedWindowStore> =
+            Arc::new(desktop_assistant_storage::PgLearnedWindowStore::new(
+                pool.clone(),
+            ));
+        routing_conv = routing_conv.with_window_store(window_store);
+    }
+    let conversation_service = Arc::new(routing_conv);
 
     let connections_service = Arc::new(api_surface::DaemonConnectionsService::new(Arc::clone(
         &registry_handle,

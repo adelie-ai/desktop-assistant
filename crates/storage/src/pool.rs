@@ -195,5 +195,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // #343: learned effective context-window observations — the reactive
+    // safety net that `min()`s an observed-overflow ceiling into budget
+    // resolution (down-only), complementing #342's proactive provisioning.
+    sqlx::raw_sql(include_str!(
+        "../migrations/025_context_window_observations.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

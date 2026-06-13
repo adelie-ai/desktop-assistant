@@ -42,6 +42,7 @@ use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
     with_model_override, with_personality, with_reasoning_config, with_system_refinement,
 };
+use desktop_assistant_core::ports::store::LearnedWindowStore;
 use desktop_assistant_core::prompts::{Personality, PersonalityOverride};
 
 use crate::config::{
@@ -616,6 +617,11 @@ where
     inner: Arc<Inner>,
     selection_store: Arc<S>,
     registry: Arc<RegistryHandle>,
+    /// Learned context-window cache (issue #343). When present, an
+    /// observed-overflow ceiling for the resolved `(connector, model)` caps the
+    /// per-turn budget DOWN (see [`crate::config::apply_learned_cap`]). `None`
+    /// (tests, no database) disables the safety net; resolution is unchanged.
+    window_store: Option<Arc<dyn LearnedWindowStore>>,
 }
 
 impl<S, Inner> RoutingConversationHandler<S, Inner>
@@ -628,7 +634,15 @@ where
             inner,
             selection_store,
             registry,
+            window_store: None,
         }
+    }
+
+    /// Install the learned context-window cache (issue #343) so budget
+    /// resolution applies the DOWN-only observed-overflow cap.
+    pub fn with_window_store(mut self, window_store: Arc<dyn LearnedWindowStore>) -> Self {
+        self.window_store = Some(window_store);
+        self
     }
 
     /// Resolve the interactive purpose from the current config. Used as
@@ -1073,6 +1087,32 @@ where
             None
         };
         let budget = crate::config::resolve_context_budget(purpose_override, connector_max);
+
+        // Issue #343: cap the resolved budget DOWN to a previously-observed
+        // overflow ceiling for this `(connector, model)`, if one was learned
+        // under the *same* effective configured window. `apply_learned_cap`
+        // enforces the down-only, invalidation, and sanity-floor rules; a miss
+        // or a stale/raising/pathological value leaves the budget untouched.
+        // The key MUST match the persist side in `ClassifyingLlmClient`:
+        // connector *type* string + the resolved model id.
+        let budget = if let (Some(store), Some(sel)) =
+            (self.window_store.as_ref(), effective_selection.as_ref())
+        {
+            let connector = ConnectionId::new(sel.connection_id.clone())
+                .ok()
+                .map(|id| self.registry.connector_type_for(&id).unwrap_or_default())
+                .unwrap_or_default();
+            match store.lookup(&connector, &sel.model_id).await {
+                Ok(learned) => crate::config::apply_learned_cap(budget, learned),
+                Err(e) => {
+                    tracing::warn!(error = %e, "learned-window lookup failed; using resolved budget");
+                    budget
+                }
+            }
+        } else {
+            budget
+        };
+
         tracing::info!(
             purpose = ?PurposeKind::Interactive,
             connection = ?effective_selection.as_ref().map(|s| s.connection_id.as_str()),
@@ -1998,6 +2038,11 @@ api_key_env = "{unused}"
             /// resolved the conversation override against the global config and
             /// installed the effective personality on the dispatch scope.
             captured_personality: StdMutex<Vec<Personality>>,
+            /// Snapshot of the `CONTEXT_BUDGET` task-local (#343) at each
+            /// `send_prompt` — proves the resolved (and possibly learned-capped)
+            /// budget reaches the dispatch scope.
+            captured_budget:
+                StdMutex<Vec<Option<desktop_assistant_core::ports::llm::ContextBudget>>>,
         }
 
         impl CapturingInner {
@@ -2007,6 +2052,7 @@ api_key_env = "{unused}"
                     captured_active_client_set: StdMutex::new(Vec::new()),
                     captured_model_override: StdMutex::new(Vec::new()),
                     captured_personality: StdMutex::new(Vec::new()),
+                    captured_budget: StdMutex::new(Vec::new()),
                 }
             }
         }
@@ -2068,6 +2114,8 @@ api_key_env = "{unused}"
                 self.captured_model_override.lock().unwrap().push(model);
                 let personality = desktop_assistant_core::ports::llm::current_personality();
                 self.captured_personality.lock().unwrap().push(personality);
+                let budget = desktop_assistant_core::ports::llm::current_context_budget();
+                self.captured_budget.lock().unwrap().push(budget);
                 Ok("ok".to_string())
             }
         }
@@ -2144,6 +2192,132 @@ api_key_env = "{unused}"
             assert_eq!(
                 captured[0], global,
                 "no override → the global personality must be installed verbatim"
+            );
+        }
+
+        // ─── Issue #343: learned context-window cap at dispatch ───────────
+
+        /// Window-store double returning a fixed learned observation.
+        struct FixedWindowStore(Option<desktop_assistant_core::ports::store::LearnedWindow>);
+        #[async_trait::async_trait]
+        impl LearnedWindowStore for FixedWindowStore {
+            async fn lookup(
+                &self,
+                _connector: &str,
+                _model: &str,
+            ) -> Result<Option<desktop_assistant_core::ports::store::LearnedWindow>, CoreError>
+            {
+                Ok(self.0)
+            }
+            async fn record(
+                &self,
+                _connector: &str,
+                _model: &str,
+                _observed_limit: u64,
+                _configured_window: u64,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+
+        /// End-to-end (issue #343): a turn-1 overflow learned a 4096 ceiling
+        /// under the same configured window the resolver produces (8192, the
+        /// Ollama effective num_ctx). On the NEXT turn budget resolution caps
+        /// DOWN to 4096, so the dispatch scope sees the smaller budget — the
+        /// turn no longer assumes the too-large window that overflowed.
+        #[tokio::test]
+        async fn learned_window_caps_budget_down_on_next_turn() {
+            let cfg = local_ollama_cfg();
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            // Resolver yields 8192 for this dead-ollama connection (the
+            // configured effective num_ctx). The learned row matches that
+            // configured window and observed 4096, so it must cap DOWN.
+            let window = Arc::new(FixedWindowStore(Some(
+                desktop_assistant_core::ports::store::LearnedWindow {
+                    observed_limit: 4_096,
+                    configured_window: 8_192,
+                },
+            )));
+            let routing = Arc::new(
+                RoutingConversationHandler::new(
+                    Arc::clone(&inner),
+                    Arc::clone(&store),
+                    Arc::clone(&registry),
+                )
+                .with_window_store(window),
+            );
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("send_prompt");
+
+            let captured = inner.captured_budget.lock().unwrap();
+            let budget = captured[0].expect("budget installed");
+            assert_eq!(
+                budget.max_input_tokens, 4_096,
+                "next turn must start under the learned ceiling, not the 8192 window that overflowed"
+            );
+            assert_eq!(
+                budget.source,
+                desktop_assistant_core::ports::llm::BudgetSource::LearnedCap
+            );
+        }
+
+        /// Invalidation end-to-end: a learned observation recorded under a
+        /// DIFFERENT configured window than the resolver now produces is stale
+        /// and must NOT cap — the budget reflects the fresh resolved window.
+        #[tokio::test]
+        async fn stale_learned_window_does_not_cap_budget() {
+            let cfg = local_ollama_cfg();
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            // Observed 4096, but under an OLD 2048 configured window — the
+            // resolver now produces 8192, so this row is stale and ignored.
+            let window = Arc::new(FixedWindowStore(Some(
+                desktop_assistant_core::ports::store::LearnedWindow {
+                    observed_limit: 4_096,
+                    configured_window: 2_048,
+                },
+            )));
+            let routing = Arc::new(
+                RoutingConversationHandler::new(
+                    Arc::clone(&inner),
+                    Arc::clone(&store),
+                    Arc::clone(&registry),
+                )
+                .with_window_store(window),
+            );
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("send_prompt");
+
+            let captured = inner.captured_budget.lock().unwrap();
+            let budget = captured[0].expect("budget installed");
+            assert_eq!(
+                budget.max_input_tokens, 8_192,
+                "a learned row under a different configured window is stale and must not cap"
+            );
+            assert_ne!(
+                budget.source,
+                desktop_assistant_core::ports::llm::BudgetSource::LearnedCap
             );
         }
 

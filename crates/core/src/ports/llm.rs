@@ -267,6 +267,11 @@ pub enum BudgetSource {
     /// Conservative universal fallback used when neither the purpose
     /// nor the connector supplied a value.
     UniversalFallback,
+    /// A learned observed-overflow window (issue #343) capped the budget
+    /// DOWN below the value the tiers above resolved. Only set when the
+    /// learned cap actually applied; identifies a budget driven by the
+    /// adaptive safety net rather than config/connector.
+    LearnedCap,
 }
 
 /// Run `fut` with `budget` installed as the resolved per-turn context

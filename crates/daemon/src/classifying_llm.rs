@@ -36,10 +36,10 @@ use desktop_assistant_core::error_classify::{
     ErrorContext, NormalizedCause, cause_to_core_error, classify_builtin,
 };
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig,
-    is_classification_in_progress, with_classification_in_progress,
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig, current_context_budget,
+    current_model_override, is_classification_in_progress, with_classification_in_progress,
 };
-use desktop_assistant_core::ports::store::ErrorClassificationStore;
+use desktop_assistant_core::ports::store::{ErrorClassificationStore, LearnedWindowStore};
 use desktop_assistant_core::sanitize::redact_secrets;
 
 /// Per-process dependencies for the learned (tier 2) and LLM (tier 3) tiers.
@@ -52,6 +52,12 @@ pub struct ClassificationDeps {
     /// Cheap LLM used to classify genuinely novel errors (tier 3). `None`
     /// disables tier 3 (tier 2 still runs).
     pub classifier: Option<Arc<dyn LlmClient>>,
+    /// Learned context-window cache (issue #343). When a context-overflow
+    /// error carries a parsed `max_tokens`, the observed ceiling is persisted
+    /// here per `(connector, model)` so the next turn's budget resolution can
+    /// cap DOWN to it. `None` disables window learning (classification still
+    /// works).
+    pub window_store: Option<Arc<dyn LearnedWindowStore>>,
 }
 
 static CLASSIFICATION_DEPS: OnceLock<ClassificationDeps> = OnceLock::new();
@@ -112,7 +118,10 @@ impl<L> ClassifyingLlmClient<L> {
     async fn reclassify(
         &self,
         result: Result<LlmResponse, CoreError>,
-    ) -> Result<LlmResponse, CoreError> {
+    ) -> Result<LlmResponse, CoreError>
+    where
+        L: LlmClient,
+    {
         self.reclassify_with(result, CLASSIFICATION_DEPS.get())
             .await
     }
@@ -124,7 +133,10 @@ impl<L> ClassifyingLlmClient<L> {
         &self,
         result: Result<LlmResponse, CoreError>,
         deps: Option<&ClassificationDeps>,
-    ) -> Result<LlmResponse, CoreError> {
+    ) -> Result<LlmResponse, CoreError>
+    where
+        L: LlmClient,
+    {
         let detail = match result {
             Err(CoreError::Llm(detail)) => detail,
             other => return other,
@@ -133,6 +145,11 @@ impl<L> ClassifyingLlmClient<L> {
         // Tier 1: deterministic, pure — always safe.
         let cause = classify_builtin(&self.ctx(&detail));
         if !matches!(cause, NormalizedCause::Unknown) {
+            // Issue #343: when this is a context overflow that surfaced a real
+            // provider-reported ceiling, persist it as a DOWN-ONLY learned cap
+            // for the next turn. Best-effort and side-channel — never blocks or
+            // changes the error that flows on to the recovery ladder.
+            self.learn_window(&cause, deps).await;
             return self.apply(cause, detail);
         }
 
@@ -178,6 +195,65 @@ impl<L> ClassifyingLlmClient<L> {
         }
 
         Err(CoreError::Llm(detail))
+    }
+
+    /// Issue #343: persist an observed context-overflow ceiling as a DOWN-ONLY
+    /// learned cap keyed by `(connector, model)`, tagged with the effective
+    /// configured window that was in force this turn (for invalidation).
+    ///
+    /// Best-effort and defensive:
+    /// - only fires for `ContextOverflow { max_tokens: Some(n) }` — no parsed
+    ///   ceiling means nothing to learn (`max_tokens: None` persists nothing);
+    /// - skipped while a classification is in progress, so the tier-3
+    ///   classifier's own overflow can't be mislearned (and its model/budget
+    ///   task-locals would be wrong);
+    /// - requires both a window store and a live `current_context_budget()` —
+    ///   without the in-flight budget we have nothing to key invalidation on;
+    /// - the persisted value is the raw provider ceiling; the sanity-floor and
+    ///   down-only/invalidation rules are enforced at apply time
+    ///   (`apply_learned_cap`) and in the store's ratchet, so a garbage parse
+    ///   can never pin the budget even if it is written.
+    async fn learn_window(&self, cause: &NormalizedCause, deps: Option<&ClassificationDeps>)
+    where
+        L: LlmClient,
+    {
+        let NormalizedCause::ContextOverflow {
+            max_tokens: Some(observed),
+            ..
+        } = cause
+        else {
+            return;
+        };
+        if is_classification_in_progress() {
+            return;
+        }
+        let Some(store) = deps.and_then(|d| d.window_store.as_deref()) else {
+            return;
+        };
+        // The effective configured window in force for this turn — the key for
+        // invalidation. Without it we can't tell a future config bump from the
+        // stale observation, so we decline to learn.
+        let Some(budget) = current_context_budget() else {
+            return;
+        };
+        let model = current_model_override()
+            .or_else(|| self.inner.get_default_model().map(str::to_string))
+            .unwrap_or_default();
+
+        if let Err(e) = store
+            .record(&self.connector, &model, *observed, budget.max_input_tokens)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to persist learned context window");
+        } else {
+            tracing::info!(
+                connector = %self.connector,
+                model = %model,
+                observed_limit = *observed,
+                configured_window = budget.max_input_tokens,
+                "learned observed context-window ceiling (#343)"
+            );
+        }
     }
 
     /// Tier 3: ask the cheap classifier LLM to label this error. Best-effort:
@@ -592,6 +668,7 @@ mod tests {
                 cause: "billing_fatal".into(),
             }))),
             classifier: None,
+            window_store: None,
         };
         let c = wrapped(Behavior::Ok);
         let err = c
@@ -618,6 +695,7 @@ mod tests {
         let deps = ClassificationDeps {
             store: store.clone(),
             classifier: Some(classifier.clone()),
+            window_store: None,
         };
         let c = wrapped(Behavior::Ok);
         let err = c
@@ -655,6 +733,7 @@ mod tests {
         let deps = ClassificationDeps {
             store: store.clone(),
             classifier: Some(classifier.clone()),
+            window_store: None,
         };
         let c = wrapped(Behavior::Ok);
         let err = c
@@ -675,6 +754,7 @@ mod tests {
         let deps = ClassificationDeps {
             store: store.clone(),
             classifier: Some(classifier.clone()),
+            window_store: None,
         };
         let c = wrapped(Behavior::Ok);
         let err = c
@@ -703,6 +783,7 @@ mod tests {
         let deps = ClassificationDeps {
             store: store.clone(),
             classifier: Some(classifier.clone()),
+            window_store: None,
         };
         let c = wrapped(Behavior::Ok);
         let err = with_classification_in_progress(
@@ -713,5 +794,202 @@ mod tests {
         assert!(matches!(err, CoreError::Llm(_)), "got {err:?}");
         assert_eq!(classifier.calls(), 0, "tier 3 must be skipped");
         assert!(store.recorded().is_empty());
+    }
+
+    // --- Window learning (issue #343) ----------------------------------------
+
+    use desktop_assistant_core::ports::llm::{
+        BudgetSource, ContextBudget, with_context_budget, with_model_override,
+    };
+    use desktop_assistant_core::ports::store::LearnedWindow;
+
+    /// Learned-window store double: records every `record()` call.
+    struct MockWindowStore {
+        recorded: Mutex<Vec<(String, String, u64, u64)>>,
+    }
+    impl MockWindowStore {
+        fn new() -> Self {
+            Self {
+                recorded: Mutex::new(vec![]),
+            }
+        }
+        fn recorded(&self) -> Vec<(String, String, u64, u64)> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl LearnedWindowStore for MockWindowStore {
+        async fn lookup(
+            &self,
+            _connector: &str,
+            _model: &str,
+        ) -> Result<Option<LearnedWindow>, CoreError> {
+            Ok(None)
+        }
+        async fn record(
+            &self,
+            connector: &str,
+            model: &str,
+            observed_limit: u64,
+            configured_window: u64,
+        ) -> Result<(), CoreError> {
+            self.recorded.lock().unwrap().push((
+                connector.into(),
+                model.into(),
+                observed_limit,
+                configured_window,
+            ));
+            Ok(())
+        }
+    }
+
+    fn budget(max: u64) -> ContextBudget {
+        ContextBudget {
+            max_input_tokens: max,
+            source: BudgetSource::ConnectorTable,
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_with_max_tokens_persists_observed_window() {
+        // A `ContextOverflow { max_tokens: Some(n) }` persists `n` for the
+        // in-flight `(connector, model)`, keyed by the effective configured
+        // window in force this turn.
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: None,
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let _ = with_context_budget(
+            budget(8_192),
+            with_model_override("qwen2.5".to_string(), async {
+                c.reclassify_with(
+                    Err(CoreError::Llm(
+                        "Input length (479258) exceeds maximum context length (4096).".into(),
+                    )),
+                    Some(&deps),
+                )
+                .await
+            }),
+        )
+        .await;
+        assert_eq!(
+            window.recorded(),
+            vec![("bedrock".into(), "qwen2.5".into(), 4_096, 8_192)],
+            "observed ceiling + configured window must be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_without_max_tokens_persists_nothing() {
+        // No parsed ceiling → nothing to learn. (The overflow phrasing here
+        // carries no two numbers, so `max_tokens` is `None`.)
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: None,
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let err = with_context_budget(
+            budget(8_192),
+            with_model_override("qwen2.5".to_string(), async {
+                c.reclassify_with(
+                    Err(CoreError::Llm("prompt is too long".into())),
+                    Some(&deps),
+                )
+                .await
+            }),
+        )
+        .await
+        .expect_err("must be an error");
+        assert!(
+            matches!(err, CoreError::ContextOverflow { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            window.recorded().is_empty(),
+            "max_tokens=None must persist nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_not_learned_without_a_budget_in_flight() {
+        // Without `current_context_budget()` there is nothing to key
+        // invalidation on, so we decline to learn rather than store a bogus
+        // configured_window.
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: None,
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        // No `with_context_budget` wrapper.
+        let _ = with_model_override("qwen2.5".to_string(), async {
+            c.reclassify_with(
+                Err(CoreError::Llm(
+                    "Input length (479258) exceeds maximum context length (4096).".into(),
+                )),
+                Some(&deps),
+            )
+            .await
+        })
+        .await;
+        assert!(window.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_overflow_error_does_not_learn_window() {
+        // A rate-limit (or any non-overflow) cause never touches the window
+        // store.
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: None,
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let _ = with_context_budget(
+            budget(8_192),
+            with_model_override("qwen2.5".to_string(), async {
+                c.reclassify_with(
+                    Err(CoreError::Llm("rate limit exceeded, slow down".into())),
+                    Some(&deps),
+                )
+                .await
+            }),
+        )
+        .await;
+        assert!(window.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn window_not_learned_while_classification_in_progress() {
+        // The tier-3 classifier's OWN overflow must not be mislearned (and its
+        // model/budget task-locals would be wrong).
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: None,
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let _ = with_context_budget(
+            budget(8_192),
+            with_model_override(
+                "qwen2.5".to_string(),
+                with_classification_in_progress(c.reclassify_with(
+                    Err(CoreError::Llm(
+                        "Input length (479258) exceeds maximum context length (4096).".into(),
+                    )),
+                    Some(&deps),
+                )),
+            ),
+        )
+        .await;
+        assert!(window.recorded().is_empty());
     }
 }
