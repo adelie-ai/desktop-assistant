@@ -1362,8 +1362,7 @@ async fn main() -> Result<()> {
     // preceded by a cold (CPU-bound, possibly minutes-long) model load. Only
     // the interactive model is kept warm; background purposes are left to
     // unload when idle. No-op for non-Ollama interactive connections.
-    let (keep_warm_shutdown_tx, mut keep_warm_shutdown_rx) =
-        tokio::sync::oneshot::channel::<()>();
+    let (keep_warm_shutdown_tx, mut keep_warm_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let keep_warm_task = {
         let resolved_interactive = api_surface::resolve_purpose_dispatch(
             daemon_config.as_ref(),
@@ -1385,10 +1384,8 @@ async fn main() -> Result<()> {
                     "ollama keep-warm enabled for interactive model"
                 );
                 Some(tokio::spawn(async move {
-                    let client = desktop_assistant_llm_ollama::OllamaClient::new(
-                        base_url,
-                        model.clone(),
-                    );
+                    let client =
+                        desktop_assistant_llm_ollama::OllamaClient::new(base_url, model.clone());
                     loop {
                         client.warm_model(&model).await;
                         tokio::select! {
