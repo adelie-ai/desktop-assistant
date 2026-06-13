@@ -1669,7 +1669,9 @@ mod tests {
     async fn max_context_tokens_hard_cap_clamps_below_window() {
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(POST).path("/api/show").body_includes("llama3.2");
+            when.method(POST)
+                .path("/api/show")
+                .body_includes("llama3.2");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);

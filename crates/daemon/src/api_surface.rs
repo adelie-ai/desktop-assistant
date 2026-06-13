@@ -609,6 +609,42 @@ pub trait ConversationSelectionStore: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
+/// The complete per-turn LLM dispatch decision, resolved ONCE at the turn
+/// boundary from the live config + the conversation's effective selection.
+///
+/// The point is a single source of truth: the context budget and the model that
+/// actually runs are derived from the *same* resolution, so they cannot drift.
+/// Historically they could: the budget read the live interactive purpose while
+/// dispatch fell through to a construction-time *static primary* client, so a
+/// stale primary could execute a different model than the budget was computed
+/// for (logs reporting model A while model B ran). Resolving everything here,
+/// once, closes that class of bug.
+///
+/// Populated incrementally (by design): today it carries the routing target,
+/// the model override, the reasoning config, and the context budget. Other
+/// per-turn decisions (e.g. personality) can move onto it in follow-ups so every
+/// derived value shares this one resolution.
+struct ResolvedTurn {
+    /// The registry client this turn dispatches through. `None` means no
+    /// concrete *live* connection was resolved — the interactive purpose defers
+    /// to the `[llm]` primary (`connection`/`model = primary`), or its named
+    /// connection isn't live — so dispatch falls through to the handler's static
+    /// primary llm, exactly as before (#33).
+    active_client: Option<Arc<dyn desktop_assistant_core::ports::llm::LlmClient>>,
+    /// Model id pinned via the `MODEL_OVERRIDE` task-local. `Some` exactly when
+    /// `active_client` is `Some` — the per-call knob that lets a single
+    /// connection client run a chosen model without a construction-time rebuild.
+    model_override: Option<String>,
+    /// Per-connector reasoning/effort config for this turn.
+    reasoning: ReasoningConfig,
+    /// Context budget computed for the model that will actually run.
+    budget: desktop_assistant_core::ports::llm::ContextBudget,
+    /// `(connection_id, model_id)` actually chosen — what to log, so the budget
+    /// line reports what runs rather than a separately-derived guess. `None`
+    /// when deferring to the static primary.
+    chosen: Option<(String, String)>,
+}
+
 pub struct RoutingConversationHandler<S, Inner>
 where
     S: ConversationSelectionStore + 'static,
@@ -713,6 +749,110 @@ where
         effort: Option<Effort>,
     ) -> ReasoningConfig {
         map_effort_to_reasoning_config(connector_type, model_id, effort)
+    }
+
+    /// Resolve the whole per-turn dispatch decision once (see [`ResolvedTurn`]).
+    ///
+    /// `effective` is the turn's effective selection — a user-driven
+    /// override/stored pick, else the interactive purpose. `user_driven` is
+    /// `Some` only when the user actually chose a model this turn; it changes the
+    /// not-live policy: a user-driven pick on a dead connection is a hard error
+    /// (never silently route elsewhere), whereas the interactive-purpose fallback
+    /// degrades to the static primary so a misconfigured purpose can't block a
+    /// turn.
+    ///
+    /// Routing target, model override, reasoning, and budget are all derived
+    /// from `effective` here, so the model the budget is computed for is exactly
+    /// the model dispatched. When `effective` names a concrete, live connection
+    /// we route through its registry client and pin the model per-call via the
+    /// `MODEL_OVERRIDE` task-local — this covers both a user-driven selection and
+    /// the interactive fallback, replacing the old behaviour where the fallback
+    /// fell through to a construction-time static primary (which could be stale).
+    async fn resolve_turn(
+        &self,
+        user_driven: Option<&ConversationModelSelection>,
+        effective: Option<&ConversationModelSelection>,
+    ) -> Result<ResolvedTurn, CoreError> {
+        let mut active_client = None;
+        let mut model_override = None;
+        let mut reasoning = ReasoningConfig::default();
+        let mut chosen = None;
+
+        if let Some(sel) = effective {
+            let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
+                CoreError::Llm(format!(
+                    "resolved selection has malformed connection id {:?}: {e}",
+                    sel.connection_id
+                ))
+            })?;
+            let connector_type = self.registry.connector_type_for(&id).unwrap_or_default();
+            reasoning = Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort);
+
+            match self.registry.client_for(&id) {
+                Some(client) => {
+                    // Concrete, live connection: route through the registry
+                    // client and pin the model per-call. Dispatch now follows the
+                    // SAME live resolution the budget does — for a user-driven
+                    // selection AND the interactive fallback — instead of a
+                    // construction-time static primary that could be stale.
+                    active_client = Some(client);
+                    model_override = Some(sel.model_id.clone());
+                    chosen = Some((sel.connection_id.clone(), sel.model_id.clone()));
+                }
+                None if user_driven.is_some() => {
+                    // The user explicitly picked this connection — fail loudly
+                    // rather than silently routing somewhere else.
+                    return Err(CoreError::Llm(format!(
+                        "resolved connection {} is not live; requested model {} cannot be dispatched",
+                        sel.connection_id, sel.model_id
+                    )));
+                }
+                None => {
+                    // Interactive-purpose fallback to a non-live connection:
+                    // degrade to the static primary (active_client stays None)
+                    // instead of failing the turn (#33's spirit).
+                    tracing::warn!(
+                        connection = %sel.connection_id,
+                        model = %sel.model_id,
+                        "interactive purpose connection is not live; falling through to the primary llm"
+                    );
+                }
+            }
+        }
+
+        // Context budget for the model that will ACTUALLY run. Tier 1: the
+        // interactive purpose's `max_context_tokens` override. Tier 2: the
+        // resolved client's curated window — the same client chosen above, so
+        // budget and dispatch agree. Tier 3: the universal fallback. Then cap
+        // DOWN to any learned overflow ceiling (#343). When `active_client` is
+        // None (static-primary passthrough) tier 2 is unavailable and we fall to
+        // the universal default, exactly as before.
+        let purpose_override = crate::config::purpose_max_context_override(
+            Some(&self.registry.snapshot_config()),
+            PurposeKind::Interactive,
+        );
+        let connector_max = active_client.as_ref().and_then(|c| c.max_context_tokens());
+        let mut budget = crate::config::resolve_context_budget(purpose_override, connector_max);
+        if let (Some(store), Some(sel)) = (self.window_store.as_ref(), effective) {
+            let connector = ConnectionId::new(sel.connection_id.clone())
+                .ok()
+                .map(|id| self.registry.connector_type_for(&id).unwrap_or_default())
+                .unwrap_or_default();
+            match store.lookup(&connector, &sel.model_id).await {
+                Ok(learned) => budget = crate::config::apply_learned_cap(budget, learned),
+                Err(e) => {
+                    tracing::warn!(error = %e, "learned-window lookup failed; using resolved budget")
+                }
+            }
+        }
+
+        Ok(ResolvedTurn {
+            active_client,
+            model_override,
+            reasoning,
+            budget,
+            chosen,
+        })
     }
 }
 
@@ -1004,119 +1144,24 @@ where
             .clone()
             .or_else(|| self.interactive_selection());
 
-        // Resolve the per-turn routing target:
-        //   - `active_client`: the `Arc<dyn LlmClient>` dispatch must use
-        //     for this turn. Only installed for *user-driven* selections;
-        //     for the interactive-purpose fallback we leave it `None` so
-        //     `RoutingLlmClient` falls through to the primary llm (which
-        //     was built with the interactive purpose's model).
-        //   - `model_override`: the resolved `model_id` to inject into the
-        //     connector's request body via the `MODEL_OVERRIDE` task-local.
-        //     Set whenever we install an `active_client` so
-        //     dispatch is deterministic — even if the user picked the
-        //     connector's default model, we still pin it explicitly rather
-        //     than relying on `self.model`. For the interactive-purpose
-        //     fallback we leave it unset so the primary llm's baked-in
-        //     model takes effect (same rationale as `active_client`).
-        //   - `reasoning`: the `ReasoningConfig` populated from the
-        //     per-connector effort mapping. Computed from
-        //     `effective_selection` so the interactive purpose's `effort`
-        //     applies even when we don't install an active_client.
-        let mut active_client: Option<
-            std::sync::Arc<dyn desktop_assistant_core::ports::llm::LlmClient>,
-        > = None;
-        let mut model_override: Option<String> = None;
-        if let Some(sel) = user_driven_selection.as_ref() {
-            let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
-                CoreError::Llm(format!(
-                    "resolved selection has malformed connection id {:?}: {e}",
-                    sel.connection_id
-                ))
-            })?;
-            // Reject Unavailable (or undeclared) connections with a
-            // clean 400-style error rather than silently falling back.
-            match self.registry.client_for(&id) {
-                Some(client) => {
-                    active_client = Some(client);
-                    model_override = Some(sel.model_id.clone());
-                }
-                None => {
-                    return Err(CoreError::Llm(format!(
-                        "resolved connection {} is not live; requested model {} cannot be dispatched",
-                        sel.connection_id, sel.model_id
-                    )));
-                }
-            }
-        }
-
-        let mut reasoning = ReasoningConfig::default();
-        if let Some(sel) = effective_selection.as_ref() {
-            let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
-                CoreError::Llm(format!(
-                    "resolved selection has malformed connection id {:?}: {e}",
-                    sel.connection_id
-                ))
-            })?;
-            let connector_type = self.registry.connector_type_for(&id).unwrap_or_default();
-            reasoning = Self::apply_effort_mapping(&connector_type, &sel.model_id, sel.effort);
-        }
-
-        // Resolve the per-turn context budget once at dispatch entry.
-        // Tier 1 is the user's `purposes.interactive.max_context_tokens`;
-        // tier 2 is the connector's curated table for the configured
-        // (or active) client; tier 3 is the universal 200K fallback.
-        // Resolving once here freezes the value for the whole
-        // `send_prompt` call so the dispatch loop's token-pressure check
-        // doesn't re-query the LLM trait on every iteration.
-        let purpose_override = crate::config::purpose_max_context_override(
-            Some(&self.registry.snapshot_config()),
-            PurposeKind::Interactive,
-        );
-        // Tier 2 input: ask the client that will actually run this turn
-        // for its curated value. For user-driven selections that's
-        // `active_client`; for the interactive-purpose fallback we look up
-        // the same client the inner handler would route through.
-        let connector_max: Option<u64> = if let Some(client) = active_client.as_ref() {
-            client.max_context_tokens()
-        } else if let Some(sel) = effective_selection.as_ref() {
-            ConnectionId::new(sel.connection_id.clone())
-                .ok()
-                .and_then(|id| self.registry.client_for(&id))
-                .and_then(|c| c.max_context_tokens())
-        } else {
-            None
-        };
-        let budget = crate::config::resolve_context_budget(purpose_override, connector_max);
-
-        // Issue #343: cap the resolved budget DOWN to a previously-observed
-        // overflow ceiling for this `(connector, model)`, if one was learned
-        // under the *same* effective configured window. `apply_learned_cap`
-        // enforces the down-only, invalidation, and sanity-floor rules; a miss
-        // or a stale/raising/pathological value leaves the budget untouched.
-        // The key MUST match the persist side in `ClassifyingLlmClient`:
-        // connector *type* string + the resolved model id.
-        let budget = if let (Some(store), Some(sel)) =
-            (self.window_store.as_ref(), effective_selection.as_ref())
-        {
-            let connector = ConnectionId::new(sel.connection_id.clone())
-                .ok()
-                .map(|id| self.registry.connector_type_for(&id).unwrap_or_default())
-                .unwrap_or_default();
-            match store.lookup(&connector, &sel.model_id).await {
-                Ok(learned) => crate::config::apply_learned_cap(budget, learned),
-                Err(e) => {
-                    tracing::warn!(error = %e, "learned-window lookup failed; using resolved budget");
-                    budget
-                }
-            }
-        } else {
-            budget
-        };
+        // Resolve the whole per-turn dispatch decision ONCE (routing target,
+        // model override, reasoning, context budget) from the effective
+        // selection, so the model the budget is computed for is exactly the
+        // model dispatched. See [`ResolvedTurn`] for why this is one resolution.
+        let ResolvedTurn {
+            active_client,
+            model_override,
+            reasoning,
+            budget,
+            chosen,
+        } = self
+            .resolve_turn(user_driven_selection.as_ref(), effective_selection.as_ref())
+            .await?;
 
         tracing::info!(
             purpose = ?PurposeKind::Interactive,
-            connection = ?effective_selection.as_ref().map(|s| s.connection_id.as_str()),
-            model = ?effective_selection.as_ref().map(|s| s.model_id.as_str()),
+            connection = ?chosen.as_ref().map(|(c, _)| c.as_str()),
+            model = ?chosen.as_ref().map(|(_, m)| m.as_str()),
             source = ?budget.source,
             max_input_tokens = budget.max_input_tokens,
             "context budget resolved"
@@ -1166,9 +1211,14 @@ where
             let dispatch = with_context_budget(budget, dispatch);
             let dispatch =
                 desktop_assistant_core::ports::llm::with_cancellation_token(cancellation, dispatch);
-            // Wrap in `with_model_override` only when we installed an
-            // `active_client`; the interactive-purpose fallback path
-            // intentionally leaves both unset (see #33).
+            // Route through the resolved registry client + pinned model when
+            // `resolve_turn` found a concrete live connection (a user-driven
+            // selection OR the interactive purpose naming an explicit
+            // connection+model). When it didn't — the interactive purpose defers
+            // to the `[llm]` primary (`connection`/`model = primary`) or its
+            // connection isn't live — both are `None` and dispatch falls through
+            // to the static primary llm, preserving #33's passthrough for that
+            // case. `active_client` and `model_override` are always set together.
             match (active_client, model_override) {
                 (Some(c), Some(m)) => {
                     let dispatch = with_model_override(m, dispatch);
@@ -2635,10 +2685,13 @@ api_key_env = "{unused}"
         // ensure the user-configured model actually reaches the wire.
 
         #[tokio::test]
-        async fn interactive_purpose_does_not_install_active_client() {
-            // No override, no stored selection: dispatch must fall through
-            // to the primary llm. `ACTIVE_CLIENT` task-local must be
-            // *unset* in the inner handler's scope.
+        async fn interactive_purpose_installs_active_client_for_concrete_connection() {
+            // No override, no stored selection → the interactive purpose drives
+            // the turn. When that purpose names a concrete, *live* connection
+            // (the fixture's `local`/`llama3`), dispatch now routes through the
+            // registry client (ACTIVE_CLIENT set) and pins the model per-call —
+            // the SAME live resolution the budget uses — instead of falling
+            // through to a construction-time static primary that could be stale.
             let (routing, inner, _reg, _store) = make_handler();
             let (on_chunk, on_status) = noop_cb();
             routing
@@ -2654,21 +2707,19 @@ api_key_env = "{unused}"
             let active = inner.captured_active_client_set.lock().unwrap();
             assert_eq!(active.len(), 1);
             assert!(
-                !active[0],
-                "interactive-purpose fallback must not install ACTIVE_CLIENT \
-                 (else dispatch would route through registry's connection \
-                 client and ignore the purpose's model)"
+                active[0],
+                "an interactive purpose naming a concrete live connection must \
+                 route through the registry client so dispatch matches the budget"
             );
         }
 
         #[tokio::test]
-        async fn interactive_purpose_effort_still_applies_without_active_client() {
-            // The purpose's effort flows through the reasoning task-local
-            // even when we *don't* install ACTIVE_CLIENT. Use ollama so
-            // the connector mapping is a no-op (default ReasoningConfig)
-            // — the assertion is that we got the expected default, not
-            // that we lost the effort entirely. A non-ollama connector
-            // can't be exercised end-to-end without a live model list,
+        async fn interactive_purpose_effort_still_applies() {
+            // The purpose's effort flows through the reasoning task-local. Use
+            // ollama so the connector mapping is a no-op (default
+            // ReasoningConfig) — the assertion is that we got the expected
+            // default, not that we lost the effort entirely. A non-ollama
+            // connector can't be exercised end-to-end without a live model list,
             // so the bedrock-effort case is covered by the unit test on
             // `apply_effort_mapping` above.
             let mut cfg = local_ollama_cfg();
@@ -2705,20 +2756,21 @@ api_key_env = "{unused}"
             assert_eq!(reasoning.len(), 1);
             // ollama connector → no-op mapping. Asserting `default()` here
             // is the *correct* outcome for the connector; the value-add of
-            // the test is that we still got *here* (pipeline didn't skip
-            // reasoning resolution just because active_client wasn't set).
+            // the test is that the effort still flowed through the resolution.
             assert_eq!(reasoning[0], ReasoningConfig::default());
 
+            // The concrete live connection routes through the registry client.
             let active = inner.captured_active_client_set.lock().unwrap();
-            assert!(!active[0]);
+            assert!(active[0]);
         }
 
         #[tokio::test]
-        async fn interactive_purpose_dispatch_does_not_install_model_override() {
-            // Negative case: when no user-driven selection exists
-            // (override is None, no stored selection), `send_prompt` must
-            // NOT install `MODEL_OVERRIDE`. Connectors then fall back to
-            // their baked-in `self.model` for this fallback path.
+        async fn interactive_purpose_dispatch_installs_model_override() {
+            // With no user-driven selection, the interactive purpose drives the
+            // turn. When it names a concrete live connection, `MODEL_OVERRIDE` is
+            // pinned to the purpose's model (`llama3`) so the connector sends
+            // exactly that — the same model the budget was computed for — rather
+            // than relying on the static primary's construction-time model.
             let (routing, inner, _reg, _store) = make_handler();
             let (on_chunk, on_status) = noop_cb();
             routing
@@ -2733,8 +2785,9 @@ api_key_env = "{unused}"
             let captured = inner.captured_model_override.lock().unwrap();
             assert_eq!(captured.len(), 1);
             assert_eq!(
-                captured[0], None,
-                "interactive-purpose fallback must leave MODEL_OVERRIDE unset"
+                captured[0],
+                Some("llama3".to_string()),
+                "interactive purpose must pin its model so dispatch matches the budget"
             );
         }
 
@@ -2909,13 +2962,13 @@ api_key_env = "{unused}"
         }
 
         #[tokio::test]
-        async fn dangling_stored_selection_falls_back_to_interactive_without_active_client() {
+        async fn dangling_stored_selection_falls_back_to_interactive() {
             // A stored selection pointing at a connection that's no longer
-            // declared falls back to the interactive purpose. Like the
-            // plain interactive path, this fallback must NOT install
-            // ACTIVE_CLIENT — the user is no longer "driving" the
-            // selection, the system is, and the primary llm already has
-            // the interactive purpose's model baked in.
+            // declared is cleared and falls back to the interactive purpose.
+            // Since that purpose names a concrete live connection, the fallback
+            // now routes through the registry client (ACTIVE_CLIENT set) and
+            // pins its model — the dangling pick is not user-driven, so this is
+            // the same fallback path the plain interactive case takes.
             let (routing, inner, _reg, store) = make_handler();
             // Stored selection points at an unknown connection id.
             // `connection_lists_model` returns false for missing ids
@@ -2951,8 +3004,9 @@ api_key_env = "{unused}"
                 let active = inner.captured_active_client_set.lock().unwrap();
                 assert_eq!(active.len(), 1);
                 assert!(
-                    !active[0],
-                    "dangling stored selection must fall through to primary llm"
+                    active[0],
+                    "dangling selection falls back to the interactive purpose, \
+                     which routes through its concrete live connection's client"
                 );
             } // drop std::sync::MutexGuard before the next .await — clippy::await_holding_lock
 
@@ -2973,6 +3027,57 @@ api_key_env = "{unused}"
             assert!(
                 cleared.is_none(),
                 "dangling stored selection must be cleared after fallback"
+            );
+        }
+
+        #[tokio::test]
+        async fn interactive_purpose_with_primary_ref_falls_through_to_static_primary() {
+            // #33 passthrough preserved: when the interactive purpose defers to
+            // the `[llm]` primary (`connection`/`model = primary`), there is no
+            // concrete registry connection to pin, so `resolve_turn` leaves
+            // ACTIVE_CLIENT / MODEL_OVERRIDE unset and dispatch falls through to
+            // the static primary llm — exactly as before.
+            let mut cfg = local_ollama_cfg();
+            cfg.purposes.set(
+                PurposeKind::Interactive,
+                Some(PurposeConfig {
+                    connection: ConnectionRef::Primary,
+                    model: ModelRef::Primary,
+                    effort: None,
+                    max_context_tokens: None,
+                }),
+            );
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("dispatch must succeed via the static primary");
+
+            let active = inner.captured_active_client_set.lock().unwrap();
+            assert_eq!(active.len(), 1);
+            assert!(
+                !active[0],
+                "a Primary-ref interactive purpose must pass through to the \
+                 static primary, not pin a registry client"
+            );
+            let overrides = inner.captured_model_override.lock().unwrap();
+            assert_eq!(
+                overrides[0], None,
+                "no model override for the primary passthrough"
             );
         }
     }

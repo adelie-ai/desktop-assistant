@@ -757,7 +757,10 @@ impl LlmClient for AnthropicClient {
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
         // Fold the per-connection hard cap into the curated window so the
         // daemon budgets against the capped value (e.g. to bound spend).
-        desktop_assistant_llm_http::apply_context_cap(self.context_cap, context_limit_for_model(&model))
+        desktop_assistant_llm_http::apply_context_cap(
+            self.context_cap,
+            context_limit_for_model(&model),
+        )
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
