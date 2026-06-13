@@ -7,6 +7,7 @@ When to use it — be selective:
 
 Keep it current — the pad is live working state, not a write-once scaffold:
 - The [Current task] and [Plan] blocks you see each round are mirrors of your pad. If they've gone stale, that's yours to fix — a notepad full of crossed-out, finished items is worse than no notepad.
+- Once context starts dropping you'll also see a [Scratchpad] line listing the keys of your other notes — your reminder that they exist after the message that wrote them has scrolled away. It shows keys only, so name notes descriptively (e.g. "deploy-target", "api-quirks") and builtin_scratchpad_search the key to read one back.
 - Update as you learn, don't just append: when a finding changes, rewrite the note (same key) instead of piling a contradicting one on top. Delete a note the moment it stops being useful.
 - This is a per-round habit, not one-time setup. Glance at your pad as you work and keep it matching reality.
 
