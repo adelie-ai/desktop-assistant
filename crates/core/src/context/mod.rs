@@ -200,6 +200,7 @@ pub(crate) fn llm_messages_for_turn_with_plan(
     max_messages: usize,
     active_task: Option<&str>,
     plan: Option<&str>,
+    scratchpad_index: Option<&str>,
     tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
@@ -216,6 +217,7 @@ pub(crate) fn llm_messages_for_turn_with_plan(
         current_max,
         active_task,
         plan,
+        scratchpad_index,
         tool_rounds_since_anchor,
         system_refinement,
         budget,
@@ -273,6 +275,7 @@ pub(crate) fn llm_messages_for_turn_with_plan(
             current_max,
             active_task,
             plan,
+            scratchpad_index,
             tool_rounds_since_anchor,
             system_refinement,
             Some(budget),
@@ -524,6 +527,7 @@ pub(crate) fn llm_messages_for_turn(
         max_messages,
         active_task,
         None,
+        None,
         tool_rounds_since_anchor,
         system_refinement,
         budget,
@@ -699,6 +703,7 @@ fn assemble_messages_inner(
     max_messages: usize,
     active_task: Option<&str>,
     plan: Option<&str>,
+    scratchpad_index: Option<&str>,
     tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
@@ -779,6 +784,12 @@ fn assemble_messages_inner(
     // tool results; an explicit `[Current task]` re-statement keeps the
     // assistant aligned with the original intent across compaction and
     // windowing events.
+    // Shared "context is starting to drop" signal used both by the
+    // `[Current task]` re-injection and the `[Scratchpad]` index (#340): once a
+    // long agentic loop has run past the round threshold, surfacing durable
+    // anchors again keeps the model on-task even if they're nominally visible.
+    let many_tool_rounds = tool_rounds_since_anchor > ACTIVE_TASK_ROUND_THRESHOLD;
+
     if let Some(task) = active_task.filter(|t| !t.is_empty()) {
         // Find a non-collapsed User message in the window whose content
         // matches the anchor. Messages with an active `summary_id` are
@@ -792,7 +803,6 @@ fn assemble_messages_inner(
                     .as_deref()
                     .is_some_and(|sid| active_summary_ids.contains(sid))
         });
-        let many_tool_rounds = tool_rounds_since_anchor > ACTIVE_TASK_ROUND_THRESHOLD;
 
         if !anchor_visible || many_tool_rounds {
             messages.push(Message::new(Role::System, format!("[Current task] {task}")));
@@ -806,6 +816,22 @@ fn assemble_messages_inner(
     // persisted to `conv.messages`.
     if let Some(plan) = plan.filter(|p| !p.is_empty()) {
         messages.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
+    }
+
+    // Advertise the free-form scratchpad note keys (#340) right after the plan.
+    // These notes are durable in storage but otherwise invisible once the
+    // message that wrote them is windowed/compacted away — nothing re-surfaces a
+    // general note, so the model never thinks to `builtin_scratchpad_search` for
+    // it. The index lists the keys (recognition over recall), gated on the SAME
+    // "context is dropping" condition as `[Current task]`: windowing has begun
+    // (which also covers collapse-behind-summary, since summaries are only
+    // injected when windowed) OR the turn has run past the round threshold.
+    // Before that, the note content is usually still in the live conversation,
+    // so the index would only burn tokens.
+    if let Some(index) = scratchpad_index.filter(|s| !s.is_empty())
+        && (is_windowed || many_tool_rounds)
+    {
+        messages.push(Message::new(Role::System, format!("[Scratchpad] {index}")));
     }
 
     // Track which summaries have already been injected.
@@ -2403,6 +2429,139 @@ mod tests {
         assert!(result[2].content.contains(task));
         // Whatever comes next must not be a System message.
         assert_ne!(result[3].role, Role::System);
+    }
+
+    // --- Scratchpad index (#340) ---
+
+    fn scratchpad_index_text(result: &[Message]) -> Option<&str> {
+        result
+            .iter()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Scratchpad]"))
+            .map(|m| m.content.as_str())
+    }
+
+    #[test]
+    fn scratchpad_index_not_shown_on_short_turn() {
+        // Anchor still visible, few tool rounds → context isn't dropping yet,
+        // so the live notes are still in view. The index would just burn tokens.
+        let msgs = vec![
+            Message::new(Role::User, "do a thing"),
+            Message::new(Role::Assistant, "on it"),
+        ];
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): foo, bar.";
+        let result = llm_messages_for_turn_with_plan(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            Some("do a thing"),
+            None,
+            Some(index),
+            0,
+            "",
+            None,
+            None,
+            &default_estimate,
+        );
+        assert!(
+            scratchpad_index_text(&result).is_none(),
+            "scratchpad index must not appear on a short, fully-visible turn"
+        );
+    }
+
+    #[test]
+    fn scratchpad_index_shown_when_windowed() {
+        let total = MAX_CONTEXT_MESSAGES + 5;
+        let mut msgs: Vec<Message> = Vec::with_capacity(total);
+        msgs.push(Message::new(Role::User, "original task"));
+        for i in 1..total {
+            if i % 2 == 0 {
+                msgs.push(Message::new(Role::User, format!("u-{i}")));
+            } else {
+                msgs.push(Message::new(Role::Assistant, format!("a-{i}")));
+            }
+        }
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): foo, bar.";
+        let result = llm_messages_for_turn_with_plan(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            None,
+            Some(index),
+            0,
+            "",
+            None,
+            None,
+            &default_estimate,
+        );
+        let text = scratchpad_index_text(&result)
+            .expect("scratchpad index must appear once windowing has dropped context");
+        assert!(text.contains(index));
+    }
+
+    #[test]
+    fn scratchpad_index_shown_after_many_tool_rounds() {
+        let msgs = vec![
+            Message::new(Role::User, "trace it"),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
+            Message::tool_result("c1", "result"),
+        ];
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): foo.";
+        let result = llm_messages_for_turn_with_plan(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            Some("trace it"),
+            None,
+            Some(index),
+            ACTIVE_TASK_ROUND_THRESHOLD + 1,
+            "",
+            None,
+            None,
+            &default_estimate,
+        );
+        assert!(
+            scratchpad_index_text(&result).is_some(),
+            "scratchpad index must appear after many tool rounds even when anchor is visible"
+        );
+    }
+
+    #[test]
+    fn scratchpad_index_omitted_when_empty() {
+        let total = MAX_CONTEXT_MESSAGES + 5;
+        let mut msgs: Vec<Message> = Vec::with_capacity(total);
+        for i in 0..total {
+            msgs.push(Message::new(Role::User, format!("m-{i}")));
+        }
+        let result = llm_messages_for_turn_with_plan(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            None,
+            None,
+            0,
+            "",
+            None,
+            None,
+            &default_estimate,
+        );
+        assert!(
+            scratchpad_index_text(&result).is_none(),
+            "no scratchpad index when there are no free-form notes"
+        );
     }
 
     // --- Message summary (collapsing) tests ---

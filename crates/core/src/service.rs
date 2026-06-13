@@ -537,6 +537,42 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         planning::render_plan_from_notes(&raw, current_key, planning::MAX_PLAN_ITEMS)
     }
 
+    /// Render the free-form scratchpad index (#340) for per-round surfacing: the
+    /// keys of `note`-typed notes that aren't already shown as `[Current task]`
+    /// (`goal`) or `[Plan]` (`outcome:*` findings and `todo` steps). These notes
+    /// are durable in storage but otherwise invisible once the message that wrote
+    /// them is windowed/compacted away, so the context builder advertises their
+    /// keys (gated on the same "context is dropping" trigger as `[Current task]`)
+    /// to remind the model what it can `builtin_scratchpad_search` for. Returns
+    /// `None` when no lister is wired or there are no free-form notes.
+    async fn render_current_scratchpad_index(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Option<String> {
+        let list = self.scratchpad_list.clone()?;
+        // No type filter — `goal` and `outcome:*` are also `note`-typed, so the
+        // free-form set is carved out by key in `freeform_note_keys`, not by a
+        // storage-side type filter.
+        let notes = list(
+            conversation_id.0.clone(),
+            None,
+            planning::MAX_SCRATCHPAD_INDEX_KEYS.saturating_mul(3),
+        )
+        .await
+        .ok()?;
+        let raw: Vec<planning::RawNote> = notes
+            .iter()
+            .map(|n| planning::RawNote {
+                key: n.key.as_str(),
+                content: n.content.as_str(),
+                note_type: n.note_type.as_str(),
+                done: n.done,
+            })
+            .collect();
+        let keys = planning::freeform_note_keys(&raw);
+        planning::render_scratchpad_index(&keys, planning::MAX_SCRATCHPAD_INDEX_KEYS)
+    }
+
     /// Build the per-turn [`StepStack`], seeding its top-level numbering from the
     /// conversation's existing `todo` notes (DA-7 / #292).
     ///
@@ -1006,6 +1042,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .render_current_plan(conversation_id, current_step.as_deref())
                 .await;
 
+            // Advertise the free-form scratchpad note keys (#340) so a note the
+            // model stashed earlier survives windowing/compaction as recognition
+            // (it can search for the key) even after the writing message is gone.
+            // Gated context-builder-side on the same trigger as [Current task].
+            let scratchpad_index = self.render_current_scratchpad_index(conversation_id).await;
+
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
@@ -1018,6 +1060,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 target_window,
                 anchor,
                 plan.as_deref(),
+                scratchpad_index.as_deref(),
                 tool_rounds_since_anchor,
                 &system_refinement,
                 current_context_budget(),

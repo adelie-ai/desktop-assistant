@@ -28,6 +28,7 @@
 //! dispatch loop; everything here is synchronous and unit-tested in isolation.
 
 use crate::domain::{Message, Role, ToolDefinition};
+use crate::ports::scratchpad::SCRATCHPAD_GOAL_KEY;
 
 /// Tool the model calls to begin a (possibly nested) step. Advertised in the
 /// per-turn tool set and intercepted by name in the dispatch loop.
@@ -411,6 +412,59 @@ fn select_plan_items<'a>(
         .enumerate()
         .filter_map(|(i, item)| keep[i].then_some(item))
         .collect()
+}
+
+/// Maximum free-form note keys named in the per-round `[Scratchpad]` index
+/// before the "… and N more" tail. Mirrors [`MAX_PLAN_ITEMS`] — the index is
+/// re-sent every round, so it stays cheap; recognition over recall means a
+/// generous-but-bounded list of keys is enough to remind the model what it has
+/// stashed.
+pub(crate) const MAX_SCRATCHPAD_INDEX_KEYS: usize = 40;
+
+/// Select the free-form notepad keys from a conversation's notes (#340).
+///
+/// "Free-form" = a `note`-typed note that is NOT already surfaced elsewhere:
+/// the `goal` note is the `[Current task]` anchor, and `outcome:<step>` notes
+/// plus `todo`-typed steps are rendered into `[Plan]`. Filtering by type alone
+/// is insufficient (both `goal` and `outcome:*` are `note`-typed), so this also
+/// excludes by key. The remaining set is the durable-but-otherwise-invisible
+/// notepad that the `[Scratchpad]` index advertises.
+pub(crate) fn freeform_note_keys<'a>(notes: &[RawNote<'a>]) -> Vec<&'a str> {
+    notes
+        .iter()
+        .filter(|n| {
+            n.note_type == OUTCOME_NOTE_TYPE
+                && n.key != SCRATCHPAD_GOAL_KEY
+                && !n.key.starts_with(OUTCOME_KEY_PREFIX)
+        })
+        .map(|n| n.key)
+        .collect()
+}
+
+/// Render the per-round `[Scratchpad]` index: a sorted, capped list of the
+/// free-form note keys, so a note the model stashed earlier survives windowing
+/// and compaction as *recognition* (it can `builtin_scratchpad_search` for the
+/// key) even after the message that wrote it is gone (#340). Keys only — no
+/// content previews. Returns `None` when there are no keys to advertise.
+pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option<String> {
+    let mut sorted: Vec<&str> = keys.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.is_empty() {
+        return None;
+    }
+
+    let total = sorted.len();
+    let shown = max_items.min(total);
+    let listed = sorted[..shown].join(", ");
+
+    let mut out = format!("Notes you've stashed (read with builtin_scratchpad_search): {listed}");
+    if total > shown {
+        out.push_str(&format!(" … and {} more.", total - shown));
+    } else {
+        out.push('.');
+    }
+    Some(out)
 }
 
 /// A scratchpad note as the plan renderer needs it — just the fields it reads,
@@ -981,5 +1035,97 @@ mod tests {
     fn step_tools_have_stable_names() {
         assert_eq!(begin_step_tool().name, "begin_step");
         assert_eq!(complete_step_tool().name, "complete_step");
+    }
+
+    // --- Scratchpad index (#340) ---
+
+    #[test]
+    fn render_scratchpad_index_empty_is_none() {
+        assert!(render_scratchpad_index(&[], 5).is_none());
+    }
+
+    #[test]
+    fn render_scratchpad_index_sorts_keys() {
+        let keys = ["user-prefs", "api-quirks", "deploy-target"];
+        let rendered = render_scratchpad_index(&keys, 10).unwrap();
+        // Sorted, no "and N more" tail (under cap).
+        assert!(
+            rendered.contains("api-quirks, deploy-target, user-prefs"),
+            "keys must be rendered sorted: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("more"),
+            "no tail under cap: {rendered:?}"
+        );
+        // Advertises the read tool so the model knows how to recover content.
+        assert!(rendered.contains("builtin_scratchpad_search"));
+    }
+
+    #[test]
+    fn render_scratchpad_index_exactly_at_cap_has_no_tail() {
+        let keys = ["a", "b", "c"];
+        let rendered = render_scratchpad_index(&keys, 3).unwrap();
+        assert!(rendered.contains("a, b, c"));
+        assert!(
+            !rendered.contains("more"),
+            "exactly at cap must not show a tail: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_scratchpad_index_over_cap_shows_remainder_count() {
+        let keys = ["e", "d", "c", "b", "a"];
+        let rendered = render_scratchpad_index(&keys, 2).unwrap();
+        // First two in sort order are shown; the remaining 3 are summarised.
+        assert!(
+            rendered.contains("a, b"),
+            "shows capped sorted head: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("… and 3 more."),
+            "over-cap must show remainder count: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(", c"),
+            "elided keys must not render: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_scratchpad_index_dedupes_and_sorts() {
+        // Duplicate keys collapse (a key is upsert-by-key in storage, but the
+        // renderer should be robust to a caller passing dups).
+        let keys = ["b", "a", "b"];
+        let rendered = render_scratchpad_index(&keys, 10).unwrap();
+        assert!(rendered.contains("a, b"));
+        assert!(
+            !rendered.contains("a, b, b"),
+            "dups must collapse: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn freeform_note_keys_filters_out_anchors_and_plan_notes() {
+        let notes = vec![
+            raw("goal", "the goal", "note", false), // excluded: [Current task]
+            raw("outcome:1", "finding", "note", false), // excluded: [Plan]
+            raw("outcome:1.2", "more", "note", false), // excluded: [Plan]
+            raw("1", "a step", "todo", false),      // excluded: [Plan] (todo)
+            raw("deploy-target", "prod", "note", false), // KEEP
+            raw("api-quirks", "rate limits", "note", false), // KEEP
+        ];
+        let mut keys = freeform_note_keys(&notes);
+        keys.sort();
+        assert_eq!(keys, vec!["api-quirks", "deploy-target"]);
+    }
+
+    #[test]
+    fn freeform_note_keys_empty_when_only_excluded() {
+        let notes = vec![
+            raw("goal", "g", "note", false),
+            raw("outcome:1", "f", "note", false),
+            raw("1", "s", "todo", true),
+        ];
+        assert!(freeform_note_keys(&notes).is_empty());
     }
 }
