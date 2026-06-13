@@ -570,6 +570,24 @@ impl BackgroundTaskRegistry {
         );
     }
 
+    /// Notify a user's subscribed connections that their conversation list
+    /// changed — created/renamed/deleted/(un)archived (#1) — so every client's
+    /// sidebar refreshes regardless of which client made the change. Rides the
+    /// same per-user broadcast as `Task*`/`ScratchpadChanged`; best-effort
+    /// (dropped if no connection for the user is currently subscribed).
+    pub fn notify_conversation_list_changed(
+        &self,
+        user_id: &UserId,
+        conversation_id: impl Into<String>,
+    ) {
+        self.inner.broadcast(
+            user_id,
+            api::Event::ConversationListChanged {
+                conversation_id: conversation_id.into(),
+            },
+        );
+    }
+
     /// Append a log entry to `id`'s log ring from outside the task's
     /// body. Used by callers that produce events on behalf of a task
     /// they don't own the body of — for example, the `spawn_subagent`
@@ -1143,6 +1161,24 @@ mod tests {
                 assert_eq!(conversation_id, "conv-1");
             }
             other => panic!("expected ScratchpadChanged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_conversation_list_changed_reaches_subscribers() {
+        // #1: conversation create/rename/delete rides the same per-user
+        // broadcast, so every subscribed connection refreshes its sidebar.
+        let registry = BackgroundTaskRegistry::new();
+        let user = UserId::new("alice");
+        let mut events = registry.subscribe(&user);
+
+        registry.notify_conversation_list_changed(&user, "conv-7");
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::ConversationListChanged { conversation_id })) => {
+                assert_eq!(conversation_id, "conv-7");
+            }
+            other => panic!("expected ConversationListChanged, got {other:?}"),
         }
     }
 

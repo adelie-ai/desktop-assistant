@@ -156,6 +156,11 @@ pub fn translate(event: api::Event) -> ForwardAction {
         api::Event::ConversationTitleChanged { .. } => ForwardAction::Ignored {
             kind: "conversation_title_changed",
         },
+        // The conversation-list refresh (#1) is a UDS/WS sidebar concern; the
+        // D-Bus client (voice) renders no conversation list.
+        api::Event::ConversationListChanged { .. } => ForwardAction::Ignored {
+            kind: "conversation_list_changed",
+        },
         api::Event::ConversationWarningEmitted { .. } => ForwardAction::Ignored {
             kind: "conversation_warning_emitted",
         },

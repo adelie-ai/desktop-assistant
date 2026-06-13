@@ -580,6 +580,17 @@ pub enum Event {
         title: String,
     },
 
+    /// A user's conversation list changed — a conversation was created,
+    /// renamed, deleted, or (un)archived (#1 live multi-client sync).
+    /// Broadcast to ALL of the user's subscribed connections so every client's
+    /// sidebar stays in sync no matter which client (or the voice daemon) made
+    /// the change. Carries only the affected `conversation_id`; clients re-fetch
+    /// the list (the change kind is intentionally not encoded — a refetch is
+    /// simplest and correct for create/rename/delete/archive alike).
+    ConversationListChanged {
+        conversation_id: String,
+    },
+
     /// A one-time advisory for a conversation (e.g. the stored model
     /// selection no longer resolves and was cleared). Emitted at most once
     /// per underlying condition — the server clears the stored state so

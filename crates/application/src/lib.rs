@@ -576,6 +576,18 @@ where
         }
     }
 
+    /// Broadcast a conversation-list change (#1) to the calling user's
+    /// connections so every client's sidebar refreshes, regardless of which
+    /// client made the change. No-op without a registry attached.
+    fn notify_conversation_list_changed(&self, conversation_id: &str) {
+        if let Some(reg) = &self.registry {
+            reg.notify_conversation_list_changed(
+                &desktop_assistant_core::ports::auth::current_user_id(),
+                conversation_id,
+            );
+        }
+    }
+
     /// Borrow the registry, if one is attached. Public so #112/#113 can
     /// reach the same instance the foreground send path uses; for #111
     /// only the foreground path itself needs it.
@@ -1127,7 +1139,9 @@ where
                     .create_conversation(title)
                     .await
                     .map_err(Self::map_core_err)?;
-                Ok(api::CommandResult::ConversationId { id: conv.id.0 })
+                let id = conv.id.0;
+                self.notify_conversation_list_changed(&id);
+                Ok(api::CommandResult::ConversationId { id })
             }
 
             api::Command::ListConversations {
@@ -1219,6 +1233,7 @@ where
                     ))
                     .await
                     .map_err(Self::map_core_err)?;
+                self.notify_conversation_list_changed(&id);
                 Ok(api::CommandResult::Ack)
             }
 
@@ -1230,6 +1245,7 @@ where
                     )
                     .await
                     .map_err(Self::map_core_err)?;
+                self.notify_conversation_list_changed(&id);
                 Ok(api::CommandResult::Ack)
             }
 
@@ -1240,6 +1256,7 @@ where
                     ))
                     .await
                     .map_err(Self::map_core_err)?;
+                self.notify_conversation_list_changed(&id);
                 Ok(api::CommandResult::Ack)
             }
 
@@ -1250,6 +1267,7 @@ where
                     ))
                     .await
                     .map_err(Self::map_core_err)?;
+                self.notify_conversation_list_changed(&id);
                 Ok(api::CommandResult::Ack)
             }
 
