@@ -334,18 +334,31 @@ pub enum ConnectionConfigPayload {
     Anthropic {
         base_url: Option<String>,
         api_key_env: Option<String>,
+        connect_timeout_secs: Option<u64>,
+        stream_timeout_secs: Option<u64>,
+        max_context_tokens: Option<u64>,
     },
     OpenAi {
         base_url: Option<String>,
         api_key_env: Option<String>,
+        connect_timeout_secs: Option<u64>,
+        stream_timeout_secs: Option<u64>,
+        max_context_tokens: Option<u64>,
     },
     Bedrock {
         aws_profile: Option<String>,
         region: Option<String>,
         base_url: Option<String>,
+        connect_timeout_secs: Option<u64>,
+        stream_timeout_secs: Option<u64>,
+        max_context_tokens: Option<u64>,
     },
     Ollama {
         base_url: Option<String>,
+        connect_timeout_secs: Option<u64>,
+        stream_timeout_secs: Option<u64>,
+        keep_warm: Option<bool>,
+        max_context_tokens: Option<u64>,
     },
 }
 

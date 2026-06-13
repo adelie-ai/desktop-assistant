@@ -508,6 +508,22 @@ pub struct ResolvedLlmConfig {
     pub hosted_tool_search: Option<bool>,
     /// AWS profile name for Bedrock connector.
     pub aws_profile: Option<String>,
+    /// Per-connection override for the streaming first-response (connect) stall
+    /// budget, in seconds. `None` falls back to the connector-shared default.
+    pub connect_timeout_secs: Option<u64>,
+    /// Per-connection override for the streaming per-chunk stall budget, in
+    /// seconds. `None` falls back to the connector-shared default.
+    pub stream_timeout_secs: Option<u64>,
+    /// Ollama-only: keep this connection's interactive model resident in
+    /// memory. `false`/`None` for every other connector. Consumed by the
+    /// daemon's keep-warm loop, not by the connectors.
+    pub keep_warm: bool,
+    /// Per-connection hard ceiling on the effective context window, in tokens.
+    /// `None` = "max available" (defer entirely to the model's reported max).
+    /// `Some(n)` caps the window to `min(n, reported)`. See
+    /// [`crate::connections::OllamaConnection::max_context_tokens`] and the
+    /// connector's `max_context_tokens()` for how this folds together.
+    pub max_context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2596,10 +2612,14 @@ y = 2
 
     #[test]
     fn resolve_context_budget_purpose_override_wins() {
-        // Tier 1: an explicit `purpose.max_context_tokens` beats the
-        // connector's curated table even when the curated value is known.
-        // The user always wins. Source tag identifies user config so the
-        // dispatch wrapper can log "user said 500K" rather than guessing.
+        // Tier 1: an explicit `purpose.max_context_tokens` beats the connector
+        // value even when it's known. The user always wins — and for Ollama
+        // this same value is read back and provisioned as `num_ctx` (then
+        // clamped at the connector to the model ceiling and the per-connection
+        // hard cap), so it isn't budgeting past the real window. We deliberately
+        // don't clamp the override to `connector_max` here: that value is read
+        // before the per-turn budget is installed, so it's the pre-override
+        // default — clamping would wrongly cap the override down to it.
         let budget = resolve_context_budget(Some(500_000), Some(200_000));
         assert_eq!(budget.max_input_tokens, 500_000);
         assert_eq!(budget.source, BudgetSource::PurposeOverride);

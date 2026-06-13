@@ -71,6 +71,14 @@ pub struct BedrockClient {
     /// mode" validation error. Per-instance so each client warms its
     /// own cache; not shared across `BedrockClient` instances. (#67)
     non_streaming_tools_models: Arc<Mutex<HashSet<String>>>,
+    /// First-response (connect) stall budget; defaults to
+    /// [`STREAM_CONNECT_TIMEOUT`], overridable per-connection.
+    connect_timeout: Duration,
+    /// Per-chunk stall budget; defaults to [`STREAM_EVENT_TIMEOUT`].
+    event_timeout: Duration,
+    /// Per-connection context-window hard cap, in tokens. `None` = "max
+    /// available". Folded with the curated table in `max_context_tokens`.
+    context_cap: Option<u64>,
 }
 
 impl BedrockClient {
@@ -97,7 +105,37 @@ impl BedrockClient {
             model_cache_ttl: DEFAULT_MODEL_CACHE_TTL,
             clock: Arc::new(SystemClock),
             non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
+            connect_timeout: STREAM_CONNECT_TIMEOUT,
+            event_timeout: STREAM_EVENT_TIMEOUT,
+            context_cap: None,
         }
+    }
+
+    /// Set the per-connection context-window hard cap, in tokens. `None`/
+    /// `Some(0)` = "max available". Clamps the daemon's input budget (no
+    /// `num_ctx` to pin), useful for bounding spend. See
+    /// `desktop_assistant_llm_http::apply_context_cap`.
+    pub fn with_max_context_tokens(mut self, max: Option<u64>) -> Self {
+        self.context_cap = max.filter(|m| *m > 0);
+        self
+    }
+
+    /// Override the first-response (connect) stall budget. `None`/`Some(0)`
+    /// keeps the [`STREAM_CONNECT_TIMEOUT`] default. Seconds.
+    pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.connect_timeout = Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the per-chunk stall budget. `None`/`Some(0)` keeps the
+    /// [`STREAM_EVENT_TIMEOUT`] default. Seconds.
+    pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.event_timeout = Duration::from_secs(s);
+        }
+        self
     }
 
     /// Override the `list_models()` cache TTL (default: 1h).
@@ -1055,7 +1093,12 @@ impl LlmClient for BedrockClient {
     }
 
     fn max_context_tokens(&self) -> Option<u64> {
-        context_limit_for_model(&self.model)
+        // Fold the per-connection hard cap into the curated window so the
+        // daemon budgets against the capped value (e.g. to bound spend).
+        desktop_assistant_llm_http::apply_context_cap(
+            self.context_cap,
+            context_limit_for_model(&self.model),
+        )
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -1272,11 +1315,12 @@ impl BedrockClient {
         // of hanging forever (#214). `stream.recv()` and `send()` have no
         // built-in timeout; gpt-oss on Bedrock was observed accepting a
         // tool-history follow-up request and then never emitting an event.
-        // The budgets are shared with the reqwest connectors (#302); Bedrock's
-        // AWS-SDK stream can't reuse the `tokio_stream`-typed `next_step`, but
-        // it keeps the same constants so the timeouts can't drift apart.
-        const BEDROCK_CONNECT_TIMEOUT: std::time::Duration = STREAM_CONNECT_TIMEOUT;
-        const BEDROCK_EVENT_TIMEOUT: std::time::Duration = STREAM_EVENT_TIMEOUT;
+        // The budgets default to the values shared with the reqwest connectors
+        // (#302) but are overridable per-connection; Bedrock's AWS-SDK stream
+        // can't reuse the `tokio_stream`-typed `next_step`, so it applies the
+        // same `self.connect_timeout` / `self.event_timeout` directly.
+        let connect_timeout = self.connect_timeout;
+        let event_timeout = self.event_timeout;
 
         // Race connection establishment against cancellation and a timeout. If
         // the user cancels mid-handshake we drop the in-flight request (the
@@ -1286,9 +1330,9 @@ impl BedrockClient {
             _ = cancellation.cancelled() => {
                 return Err(StreamingDispatchError::Other(CoreError::Cancelled));
             }
-            _ = tokio::time::sleep(BEDROCK_CONNECT_TIMEOUT) => {
+            _ = tokio::time::sleep(connect_timeout) => {
                 tracing::error!(
-                    timeout_s = BEDROCK_CONNECT_TIMEOUT.as_secs(),
+                    timeout_s = connect_timeout.as_secs(),
                     "Bedrock converse_stream send() timed out (no response headers)"
                 );
                 return Err(StreamingDispatchError::Other(CoreError::Llm(
@@ -1325,9 +1369,9 @@ impl BedrockClient {
                     drop(stream);
                     return Err(StreamingDispatchError::Other(CoreError::Cancelled));
                 }
-                _ = tokio::time::sleep(BEDROCK_EVENT_TIMEOUT) => {
+                _ = tokio::time::sleep(event_timeout) => {
                     tracing::error!(
-                        timeout_s = BEDROCK_EVENT_TIMEOUT.as_secs(),
+                        timeout_s = event_timeout.as_secs(),
                         events_so_far = event_count,
                         "Bedrock converse_stream stalled — no further event"
                     );

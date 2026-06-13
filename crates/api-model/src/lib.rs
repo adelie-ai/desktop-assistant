@@ -781,6 +781,12 @@ pub enum ConnectionConfigView {
         base_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_key_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connect_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
     },
     #[serde(rename = "openai")]
     OpenAi {
@@ -788,6 +794,12 @@ pub enum ConnectionConfigView {
         base_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_key_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connect_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
     },
     Bedrock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -796,10 +808,26 @@ pub enum ConnectionConfigView {
         region: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connect_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
     },
     Ollama {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connect_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_warm: Option<bool>,
+        /// Hard ceiling on the context window in tokens; `None` = "max
+        /// available" (use the model's reported maximum).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
     },
 }
 
@@ -1291,6 +1319,9 @@ mod tests {
             config: ConnectionConfigView::OpenAi {
                 base_url: Some("https://api.openai.com/v1".into()),
                 api_key_env: Some("OPENAI_WORK_KEY".into()),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
             },
         };
         let json = serde_json::to_string(&cmd).unwrap();
@@ -1304,6 +1335,9 @@ mod tests {
             aws_profile: Some("work".into()),
             region: Some("us-west-2".into()),
             base_url: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"type\":\"bedrock\""));

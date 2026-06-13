@@ -23,6 +23,11 @@ use tokio::sync::OnceCell;
 const OLLAMA_CONNECT_TIMEOUT: std::time::Duration = STREAM_CONNECT_TIMEOUT;
 const OLLAMA_EVENT_TIMEOUT: std::time::Duration = STREAM_EVENT_TIMEOUT;
 
+/// `keep_alive` window requested when pre-loading / keeping a model warm.
+/// Longer than Ollama's 5-minute default so an interactive model survives
+/// brief idle gaps between turns instead of being unloaded and re-thrashed.
+pub const OLLAMA_KEEP_ALIVE: &str = "15m";
+
 /// Default effective context window (`num_ctx`) the connector provisions
 /// when the user hasn't configured one (issue #342).
 ///
@@ -85,6 +90,18 @@ pub struct OllamaClient {
     /// [`DEFAULT_OLLAMA_NUM_CTX`]". Either way it is clamped to the
     /// `/api/show` ceiling before being applied/reported.
     num_ctx: Option<u64>,
+    /// Per-connection **hard cap** on the effective context window, in tokens.
+    /// `None` = "max available" (no extra ceiling). Distinct from [`Self::num_ctx`]
+    /// (the *requested* window): this only ever clamps [`Self::effective_num_ctx`]
+    /// *down*, so a hardware/billing limit always binds — even over a larger
+    /// per-turn purpose override. See [`Self::with_max_context_tokens`].
+    context_cap: Option<u64>,
+    /// First-response (connect) stall budget. Defaults to
+    /// [`OLLAMA_CONNECT_TIMEOUT`]; overridable per-connection so a slow local
+    /// model on CPU isn't killed mid prompt-eval.
+    connect_timeout: std::time::Duration,
+    /// Per-chunk stall budget. Defaults to [`OLLAMA_EVENT_TIMEOUT`].
+    event_timeout: std::time::Duration,
     /// Per-model cache of `/api/show`-derived *architecture ceiling* context
     /// lengths. `None` values are cached too (when `/api/show` declines to
     /// populate the field) so we don't keep retrying. Populated by
@@ -111,6 +128,9 @@ impl OllamaClient {
             top_p: None,
             max_tokens: None,
             num_ctx: None,
+            context_cap: None,
+            connect_timeout: OLLAMA_CONNECT_TIMEOUT,
+            event_timeout: OLLAMA_EVENT_TIMEOUT,
             context_length_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -151,6 +171,34 @@ impl OllamaClient {
     /// `/api/show` architecture ceiling when that is known (issue #342).
     pub fn with_num_ctx(mut self, num_ctx: Option<u64>) -> Self {
         self.num_ctx = num_ctx;
+        self
+    }
+
+    /// Set the per-connection context-window **hard cap**, in tokens. `None`
+    /// (or `Some(0)`) means "max available" — no extra ceiling. A positive
+    /// value clamps [`Self::effective_num_ctx`] (and therefore the reported
+    /// window and the `num_ctx` sent on the wire) down to at most this many
+    /// tokens, e.g. when the model's full window won't fit in RAM on this box.
+    pub fn with_max_context_tokens(mut self, max: Option<u64>) -> Self {
+        self.context_cap = max.filter(|m| *m > 0);
+        self
+    }
+
+    /// Override the first-response (connect) stall budget. `None`/`Some(0)`
+    /// keeps the [`OLLAMA_CONNECT_TIMEOUT`] default. Seconds.
+    pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.connect_timeout = std::time::Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the per-chunk stall budget. `None`/`Some(0)` keeps the
+    /// [`OLLAMA_EVENT_TIMEOUT`] default. Seconds.
+    pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.event_timeout = std::time::Duration::from_secs(s);
+        }
         self
     }
 
@@ -215,6 +263,45 @@ impl OllamaClient {
         .await?;
 
         Ok(())
+    }
+
+    /// Pre-load `model` into Ollama's memory by POSTing an empty-prompt
+    /// `/api/generate` with a [`OLLAMA_KEEP_ALIVE`] window. Ollama loads the
+    /// weights (a cold load of a large GGUF — especially on CPU — can take
+    /// tens of seconds to minutes) and returns once resident.
+    ///
+    /// Best-effort and side-effect-only: transport errors and non-success
+    /// responses are logged at debug and swallowed so callers can fall through
+    /// to the real request, which surfaces any genuine failure. Used both as
+    /// the pre-request warm-up in [`Self::stream_completion`] (so the stall
+    /// timeouts cover generation, not loading) and by the daemon's interactive
+    /// keep-warm loop.
+    pub async fn warm_model(&self, model: &str) {
+        let url = format!("{}/api/generate", self.base_url.trim_end_matches('/'));
+        let result = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": model,
+                "prompt": "",
+                "stream": false,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            }))
+            .send()
+            .await;
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(model, "ollama model warmed (resident in memory)");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                tracing::debug!(model, %status, "ollama warm-up non-success; proceeding");
+            }
+            Err(e) => {
+                tracing::debug!(model, error = %e, "ollama warm-up request failed; proceeding");
+            }
+        }
     }
 
     /// Return the model name stamped with the server-side digest.
@@ -636,6 +723,11 @@ impl OllamaClient {
     /// circular) and the latter is the 200K guess this method exists to
     /// replace.
     ///
+    /// Finally the result is clamped to the per-connection **hard cap**
+    /// ([`Self::context_cap`], the KCM "context length hard cap"; `None` = no
+    /// cap). The cap only ever lowers the window, so a hardware/billing limit
+    /// binds even over a larger purpose override.
+    ///
     /// Returns the same value `max_context_tokens()` reports and the same
     /// value the chat request carries — the two must agree.
     fn effective_num_ctx(&self, model: &str) -> u64 {
@@ -644,7 +736,7 @@ impl OllamaClient {
             .or(self.num_ctx)
             .unwrap_or(DEFAULT_OLLAMA_NUM_CTX);
 
-        match self.cached_context_length(model) {
+        let windowed = match self.cached_context_length(model) {
             Some(ceiling) => {
                 if requested > ceiling {
                     tracing::debug!(
@@ -660,7 +752,11 @@ impl OllamaClient {
             // gracefully — provision the requested window unclamped rather
             // than guessing high or returning None.
             None => requested,
-        }
+        };
+
+        // Per-connection hard cap: the absolute ceiling, applied last so it
+        // wins over everything above.
+        windowed.min(self.context_cap.unwrap_or(u64::MAX))
     }
 
     /// The per-turn purpose-override context window, if one is installed as a
@@ -730,6 +826,15 @@ impl LlmClient for OllamaClient {
         // it isn't pulled.
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
 
+        // Pre-load the model into memory BEFORE the streaming request so the
+        // connect/stall budgets below cover generation latency only — not a
+        // (potentially minutes-long) cold load on CPU. Raced against
+        // cancellation so a wedged load stays interruptible.
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            () = self.warm_model(&model) => {}
+        }
+
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
 
         // Always provision an explicit num_ctx (issue #342): sized to the
@@ -781,9 +886,9 @@ impl LlmClient for OllamaClient {
         // wedged daemon) fails the turn instead of hanging forever (#220).
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-            _ = tokio::time::sleep(OLLAMA_CONNECT_TIMEOUT) => {
+            _ = tokio::time::sleep(self.connect_timeout) => {
                 tracing::error!(
-                    timeout_s = OLLAMA_CONNECT_TIMEOUT.as_secs(),
+                    timeout_s = self.connect_timeout.as_secs(),
                     "Ollama request send() timed out (no response headers)"
                 );
                 return Err(CoreError::Llm("Ollama stream stalled".into()));
@@ -849,7 +954,7 @@ impl LlmClient for OllamaClient {
             // timeout. Dropping `stream` closes the underlying reqwest body
             // and the socket — same shape as the SSE adapters. The stall
             // window resets on every received chunk (#220).
-            let chunk = match next_step(&mut stream, &cancellation, OLLAMA_EVENT_TIMEOUT).await {
+            let chunk = match next_step(&mut stream, &cancellation, self.event_timeout).await {
                 StreamStep::Item(c) => c,
                 StreamStep::Done => break,
                 StreamStep::Cancelled => {
@@ -859,7 +964,7 @@ impl LlmClient for OllamaClient {
                 }
                 StreamStep::Stalled => {
                     tracing::error!(
-                        timeout_s = OLLAMA_EVENT_TIMEOUT.as_secs(),
+                        timeout_s = self.event_timeout.as_secs(),
                         "Ollama stream stalled — no further chunk"
                     );
                     drop(stream);
@@ -1558,6 +1663,39 @@ mod tests {
         // But the connector still reports its configured-default num_ctx
         // (unclamped, since the ceiling is unknown) — never None (#342).
         assert_eq!(client.max_context_tokens(), Some(DEFAULT_OLLAMA_NUM_CTX));
+    }
+
+    #[tokio::test]
+    async fn max_context_tokens_hard_cap_clamps_below_window() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show").body_includes("llama3.2");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"llama.context_length":131072}}"#);
+        });
+
+        // Requested num_ctx (200k) clamps to the ceiling (131k), then the
+        // per-connection hard cap (16k) clamps it the rest of the way down —
+        // and that is the exact value `num_ctx` is pinned to on the wire.
+        let capped = OllamaClient::new(server.url(""), "llama3.2")
+            .with_num_ctx(Some(200_000))
+            .with_max_context_tokens(Some(16_384));
+        capped.warm_context_length().await;
+        assert_eq!(capped.max_context_tokens(), Some(16_384));
+
+        // The cap binds even before /api/show warms the ceiling cache.
+        let cold = OllamaClient::new("http://localhost:11434", "llama3.2")
+            .with_num_ctx(Some(200_000))
+            .with_max_context_tokens(Some(8_192));
+        assert_eq!(cold.max_context_tokens(), Some(8_192));
+
+        // A cap above the effective window is a no-op ("max available").
+        let loose = OllamaClient::new(server.url(""), "llama3.2")
+            .with_num_ctx(Some(32_768))
+            .with_max_context_tokens(Some(120_000));
+        loose.warm_context_length().await;
+        assert_eq!(loose.max_context_tokens(), Some(32_768));
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@
 mod models;
 pub mod streaming;
 
-pub use models::merge_curated_with_live;
+pub use models::{apply_context_cap, merge_curated_with_live};
 pub use streaming::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
     parse_retry_after_header,

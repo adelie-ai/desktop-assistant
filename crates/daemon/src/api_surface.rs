@@ -1225,31 +1225,59 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
         ConnectionConfigPayload::Anthropic {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => ConnectionConfig::Anthropic(AnthropicConnection {
             base_url,
             api_key_env,
             secret: None,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         }),
         ConnectionConfigPayload::OpenAi {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => ConnectionConfig::OpenAi(OpenAiConnection {
             base_url,
             api_key_env,
             secret: None,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         }),
         ConnectionConfigPayload::Bedrock {
             aws_profile,
             region,
             base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => ConnectionConfig::Bedrock(BedrockConnection {
             aws_profile,
             region,
             base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         }),
-        ConnectionConfigPayload::Ollama { base_url } => {
-            ConnectionConfig::Ollama(OllamaConnection { base_url })
-        }
+        ConnectionConfigPayload::Ollama {
+            base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            keep_warm,
+            max_context_tokens,
+        } => ConnectionConfig::Ollama(OllamaConnection {
+            base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            keep_warm,
+            max_context_tokens,
+        }),
     }
 }
 
@@ -1268,19 +1296,32 @@ fn connection_to_payload(conn: &ConnectionConfig) -> ConnectionConfigPayload {
             base_url: c.base_url.clone(),
             api_key_env: c.api_key_env.clone(),
             // `c.secret` (keyring coordinates) intentionally not echoed.
+            connect_timeout_secs: c.connect_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            max_context_tokens: c.max_context_tokens,
         },
         ConnectionConfig::OpenAi(c) => ConnectionConfigPayload::OpenAi {
             base_url: c.base_url.clone(),
             api_key_env: c.api_key_env.clone(),
             // `c.secret` (keyring coordinates) intentionally not echoed.
+            connect_timeout_secs: c.connect_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            max_context_tokens: c.max_context_tokens,
         },
         ConnectionConfig::Bedrock(c) => ConnectionConfigPayload::Bedrock {
             aws_profile: c.aws_profile.clone(),
             region: c.region.clone(),
             base_url: c.base_url.clone(),
+            connect_timeout_secs: c.connect_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            max_context_tokens: c.max_context_tokens,
         },
         ConnectionConfig::Ollama(c) => ConnectionConfigPayload::Ollama {
             base_url: c.base_url.clone(),
+            connect_timeout_secs: c.connect_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            keep_warm: c.keep_warm,
+            max_context_tokens: c.max_context_tokens,
         },
     }
 }
@@ -1443,6 +1484,7 @@ mod tests {
     fn ollama_local() -> ConnectionConfig {
         ConnectionConfig::Ollama(OllamaConnection {
             base_url: Some("http://localhost:11434".into()),
+            ..Default::default()
         })
     }
 
@@ -1451,6 +1493,7 @@ mod tests {
             aws_profile: Some("work".into()),
             region: Some("us-west-2".into()),
             base_url: None,
+            ..Default::default()
         })
     }
 
@@ -1467,6 +1510,7 @@ mod tests {
                 entry: Some("super-secret-entry".into()),
                 ..SecretConfig::default()
             }),
+            ..Default::default()
         })
     }
 
@@ -1501,6 +1545,7 @@ mod tests {
                 aws_profile,
                 region,
                 base_url,
+                ..
             } => {
                 assert_eq!(aws_profile.as_deref(), Some("work"));
                 assert_eq!(region.as_deref(), Some("us-west-2"));
@@ -1525,6 +1570,7 @@ mod tests {
             ConnectionConfigPayload::Anthropic {
                 base_url,
                 api_key_env,
+                ..
             } => {
                 assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
                 assert_eq!(api_key_env.as_deref(), Some("ANTHROPIC_WORK_KEY"));
@@ -1550,6 +1596,10 @@ mod tests {
                 "Bad Id!".to_string(),
                 ConnectionConfigPayload::Ollama {
                     base_url: Some("http://localhost:11434".into()),
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    keep_warm: None,
+                    max_context_tokens: None,
                 },
             )
             .await
@@ -1566,6 +1616,10 @@ mod tests {
                 "local".to_string(),
                 ConnectionConfigPayload::Ollama {
                     base_url: Some("http://localhost:11434".into()),
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    keep_warm: None,
+                    max_context_tokens: None,
                 },
             )
             .await
@@ -2720,6 +2774,7 @@ api_key_env = "{unused}"
                     "local",
                     ConnectionConfig::Ollama(OllamaConnection {
                         base_url: Some(server.url("")),
+                        ..Default::default()
                     }),
                 )]);
                 c.purposes.set(
@@ -2804,6 +2859,7 @@ api_key_env = "{unused}"
                     "local",
                     ConnectionConfig::Ollama(OllamaConnection {
                         base_url: Some(server.url("")),
+                        ..Default::default()
                     }),
                 )]);
                 c.purposes.set(

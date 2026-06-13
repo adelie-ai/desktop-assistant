@@ -189,12 +189,30 @@ impl Default for ConnectionRegistry {
 pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
     let connector = resolved.connector.clone();
     let inner: Arc<dyn LlmClient> = match resolved.connector.as_str() {
-        "ollama" => Arc::new(
-            desktop_assistant_llm_ollama::OllamaClient::new(resolved.base_url, resolved.model)
-                .with_temperature(resolved.temperature)
-                .with_top_p(resolved.top_p)
-                .with_max_tokens(resolved.max_tokens),
-        ),
+        "ollama" => {
+            let ollama = Arc::new(
+                desktop_assistant_llm_ollama::OllamaClient::new(resolved.base_url, resolved.model)
+                    .with_temperature(resolved.temperature)
+                    .with_top_p(resolved.top_p)
+                    .with_max_tokens(resolved.max_tokens)
+                    .with_connect_timeout(resolved.connect_timeout_secs)
+                    .with_event_timeout(resolved.stream_timeout_secs)
+                    .with_max_context_tokens(resolved.max_context_tokens),
+            );
+            // Eagerly warm the `/api/show` context-length cache so the budget
+            // resolver sees the model's real window on the very first turn
+            // instead of falling back to the universal default (the cache is
+            // otherwise cold until the first request). Fire-and-forget and
+            // best-effort; only runs when a tokio runtime is available (it
+            // always is during daemon startup / reload).
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let warm = Arc::clone(&ollama);
+                handle.spawn(async move {
+                    warm.warm_context_length().await;
+                });
+            }
+            ollama as Arc<dyn LlmClient>
+        }
         "anthropic" => {
             if resolved.api_key.is_empty() {
                 tracing::warn!(
@@ -207,7 +225,10 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
                     .with_base_url(resolved.base_url)
                     .with_temperature(resolved.temperature)
                     .with_top_p(resolved.top_p)
-                    .with_max_tokens_override(resolved.max_tokens);
+                    .with_max_tokens_override(resolved.max_tokens)
+                    .with_connect_timeout(resolved.connect_timeout_secs)
+                    .with_event_timeout(resolved.stream_timeout_secs)
+                    .with_max_context_tokens(resolved.max_context_tokens);
             if let Some(hts) = resolved.hosted_tool_search {
                 client = client.with_hosted_tool_search(hts);
             }
@@ -220,7 +241,10 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
                 .with_temperature(resolved.temperature)
                 .with_top_p(resolved.top_p)
                 .with_max_tokens(resolved.max_tokens)
-                .with_aws_profile(resolved.aws_profile),
+                .with_aws_profile(resolved.aws_profile)
+                .with_connect_timeout(resolved.connect_timeout_secs)
+                .with_event_timeout(resolved.stream_timeout_secs)
+                .with_max_context_tokens(resolved.max_context_tokens),
         ),
         _ => {
             if resolved.api_key.is_empty() {
@@ -233,7 +257,10 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
                 .with_base_url(resolved.base_url)
                 .with_temperature(resolved.temperature)
                 .with_top_p(resolved.top_p)
-                .with_max_tokens(resolved.max_tokens);
+                .with_max_tokens(resolved.max_tokens)
+                .with_connect_timeout(resolved.connect_timeout_secs)
+                .with_event_timeout(resolved.stream_timeout_secs)
+                .with_max_context_tokens(resolved.max_context_tokens);
             if let Some(hts) = resolved.hosted_tool_search {
                 client = client.with_hosted_tool_search(hts);
             }
@@ -445,12 +472,14 @@ mod tests {
             base_url: Some("https://api.openai.com/v1".to_string()),
             api_key_env: Some(key.to_string()),
             secret: None,
+            ..Default::default()
         })
     }
 
     fn ollama_local() -> ConnectionConfig {
         ConnectionConfig::Ollama(OllamaConnection {
             base_url: Some("http://localhost:11434".to_string()),
+            ..Default::default()
         })
     }
 
@@ -459,6 +488,7 @@ mod tests {
             base_url: Some("https://api.anthropic.com".to_string()),
             api_key_env: Some(key.to_string()),
             secret: None,
+            ..Default::default()
         })
     }
 
@@ -582,6 +612,7 @@ mod tests {
                     aws_profile: Some("work".to_string()),
                     region: Some("us-west-2".to_string()),
                     base_url: None,
+                    ..Default::default()
                 }),
             ),
         ];
@@ -672,6 +703,10 @@ mod tests {
             max_tokens: None,
             hosted_tool_search: None,
             aws_profile: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            keep_warm: false,
+            max_context_tokens: None,
         };
         let err = sanity_check_resolved(&resolved).unwrap_err();
         assert!(err.contains("base_url"), "got: {err}");
@@ -690,6 +725,10 @@ mod tests {
             max_tokens: None,
             hosted_tool_search: None,
             aws_profile: Some("work".to_string()),
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            keep_warm: false,
+            max_context_tokens: None,
         };
         sanity_check_resolved(&resolved).expect("bedrock without api key should pass");
     }
@@ -706,6 +745,10 @@ mod tests {
             max_tokens: None,
             hosted_tool_search: None,
             aws_profile: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            keep_warm: false,
+            max_context_tokens: None,
         };
         sanity_check_resolved(&resolved).expect("ollama without api key should pass");
     }
@@ -796,6 +839,7 @@ mod tests {
                 aws_profile: Some("work".to_string()),
                 region: Some("us-west-2".to_string()),
                 base_url: None,
+                ..Default::default()
             }),
         )];
         let config = config_from_pairs(pairs);

@@ -792,29 +792,57 @@ fn api_connection_config_to_core(c: api::ConnectionConfigView) -> ConnectionConf
         api::ConnectionConfigView::Anthropic {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => ConnectionConfigPayload::Anthropic {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         },
         api::ConnectionConfigView::OpenAi {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => ConnectionConfigPayload::OpenAi {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         },
         api::ConnectionConfigView::Bedrock {
             aws_profile,
             region,
             base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => ConnectionConfigPayload::Bedrock {
             aws_profile,
             region,
             base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         },
-        api::ConnectionConfigView::Ollama { base_url } => {
-            ConnectionConfigPayload::Ollama { base_url }
-        }
+        api::ConnectionConfigView::Ollama {
+            base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            keep_warm,
+            max_context_tokens,
+        } => ConnectionConfigPayload::Ollama {
+            base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            keep_warm,
+            max_context_tokens,
+        },
     }
 }
 
@@ -826,29 +854,57 @@ fn core_connection_config_to_api(c: ConnectionConfigPayload) -> api::ConnectionC
         ConnectionConfigPayload::Anthropic {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => api::ConnectionConfigView::Anthropic {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         },
         ConnectionConfigPayload::OpenAi {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => api::ConnectionConfigView::OpenAi {
             base_url,
             api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         },
         ConnectionConfigPayload::Bedrock {
             aws_profile,
             region,
             base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         } => api::ConnectionConfigView::Bedrock {
             aws_profile,
             region,
             base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
         },
-        ConnectionConfigPayload::Ollama { base_url } => {
-            api::ConnectionConfigView::Ollama { base_url }
-        }
+        ConnectionConfigPayload::Ollama {
+            base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            keep_warm,
+            max_context_tokens,
+        } => api::ConnectionConfigView::Ollama {
+            base_url,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            keep_warm,
+            max_context_tokens,
+        },
     }
 }
 

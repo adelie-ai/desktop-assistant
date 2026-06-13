@@ -363,6 +363,7 @@ mod tests {
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
                     base_url: Some(DEAD_OLLAMA.into()),
+                    ..Default::default()
                 }),
             )]),
             ..crate::config::DaemonConfig::default()
@@ -442,6 +443,7 @@ mod tests {
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
                     base_url: Some(DEAD_OLLAMA.into()),
+                    ..Default::default()
                 }),
             )]),
             ..crate::config::DaemonConfig::default()
@@ -517,6 +519,7 @@ mod tests {
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
                     base_url: Some(DEAD_OLLAMA.into()),
+                    ..Default::default()
                 }),
             )]),
             purposes,
@@ -550,6 +553,7 @@ mod tests {
                 "local".to_string(),
                 ConnectionConfig::Ollama(OllamaConnection {
                     base_url: Some(DEAD_OLLAMA.into()),
+                    ..Default::default()
                 }),
             )]),
             purposes,

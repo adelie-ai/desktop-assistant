@@ -32,6 +32,30 @@ use desktop_assistant_core::ports::llm::ModelInfo;
 ///
 /// Passing an empty `live` returns `curated` unchanged; passing an empty
 /// `curated` returns `live` de-duplicated by id (first occurrence wins).
+/// Fold a per-connection context-window hard cap together with a connector's
+/// reported/curated window into the **effective window** a connector should
+/// report from `LlmClient::max_context_tokens()`.
+///
+/// Shared by every connector so the "lesser wins, honour the cap even when the
+/// reported value is unknown" policy lives in exactly one place:
+///
+/// | `cap`     | `reported` | result      | rationale                               |
+/// |-----------|------------|-------------|-----------------------------------------|
+/// | `Some(c)` | `Some(r)`  | `min(c, r)` | clamp to the lesser                     |
+/// | `Some(c)` | `None`     | `Some(c)`   | honour the cap even with no curated entry |
+/// | `None`    | `Some(r)`  | `Some(r)`   | "max available" — float to the reported window |
+/// | `None`    | `None`     | `None`      | unknown — caller falls back to its default |
+///
+/// `cap == Some(0)` is treated as "no cap" by callers before this point (the
+/// builders normalise it away), so a `0` never collapses the window to nothing.
+pub fn apply_context_cap(cap: Option<u64>, reported: Option<u64>) -> Option<u64> {
+    match (cap, reported) {
+        (Some(c), Some(r)) => Some(c.min(r)),
+        (Some(c), None) => Some(c),
+        (None, r) => r,
+    }
+}
+
 pub fn merge_curated_with_live(curated: Vec<ModelInfo>, live: Vec<ModelInfo>) -> Vec<ModelInfo> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut merged: Vec<ModelInfo> = Vec::with_capacity(curated.len() + live.len());
@@ -49,6 +73,19 @@ pub fn merge_curated_with_live(curated: Vec<ModelInfo>, live: Vec<ModelInfo>) ->
 mod tests {
     use super::*;
     use desktop_assistant_core::ports::llm::{ModelCapabilities, ModelInfo};
+
+    #[test]
+    fn apply_context_cap_folds_cap_and_reported() {
+        // Lesser of cap and reported wins.
+        assert_eq!(apply_context_cap(Some(16_000), Some(32_768)), Some(16_000));
+        assert_eq!(apply_context_cap(Some(64_000), Some(32_768)), Some(32_768));
+        // Cap is honoured even before the reported value is known (cold cache).
+        assert_eq!(apply_context_cap(Some(16_000), None), Some(16_000));
+        // "Max available" floats to the reported window.
+        assert_eq!(apply_context_cap(None, Some(32_768)), Some(32_768));
+        // Nothing known → None, so the caller falls back to its default.
+        assert_eq!(apply_context_cap(None, None), None);
+    }
 
     fn model(id: &str, ctx: u64, reasoning: bool) -> ModelInfo {
         ModelInfo::new(id)
