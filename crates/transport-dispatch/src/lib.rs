@@ -149,6 +149,24 @@ impl EventSink for ChannelEventSink {
     }
 }
 
+/// Best-effort sink registered in [`ConversationSubscriptions`] for fanning a
+/// turn's events to OTHER connections viewing the conversation (#1). Uses
+/// `try_send`, so a slow or backed-up viewer drops events (and resyncs on its
+/// next reload) instead of backpressuring the *originating* turn — the live
+/// render is a convenience, never a guarantee, and the sender's own stream
+/// stays reliable on its separate [`ChannelEventSink`].
+struct FanoutTargetSink {
+    tx: mpsc::Sender<WsFrame>,
+}
+
+#[async_trait::async_trait]
+impl EventSink for FanoutTargetSink {
+    async fn emit(&self, event: api::Event) -> bool {
+        // Non-blocking: a full or closed channel drops rather than awaiting.
+        self.tx.try_send(WsFrame::Event { event }).is_ok()
+    }
+}
+
 /// Run the dispatcher loop on `inbound` / `outbound` until the inbound
 /// stream ends or the outbound sink errors.
 ///
@@ -229,6 +247,21 @@ pub async fn dispatch_loop<R, W>(
     // teardown so the broadcast receiver is dropped cleanly.
     let mut bg_subscription: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Per-connection conversation subscriptions (#1 live multi-client sync).
+    // When the handler provides the registry, register this connection's
+    // best-effort fan-out sink under its session id so a turn in any
+    // conversation it later subscribes to is delivered here. The set of
+    // subscribed conversations is applied by `SubscribeConversations`; the
+    // registration is torn down on disconnect. `None` keeps the prior behaviour
+    // (turn events reach only the initiating connection).
+    let conv_subs = handler.conversation_subscriptions();
+    if let Some(ref subs) = conv_subs {
+        subs.register(
+            &auth.session_id,
+            Arc::new(FanoutTargetSink { tx: out_tx.clone() }),
+        );
+    }
+
     while let Some(item) = inbound.next().await {
         let req = match item {
             Ok(req) => req,
@@ -265,6 +298,10 @@ pub async fn dispatch_loop<R, W>(
             } => {
                 // Per-request id for event correlation (matches old WS path).
                 let request_id = uuid::Uuid::new_v4().to_string();
+                // Reliable delivery to THIS connection. The handler additionally
+                // fans each turn event to other connections viewing the
+                // conversation (#1) — done there, not here, so the fan-out is
+                // transport-agnostic and also covers voice turns over D-Bus.
                 let sink: Arc<dyn EventSink> = Arc::new(ChannelEventSink::new(out_tx.clone()));
 
                 // Prefer the new `start_send_message` registration
@@ -530,6 +567,27 @@ pub async fn dispatch_loop<R, W>(
                 }
             }
 
+            api::Command::SubscribeConversations { conversation_ids } => {
+                // Set-replace the conversations this connection is viewing (#1).
+                // When the registry is attached, the connection's fan-out sink
+                // (registered on connect) now receives turn events for these
+                // conversations from other connections. A no-registry handler
+                // just Acks — the feature is simply off, the client unaffected.
+                if let Some(ref subs) = conv_subs {
+                    subs.set_subscriptions(&auth.session_id, conversation_ids);
+                }
+                if out_tx
+                    .send(WsFrame::Result {
+                        id: req.id,
+                        result: api::CommandResult::Ack,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
             api::Command::SetConfig { changes } => {
                 let res = with_user_id(
                     user_id.clone(),
@@ -649,6 +707,13 @@ pub async fn dispatch_loop<R, W>(
     // shuts down (#114).
     if let Some(handle) = bg_subscription.take() {
         handle.abort();
+    }
+
+    // Drop this connection's conversation subscriptions + fan-out sink (#1) so
+    // the registry stays bounded by live connections and no turn is routed to a
+    // dead channel.
+    if let Some(ref subs) = conv_subs {
+        subs.unregister(&auth.session_id);
     }
 
     // Connection closed: evict any client-local tools this session

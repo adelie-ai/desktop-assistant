@@ -1684,7 +1684,14 @@ async fn main() -> Result<()> {
         Arc::clone(&connections_service),
         Arc::clone(&knowledge_service),
     )
-    .with_registry(Arc::clone(&background_task_registry));
+    .with_registry(Arc::clone(&background_task_registry))
+    // Live multi-client sync (#1): one shared subscription registry, so a turn
+    // started by any connection (or by voice) is fanned to every other
+    // connection viewing that conversation. Shared via the single handler all
+    // dispatch loops hold, so every connection sees the same registrations.
+    .with_conversation_subscriptions(Arc::new(
+        desktop_assistant_application::conversation_subs::ConversationSubscriptions::new(),
+    ));
     if let Some((write, get_many, list, delete_many, clear)) = scratchpad_handler_fns {
         api_handler_impl =
             api_handler_impl.with_scratchpad(write, get_many, list, delete_many, clear);

@@ -5,6 +5,7 @@
 
 pub mod background_tasks;
 pub mod client_tools;
+pub mod conversation_subs;
 mod inflight;
 pub mod subagent_tools;
 
@@ -257,6 +258,18 @@ pub trait AssistantApiHandler: Send + Sync {
         None
     }
 
+    /// The per-connection conversation-subscription registry (#1 live
+    /// multi-client sync), or `None` when the daemon was built without it — in
+    /// which case turn events reach only the connection that initiated them, as
+    /// before (graceful degradation). The dispatcher registers each connection's
+    /// sink here, applies `SubscribeConversations`, and fans a turn's events to
+    /// every other connection viewing that conversation.
+    fn conversation_subscriptions(
+        &self,
+    ) -> Option<Arc<crate::conversation_subs::ConversationSubscriptions>> {
+        None
+    }
+
     /// Register a `SendMessage` request as a background task and
     /// return the new task id synchronously. The body runs in the
     /// background; events stream through `sink` as before.
@@ -433,6 +446,11 @@ where
     /// pre-#234 behaviour: the two commands return `Unsupported` and every
     /// tool is server-side.
     client_tools: Option<ClientToolWiring>,
+    /// Optional per-connection conversation-subscription registry (#1 live
+    /// multi-client sync). When attached, the dispatcher fans a turn's events to
+    /// every other connection viewing that conversation. `None` keeps the prior
+    /// behaviour: turn events reach only the initiating connection.
+    conversation_subs: Option<Arc<crate::conversation_subs::ConversationSubscriptions>>,
 }
 
 /// The handler-resident client-tool dependencies (#234). Both halves are
@@ -475,6 +493,7 @@ where
             idempotency: None,
             inflight: Arc::new(InFlightRegistry::default()),
             client_tools: None,
+            conversation_subs: None,
         }
     }
 
@@ -521,6 +540,40 @@ where
     pub fn with_registry(mut self, registry: Arc<BackgroundTaskRegistry>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    /// Attach the per-connection conversation-subscription registry (#1) so the
+    /// dispatcher can fan a turn's events to every other connection viewing that
+    /// conversation (live multi-client sync). The daemon wires one shared
+    /// instance in `main.rs`; callers that skip it keep turn events scoped to
+    /// the initiating connection.
+    pub fn with_conversation_subscriptions(
+        mut self,
+        subs: Arc<crate::conversation_subs::ConversationSubscriptions>,
+    ) -> Self {
+        self.conversation_subs = Some(subs);
+        self
+    }
+
+    /// Wrap a fresh turn's event sink so each event also fans to other
+    /// connections viewing the conversation (#1 live multi-client sync). A no-op
+    /// when the subscription registry isn't attached. The origin — this
+    /// request's connection session — is excluded from the fan-out (it receives
+    /// the events through `sink` directly). Read the session here, before any
+    /// spawn, while the dispatcher's per-request session scope is still active.
+    /// Applied only to the fresh-turn path, never to idempotent replays, so a
+    /// retried turn's stored reply is not re-broadcast to viewers.
+    fn fanout_sink(&self, sink: Arc<dyn EventSink>) -> Arc<dyn EventSink> {
+        match &self.conversation_subs {
+            Some(subs) => Arc::new(crate::conversation_subs::FanOutSink::new(
+                sink,
+                Arc::clone(subs),
+                desktop_assistant_core::ports::session::current_session_id()
+                    .as_str()
+                    .to_string(),
+            )),
+            None => sink,
+        }
     }
 
     /// Borrow the registry, if one is attached. Public so #112/#113 can
@@ -1595,6 +1648,9 @@ where
             // `Event::Task*` frames to the connection.
             api::Command::SubscribeBackgroundTasks => Ok(api::CommandResult::Ack),
             api::Command::UnsubscribeBackgroundTasks => Ok(api::CommandResult::Ack),
+            // Dispatcher-handled (it owns the per-connection subscription set +
+            // fan-out sink, #1); Ack here for the direct-call path.
+            api::Command::SubscribeConversations { .. } => Ok(api::CommandResult::Ack),
 
             // Standalone agent spawn (issue #113). Creates a fresh
             // conversation scoped to the calling user, registers a
@@ -1857,6 +1913,11 @@ where
         // records the reply on completion for a future retry.
         let idempotency = self.idempotency.clone().zip(idempotency_key);
 
+        // Fan this fresh turn's events to other connections viewing the
+        // conversation (#1); no-op without the registry. After the replay
+        // shortcut above, so a replayed reply is not re-broadcast.
+        let sink = self.fanout_sink(sink);
+
         // When a registry is attached we route the turn body through
         // it so the user has a cancellable, identifiable handle on the
         // running work (#111). When no registry is attached we fall back
@@ -2005,6 +2066,11 @@ where
         };
         let title = format!("Conversation: {conversation_id}");
 
+        // Fan this fresh turn's events to other connections viewing the
+        // conversation (#1); no-op without the registry. After the reattach /
+        // completed-replay shortcuts above, so only a genuinely fresh turn fans.
+        let sink = self.fanout_sink(sink);
+
         // A keyed turn emits through a `TeeSink` so its events both reach the
         // caller and feed the in-flight hub for re-attachers; an unkeyed turn
         // emits straight to the caller's sink.
@@ -2096,6 +2162,12 @@ where
         let registry = self.registry.as_ref()?;
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
         Some(registry.subscribe(&user_id))
+    }
+
+    fn conversation_subscriptions(
+        &self,
+    ) -> Option<Arc<crate::conversation_subs::ConversationSubscriptions>> {
+        self.conversation_subs.clone()
     }
 }
 
@@ -3783,6 +3855,58 @@ mod tests {
         assert!(matches!(evs[1], api::Event::AssistantDelta { .. }));
         assert!(matches!(evs[2], api::Event::AssistantDelta { .. }));
         assert!(matches!(evs[3], api::Event::AssistantCompleted { .. }));
+    }
+
+    /// #1 live multi-client sync: a turn fans its events to other connections
+    /// viewing the conversation, and excludes the originating connection (which
+    /// gets them through its own request stream).
+    #[tokio::test]
+    async fn turn_fans_out_to_other_subscribers_excluding_origin() {
+        let subs = Arc::new(crate::conversation_subs::ConversationSubscriptions::new());
+
+        // A viewer connection looking at c1, on a different session than the
+        // sender (whose session is "unscoped" with no `with_session_id` scope).
+        let viewer = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        subs.register("viewer-session", viewer.clone());
+        subs.set_subscriptions("viewer-session", vec!["c1".to_string()]);
+
+        // A connection registered under the SENDER's own session, also viewing
+        // c1 — it must NOT be fanned its own turn.
+        let self_view = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        subs.register("unscoped", self_view.clone());
+        subs.set_subscriptions("unscoped", vec!["c1".to_string()]);
+
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_conversation_subscriptions(Arc::clone(&subs));
+
+        let origin = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message("c1".into(), "hi".into(), "r1".into(), origin.clone())
+            .await
+            .unwrap();
+
+        let viewed = viewer.0.lock().await.clone();
+        assert!(
+            viewed
+                .iter()
+                .any(|e| matches!(e, api::Event::UserMessageAdded { .. })),
+            "viewer of c1 must receive the user message live: {viewed:?}"
+        );
+        assert!(
+            viewed
+                .iter()
+                .any(|e| matches!(e, api::Event::AssistantCompleted { .. })),
+            "viewer of c1 must receive the assistant reply live: {viewed:?}"
+        );
+        assert!(
+            self_view.0.lock().await.is_empty(),
+            "a connection on the origin's own session must be excluded from the fan-out"
+        );
     }
 
     #[tokio::test]
