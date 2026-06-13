@@ -134,6 +134,14 @@ pub fn translate(event: api::Event) -> ForwardAction {
         api::Event::ConfigChanged { config } => ForwardAction::ConfigChanged {
             config: config_data_from_event(&config),
         },
+        // Live user-message echo (#1) is a UDS/WS-protocol concern — the GUI
+        // clients that render an external turn's user bubble live (adele-gtk,
+        // adele-tui) subscribe over UDS/WS. The sole D-Bus client (voice) is the
+        // *producer* of these turns, not a renderer, so there is no D-Bus signal
+        // for it. Deliberate ignore rather than a missed translation.
+        api::Event::UserMessageAdded { .. } => ForwardAction::Ignored {
+            kind: "user_message_added",
+        },
         api::Event::AssistantStatus { .. } => ForwardAction::Ignored {
             kind: "assistant_status",
         },

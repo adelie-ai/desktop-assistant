@@ -2510,6 +2510,20 @@ where
         }
     });
 
+    // Announce the user's prompt to every client viewing this conversation —
+    // including ones that did NOT initiate this turn (a voice turn, or a second
+    // client on the same account) — so they render the user bubble live rather
+    // than only after a reload (#1). Emitted before dispatch so it precedes the
+    // assistant's chunks; the initiating client dedupes on `request_id` (it
+    // already rendered the bubble optimistically).
+    let _ = sink
+        .emit(api::Event::UserMessageAdded {
+            conversation_id: conversation_id.clone(),
+            request_id: request_id.clone(),
+            content: content.clone(),
+        })
+        .await;
+
     // Bridge chunks from core callback -> canonical events.
     let conv_id_for_cb = conversation_id.clone();
     let req_id_for_cb = request_id.clone();
@@ -3762,9 +3776,12 @@ mod tests {
             .unwrap();
 
         let evs = sink.0.lock().await.clone();
-        assert!(matches!(evs[0], api::Event::AssistantDelta { .. }));
+        // A turn now opens with `UserMessageAdded` (#1) so viewers can render the
+        // user bubble live, before the assistant's deltas stream in.
+        assert!(matches!(evs[0], api::Event::UserMessageAdded { .. }));
         assert!(matches!(evs[1], api::Event::AssistantDelta { .. }));
-        assert!(matches!(evs[2], api::Event::AssistantCompleted { .. }));
+        assert!(matches!(evs[2], api::Event::AssistantDelta { .. }));
+        assert!(matches!(evs[3], api::Event::AssistantCompleted { .. }));
     }
 
     #[tokio::test]

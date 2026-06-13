@@ -1073,6 +1073,31 @@ async fn ws_send_message_ack_then_streaming_events() {
         other => panic!("expected SendMessageAck, got {other:?}"),
     };
 
+    // A turn now opens with `UserMessageAdded` (#1) — the user's prompt echoed
+    // to every viewer so they can render the bubble live — before the
+    // assistant's deltas. It carries the same request_id as the ack/stream.
+    let user_msg =
+        serde_json::from_str::<WsFrame>(&ws.next().await.unwrap().unwrap().into_text().unwrap())
+            .unwrap();
+    match user_msg {
+        WsFrame::Event {
+            event:
+                desktop_assistant_api_model::Event::UserMessageAdded {
+                    conversation_id,
+                    request_id,
+                    content,
+                },
+        } => {
+            assert_eq!(conversation_id, "c1");
+            assert_eq!(content, "hello");
+            assert_eq!(
+                request_id, ack_request_id,
+                "UserMessageAdded request_id must match the SendMessageAck request_id"
+            );
+        }
+        other => panic!("expected UserMessageAdded, got {other:?}"),
+    }
+
     let second =
         serde_json::from_str::<WsFrame>(&ws.next().await.unwrap().unwrap().into_text().unwrap())
             .unwrap();

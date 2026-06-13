@@ -7,6 +7,16 @@ pub enum SignalEvent {
     // frames) so a client can route a turn it did NOT initiate — e.g. a voice
     // turn streaming into a conversation the GUI is merely viewing — to the
     // right chat view, instead of only rendering streams it started itself.
+    /// A user message was committed and a turn started (api `UserMessageAdded`).
+    /// Emitted for every send turn, including ones this client did not initiate
+    /// (a voice turn, or another client on the same account). The client renders
+    /// the user bubble live in the matching `conversation_id`; the initiator
+    /// dedupes on `request_id` (it already rendered the bubble optimistically).
+    UserMessageAdded {
+        conversation_id: String,
+        request_id: String,
+        content: String,
+    },
     Chunk {
         conversation_id: String,
         request_id: String,
