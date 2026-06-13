@@ -126,6 +126,7 @@ fn restamp_request_id(mut event: api::Event, request_id: &str) -> api::Event {
     match &mut event {
         api::Event::AssistantDelta { request_id: r, .. }
         | api::Event::AssistantStatus { request_id: r, .. }
+        | api::Event::ContextUsage { request_id: r, .. }
         | api::Event::AssistantCompleted { request_id: r, .. }
         | api::Event::AssistantError { request_id: r, .. } => {
             *r = request_id.to_string();

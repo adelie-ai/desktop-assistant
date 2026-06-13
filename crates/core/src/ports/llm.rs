@@ -15,6 +15,29 @@ pub type ChunkCallback = Box<dyn FnMut(String) -> bool + Send>;
 /// (e.g. "Searching knowledge base...", "Querying timeclock sessions...").
 pub type StatusCallback = Box<dyn FnMut(String) + Send>;
 
+/// Per-turn context-window fill snapshot reported by the dispatch loop after
+/// each LLM call (issue #341). Carries token COUNTS only — never message
+/// content — so a client can render a "used / budget (%)" indicator and shift
+/// colour as the proactive-compaction line is approached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsage {
+    /// Prompt/input tokens the provider reported for this turn.
+    pub used_tokens: u64,
+    /// Resolved max input-token budget for this turn.
+    pub budget_tokens: u64,
+    /// `true` once the effective window was shrunk and the dropped range
+    /// compacted on this turn (proactive compaction ran).
+    pub compaction_active: bool,
+}
+
+/// Sink the dispatch loop calls with each turn's [`ContextUsage`]. Installed
+/// as a task-local by the daemon/application transport layer (which owns the
+/// event channel) via [`with_context_usage_sink`]; read in `send_prompt` via
+/// [`emit_context_usage`]. `Arc<dyn Fn>` so it is `Clone` for the task-local
+/// slot and may fan to the event sink from any concurrent turn. Unset outside
+/// the scope (tests, dreaming jobs), in which case emission is a no-op.
+pub type ContextUsageSink = std::sync::Arc<dyn Fn(ContextUsage) + Send + Sync>;
+
 tokio::task_local! {
     /// Per-turn reasoning configuration. Set by the daemon-side routing
     /// handler via [`with_reasoning_config`] before invoking `send_prompt`;
@@ -55,6 +78,16 @@ tokio::task_local! {
     /// in `service::ConversationHandler` doesn't need to know the daemon's
     /// resolution logic.
     static CONTEXT_BUDGET: ContextBudget;
+
+    /// Per-turn context-usage sink (issue #341). Installed by the transport
+    /// layer (which owns the client event channel) via
+    /// [`with_context_usage_sink`]; the dispatch loop reports each turn's fill
+    /// via [`emit_context_usage`]. Lives in core so the read site in
+    /// `service::ConversationHandler` need not know the transport's event
+    /// plumbing — same rationale as [`CONTEXT_BUDGET`]. Unset for callers that
+    /// don't route through the transport layer (tests, dreaming jobs), where
+    /// emission is a silent no-op.
+    static CONTEXT_USAGE_SINK: ContextUsageSink;
 
     /// Per-turn cancellation token for `send_prompt` (issue #109).
     ///
@@ -290,6 +323,24 @@ where
 /// from `max_context_tokens()`.
 pub fn current_context_budget() -> Option<ContextBudget> {
     CONTEXT_BUDGET.try_with(|b| *b).ok()
+}
+
+/// Run `fut` with `sink` installed as the per-turn context-usage sink.
+/// The dispatch loop reports each turn's [`ContextUsage`] via
+/// [`emit_context_usage`], which the transport layer forwards as an
+/// `Event::ContextUsage` on the client stream (issue #341).
+pub async fn with_context_usage_sink<F, T>(sink: ContextUsageSink, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CONTEXT_USAGE_SINK.scope(sink, fut).await
+}
+
+/// Report this turn's context fill to the installed sink, if any. A silent
+/// no-op when no sink is installed (tests, dreaming jobs) — context usage is
+/// best-effort telemetry, never load-bearing for the turn's outcome.
+pub fn emit_context_usage(usage: ContextUsage) {
+    let _ = CONTEXT_USAGE_SINK.try_with(|sink| sink(usage));
 }
 
 /// Run `fut` with `token` installed as the per-turn cancellation token.
@@ -1597,6 +1648,68 @@ mod tests {
         })
         .await;
         assert_eq!(observed, Some(inner_budget));
+    }
+
+    // --- CONTEXT_USAGE_SINK tests (issue #341) --------------------------
+
+    #[tokio::test]
+    async fn emit_context_usage_is_noop_when_no_sink_installed() {
+        // No `with_context_usage_sink` wrapper — the foreground send path,
+        // a dreaming job, or a unit test. Emission must be a silent no-op,
+        // never a panic: context usage is best-effort telemetry.
+        emit_context_usage(ContextUsage {
+            used_tokens: 100,
+            budget_tokens: 1_000,
+            compaction_active: false,
+        });
+    }
+
+    #[tokio::test]
+    async fn emit_context_usage_invokes_installed_sink() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_sink = std::sync::Arc::clone(&captured);
+        let sink: ContextUsageSink = std::sync::Arc::new(move |u: ContextUsage| {
+            captured_for_sink.lock().unwrap().push(u);
+        });
+
+        with_context_usage_sink(sink, async {
+            emit_context_usage(ContextUsage {
+                used_tokens: 12_000,
+                budget_tokens: 32_000,
+                compaction_active: false,
+            });
+            emit_context_usage(ContextUsage {
+                used_tokens: 30_000,
+                budget_tokens: 32_000,
+                compaction_active: true,
+            });
+        })
+        .await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                ContextUsage {
+                    used_tokens: 12_000,
+                    budget_tokens: 32_000,
+                    compaction_active: false,
+                },
+                ContextUsage {
+                    used_tokens: 30_000,
+                    budget_tokens: 32_000,
+                    compaction_active: true,
+                },
+            ]
+        );
+
+        // After the scope exits the slot is unset again — emission no-ops.
+        emit_context_usage(ContextUsage {
+            used_tokens: 1,
+            budget_tokens: 2,
+            compaction_active: false,
+        });
+        assert_eq!(captured.lock().unwrap().len(), 2);
     }
 
     // --- TOOL_ALLOWLIST tests (issues #112 / #113) ----------------------

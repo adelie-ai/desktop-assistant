@@ -2441,6 +2441,9 @@ where
     C: ConversationService + Send + Sync + 'static,
 {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<api::Event>(STREAM_EVENT_BUFFER);
+    // Cloned before `tx` is moved into the chunk callback below; used by the
+    // context-usage sink (#341) installed around the dispatch.
+    let usage_tx = tx.clone();
 
     let sink_for_forwarder = Arc::clone(&sink);
     let forwarder = tokio::spawn(async move {
@@ -2516,12 +2519,34 @@ where
     // client-local tools and suspend on a call. Outermost: a tool observer
     // (when this turn is a tracked task) so the loop's tool/MCP calls land in
     // the task's log ring for the panel's activity feed.
+    // Context-usage sink (#341): the core dispatch loop reports each turn's
+    // fill (used / budget tokens + compaction flag) via this sink, which we
+    // forward as `Event::ContextUsage` on the same channel the chunk/status
+    // callbacks use. `try_send` is synchronous and non-blocking — usage is
+    // best-effort telemetry, so a full buffer simply drops the report rather
+    // than stalling the turn. Token COUNTS only; no message content crosses.
+    let conv_id_for_usage = conversation_id.clone();
+    let req_id_for_usage = request_id.clone();
+    let usage_sink: desktop_assistant_core::ports::llm::ContextUsageSink = Arc::new(
+        move |usage: desktop_assistant_core::ports::llm::ContextUsage| {
+            let _ = usage_tx.try_send(api::Event::ContextUsage {
+                conversation_id: conv_id_for_usage.clone(),
+                request_id: req_id_for_usage.clone(),
+                used_tokens: usage.used_tokens,
+                budget_tokens: usage.budget_tokens,
+                compaction_active: usage.compaction_active,
+            });
+        },
+    );
+
     let dispatched = async move {
         match client_tool_port {
             Some(port) => with_client_tools(port, dispatch).await,
             None => dispatch.await,
         }
     };
+    let dispatched =
+        desktop_assistant_core::ports::llm::with_context_usage_sink(usage_sink, dispatched);
     // Install this turn's task-tool observer when tracked by a registry task
     // (#256 — shared with the agent path). The companion `progress_hint` clear
     // lives in the registry's panic-safe `finalize` (#254), so there is no

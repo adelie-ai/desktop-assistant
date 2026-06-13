@@ -19,6 +19,18 @@ pub enum SignalEvent {
         request_id: String,
         message: String,
     },
+    /// Per-turn context-window fill report (issue #341): `used_tokens` of
+    /// `budget_tokens` consumed this turn, plus whether proactive compaction
+    /// ran. Carries token COUNTS only — clients render a "used / budget (%)"
+    /// indicator and shift colour toward the 0.85 compaction line. Delivered
+    /// on the same stream as `Status`.
+    ContextUsage {
+        conversation_id: String,
+        request_id: String,
+        used_tokens: u64,
+        budget_tokens: u64,
+        compaction_active: bool,
+    },
     TitleChanged {
         conversation_id: String,
         title: String,

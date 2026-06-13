@@ -137,6 +137,14 @@ pub fn translate(event: api::Event) -> ForwardAction {
         api::Event::AssistantStatus { .. } => ForwardAction::Ignored {
             kind: "assistant_status",
         },
+        // Context-usage fill (issue #341) is a UDS/WS-protocol concern — the
+        // clients that render the indicator (adele-tui, adele-gtk, KDE) all
+        // subscribe over UDS/WS. The sole D-Bus client (voice) does not show
+        // a context indicator, so there is no D-Bus signal for it. Recorded
+        // as a deliberate ignore rather than a missed translation.
+        api::Event::ContextUsage { .. } => ForwardAction::Ignored {
+            kind: "context_usage",
+        },
         api::Event::ConversationTitleChanged { .. } => ForwardAction::Ignored {
             kind: "conversation_title_changed",
         },

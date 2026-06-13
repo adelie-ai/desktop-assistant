@@ -1208,6 +1208,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             {
                 let max_tokens = budget.max_input_tokens;
                 let threshold = (max_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
+                // Whether proactive compaction actually ran this turn — set
+                // only when we both crossed the threshold AND were able to
+                // shrink the window. Reported to clients so the indicator can
+                // show that summarization is active (#341).
+                let mut compaction_active = false;
                 if input_tokens > threshold {
                     let new_window = (target_window / 2).max(MIN_CONTEXT_MESSAGES);
                     if new_window < target_window {
@@ -1229,6 +1234,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             conv.context_summary = summary;
                             conv.compacted_through = to;
                         }
+                        compaction_active = true;
                     } else {
                         tracing::debug!(
                             input_tokens,
@@ -1238,6 +1244,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         );
                     }
                 }
+                // Surface the fill to subscribed clients (#341). Token counts
+                // only — no message content crosses this boundary.
+                crate::ports::llm::emit_context_usage(crate::ports::llm::ContextUsage {
+                    used_tokens: input_tokens,
+                    budget_tokens: max_tokens,
+                    compaction_active,
+                });
             }
 
             if !response.has_tool_calls() {
@@ -4432,6 +4445,159 @@ mod tests {
         assert_eq!(
             after.compacted_through, 0,
             "no compaction expected when token usage is below threshold"
+        );
+    }
+
+    // --- Context-usage emission tests (issue #341) ----------------------
+
+    /// Run one turn with a [`ContextUsage`](crate::ports::llm::ContextUsage)
+    /// sink + the given budget installed, returning every usage report the
+    /// dispatch loop emitted. `input_tokens` is what the mock LLM reports;
+    /// `prime_messages` seeds the conversation so the window-shrink path can
+    /// be exercised when desired.
+    async fn capture_context_usage(
+        input_tokens: u64,
+        max_context: u64,
+        prime_messages: usize,
+    ) -> Vec<crate::ports::llm::ContextUsage> {
+        use crate::ports::llm::{
+            BudgetSource, ContextBudget, ContextUsage, ContextUsageSink, with_context_budget,
+            with_context_usage_sink,
+        };
+
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            TokenReportingLlm {
+                text: "ok".into(),
+                input_tokens,
+                max_context: Some(max_context),
+            },
+            Box::new(|| "conv-1".to_string()),
+        );
+
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+        if prime_messages > 0 {
+            let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+            for i in 0..prime_messages {
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                stored.messages.push(Message::new(role, format!("m-{i}")));
+            }
+            handler.store.update(stored).await.unwrap();
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_sink = Arc::clone(&captured);
+        let sink: ContextUsageSink = Arc::new(move |u: ContextUsage| {
+            captured_for_sink.lock().unwrap().push(u);
+        });
+
+        let budget = ContextBudget {
+            max_input_tokens: max_context,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            with_context_usage_sink(sink, async {
+                handler
+                    .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                    .await
+                    .unwrap();
+            })
+            .await
+        })
+        .await;
+
+        captured.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn emits_context_usage_with_correct_used_and_budget() {
+        // A modest fill well under the 0.85 line: report used/budget verbatim,
+        // compaction not active.
+        let reports = capture_context_usage(12_000, 32_000, 4).await;
+        assert_eq!(reports.len(), 1, "exactly one usage report per turn");
+        let r = reports[0];
+        assert_eq!(r.used_tokens, 12_000);
+        assert_eq!(r.budget_tokens, 32_000);
+        assert!(!r.compaction_active);
+    }
+
+    #[tokio::test]
+    async fn emits_context_usage_at_0_85_boundary_without_compaction() {
+        // Exactly at the threshold: the pressure branch uses `>` (strictly
+        // greater), so being *at* 0.85 does NOT trigger compaction. The
+        // 0.85 amber colour decision is the client's; the daemon only flags
+        // compaction when it actually ran. 27_200 == 0.85 * 32_000.
+        let reports = capture_context_usage(27_200, 32_000, 4).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].used_tokens, 27_200);
+        assert_eq!(reports[0].budget_tokens, 32_000);
+        assert!(
+            !reports[0].compaction_active,
+            "at exactly 0.85 the strict `>` threshold must not flag compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_context_usage_flagging_compaction_when_window_shrinks() {
+        // Above the threshold with enough primed history that the window can
+        // actually shrink → compaction ran → flag set. used > budget here
+        // (overflow), which clients render red.
+        let reports = capture_context_usage(40_000, 32_000, MAX_CONTEXT_MESSAGES + 20).await;
+        assert_eq!(reports.len(), 1);
+        let r = reports[0];
+        assert_eq!(r.used_tokens, 40_000);
+        assert_eq!(r.budget_tokens, 32_000);
+        assert!(
+            r.used_tokens > r.budget_tokens,
+            "overflow case: used exceeds budget"
+        );
+        assert!(
+            r.compaction_active,
+            "above threshold with shrinkable window must flag compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_context_usage_emitted_when_budget_unset() {
+        use crate::ports::llm::{ContextUsage, ContextUsageSink, with_context_usage_sink};
+
+        // No budget installed (foreground send / background job): the
+        // token-pressure branch is gated on `current_context_budget()`, so
+        // no usage is reported even though the LLM reported input tokens.
+        // This is the "used==0 at turn start / budget unknown" graceful case
+        // — clients simply never see a report and render nothing.
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            TokenReportingLlm {
+                text: "ok".into(),
+                input_tokens: 5_000,
+                max_context: Some(32_000),
+            },
+            Box::new(|| "conv-1".to_string()),
+        );
+        let conv = handler.create_conversation("Test".into()).await.unwrap();
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_sink = Arc::clone(&captured);
+        let sink: ContextUsageSink = Arc::new(move |u: ContextUsage| {
+            captured_for_sink.lock().unwrap().push(u);
+        });
+        // Sink installed, but NO `with_context_budget` wrapper.
+        with_context_usage_sink(sink, async {
+            handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
+
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "no budget installed → no context-usage report"
         );
     }
 

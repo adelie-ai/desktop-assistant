@@ -502,6 +502,26 @@ pub enum Event {
         message: String,
     },
 
+    /// Per-turn context-window fill report (issue #341). Emitted after each
+    /// LLM call once the provider reports input-token usage and the per-turn
+    /// budget is known, so clients can render a "used / budget (%)" indicator
+    /// and shift colour as the proactive-compaction line (0.85 of budget) is
+    /// approached. Carries token COUNTS only — never message content — and is
+    /// purely advisory: a client that does not understand it ignores it.
+    ContextUsage {
+        conversation_id: String,
+        request_id: String,
+        /// Prompt/input tokens the provider reported for this turn.
+        used_tokens: u64,
+        /// Resolved max input-token budget for this turn (three-tier
+        /// resolution: purpose override → connector table → fallback).
+        budget_tokens: u64,
+        /// `true` once the effective message window was shrunk and the
+        /// dropped range compacted on this turn (proactive compaction ran).
+        #[serde(default)]
+        compaction_active: bool,
+    },
+
     /// Streaming chunk for a content response.
     AssistantDelta {
         conversation_id: String,

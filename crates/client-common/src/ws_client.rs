@@ -419,6 +419,19 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             request_id,
             message,
         }),
+        api::Event::ContextUsage {
+            conversation_id,
+            request_id,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
+        } => Some(SignalEvent::ContextUsage {
+            conversation_id,
+            request_id,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
+        }),
         api::Event::ConfigChanged { .. } => None,
         api::Event::ConversationWarningEmitted {
             conversation_id,
@@ -497,6 +510,35 @@ mod tests {
             error: "oops".to_string(),
         });
         assert!(matches!(error, Some(SignalEvent::Error { .. })));
+    }
+
+    #[test]
+    fn maps_context_usage_event() {
+        // Issue #341: the per-turn fill report crosses to the signal stream
+        // with its counts and flag intact so clients can render the indicator.
+        let signal = map_event_to_signal(api::Event::ContextUsage {
+            conversation_id: "c1".to_string(),
+            request_id: "r1".to_string(),
+            used_tokens: 12_000,
+            budget_tokens: 32_000,
+            compaction_active: true,
+        });
+        match signal {
+            Some(SignalEvent::ContextUsage {
+                conversation_id,
+                request_id,
+                used_tokens,
+                budget_tokens,
+                compaction_active,
+            }) => {
+                assert_eq!(conversation_id, "c1");
+                assert_eq!(request_id, "r1");
+                assert_eq!(used_tokens, 12_000);
+                assert_eq!(budget_tokens, 32_000);
+                assert!(compaction_active);
+            }
+            other => panic!("expected SignalEvent::ContextUsage, got {other:?}"),
+        }
     }
 
     #[test]
