@@ -263,6 +263,19 @@ pub enum Command {
     SubscribeBackgroundTasks,
     /// Stop receiving `Task*` events on this connection.
     UnsubscribeBackgroundTasks,
+    /// Replace the set of conversations this connection is viewing (#1 live
+    /// multi-client sync). The daemon fans this connection's turn events
+    /// (`UserMessageAdded`/`AssistantDelta`/`AssistantCompleted`/`AssistantError`/
+    /// `AssistantStatus`) for any subscribed conversation to it — including
+    /// turns it did NOT initiate (a voice turn, or another client on the same
+    /// account) — so it can render them live. Set-replace, not a delta: the
+    /// client sends the WHOLE set each time its viewed set changes (open,
+    /// switch, close, tabs), so there is no per-side count to drift. An empty
+    /// list unsubscribes from all. A connection still receives turns it
+    /// initiated via its own request stream regardless of this set.
+    SubscribeConversations {
+        conversation_ids: Vec<String>,
+    },
     /// Launch a user-initiated standalone background agent. Returns
     /// `CommandResult::BackgroundTaskSpawned { id }` on success.
     SpawnStandaloneAgent {
