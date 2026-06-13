@@ -547,6 +547,7 @@ mod tests {
         let mut b = register(&subs);
 
         tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
             request_id: "r".into(),
             chunk: "hi".into(),
         })
@@ -565,6 +566,7 @@ mod tests {
         drop(gone); // its receiver is dropped — must not break delivery to `live`
 
         tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
             request_id: "r".into(),
             chunk: "one".into(),
         })
@@ -572,6 +574,7 @@ mod tests {
         assert!(matches!(live.recv().await, Some(SignalEvent::Chunk { .. })));
         // After the dead subscriber is retained-out, only `live` remains.
         tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
             request_id: "r".into(),
             chunk: "two".into(),
         })
@@ -628,6 +631,7 @@ mod tests {
         // Send three events spaced under the stall window; none should trip it.
         for i in 0..3 {
             tx.send(SignalEvent::Chunk {
+                conversation_id: "c".into(),
                 request_id: "r".into(),
                 chunk: format!("c{i}"),
             })
@@ -659,6 +663,7 @@ mod tests {
         // First turn: subscribe, then events arrive — they must be delivered.
         let mut a = register(&subs);
         tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
             request_id: "r".into(),
             chunk: "hi".into(),
         })
@@ -699,6 +704,7 @@ mod tests {
         // still receive events — the pump survived the stall.
         let mut second = register(&subs);
         tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
             request_id: "r2".into(),
             chunk: "next".into(),
         })

@@ -369,6 +369,7 @@ impl DbusClient {
             while let Some(signal) = chunk_stream.next().await {
                 if let Ok(args) = signal.args() {
                     let _ = tx_chunk.send(SignalEvent::Chunk {
+                        conversation_id: args.conversation_id.to_string(),
                         request_id: args.request_id.to_string(),
                         chunk: args.chunk.to_string(),
                     });
@@ -382,6 +383,7 @@ impl DbusClient {
             while let Some(signal) = complete_stream.next().await {
                 if let Ok(args) = signal.args() {
                     let _ = tx_complete.send(SignalEvent::Complete {
+                        conversation_id: args.conversation_id.to_string(),
                         request_id: args.request_id.to_string(),
                         full_response: args.full_response.to_string(),
                     });
@@ -394,6 +396,7 @@ impl DbusClient {
             while let Some(signal) = error_stream.next().await {
                 if let Ok(args) = signal.args() {
                     let _ = tx.send(SignalEvent::Error {
+                        conversation_id: args.conversation_id.to_string(),
                         request_id: args.request_id.to_string(),
                         error: args.error.to_string(),
                     });

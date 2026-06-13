@@ -391,19 +391,32 @@ fn build_tls_connector(ca_cert_path: Option<&Path>) -> Result<tokio_tungstenite:
 pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
     match event {
         api::Event::AssistantDelta {
-            request_id, chunk, ..
-        } => Some(SignalEvent::Chunk { request_id, chunk }),
+            conversation_id,
+            request_id,
+            chunk,
+        } => Some(SignalEvent::Chunk {
+            conversation_id,
+            request_id,
+            chunk,
+        }),
         api::Event::AssistantCompleted {
+            conversation_id,
             request_id,
             full_response,
-            ..
         } => Some(SignalEvent::Complete {
+            conversation_id,
             request_id,
             full_response,
         }),
         api::Event::AssistantError {
-            request_id, error, ..
-        } => Some(SignalEvent::Error { request_id, error }),
+            conversation_id,
+            request_id,
+            error,
+        } => Some(SignalEvent::Error {
+            conversation_id,
+            request_id,
+            error,
+        }),
         api::Event::ConversationTitleChanged {
             conversation_id,
             title,
@@ -412,10 +425,11 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             title,
         }),
         api::Event::AssistantStatus {
+            conversation_id,
             request_id,
             message,
-            ..
         } => Some(SignalEvent::Status {
+            conversation_id,
             request_id,
             message,
         }),
