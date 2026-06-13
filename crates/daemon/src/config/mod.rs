@@ -2630,6 +2630,52 @@ y = 2
         assert_eq!(budget.max_input_tokens, 200_000);
     }
 
+    /// Integration (issue #342): a real Ollama connector with a small
+    /// configured window must drive a small resolved budget — NOT the 200K
+    /// universal fallback. Before #342 Ollama reported `None` here, so the
+    /// budget fell through to 200K, the 0.85 proactive-compaction trigger
+    /// never fired (170K vs. a real 8k window), and every turn landed in
+    /// reactive overflow-recovery. This proves the connector's effective
+    /// `num_ctx` reaches tier-2 budget resolution so compaction keys off the
+    /// real runtime window.
+    #[tokio::test]
+    async fn ollama_effective_window_drives_budget_not_200k_fallback() {
+        use desktop_assistant_core::ports::llm::LlmClient;
+        use httpmock::Method::POST;
+        use httpmock::MockServer;
+
+        let server = MockServer::start();
+        // Model's architecture ceiling is 32k; the configured num_ctx (4096)
+        // is smaller, so the effective runtime window is 4096.
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"model_info":{"qwen2.context_length":32768}}"#);
+        });
+
+        let client = desktop_assistant_llm_ollama::OllamaClient::new(server.url(""), "qwen2.5")
+            .with_num_ctx(Some(4_096));
+        client.warm_context_length().await;
+
+        // Tier-2 source: the connector's honest effective window.
+        let connector_max = client.max_context_tokens();
+        assert_eq!(connector_max, Some(4_096));
+
+        // No purpose override → tier 2 wins, NOT the 200K fallback.
+        let budget = resolve_context_budget(None, connector_max);
+        assert_eq!(budget.source, BudgetSource::ConnectorTable);
+        assert_eq!(budget.max_input_tokens, 4_096);
+        assert_ne!(budget.max_input_tokens, DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS);
+
+        // The 0.85 proactive-compaction trigger therefore fires at ~3481
+        // tokens — well below the real window — instead of at 170K, which
+        // the model could never reach. Sanity-check the trigger point sits
+        // inside the real window.
+        let trigger = (budget.max_input_tokens as f64 * 0.85) as u64;
+        assert!(trigger < 4_096 && trigger > 3_000);
+    }
+
     #[test]
     fn max_context_purpose_override_pulls_from_config() {
         // The `purpose_max_context_override` helper extracts the field
