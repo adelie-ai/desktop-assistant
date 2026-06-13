@@ -1,6 +1,29 @@
 use serde::{Deserialize, Serialize};
+use uuid::{ContextV7, Timestamp, Uuid};
 
 use super::tool::ToolCall;
+
+thread_local! {
+    /// Per-thread monotonic UUIDv7 counter context for message ids (#1 live
+    /// multi-client sync). The counter makes ids minted in the same millisecond
+    /// on a thread order deterministically, so a v7 id can serve as a message's
+    /// identity AND a sortable high-water cursor: `max(id)` is the latest
+    /// message, `id > since` is an exact "everything after" filter.
+    ///
+    /// Thread-local (not a global `Mutex`) because `Message::new` is hot — a
+    /// shared lock per construction would contend. Within a single conversation
+    /// appends are serialized by the turn lock and paced seconds apart by the
+    /// LLM/human, so the millisecond timestamp alone separates them across
+    /// threads; the counter only needs to disambiguate same-thread same-ms
+    /// bursts, which it does. `ContextV7` is `!Sync` anyway, so it cannot be a
+    /// `static`.
+    static MESSAGE_ID_CTX: ContextV7 = const { ContextV7::new() };
+}
+
+/// Mint a fresh monotonic UUIDv7 message id.
+pub fn new_message_id() -> String {
+    MESSAGE_ID_CTX.with(|ctx| Uuid::new_v7(Timestamp::now(ctx)).to_string())
+}
 
 /// The role of a participant in a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,8 +36,19 @@ pub enum Role {
 }
 
 /// A single chat message within a conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `id` is a monotonic UUIDv7 ([`new_message_id`]) assigned at creation — the
+/// message's stable identity, ordering key, and resume cursor for live
+/// multi-client sync. It is deliberately NOT part of `PartialEq`/`Eq`: equality
+/// compares message *content* (role/content/tool calls), so existing
+/// value-comparisons and the storage structural diff are unaffected by ids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Stable monotonic UUIDv7 identity, assigned at creation and preserved
+    /// across load/clone. `serde(default)` mints one so messages persisted
+    /// before ids were carried still get a stable id when deserialized.
+    #[serde(default = "new_message_id")]
+    pub id: String,
     pub role: Role,
     pub content: String,
     /// Tool calls requested by the assistant (only set for Role::Assistant).
@@ -31,6 +65,7 @@ pub struct Message {
 impl Message {
     pub fn new(role: Role, content: impl Into<String>) -> Self {
         Self {
+            id: new_message_id(),
             role,
             content: content.into(),
             tool_calls: Vec::new(),
@@ -42,6 +77,7 @@ impl Message {
     /// Create an assistant message that requests tool calls.
     pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self {
+            id: new_message_id(),
             role: Role::Assistant,
             content: String::new(),
             tool_calls,
@@ -53,6 +89,7 @@ impl Message {
     /// Create a tool result message.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
+            id: new_message_id(),
             role: Role::Tool,
             content: content.into(),
             tool_calls: Vec::new(),
@@ -61,6 +98,22 @@ impl Message {
         }
     }
 }
+
+/// Equality compares message *content*, deliberately excluding `id`: a fresh
+/// monotonic id is minted on every construction, so two `Message::new` calls
+/// with the same content must still compare equal for the storage structural
+/// diff (`ExistingMsgRow::matches`) and the many value-comparison tests.
+impl PartialEq for Message {
+    fn eq(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.content == other.content
+            && self.tool_calls == other.tool_calls
+            && self.tool_call_id == other.tool_call_id
+            && self.summary_id == other.summary_id
+    }
+}
+
+impl Eq for Message {}
 
 #[cfg(test)]
 mod tests {

@@ -253,7 +253,15 @@ impl DbusClient {
             title,
             messages: messages
                 .into_iter()
-                .map(|(role, content)| ChatMessage { role, content })
+                // The D-Bus conversation API predates message ids (#1) and only
+                // returns (role, content); leave the id empty. The live-sync
+                // cursor is a UDS/WS concern — the D-Bus client (voice) is a
+                // turn producer, not a transcript renderer.
+                .map(|(role, content)| ChatMessage {
+                    id: String::new(),
+                    role,
+                    content,
+                })
                 .collect(),
             model_selection: None,
             conversation_personality: None,

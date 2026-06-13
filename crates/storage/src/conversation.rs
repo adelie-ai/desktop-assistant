@@ -223,7 +223,7 @@ impl ConversationStore for PgConversationStore {
         let row = row.ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
 
         let msg_rows: Vec<MsgRow> = sqlx::query_as(
-            "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id \
+            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id \
              FROM messages \
              WHERE user_id = $1 AND conversation_id = $2 \
              ORDER BY ordinal",
@@ -545,7 +545,10 @@ async fn insert_message(
              tool_calls, tool_call_id, summary_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
-    .bind(uuid::Uuid::now_v7().to_string())
+    // Persist the message's own monotonic UUIDv7 (assigned at creation) rather
+    // than minting a fresh one here, so the id is a single source of truth from
+    // creation through storage to the client cursor (#1).
+    .bind(&msg.id)
     .bind(user_id)
     .bind(conversation_id)
     .bind(ordinal as i32)
@@ -597,6 +600,9 @@ async fn update_message(
 
 fn msg_from_row(r: MsgRow) -> Message {
     let mut msg = Message::new(str_to_role(&r.role), &r.content);
+    // Carry the persisted UUIDv7 identity (not the fresh one `Message::new`
+    // minted) so the id is stable across loads and usable as a client cursor.
+    msg.id = r.id;
     if let Some(tc_json) = r.tool_calls
         && let Ok(tool_calls) = serde_json::from_value::<Vec<ToolCall>>(tc_json)
     {
@@ -655,6 +661,9 @@ struct ConvListRow {
 
 #[derive(sqlx::FromRow)]
 struct MsgRow {
+    /// The message's stable UUIDv7 id (migration 005); carried onto the domain
+    /// `Message` so clients get a sortable identity + cursor (#1).
+    id: String,
     #[allow(dead_code)]
     ordinal: i32,
     role: String,

@@ -10,6 +10,10 @@ pub struct ConversationSummary {
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    /// Stable monotonic UUIDv7 id (#1) — the message's identity, ordering key,
+    /// and the cursor a client uses to dedupe live vs snapshot, subscribe
+    /// forward, and back-page. Empty only when talking to a pre-id daemon.
+    pub id: String,
     pub role: String,
     pub content: String,
 }
@@ -39,6 +43,7 @@ impl From<api::ConversationSummary> for ConversationSummary {
 impl From<api::MessageView> for ChatMessage {
     fn from(value: api::MessageView) -> Self {
         Self {
+            id: value.id,
             role: value.role,
             content: value.content,
         }
