@@ -3,19 +3,27 @@ use desktop_assistant_api_model as api;
 // `Clone` lets the `Connector` fan one signal stream out to many subscribers.
 #[derive(Debug, Clone)]
 pub enum SignalEvent {
+    // The streaming events carry `conversation_id` (already present on the wire
+    // frames) so a client can route a turn it did NOT initiate — e.g. a voice
+    // turn streaming into a conversation the GUI is merely viewing — to the
+    // right chat view, instead of only rendering streams it started itself.
     Chunk {
+        conversation_id: String,
         request_id: String,
         chunk: String,
     },
     Complete {
+        conversation_id: String,
         request_id: String,
         full_response: String,
     },
     Error {
+        conversation_id: String,
         request_id: String,
         error: String,
     },
     Status {
+        conversation_id: String,
         request_id: String,
         message: String,
     },

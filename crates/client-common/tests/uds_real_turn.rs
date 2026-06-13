@@ -662,6 +662,7 @@ async fn collect_turn(
             Ok(Some(SignalEvent::Complete {
                 request_id: rid,
                 full_response,
+                ..
             })) if rid == request_id => {
                 return full_response == "hello";
             }
@@ -835,12 +836,15 @@ async fn keyed_send_over_uds_streams_real_turn_events() {
             Ok(Some(SignalEvent::Status { request_id, .. })) if request_id == returned_id => {
                 got_status = true;
             }
-            Ok(Some(SignalEvent::Chunk { request_id, chunk })) if request_id == returned_id => {
+            Ok(Some(SignalEvent::Chunk {
+                request_id, chunk, ..
+            })) if request_id == returned_id => {
                 chunks.push_str(&chunk);
             }
             Ok(Some(SignalEvent::Complete {
                 request_id,
                 full_response,
+                ..
             })) if request_id == returned_id => {
                 assert_eq!(full_response, "hello");
                 got_complete = true;
@@ -927,12 +931,15 @@ async fn idle_past_stall_then_turn_still_streams_events() {
     let mut got_complete = false;
     for _ in 0..20 {
         match timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Some(SignalEvent::Chunk { request_id, chunk })) if request_id == returned_id => {
+            Ok(Some(SignalEvent::Chunk {
+                request_id, chunk, ..
+            })) if request_id == returned_id => {
                 chunks.push_str(&chunk);
             }
             Ok(Some(SignalEvent::Complete {
                 request_id,
                 full_response,
+                ..
             })) if request_id == returned_id => {
                 assert_eq!(full_response, "hello");
                 got_complete = true;

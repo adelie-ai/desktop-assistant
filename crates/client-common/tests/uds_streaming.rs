@@ -191,7 +191,9 @@ async fn uds_streamed_response_is_correlatable_to_the_send() {
     let mut got_complete = false;
     for _ in 0..10 {
         match timeout(Duration::from_secs(2), signals.recv()).await {
-            Ok(Some(SignalEvent::Chunk { request_id, chunk })) => {
+            Ok(Some(SignalEvent::Chunk {
+                request_id, chunk, ..
+            })) => {
                 assert_eq!(
                     request_id, returned_id,
                     "chunk request_id must match the id send_prompt returned (voice#49)"
@@ -201,6 +203,7 @@ async fn uds_streamed_response_is_correlatable_to_the_send() {
             Ok(Some(SignalEvent::Complete {
                 request_id,
                 full_response,
+                ..
             })) => {
                 assert_eq!(
                     request_id, returned_id,
@@ -251,12 +254,13 @@ async fn connector_over_uds_delivers_correlated_response() {
     let mut got_complete = false;
     for _ in 0..10 {
         match timeout(Duration::from_secs(2), events.recv()).await {
-            Ok(Some(SignalEvent::Chunk { request_id, chunk })) if request_id == returned_id => {
-                chunks.push_str(&chunk)
-            }
+            Ok(Some(SignalEvent::Chunk {
+                request_id, chunk, ..
+            })) if request_id == returned_id => chunks.push_str(&chunk),
             Ok(Some(SignalEvent::Complete {
                 request_id,
                 full_response,
+                ..
             })) if request_id == returned_id => {
                 assert_eq!(full_response, "hello");
                 got_complete = true;
