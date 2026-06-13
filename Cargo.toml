@@ -23,6 +23,15 @@ members = [
     "crates/dbus-bridge",
 ]
 
+# Warnings are failures, enforced by the compiler — not by reviewer vigilance.
+# Members inherit via `[lints] workspace = true`. Safe against toolchain churn
+# because the workspace pins its Rust toolchain.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
 [workspace.dependencies]
 notify = "8"
 tokio = { version = "1", features = ["full"] }

@@ -45,3 +45,6 @@ tower = "0.5"
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+
+[lints]
+workspace = true

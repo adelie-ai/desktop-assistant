@@ -31,3 +31,6 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 # then invoke it through `BuiltinToolService::execute_tool` so the
 # end-to-end LLM-driven path is exercised verbatim.
 desktop-assistant-mcp-client.workspace = true
+
+[lints]
+workspace = true

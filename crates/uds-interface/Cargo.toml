@@ -27,3 +27,6 @@ desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+
+[lints]
+workspace = true
