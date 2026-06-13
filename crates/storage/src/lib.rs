@@ -1,6 +1,7 @@
 //! SQLite-backed persistence for conversations, knowledge, and assistant state.
 
 pub mod background_tasks;
+pub mod context_window_observations;
 pub mod conversation;
 pub mod conversation_search;
 pub mod database;
@@ -25,6 +26,7 @@ pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};
 pub use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 
 pub use background_tasks::PgBackgroundTaskStore;
+pub use context_window_observations::PgLearnedWindowStore;
 pub use conversation::PgConversationStore;
 pub use conversation_search::PgConversationSearchStore;
 pub use database::execute_database_query;

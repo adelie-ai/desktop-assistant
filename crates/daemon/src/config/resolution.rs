@@ -9,6 +9,7 @@
 //! the secret backends.
 
 use desktop_assistant_core::ports::llm::{BudgetSource, ContextBudget};
+use desktop_assistant_core::ports::store::LearnedWindow;
 
 use crate::connections::{
     AnthropicConnection, BedrockConnection, ConnectionConfig, Connector, OllamaConnection,
@@ -318,6 +319,64 @@ pub fn resolve_context_budget(
     ContextBudget {
         max_input_tokens: DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS,
         source: BudgetSource::UniversalFallback,
+    }
+}
+
+/// Sanity floor for a learned (observed-overflow) context-window cap.
+///
+/// `observed_limit` is parsed out of an upstream provider's error STRING
+/// (`error_classify::first_two_numbers`), which is untrusted-ish: a malicious
+/// or garbled message could yield `0`, `1`, or some absurdly small number that,
+/// applied as a `min()` cap, would brick the assistant (no prompt fits). We
+/// refuse to learn — and refuse to apply — any cap below this floor. The floor
+/// is intentionally tiny (a few hundred tokens is a legitimately small window
+/// on some embedded models) so it rejects only pathological values, not
+/// genuinely-small-but-usable ones.
+pub const MIN_LEARNED_WINDOW: u64 = 256;
+
+/// Apply a learned (observed-overflow) window as a DOWN-ONLY cap on an already
+/// resolved [`ContextBudget`] (issue #343).
+///
+/// This composes *after* [`resolve_context_budget`] so the documented
+/// precedence holds: `purpose-override > learned (min, DOWN-ONLY) > connector /
+/// Ollama-effective-window > 200K fallback`. The learned value is a `min()`
+/// CAP, never an additive tier — it can only lower the budget, never raise it.
+///
+/// Guards, in order:
+///   1. **Sanity floor.** A learned `observed_limit` below [`MIN_LEARNED_WINDOW`]
+///      is pathological (garbage/hostile parse) and is ignored — a parsed `0`
+///      or `1` must never pin the budget.
+///   2. **Invalidation.** The learned row carries the `configured_window` that
+///      was in force when the overflow was observed. If that differs from the
+///      *current* effective configured window (`budget.max_input_tokens`), the
+///      observation is stale — the user bumped (or lowered) the window — so it
+///      is discarded and the fresh, higher (or new) ceiling stands. This is how
+///      a config bump escapes a previously-learned-low value.
+///   3. **Down-only.** Even for a matching configured window, the cap only
+///      applies when it is strictly below the resolved budget; a learned value
+///      `>=` the budget never raises it (the `min()` is a no-op).
+///
+/// Returns the (possibly unchanged) budget; when the cap applies, the source is
+/// re-tagged [`BudgetSource::LearnedCap`].
+pub fn apply_learned_cap(budget: ContextBudget, learned: Option<LearnedWindow>) -> ContextBudget {
+    let Some(learned) = learned else {
+        return budget;
+    };
+    // Guard 1: pathological observed value — refuse to apply.
+    if learned.observed_limit < MIN_LEARNED_WINDOW {
+        return budget;
+    }
+    // Guard 2: invalidation — stale if the configured window has changed.
+    if learned.configured_window != budget.max_input_tokens {
+        return budget;
+    }
+    // Guard 3: down-only — never raise the budget.
+    if learned.observed_limit >= budget.max_input_tokens {
+        return budget;
+    }
+    ContextBudget {
+        max_input_tokens: learned.observed_limit,
+        source: BudgetSource::LearnedCap,
     }
 }
 
