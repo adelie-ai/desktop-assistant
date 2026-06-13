@@ -338,6 +338,21 @@ pub(crate) fn render_plan(
     if sorted.len() > shown {
         out.push_str(&format!("\n… and {} more.", sorted.len() - shown));
     }
+
+    // Wrap-up nudge: when no step is live (the stack has fully unwound) and
+    // every step is done, the plan is complete — prompt the model to write its
+    // closing summary and clear the stale `goal` note rather than leave it to
+    // linger into the next task. Gated on `current.is_none()` so a still-open
+    // step (more work pending) never trips it; computed over `sorted` (all
+    // items) so cap-elision can't hide an unfinished step and falsely fire it.
+    if current.is_none() && sorted.iter().all(|i| i.done) {
+        out.push_str(
+            "\nAll steps are done. If the task is complete: give the user your closing summary, \
+             promote anything worth keeping beyond this conversation to the knowledge base \
+             (builtin_knowledge_base_write), then clear your goal note \
+             (builtin_scratchpad_delete keys: [\"goal\"]) so it doesn't linger into the next task.",
+        );
+    }
     Some(out)
 }
 
@@ -724,6 +739,63 @@ mod tests {
     #[test]
     fn render_plan_empty_is_none() {
         assert!(render_plan(&[], None, 10).is_none());
+    }
+
+    #[test]
+    fn render_plan_nudges_wrap_up_when_all_done_and_no_live_step() {
+        // Plan fully unwound (no current step) and every step done → wrap-up
+        // nudge to summarise and clear the stale goal note.
+        let items = vec![
+            PlanItem {
+                key: "1",
+                goal: "research",
+                done: true,
+                outcome: None,
+            },
+            PlanItem {
+                key: "2",
+                goal: "write up",
+                done: true,
+                outcome: None,
+            },
+        ];
+        let rendered = render_plan(&items, None, 50).unwrap();
+        assert!(rendered.contains("All steps are done"), "{rendered}");
+        assert!(rendered.contains(r#"["goal"]"#), "{rendered}");
+        // Cleanup reminder covers durable promotion as well as goal clearing.
+        assert!(
+            rendered.contains("builtin_knowledge_base_write"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_plan_no_wrap_up_nudge_while_a_step_is_open() {
+        // A live/open step means work is pending — the wrap-up nudge must not
+        // fire, whether the open step is the current one or just unfinished.
+        let items = vec![
+            PlanItem {
+                key: "1",
+                goal: "research",
+                done: true,
+                outcome: None,
+            },
+            PlanItem {
+                key: "2",
+                goal: "still going",
+                done: false,
+                outcome: None,
+            },
+        ];
+        // Open step is the current one.
+        let with_current = render_plan(&items, Some("2"), 50).unwrap();
+        assert!(
+            !with_current.contains("All steps are done"),
+            "{with_current}"
+        );
+        // Even with no current step, an unfinished step suppresses the nudge.
+        let no_current = render_plan(&items, None, 50).unwrap();
+        assert!(!no_current.contains("All steps are done"), "{no_current}");
     }
 
     #[test]
