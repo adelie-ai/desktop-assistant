@@ -35,6 +35,21 @@ pub enum Command {
     GetConversation {
         id: String,
     },
+    /// Windowed message fetch (CC-5 / #361) so a GUI can load a slice of a
+    /// conversation instead of the whole transcript — the socket-transport
+    /// equivalent of the D-Bus `GetMessages` method. `after_count >= 0` returns
+    /// messages from that raw index onward; otherwise `tail > 0` returns the
+    /// last `tail` messages (`tail <= 0` with no `after_count` = all).
+    /// `include_roles` is an allowlist (empty = every role). Returns
+    /// `CommandResult::Messages` with full `MessageView`s including the UUIDv7
+    /// `id`, so the client can dedupe / order / back-page by id.
+    GetMessages {
+        conversation_id: String,
+        tail: i32,
+        after_count: i32,
+        #[serde(default)]
+        include_roles: Vec<String>,
+    },
     DeleteConversation {
         id: String,
     },

@@ -65,6 +65,31 @@ pub trait AssistantCommands: Send + Sync {
         Ok(ConversationDetail::from(conversation))
     }
 
+    /// Windowed message fetch (CC-5 / #361): a slice of a conversation's
+    /// messages instead of the whole transcript, with the UUIDv7 id on each so
+    /// the client can dedupe/order/back-page. `after_count >= 0` = from that raw
+    /// index; else `tail > 0` = the last `tail`; `include_roles` empty = all.
+    async fn get_messages(
+        &self,
+        conversation_id: &str,
+        tail: i32,
+        after_count: i32,
+        include_roles: Vec<String>,
+    ) -> Result<api::MessagesView> {
+        let result = self
+            .send_command(api::Command::GetMessages {
+                conversation_id: conversation_id.to_string(),
+                tail,
+                after_count,
+                include_roles,
+            })
+            .await?;
+        let api::CommandResult::Messages(messages) = result else {
+            return Err(anyhow!("unexpected response for get_messages"));
+        };
+        Ok(messages)
+    }
+
     async fn create_conversation(&self, title: &str) -> Result<String> {
         let result = self
             .send_command(api::Command::CreateConversation {

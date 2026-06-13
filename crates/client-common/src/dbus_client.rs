@@ -57,6 +57,10 @@ type DbusConversationSummary = (String, String, u32, String, bool);
 /// is `(role, content)` — mirrors the D-Bus `(ssa(ss))` reply.
 type DbusConversationDetail = (String, String, Vec<(String, String)>);
 
+/// The D-Bus `GetMessages` reply: `(total_raw_count, truncated, [(role, content)])`.
+/// Aliased to keep the proxy signature within clippy's type-complexity bar.
+type DbusMessagesPage = (u32, bool, Vec<(String, String)>);
+
 #[zbus::proxy(interface = "org.desktopAssistant.Conversations")]
 trait Conversations {
     async fn create_conversation(&self, title: &str) -> zbus::fdo::Result<String>;
@@ -72,6 +76,14 @@ trait Conversations {
     async fn unarchive_conversation(&self, id: &str) -> zbus::fdo::Result<()>;
 
     async fn get_conversation(&self, id: &str) -> zbus::fdo::Result<DbusConversationDetail>;
+
+    async fn get_messages(
+        &self,
+        id: &str,
+        tail: i32,
+        after_count: i32,
+        include_roles: Vec<String>,
+    ) -> zbus::fdo::Result<DbusMessagesPage>;
 
     async fn delete_conversation(&self, id: &str) -> zbus::fdo::Result<()>;
 
@@ -265,6 +277,34 @@ impl DbusClient {
                 .collect(),
             model_selection: None,
             conversation_personality: None,
+        })
+    }
+
+    pub async fn get_messages(
+        &self,
+        conversation_id: &str,
+        tail: i32,
+        after_count: i32,
+        include_roles: Vec<String>,
+    ) -> Result<api::MessagesView> {
+        let (total, truncated, messages) = self
+            .proxy
+            .get_messages(conversation_id, tail, after_count, include_roles)
+            .await?;
+        Ok(api::MessagesView {
+            total_raw_count: total,
+            truncated,
+            // The D-Bus get_messages predates message ids (#1) and returns only
+            // (role, content); leave the id empty — this transport is the
+            // producer side, not a windowed-render consumer.
+            messages: messages
+                .into_iter()
+                .map(|(role, content)| api::MessageView {
+                    id: String::new(),
+                    role,
+                    content,
+                })
+                .collect(),
         })
     }
 

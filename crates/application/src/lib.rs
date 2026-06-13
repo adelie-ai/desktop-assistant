@@ -1205,6 +1205,36 @@ where
                 }))
             }
 
+            api::Command::GetMessages {
+                conversation_id,
+                tail,
+                after_count,
+                include_roles,
+            } => {
+                let conv = self
+                    .conversations
+                    .get_conversation(&desktop_assistant_core::domain::ConversationId::from(
+                        conversation_id.as_str(),
+                    ))
+                    .await
+                    .map_err(Self::map_core_err)?;
+                let all: Vec<api::MessageView> = conv
+                    .messages
+                    .into_iter()
+                    .map(|m| api::MessageView {
+                        id: m.id,
+                        role: format!("{:?}", m.role).to_lowercase(),
+                        content: m.content,
+                    })
+                    .collect();
+                Ok(api::CommandResult::Messages(window_messages(
+                    all,
+                    tail,
+                    after_count,
+                    &include_roles,
+                )))
+            }
+
             api::Command::SetConversationPersonality {
                 conversation_id,
                 personality,
@@ -2555,6 +2585,45 @@ async fn replay_completed_response(
             full_response: response,
         })
         .await;
+}
+
+/// Windowed-message slicing for `Command::GetMessages` (CC-5 / #361), mirroring
+/// the D-Bus `get_messages` semantics so the bridge maps the two 1:1:
+/// `after_count >= 0` slices from that raw index onward (a stable position
+/// cursor); otherwise `tail > 0` keeps the last `tail`. The `include_roles`
+/// allowlist is applied AFTER the position slice (empty = no filter), matching
+/// the D-Bus method. `total_raw_count` is always the pre-slice message count so
+/// the client knows how much history exists; `truncated` is set only in tail
+/// mode when older messages were dropped.
+fn window_messages(
+    all: Vec<api::MessageView>,
+    tail: i32,
+    after_count: i32,
+    include_roles: &[String],
+) -> api::MessagesView {
+    let total = all.len() as u32;
+    let use_after = after_count >= 0;
+    let sliced: Vec<api::MessageView> = if use_after {
+        let start = (after_count as usize).min(all.len());
+        all[start..].to_vec()
+    } else {
+        all
+    };
+    let filtered: Vec<api::MessageView> = sliced
+        .into_iter()
+        .filter(|m| include_roles.is_empty() || include_roles.contains(&m.role))
+        .collect();
+    let (truncated, messages) = if !use_after && tail > 0 && filtered.len() > tail as usize {
+        let start = filtered.len() - tail as usize;
+        (true, filtered[start..].to_vec())
+    } else {
+        (false, filtered)
+    };
+    api::MessagesView {
+        total_raw_count: total,
+        truncated,
+        messages,
+    }
 }
 
 /// Inline turn body, shared between the registry-aware and the
@@ -3925,6 +3994,84 @@ mod tests {
             self_view.0.lock().await.is_empty(),
             "a connection on the origin's own session must be excluded from the fan-out"
         );
+    }
+
+    // --- GetMessages windowing (CC-5 / #361) ------------------------------
+
+    fn mv(id: &str, role: &str, content: &str) -> api::MessageView {
+        api::MessageView {
+            id: id.into(),
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn window_messages_tail_keeps_last_n_and_flags_truncated() {
+        let all = vec![
+            mv("1", "user", "a"),
+            mv("2", "assistant", "b"),
+            mv("3", "user", "c"),
+        ];
+        let w = window_messages(all, 2, -1, &[]);
+        assert_eq!(w.total_raw_count, 3, "total is the full pre-slice count");
+        assert!(w.truncated, "tail dropped older messages");
+        assert_eq!(
+            w.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["2", "3"],
+            "keeps the last `tail`, ids intact for the client cursor"
+        );
+    }
+
+    #[test]
+    fn window_messages_after_count_slices_from_index_and_never_truncates() {
+        let all = vec![
+            mv("1", "user", "a"),
+            mv("2", "assistant", "b"),
+            mv("3", "user", "c"),
+        ];
+        let w = window_messages(all, 0, 1, &[]);
+        assert_eq!(w.total_raw_count, 3);
+        assert!(
+            !w.truncated,
+            "after_count is an exact position cursor, not a truncation"
+        );
+        assert_eq!(
+            w.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["2", "3"]
+        );
+    }
+
+    #[test]
+    fn window_messages_role_filter_applies_after_slice_and_total_is_pre_slice() {
+        let all = vec![
+            mv("1", "user", "a"),
+            mv("2", "assistant", "b"),
+            mv("3", "user", "c"),
+            mv("4", "tool", "d"),
+        ];
+        let w = window_messages(all, 0, -1, &["user".to_string()]);
+        assert_eq!(w.total_raw_count, 4, "total counts every role, pre-filter");
+        assert_eq!(
+            w.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["1", "3"],
+            "only the allowlisted role survives"
+        );
+    }
+
+    #[test]
+    fn window_messages_tail_within_limit_is_not_truncated() {
+        let all = vec![mv("1", "user", "a"), mv("2", "assistant", "b")];
+        let w = window_messages(all, 5, -1, &[]);
+        assert!(!w.truncated);
+        assert_eq!(w.messages.len(), 2);
+    }
+
+    #[test]
+    fn window_messages_after_count_past_end_is_empty() {
+        let w = window_messages(vec![mv("1", "user", "a")], 0, 9, &[]);
+        assert_eq!(w.total_raw_count, 1);
+        assert!(w.messages.is_empty());
     }
 
     #[tokio::test]

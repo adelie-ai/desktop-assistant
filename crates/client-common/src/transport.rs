@@ -16,6 +16,16 @@ pub trait AssistantClient: Send + Sync {
     async fn list_conversations(&self) -> Result<Vec<ConversationSummary>>;
     async fn list_conversations_with_archived(&self) -> Result<Vec<ConversationSummary>>;
     async fn get_conversation(&self, id: &str) -> Result<ConversationDetail>;
+    /// Windowed message fetch (CC-5 / #361): a slice of a conversation instead
+    /// of the full transcript. `after_count >= 0` = from that raw index; else
+    /// `tail > 0` = the last `tail`; `include_roles` empty = all roles.
+    async fn get_messages(
+        &self,
+        conversation_id: &str,
+        tail: i32,
+        after_count: i32,
+        include_roles: Vec<String>,
+    ) -> Result<api::MessagesView>;
     async fn create_conversation(&self, title: &str) -> Result<String>;
     async fn delete_conversation(&self, id: &str) -> Result<()>;
     async fn rename_conversation(&self, id: &str, title: &str) -> Result<()>;
@@ -169,6 +179,33 @@ impl AssistantClient for TransportClient {
             Self::Dbus(client) => client.get_conversation(id).await,
             Self::Ws(client) => client.get_conversation(id).await,
             Self::Uds(client) => client.get_conversation(id).await,
+        }
+    }
+
+    async fn get_messages(
+        &self,
+        conversation_id: &str,
+        tail: i32,
+        after_count: i32,
+        include_roles: Vec<String>,
+    ) -> Result<api::MessagesView> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(client) => {
+                client
+                    .get_messages(conversation_id, tail, after_count, include_roles)
+                    .await
+            }
+            Self::Ws(client) => {
+                client
+                    .get_messages(conversation_id, tail, after_count, include_roles)
+                    .await
+            }
+            Self::Uds(client) => {
+                client
+                    .get_messages(conversation_id, tail, after_count, include_roles)
+                    .await
+            }
         }
     }
 
