@@ -522,6 +522,24 @@ pub enum Event {
         compaction_active: bool,
     },
 
+    /// A user message was committed to a conversation and a turn started for
+    /// it. Emitted once at the start of every send turn — including turns a
+    /// given client did NOT initiate (e.g. a voice turn, or another client on
+    /// the same account). Lets a client render the user's bubble live in a
+    /// conversation it is merely *viewing*, instead of only seeing it after a
+    /// switch-away-and-back / reload. The turn's assistant reply then streams
+    /// via `AssistantDelta` / `AssistantCompleted` for the same
+    /// `conversation_id` and `request_id`.
+    ///
+    /// A client that initiated this turn already rendered the bubble
+    /// optimistically; it dedupes by matching `request_id` against its own
+    /// in-flight send and skips re-rendering.
+    UserMessageAdded {
+        conversation_id: String,
+        request_id: String,
+        content: String,
+    },
+
     /// Streaming chunk for a content response.
     AssistantDelta {
         conversation_id: String,

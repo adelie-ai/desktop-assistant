@@ -390,6 +390,15 @@ fn build_tls_connector(ca_cert_path: Option<&Path>) -> Result<tokio_tungstenite:
 
 pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
     match event {
+        api::Event::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        } => Some(SignalEvent::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        }),
         api::Event::AssistantDelta {
             conversation_id,
             request_id,
