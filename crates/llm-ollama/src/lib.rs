@@ -7,8 +7,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage, current_model_override,
+    BudgetSource, ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo,
+    ReasoningConfig, TokenUsage, current_context_budget, current_model_override,
 };
 use desktop_assistant_llm_http::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
@@ -23,23 +23,56 @@ use tokio::sync::OnceCell;
 const OLLAMA_CONNECT_TIMEOUT: std::time::Duration = STREAM_CONNECT_TIMEOUT;
 const OLLAMA_EVENT_TIMEOUT: std::time::Duration = STREAM_EVENT_TIMEOUT;
 
+/// Default effective context window (`num_ctx`) the connector provisions
+/// when the user hasn't configured one (issue #342).
+///
+/// Ollama's own default is **2048**, independent of the model's real
+/// capability — a qwen2.5 that can do 32k–128k still runs at 2048 unless
+/// the daemon sets `num_ctx` explicitly. We pick a value comfortably above
+/// 2048 that any modern local chat model can hold and that consumer
+/// hardware can afford. Unlike hosted connectors we never guess
+/// *optimistically* high: Ollama silently truncates above the effective
+/// window with no error, so the window must be **provisioned** (set on the
+/// request) and **reported honestly** (`max_context_tokens`), then clamped
+/// down to the model's architecture ceiling from `/api/show`.
+pub const DEFAULT_OLLAMA_NUM_CTX: u64 = 8_192;
+
 /// Ollama LLM client that streams completions via the native `/api/chat` endpoint.
 ///
 /// Uses NDJSON streaming (one JSON object per line) and Ollama's native tool
 /// calling format. No authentication is required.
 ///
-/// Context windows are not curated — Ollama hosts arbitrary GGUF models, so
-/// we read the value from the per-model `POST /api/show` response. Because
-/// `LlmClient::max_context_tokens` is synchronous and the source is an HTTP
-/// call, the connector caches results per-model id in
-/// [`OllamaClient::context_length_cache`]. Callers should invoke
-/// [`OllamaClient::warm_context_length`] (fire-and-forget) shortly after
-/// construction to populate the cache for `self.model`; until then,
-/// `max_context_tokens()` returns `None` and the daemon's universal
-/// fallback applies. The cache is keyed by model id so per-turn model
-/// overrides (issue #34) can be warmed independently — but a cold lookup
-/// for an overridden model still returns `None` until that model has been
-/// warmed.
+/// # Effective context window (`num_ctx`) — issue #342
+///
+/// Ollama hosts arbitrary GGUF models, so we don't curate context windows.
+/// The model's *architecture* context length (the ceiling) is read from the
+/// per-model `POST /api/show` response and cached per-model in
+/// [`OllamaClient::context_length_cache`] (populated by
+/// [`OllamaClient::warm_context_length`], fire-and-forget at startup).
+///
+/// The *runtime* window is Ollama's `num_ctx`, which defaults to a measly
+/// 2048 regardless of what the model can do. We therefore:
+///
+/// 1. **Provision** an explicit `num_ctx` on every chat request, sized to a
+///    configurable default ([`DEFAULT_OLLAMA_NUM_CTX`], well above 2048) or
+///    a per-connection [`Self::with_num_ctx`] override, clamped down to the
+///    `/api/show` ceiling when known.
+/// 2. **Report** that same effective `num_ctx` from
+///    [`LlmClient::max_context_tokens`] (never `None`) so the daemon's
+///    budget resolution and the 0.85 proactive-compaction trigger key off
+///    the real runtime window instead of the 200K universal fallback.
+///
+/// When a per-turn [`ContextBudget`](desktop_assistant_core::ports::llm::ContextBudget)
+/// tagged `PurposeOverride` is installed (the user's
+/// `purposes.<kind>.max_context_tokens`), it wins over the configured
+/// default for the request `num_ctx` too — so the budget the daemon
+/// believes and the `num_ctx` actually sent agree (both clamped to the
+/// ceiling). A `ConnectorTable` budget is the connector's own value echoed
+/// back and is deliberately ignored to avoid circularity.
+///
+/// Degradation: if `/api/show` is unavailable/old, the ceiling is unknown
+/// and the configured `num_ctx` is used unclamped (logged once) — the
+/// network probe is never a hard dependency.
 pub struct OllamaClient {
     client: Client,
     model: String,
@@ -48,10 +81,14 @@ pub struct OllamaClient {
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
-    /// Per-model cache of `/api/show`-derived context lengths. `None`
-    /// values are cached too (when `/api/show` declines to populate the
-    /// field) so we don't keep retrying. Populated by
-    /// [`Self::warm_context_length`] and [`Self::context_length_for`].
+    /// Configured effective context window. `None` means "use
+    /// [`DEFAULT_OLLAMA_NUM_CTX`]". Either way it is clamped to the
+    /// `/api/show` ceiling before being applied/reported.
+    num_ctx: Option<u64>,
+    /// Per-model cache of `/api/show`-derived *architecture ceiling* context
+    /// lengths. `None` values are cached too (when `/api/show` declines to
+    /// populate the field) so we don't keep retrying. Populated by
+    /// [`Self::warm_context_length`] and read by [`Self::cached_context_length`].
     context_length_cache: Mutex<HashMap<String, Option<u64>>>,
 }
 
@@ -73,6 +110,7 @@ impl OllamaClient {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            num_ctx: None,
             context_length_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -103,6 +141,16 @@ impl OllamaClient {
 
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Configure the effective context window (`num_ctx`) the connector
+    /// provisions on chat requests and reports via
+    /// [`LlmClient::max_context_tokens`]. `None` (the default) uses
+    /// [`DEFAULT_OLLAMA_NUM_CTX`]. The value is always clamped to the model's
+    /// `/api/show` architecture ceiling when that is known (issue #342).
+    pub fn with_num_ctx(mut self, num_ctx: Option<u64>) -> Self {
+        self.num_ctx = num_ctx;
         self
     }
 
@@ -255,6 +303,10 @@ struct OllamaOptions {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_predict: Option<u32>,
+    /// Effective context window. Always set on chat requests (issue #342) so
+    /// Ollama doesn't silently fall back to its 2048 default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -566,6 +618,58 @@ impl OllamaClient {
             .ok()
             .and_then(|guard| guard.get(model).copied().flatten())
     }
+
+    /// The effective runtime context window (`num_ctx`) for `model` (issue
+    /// #342): the requested window clamped down to the model's `/api/show`
+    /// architecture ceiling when that ceiling is known.
+    ///
+    /// The requested window is:
+    /// - a per-turn [`ContextBudget`] tagged `PurposeOverride` (the user's
+    ///   `purposes.<kind>.max_context_tokens`), when one is installed for the
+    ///   current task — so the budget the daemon believes and the `num_ctx`
+    ///   sent on the wire agree; otherwise
+    /// - the connection's configured [`Self::num_ctx`]; otherwise
+    /// - [`DEFAULT_OLLAMA_NUM_CTX`].
+    ///
+    /// A `ConnectorTable` / `UniversalFallback` budget is ignored: the former
+    /// is this connector's own value echoed back (reading it would be
+    /// circular) and the latter is the 200K guess this method exists to
+    /// replace.
+    ///
+    /// Returns the same value `max_context_tokens()` reports and the same
+    /// value the chat request carries — the two must agree.
+    fn effective_num_ctx(&self, model: &str) -> u64 {
+        let requested = self
+            .purpose_override_window()
+            .or(self.num_ctx)
+            .unwrap_or(DEFAULT_OLLAMA_NUM_CTX);
+
+        match self.cached_context_length(model) {
+            Some(ceiling) => {
+                if requested > ceiling {
+                    tracing::debug!(
+                        model,
+                        requested,
+                        ceiling,
+                        "clamping requested num_ctx down to the model's architecture ceiling"
+                    );
+                }
+                requested.min(ceiling)
+            }
+            // Ceiling unknown (/api/show unavailable or old): degrade
+            // gracefully — provision the requested window unclamped rather
+            // than guessing high or returning None.
+            None => requested,
+        }
+    }
+
+    /// The per-turn purpose-override context window, if one is installed as a
+    /// `PurposeOverride` budget for the current task. `None` otherwise.
+    fn purpose_override_window(&self) -> Option<u64> {
+        current_context_budget()
+            .filter(|b| b.source == BudgetSource::PurposeOverride)
+            .map(|b| b.max_input_tokens)
+    }
 }
 
 #[async_trait::async_trait]
@@ -580,7 +684,11 @@ impl LlmClient for OllamaClient {
 
     fn max_context_tokens(&self) -> Option<u64> {
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
-        self.cached_context_length(&model)
+        // Report the effective runtime window (configured/overridden num_ctx
+        // clamped to the ceiling), never `None` — see the type-level docs and
+        // issue #342. This is the value the daemon's budget resolution keys
+        // off, and it matches the `num_ctx` the chat request carries.
+        Some(self.effective_num_ctx(&model))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -624,16 +732,17 @@ impl LlmClient for OllamaClient {
 
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
 
-        let options =
-            if self.temperature.is_some() || self.top_p.is_some() || self.max_tokens.is_some() {
-                Some(OllamaOptions {
-                    temperature: self.temperature,
-                    top_p: self.top_p,
-                    num_predict: self.max_tokens,
-                })
-            } else {
-                None
-            };
+        // Always provision an explicit num_ctx (issue #342): sized to the
+        // configured/overridden window, clamped to the model's ceiling. This
+        // matches what `max_context_tokens()` reports, so the budget the
+        // daemon believes and the window Ollama actually runs at agree.
+        let num_ctx = self.effective_num_ctx(&model);
+        let options = Some(OllamaOptions {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            num_predict: self.max_tokens,
+            num_ctx: Some(num_ctx),
+        });
 
         let request = ChatRequest {
             model,
@@ -1420,9 +1529,16 @@ mod tests {
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);
         });
 
-        let client = OllamaClient::new(server.url(""), "llama3.2");
+        // `warm_context_length` caches the /api/show *ceiling* (131_072).
+        // With a configured num_ctx at/above the ceiling, the reported
+        // effective window equals the ceiling (clamp is a no-op here).
+        let client = OllamaClient::new(server.url(""), "llama3.2").with_num_ctx(Some(200_000));
         let warmed = client.warm_context_length().await;
-        assert_eq!(warmed, Some(131_072));
+        assert_eq!(
+            warmed,
+            Some(131_072),
+            "warmup caches the architecture ceiling"
+        );
         assert_eq!(client.max_context_tokens(), Some(131_072));
         show.assert_calls(1);
     }
@@ -1495,8 +1611,8 @@ mod tests {
                 .body(r#"{"model_info":{"llama.context_length":131072}}"#);
         });
 
-        let client =
-            OllamaClient::new(server.url(""), "llama3.2").with_num_ctx(Some(DEFAULT_OLLAMA_NUM_CTX));
+        let client = OllamaClient::new(server.url(""), "llama3.2")
+            .with_num_ctx(Some(DEFAULT_OLLAMA_NUM_CTX));
         let _ = client.warm_context_length().await;
 
         // Override targets a model whose ceiling hasn't been warmed: the
@@ -1838,10 +1954,9 @@ mod tests {
         // runtime window, well above Ollama's own 2048 default.
         let client = OllamaClient::new("http://localhost:11434", "llama3.2");
         assert_eq!(client.max_context_tokens(), Some(DEFAULT_OLLAMA_NUM_CTX));
-        assert!(
-            DEFAULT_OLLAMA_NUM_CTX > 2048,
-            "default num_ctx must exceed Ollama's 2048 default"
-        );
+        // The default must exceed Ollama's own 2048 default (compile-time
+        // checked, documenting the invariant the value upholds).
+        const _: () = assert!(DEFAULT_OLLAMA_NUM_CTX > 2048);
     }
 
     #[test]
@@ -1957,7 +2072,11 @@ mod tests {
         let client = OllamaClient::new(server.url(""), "clamped").with_num_ctx(Some(65_536));
         client.warm_context_length().await;
         let reported = client.max_context_tokens();
-        assert_eq!(reported, Some(4_096), "reported window is clamped to ceiling");
+        assert_eq!(
+            reported,
+            Some(4_096),
+            "reported window is clamped to ceiling"
+        );
 
         client
             .stream_completion(

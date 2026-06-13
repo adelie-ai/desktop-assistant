@@ -475,11 +475,15 @@ mod tests {
         // `RoutingLlmClient::max_context_tokens` is plain delegation to
         // the resolved client — no overlay, no tier fallback (the
         // three-tier budget resolution lives in
-        // `config::resolve_context_budget`). Ollama returns `None`;
-        // the wrapper must too.
+        // `config::resolve_context_budget`). Post-#342 an un-warmed Ollama
+        // reports its configured-default effective `num_ctx` (never `None`),
+        // so the wrapper must surface that same value.
         let fallback = build_ollama_registry();
         let client = RoutingLlmClient::new(fallback);
-        assert_eq!(client.max_context_tokens(), None);
+        assert_eq!(
+            client.max_context_tokens(),
+            Some(desktop_assistant_llm_ollama::DEFAULT_OLLAMA_NUM_CTX)
+        );
     }
 
     // --- DynamicPurpose mode -------------------------------------------------
