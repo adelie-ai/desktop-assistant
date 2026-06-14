@@ -790,7 +790,7 @@ impl ZbusPair {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     ev = signal_rx.recv() => match ev {
-                        Some(sig) => forward_one(&forwarder_conn, sig).await,
+                        Some(sig) => forward_one(&forwarder_conn, None, sig).await,
                         None => break,
                     }
                 }

@@ -28,8 +28,14 @@
 //!   authenticated UDS connection, reconnect, and JWT minting — #316).
 //! - [`adapter`]: D-Bus adapter structs (one per object path) that
 //!   speak only `api-model` types — no `core`/`application` deps.
+//! - [`session`]: per-D-Bus-sender daemon sessions — each sender gets its own
+//!   authenticated `Connector` + a unicast event forwarder, so turn responses
+//!   (and, post-#367/#320, live sync and client tools) reach only that caller
+//!   instead of broadcasting across the bus.
 
 pub mod adapter;
+pub mod session;
 pub mod transport;
 
+pub use session::{ConnectorSessionFactory, SessionRegistry, spawn_name_owner_watcher};
 pub use transport::{BridgeTransport, BridgeTransportError, ConnectorBridgeTransport};
