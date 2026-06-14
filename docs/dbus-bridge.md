@@ -41,8 +41,8 @@ User systemd units live in `systemd/`. With binaries installed (`cargo install
 --path crates/daemon`, `--path crates/jwt-minter`, `--path crates/dbus-bridge`):
 
 ```sh
-just install-service     # daemon unit + org.desktopAssistant D-Bus activation
-just install-bridge      # bridge + minter units + org.desktopAssistant.Bridge activation
+just install-service     # daemon unit + the org.desktopAssistant activation (→ the bridge)
+just install-bridge      # bridge + minter units
 just backend-enable      # enable + start the daemon
 just bridge-enable       # enable + start the minter, then the bridge
 ```
@@ -58,16 +58,24 @@ tap (Linux-only, alongside `adelie-mint`). `brew install` lays down the binaries
 the systemd units above are installed separately (Homebrew does not manage user
 services). The tap is currently untested end-to-end — see the homebrew-tap notes.
 
-## Default name and the cutover
+## The name flip (#318)
 
-The bridge binds `org.desktopAssistant.Bridge` by default (`ADELIE_BRIDGE_NAME`)
-so it can run **alongside** the daemon's in-process surface during the
-transition (Option A, PR #106). The flip to `org.desktopAssistant` — and removal
-of the in-process surface plus its `DESKTOP_ASSISTANT_DBUS_SERVICE` /
-`DESKTOP_ASSISTANT_DBUS_REQUIRED` env knobs — is the cutover's steps 6 and 7
-([#318](https://github.com/adelie-ai/desktop-assistant/issues/318) /
-[#319](https://github.com/adelie-ai/desktop-assistant/issues/319)). To run a dev
-bridge under a side-name for QA, set `ADELIE_BRIDGE_NAME=org.desktopAssistant.Dev`.
+The bridge binds `org.desktopAssistant` by default (`ADELIE_BRIDGE_NAME`) — it is
+the live D-Bus surface. The daemon no longer claims the name: its legacy
+in-process surface is **off** by default (`dbus_inprocess = false` /
+`DESKTOP_ASSISTANT_DBUS_INPROCESS`), so its systemd unit is `Type=simple` (not
+`Type=dbus` with `BusName=`), and the `org.desktopAssistant` D-Bus activation
+file points at the bridge.
+
+**Revert** (if the bridge misbehaves): set `DESKTOP_ASSISTANT_DBUS_INPROCESS=true`
+on the daemon (env, or `dbus_inprocess = true` under `[transports]` in
+daemon.toml), restore its unit to `Type=dbus` + `BusName=org.desktopAssistant`,
+stop the bridge, and restart the daemon — the legacy in-process surface returns.
+Deleting that surface for good (so the flag goes away) is step 7
+([#319](https://github.com/adelie-ai/desktop-assistant/issues/319)).
+
+For a side-by-side QA instance, run a second bridge with
+`ADELIE_BRIDGE_NAME=org.desktopAssistant.Bridge` (or `.Dev`).
 
 ## Failure mode + health
 
@@ -83,7 +91,7 @@ The authoritative "is the bridge up?" fact is the unit's own state:
 
 ```sh
 systemctl --user is-active adelie-dbus-bridge.service   # active | failed | inactive
-busctl --user list | grep org.desktopAssistant.Bridge   # is the name claimed?
+busctl --user list | grep org.desktopAssistant          # is the name claimed (by the bridge)?
 just bridge-status                                       # bridge + minter at a glance
 ```
 

@@ -17,11 +17,9 @@ bridge_service_name := "adelie-dbus-bridge"
 mint_service_name := "adelie-mint"
 bridge_service_src := "systemd/adelie-dbus-bridge.service"
 mint_service_src := "systemd/adelie-mint.service"
-bridge_dbus_service_src := "systemd/org.desktopAssistant.Bridge.service"
 systemd_user_dir := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config") + "/systemd/user"
 bridge_service_dst := systemd_user_dir + "/adelie-dbus-bridge.service"
 mint_service_dst := systemd_user_dir + "/adelie-mint.service"
-bridge_dbus_service_dst := dbus_service_dir + "/org.desktopAssistant.Bridge.service"
 container_cli := env_var_or_default("CONTAINER_CLI", "docker")
 container_security_opts := env_var_or_default("CONTAINER_SECURITY_OPTS", "--security-opt label=disable")
 debian_builder_image := env_var_or_default("DEBIAN_BUILDER_IMAGE", "debian:trixie")
@@ -190,16 +188,15 @@ uninstall-dbus-activation:
 # The bridge re-exposes org.desktopAssistant.* by talking to the daemon over an
 # authenticated UDS connection; it mints its JWT from adelie-mint. Install both.
 
-# Install the bridge + minter user units (+ bridge D-Bus activation) and reload
+# Install the bridge + minter user units and reload. The org.desktopAssistant
+# D-Bus activation file (which now points to the bridge) is installed by
+# `install-service` / `install-dbus-activation`.
 install-bridge:
     [ -f "{{bridge_service_src}}" ] || (echo "Missing service file: {{bridge_service_src}}" >&2; exit 1)
     [ -f "{{mint_service_src}}" ] || (echo "Missing service file: {{mint_service_src}}" >&2; exit 1)
-    [ -f "{{bridge_dbus_service_src}}" ] || (echo "Missing D-Bus service file: {{bridge_dbus_service_src}}" >&2; exit 1)
     mkdir -p "{{systemd_user_dir}}"
-    mkdir -p "{{dbus_service_dir}}"
     cp "{{mint_service_src}}" "{{mint_service_dst}}"
     cp "{{bridge_service_src}}" "{{bridge_service_dst}}"
-    cp "{{bridge_dbus_service_src}}" "{{bridge_dbus_service_dst}}"
     systemctl --user daemon-reload
 
 # Enable + start the minter, then the bridge (the bridge is ordered After= it)
@@ -235,7 +232,7 @@ bridge-reinstall:
 uninstall-bridge:
     systemctl --user disable --now {{bridge_service_name}} || true
     systemctl --user disable --now {{mint_service_name}} || true
-    rm -f "{{bridge_service_dst}}" "{{mint_service_dst}}" "{{bridge_dbus_service_dst}}"
+    rm -f "{{bridge_service_dst}}" "{{mint_service_dst}}"
     systemctl --user daemon-reload
 
 # Uninstall everything (services)

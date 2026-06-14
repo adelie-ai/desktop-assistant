@@ -1,4 +1,6 @@
 [D-BUS Service]
 Name=org.desktopAssistant
 Exec=/bin/false
-SystemdService=desktop-assistant-daemon.service
+# The cutover (#318) moved org.desktopAssistant from the daemon's in-process
+# surface to the standalone bridge, so on-demand activation starts the bridge.
+SystemdService=adelie-dbus-bridge.service

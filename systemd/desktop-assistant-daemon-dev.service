@@ -10,6 +10,9 @@ Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
 Environment=DESKTOP_ASSISTANT_DBUS_SERVICE=org.desktopAssistant.Dev
+# The dev daemon keeps serving the in-process surface at .Dev (the cutover
+# default is off; re-enable it here so Type=dbus/BusName works for dev QA).
+Environment=DESKTOP_ASSISTANT_DBUS_INPROCESS=true
 
 [Install]
 WantedBy=default.target
