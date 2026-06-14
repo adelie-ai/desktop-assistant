@@ -65,3 +65,23 @@ rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = "0.26"
 chrono = { version = "0.4", features = ["clock"] }
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+
+# Release profiles. Default favors small, fast binaries (strip + thin LTO).
+# Build variants: `cargo build --profile release-fast` / `--profile release-small`.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+
+[profile.release-fast]
+inherits = "release"
+lto = "fat"
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+strip = true
