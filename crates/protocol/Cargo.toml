@@ -1,0 +1,17 @@
+[package]
+name = "desktop-assistant-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+# Foundational, dependency-light crate holding the small shared enums and (later)
+# wire types that both `core` (domain/prompt logic) and `api-model` (client-facing
+# views) need. Deliberately has NO native dependency tail (no tokio, no crypto, no
+# transport) so it — and the client cores that depend on it — compile to
+# `wasm32-unknown-unknown` for the web client (adelie-ai/adele-web-ui). See #377.
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

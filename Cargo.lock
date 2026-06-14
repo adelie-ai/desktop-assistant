@@ -1493,6 +1493,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "desktop-assistant-storage"
 version = "0.1.0"
 dependencies = [
