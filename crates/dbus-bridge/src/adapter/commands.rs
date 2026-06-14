@@ -10,32 +10,25 @@
 //! through this one method. This adapter restores that parity over the bridge's
 //! UDS connection: `command_json` in, `api::CommandResult` JSON out.
 //!
-//! ## Routing and why some commands are still rejected here
+//! ## Routing and why background-task subscriptions are rejected here
 //!
-//! Turn-driving (`SendMessage`) and session-pinned (`SubscribeConversations`)
-//! commands route through the **caller's own per-sender daemon session**
-//! ([`crate::session`]) — keyed by the D-Bus sender on the message header — so a
-//! turn's events come back on that session and a subscription's fan-out is
-//! isolated to that caller. Stateless request/response uses the bridge's shared
-//! session. A few commands still assume a private, persistent, per-caller
-//! *streaming* channel that a one-shot D-Bus method cannot provide, so they are
-//! rejected up front with `NotSupported` rather than silently mis-served:
+//! Turn-driving (`SendMessage`) and session-pinned commands —
+//! `SubscribeConversations` (#367) and `RegisterClientTools` / `ClientToolResult`
+//! (#320) — route through the **caller's own per-sender daemon session**
+//! ([`crate::session`]), keyed by the D-Bus sender on the message header. So a
+//! turn's events come back on that session, a subscription's fan-out is isolated
+//! to that caller, and a registered tool's `ClientToolCall` unicasts back to the
+//! registrant. Stateless request/response uses the bridge's shared session.
 //!
-//! - **`SubscribeBackgroundTasks` / `UnsubscribeBackgroundTasks`** — set up a
-//!   streaming push of `Event::Task*` frames for the lifetime of a connection.
-//!   A one-shot D-Bus method cannot push events; the bridge holds its own
-//!   background-task subscription open and re-emits them as
-//!   `BackgroundTasks.*` signals instead (see `main.rs`). Mirrors the
-//!   in-process adapter's rejection (`dbus-interface/src/commands.rs`).
-//! - **`RegisterClientTools` / `ClientToolResult`** — the #270 / DT-4 hazard.
-//!   The per-sender session machinery (B1) now makes safe routing *possible*,
-//!   but wiring it — registering tools on the caller's session and delivering
-//!   the resulting tool call as a unicast `ClientToolCall` signal — is #320.
-//!   Until then, reject both rather than wedge a turn on a tool call that has
-//!   no D-Bus signal to be delivered on.
+//! Only the background-task subscriptions are rejected, because they set up a
+//! streaming push for the lifetime of a connection that a one-shot D-Bus method
+//! cannot provide:
 //!
-//! A client that needs working client-side tools today should use a socket
-//! transport (WS/UDS), which already gives each client its own session.
+//! - **`SubscribeBackgroundTasks` / `UnsubscribeBackgroundTasks`** — a one-shot
+//!   D-Bus method cannot push the `Event::Task*` frame stream they request; the
+//!   bridge holds its own background-task subscription open and re-emits them as
+//!   `BackgroundTasks.*` signals instead (see `main.rs`). Rejected up front with
+//!   `NotSupported` rather than silently mis-served.
 
 use std::sync::Arc;
 
@@ -66,14 +59,11 @@ fn reject_reason(command: &api::Command) -> Option<&'static str> {
              BackgroundTasks signals, or use a socket transport (WS/UDS) and \
              Command::SubscribeBackgroundTasks for the live stream",
         ),
-        // NOTE: `SubscribeConversations` is intentionally NOT rejected — it routes
-        // to the caller's per-sender session (#367, see the module docs and
-        // `crate::session::route`), so each caller's viewed-set is isolated.
-        api::Command::RegisterClientTools { .. } | api::Command::ClientToolResult { .. } => Some(
-            "client-tool registration is not yet available over D-Bus: routing onto per-sender \
-             sessions and delivering the resulting tool call as a ClientToolCall signal is #320; \
-             until then use a socket transport (WS/UDS)",
-        ),
+        // NOTE: `SubscribeConversations` (#367) and `RegisterClientTools` /
+        // `ClientToolResult` (#320) are intentionally NOT rejected — they route to
+        // the caller's per-sender session (see the module docs and
+        // `crate::session::route`), so each caller's viewed-set + tool bucket are
+        // isolated and the turn's `ClientToolCall` unicasts back to that caller.
         _ => None,
     }
 }
@@ -303,8 +293,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_client_tool_registration_and_result_before_dispatch() {
-        // The DT-4 / #270 hazard: never forward these onto the shared session.
+    async fn client_tool_commands_are_routed_not_rejected() {
+        // #320: RegisterClientTools + ClientToolResult now route to the caller's
+        // per-sender session instead of being rejected. With no registry wired
+        // (unit test) run_command falls back to the shared transport, so they
+        // reach the daemon — the regression guard for "we stopped rejecting them".
         let register = api::Command::RegisterClientTools { tools: vec![] };
         let result = api::Command::ClientToolResult {
             task_id: api::TaskId("t1".into()),
@@ -317,12 +310,15 @@ mod tests {
             let adapter = adapter(Arc::clone(&transport));
             let request = serde_json::to_string(&cmd).unwrap();
 
-            let err = adapter
-                .run_command(None, &request)
+            adapter
+                .run_command(Some(":1.10"), &request)
                 .await
-                .expect_err("client-tool commands must be rejected over D-Bus");
-            assert!(matches!(err, fdo::Error::NotSupported(_)), "got {err:?}");
-            assert_eq!(transport.count(), 0);
+                .expect("client-tool commands must no longer be rejected over D-Bus");
+            assert_eq!(
+                transport.count(),
+                1,
+                "it must reach the daemon (be routed), not be rejected"
+            );
         }
     }
 

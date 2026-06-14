@@ -265,6 +265,36 @@ fn translate_forwards_user_message_added_and_conversation_list_changed() {
     ));
 }
 
+#[test]
+fn translate_forwards_client_tool_call_with_json_string_args() {
+    // #320: ClientToolCall is forwarded; the serde_json::Value arguments are
+    // serialized to a JSON string for the D-Bus signal (which has no Value type),
+    // round-tripping back to the same Value.
+    match translate(SignalEvent::ClientToolCall {
+        task_id: "task".into(),
+        conversation_id: "c".into(),
+        tool_call_id: "call".into(),
+        tool_name: "echo".into(),
+        arguments: serde_json::json!({"x": 1, "y": "hi"}),
+    }) {
+        ForwardAction::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        } => {
+            assert_eq!(task_id, "task");
+            assert_eq!(conversation_id, "c");
+            assert_eq!(tool_call_id, "call");
+            assert_eq!(tool_name, "echo");
+            let parsed: serde_json::Value = serde_json::from_str(&arguments_json).unwrap();
+            assert_eq!(parsed, serde_json::json!({"x": 1, "y": "hi"}));
+        }
+        other => panic!("expected ClientToolCall, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Frozen D-Bus surface (object paths + well-known name)
 // ---------------------------------------------------------------------------

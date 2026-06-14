@@ -578,6 +578,22 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         emitter: &SignalEmitter<'_>,
         conversation_id: &str,
     ) -> zbus::Result<()>;
+
+    /// Signal emitted when a turn suspends on a client-side tool call (#320),
+    /// **unicast** to the session that registered the tool. The client runs
+    /// `tool_name` with `arguments_json` (the tool input as a JSON string) and
+    /// posts the outcome back via a `ClientToolResult` command on the generic
+    /// `Commands` channel, carrying the same `task_id` + `tool_call_id`. Forwarded
+    /// from `Event::ClientToolCall`.
+    #[zbus(signal)]
+    async fn client_tool_call(
+        emitter: &SignalEmitter<'_>,
+        task_id: &str,
+        conversation_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
