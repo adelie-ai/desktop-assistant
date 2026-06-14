@@ -245,11 +245,10 @@ fn default_ws_auth_methods() -> Vec<String> {
 
 /// Transport enable/bind configuration (#279 item 3).
 ///
-/// Defaults are local-first: WebSocket off, UDS on (Unix), and — since the
-/// dbus-bridge cutover (#281) — the legacy in-process D-Bus surface **off** (the
-/// standalone `adelie-dbus-bridge` owns `org.desktopAssistant`; set
-/// `dbus_inprocess = true` to restore it). The matching `DESKTOP_ASSISTANT_*`
-/// env var still overrides each field when set.
+/// Defaults are local-first: WebSocket off, UDS on (Unix). The matching
+/// `DESKTOP_ASSISTANT_*` env var still overrides each field when set. The daemon
+/// serves no in-process D-Bus surface — the standalone `adelie-dbus-bridge` owns
+/// `org.desktopAssistant` since the cutover (#281/#319).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TransportsConfig {
@@ -263,34 +262,12 @@ pub struct TransportsConfig {
     /// Override the UDS socket path. Empty = use the default path. Env:
     /// `DESKTOP_ASSISTANT_UDS_SOCKET`.
     pub uds_socket: Option<String>,
-    /// Fail startup if the session D-Bus is unavailable. Env:
-    /// `DESKTOP_ASSISTANT_DBUS_REQUIRED`. Only consulted when
-    /// [`Self::dbus_inprocess`] is on.
-    pub dbus_required: bool,
-    /// D-Bus well-known name to claim *when serving the in-process surface*.
-    /// Env: `DESKTOP_ASSISTANT_DBUS_SERVICE`.
-    pub dbus_service: String,
-    /// Serve the legacy **in-process** D-Bus surface (the daemon claims
-    /// [`Self::dbus_service`] and answers method calls itself). Default
-    /// **false** since the dbus-bridge cutover (#281): the standalone
-    /// `adelie-dbus-bridge` now owns `org.desktopAssistant`, and the daemon
-    /// keeps exactly one local ingress (UDS). Set true (env:
-    /// `DESKTOP_ASSISTANT_DBUS_INPROCESS`) to re-enable the legacy surface — the
-    /// revert lever during the cutover; removed entirely in #319.
-    pub dbus_inprocess: bool,
 }
 
 /// Local-first WebSocket-off default, mirroring the historical env defaults.
 pub const DEFAULT_WS_ENABLED: bool = false;
 /// Historical default WebSocket bind address.
 pub const DEFAULT_WS_BIND: &str = "127.0.0.1:11339";
-/// D-Bus best-effort by default (a missing bus logs and the daemon continues).
-pub const DEFAULT_DBUS_REQUIRED: bool = false;
-/// Historical default D-Bus well-known name.
-pub const DEFAULT_DBUS_SERVICE: &str = "org.desktopAssistant";
-/// In-process D-Bus surface **off** by default since the cutover (#281) — the
-/// standalone `adelie-dbus-bridge` owns `org.desktopAssistant`.
-pub const DEFAULT_DBUS_INPROCESS: bool = false;
 
 impl Default for TransportsConfig {
     fn default() -> Self {
@@ -299,9 +276,6 @@ impl Default for TransportsConfig {
             ws_bind: DEFAULT_WS_BIND.to_string(),
             uds_enabled: cfg!(unix),
             uds_socket: None,
-            dbus_required: DEFAULT_DBUS_REQUIRED,
-            dbus_service: DEFAULT_DBUS_SERVICE.to_string(),
-            dbus_inprocess: DEFAULT_DBUS_INPROCESS,
         }
     }
 }
@@ -878,8 +852,6 @@ ws_enabled = true
 ws_bind = "0.0.0.0:8080"
 uds_enabled = false
 uds_socket = "/tmp/adelie.sock"
-dbus_required = true
-dbus_service = "org.example.Adelie"
 "#;
         let cfg: DaemonConfig = toml::from_str(src).unwrap();
         let t = &cfg.transports;
@@ -887,8 +859,6 @@ dbus_service = "org.example.Adelie"
         assert_eq!(t.ws_bind, "0.0.0.0:8080");
         assert!(!t.uds_enabled);
         assert_eq!(t.uds_socket.as_deref(), Some("/tmp/adelie.sock"));
-        assert!(t.dbus_required);
-        assert_eq!(t.dbus_service, "org.example.Adelie");
 
         // Non-default => the table is serialized back out.
         let serialized = toml::to_string(&cfg).unwrap();

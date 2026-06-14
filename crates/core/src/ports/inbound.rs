@@ -114,7 +114,7 @@ pub trait AssistantService: Send + Sync {
 /// Uses [`async_trait::async_trait`] so the per-turn future is boxed
 /// (`Pin<Box<dyn Future>>`) rather than a deeply nested generic state
 /// machine. The interactive turn spawns `send_prompt[_with_override]` on
-/// a tokio worker (`dbus-interface` / `ws-interface` / subagents); the
+/// a tokio worker (the transport dispatch loop / subagents); the
 /// unboxed RPITIT form monomorphized into a multi-MB frame that
 /// overflowed the 2 MB worker stack (#205/#206). Boxing keeps the
 /// spawned future thin — the one heap allocation per call is negligible

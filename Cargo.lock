@@ -1308,7 +1308,6 @@ dependencies = [
  "desktop-assistant-application",
  "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
- "desktop-assistant-dbus",
  "desktop-assistant-llm-anthropic",
  "desktop-assistant-llm-bedrock",
  "desktop-assistant-llm-ollama",
@@ -1344,24 +1343,6 @@ dependencies = [
  "zbus",
  "zbus-secret-service-keyring-store",
  "zeroize",
-]
-
-[[package]]
-name = "desktop-assistant-dbus"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "desktop-assistant-api-model",
- "desktop-assistant-application",
- "desktop-assistant-core",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "zbus",
 ]
 
 [[package]]

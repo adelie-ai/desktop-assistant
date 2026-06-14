@@ -9,7 +9,6 @@ desktop-assistant-application = { path = "../application" }
 desktop-assistant-ws = { path = "../ws-interface", features = ["tls"] }
 desktop-assistant-uds = { path = "../uds-interface" }
 desktop-assistant-core.workspace = true
-desktop-assistant-dbus.workspace = true
 desktop-assistant-llm-anthropic.workspace = true
 desktop-assistant-llm-openai.workspace = true
 desktop-assistant-llm-ollama.workspace = true

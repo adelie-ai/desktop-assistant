@@ -30,9 +30,6 @@ use crate::app::Assistant;
 use crate::registry::{ConnectionHealth, build_llm_client, build_registry};
 use desktop_assistant_application::DefaultAssistantApiHandler;
 use desktop_assistant_core::service::ConversationHandler;
-use desktop_assistant_dbus::conversation::DbusConversationAdapter;
-use desktop_assistant_dbus::reload::DbusReloadAdapter;
-use desktop_assistant_dbus::settings::DbusSettingsAdapter;
 use desktop_assistant_mcp_client::config as mcp_config;
 use desktop_assistant_mcp_client::executor::{BuiltinToolService, McpToolExecutor};
 use desktop_assistant_uds as uds;
@@ -1724,127 +1721,10 @@ async fn main() -> Result<()> {
     let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
         Arc::new(api_handler_impl);
 
-    // In-process D-Bus surface (#281 cutover): OFF by default — the standalone
-    // adelie-dbus-bridge owns org.desktopAssistant now, leaving the daemon a
-    // single privileged local ingress (UDS). Set
-    // DESKTOP_ASSISTANT_DBUS_INPROCESS=true (or `dbus_inprocess = true` under
-    // [transports]) to re-enable the legacy in-process surface — the cutover
-    // revert lever; removed entirely in #319.
-    let dbus_inprocess = env_bool(
-        "DESKTOP_ASSISTANT_DBUS_INPROCESS",
-        transports_config.dbus_inprocess,
-    );
-    let dbus_connection = if !dbus_inprocess {
-        tracing::info!(
-            "in-process D-Bus surface disabled; adelie-dbus-bridge owns the well-known name \
-             (set DESKTOP_ASSISTANT_DBUS_INPROCESS=true to re-enable the legacy surface)"
-        );
-        None
-    } else {
-        let dbus_service_name = std::env::var("DESKTOP_ASSISTANT_DBUS_SERVICE")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| transports_config.dbus_service.clone());
-        let dbus_required = env_bool(
-            "DESKTOP_ASSISTANT_DBUS_REQUIRED",
-            transports_config.dbus_required,
-        );
-        tracing::info!("D-Bus well-known name={dbus_service_name}");
-        tracing::info!("D-Bus required={dbus_required}");
-
-        // Set up D-Bus connection (required by default; optional in headless mode).
-        match zbus::connection::Builder::session() {
-            Ok(builder) => match builder
-                .name(dbus_service_name.as_str())
-                .and_then(|b| {
-                    b.serve_at(
-                        "/org/desktopAssistant/Conversations",
-                        DbusConversationAdapter::new(Arc::clone(&conversation_service)),
-                    )
-                })
-                .and_then(|b| {
-                    b.serve_at(
-                        "/org/desktopAssistant/Settings",
-                        DbusSettingsAdapter::new(Arc::clone(&settings_service)),
-                    )
-                })
-                .and_then(|b| {
-                    b.serve_at(
-                        "/org/desktopAssistant/Connections",
-                        desktop_assistant_dbus::connections::DbusConnectionsAdapter::new(
-                            Arc::clone(&api_handler),
-                        ),
-                    )
-                })
-                .and_then(|b| {
-                    b.serve_at(
-                        "/org/desktopAssistant/Knowledge",
-                        desktop_assistant_dbus::knowledge::DbusKnowledgeAdapter::new(Arc::clone(
-                            &api_handler,
-                        )),
-                    )
-                })
-                .and_then(|b| {
-                    // Generic command channel (#213): the shared `AssistantCommands`
-                    // surface over D-Bus, dispatching through the same handler the
-                    // socket transports use, so `TransportClient::as_commands` works
-                    // on every transport.
-                    b.serve_at(
-                        "/org/desktopAssistant/Commands",
-                        desktop_assistant_dbus::commands::DbusCommandsAdapter::new(Arc::clone(
-                            &api_handler,
-                        )),
-                    )
-                })
-                .and_then(|b| {
-                    // Hot-reload trigger (#222): the KCM calls `Reload` after
-                    // writing daemon.toml so changes apply without a restart.
-                    b.serve_at(
-                        "/org/desktopAssistant/Reload",
-                        DbusReloadAdapter::new(reload_tx.clone()),
-                    )
-                }) {
-                Ok(builder) => match builder.build().await {
-                    Ok(connection) => {
-                        if let Some(unique_name) = connection.unique_name() {
-                            tracing::info!("D-Bus service registered at {}", unique_name);
-                        } else {
-                            tracing::info!("D-Bus service registered");
-                        }
-                        Some(connection)
-                    }
-                    Err(error) => {
-                        if dbus_required {
-                            return Err(error.into());
-                        }
-                        tracing::warn!(
-                            "D-Bus unavailable; continuing without D-Bus API (set DESKTOP_ASSISTANT_DBUS_REQUIRED=true to fail): {error}"
-                        );
-                        None
-                    }
-                },
-                Err(error) => {
-                    if dbus_required {
-                        return Err(error.into());
-                    }
-                    tracing::warn!(
-                        "failed to configure D-Bus interface; continuing without D-Bus API (set DESKTOP_ASSISTANT_DBUS_REQUIRED=true to fail): {error}"
-                    );
-                    None
-                }
-            },
-            Err(error) => {
-                if dbus_required {
-                    return Err(error.into());
-                }
-                tracing::warn!(
-                    "failed to connect to session D-Bus; continuing without D-Bus API (set DESKTOP_ASSISTANT_DBUS_REQUIRED=true to fail): {error}"
-                );
-                None
-            }
-        }
-    };
+    // No in-process D-Bus surface (cutover complete — #281/#319): the standalone
+    // adelie-dbus-bridge owns `org.desktopAssistant`, talking to this daemon over
+    // UDS like any other client. The daemon keeps exactly one privileged local
+    // ingress (UDS) plus the optional WS frontend; zbus is gone from the daemon.
 
     // The daemon's own per-machine system id for the tool-locality co-location
     // handshake (#248), read once at startup. Each client reports its id in the
@@ -2120,8 +2000,6 @@ async fn main() -> Result<()> {
     {
         tracing::warn!("UDS task join error during shutdown: {e}");
     }
-
-    drop(dbus_connection);
 
     Ok(())
 }

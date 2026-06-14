@@ -327,19 +327,15 @@ mod tests {
     #[test]
     fn transport_defaults_are_local_first() {
         // Local-first policy lives in `[transports]` (#279 item 3): WebSocket
-        // off, D-Bus best-effort (not required), UDS on (Unix). Bind to locals
-        // so the asserts are runtime checks rather than constant-folded
-        // tautologies.
+        // off, UDS on (Unix). Bind to locals so the asserts are runtime checks
+        // rather than constant-folded tautologies.
         let defaults = TransportsConfig::default();
         assert!(!defaults.ws_enabled, "WS must default off");
-        assert!(!defaults.dbus_required, "D-Bus must be optional by default");
         assert_eq!(defaults.uds_enabled, cfg!(unix));
         assert_eq!(defaults.ws_bind, "127.0.0.1:11339");
-        assert_eq!(defaults.dbus_service, "org.desktopAssistant");
 
         // The env knobs (via `parse_env_bool`) still flip each policy.
         assert!(parse_env_bool(Some("true"), defaults.ws_enabled));
-        assert!(parse_env_bool(Some("true"), defaults.dbus_required));
         assert!(!parse_env_bool(Some("false"), defaults.uds_enabled));
     }
 
