@@ -43,6 +43,12 @@ pub struct McpServerConfig {
 pub struct McpServerStatusInfo {
     pub name: String,
     pub command: String,
+    /// Configured launch arguments. Surfaced so the settings layer can project
+    /// an `McpServerView` that round-trips what `add_mcp_server` wrote (#314).
+    pub args: Vec<String>,
+    /// Optional tool-namespace prefix, mirrored from the config so it
+    /// round-trips through the settings surface (#314).
+    pub namespace: Option<String>,
     pub enabled: bool,
     pub status: String,
     pub tool_count: u32,
@@ -359,6 +365,8 @@ impl McpControlHandle {
                 Some(McpServerStatusInfo {
                     name: config.name.clone(),
                     command: config.command.clone(),
+                    args: config.args.clone(),
+                    namespace: config.namespace.clone(),
                     enabled: config.enabled,
                     status: status.to_string(),
                     tool_count,
@@ -1033,6 +1041,32 @@ mod tests {
         assert_eq!(status[1].name, "jira");
         assert_eq!(status[1].status, "disabled");
         assert!(!status[1].enabled);
+    }
+
+    #[tokio::test]
+    async fn control_handle_status_carries_command_args_namespace() {
+        // #314 MCP CRUD round-trip: `status()` must surface the full config
+        // (command + args + namespace), not just the command, so the settings
+        // layer can project an `McpServerView` that round-trips what was added.
+        let configs = vec![McpServerConfig {
+            name: "tasks".into(),
+            command: "/usr/bin/tasks-mcp".into(),
+            args: vec!["--mode".into(), "stdio".into()],
+            namespace: Some("jira".into()),
+            enabled: true,
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+        }];
+        let executor = McpToolExecutor::new(configs);
+        let handle = executor.control_handle();
+        let status = handle.status(None).await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].command, "/usr/bin/tasks-mcp");
+        assert_eq!(
+            status[0].args,
+            vec!["--mode".to_string(), "stdio".to_string()]
+        );
+        assert_eq!(status[0].namespace.as_deref(), Some("jira"));
     }
 
     #[tokio::test]

@@ -142,6 +142,71 @@ pub enum Command {
         push_on_update: bool,
     },
 
+    // Database / backend-tasks / WS-auth settings (bridge cutover 2/7, #314).
+    //
+    // These mirror the in-process D-Bus `org.desktopAssistant.Settings`
+    // methods of the same name 1:1 (same fields, same `None`/empty-clears
+    // semantics) so the dbus-bridge can proxy them over a socket transport and
+    // reach parity with the in-process adapter. They are the wire equivalents
+    // the bridge needs; the KCM already calls the D-Bus methods these mirror.
+    /// Read database settings. Returns
+    /// [`CommandResult::DatabaseSettings`].
+    ///
+    /// SECURITY: the returned `url` is the raw PostgreSQL connection string,
+    /// which for a password-auth deployment embeds the password inline
+    /// (`postgres://user:pass@host/db`). This mirrors the D-Bus
+    /// `GetDatabaseSettings` method exactly, which returns `settings.url`
+    /// verbatim with no redaction. Wire-modeling makes this reachable over a
+    /// socket (incl. WS); the secret exposure is unchanged from today's D-Bus
+    /// surface but is now reachable by a remote WS client if one is configured.
+    GetDatabaseSettings,
+    /// Update database settings. An empty `url` clears it (no database
+    /// configured). Mirrors the D-Bus `SetDatabaseSettings` method.
+    SetDatabaseSettings {
+        /// Empty string clears the configured URL.
+        url: String,
+        max_connections: u32,
+    },
+
+    /// Read backend-tasks settings (the LLM override used for background work
+    /// plus the dreaming / archive config). Returns
+    /// [`CommandResult::BackendTasksSettings`]. No secret is exposed: the
+    /// fields are the resolved connector/model/base-URL (an endpoint, not a
+    /// credential) and the dreaming/archive knobs; API keys live only in the
+    /// secret backend and are never returned here, matching the D-Bus
+    /// `GetBackendTasksSettings` method.
+    GetBackendTasksSettings,
+    /// Update backend-tasks settings. An empty `llm_connector` clears the LLM
+    /// override (background work falls back to the primary LLM). Mirrors the
+    /// D-Bus `SetBackendTasksSettings` method.
+    SetBackendTasksSettings {
+        /// Empty string clears the separate backend-tasks LLM override.
+        llm_connector: String,
+        llm_model: String,
+        llm_base_url: String,
+        dreaming_enabled: bool,
+        dreaming_interval_secs: u64,
+        archive_after_days: u32,
+    },
+
+    /// Read WebSocket auth settings (enabled auth methods + OIDC discovery
+    /// config). Returns [`CommandResult::WsAuthSettings`]. No secret is
+    /// exposed: the JWT HS256 signing key is stored in the secret backend and
+    /// is never read by this command; only the method list and the
+    /// non-sensitive OIDC issuer / endpoints / client id / scopes are
+    /// returned, matching the D-Bus `GetWsAuthSettings` method.
+    GetWsAuthSettings,
+    /// Update WebSocket auth settings. Mirrors the D-Bus `SetWsAuthSettings`
+    /// method.
+    SetWsAuthSettings {
+        methods: Vec<String>,
+        oidc_issuer: String,
+        oidc_auth_endpoint: String,
+        oidc_token_endpoint: String,
+        oidc_client_id: String,
+        oidc_scopes: String,
+    },
+
     // Named connections (issue #11).
     /// Enumerate every configured connection with its availability and
     /// whether credentials are present.
@@ -414,6 +479,13 @@ pub enum CommandResult {
     EmbeddingsSettings(EmbeddingsSettingsView),
     ConnectorDefaults(ConnectorDefaultsView),
     PersistenceSettings(PersistenceSettingsView),
+
+    /// Response to `GetDatabaseSettings` / `SetDatabaseSettings` (#314).
+    DatabaseSettings(DatabaseSettingsView),
+    /// Response to `GetBackendTasksSettings` / `SetBackendTasksSettings` (#314).
+    BackendTasksSettings(BackendTasksSettingsView),
+    /// Response to `GetWsAuthSettings` / `SetWsAuthSettings` (#314).
+    WsAuthSettings(WsAuthSettingsView),
 
     McpServers(Vec<McpServerView>),
 
@@ -826,6 +898,60 @@ pub struct McpServerView {
     /// "running" | "stopped" | "disabled"
     pub status: String,
     pub tool_count: u32,
+}
+
+/// Wire form of the database settings (#314). Mirrors the core
+/// [`desktop_assistant_core::ports::inbound::DatabaseSettingsView`] but lives
+/// here (serializable) so it can travel over the socket transports.
+///
+/// SECURITY: `url` is the raw PostgreSQL connection string and, for a
+/// password-auth deployment, embeds the password inline. It is returned
+/// verbatim, exactly as the in-process D-Bus `GetDatabaseSettings` method
+/// does — this view does NOT redact. See `Command::GetDatabaseSettings`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseSettingsView {
+    /// Empty string means no URL is configured.
+    pub url: String,
+    pub max_connections: u32,
+}
+
+/// Wire form of the backend-tasks settings (#314). Mirrors the core
+/// [`desktop_assistant_core::ports::inbound::BackendTasksSettingsView`].
+/// Carries no secret — `llm_base_url` is an endpoint, not a credential.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendTasksSettingsView {
+    /// Whether `[backend_tasks.llm]` is explicitly configured (vs. falling
+    /// back to the primary LLM).
+    pub has_separate_llm: bool,
+    /// Resolved connector (from backend_tasks.llm or fallback).
+    pub llm_connector: String,
+    /// Resolved model (from backend_tasks.llm or fallback).
+    pub llm_model: String,
+    /// Resolved base URL (from backend_tasks.llm or fallback).
+    pub llm_base_url: String,
+    /// Whether periodic fact extraction ("dreaming") is enabled.
+    pub dreaming_enabled: bool,
+    /// Interval in seconds between dreaming cycles.
+    pub dreaming_interval_secs: u64,
+    /// Archive conversations older than this many days (0 = disabled).
+    pub archive_after_days: u32,
+}
+
+/// Wire form of the WebSocket auth settings (#314). Mirrors the core
+/// [`desktop_assistant_core::ports::inbound::WsAuthSettingsView`].
+///
+/// SECURITY: this carries only the enabled auth `methods` and the
+/// non-sensitive OIDC discovery fields. The JWT HS256 signing key lives in
+/// the secret backend and is intentionally NOT a field here — matching the
+/// in-process D-Bus `GetWsAuthSettings` method, which never returns it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WsAuthSettingsView {
+    pub methods: Vec<String>,
+    pub oidc_issuer: String,
+    pub oidc_auth_endpoint: String,
+    pub oidc_token_endpoint: String,
+    pub oidc_client_id: String,
+    pub oidc_scopes: String,
 }
 
 // --- Named-connection views (#11) ------------------------------------------
@@ -2015,6 +2141,175 @@ mod tests {
         .unwrap();
         assert_eq!(v, expected);
         assert_eq!(cmd, serde_json::from_value(v).unwrap());
+    }
+
+    // --- #314 settings commands: database / backend-tasks / ws-auth ---------
+
+    #[test]
+    fn database_settings_commands_match_documented_snake_case() {
+        // GetDatabaseSettings is a unit variant.
+        let cmd = Command::GetDatabaseSettings;
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v, serde_json::json!("get_database_settings"));
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+
+        // SetDatabaseSettings carries the raw url + max_connections.
+        let cmd = Command::SetDatabaseSettings {
+            url: "postgres://u:p@host/db".into(),
+            max_connections: 7,
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"set_database_settings":{"url":"postgres://u:p@host/db","max_connections":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+    }
+
+    #[test]
+    fn database_settings_result_round_trips() {
+        let res = CommandResult::DatabaseSettings(DatabaseSettingsView {
+            url: "postgres://u:p@host/db".into(),
+            max_connections: 9,
+        });
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let dbv = v.get("database_settings").expect("database_settings key");
+        assert_eq!(
+            dbv.get("url"),
+            Some(&serde_json::json!("postgres://u:p@host/db"))
+        );
+        assert_eq!(dbv.get("max_connections"), Some(&serde_json::json!(9)));
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn backend_tasks_settings_commands_match_documented_snake_case() {
+        let cmd = Command::GetBackendTasksSettings;
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v, serde_json::json!("get_backend_tasks_settings"));
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+
+        let cmd = Command::SetBackendTasksSettings {
+            llm_connector: "ollama".into(),
+            llm_model: "qwen3".into(),
+            llm_base_url: "http://localhost:11434".into(),
+            dreaming_enabled: true,
+            dreaming_interval_secs: 1800,
+            archive_after_days: 30,
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"set_backend_tasks_settings":{"llm_connector":"ollama","llm_model":"qwen3","llm_base_url":"http://localhost:11434","dreaming_enabled":true,"dreaming_interval_secs":1800,"archive_after_days":30}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+    }
+
+    #[test]
+    fn backend_tasks_settings_result_round_trips() {
+        let res = CommandResult::BackendTasksSettings(BackendTasksSettingsView {
+            has_separate_llm: true,
+            llm_connector: "ollama".into(),
+            llm_model: "qwen3".into(),
+            llm_base_url: "http://localhost:11434".into(),
+            dreaming_enabled: true,
+            dreaming_interval_secs: 1800,
+            archive_after_days: 30,
+        });
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        assert!(v.get("backend_tasks_settings").is_some());
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn ws_auth_settings_commands_match_documented_snake_case() {
+        let cmd = Command::GetWsAuthSettings;
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v, serde_json::json!("get_ws_auth_settings"));
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+
+        let cmd = Command::SetWsAuthSettings {
+            methods: vec!["password".into(), "oidc".into()],
+            oidc_issuer: "https://issuer.example".into(),
+            oidc_auth_endpoint: "https://issuer.example/authorize".into(),
+            oidc_token_endpoint: "https://issuer.example/token".into(),
+            oidc_client_id: "client-123".into(),
+            oidc_scopes: "openid profile".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"set_ws_auth_settings":{"methods":["password","oidc"],"oidc_issuer":"https://issuer.example","oidc_auth_endpoint":"https://issuer.example/authorize","oidc_token_endpoint":"https://issuer.example/token","oidc_client_id":"client-123","oidc_scopes":"openid profile"}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, expected);
+        assert_eq!(cmd, serde_json::from_value(v).unwrap());
+    }
+
+    #[test]
+    fn ws_auth_settings_result_round_trips_and_exposes_no_signing_secret() {
+        let res = CommandResult::WsAuthSettings(WsAuthSettingsView {
+            methods: vec!["password".into()],
+            oidc_issuer: "https://issuer.example".into(),
+            oidc_auth_endpoint: String::new(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+            oidc_scopes: String::new(),
+        });
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let ws = v.get("ws_auth_settings").expect("ws_auth_settings key");
+        // Security guard: the WS-auth view must never carry the HS256 signing
+        // key (it lives in the secret backend). Pin the exact field set so a
+        // future change that adds a secret-bearing field trips this test.
+        let obj = ws.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "methods",
+                "oidc_auth_endpoint",
+                "oidc_client_id",
+                "oidc_issuer",
+                "oidc_scopes",
+                "oidc_token_endpoint",
+            ],
+            "WsAuthSettingsView must expose only methods + OIDC fields, no signing secret"
+        );
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn mcp_server_view_round_trips_command_args_and_namespace() {
+        // #314 MCP CRUD round-trip: a written command/args/namespace must read
+        // back. Pin the full wire shape (incl. `command`, which the bridge note
+        // flagged as not round-tripping).
+        let res = CommandResult::McpServers(vec![McpServerView {
+            name: "tasks".into(),
+            command: "/usr/bin/tasks-mcp".into(),
+            args: vec!["--mode".into(), "stdio".into()],
+            namespace: Some("jira".into()),
+            enabled: true,
+            status: "running".into(),
+            tool_count: 4,
+        }]);
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let server = &v.get("mcp_servers").expect("mcp_servers key")[0];
+        assert_eq!(
+            server.get("command"),
+            Some(&serde_json::json!("/usr/bin/tasks-mcp"))
+        );
+        assert_eq!(
+            server.get("args"),
+            Some(&serde_json::json!(["--mode", "stdio"]))
+        );
+        assert_eq!(server.get("namespace"), Some(&serde_json::json!("jira")));
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
     }
 
     #[test]

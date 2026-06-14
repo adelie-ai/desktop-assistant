@@ -258,8 +258,8 @@ impl SettingsService for DaemonSettingsService {
             .map(|s| McpServerView {
                 name: s.name,
                 command: s.command,
-                args: vec![],
-                namespace: None,
+                args: s.args,
+                namespace: s.namespace,
                 enabled: s.enabled,
                 status: s.status,
                 tool_count: s.tool_count,
@@ -355,8 +355,8 @@ impl SettingsService for DaemonSettingsService {
             .map(|s| McpServerView {
                 name: s.name,
                 command: s.command,
-                args: vec![],
-                namespace: None,
+                args: s.args,
+                namespace: s.namespace,
                 enabled: s.enabled,
                 status: s.status,
                 tool_count: s.tool_count,
