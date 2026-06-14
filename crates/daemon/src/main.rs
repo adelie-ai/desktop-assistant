@@ -876,19 +876,33 @@ async fn main() -> Result<()> {
         let kb_w = Arc::clone(kb);
         let kb_s = Arc::clone(kb);
         let kb_d = Arc::clone(kb);
+        let kb_l = Arc::clone(kb);
+        let kb_g = Arc::clone(kb);
         use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
         builtin_tools = builtin_tools.with_knowledge_base(
             Arc::new(move |entry| {
                 let store = Arc::clone(&kb_w);
                 Box::pin(async move { store.write(entry).await })
             }),
-            Arc::new(move |query, embedding, tags, limit| {
+            Arc::new(move |query, embedding, tags, exclude_tags, limit| {
                 let store = Arc::clone(&kb_s);
-                Box::pin(async move { store.search(&query, embedding, tags, limit).await })
+                Box::pin(async move {
+                    store
+                        .search(&query, embedding, tags, exclude_tags, limit)
+                        .await
+                })
+            }),
+            Arc::new(move |ids| {
+                let store = Arc::clone(&kb_d);
+                Box::pin(async move { store.delete_many(&ids).await })
+            }),
+            Arc::new(move |query| {
+                let store = Arc::clone(&kb_l);
+                Box::pin(async move { store.list_page(query).await })
             }),
             Arc::new(move |id| {
-                let store = Arc::clone(&kb_d);
-                Box::pin(async move { store.delete(&id).await })
+                let store = Arc::clone(&kb_g);
+                Box::pin(async move { store.get(&id).await })
             }),
         );
     }

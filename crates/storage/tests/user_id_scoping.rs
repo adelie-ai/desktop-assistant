@@ -453,7 +453,7 @@ async fn knowledge_search_with_empty_embedding_falls_back_to_fts() {
                 store.write(entry).await.expect("write");
 
                 let hits = store
-                    .search("forecast planning", Vec::new(), None, 10)
+                    .search("forecast planning", Vec::new(), None, None, 10)
                     .await
                     .expect("empty-embedding search must fall back to FTS, not error");
                 assert!(
