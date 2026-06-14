@@ -121,13 +121,16 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         self.transport.request(cmd).await.map_err(map_transport_err)
     }
 
-    /// Dispatch a turn-driving command. With the registry wired and the caller
-    /// known, route through that caller's per-sender session (so the daemon
-    /// streams the turn's events back on that session, which the unicast
-    /// forwarder delivers to only this caller); otherwise fall back to the shared
-    /// transport. `caller` is the D-Bus sender's unique bus name from the message
-    /// header.
-    async fn dispatch_turn(
+    /// Dispatch a command that may be **session-scoped**, routing it through the
+    /// per-sender [`SessionRegistry`]: a turn runs on the caller's own session (so
+    /// its streamed events come back there, to be unicast to only this caller);
+    /// `SubscribeConversations` is pinned to that session too (#367); everything
+    /// else uses the shared connection. The registry's
+    /// [`route`](SessionRegistry::route) makes that decision in one place, so the
+    /// typed methods and the generic Commands channel route identically. Without a
+    /// registry (unit tests) the command falls back to the shared transport.
+    /// `caller` is the D-Bus sender's unique bus name from the message header.
+    async fn dispatch_routed(
         &self,
         caller: Option<&str>,
         cmd: api::Command,
@@ -157,7 +160,7 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         // SendMessage returns an immediate Ack/SendMessageAck; a daemon refusal
         // before streaming surfaces here as the mapped transport error.
         let result = self
-            .dispatch_turn(
+            .dispatch_routed(
                 caller,
                 api::Command::SendMessage {
                     conversation_id: conversation_id.to_string(),
@@ -186,6 +189,33 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
             api::CommandResult::SendMessageAck { request_id, .. } => Ok(request_id),
             other => Err(fdo::Error::Failed(format!(
                 "unexpected SendMessage result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Shared body for `SubscribeConversations` (#367): set-replace the set of
+    /// conversations this caller is viewing, **pinned to the caller's own
+    /// session**, so the daemon fans those conversations' turn events
+    /// (`UserMessageAdded` + the response stream, including turns this caller did
+    /// not initiate) back on that session — which the per-sender unicast forwarder
+    /// delivers to only this caller. An empty list unsubscribes from all.
+    /// Factored out (no header) so it is unit-testable; the `#[interface]` method
+    /// extracts `caller` and calls it.
+    async fn dispatch_subscribe_conversations(
+        &self,
+        caller: Option<&str>,
+        conversation_ids: Vec<String>,
+    ) -> fdo::Result<()> {
+        let result = self
+            .dispatch_routed(
+                caller,
+                api::Command::SubscribeConversations { conversation_ids },
+            )
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SubscribeConversations result: {other:?}"
             ))),
         }
     }
@@ -477,6 +507,24 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         .await
     }
 
+    /// Set-replace the conversations this caller is viewing, for live
+    /// multi-client sync (#367). The daemon fans these conversations' turn events
+    /// back on the caller's per-sender session — including turns it did NOT
+    /// initiate (a voice turn, or another client) — delivered as
+    /// `UserMessageAdded` + `ResponseChunk`/`ResponseComplete`/`ResponseError`
+    /// signals unicast to this caller. Send the WHOLE set each time it changes
+    /// (open/switch/close); an empty list unsubscribes from all. A caller still
+    /// receives turns it drives itself regardless of this set.
+    async fn subscribe_conversations(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        conversation_ids: Vec<String>,
+    ) -> fdo::Result<()> {
+        let caller = hdr.sender().map(|s| s.as_str());
+        self.dispatch_subscribe_conversations(caller, conversation_ids)
+            .await
+    }
+
     /// Signal emitted for each chunk of a streaming response.
     /// Body is forwarded by [`super::event_forwarder`] from
     /// `Event::AssistantDelta`.
@@ -506,6 +554,29 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         conversation_id: &str,
         request_id: &str,
         error: &str,
+    ) -> zbus::Result<()>;
+
+    /// Signal emitted when a user message is committed and a turn starts in a
+    /// conversation this caller is viewing (via `SubscribeConversations`) —
+    /// including turns this caller did NOT initiate. Forwarded from
+    /// `Event::UserMessageAdded`; the initiator dedupes on `request_id` (#367).
+    #[zbus(signal)]
+    async fn user_message_added(
+        emitter: &SignalEmitter<'_>,
+        conversation_id: &str,
+        request_id: &str,
+        content: &str,
+    ) -> zbus::Result<()>;
+
+    /// Signal emitted when the user's conversation list changed
+    /// (created/renamed/deleted/(un)archived) by any client or the voice daemon.
+    /// Broadcast to every D-Bus client so sidebars refresh; carries only the
+    /// affected `conversation_id` (clients re-fetch the list). Forwarded from
+    /// `Event::ConversationListChanged` (#367).
+    #[zbus(signal)]
+    async fn conversation_list_changed(
+        emitter: &SignalEmitter<'_>,
+        conversation_id: &str,
     ) -> zbus::Result<()>;
 }
 
@@ -1043,6 +1114,56 @@ mod tests {
             }
             other => panic!("expected SendMessage, got {other:?}"),
         }
+    }
+
+    // --- subscribe_conversations (#367) ---------------------------------------
+
+    #[tokio::test]
+    async fn subscribe_conversations_builds_set_replace_command() {
+        // The bridge forwards the WHOLE viewed-set verbatim — the daemon does the
+        // set-replace. (Routing to the caller's session is covered in session.rs;
+        // with no registry wired here it falls back to the shared transport, which
+        // is enough to assert the command the adapter builds.)
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .dispatch_subscribe_conversations(Some(":1.10"), vec!["c1".into(), "c2".into()])
+            .await
+            .unwrap();
+        match only_command(&t).await {
+            api::Command::SubscribeConversations { conversation_ids } => {
+                assert_eq!(conversation_ids, vec!["c1".to_string(), "c2".to_string()]);
+            }
+            other => panic!("expected SubscribeConversations, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_conversations_empty_list_is_forwarded_as_unsubscribe() {
+        // An empty set is the documented "unsubscribe from all"; it must still be
+        // forwarded (not dropped) so the daemon clears the viewed-set.
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .dispatch_subscribe_conversations(Some(":1.10"), vec![])
+            .await
+            .unwrap();
+        assert!(matches!(
+            only_command(&t).await,
+            api::Command::SubscribeConversations { conversation_ids } if conversation_ids.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscribe_conversations_errors_on_unexpected_result_variant() {
+        // A non-Ack result is a contract violation and must surface as an error,
+        // not be swallowed.
+        let t = Arc::new(CannedTransport::new(api::CommandResult::ConversationId {
+            id: "x".into(),
+        }));
+        let err = DbusConversationsAdapter::new(Arc::clone(&t))
+            .dispatch_subscribe_conversations(Some(":1.10"), vec!["c1".into()])
+            .await
+            .expect_err("a non-Ack SubscribeConversations result must error");
+        assert!(matches!(err, fdo::Error::Failed(_)));
     }
 
     // -------------------------------------------------------------------------

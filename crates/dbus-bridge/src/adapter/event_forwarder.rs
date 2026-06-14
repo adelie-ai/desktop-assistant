@@ -5,16 +5,18 @@
 //! the matching object path on a [`zbus::Connection`]. Translation mirrors the
 //! in-process daemon's signal vocabulary one-for-one:
 //!
-//! | Signal event       | D-Bus signal                              |
-//! | ------------------ | ----------------------------------------- |
-//! | `Chunk`            | `Conversations.ResponseChunk`             |
-//! | `Complete`         | `Conversations.ResponseComplete`          |
-//! | `Error`            | `Conversations.ResponseError`             |
-//! | `TaskStarted`      | `BackgroundTasks.TaskStarted` (#116)      |
-//! | `TaskProgress`     | `BackgroundTasks.TaskProgress` (#116)     |
-//! | `TaskLogAppended`  | `BackgroundTasks.TaskLogAppended` (#116)  |
-//! | `TaskCompleted`    | `BackgroundTasks.TaskCompleted` (#116)    |
-//! | other              | dropped (see #367 for the parity follow-up)|
+//! | Signal event            | D-Bus signal                                   |
+//! | ----------------------- | ---------------------------------------------- |
+//! | `Chunk`                 | `Conversations.ResponseChunk`                  |
+//! | `Complete`              | `Conversations.ResponseComplete`               |
+//! | `Error`                 | `Conversations.ResponseError`                  |
+//! | `UserMessageAdded`      | `Conversations.UserMessageAdded` (#367)        |
+//! | `ConversationListChanged`| `Conversations.ConversationListChanged` (#367)|
+//! | `TaskStarted`           | `BackgroundTasks.TaskStarted` (#116)           |
+//! | `TaskProgress`          | `BackgroundTasks.TaskProgress` (#116)          |
+//! | `TaskLogAppended`       | `BackgroundTasks.TaskLogAppended` (#116)       |
+//! | `TaskCompleted`         | `BackgroundTasks.TaskCompleted` (#116)         |
+//! | other                   | dropped (Status/ContextUsage/Title; #320 tools)|
 //!
 //! `Settings.ConfigChanged` is **not** forwarded here: the decoded
 //! [`SignalEvent`] stream carries no config event, and the bridge's
@@ -72,6 +74,21 @@ pub enum ForwardAction {
         request_id: String,
         error: String,
     },
+    /// A user message was committed and a turn started in a conversation the
+    /// recipient is viewing (#367). Unicast to a per-sender session: it arrives
+    /// via that session's `SubscribeConversations` fan-out — including turns the
+    /// recipient did NOT initiate (a voice turn, or another client) — so a client
+    /// can render the user bubble live. The initiator dedupes on `request_id`.
+    UserMessageAdded {
+        conversation_id: String,
+        request_id: String,
+        content: String,
+    },
+    /// The user's conversation list changed — created/renamed/deleted/(un)archived
+    /// by any client or the voice daemon (#367). Broadcast on the shared per-user
+    /// stream so every D-Bus client refreshes its sidebar; carries only the
+    /// affected `conversation_id` (clients re-fetch the list).
+    ConversationListChanged { conversation_id: String },
     /// Task is now `Pending`/`Running`. `task` is the JSON-keyed `TaskView`
     /// encoded as `a{sv}`.
     TaskStarted {
@@ -97,6 +114,31 @@ pub enum ForwardAction {
     /// these to D-Bus (UserMessageAdded / ConversationListChanged / …) for full
     /// UDS/WS parity is the #367 follow-up.
     Ignored { kind: &'static str },
+}
+
+impl ForwardAction {
+    /// Whether this action belongs on the per-user **broadcast** stream (the
+    /// shared connection, `destination = None`) rather than a per-sender
+    /// **unicast** session stream. `Task*` and `ConversationListChanged` ride the
+    /// daemon's per-user broadcast (the `SubscribeBackgroundTasks` tap the shared
+    /// connection holds); the response stream and `UserMessageAdded` are
+    /// per-conversation fan-out delivered to a session's own connection.
+    ///
+    /// Used by [`run_unicast`] to defensively skip any broadcast-class action: a
+    /// per-sender session never *should* receive one (it holds no
+    /// `SubscribeBackgroundTasks`), but if daemon delivery ever changed, this
+    /// keeps a list-change from being re-emitted once per session on top of the
+    /// shared broadcast.
+    fn is_broadcast(&self) -> bool {
+        matches!(
+            self,
+            ForwardAction::TaskStarted { .. }
+                | ForwardAction::TaskProgress { .. }
+                | ForwardAction::TaskLogAppended { .. }
+                | ForwardAction::TaskCompleted { .. }
+                | ForwardAction::ConversationListChanged { .. }
+        )
+    }
 }
 
 /// Pure translator: one signal event → a D-Bus action. Sync / no-side-effects so
@@ -130,6 +172,21 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
             request_id,
             error,
         },
+        // #367: forwarded for full UDS/WS parity. `UserMessageAdded` reaches a
+        // per-sender session via its `SubscribeConversations` fan-out (unicast);
+        // `ConversationListChanged` rides the shared per-user broadcast.
+        SignalEvent::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        } => ForwardAction::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        },
+        SignalEvent::ConversationListChanged { conversation_id } => {
+            ForwardAction::ConversationListChanged { conversation_id }
+        }
         SignalEvent::TaskStarted { task } => {
             let id = task.id.0.clone();
             ForwardAction::TaskStarted {
@@ -154,10 +211,9 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
             status: task_status_str(status).to_string(),
             last_error: last_error.unwrap_or_default(),
         },
-        // --- deliberately not forwarded in v1 (see the module docs + #367) ---
-        SignalEvent::UserMessageAdded { .. } => ForwardAction::Ignored {
-            kind: "user_message_added",
-        },
+        // --- not (yet) forwarded: no D-Bus signal for these. Status/ContextUsage/
+        // TitleChanged are richer-parity follow-ups; ClientToolCall is #320;
+        // recorded as a deliberate ignore rather than a missed translation. ---
         SignalEvent::Status { .. } => ForwardAction::Ignored {
             kind: "assistant_status",
         },
@@ -166,9 +222,6 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
         },
         SignalEvent::TitleChanged { .. } => ForwardAction::Ignored {
             kind: "conversation_title_changed",
-        },
-        SignalEvent::ConversationListChanged { .. } => ForwardAction::Ignored {
-            kind: "conversation_list_changed",
         },
         SignalEvent::ConversationWarning { .. } => ForwardAction::Ignored {
             kind: "conversation_warning",
@@ -294,7 +347,18 @@ pub async fn run_unicast(connector: Arc<Connector>, connection: Connection, dest
                 );
                 events = connector.subscribe();
             }
-            Some(event) => emit(&connection, Some(&destination), translate(event)).await,
+            Some(event) => {
+                let action = translate(event);
+                if action.is_broadcast() {
+                    // A per-sender session holds no `SubscribeBackgroundTasks`, so
+                    // it should never receive a broadcast-class event; if it ever
+                    // did, the shared forwarder already broadcasts it — don't also
+                    // unicast a duplicate to this one sender.
+                    debug!("unicast forwarder for {destination}: skipping broadcast-class action");
+                } else {
+                    emit(&connection, Some(&destination), action).await;
+                }
+            }
             None => events = connector.subscribe(),
         }
     }
@@ -363,6 +427,40 @@ async fn emit(connection: &Connection, destination: Option<&str>, action: Forwar
                 .await
             {
                 warn!("response_error emit failed: {e}");
+            }
+        }
+        ForwardAction::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        } => {
+            let body = (conversation_id, request_id, content);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "UserMessageAdded",
+                    &body,
+                )
+                .await
+            {
+                warn!("user_message_added emit failed: {e}");
+            }
+        }
+        ForwardAction::ConversationListChanged { conversation_id } => {
+            let body = (conversation_id,);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "ConversationListChanged",
+                    &body,
+                )
+                .await
+            {
+                warn!("conversation_list_changed emit failed: {e}");
             }
         }
         ForwardAction::TaskStarted { id, task } => {
@@ -445,5 +543,73 @@ fn task_status_str(status: api::TaskStatus) -> &'static str {
         api::TaskStatus::Completed => "completed",
         api::TaskStatus::Failed => "failed",
         api::TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_broadcast_separates_per_user_stream_from_per_session_fanout() {
+        // Per-user BROADCAST stream (rides the shared connection's
+        // SubscribeBackgroundTasks): Task* + ConversationListChanged.
+        assert!(
+            ForwardAction::ConversationListChanged {
+                conversation_id: "c".into()
+            }
+            .is_broadcast()
+        );
+        assert!(
+            ForwardAction::TaskProgress {
+                id: "t".into(),
+                hint: String::new()
+            }
+            .is_broadcast()
+        );
+        assert!(
+            ForwardAction::TaskCompleted {
+                id: "t".into(),
+                status: "completed".into(),
+                last_error: String::new(),
+            }
+            .is_broadcast()
+        );
+
+        // Per-conversation fan-out (delivered to a per-sender session, UNICAST):
+        // the response stream + UserMessageAdded must NOT be classed broadcast, or
+        // `run_unicast` would drop them and a viewer would see no live turn.
+        assert!(
+            !ForwardAction::UserMessageAdded {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                content: "hi".into(),
+            }
+            .is_broadcast()
+        );
+        assert!(
+            !ForwardAction::ResponseChunk {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                chunk: "x".into(),
+            }
+            .is_broadcast()
+        );
+        assert!(
+            !ForwardAction::ResponseComplete {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                full_response: "x".into(),
+            }
+            .is_broadcast()
+        );
+        assert!(
+            !ForwardAction::ResponseError {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                error: "x".into(),
+            }
+            .is_broadcast()
+        );
     }
 }

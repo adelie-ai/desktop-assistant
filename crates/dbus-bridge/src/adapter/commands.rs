@@ -10,12 +10,15 @@
 //! through this one method. This adapter restores that parity over the bridge's
 //! UDS connection: `command_json` in, `api::CommandResult` JSON out.
 //!
-//! ## Why some commands are rejected here
+//! ## Routing and why some commands are still rejected here
 //!
-//! The bridge multiplexes **every** D-Bus caller onto its *single* daemon UDS
-//! session (the one minted at startup, [`crate::transport`]). A handful of
-//! commands assume a private, persistent, per-caller channel and would either
-//! be undeliverable or leak across callers if forwarded blindly, so they are
+//! Turn-driving (`SendMessage`) and session-pinned (`SubscribeConversations`)
+//! commands route through the **caller's own per-sender daemon session**
+//! ([`crate::session`]) — keyed by the D-Bus sender on the message header — so a
+//! turn's events come back on that session and a subscription's fan-out is
+//! isolated to that caller. Stateless request/response uses the bridge's shared
+//! session. A few commands still assume a private, persistent, per-caller
+//! *streaming* channel that a one-shot D-Bus method cannot provide, so they are
 //! rejected up front with `NotSupported` rather than silently mis-served:
 //!
 //! - **`SubscribeBackgroundTasks` / `UnsubscribeBackgroundTasks`** — set up a
@@ -24,23 +27,15 @@
 //!   background-task subscription open and re-emits them as
 //!   `BackgroundTasks.*` signals instead (see `main.rs`). Mirrors the
 //!   in-process adapter's rejection (`dbus-interface/src/commands.rs`).
-//! - **`SubscribeConversations`** — the set-replace live-sync subscription
-//!   (#356) registers the *connection's* sink against a set of conversations.
-//!   Over the bridge that is the one shared UDS connection, so a single D-Bus
-//!   caller's subscription would silently capture fan-out for every other
-//!   D-Bus caller. Live multi-client sync over D-Bus needs per-caller routing
-//!   the bridge does not model in v1 (it is a post-cutover follow-up, after
-//!   the in-process surface is retired in #319); reject it for now.
 //! - **`RegisterClientTools` / `ClientToolResult`** — the #270 / DT-4 hazard.
-//!   Registrations would land in the bridge session's single tool bucket,
-//!   shared across every D-Bus caller, and the resulting `Event::ClientToolCall`
-//!   has no D-Bus signal to be delivered on, so the turn would wedge until the
-//!   suspension timeout. Reject both, exactly as the tactical fix does for the
-//!   in-process surface.
+//!   The per-sender session machinery (B1) now makes safe routing *possible*,
+//!   but wiring it — registering tools on the caller's session and delivering
+//!   the resulting tool call as a unicast `ClientToolCall` signal — is #320.
+//!   Until then, reject both rather than wedge a turn on a tool call that has
+//!   no D-Bus signal to be delivered on.
 //!
-//! A client that genuinely needs streaming subscriptions or working
-//! client-side tools should use a socket transport (WS/UDS), which gives each
-//! client its own session.
+//! A client that needs working client-side tools today should use a socket
+//! transport (WS/UDS), which already gives each client its own session.
 
 use std::sync::Arc;
 
@@ -71,17 +66,13 @@ fn reject_reason(command: &api::Command) -> Option<&'static str> {
              BackgroundTasks signals, or use a socket transport (WS/UDS) and \
              Command::SubscribeBackgroundTasks for the live stream",
         ),
-        api::Command::SubscribeConversations { .. } => Some(
-            "live conversation subscription is not available over the generic D-Bus command \
-             channel: the bridge multiplexes every D-Bus caller onto one daemon session, so a \
-             subscription would capture fan-out for all callers; use a socket transport (WS/UDS) \
-             for live multi-client sync",
-        ),
+        // NOTE: `SubscribeConversations` is intentionally NOT rejected — it routes
+        // to the caller's per-sender session (#367, see the module docs and
+        // `crate::session::route`), so each caller's viewed-set is isolated.
         api::Command::RegisterClientTools { .. } | api::Command::ClientToolResult { .. } => Some(
-            "client-tool registration is not available over the generic D-Bus command channel: \
-             the bridge shares one daemon session across all D-Bus callers, so a registration \
-             would leak across callers, and the resulting tool-call events cannot be delivered \
-             back over a one-shot method; use a socket transport (WS/UDS)",
+            "client-tool registration is not yet available over D-Bus: routing onto per-sender \
+             sessions and delivering the resulting tool call as a ClientToolCall signal is #320; \
+             until then use a socket transport (WS/UDS)",
         ),
         _ => None,
     }
@@ -284,7 +275,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_conversation_subscription_before_dispatch() {
+    async fn subscribe_conversations_is_routed_not_rejected() {
+        // #367: SubscribeConversations now routes to the caller's per-sender
+        // session instead of being rejected. With no registry wired (unit test),
+        // run_command falls back to the shared transport, so it reaches the daemon
+        // rather than erroring — the regression guard for "we stopped rejecting it".
         let transport = FakeTransport::replying(api::CommandResult::Ack);
         let adapter = adapter(Arc::clone(&transport));
         let request = serde_json::to_string(&api::Command::SubscribeConversations {
@@ -292,13 +287,19 @@ mod tests {
         })
         .unwrap();
 
-        let err = adapter
-            .run_command(None, &request)
+        adapter
+            .run_command(Some(":1.10"), &request)
             .await
-            .expect_err("conversation subscription must be rejected over D-Bus");
-        assert!(matches!(err, fdo::Error::NotSupported(_)), "got {err:?}");
-        assert!(format!("{err}").contains("live multi-client sync"));
-        assert_eq!(transport.count(), 0);
+            .expect("SubscribeConversations must no longer be rejected over D-Bus");
+        assert_eq!(
+            transport.count(),
+            1,
+            "it must reach the daemon (be routed), not be rejected"
+        );
+        assert!(matches!(
+            transport.last(),
+            api::Command::SubscribeConversations { .. }
+        ));
     }
 
     #[tokio::test]
