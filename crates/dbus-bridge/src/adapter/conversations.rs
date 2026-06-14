@@ -670,4 +670,367 @@ mod tests {
         // Validation happens before dispatch — no command sent.
         assert!(transport.commands.lock().await.is_empty());
     }
+
+    // -------------------------------------------------------------------------
+    // Contract coverage for the remaining methods: each builds the canonical
+    // `api::Command` and maps its result; the rich logic (get_messages slicing,
+    // list_conversations normalization) gets edge-case tests.
+    // -------------------------------------------------------------------------
+
+    fn conv(messages: Vec<(&str, &str)>) -> api::CommandResult {
+        api::CommandResult::Conversation(api::ConversationView {
+            id: "c1".to_string(),
+            title: "Chat".to_string(),
+            messages: messages
+                .into_iter()
+                .map(|(role, content)| api::MessageView {
+                    id: String::new(),
+                    role: role.to_string(),
+                    content: content.to_string(),
+                })
+                .collect(),
+            warnings: Vec::new(),
+            model_selection: None,
+            conversation_personality: None,
+        })
+    }
+
+    async fn only_command(t: &CannedTransport) -> api::Command {
+        let cmds = t.commands.lock().await;
+        assert_eq!(cmds.len(), 1, "expected exactly one dispatched command");
+        cmds[0].clone()
+    }
+
+    // --- create_conversation --------------------------------------------------
+
+    #[tokio::test]
+    async fn create_conversation_builds_command_and_returns_id() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::ConversationId {
+            id: "new-id".to_string(),
+        }));
+        let id = DbusConversationsAdapter::new(Arc::clone(&t))
+            .create_conversation("Trip planning")
+            .await
+            .unwrap();
+        assert_eq!(id, "new-id");
+        assert!(matches!(
+            only_command(&t).await,
+            api::Command::CreateConversation { title } if title == "Trip planning"
+        ));
+    }
+
+    // --- list_conversations ---------------------------------------------------
+
+    #[tokio::test]
+    async fn list_conversations_positive_max_age_passes_through() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Conversations(
+            Vec::new(),
+        )));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .list_conversations(7, true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            only_command(&t).await,
+            api::Command::ListConversations {
+                max_age_days: Some(7),
+                include_archived: true
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_conversations_nonpositive_max_age_means_no_limit() {
+        // The contract: 0 or negative max_age_days means "no age cutoff" → None,
+        // never Some(0) (which the daemon would read as "younger than 0 days").
+        for days in [0, -1, -365] {
+            let t = Arc::new(CannedTransport::new(api::CommandResult::Conversations(
+                Vec::new(),
+            )));
+            DbusConversationsAdapter::new(Arc::clone(&t))
+                .list_conversations(days, false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    only_command(&t).await,
+                    api::Command::ListConversations {
+                        max_age_days: None,
+                        ..
+                    }
+                ),
+                "days={days} must normalize to None"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_conversations_maps_summaries_to_tuples() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Conversations(
+            vec![api::ConversationSummary {
+                id: "a".into(),
+                title: "Alpha".into(),
+                message_count: 3,
+                updated_at: "2026-06-14".into(),
+                archived: false,
+            }],
+        )));
+        let rows = DbusConversationsAdapter::new(Arc::clone(&t))
+            .list_conversations(0, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "a".to_string(),
+                "Alpha".to_string(),
+                3,
+                "2026-06-14".to_string(),
+                false
+            )]
+        );
+    }
+
+    // --- archive / unarchive / delete / rename (Ack) --------------------------
+
+    #[tokio::test]
+    async fn archive_conversation_builds_command_and_acks() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .archive_conversation("x")
+            .await
+            .unwrap();
+        assert!(
+            matches!(only_command(&t).await, api::Command::ArchiveConversation { id } if id == "x")
+        );
+    }
+
+    #[tokio::test]
+    async fn unarchive_conversation_builds_command_and_acks() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .unarchive_conversation("x")
+            .await
+            .unwrap();
+        assert!(
+            matches!(only_command(&t).await, api::Command::UnarchiveConversation { id } if id == "x")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_builds_command_and_acks() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .delete_conversation("x")
+            .await
+            .unwrap();
+        assert!(
+            matches!(only_command(&t).await, api::Command::DeleteConversation { id } if id == "x")
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_conversation_builds_command_with_id_and_title() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .rename_conversation("c1", "Renamed")
+            .await
+            .unwrap();
+        assert!(matches!(
+            only_command(&t).await,
+            api::Command::RenameConversation { id, title } if id == "c1" && title == "Renamed"
+        ));
+    }
+
+    // --- get_conversation -----------------------------------------------------
+
+    #[tokio::test]
+    async fn get_conversation_maps_view_to_id_title_and_role_content_tuples() {
+        let t = Arc::new(CannedTransport::new(conv(vec![
+            ("user", "hi"),
+            ("assistant", "hello"),
+        ])));
+        let (id, title, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_conversation("c1")
+            .await
+            .unwrap();
+        assert_eq!(id, "c1");
+        assert_eq!(title, "Chat");
+        assert_eq!(
+            messages,
+            vec![
+                ("user".to_string(), "hi".to_string()),
+                ("assistant".to_string(), "hello".to_string())
+            ]
+        );
+    }
+
+    // --- get_messages: the bridge-side pagination / filter / tail -------------
+
+    fn five_msgs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("user", "m0"),
+            ("assistant", "m1"),
+            ("user", "m2"),
+            ("assistant", "m3"),
+            ("user", "m4"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn get_messages_dispatches_get_conversation() {
+        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", -1, -1, vec![])
+            .await
+            .unwrap();
+        assert!(
+            matches!(only_command(&t).await, api::Command::GetConversation { id } if id == "c1")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_count_slices_from_offset() {
+        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
+        let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", -1, 2, vec![])
+            .await
+            .unwrap();
+        assert_eq!(total, 5, "total is the raw count, pre-slice");
+        assert!(!truncated, "after-paging does not truncate");
+        assert_eq!(
+            messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec!["m2", "m3", "m4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_messages_after_count_past_end_is_empty() {
+        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
+        let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", -1, 99, vec![])
+            .await
+            .unwrap();
+        assert_eq!(total, 5);
+        assert!(!truncated);
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_messages_tail_returns_last_n_and_marks_truncated() {
+        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
+        let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", 2, -1, vec![])
+            .await
+            .unwrap();
+        assert_eq!(total, 5);
+        assert!(
+            truncated,
+            "tail dropped older messages, so truncated is true"
+        );
+        assert_eq!(
+            messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec!["m3", "m4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_messages_tail_not_smaller_than_len_returns_all_untruncated() {
+        for tail in [0, 5, 10] {
+            let t = Arc::new(CannedTransport::new(conv(five_msgs())));
+            let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
+                .get_messages("c1", tail, -1, vec![])
+                .await
+                .unwrap();
+            assert_eq!(total, 5);
+            assert!(!truncated, "tail={tail} should not truncate");
+            assert_eq!(messages.len(), 5, "tail={tail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_messages_role_filter_keeps_only_named_roles() {
+        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
+        let (total, _truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", -1, -1, vec!["user".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(total, 5, "total counts all roles, even filtered-out ones");
+        assert_eq!(
+            messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
+            vec!["m0", "m2", "m4"],
+            "only user messages survive the filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_messages_errors_on_unexpected_result_variant() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        let err = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", -1, -1, vec![])
+            .await
+            .expect_err("a non-Conversation result must error");
+        assert!(matches!(err, fdo::Error::Failed(_)));
+    }
+
+    // --- clear_all_history ----------------------------------------------------
+
+    #[tokio::test]
+    async fn clear_all_history_returns_the_deleted_count() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::Cleared {
+            deleted_count: 9,
+        }));
+        let n = DbusConversationsAdapter::new(Arc::clone(&t))
+            .clear_all_history()
+            .await
+            .unwrap();
+        assert_eq!(n, 9);
+        assert!(matches!(
+            only_command(&t).await,
+            api::Command::ClearAllHistory
+        ));
+    }
+
+    // --- get_conversation_personality -----------------------------------------
+
+    #[tokio::test]
+    async fn get_conversation_personality_is_all_unset_when_none_stored() {
+        // No stored override → every trait reads back as -1 (fall back to global).
+        let t = Arc::new(CannedTransport::new(conv(vec![])));
+        let ordinals = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_conversation_personality("c1")
+            .await
+            .unwrap();
+        assert_eq!(ordinals, (-1, -1, -1, -1, -1, -1, -1));
+    }
+
+    // --- send_prompt ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn send_prompt_builds_send_message_with_empty_refinement() {
+        let t = Arc::new(CannedTransport::new(api::CommandResult::SendMessageAck {
+            request_id: "r".into(),
+            task_id: "t".into(),
+        }));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .send_prompt("c1", "hello there")
+            .await
+            .unwrap();
+        match only_command(&t).await {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                system_refinement,
+                ..
+            } => {
+                assert_eq!(conversation_id, "c1");
+                assert_eq!(content, "hello there");
+                assert!(
+                    system_refinement.is_empty(),
+                    "plain send_prompt carries no refinement"
+                );
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+    }
 }
