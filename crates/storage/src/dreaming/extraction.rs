@@ -374,10 +374,17 @@ fn build_extraction_system_prompt(registry: &[TagRecord]) -> String {
         ## Output format\n\
         \n\
         Return a JSON object with a `facts` array. Each fact has:\n\
-        - `content` (string): A self-contained prose sentence. If the fact only \
-        applies in a specific context (a project, tool, environment), include \
-        that context IN THE PROSE — never write a scope-naked fact like \
-        \"the project directory is /a\" without naming the project.\n\
+        - `content` (string): A fully SELF-CONTAINED prose sentence that will \
+        still make sense months from now with no access to this conversation. \
+        Resolve every referent inline: (a) name the subject — never \
+        \"he/she/they/it/this/that\"; write the actual person, project, tool, \
+        or file; (b) use absolute dates (\"2026-06-14\"), never relative ones \
+        (\"yesterday\", \"recently\"); (c) include the context that makes the \
+        fact useful — if it only applies to a specific project/tool/environment, \
+        say so IN THE PROSE, never a scope-naked fact like \"the project \
+        directory is /a\" without naming the project. A later cleanup pass sees \
+        ONLY this sentence (not the conversation), so anything it depends on \
+        must be written into it.\n\
         - `tags` (array of strings): Categorical tags from the registry below. \
         Pick only from registered tags. Tags describe WHAT KIND of fact this \
         is (e.g. `preference`, `architecture`), not the specific subject.\n\

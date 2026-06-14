@@ -1,9 +1,16 @@
 //! Phase 3: archive old conversations.
 //!
 //! Marks conversations whose `updated_at` is older than `days` days ago
-//! as archived. Hard-deletion of the underlying messages is a separate
-//! concern. Consolidation tolerates the case where a fact's
-//! `source_conversation_id` no longer resolves.
+//! as archived. This is a non-destructive soft flag (`archived_at`); the
+//! messages and the conversation row remain, so a fact's
+//! `source_conversation_id` still resolves after archival. (The only hard
+//! deletion of a conversation is an explicit user-initiated delete.)
+//!
+//! Ordering is not a concern for the dream cycle: extraction processes a
+//! conversation's messages within the hour they arrive — long before the
+//! multi-day archival window — and holistic consolidation operates purely on
+//! the (self-contained) knowledge entries, never re-reading transcripts. So
+//! `source_conversation_id` is now informational provenance only.
 //!
 //! This phase iterates implicitly over all users — each row carries its
 //! own `user_id`, and the archival flag is set in place, so the
