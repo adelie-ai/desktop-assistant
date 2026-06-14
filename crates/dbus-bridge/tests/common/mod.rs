@@ -18,7 +18,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Whether the stub minter should succeed and what token to return.
+///
+/// The non-`Success` variants are reusable failure-simulation scaffolding for
+/// the bridge's failure-path / soak tests (#317/#318); the minter's own error
+/// handling is unit-tested in `client-common`, so they're currently unused here.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum MinterScript {
     /// Return a one-shot success token.
     Success { token: String },
@@ -94,7 +99,13 @@ pub async fn spawn_stub_minter(
 }
 
 /// What a stub daemon does after the handshake.
+///
+/// Beyond `EchoAck`, the variants are reusable failure/event-injection
+/// scaffolding for the bridge's failure-path / soak tests (#317/#318) — the
+/// handshake-rejection and per-frame paths are unit-tested in `client-common`,
+/// so they're currently unused here.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum DaemonScript {
     /// Accept the handshake; for every inbound request reply with
     /// `WsFrame::Result { id, result: Ack }`.
@@ -114,6 +125,7 @@ pub enum DaemonScript {
 /// - a `Vec` of received `WsRequest` envelopes (parsed),
 /// - a oneshot to shut it down.
 pub struct StubDaemonHandle {
+    #[allow(dead_code)] // recorded for handshake-assertion tests (now in client-common)
     pub handshakes: Arc<Mutex<Vec<String>>>,
     pub requests: Arc<Mutex<Vec<api::WsRequest>>>,
     #[allow(dead_code)] // surfaced for future tests that push events dynamically
@@ -135,9 +147,19 @@ pub async fn spawn_stub_daemon(path: &Path, script: DaemonScript) -> StubDaemonH
     let handshakes_clone = Arc::clone(&handshakes);
     let requests_clone = Arc::clone(&requests);
     tokio::spawn(async move {
+        // Track live connection tasks so stopping the daemon closes their
+        // sockets (not just the accept loop). That's what lets a reconnect test
+        // simulate a real daemon restart: aborting the task drops the server end,
+        // the client sees EOF, and the Connector's reconnect supervisor fires.
+        let mut conns: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         loop {
             tokio::select! {
-                _ = &mut stop_rx => break,
+                _ = &mut stop_rx => {
+                    for c in &conns {
+                        c.abort();
+                    }
+                    break;
+                }
                 accept = listener.accept() => {
                     let Ok((stream, _)) = accept else { continue };
                     let script = script.clone();
@@ -150,7 +172,8 @@ pub async fn spawn_stub_daemon(path: &Path, script: DaemonScript) -> StubDaemonH
                     while let Ok(ev) = event_rx.try_recv() {
                         let _ = sub_tx.send(ev);
                     }
-                    tokio::spawn(async move {
+                    conns.retain(|c| !c.is_finished());
+                    conns.push(tokio::spawn(async move {
                         handle_daemon_connection(
                             stream,
                             script,
@@ -158,10 +181,12 @@ pub async fn spawn_stub_daemon(path: &Path, script: DaemonScript) -> StubDaemonH
                             requests_clone,
                             &mut sub_rx,
                         ).await;
-                    });
+                    }));
                 }
             }
         }
+        // `listener` drops here, unbinding the socket so a replacement daemon
+        // can rebind the same path.
     });
 
     StubDaemonHandle {

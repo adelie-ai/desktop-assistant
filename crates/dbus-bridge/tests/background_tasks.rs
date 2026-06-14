@@ -25,15 +25,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use desktop_assistant_api_model as api;
+use desktop_assistant_client_common::SignalEvent;
 use desktop_assistant_dbus_bridge::adapter::background_tasks::{
     DbusBackgroundTasksAdapter, log_entry_to_dict, task_view_to_dict,
 };
-use desktop_assistant_dbus_bridge::adapter::event_forwarder::{ForwardAction, run, translate};
+use desktop_assistant_dbus_bridge::adapter::event_forwarder::{
+    ForwardAction, forward_one, translate,
+};
 use desktop_assistant_dbus_bridge::adapter::paths;
 use desktop_assistant_dbus_bridge::transport::{BridgeTransport, BridgeTransportError};
 use futures_util::StreamExt;
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use zbus::fdo;
 use zbus::zvariant::{OwnedValue, Value};
 
@@ -54,27 +57,18 @@ struct StubTransport {
     /// daemon-level error frames (which the real transport surfaces as
     /// `BridgeTransportError::Daemon`).
     replies: Mutex<Vec<Result<api::CommandResult, String>>>,
-    /// Broadcast channel for `subscribe_events`. Tests push events in
-    /// via `push_event` to exercise the forwarder.
-    events_tx: broadcast::Sender<api::Event>,
 }
 
 impl StubTransport {
     fn new(replies: Vec<Result<api::CommandResult, String>>) -> Arc<Self> {
-        let (events_tx, _) = broadcast::channel(64);
         Arc::new(Self {
             commands: Mutex::new(Vec::new()),
             replies: Mutex::new(replies),
-            events_tx,
         })
     }
 
     async fn commands(&self) -> Vec<api::Command> {
         self.commands.lock().await.clone()
-    }
-
-    fn push_event(&self, event: api::Event) {
-        let _ = self.events_tx.send(event);
     }
 }
 
@@ -94,10 +88,6 @@ impl BridgeTransport for StubTransport {
             }
         };
         next.map_err(BridgeTransportError::Daemon)
-    }
-
-    fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
-        self.events_tx.subscribe()
     }
 }
 
@@ -386,7 +376,7 @@ async fn cancel_already_terminal_task_returns_fdo_error() {
 
 #[tokio::test]
 async fn event_translator_routes_task_started_to_dbus_signal() {
-    let event = api::Event::TaskStarted {
+    let event = SignalEvent::TaskStarted {
         task: sample_task_view("t-1"),
     };
     let action = translate(event);
@@ -408,7 +398,7 @@ async fn event_translator_routes_task_started_to_dbus_signal() {
 
 #[tokio::test]
 async fn event_translator_routes_task_progress_to_dbus_signal() {
-    let event = api::Event::TaskProgress {
+    let event = SignalEvent::TaskProgress {
         id: "t-1".to_string(),
         progress_hint: Some("processing".to_string()),
     };
@@ -423,7 +413,7 @@ async fn event_translator_routes_task_progress_to_dbus_signal() {
 
 #[tokio::test]
 async fn event_translator_routes_task_progress_with_no_hint() {
-    let event = api::Event::TaskProgress {
+    let event = SignalEvent::TaskProgress {
         id: "t-1".to_string(),
         progress_hint: None,
     };
@@ -438,7 +428,7 @@ async fn event_translator_routes_task_progress_with_no_hint() {
 
 #[tokio::test]
 async fn event_translator_routes_task_log_appended_to_dbus_signal() {
-    let event = api::Event::TaskLogAppended {
+    let event = SignalEvent::TaskLogAppended {
         id: "t-1".to_string(),
         entry: sample_log_entry(5),
     };
@@ -466,7 +456,7 @@ async fn event_translator_routes_task_log_appended_to_dbus_signal() {
 
 #[tokio::test]
 async fn event_translator_routes_task_completed_to_dbus_signal() {
-    let event = api::Event::TaskCompleted {
+    let event = SignalEvent::TaskCompleted {
         id: "t-1".to_string(),
         status: api::TaskStatus::Failed,
         last_error: Some("boom".to_string()),
@@ -487,7 +477,7 @@ async fn event_translator_routes_task_completed_to_dbus_signal() {
 
 #[tokio::test]
 async fn event_translator_routes_task_completed_with_no_error() {
-    let event = api::Event::TaskCompleted {
+    let event = SignalEvent::TaskCompleted {
         id: "t-1".to_string(),
         status: api::TaskStatus::Completed,
         last_error: None,
@@ -615,8 +605,7 @@ async fn task_started_signal_fires_within_500ms_of_spawn() {
         .await
         .expect("spawn ok");
     let started = sample_task_view("t-spawned");
-    pair.transport
-        .push_event(api::Event::TaskStarted { task: started });
+    pair.push_signal(SignalEvent::TaskStarted { task: started });
 
     let msg = tokio::time::timeout(Duration::from_millis(500), stream.next())
         .await
@@ -653,7 +642,7 @@ async fn task_log_appended_signal_streams_entries() {
     .expect("subscribe TaskLogAppended");
 
     for seq in 1..=5 {
-        pair.transport.push_event(api::Event::TaskLogAppended {
+        pair.push_signal(SignalEvent::TaskLogAppended {
             id: "t-1".to_string(),
             entry: sample_log_entry(seq),
         });
@@ -732,8 +721,8 @@ async fn signals_are_user_scoped_under_session_bus() {
     .await
     .expect("subscribe on B");
 
-    // Push an event into A's transport only.
-    pair_a.transport.push_event(api::Event::TaskStarted {
+    // Push a signal into A only.
+    pair_a.push_signal(SignalEvent::TaskStarted {
         task: sample_task_view("t-a-only"),
     });
 
@@ -759,7 +748,11 @@ struct ZbusPair {
     #[allow(dead_code)]
     server: zbus::Connection,
     client: zbus::Connection,
+    #[allow(dead_code)]
     transport: Arc<StubTransport>,
+    /// Push a `SignalEvent` to have the forwarder translate + emit it as a D-Bus
+    /// signal on the server connection (the seam the production `run` uses).
+    signal_tx: mpsc::UnboundedSender<SignalEvent>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     forwarder: Option<tokio::task::JoinHandle<()>>,
 }
@@ -789,23 +782,34 @@ impl ZbusPair {
             .await
             .expect("attach adapter");
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let events = transport.subscribe_events();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<SignalEvent>();
         let forwarder_conn = server.clone();
         let forwarder = tokio::spawn(async move {
-            run(events, forwarder_conn, async move {
-                let _ = shutdown_rx.await;
-            })
-            .await;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    ev = signal_rx.recv() => match ev {
+                        Some(sig) => forward_one(&forwarder_conn, sig).await,
+                        None => break,
+                    }
+                }
+            }
         });
 
         Self {
             server,
             client,
             transport,
+            signal_tx,
             shutdown_tx: Some(shutdown_tx),
             forwarder: Some(forwarder),
         }
+    }
+
+    /// Push a `SignalEvent` so the forwarder emits the matching D-Bus signal.
+    fn push_signal(&self, event: SignalEvent) {
+        let _ = self.signal_tx.send(event);
     }
 
     /// Call a method on the bridge interface from the client side.

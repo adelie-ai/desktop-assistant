@@ -8,6 +8,7 @@ pub mod config;
 pub mod connector;
 #[cfg(feature = "dbus")]
 pub mod dbus_client;
+pub mod minter;
 pub mod signal;
 pub mod system_id;
 pub mod timeouts;

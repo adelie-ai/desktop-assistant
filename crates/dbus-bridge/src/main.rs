@@ -1,21 +1,21 @@
 //! `adelie-dbus-bridge` — standalone D-Bus bridge binary (issue #106).
 //!
 //! At startup:
-//! 1. Fetch a JWT from the local minter (`$XDG_RUNTIME_DIR/adelie/mint.sock`
-//!    by default; overridable via `--minter-socket`).
-//! 2. Open a UDS connection to the daemon (`$XDG_RUNTIME_DIR/adelie/sock`,
-//!    overridable via `--daemon-socket`), perform the JWT handshake.
-//! 3. Stand up zbus adapters at the four canonical object paths.
-//! 4. Forward incoming wire events to D-Bus signals.
-//! 5. Wait for SIGTERM / SIGINT; tear down cleanly.
+//! 1. Build a UDS [`ConnectionConfig`] pointing at the daemon socket + the local
+//!    `adelie-mint` socket, and open a client-common [`Connector`] (#316). The
+//!    Connector mints a JWT from the minter, performs the handshake, and from
+//!    then on owns reconnect + re-minting on every drop.
+//! 2. Stand up zbus adapters at the canonical object paths over a transport that
+//!    forwards each command through the Connector.
+//! 3. Forward the daemon's signal stream to D-Bus signals (auto-resubscribing
+//!    across reconnects).
+//! 4. Wait for SIGTERM / SIGINT; tear down cleanly.
 //!
 //! The well-known bus name is configurable (`--name`, default
-//! `org.desktopAssistant.Bridge`). This default deliberately differs
-//! from the daemon's in-process name (`org.desktopAssistant`) so the
-//! bridge can run alongside the daemon during the transition (PR #106
-//! ships Option A — see PR body). A follow-up issue switches the
-//! default to `org.desktopAssistant` and removes the daemon's
-//! in-process surface.
+//! `org.desktopAssistant.Bridge`). This default deliberately differs from the
+//! daemon's in-process name (`org.desktopAssistant`) so the bridge can run
+//! alongside it during the transition (PR #106 Option A); a follow-up flips the
+//! default and removes the in-process surface.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,16 +23,16 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use desktop_assistant_api_model as api;
+use desktop_assistant_client_common::minter::default_minter_socket_path;
+use desktop_assistant_client_common::{
+    ConnectionConfig, Connector, TransportMode, default_desktop_socket_path,
+};
 use desktop_assistant_dbus_bridge::adapter::{
     DBUS_SERVICE_NAME, DbusBackgroundTasksAdapter, DbusCommandsAdapter, DbusConnectionsAdapter,
     DbusConversationsAdapter, DbusKnowledgeAdapter, DbusReloadAdapter, DbusSettingsAdapter,
     event_forwarder, paths,
 };
-use desktop_assistant_dbus_bridge::minter::{MintRequest, default_minter_socket_path, fetch_jwt};
-use desktop_assistant_dbus_bridge::transport::{
-    BridgeTransport, UdsBridgeConfig, UdsBridgeTransport, default_daemon_socket_path,
-};
+use desktop_assistant_dbus_bridge::transport::ConnectorBridgeTransport;
 use tokio::signal::unix::{SignalKind, signal};
 
 const DEFAULT_BRIDGE_NAME: &str = "org.desktopAssistant.Bridge";
@@ -62,13 +62,9 @@ struct Cli {
     #[arg(long, env = "ADELIE_BRIDGE_NAME", default_value = DEFAULT_BRIDGE_NAME)]
     name: String,
 
-    /// JWT TTL in seconds requested from the minter.
+    /// JWT TTL in seconds requested from the minter on every (re)connect.
     #[arg(long, default_value_t = 60 * 60)]
     token_ttl_seconds: u64,
-
-    /// Per-request timeout (seconds) for the UDS dispatch.
-    #[arg(long, default_value_t = 30)]
-    request_timeout_seconds: u64,
 }
 
 #[tokio::main]
@@ -88,56 +84,40 @@ async fn main() -> anyhow::Result<()> {
         .context("XDG_RUNTIME_DIR not set; pass --minter-socket explicitly")?;
     let daemon_socket = cli
         .daemon_socket
-        .or_else(default_daemon_socket_path)
+        .or_else(default_desktop_socket_path)
         .context("XDG_RUNTIME_DIR not set; pass --daemon-socket explicitly")?;
 
-    // 1. Mint.
-    tracing::info!(
-        minter = %minter_socket.display(),
-        "requesting JWT from local minter",
-    );
-    let jwt = fetch_jwt(
-        &minter_socket,
-        MintRequest {
-            ttl_seconds: Some(cli.token_ttl_seconds),
-            audience: None,
-        },
-        Duration::from_secs(10),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to fetch JWT from minter at {} — is adelie-mint.service running?",
-            minter_socket.display()
-        )
-    })?;
-
-    // 2. Connect.
+    // 1. Connect via the shared Connector (mints a JWT from the local minter,
+    //    handshakes, and owns reconnect + re-minting from here on — #316).
     tracing::info!(
         daemon = %daemon_socket.display(),
-        "connecting to daemon UDS",
+        minter = %minter_socket.display(),
+        "connecting to daemon UDS via the client-common Connector",
     );
-    let transport_config = UdsBridgeConfig {
-        socket_path: daemon_socket.clone(),
-        request_timeout: Duration::from_secs(cli.request_timeout_seconds),
-        event_buffer: 256,
+    let config = ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        socket_path: Some(daemon_socket.clone()),
+        minter_socket: Some(minter_socket.clone()),
+        minter_ttl_seconds: Some(cli.token_ttl_seconds),
+        ws_jwt: None,
+        ..ConnectionConfig::default()
     };
-    let transport = UdsBridgeTransport::connect(transport_config, &jwt)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to handshake with daemon at {} — is the daemon running with the UDS frontend enabled?",
-                daemon_socket.display()
-            )
-        })?;
-    let transport = Arc::new(transport);
+    let connector = Connector::connect(&config).await.with_context(|| {
+        format!(
+            "failed to connect to the daemon at {} (minter {}) — are \
+             desktop-assistant-daemon and adelie-mint running?",
+            daemon_socket.display(),
+            minter_socket.display(),
+        )
+    })?;
+    let connector = Arc::new(connector);
 
-    // 3. Stand up adapters + bind D-Bus name.
+    // 2. Stand up adapters over a Connector-backed transport + bind the name.
     tracing::info!(name = %cli.name, "binding D-Bus name");
     let _ = DBUS_SERVICE_NAME; // referenced for symmetry; CLI flag overrides
+    let transport = Arc::new(ConnectorBridgeTransport::new(Arc::clone(&connector)));
     // Generic command channel (#213 / #315 G1): the JSON-in/JSON-out surface
-    // tui/gtk use on `--transport dbus`. Without it the cutover would regress
-    // their management surface.
+    // tui/gtk use on `--transport dbus`.
     let commands = DbusCommandsAdapter::new(Arc::clone(&transport));
     let conversations = DbusConversationsAdapter::new(Arc::clone(&transport));
     let settings = DbusSettingsAdapter::new(Arc::clone(&transport));
@@ -163,42 +143,26 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to build D-Bus connection")?;
     tracing::info!(name = %cli.name, "D-Bus bridge ready");
 
-    // Subscribe to background-task events so the forwarder can fan
-    // them out as `BackgroundTasks.*` signals. Best-effort: a
-    // failed subscription is logged but does not abort startup —
-    // older daemons may not implement the command, and the rest of
-    // the bridge stays functional.
-    match transport
-        .request(api::Command::SubscribeBackgroundTasks)
-        .await
-    {
-        Ok(_) => tracing::info!("subscribed to background-task events"),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "failed to subscribe to background-task events; \
-             BackgroundTasks signals will not fire"
-        ),
-    }
-
-    // 4. Event forwarder.
-    let events = transport.subscribe_events();
+    // 3. Event forwarder. It issues the initial `SubscribeBackgroundTasks` and
+    //    re-issues it (and re-subscribes the stream) across daemon restarts.
     let forwarder_shutdown = build_shutdown_signal()?;
-    let forwarder_connection = connection.clone();
     let forwarder = tokio::spawn(event_forwarder::run(
-        events,
-        forwarder_connection,
+        Arc::clone(&connector),
+        connection.clone(),
         forwarder_shutdown,
     ));
 
-    // 5. Wait for SIGTERM/SIGINT.
+    // 4. Wait for SIGTERM/SIGINT.
     let main_shutdown = build_shutdown_signal()?;
     main_shutdown.await;
     tracing::info!("shutdown signal received; tearing down");
 
-    transport.shutdown();
-    // Best effort: give the forwarder a moment to drain.
+    // Dropping the connection stops serving; the forwarder exits on its own
+    // shutdown signal. Give it a moment to drain, then drop the Connector
+    // (which aborts its reconnect supervisor).
     let _ = tokio::time::timeout(Duration::from_secs(2), forwarder).await;
     drop(connection);
+    drop(connector);
     Ok(())
 }
 

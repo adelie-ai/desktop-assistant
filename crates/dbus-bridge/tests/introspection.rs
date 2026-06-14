@@ -46,7 +46,6 @@ use desktop_assistant_dbus_bridge::adapter::{
     DbusReloadAdapter, DbusSettingsAdapter,
 };
 use desktop_assistant_dbus_bridge::transport::{BridgeTransport, BridgeTransportError};
-use tokio::sync::broadcast;
 use zbus::object_server::Interface;
 
 /// Interfaces whose signature must match the live surface, keyed by the golden
@@ -73,16 +72,12 @@ const Q2_DROPS: &[(&str, &str)] = &[
 // --- fake transport ---------------------------------------------------------
 
 /// A transport that never connects — introspection never calls `request`, it
-/// only needs a constructed adapter. `subscribe_events` returns a live-but-idle
-/// receiver to satisfy the trait.
-struct NoopTransport {
-    events_tx: broadcast::Sender<api::Event>,
-}
+/// only needs a constructed adapter.
+struct NoopTransport;
 
 impl NoopTransport {
     fn arc() -> Arc<Self> {
-        let (events_tx, _rx) = broadcast::channel(1);
-        Arc::new(Self { events_tx })
+        Arc::new(Self)
     }
 }
 
@@ -93,10 +88,6 @@ impl BridgeTransport for NoopTransport {
         _command: api::Command,
     ) -> Result<api::CommandResult, BridgeTransportError> {
         Err(BridgeTransportError::Daemon("noop transport".into()))
-    }
-
-    fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
-        self.events_tx.subscribe()
     }
 }
 
