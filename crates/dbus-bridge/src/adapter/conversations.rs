@@ -251,10 +251,13 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
     }
 
     /// Get messages with pagination + role filter. Returns
-    /// `(total_raw_count, truncated, messages)`. Slicing is performed
-    /// on the bridge side using the daemon's full conversation view
-    /// because the daemon's command set does not (yet) expose this
-    /// exact pagination shape on the wire.
+    /// `(total_raw_count, truncated, messages)` where `messages` is
+    /// `(role, content)` tuples.
+    ///
+    /// The windowing is the daemon's: `Command::GetMessages` runs the single
+    /// `window_messages` slicer (#363) that every UDS/WS client also uses, so
+    /// this adapter is a thin translator — no slicing logic of its own to drift
+    /// from the others. The D-Bus signature is unchanged.
     async fn get_messages(
         &self,
         id: &str,
@@ -263,45 +266,26 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         include_roles: Vec<String>,
     ) -> fdo::Result<(u32, bool, Vec<(String, String)>)> {
         let result = self
-            .dispatch(api::Command::GetConversation { id: id.to_string() })
+            .dispatch(api::Command::GetMessages {
+                conversation_id: id.to_string(),
+                tail,
+                after_count,
+                include_roles,
+            })
             .await?;
-        let conv = match result {
-            api::CommandResult::Conversation(c) => c,
-            other => {
-                return Err(fdo::Error::Failed(format!(
-                    "unexpected GetConversation result for get_messages: {other:?}"
-                )));
-            }
-        };
-
-        let total = conv.messages.len() as u32;
-        let all: Vec<(String, String)> = conv
-            .messages
-            .into_iter()
-            .map(|m| (m.role, m.content))
-            .collect();
-
-        let use_after = after_count >= 0;
-        let sliced: Vec<(String, String)> = if use_after {
-            let start = (after_count as usize).min(all.len());
-            all[start..].to_vec()
-        } else {
-            all
-        };
-
-        let filtered: Vec<(String, String)> = sliced
-            .into_iter()
-            .filter(|(role, _)| include_roles.is_empty() || include_roles.contains(role))
-            .collect();
-
-        let (truncated, messages) = if !use_after && tail > 0 && filtered.len() > tail as usize {
-            let start = filtered.len() - tail as usize;
-            (true, filtered[start..].to_vec())
-        } else {
-            (false, filtered)
-        };
-
-        Ok((total, truncated, messages))
+        match result {
+            api::CommandResult::Messages(view) => Ok((
+                view.total_raw_count,
+                view.truncated,
+                view.messages
+                    .into_iter()
+                    .map(|m| (m.role, m.content))
+                    .collect(),
+            )),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected GetMessages result: {other:?}"
+            ))),
+        }
     }
 
     /// Delete a conversation by ID.
@@ -865,101 +849,75 @@ mod tests {
         );
     }
 
-    // --- get_messages: the bridge-side pagination / filter / tail -------------
+    // --- get_messages: a thin translator over the wire windowing -------------
+    // The slicing lives in — and is tested by — the daemon's `window_messages`
+    // (#363); the bridge only forwards the window args and maps the result, so
+    // these tests pin the *translation*, not the slicing. (This is what keeps
+    // the D-Bus path identical to every UDS/WS client: one slicer, shared.)
 
-    fn five_msgs() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("user", "m0"),
-            ("assistant", "m1"),
-            ("user", "m2"),
-            ("assistant", "m3"),
-            ("user", "m4"),
-        ]
-    }
-
-    #[tokio::test]
-    async fn get_messages_dispatches_get_conversation() {
-        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
-        DbusConversationsAdapter::new(Arc::clone(&t))
-            .get_messages("c1", -1, -1, vec![])
-            .await
-            .unwrap();
-        assert!(
-            matches!(only_command(&t).await, api::Command::GetConversation { id } if id == "c1")
-        );
-    }
-
-    #[tokio::test]
-    async fn get_messages_after_count_slices_from_offset() {
-        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
-        let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
-            .get_messages("c1", -1, 2, vec![])
-            .await
-            .unwrap();
-        assert_eq!(total, 5, "total is the raw count, pre-slice");
-        assert!(!truncated, "after-paging does not truncate");
-        assert_eq!(
-            messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
-            vec!["m2", "m3", "m4"]
-        );
-    }
-
-    #[tokio::test]
-    async fn get_messages_after_count_past_end_is_empty() {
-        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
-        let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
-            .get_messages("c1", -1, 99, vec![])
-            .await
-            .unwrap();
-        assert_eq!(total, 5);
-        assert!(!truncated);
-        assert!(messages.is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_messages_tail_returns_last_n_and_marks_truncated() {
-        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
-        let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
-            .get_messages("c1", 2, -1, vec![])
-            .await
-            .unwrap();
-        assert_eq!(total, 5);
-        assert!(
+    fn messages_view(
+        total_raw_count: u32,
+        truncated: bool,
+        msgs: Vec<(&str, &str)>,
+    ) -> api::CommandResult {
+        api::CommandResult::Messages(api::MessagesView {
+            total_raw_count,
             truncated,
-            "tail dropped older messages, so truncated is true"
-        );
-        assert_eq!(
-            messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
-            vec!["m3", "m4"]
-        );
+            messages: msgs
+                .into_iter()
+                .map(|(role, content)| api::MessageView {
+                    id: String::new(),
+                    role: role.to_string(),
+                    content: content.to_string(),
+                })
+                .collect(),
+        })
     }
 
     #[tokio::test]
-    async fn get_messages_tail_not_smaller_than_len_returns_all_untruncated() {
-        for tail in [0, 5, 10] {
-            let t = Arc::new(CannedTransport::new(conv(five_msgs())));
-            let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
-                .get_messages("c1", tail, -1, vec![])
-                .await
-                .unwrap();
-            assert_eq!(total, 5);
-            assert!(!truncated, "tail={tail} should not truncate");
-            assert_eq!(messages.len(), 5, "tail={tail}");
+    async fn get_messages_forwards_window_args_to_the_daemon_verbatim() {
+        // The bridge must NOT interpret tail/after_count/roles itself — it
+        // forwards them so the daemon's single `window_messages` does the work.
+        let t = Arc::new(CannedTransport::new(messages_view(0, false, vec![])));
+        DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", 50, 10, vec!["user".to_string()])
+            .await
+            .unwrap();
+        match only_command(&t).await {
+            api::Command::GetMessages {
+                conversation_id,
+                tail,
+                after_count,
+                include_roles,
+            } => {
+                assert_eq!(conversation_id, "c1");
+                assert_eq!(tail, 50);
+                assert_eq!(after_count, 10);
+                assert_eq!(include_roles, vec!["user".to_string()]);
+            }
+            other => panic!("expected GetMessages, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn get_messages_role_filter_keeps_only_named_roles() {
-        let t = Arc::new(CannedTransport::new(conv(five_msgs())));
-        let (total, _truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
-            .get_messages("c1", -1, -1, vec!["user".to_string()])
+    async fn get_messages_maps_view_to_total_truncated_and_tuples() {
+        let t = Arc::new(CannedTransport::new(messages_view(
+            42,
+            true,
+            vec![("user", "hi"), ("assistant", "yo")],
+        )));
+        let (total, truncated, messages) = DbusConversationsAdapter::new(Arc::clone(&t))
+            .get_messages("c1", 2, -1, vec![])
             .await
             .unwrap();
-        assert_eq!(total, 5, "total counts all roles, even filtered-out ones");
+        assert_eq!(total, 42, "total_raw_count passes through");
+        assert!(truncated, "truncated passes through");
         assert_eq!(
-            messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
-            vec!["m0", "m2", "m4"],
-            "only user messages survive the filter"
+            messages,
+            vec![
+                ("user".to_string(), "hi".to_string()),
+                ("assistant".to_string(), "yo".to_string())
+            ]
         );
     }
 
@@ -969,7 +927,7 @@ mod tests {
         let err = DbusConversationsAdapter::new(Arc::clone(&t))
             .get_messages("c1", -1, -1, vec![])
             .await
-            .expect_err("a non-Conversation result must error");
+            .expect_err("a non-Messages result must error");
         assert!(matches!(err, fdo::Error::Failed(_)));
     }
 
@@ -1032,5 +990,99 @@ mod tests {
             }
             other => panic!("expected SendMessage, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-transport parity guard.
+    //
+    // The bridge adapters and client-common's `AssistantCommands` (tui/gtk over
+    // UDS/WS) are two independent layers that translate the same operation into
+    // an `api::Command`. They must build the SAME command — past that point the
+    // daemon's single handler makes behavior identical, so command-equality IS
+    // the parity contract, asserted where divergence can happen. (This is the
+    // regression guard for the get_messages divergence: pre-fix the bridge built
+    // GetConversation + sliced client-side while client-common built GetMessages.)
+    // -------------------------------------------------------------------------
+    use desktop_assistant_client_common::AssistantCommands;
+
+    /// Records the command client-common builds — every typed method funnels
+    /// through `send_command`.
+    struct RecordingClient {
+        seen: std::sync::Mutex<Vec<api::Command>>,
+        reply: api::CommandResult,
+    }
+    impl RecordingClient {
+        fn new(reply: api::CommandResult) -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                reply,
+            }
+        }
+        fn command(&self) -> api::Command {
+            self.seen
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .expect("a command was sent")
+        }
+    }
+    #[async_trait::async_trait]
+    impl AssistantCommands for RecordingClient {
+        async fn send_command(&self, command: api::Command) -> anyhow::Result<api::CommandResult> {
+            self.seen.lock().unwrap().push(command);
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn get_messages_builds_the_same_command_on_dbus_and_client_common() {
+        let reply = api::CommandResult::Messages(api::MessagesView {
+            total_raw_count: 0,
+            truncated: false,
+            messages: Vec::new(),
+        });
+        let bridge = Arc::new(CannedTransport::new(reply.clone()));
+        DbusConversationsAdapter::new(Arc::clone(&bridge))
+            .get_messages("c1", 50, 10, vec!["user".to_string()])
+            .await
+            .unwrap();
+        let client = RecordingClient::new(reply);
+        client
+            .get_messages("c1", 50, 10, vec!["user".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            only_command(&bridge).await,
+            client.command(),
+            "get_messages must build the same api::Command over D-Bus and UDS/WS"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_conversation_builds_the_same_command_on_dbus_and_client_common() {
+        let reply = api::CommandResult::ConversationId {
+            id: "x".to_string(),
+        };
+        let bridge = Arc::new(CannedTransport::new(reply.clone()));
+        DbusConversationsAdapter::new(Arc::clone(&bridge))
+            .create_conversation("Trip planning")
+            .await
+            .unwrap();
+        let client = RecordingClient::new(reply);
+        client.create_conversation("Trip planning").await.unwrap();
+        assert_eq!(only_command(&bridge).await, client.command());
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_builds_the_same_command_on_dbus_and_client_common() {
+        let bridge = Arc::new(CannedTransport::new(api::CommandResult::Ack));
+        DbusConversationsAdapter::new(Arc::clone(&bridge))
+            .delete_conversation("c1")
+            .await
+            .unwrap();
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        client.delete_conversation("c1").await.unwrap();
+        assert_eq!(only_command(&bridge).await, client.command());
     }
 }
