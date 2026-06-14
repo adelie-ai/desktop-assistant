@@ -1,0 +1,7 @@
+method CreateConnection(in:s:id, in:s:config_json)
+method DeleteConnection(in:s:id, in:b:force)
+method GetPurposes(out:s:)
+method ListAvailableModels(in:s:connection_id, in:b:refresh, out:s:)
+method ListConnections(out:s:)
+method SetPurpose(in:s:purpose, in:s:config_json)
+method UpdateConnection(in:s:id, in:s:config_json)

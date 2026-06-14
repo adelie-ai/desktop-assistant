@@ -1,0 +1,6 @@
+method CreateEntry(in:s:content, in:s:tags_json, in:s:metadata_json, out:s:)
+method DeleteEntry(in:s:id)
+method GetEntry(in:s:id, out:s:)
+method ListEntries(in:u:limit, in:u:offset, in:s:tag_filter_json, out:s:)
+method SearchEntries(in:s:query, in:s:tag_filter_json, in:u:limit, out:s:)
+method UpdateEntry(in:s:id, in:s:content, in:s:tags_json, in:s:metadata_json, out:s:)

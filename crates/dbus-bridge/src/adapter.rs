@@ -23,6 +23,7 @@
 //! reply.
 
 pub mod background_tasks;
+pub mod commands;
 pub mod connections;
 pub mod conversations;
 pub mod event_forwarder;
@@ -31,6 +32,7 @@ pub mod reload;
 pub mod settings;
 
 pub use background_tasks::DbusBackgroundTasksAdapter;
+pub use commands::DbusCommandsAdapter;
 pub use connections::DbusConnectionsAdapter;
 pub use conversations::DbusConversationsAdapter;
 pub use knowledge::DbusKnowledgeAdapter;
@@ -47,6 +49,7 @@ pub const DBUS_SERVICE_NAME: &str = "org.desktopAssistant";
 /// Object paths the bridge exposes. Order matters for introspection
 /// goldens.
 pub mod paths {
+    pub const COMMANDS: &str = "/org/desktopAssistant/Commands";
     pub const CONVERSATIONS: &str = "/org/desktopAssistant/Conversations";
     pub const SETTINGS: &str = "/org/desktopAssistant/Settings";
     pub const CONNECTIONS: &str = "/org/desktopAssistant/Connections";

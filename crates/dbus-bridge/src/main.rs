@@ -25,7 +25,7 @@ use anyhow::Context;
 use clap::Parser;
 use desktop_assistant_api_model as api;
 use desktop_assistant_dbus_bridge::adapter::{
-    DBUS_SERVICE_NAME, DbusBackgroundTasksAdapter, DbusConnectionsAdapter,
+    DBUS_SERVICE_NAME, DbusBackgroundTasksAdapter, DbusCommandsAdapter, DbusConnectionsAdapter,
     DbusConversationsAdapter, DbusKnowledgeAdapter, DbusReloadAdapter, DbusSettingsAdapter,
     event_forwarder, paths,
 };
@@ -135,6 +135,10 @@ async fn main() -> anyhow::Result<()> {
     // 3. Stand up adapters + bind D-Bus name.
     tracing::info!(name = %cli.name, "binding D-Bus name");
     let _ = DBUS_SERVICE_NAME; // referenced for symmetry; CLI flag overrides
+    // Generic command channel (#213 / #315 G1): the JSON-in/JSON-out surface
+    // tui/gtk use on `--transport dbus`. Without it the cutover would regress
+    // their management surface.
+    let commands = DbusCommandsAdapter::new(Arc::clone(&transport));
     let conversations = DbusConversationsAdapter::new(Arc::clone(&transport));
     let settings = DbusSettingsAdapter::new(Arc::clone(&transport));
     let connections = DbusConnectionsAdapter::new(Arc::clone(&transport));
@@ -147,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
     let connection = zbus::connection::Builder::session()
         .context("failed to connect to D-Bus session bus")?
         .name(cli.name.as_str())?
+        .serve_at(paths::COMMANDS, commands)?
         .serve_at(paths::CONVERSATIONS, conversations)?
         .serve_at(paths::SETTINGS, settings)?
         .serve_at(paths::CONNECTIONS, connections)?
