@@ -1282,6 +1282,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "desktop-assistant-api-model",
+ "desktop-assistant-client-common",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "desktop-assistant-core"
 version = "0.1.0"
 dependencies = [
