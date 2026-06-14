@@ -205,19 +205,11 @@ fn translate_covers_streaming_response_variants() {
 
 #[test]
 fn translate_marks_unforwarded_variants_explicitly() {
-    // Variants not yet surfaced as D-Bus signals must hit `Ignored` with a
-    // stable kind, so the #367 follow-up (full UDS/WS parity) is a deliberate,
-    // visible step rather than silent drift. Task* variants are forwarded and
-    // covered in `tests/background_tasks.rs`.
+    // Variants with no D-Bus signal must hit `Ignored` with a stable kind, so a
+    // future parity step is deliberate rather than silent drift. (UserMessageAdded
+    // + ConversationListChanged ARE now forwarded — see the next test. Task*
+    // variants are forwarded and covered in `tests/background_tasks.rs`.)
     let cases: Vec<(SignalEvent, &str)> = vec![
-        (
-            SignalEvent::UserMessageAdded {
-                conversation_id: "c".into(),
-                request_id: "r".into(),
-                content: "hi".into(),
-            },
-            "user_message_added",
-        ),
         (
             SignalEvent::Status {
                 conversation_id: "c".into(),
@@ -243,12 +235,6 @@ fn translate_marks_unforwarded_variants_explicitly() {
             },
             "context_usage",
         ),
-        (
-            SignalEvent::ConversationListChanged {
-                conversation_id: "c".into(),
-            },
-            "conversation_list_changed",
-        ),
     ];
     for (event, expected_kind) in cases {
         match translate(event) {
@@ -256,6 +242,27 @@ fn translate_marks_unforwarded_variants_explicitly() {
             other => panic!("expected Ignored {expected_kind}, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn translate_forwards_user_message_added_and_conversation_list_changed() {
+    // #367: both are now real D-Bus signals on Conversations, carrying their
+    // payload through verbatim.
+    assert!(matches!(
+        translate(SignalEvent::UserMessageAdded {
+            conversation_id: "c".into(),
+            request_id: "r".into(),
+            content: "hi".into(),
+        }),
+        ForwardAction::UserMessageAdded { conversation_id, request_id, content }
+            if conversation_id == "c" && request_id == "r" && content == "hi"
+    ));
+    assert!(matches!(
+        translate(SignalEvent::ConversationListChanged {
+            conversation_id: "c".into(),
+        }),
+        ForwardAction::ConversationListChanged { conversation_id } if conversation_id == "c"
+    ));
 }
 
 // ---------------------------------------------------------------------------

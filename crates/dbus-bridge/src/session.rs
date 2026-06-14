@@ -46,6 +46,17 @@ pub fn is_turn_driving(command: &api::Command) -> bool {
     matches!(command, api::Command::SendMessage { .. })
 }
 
+/// Whether `command` registers **per-connection** state that only has meaning on
+/// the caller's own session — currently `SubscribeConversations` (the live-sync
+/// viewed-set; #367), and post-#320 the client-tool registration/result. Unlike a
+/// turn (which can fall back to the shared connection for a caller-less message),
+/// a session-pinned command with no identifiable caller is rejected: routing it
+/// to the shared connection would let one D-Bus caller's subscription capture or
+/// broadcast every other caller's fan-out (#270 / DT-4).
+pub fn is_session_pinned(command: &api::Command) -> bool {
+    matches!(command, api::Command::SubscribeConversations { .. })
+}
+
 /// One D-Bus sender's private daemon session: the transport its commands
 /// dispatch through, plus the handle of the unicast forwarder pumping that
 /// session's events to the sender. Dropping it aborts the forwarder (and, with
@@ -198,9 +209,26 @@ impl SessionRegistry {
         command: api::Command,
         fallback: &dyn BridgeTransport,
     ) -> Result<api::CommandResult, BridgeTransportError> {
+        // Turn-driving: run on the caller's own session so its streamed events
+        // come back on that session (to be unicast). A caller-less turn (no bus
+        // sender — not expected on a real bus) falls back to the shared
+        // connection, preserving prior behaviour.
         if is_turn_driving(&command)
             && let Some(sender) = caller
         {
+            return self.session_for(sender).await?.request(command).await;
+        }
+        // Session-pinned: registers per-connection state that only has meaning on
+        // the caller's own session. With no identifiable caller, reject rather
+        // than fall back to the shared connection — a shared subscription would
+        // capture or broadcast every caller's fan-out (#270).
+        if is_session_pinned(&command) {
+            let sender = caller.ok_or_else(|| {
+                BridgeTransportError::Daemon(
+                    "a session-scoped command requires a D-Bus sender (none on the message)"
+                        .to_string(),
+                )
+            })?;
             return self.session_for(sender).await?.request(command).await;
         }
         fallback.request(command).await
@@ -497,6 +525,66 @@ mod tests {
             fallback.commands.lock().unwrap().len(),
             2,
             "a caller-less turn falls back to the shared connection"
+        );
+    }
+
+    fn subscribe(convs: &[&str]) -> api::Command {
+        api::Command::SubscribeConversations {
+            conversation_ids: convs.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn is_session_pinned_is_subscribe_conversations_only() {
+        assert!(is_session_pinned(&subscribe(&["c1"])));
+        // A turn is routed via is_turn_driving (which has a caller-less shared
+        // fallback), NOT pinned; stateless commands are neither.
+        assert!(!is_session_pinned(&send_message("c1")));
+        assert!(!is_session_pinned(&api::Command::Ping));
+    }
+
+    #[tokio::test]
+    async fn route_pins_session_scoped_commands_and_rejects_caller_less() {
+        let factory = Arc::new(FakeFactory::default());
+        let registry = registry_with(Arc::clone(&factory));
+        let fallback = Arc::new(RecordingTransport::default());
+
+        // SubscribeConversations with a known caller → that caller's own session,
+        // never the shared connection (a shared sub would capture every caller's
+        // fan-out — the #270 hazard).
+        registry
+            .route(Some(":1.10"), subscribe(&["c1"]), fallback.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            fallback.commands.lock().unwrap().is_empty(),
+            "a subscription must not ride the shared connection"
+        );
+        {
+            let transports = factory.transports.lock().unwrap();
+            assert!(matches!(
+                transports[":1.10"].commands.lock().unwrap().as_slice(),
+                [api::Command::SubscribeConversations { .. }]
+            ));
+        }
+
+        // Caller-less session-pinned command → rejected, and crucially NOT routed
+        // to the shared connection (which would broadcast its fan-out).
+        let err = registry
+            .route(None, subscribe(&["c2"]), fallback.as_ref())
+            .await;
+        assert!(
+            err.is_err(),
+            "a caller-less session-scoped command must be rejected"
+        );
+        assert!(
+            fallback.commands.lock().unwrap().is_empty(),
+            "and must not fall back to the shared connection"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "the rejected caller-less command must add no session (only :1.10's remains)"
         );
     }
 

@@ -9,18 +9,30 @@
 //! canonicalizes its introspection XML down to a sorted set of signature lines,
 //! and asserts it matches the committed golden for that interface.
 //!
-//! ## Where the goldens come from (and why that makes this a real gate)
+//! ## Where the goldens come from (and why this is a real gate)
 //!
-//! The goldens under `tests/goldens/*.canon` are the *canonicalized live
-//! surface*, captured from a running daemon — not a snapshot of the bridge
-//! against itself. They are therefore authoritative: a divergence is a genuine
-//! parity bug in the bridge, not drift in the test. Two documented intentional
-//! drops are removed from the captured Settings surface (`Q2_DROPS`): the
-//! legacy `Get/SetLlmSettings` (superseded by named connections) and
-//! `GenerateWsJwt` (JWT minting is off D-Bus entirely — #281).
+//! The goldens under `tests/goldens/*.canon` are the *canonicalized live surface*
+//! captured from the original in-process daemon — the frozen, KDE-facing **parity
+//! floor**. They are authoritative and intentionally NOT regenerated: the
+//! in-process `dbus-interface` was deleted in #319, so there is no surface left
+//! to re-capture, and re-freezing from the bridge itself would let a dropped
+//! member (a KDE regression) silently re-baseline. Two documented intentional
+//! drops are removed from the captured Settings surface (`Q2_DROPS`): the legacy
+//! `Get/SetLlmSettings` (superseded by named connections) and `GenerateWsJwt`
+//! (JWT minting is off D-Bus entirely — #281).
 //!
-//! Re-capture only when the frozen surface legitimately changes (before #319
-//! deletes `dbus-interface`):
+//! The gate checks two things, NOT byte-equality:
+//!   1. **No floor regression** — every golden member is still present on the
+//!      bridge (a missing one would break adele-kde).
+//!   2. **No undeclared additions** — any member the bridge exposes beyond the
+//!      floor must be listed in [`ADDITIONS`] with its issue. Post-cutover the
+//!      bridge legitimately grows a superset (e.g. #367's live-sync signals +
+//!      `SubscribeConversations`); each addition is declared so the surface can't
+//!      change silently.
+//!
+//! The capture recipe below built the original floor (pre-#319). It now targets
+//! the bridge's own name, so do NOT re-run it to "update" the floor — add new
+//! members to [`ADDITIONS`] instead.
 //!
 //! ```text
 //! mkdir -p /tmp/live-xml
@@ -67,6 +79,27 @@ const Q2_DROPS: &[(&str, &str)] = &[
     ("org.desktopAssistant.Settings", "GetLlmSettings"),
     ("org.desktopAssistant.Settings", "SetLlmSettings"),
     ("org.desktopAssistant.Settings", "GenerateWsJwt"),
+];
+
+/// Post-cutover **superset** members the bridge adds beyond the frozen floor.
+/// Each is declared with its issue so the gate treats it as an intentional
+/// addition rather than drift; everything else must still match the floor exactly
+/// (no silent surface changes). Values are canonical member lines, exactly as
+/// [`canonicalize`] emits them (see an existing `.canon` golden for the format).
+const ADDITIONS: &[(&str, &str)] = &[
+    // #367 — live multi-client sync over D-Bus.
+    (
+        "org.desktopAssistant.Conversations",
+        "method SubscribeConversations(in:as:conversation_ids)",
+    ),
+    (
+        "org.desktopAssistant.Conversations",
+        "signal UserMessageAdded(:s:conversation_id, :s:request_id, :s:content)",
+    ),
+    (
+        "org.desktopAssistant.Conversations",
+        "signal ConversationListChanged(:s:conversation_id)",
+    ),
 ];
 
 // --- fake transport ---------------------------------------------------------
@@ -240,25 +273,11 @@ fn golden_path(label: &str) -> PathBuf {
         .join(format!("{label}.canon"))
 }
 
-/// Human-readable symmetric difference of two canonical surfaces.
-fn line_diff(want: &str, got: &str) -> String {
-    use std::collections::BTreeSet;
-    let want_set: BTreeSet<&str> = want.lines().collect();
-    let got_set: BTreeSet<&str> = got.lines().collect();
-    let mut out = String::new();
-    for l in want_set.difference(&got_set) {
-        out.push_str(&format!("  - missing on bridge: {l}\n"));
-    }
-    for l in got_set.difference(&want_set) {
-        out.push_str(&format!("  + extra on bridge:   {l}\n"));
-    }
-    out
-}
-
 // --- the gate ---------------------------------------------------------------
 
 #[test]
 fn bridge_matches_live_golden() {
+    use std::collections::BTreeSet;
     let mut failures = Vec::new();
     for (label, iface) in PARITY {
         let got = canonicalize(&bridge_introspection(iface), iface);
@@ -267,23 +286,58 @@ fn bridge_matches_live_golden() {
             Ok(s) => s.trim_end().to_string(),
             Err(e) => {
                 failures.push(format!(
-                    "missing golden for {iface} at {} ({e}); regenerate with capture_goldens_from_live",
+                    "missing golden for {iface} at {} ({e}); see the capture recipe in the module docs",
                     path.display()
                 ));
                 continue;
             }
         };
-        if got != want {
-            failures.push(format!(
-                "interface {iface} diverged from the frozen live surface ({}):\n{}",
-                path.display(),
-                line_diff(&want, &got)
-            ));
+        let want_set: BTreeSet<&str> = want.lines().collect();
+        let got_set: BTreeSet<&str> = got.lines().collect();
+        let additions: BTreeSet<&str> = ADDITIONS
+            .iter()
+            .filter(|(i, _)| i == iface)
+            .map(|(_, m)| *m)
+            .collect();
+
+        // 1. No floor regression: every frozen member must still be present.
+        let missing: Vec<&str> = want_set.difference(&got_set).copied().collect();
+        // 2. No undeclared additions: any extra member must be in ADDITIONS.
+        let undeclared: Vec<&str> = got_set
+            .difference(&want_set)
+            .copied()
+            .filter(|l| !additions.contains(l))
+            .collect();
+        // 3. No stale declarations: an ADDITIONS entry the bridge no longer
+        //    exposes is dead weight — flag it so the list stays honest.
+        let stale: Vec<&str> = additions.difference(&got_set).copied().collect();
+
+        if !missing.is_empty() || !undeclared.is_empty() || !stale.is_empty() {
+            let mut msg = format!(
+                "interface {iface} diverged from the frozen floor ({}):\n",
+                path.display()
+            );
+            for l in &missing {
+                msg.push_str(&format!(
+                    "  - missing on bridge (KDE-facing floor regression): {l}\n"
+                ));
+            }
+            for l in &undeclared {
+                msg.push_str(&format!(
+                    "  + undeclared addition (add to ADDITIONS with its issue, or remove from the bridge): {l}\n"
+                ));
+            }
+            for l in &stale {
+                msg.push_str(&format!(
+                    "  ! stale ADDITIONS entry (bridge no longer exposes it — delete the entry): {l}\n"
+                ));
+            }
+            failures.push(msg);
         }
     }
     assert!(
         failures.is_empty(),
-        "D-Bus introspection parity gate failed (#315):\n\n{}",
+        "D-Bus introspection parity gate failed (#315/#367):\n\n{}",
         failures.join("\n\n")
     );
 }
