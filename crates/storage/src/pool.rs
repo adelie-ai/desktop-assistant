@@ -204,5 +204,16 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Dream-cycle overhaul foundation — `embeddings_updated_at` (embedding
+    // generation decoupled from content writes; a background task regenerates
+    // NULL/stale vectors) and a first-class `source` provenance column
+    // ('extraction' | 'consolidation' | 'explicit') replacing the
+    // `source:dreaming` tag convention.
+    sqlx::raw_sql(include_str!(
+        "../migrations/026_knowledge_base_source_and_embedding_freshness.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
