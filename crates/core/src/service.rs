@@ -3818,7 +3818,7 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("builtin_knowledge_base_write/search/delete")
+                .contains("builtin_knowledge_base_write/search/list/delete")
         );
         assert!(messages[0].content.contains("builtin_sys_props"));
         assert!(messages[0].content.contains("builtin_tool_search"));

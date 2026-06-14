@@ -37,6 +37,8 @@ max_connections = 5
 dreaming_enabled = true
 dreaming_interval_secs = 3600
 archive_after_days = 7
+embedding_backfill_interval_secs = 300
+consolidation_interval_secs = 86400
 
 [purposes.interactive]
 connection = "default"

@@ -414,6 +414,7 @@ pub struct PurposeConfigPayload {
 pub struct PurposesView {
     pub interactive: Option<PurposeConfigPayload>,
     pub dreaming: Option<PurposeConfigPayload>,
+    pub consolidation: Option<PurposeConfigPayload>,
     pub embedding: Option<PurposeConfigPayload>,
     pub titling: Option<PurposeConfigPayload>,
 }

@@ -1157,6 +1157,8 @@ pub struct PurposesView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dreaming: Option<PurposeConfigView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consolidation: Option<PurposeConfigView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<PurposeConfigView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub titling: Option<PurposeConfigView>,
@@ -1172,6 +1174,9 @@ impl PurposesView {
         }
         if let Some(v) = &self.dreaming {
             map.insert("dreaming".to_string(), v.clone());
+        }
+        if let Some(v) = &self.consolidation {
+            map.insert("consolidation".to_string(), v.clone());
         }
         if let Some(v) = &self.embedding {
             map.insert("embedding".to_string(), v.clone());
