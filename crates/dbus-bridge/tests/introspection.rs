@@ -100,6 +100,12 @@ const ADDITIONS: &[(&str, &str)] = &[
         "org.desktopAssistant.Conversations",
         "signal ConversationListChanged(:s:conversation_id)",
     ),
+    // #320 — client tools over D-Bus (the call is a unicast signal; register +
+    // result ride the generic Commands channel).
+    (
+        "org.desktopAssistant.Conversations",
+        "signal ClientToolCall(:s:task_id, :s:conversation_id, :s:tool_call_id, :s:tool_name, :s:arguments_json)",
+    ),
 ];
 
 // --- fake transport ---------------------------------------------------------

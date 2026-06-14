@@ -12,11 +12,12 @@
 //! | `Error`                 | `Conversations.ResponseError`                  |
 //! | `UserMessageAdded`      | `Conversations.UserMessageAdded` (#367)        |
 //! | `ConversationListChanged`| `Conversations.ConversationListChanged` (#367)|
+//! | `ClientToolCall`        | `Conversations.ClientToolCall` (#320)          |
 //! | `TaskStarted`           | `BackgroundTasks.TaskStarted` (#116)           |
 //! | `TaskProgress`          | `BackgroundTasks.TaskProgress` (#116)          |
 //! | `TaskLogAppended`       | `BackgroundTasks.TaskLogAppended` (#116)       |
 //! | `TaskCompleted`         | `BackgroundTasks.TaskCompleted` (#116)         |
-//! | other                   | dropped (Status/ContextUsage/Title; #320 tools)|
+//! | other                   | dropped (Status/ContextUsage/Title/Warning/Scratch)|
 //!
 //! `Settings.ConfigChanged` is **not** forwarded here: the decoded
 //! [`SignalEvent`] stream carries no config event, and the bridge's
@@ -89,6 +90,18 @@ pub enum ForwardAction {
     /// stream so every D-Bus client refreshes its sidebar; carries only the
     /// affected `conversation_id` (clients re-fetch the list).
     ConversationListChanged { conversation_id: String },
+    /// A turn suspended on a client-side tool call (#320). Unicast to the session
+    /// that registered the tool (= the session driving the turn), so the caller
+    /// runs the tool and posts the outcome back via a `ClientToolResult` command
+    /// carrying the same `task_id` + `tool_call_id`. `arguments_json` is the tool
+    /// input serialized to JSON (the wire event carries a `serde_json::Value`).
+    ClientToolCall {
+        task_id: String,
+        conversation_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
     /// Task is now `Pending`/`Running`. `task` is the JSON-keyed `TaskView`
     /// encoded as `a{sv}`.
     TaskStarted {
@@ -187,6 +200,21 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
         SignalEvent::ConversationListChanged { conversation_id } => {
             ForwardAction::ConversationListChanged { conversation_id }
         }
+        // #320: the turn suspended on a client tool. Unicast to the registrant's
+        // session; the args ride as a JSON string (the wire event is a Value).
+        SignalEvent::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => ForwardAction::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments_json: arguments.to_string(),
+        },
         SignalEvent::TaskStarted { task } => {
             let id = task.id.0.clone();
             ForwardAction::TaskStarted {
@@ -228,9 +256,6 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
         },
         SignalEvent::ScratchpadChanged { .. } => ForwardAction::Ignored {
             kind: "scratchpad_changed",
-        },
-        SignalEvent::ClientToolCall { .. } => ForwardAction::Ignored {
-            kind: "client_tool_call",
         },
         // Control signal handled by `run` before it reaches `translate`; mapped
         // here only for match exhaustiveness.
@@ -463,6 +488,33 @@ async fn emit(connection: &Connection, destination: Option<&str>, action: Forwar
                 warn!("conversation_list_changed emit failed: {e}");
             }
         }
+        ForwardAction::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        } => {
+            let body = (
+                task_id,
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            );
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "ClientToolCall",
+                    &body,
+                )
+                .await
+            {
+                warn!("client_tool_call emit failed: {e}");
+            }
+        }
         ForwardAction::TaskStarted { id, task } => {
             let body = (id, task);
             if let Err(e) = connection
@@ -608,6 +660,18 @@ mod tests {
                 conversation_id: "c".into(),
                 request_id: "r".into(),
                 error: "x".into(),
+            }
+            .is_broadcast()
+        );
+        // #320: a tool call is unicast to the registrant — never broadcast (args
+        // can be sensitive).
+        assert!(
+            !ForwardAction::ClientToolCall {
+                task_id: "t".into(),
+                conversation_id: "c".into(),
+                tool_call_id: "tc".into(),
+                tool_name: "echo".into(),
+                arguments_json: "{}".into(),
             }
             .is_broadcast()
         );

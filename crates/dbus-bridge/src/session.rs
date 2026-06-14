@@ -47,14 +47,21 @@ pub fn is_turn_driving(command: &api::Command) -> bool {
 }
 
 /// Whether `command` registers **per-connection** state that only has meaning on
-/// the caller's own session — currently `SubscribeConversations` (the live-sync
-/// viewed-set; #367), and post-#320 the client-tool registration/result. Unlike a
-/// turn (which can fall back to the shared connection for a caller-less message),
-/// a session-pinned command with no identifiable caller is rejected: routing it
-/// to the shared connection would let one D-Bus caller's subscription capture or
-/// broadcast every other caller's fan-out (#270 / DT-4).
+/// the caller's own session: the `SubscribeConversations` live-sync viewed-set
+/// (#367), and the client-tool registration + its result (#320) — a tool bucket
+/// the daemon keys to the connection, whose `ClientToolCall` must come back on
+/// that same connection (to be unicast to the caller). Unlike a turn (which can
+/// fall back to the shared connection for a caller-less message), a session-pinned
+/// command with no identifiable caller is rejected: routing it to the shared
+/// connection would let one D-Bus caller's subscription or tools capture or leak
+/// across every other caller (#270 / DT-4).
 pub fn is_session_pinned(command: &api::Command) -> bool {
-    matches!(command, api::Command::SubscribeConversations { .. })
+    matches!(
+        command,
+        api::Command::SubscribeConversations { .. }
+            | api::Command::RegisterClientTools { .. }
+            | api::Command::ClientToolResult { .. }
+    )
 }
 
 /// One D-Bus sender's private daemon session: the transport its commands
@@ -535,8 +542,19 @@ mod tests {
     }
 
     #[test]
-    fn is_session_pinned_is_subscribe_conversations_only() {
+    fn is_session_pinned_covers_subscribe_and_client_tools() {
         assert!(is_session_pinned(&subscribe(&["c1"])));
+        // #320: client-tool registration + its result are pinned to the session
+        // that owns the tool bucket / the suspended turn.
+        assert!(is_session_pinned(&api::Command::RegisterClientTools {
+            tools: vec![]
+        }));
+        assert!(is_session_pinned(&api::Command::ClientToolResult {
+            task_id: api::TaskId("t".into()),
+            tool_call_id: "tc".into(),
+            result: Some("ok".into()),
+            error: None,
+        }));
         // A turn is routed via is_turn_driving (which has a caller-less shared
         // fallback), NOT pinned; stateless commands are neither.
         assert!(!is_session_pinned(&send_message("c1")));
