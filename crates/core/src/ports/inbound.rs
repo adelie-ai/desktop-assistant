@@ -268,17 +268,10 @@ pub trait ConversationService: Send + Sync {
 }
 
 /// Effort hint passed to connectors and mapped to per-connector request
-/// parameters at dispatch time.
-///
-/// Serializes as the lowercase variant name (`"low"`, `"medium"`,
-/// `"high"`) for JSON columns and wire payloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
-}
+/// parameters at dispatch time. Defined in `desktop-assistant-protocol`
+/// (serde wire format: lowercase `"low"`/`"medium"`/`"high"`); re-exported
+/// here so existing `core::ports::inbound::Effort` paths are unchanged (#377).
+pub use desktop_assistant_protocol::Effort;
 
 /// Per-send selection override (model/connection/effort). Supplied by API
 /// clients via `SendPrompt { override: ... }`.
@@ -398,71 +391,11 @@ pub struct ModelListing {
     pub model: ModelInfo,
 }
 
-/// Purpose kind identifiers. Canonical home for the enum that used to
-/// live in three places (this crate, `daemon::purposes`, and api-model
-/// as `PurposeKindApi`); see #43. The other crates re-export from here.
-///
-/// Wire format (`serde`) is `snake_case` so JSON / settings payloads
-/// produce `"interactive"`, `"dreaming"`, etc. The TOML config in the
-/// daemon does not derive serde on this type — it builds its own
-/// keyed map via [`Self::as_key`] / [`Self::from_key`].
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum PurposeKind {
-    /// The user-facing chat LLM. Cannot inherit (nothing to inherit from).
-    Interactive,
-    /// Periodic fact extraction (the "dreaming" background task).
-    Dreaming,
-    /// Vector embeddings for memory and retrieval.
-    Embedding,
-    /// Short-title generation for conversations.
-    Titling,
-}
-
-impl PurposeKind {
-    /// Canonical lowercase key used in TOML and error messages.
-    pub fn as_key(self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Dreaming => "dreaming",
-            Self::Embedding => "embedding",
-            Self::Titling => "titling",
-        }
-    }
-
-    /// Parse a canonical key back into a [`PurposeKind`]. Inverse of
-    /// [`Self::as_key`]; used by adapters that round-trip key strings.
-    pub fn from_key(key: &str) -> Option<Self> {
-        match key {
-            "interactive" => Some(Self::Interactive),
-            "dreaming" => Some(Self::Dreaming),
-            "embedding" => Some(Self::Embedding),
-            "titling" => Some(Self::Titling),
-            _ => None,
-        }
-    }
-
-    /// Every purpose kind, in a stable order. Useful for iteration in
-    /// tests and serialization round-trips. Order matches the schema
-    /// migration order (interactive first because every other purpose
-    /// can inherit from it).
-    pub fn all() -> [Self; 4] {
-        [
-            Self::Interactive,
-            Self::Dreaming,
-            Self::Embedding,
-            Self::Titling,
-        ]
-    }
-}
-
-impl std::fmt::Display for PurposeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_key())
-    }
-}
+/// Purpose kind identifiers (`Interactive`/`Dreaming`/`Embedding`/`Titling`).
+/// Defined in `desktop-assistant-protocol` (serde wire format: `snake_case`);
+/// re-exported here — the canonical `core::ports::inbound::PurposeKind` path —
+/// so the daemon and api-model keep consuming it from one place (#43, #377).
+pub use desktop_assistant_protocol::PurposeKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurposeConfigPayload {

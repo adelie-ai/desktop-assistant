@@ -27,123 +27,13 @@ pub enum PromptSectionKind {
 
 // --- Personality (#226) ----------------------------------------------------
 
-/// Qualitative level for a single personality trait.
-///
-/// Ordered `Never < Rarely < Sometimes < Often < Always`. The numeric
-/// ordinal (0..=4, via [`Self::as_ordinal`] / [`Self::from_ordinal`]) is a
-/// **stable wire contract**: the D-Bus settings surface exposes each trait as
-/// an integer 0..=4 so the KCM can bind a slider directly (Never=0 … Always=4).
-/// The serde representation is the lowercase variant name (e.g. `"always"`)
-/// for human-friendly TOML/JSON config, mirroring [`crate::ports::llm::ReasoningLevel`].
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum PersonalityLevel {
-    Never,
-    Rarely,
-    Sometimes,
-    Often,
-    Always,
-}
-
-impl PersonalityLevel {
-    /// Stable ordinal 0..=4 used by the D-Bus int contract (Never=0 … Always=4).
-    pub fn as_ordinal(self) -> u8 {
-        match self {
-            Self::Never => 0,
-            Self::Rarely => 1,
-            Self::Sometimes => 2,
-            Self::Often => 3,
-            Self::Always => 4,
-        }
-    }
-
-    /// Inverse of [`Self::as_ordinal`]. Returns `None` for out-of-range input
-    /// rather than clamping, so a malformed wire value surfaces as an error at
-    /// the boundary instead of silently snapping to a level.
-    pub fn from_ordinal(n: u8) -> Option<Self> {
-        match n {
-            0 => Some(Self::Never),
-            1 => Some(Self::Rarely),
-            2 => Some(Self::Sometimes),
-            3 => Some(Self::Often),
-            4 => Some(Self::Always),
-            _ => None,
-        }
-    }
-}
-
-/// The assistant's configurable disposition — the "Expressive 7" traits, each
-/// at a [`PersonalityLevel`] (issue #226, Phase 1: global).
-///
-/// Why a typed struct rather than a free `HashMap<String, Level>`: the trait
-/// set is fixed and small, so naming each field gives compile-time safety (no
-/// typo'd keys, exhaustive `render_blurb` matching) and a **stable wire schema**
-/// — config files, the api-model `Config` view, and the D-Bus `ConfigData`
-/// tuple all derive from these named fields, so adding/removing a trait is a
-/// deliberate, type-checked change rather than a silent string drift.
-///
-/// The levels are an *initial disposition*, not a rulebook: [`Self::render_blurb`]
-/// always appends an adaptation clause telling the model to take cues from the
-/// conversation and adapt both ways.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Personality {
-    #[serde(default = "default_professionalism")]
-    pub professionalism: PersonalityLevel,
-    #[serde(default = "default_warmth")]
-    pub warmth: PersonalityLevel,
-    #[serde(default = "default_directness")]
-    pub directness: PersonalityLevel,
-    #[serde(default = "default_enthusiasm")]
-    pub enthusiasm: PersonalityLevel,
-    #[serde(default = "default_humor")]
-    pub humor: PersonalityLevel,
-    #[serde(default = "default_sarcasm")]
-    pub sarcasm: PersonalityLevel,
-    #[serde(default = "default_pretentiousness")]
-    pub pretentiousness: PersonalityLevel,
-}
-
-// Per-field default fns so a partial `[personality]` TOML block (only some
-// traits specified) fills the rest from the Expressive-7 table rather than
-// from `PersonalityLevel`'s arbitrary first variant.
-fn default_professionalism() -> PersonalityLevel {
-    PersonalityLevel::Always
-}
-fn default_warmth() -> PersonalityLevel {
-    PersonalityLevel::Often
-}
-fn default_directness() -> PersonalityLevel {
-    PersonalityLevel::Often
-}
-fn default_enthusiasm() -> PersonalityLevel {
-    PersonalityLevel::Sometimes
-}
-fn default_humor() -> PersonalityLevel {
-    PersonalityLevel::Sometimes
-}
-fn default_sarcasm() -> PersonalityLevel {
-    PersonalityLevel::Rarely
-}
-fn default_pretentiousness() -> PersonalityLevel {
-    PersonalityLevel::Rarely
-}
-
-impl Default for Personality {
-    /// The "Expressive 7" defaults from the issue table.
-    fn default() -> Self {
-        Self {
-            professionalism: default_professionalism(),
-            warmth: default_warmth(),
-            directness: default_directness(),
-            enthusiasm: default_enthusiasm(),
-            humor: default_humor(),
-            sarcasm: default_sarcasm(),
-            pretentiousness: default_pretentiousness(),
-        }
-    }
-}
+/// The personality types — [`Personality`], [`PersonalityLevel`], and
+/// [`PersonalityOverride`] — are defined in `desktop-assistant-protocol` (the
+/// dependency-light crate that compiles to wasm) and re-exported here at their
+/// canonical `core::prompts::*` paths so existing call sites are unchanged
+/// (#377). The prompt-rendering logic ([`render_blurb`] + the phrasing tables)
+/// stays in this module.
+pub use desktop_assistant_protocol::{Personality, PersonalityLevel, PersonalityOverride};
 
 /// The fixed adaptation clause appended to every personality blurb. It tells
 /// the model the levels are a starting point and to match the user's energy
@@ -155,93 +45,39 @@ const ADAPTATION_CLAUSE: &str = "Treat this as a starting point, not a script. \
      touch genuinely helps. Match the user's energy rather than forcing a trait that \
      doesn't fit the moment.";
 
-impl Personality {
-    /// Render the disposition into a natural-language blurb for the system
-    /// prompt.
-    ///
-    /// The blurb is a single disposition sentence — one clause per trait whose
-    /// level is not [`PersonalityLevel::Never`], phrased by level — followed by
-    /// the fixed [`ADAPTATION_CLAUSE`]. A `Never` trait contributes no clause.
-    /// When every trait is `Never`, only the adaptation clause is emitted.
-    pub fn render_blurb(&self) -> String {
-        // (trait clause builder, level) pairs in a fixed, readable order. Each
-        // builder turns a non-Never level into a natural clause; `None` means
-        // the trait is omitted (Never).
-        let clauses: Vec<String> = [
-            trait_clause(self.professionalism, &PROFESSIONALISM_PHRASING),
-            trait_clause(self.warmth, &WARMTH_PHRASING),
-            trait_clause(self.directness, &DIRECTNESS_PHRASING),
-            trait_clause(self.enthusiasm, &ENTHUSIASM_PHRASING),
-            trait_clause(self.humor, &HUMOR_PHRASING),
-            trait_clause(self.sarcasm, &SARCASM_PHRASING),
-            trait_clause(self.pretentiousness, &PRETENTIOUSNESS_PHRASING),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
-        if clauses.is_empty() {
-            return ADAPTATION_CLAUSE.to_string();
-        }
-
-        let disposition = format!("In your default manner, you {}.", join_clauses(&clauses));
-        format!("{disposition} {ADAPTATION_CLAUSE}")
-    }
-}
-
-/// A partial, per-conversation override of the global [`Personality`] (issue
-/// #227, Phase 2). Each trait is an `Option<PersonalityLevel>`: `Some(level)`
-/// pins that trait for the conversation, `None` falls back to the global value.
+/// Render a [`Personality`] into a natural-language disposition blurb for the
+/// system prompt.
 ///
-/// Why a separate type rather than reusing `Personality` directly: the global
-/// config is always a *complete* disposition (every trait has a level), but a
-/// conversation override is *partial by design* — a "no-nonsense" client may
-/// only want to force `humor = Never` and `directness = Always` and inherit the
-/// rest of the user's global tuning. Modeling each trait as `Option` makes that
-/// partial intent explicit and type-checked, and keeps [`Self::resolve`] a
-/// trait-by-trait merge rather than an all-or-nothing replacement. The override
-/// only sets the *initial disposition*; it still flows through
-/// [`Personality::render_blurb`], so the adaptation clause continues to apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub struct PersonalityOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub professionalism: Option<PersonalityLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub warmth: Option<PersonalityLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub directness: Option<PersonalityLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enthusiasm: Option<PersonalityLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub humor: Option<PersonalityLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sarcasm: Option<PersonalityLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pretentiousness: Option<PersonalityLevel>,
-}
+/// The blurb is a single disposition sentence — one clause per trait whose
+/// level is not [`PersonalityLevel::Never`], phrased by level — followed by the
+/// fixed [`ADAPTATION_CLAUSE`]. A `Never` trait contributes no clause. When
+/// every trait is `Never`, only the adaptation clause is emitted.
+///
+/// A free function (not an inherent method) because [`Personality`] now lives
+/// in `desktop-assistant-protocol`; the prompt-rendering logic stays in `core`.
+pub fn render_blurb(p: &Personality) -> String {
+    // (trait clause builder, level) pairs in a fixed, readable order. Each
+    // builder turns a non-Never level into a natural clause; `None` means
+    // the trait is omitted (Never).
+    let clauses: Vec<String> = [
+        trait_clause(p.professionalism, &PROFESSIONALISM_PHRASING),
+        trait_clause(p.warmth, &WARMTH_PHRASING),
+        trait_clause(p.directness, &DIRECTNESS_PHRASING),
+        trait_clause(p.enthusiasm, &ENTHUSIASM_PHRASING),
+        trait_clause(p.humor, &HUMOR_PHRASING),
+        trait_clause(p.sarcasm, &SARCASM_PHRASING),
+        trait_clause(p.pretentiousness, &PRETENTIOUSNESS_PHRASING),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
-impl PersonalityOverride {
-    /// Resolve this partial override against the `global` disposition into a
-    /// concrete [`Personality`]: each `Some` trait wins, each `None` falls back
-    /// to `global`. An all-`None` override resolves to `global` unchanged.
-    pub fn resolve(&self, global: &Personality) -> Personality {
-        Personality {
-            professionalism: self.professionalism.unwrap_or(global.professionalism),
-            warmth: self.warmth.unwrap_or(global.warmth),
-            directness: self.directness.unwrap_or(global.directness),
-            enthusiasm: self.enthusiasm.unwrap_or(global.enthusiasm),
-            humor: self.humor.unwrap_or(global.humor),
-            sarcasm: self.sarcasm.unwrap_or(global.sarcasm),
-            pretentiousness: self.pretentiousness.unwrap_or(global.pretentiousness),
-        }
+    if clauses.is_empty() {
+        return ADAPTATION_CLAUSE.to_string();
     }
 
-    /// `true` when every trait is `None` — i.e. the override pins nothing and
-    /// [`Self::resolve`] returns the global value verbatim. Used by the
-    /// persistence layer to store `NULL` rather than an empty object.
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
+    let disposition = format!("In your default manner, you {}.", join_clauses(&clauses));
+    format!("{disposition} {ADAPTATION_CLAUSE}")
 }
 
 /// Per-level phrasing for a single trait. Each field is the clause body used at
@@ -460,7 +296,7 @@ mod tests {
 
     #[test]
     fn render_blurb_defaults_emits_disposition_then_adaptation() {
-        let blurb = Personality::default().render_blurb();
+        let blurb = render_blurb(&Personality::default());
         // Disposition paragraph mentions each non-Never trait.
         assert!(blurb.contains("professional"), "blurb: {blurb}");
         assert!(blurb.contains("warm"), "blurb: {blurb}");
@@ -492,7 +328,7 @@ mod tests {
             sarcasm: PersonalityLevel::Never,
             ..Personality::default()
         };
-        let blurb = p.render_blurb();
+        let blurb = render_blurb(&p);
         let disposition = blurb
             .split(ADAPTATION_CLAUSE)
             .next()
@@ -526,7 +362,7 @@ mod tests {
             sarcasm: PersonalityLevel::Never,
             pretentiousness: PersonalityLevel::Never,
         };
-        let blurb = p.render_blurb();
+        let blurb = render_blurb(&p);
         // No disposition sentence at all — only the adaptation clause.
         assert_eq!(blurb.trim(), ADAPTATION_CLAUSE);
     }
@@ -548,7 +384,7 @@ mod tests {
                 ..Personality::default()
             };
             assert!(
-                p.render_blurb().contains(ADAPTATION_CLAUSE),
+                render_blurb(&p).contains(ADAPTATION_CLAUSE),
                 "level {level:?} dropped the adaptation clause"
             );
         }

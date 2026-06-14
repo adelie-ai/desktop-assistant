@@ -8,6 +8,7 @@ license = "AGPL-3.0-or-later"
 async-trait.workspace = true
 backon = "1"
 desktop-assistant-auth-jwt.workspace = true
+desktop-assistant-protocol.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

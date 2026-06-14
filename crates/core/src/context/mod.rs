@@ -667,7 +667,7 @@ fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> St
     // blurb at minimum carries the adaptation clause — so every turn carries a
     // personality, with the default disposition for callers that install no
     // scope.
-    let personality_blurb = crate::ports::llm::current_personality().render_blurb();
+    let personality_blurb = crate::prompts::render_blurb(&crate::ports::llm::current_personality());
     if !personality_blurb.trim().is_empty() {
         sections.push(PromptSection::new(
             PromptSectionKind::Personality,
@@ -1260,7 +1260,7 @@ mod tests {
         .await;
 
         // The personality blurb is present.
-        let blurb = personality.render_blurb();
+        let blurb = crate::prompts::render_blurb(&personality);
         assert!(
             assembled.contains(&blurb),
             "assembled prompt must contain the personality blurb:\n{assembled}"
@@ -1279,7 +1279,7 @@ mod tests {
         // No `with_personality` scope installed → the default disposition is
         // still injected (global personality applies to every turn).
         let assembled = assemble_system_instruction("TOOLNOTE".to_string(), "");
-        let default_blurb = crate::prompts::Personality::default().render_blurb();
+        let default_blurb = crate::prompts::render_blurb(&crate::prompts::Personality::default());
         assert!(
             assembled.contains(&default_blurb),
             "default personality must be injected even without a scope:\n{assembled}"
