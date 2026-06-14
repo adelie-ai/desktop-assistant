@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/protocol",
     "crates/api-model",
     "crates/application",
     "crates/frame-codec",
@@ -44,6 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 
+desktop-assistant-protocol = { path = "crates/protocol" }
 desktop-assistant-core = { path = "crates/core" }
 desktop-assistant-auth-jwt = { path = "crates/auth-jwt" }
 desktop-assistant-llm-anthropic = { path = "crates/llm-anthropic" }

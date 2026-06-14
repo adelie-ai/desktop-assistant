@@ -10,6 +10,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod client;
+pub mod signal;
+pub use signal::{SignalEvent, map_event_to_signal};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -1100,28 +1104,29 @@ pub struct ModelCapabilitiesView {
 
 // --- Purpose views (#10 + #11) --------------------------------------------
 
-// `PurposeKindApi` and `EffortLevel` are re-exports of the canonical
-// types in `desktop_assistant_core::ports::inbound` (#43). The aliases
-// are kept so existing callers keep compiling without churn; new code
-// can use either name.
-pub use desktop_assistant_core::ports::inbound::Effort as EffortLevel;
-pub use desktop_assistant_core::ports::inbound::PurposeKind as PurposeKindApi;
+// `PurposeKindApi` and `EffortLevel` are re-exports of the canonical types,
+// now defined in `desktop-assistant-protocol` (#43, #377; `core` also
+// re-exports them at its old paths). The aliases are kept so existing callers
+// keep compiling without churn; new code can use either name.
+pub use desktop_assistant_protocol::Effort as EffortLevel;
+pub use desktop_assistant_protocol::PurposeKind as PurposeKindApi;
 
-// Personality wire types (#226). Re-export the canonical core types so the
-// settings channel, the daemon config, and clients (e.g. the KCM) share one
-// schema rather than maintaining a parallel definition. `PersonalitySettingsView`
-// is the `Config`-view shape (the 7 trait levels); it is the core `Personality`
-// struct verbatim, so converting between the wire view and the core type is the
-// identity `From` impl.
-pub use desktop_assistant_core::prompts::{Personality, PersonalityLevel};
+// Personality wire types (#226). Re-export the canonical types (now in
+// `desktop-assistant-protocol`, #377) so the settings channel, the daemon
+// config, and clients (e.g. the KCM) share one schema rather than maintaining a
+// parallel definition. `PersonalitySettingsView` is the `Config`-view shape
+// (the 7 trait levels); it is the `Personality` struct verbatim, so converting
+// between the wire view and the type is the identity `From` impl.
+pub use desktop_assistant_protocol::{Personality, PersonalityLevel};
 pub type PersonalitySettingsView = Personality;
 
 // Per-conversation personality override (#227, Phase 2). Re-export the canonical
-// core [`PersonalityOverride`] (7 optional trait levels) so the per-conversation
-// command/view shares one schema with the resolution logic in core. The view
-// returned by `GetConversation` / `SetConversationPersonality` is that override
-// verbatim, so converting between wire and core is the identity.
-pub use desktop_assistant_core::prompts::PersonalityOverride;
+// [`PersonalityOverride`] (7 optional trait levels, now in
+// `desktop-assistant-protocol`) so the per-conversation command/view shares one
+// schema with the resolution logic in core. The view returned by
+// `GetConversation` / `SetConversationPersonality` is that override verbatim, so
+// converting between wire and type is the identity.
+pub use desktop_assistant_protocol::PersonalityOverride;
 pub type ConversationPersonalityView = PersonalityOverride;
 
 /// Protocol-neutral purpose config. String `"primary"` in the connection or
