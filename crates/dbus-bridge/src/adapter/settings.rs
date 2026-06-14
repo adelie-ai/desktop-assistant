@@ -4,31 +4,35 @@
 //!
 //! The in-process settings adapter
 //! (`crates/dbus-interface/src/settings.rs`) calls methods on
-//! `SettingsService` that have **no `api::Command` equivalent on the
-//! wire today**:
+//! `SettingsService`. Most now have an `api::Command` wire equivalent;
+//! the bridge adapter below still proxies only a subset of them.
 //!
+//! - `GetDatabaseSettings` / `SetDatabaseSettings`,
+//!   `GetBackendTasksSettings` / `SetBackendTasksSettings`,
+//!   `GetWsAuthSettings` / `SetWsAuthSettings`: **wire-modeled as of
+//!   #314** (bridge cutover 2/7). Proxying them through this adapter is
+//!   the next step (#315); they are not yet exposed here.
+//! - The MCP server CRUD methods
+//!   (`AddMcpServer`/`RemoveMcpServer`/`SetMcpServerEnabled`/
+//!   `McpServerAction`) are wire-modeled and now fully round-trip
+//!   `command`/`args`/`namespace` (#314 surfaced them on
+//!   `McpServerStatusInfo`); the bridge still proxies only
+//!   `ListMcpServers`, with CRUD proxying deferred to #315.
 //! - `GetLlmSettings` / `SetLlmSettings` (legacy single-connection
 //!   surface, removed from `api-model`; supplanted by named
-//!   connections via the `Connections` adapter).
-//! - `GenerateWsJwt`, `ValidateWsJwt` (the bridge already has a JWT
-//!   from the local minter; clients that need their own should call
-//!   the minter directly).
-//! - `GetDatabaseSettings` / `SetDatabaseSettings`.
-//! - `GetBackendTasksSettings` / `SetBackendTasksSettings`.
-//! - `GetWsAuthSettings` / `SetWsAuthSettings`.
-//! - The MCP server CRUD methods
-//!   (`AddMcpServer`/`RemoveMcpServer`/...) are wire-modeled but the
-//!   bridge currently only proxies `ListMcpServers`. MCP CRUD is
-//!   wired up in a follow-up because the wire surface for
-//!   `ServerView` does not yet round-trip the `command` arg the
-//!   in-process adapter requires.
+//!   connections via the `Connections` adapter) and `ValidateWsJwt`
+//!   have **no callers in adele-kde** (#314 Q2) and are intentionally
+//!   NOT wire-modeled.
+//! - `GenerateWsJwt` (#314 Q1, gated on a security review) is also not
+//!   wire-modeled; the bridge already has a JWT from the local minter,
+//!   and clients that need their own should call the minter directly.
 //!
 //! Per Option A in PR #106, this is acceptable: the daemon still
 //! ships the in-process surface, and existing TUI/KCM/plasmoid clients
 //! talk to that. The bridge exposes the wire-proxyable subset under a
 //! configurable name (default `org.desktopAssistant.Bridge`), and the
-//! follow-up issue widens the api-model so the bridge can subsume the
-//! full surface.
+//! follow-up step (#315) proxies the now-wire-modeled settings methods
+//! through this adapter.
 
 use std::sync::Arc;
 

@@ -1397,6 +1397,125 @@ where
                 Ok(api::CommandResult::Ack)
             }
 
+            // Database / backend-tasks / WS-auth settings (bridge cutover 2/7,
+            // #314). Each mirrors the in-process D-Bus method of the same name:
+            // the getters return the same fields the D-Bus method returns (no
+            // new secret exposure — see the `Command` doc-comments), and the
+            // setters apply the same `empty-string clears` normalization the
+            // D-Bus methods apply before delegating to `SettingsService`.
+            api::Command::GetDatabaseSettings => {
+                let s = self
+                    .settings
+                    .get_database_settings()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::DatabaseSettings(
+                    api::DatabaseSettingsView {
+                        url: s.url,
+                        max_connections: s.max_connections,
+                    },
+                ))
+            }
+
+            api::Command::SetDatabaseSettings {
+                url,
+                max_connections,
+            } => {
+                // Mirror the D-Bus `set_database_settings`: an empty/whitespace
+                // url clears the configured URL.
+                self.settings
+                    .set_database_settings(normalize_empty(url), max_connections)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::GetBackendTasksSettings => {
+                let s = self
+                    .settings
+                    .get_backend_tasks_settings()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::BackendTasksSettings(
+                    api::BackendTasksSettingsView {
+                        has_separate_llm: s.has_separate_llm,
+                        llm_connector: s.llm_connector,
+                        llm_model: s.llm_model,
+                        llm_base_url: s.llm_base_url,
+                        dreaming_enabled: s.dreaming_enabled,
+                        dreaming_interval_secs: s.dreaming_interval_secs,
+                        archive_after_days: s.archive_after_days,
+                    },
+                ))
+            }
+
+            api::Command::SetBackendTasksSettings {
+                llm_connector,
+                llm_model,
+                llm_base_url,
+                dreaming_enabled,
+                dreaming_interval_secs,
+                archive_after_days,
+            } => {
+                // Mirror the D-Bus `set_backend_tasks_settings`: an empty
+                // llm_connector clears the separate LLM override; empty
+                // model/base_url normalize to "unset" too.
+                self.settings
+                    .set_backend_tasks_settings(
+                        normalize_empty(llm_connector),
+                        normalize_empty(llm_model),
+                        normalize_empty(llm_base_url),
+                        dreaming_enabled,
+                        dreaming_interval_secs,
+                        archive_after_days,
+                    )
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::GetWsAuthSettings => {
+                let s = self
+                    .settings
+                    .get_ws_auth_settings()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::WsAuthSettings(
+                    api::WsAuthSettingsView {
+                        methods: s.methods,
+                        oidc_issuer: s.oidc_issuer,
+                        oidc_auth_endpoint: s.oidc_auth_endpoint,
+                        oidc_token_endpoint: s.oidc_token_endpoint,
+                        oidc_client_id: s.oidc_client_id,
+                        oidc_scopes: s.oidc_scopes,
+                    },
+                ))
+            }
+
+            api::Command::SetWsAuthSettings {
+                methods,
+                oidc_issuer,
+                oidc_auth_endpoint,
+                oidc_token_endpoint,
+                oidc_client_id,
+                oidc_scopes,
+            } => {
+                // Mirror the D-Bus `set_ws_auth_settings`: pass strings through
+                // verbatim (the D-Bus method does no normalization here).
+                self.settings
+                    .set_ws_auth_settings(
+                        methods,
+                        oidc_issuer,
+                        oidc_auth_endpoint,
+                        oidc_token_endpoint,
+                        oidc_client_id,
+                        oidc_scopes,
+                    )
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
             // Knowledge base management (issue #73)
             api::Command::ListKnowledgeEntries {
                 limit,
@@ -2587,6 +2706,19 @@ async fn replay_completed_response(
         .await;
 }
 
+/// Normalize a wire `String` into `Option<String>` for the `set_*` settings
+/// commands (#314): a trimmed-empty string becomes `None` (clears the field),
+/// matching the in-process D-Bus settings adapters which treat an empty string
+/// as "clear this optional field". Non-empty values are trimmed and kept.
+fn normalize_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Windowed-message slicing for `Command::GetMessages` (CC-5 / #361), mirroring
 /// the D-Bus `get_messages` semantics so the bridge maps the two 1:1:
 /// `after_count >= 0` slices from that raw index onward (a stable position
@@ -3203,6 +3335,11 @@ mod tests {
         persistence: PersistenceSettingsView,
         personality: PersonalitySettingsView,
         api_key_set: bool,
+        // #314 round-trip state: database / backend-tasks / ws-auth / MCP.
+        database: DatabaseSettingsView,
+        backend_tasks: BackendTasksSettingsView,
+        ws_auth: desktop_assistant_core::ports::inbound::WsAuthSettingsView,
+        mcp_servers: Vec<desktop_assistant_core::ports::inbound::McpServerView>,
     }
 
     struct ConfigurableSettings {
@@ -3239,6 +3376,28 @@ mod tests {
                     },
                     personality: PersonalitySettingsView::default(),
                     api_key_set: false,
+                    database: DatabaseSettingsView {
+                        url: String::new(),
+                        max_connections: 5,
+                    },
+                    backend_tasks: BackendTasksSettingsView {
+                        has_separate_llm: false,
+                        llm_connector: "openai".into(),
+                        llm_model: "gpt-5".into(),
+                        llm_base_url: "https://api.openai.com/v1".into(),
+                        dreaming_enabled: false,
+                        dreaming_interval_secs: 3600,
+                        archive_after_days: 0,
+                    },
+                    ws_auth: desktop_assistant_core::ports::inbound::WsAuthSettingsView {
+                        methods: vec!["password".into()],
+                        oidc_issuer: String::new(),
+                        oidc_auth_endpoint: String::new(),
+                        oidc_token_endpoint: String::new(),
+                        oidc_client_id: String::new(),
+                        oidc_scopes: String::new(),
+                    },
+                    mcp_servers: vec![],
                 }),
             }
         }
@@ -3372,94 +3531,161 @@ mod tests {
         }
 
         async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
-            Ok(DatabaseSettingsView {
-                url: String::new(),
-                max_connections: 5,
-            })
+            Ok(self.state.lock().unwrap().database.clone())
         }
 
         async fn set_database_settings(
             &self,
-            _url: Option<String>,
-            _max_connections: u32,
+            url: Option<String>,
+            max_connections: u32,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            // Mirror the daemon: `None` (empty url) clears the URL.
+            state.database.url = url.unwrap_or_default();
+            state.database.max_connections = max_connections;
             Ok(())
         }
         async fn get_backend_tasks_settings(&self) -> Result<BackendTasksSettingsView, CoreError> {
-            Ok(BackendTasksSettingsView {
-                has_separate_llm: false,
-                llm_connector: "openai".into(),
-                llm_model: "gpt-5".into(),
-                llm_base_url: "https://api.openai.com/v1".into(),
-                dreaming_enabled: false,
-                dreaming_interval_secs: 3600,
-                archive_after_days: 0,
-            })
+            Ok(self.state.lock().unwrap().backend_tasks.clone())
         }
         async fn set_backend_tasks_settings(
             &self,
-            _llm_connector: Option<String>,
-            _llm_model: Option<String>,
-            _llm_base_url: Option<String>,
-            _dreaming_enabled: bool,
-            _dreaming_interval_secs: u64,
-            _archive_after_days: u32,
+            llm_connector: Option<String>,
+            llm_model: Option<String>,
+            llm_base_url: Option<String>,
+            dreaming_enabled: bool,
+            dreaming_interval_secs: u64,
+            archive_after_days: u32,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            // Mirror the daemon: presence of a connector means a separate
+            // backend-tasks LLM override; absence clears it.
+            state.backend_tasks.has_separate_llm = llm_connector.is_some();
+            if let Some(connector) = llm_connector {
+                state.backend_tasks.llm_connector = connector;
+            }
+            if let Some(model) = llm_model {
+                state.backend_tasks.llm_model = model;
+            }
+            if let Some(base_url) = llm_base_url {
+                state.backend_tasks.llm_base_url = base_url;
+            }
+            state.backend_tasks.dreaming_enabled = dreaming_enabled;
+            state.backend_tasks.dreaming_interval_secs = dreaming_interval_secs;
+            state.backend_tasks.archive_after_days = archive_after_days;
             Ok(())
         }
         async fn list_mcp_servers(
             &self,
         ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
-            Ok(vec![])
+            Ok(self.state.lock().unwrap().mcp_servers.clone())
         }
         async fn add_mcp_server(
             &self,
-            _name: String,
-            _command: String,
-            _args: Vec<String>,
-            _namespace: Option<String>,
-            _enabled: bool,
+            name: String,
+            command: String,
+            args: Vec<String>,
+            namespace: Option<String>,
+            enabled: bool,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            if state.mcp_servers.iter().any(|s| s.name == name) {
+                return Err(CoreError::SystemService(format!(
+                    "MCP server '{name}' already exists"
+                )));
+            }
+            // Persist the full config so command/args/namespace round-trip on a
+            // later list (#314), mirroring the daemon persisting to TOML.
+            state
+                .mcp_servers
+                .push(desktop_assistant_core::ports::inbound::McpServerView {
+                    name,
+                    command,
+                    args,
+                    namespace,
+                    enabled,
+                    status: if enabled { "running" } else { "disabled" }.to_string(),
+                    tool_count: 0,
+                });
             Ok(())
         }
-        async fn remove_mcp_server(&self, _name: String) -> Result<(), CoreError> {
+        async fn remove_mcp_server(&self, name: String) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            let before = state.mcp_servers.len();
+            state.mcp_servers.retain(|s| s.name != name);
+            if state.mcp_servers.len() == before {
+                return Err(CoreError::SystemService(format!(
+                    "MCP server '{name}' not found"
+                )));
+            }
             Ok(())
         }
         async fn set_mcp_server_enabled(
             &self,
-            _name: String,
-            _enabled: bool,
+            name: String,
+            enabled: bool,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            let server = state
+                .mcp_servers
+                .iter_mut()
+                .find(|s| s.name == name)
+                .ok_or_else(|| {
+                    CoreError::SystemService(format!("MCP server '{name}' not found"))
+                })?;
+            server.enabled = enabled;
+            server.status = if enabled { "running" } else { "disabled" }.to_string();
             Ok(())
         }
         async fn mcp_server_action(
             &self,
-            _action: String,
-            _server: Option<String>,
+            action: String,
+            server: Option<String>,
         ) -> Result<Vec<desktop_assistant_core::ports::inbound::McpServerView>, CoreError> {
-            Ok(vec![])
+            // Validate the action like the daemon, then return current status.
+            match action.as_str() {
+                "status" | "start" | "stop" | "restart" => {}
+                other => {
+                    return Err(CoreError::SystemService(format!(
+                        "unknown MCP action: {other}"
+                    )));
+                }
+            }
+            let state = self.state.lock().unwrap();
+            let servers = match server {
+                Some(name) => state
+                    .mcp_servers
+                    .iter()
+                    .filter(|s| s.name == name)
+                    .cloned()
+                    .collect(),
+                None => state.mcp_servers.clone(),
+            };
+            Ok(servers)
         }
         async fn get_ws_auth_settings(
             &self,
         ) -> Result<desktop_assistant_core::ports::inbound::WsAuthSettingsView, CoreError> {
-            Ok(desktop_assistant_core::ports::inbound::WsAuthSettingsView {
-                methods: vec![],
-                oidc_issuer: String::new(),
-                oidc_auth_endpoint: String::new(),
-                oidc_token_endpoint: String::new(),
-                oidc_client_id: String::new(),
-                oidc_scopes: String::new(),
-            })
+            Ok(self.state.lock().unwrap().ws_auth.clone())
         }
         async fn set_ws_auth_settings(
             &self,
-            _methods: Vec<String>,
-            _oidc_issuer: String,
-            _oidc_auth_endpoint: String,
-            _oidc_token_endpoint: String,
-            _oidc_client_id: String,
-            _oidc_scopes: String,
+            methods: Vec<String>,
+            oidc_issuer: String,
+            oidc_auth_endpoint: String,
+            oidc_token_endpoint: String,
+            oidc_client_id: String,
+            oidc_scopes: String,
         ) -> Result<(), CoreError> {
+            let mut state = self.state.lock().unwrap();
+            state.ws_auth = desktop_assistant_core::ports::inbound::WsAuthSettingsView {
+                methods,
+                oidc_issuer,
+                oidc_auth_endpoint,
+                oidc_token_endpoint,
+                oidc_client_id,
+                oidc_scopes,
+            };
             Ok(())
         }
     }
@@ -4146,6 +4372,407 @@ mod tests {
         assert_eq!(config.embeddings.model, "text-embedding-3-large");
         assert_eq!(config.persistence.remote_name, "upstream");
         assert!(!config.persistence.push_on_update);
+    }
+
+    // --- #314 bridge cutover (2/7): database / backend-tasks / ws-auth ------
+    //
+    // Each new command gets a handler round-trip test (set then get returns the
+    // written value) plus unhappy paths. The fakes mirror the daemon's
+    // `empty-clears` semantics so the normalization in the handler arm is
+    // exercised end-to-end.
+
+    fn handler_with(
+        settings: Arc<ConfigurableSettings>,
+    ) -> DefaultAssistantApiHandler<
+        FakeAssistant,
+        FakeConversations,
+        ConfigurableSettings,
+        FakeConnections,
+        FakeKnowledge,
+    > {
+        DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            settings,
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+    }
+
+    #[tokio::test]
+    async fn set_then_get_database_settings_round_trips() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        let ack = h
+            .handle_command(api::Command::SetDatabaseSettings {
+                url: "postgres://u:p@host/db".into(),
+                max_connections: 12,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ack, api::CommandResult::Ack);
+
+        let res = h
+            .handle_command(api::Command::GetDatabaseSettings)
+            .await
+            .unwrap();
+        let api::CommandResult::DatabaseSettings(db) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(db.url, "postgres://u:p@host/db");
+        assert_eq!(db.max_connections, 12);
+    }
+
+    #[tokio::test]
+    async fn set_database_settings_empty_url_clears_it() {
+        // Seed a URL, then an empty url must clear it (mirrors the D-Bus method).
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://u:p@host/db".into(),
+            max_connections: 4,
+        })
+        .await
+        .unwrap();
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "   ".into(),
+            max_connections: 4,
+        })
+        .await
+        .unwrap();
+
+        let res = h
+            .handle_command(api::Command::GetDatabaseSettings)
+            .await
+            .unwrap();
+        let api::CommandResult::DatabaseSettings(db) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(db.url, "", "empty/whitespace url clears the configured URL");
+    }
+
+    #[tokio::test]
+    async fn set_then_get_backend_tasks_settings_round_trips() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        let ack = h
+            .handle_command(api::Command::SetBackendTasksSettings {
+                llm_connector: "ollama".into(),
+                llm_model: "qwen3".into(),
+                llm_base_url: "http://localhost:11434".into(),
+                dreaming_enabled: true,
+                dreaming_interval_secs: 1800,
+                archive_after_days: 14,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ack, api::CommandResult::Ack);
+
+        let res = h
+            .handle_command(api::Command::GetBackendTasksSettings)
+            .await
+            .unwrap();
+        let api::CommandResult::BackendTasksSettings(bt) = res else {
+            panic!("unexpected result variant");
+        };
+        assert!(bt.has_separate_llm, "a set connector means a separate LLM");
+        assert_eq!(bt.llm_connector, "ollama");
+        assert_eq!(bt.llm_model, "qwen3");
+        assert_eq!(bt.llm_base_url, "http://localhost:11434");
+        assert!(bt.dreaming_enabled);
+        assert_eq!(bt.dreaming_interval_secs, 1800);
+        assert_eq!(bt.archive_after_days, 14);
+    }
+
+    #[tokio::test]
+    async fn set_backend_tasks_empty_connector_clears_separate_llm() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        // First set a separate LLM, then clear it with an empty connector.
+        h.handle_command(api::Command::SetBackendTasksSettings {
+            llm_connector: "ollama".into(),
+            llm_model: "qwen3".into(),
+            llm_base_url: "http://localhost:11434".into(),
+            dreaming_enabled: false,
+            dreaming_interval_secs: 3600,
+            archive_after_days: 0,
+        })
+        .await
+        .unwrap();
+        h.handle_command(api::Command::SetBackendTasksSettings {
+            llm_connector: "".into(),
+            llm_model: "".into(),
+            llm_base_url: "".into(),
+            dreaming_enabled: false,
+            dreaming_interval_secs: 3600,
+            archive_after_days: 0,
+        })
+        .await
+        .unwrap();
+
+        let res = h
+            .handle_command(api::Command::GetBackendTasksSettings)
+            .await
+            .unwrap();
+        let api::CommandResult::BackendTasksSettings(bt) = res else {
+            panic!("unexpected result variant");
+        };
+        assert!(
+            !bt.has_separate_llm,
+            "empty connector clears the separate backend-tasks LLM override"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_then_get_ws_auth_settings_round_trips() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        let ack = h
+            .handle_command(api::Command::SetWsAuthSettings {
+                methods: vec!["password".into(), "oidc".into()],
+                oidc_issuer: "https://issuer.example".into(),
+                oidc_auth_endpoint: "https://issuer.example/authorize".into(),
+                oidc_token_endpoint: "https://issuer.example/token".into(),
+                oidc_client_id: "client-123".into(),
+                oidc_scopes: "openid profile".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(ack, api::CommandResult::Ack);
+
+        let res = h
+            .handle_command(api::Command::GetWsAuthSettings)
+            .await
+            .unwrap();
+        let api::CommandResult::WsAuthSettings(ws) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(ws.methods, vec!["password".to_string(), "oidc".to_string()]);
+        assert_eq!(ws.oidc_issuer, "https://issuer.example");
+        assert_eq!(ws.oidc_auth_endpoint, "https://issuer.example/authorize");
+        assert_eq!(ws.oidc_token_endpoint, "https://issuer.example/token");
+        assert_eq!(ws.oidc_client_id, "client-123");
+        assert_eq!(ws.oidc_scopes, "openid profile");
+    }
+
+    // --- #314 MCP CRUD round-trip ------------------------------------------
+
+    #[tokio::test]
+    async fn add_then_list_mcp_server_round_trips_command_args_namespace() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        let ack = h
+            .handle_command(api::Command::AddMcpServer {
+                name: "tasks".into(),
+                command: "/usr/bin/tasks-mcp".into(),
+                args: vec!["--mode".into(), "stdio".into()],
+                namespace: Some("jira".into()),
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ack, api::CommandResult::Ack);
+
+        let res = h
+            .handle_command(api::Command::ListMcpServers)
+            .await
+            .unwrap();
+        let api::CommandResult::McpServers(servers) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(servers.len(), 1);
+        let s = &servers[0];
+        assert_eq!(s.name, "tasks");
+        // The crux of #314: command/args/namespace written via AddMcpServer
+        // must read back on ListMcpServers.
+        assert_eq!(s.command, "/usr/bin/tasks-mcp");
+        assert_eq!(s.args, vec!["--mode".to_string(), "stdio".to_string()]);
+        assert_eq!(s.namespace.as_deref(), Some("jira"));
+        assert!(s.enabled);
+    }
+
+    #[tokio::test]
+    async fn set_mcp_server_enabled_toggles_and_round_trips() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::AddMcpServer {
+            name: "tasks".into(),
+            command: "/usr/bin/tasks-mcp".into(),
+            args: vec![],
+            namespace: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        h.handle_command(api::Command::SetMcpServerEnabled {
+            name: "tasks".into(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+
+        let api::CommandResult::McpServers(servers) = h
+            .handle_command(api::Command::ListMcpServers)
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected result variant");
+        };
+        assert!(!servers[0].enabled, "enabled flag must round-trip");
+        assert_eq!(servers[0].status, "disabled");
+    }
+
+    #[tokio::test]
+    async fn remove_then_list_mcp_server_drops_it() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::AddMcpServer {
+            name: "tasks".into(),
+            command: "/usr/bin/tasks-mcp".into(),
+            args: vec![],
+            namespace: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        let ack = h
+            .handle_command(api::Command::RemoveMcpServer {
+                name: "tasks".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(ack, api::CommandResult::Ack);
+
+        let api::CommandResult::McpServers(servers) = h
+            .handle_command(api::Command::ListMcpServers)
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected result variant");
+        };
+        assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_mcp_server_errors() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(settings);
+
+        let err = h
+            .handle_command(api::Command::RemoveMcpServer {
+                name: "does-not-exist".into(),
+            })
+            .await
+            .expect_err("removing an unknown MCP server must error");
+        assert!(
+            format!("{err:?}").contains("not found"),
+            "unknown server id should surface a not-found error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_enabled_unknown_mcp_server_errors() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(settings);
+
+        let err = h
+            .handle_command(api::Command::SetMcpServerEnabled {
+                name: "does-not-exist".into(),
+                enabled: true,
+            })
+            .await
+            .expect_err("toggling an unknown MCP server must error");
+        assert!(format!("{err:?}").contains("not found"), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_server_action_unknown_action_errors() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(settings);
+
+        let err = h
+            .handle_command(api::Command::McpServerAction {
+                action: "frobnicate".into(),
+                server: None,
+            })
+            .await
+            .expect_err("an unknown MCP action must error");
+        assert!(
+            format!("{err:?}").contains("unknown MCP action"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_action_status_returns_servers() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::AddMcpServer {
+            name: "tasks".into(),
+            command: "/usr/bin/tasks-mcp".into(),
+            args: vec!["--mode".into(), "stdio".into()],
+            namespace: Some("jira".into()),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+        let api::CommandResult::McpServers(servers) = h
+            .handle_command(api::Command::McpServerAction {
+                action: "status".into(),
+                server: Some("tasks".into()),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].command, "/usr/bin/tasks-mcp");
+        assert_eq!(
+            servers[0].args,
+            vec!["--mode".to_string(), "stdio".to_string()]
+        );
+        assert_eq!(servers[0].namespace.as_deref(), Some("jira"));
+    }
+
+    #[tokio::test]
+    async fn add_duplicate_mcp_server_errors() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::AddMcpServer {
+            name: "tasks".into(),
+            command: "/usr/bin/tasks-mcp".into(),
+            args: vec![],
+            namespace: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        let err = h
+            .handle_command(api::Command::AddMcpServer {
+                name: "tasks".into(),
+                command: "/usr/bin/other".into(),
+                args: vec![],
+                namespace: None,
+                enabled: true,
+            })
+            .await
+            .expect_err("adding a duplicate MCP server name must error");
+        assert!(
+            format!("{err:?}").contains("already exists"),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]

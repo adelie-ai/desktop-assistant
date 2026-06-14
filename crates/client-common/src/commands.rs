@@ -521,6 +521,116 @@ pub trait AssistantCommands: Send + Sync {
         };
         Ok(())
     }
+
+    // --- Database / backend-tasks / WS-auth settings (#314) ----------------
+    //
+    // Socket-transport equivalents of the in-process D-Bus settings methods
+    // (bridge cutover 2/7). Each is a thin default over `send_command`, so the
+    // UDS, WS, and D-Bus clients all inherit it.
+
+    /// Read database settings (#314). SECURITY: the returned `url` is the raw
+    /// connection string and may embed a password inline — this mirrors the
+    /// D-Bus `GetDatabaseSettings` method, which returns it verbatim.
+    async fn get_database_settings(&self) -> Result<api::DatabaseSettingsView> {
+        let result = self.send_command(api::Command::GetDatabaseSettings).await?;
+        let api::CommandResult::DatabaseSettings(view) = result else {
+            return Err(anyhow!("unexpected response for get_database_settings"));
+        };
+        Ok(view)
+    }
+
+    /// Update database settings (#314). An empty `url` clears it.
+    async fn set_database_settings(&self, url: &str, max_connections: u32) -> Result<()> {
+        let result = self
+            .send_command(api::Command::SetDatabaseSettings {
+                url: url.to_string(),
+                max_connections,
+            })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!("unexpected response for set_database_settings"));
+        };
+        Ok(())
+    }
+
+    /// Read backend-tasks settings (#314). No secret is returned.
+    async fn get_backend_tasks_settings(&self) -> Result<api::BackendTasksSettingsView> {
+        let result = self
+            .send_command(api::Command::GetBackendTasksSettings)
+            .await?;
+        let api::CommandResult::BackendTasksSettings(view) = result else {
+            return Err(anyhow!(
+                "unexpected response for get_backend_tasks_settings"
+            ));
+        };
+        Ok(view)
+    }
+
+    /// Update backend-tasks settings (#314). An empty `llm_connector` clears the
+    /// separate backend-tasks LLM override.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_backend_tasks_settings(
+        &self,
+        llm_connector: &str,
+        llm_model: &str,
+        llm_base_url: &str,
+        dreaming_enabled: bool,
+        dreaming_interval_secs: u64,
+        archive_after_days: u32,
+    ) -> Result<()> {
+        let result = self
+            .send_command(api::Command::SetBackendTasksSettings {
+                llm_connector: llm_connector.to_string(),
+                llm_model: llm_model.to_string(),
+                llm_base_url: llm_base_url.to_string(),
+                dreaming_enabled,
+                dreaming_interval_secs,
+                archive_after_days,
+            })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!(
+                "unexpected response for set_backend_tasks_settings"
+            ));
+        };
+        Ok(())
+    }
+
+    /// Read WebSocket auth settings (#314). No signing secret is returned — only
+    /// the method list and the non-sensitive OIDC discovery fields.
+    async fn get_ws_auth_settings(&self) -> Result<api::WsAuthSettingsView> {
+        let result = self.send_command(api::Command::GetWsAuthSettings).await?;
+        let api::CommandResult::WsAuthSettings(view) = result else {
+            return Err(anyhow!("unexpected response for get_ws_auth_settings"));
+        };
+        Ok(view)
+    }
+
+    /// Update WebSocket auth settings (#314).
+    async fn set_ws_auth_settings(
+        &self,
+        methods: Vec<String>,
+        oidc_issuer: &str,
+        oidc_auth_endpoint: &str,
+        oidc_token_endpoint: &str,
+        oidc_client_id: &str,
+        oidc_scopes: &str,
+    ) -> Result<()> {
+        let result = self
+            .send_command(api::Command::SetWsAuthSettings {
+                methods,
+                oidc_issuer: oidc_issuer.to_string(),
+                oidc_auth_endpoint: oidc_auth_endpoint.to_string(),
+                oidc_token_endpoint: oidc_token_endpoint.to_string(),
+                oidc_client_id: oidc_client_id.to_string(),
+                oidc_scopes: oidc_scopes.to_string(),
+            })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!("unexpected response for set_ws_auth_settings"));
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -939,5 +1049,145 @@ mod tests {
             }
             other => panic!("expected ClientToolResult, got {other:?}"),
         }
+    }
+
+    // --- #314 settings client methods --------------------------------------
+
+    #[tokio::test]
+    async fn get_database_settings_emits_command_and_decodes_view() {
+        let client = RecordingClient::new(api::CommandResult::DatabaseSettings(
+            api::DatabaseSettingsView {
+                url: "postgres://u:p@host/db".into(),
+                max_connections: 8,
+            },
+        ));
+        let view = client.get_database_settings().await.unwrap();
+        assert_eq!(view.url, "postgres://u:p@host/db");
+        assert_eq!(view.max_connections, 8);
+        assert!(matches!(client.last(), api::Command::GetDatabaseSettings));
+    }
+
+    #[tokio::test]
+    async fn set_database_settings_emits_command_with_args() {
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        client
+            .set_database_settings("postgres://u:p@host/db", 8)
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::SetDatabaseSettings {
+                url,
+                max_connections,
+            } => {
+                assert_eq!(url, "postgres://u:p@host/db");
+                assert_eq!(max_connections, 8);
+            }
+            other => panic!("expected SetDatabaseSettings, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_backend_tasks_settings_emits_command_and_decodes_view() {
+        let client = RecordingClient::new(api::CommandResult::BackendTasksSettings(
+            api::BackendTasksSettingsView {
+                has_separate_llm: true,
+                llm_connector: "ollama".into(),
+                llm_model: "qwen3".into(),
+                llm_base_url: "http://localhost:11434".into(),
+                dreaming_enabled: true,
+                dreaming_interval_secs: 1800,
+                archive_after_days: 7,
+            },
+        ));
+        let view = client.get_backend_tasks_settings().await.unwrap();
+        assert!(view.has_separate_llm);
+        assert_eq!(view.llm_connector, "ollama");
+        assert!(matches!(
+            client.last(),
+            api::Command::GetBackendTasksSettings
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_backend_tasks_settings_emits_command_with_args() {
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        client
+            .set_backend_tasks_settings("ollama", "qwen3", "http://localhost:11434", true, 1800, 7)
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::SetBackendTasksSettings {
+                llm_connector,
+                llm_model,
+                llm_base_url,
+                dreaming_enabled,
+                dreaming_interval_secs,
+                archive_after_days,
+            } => {
+                assert_eq!(llm_connector, "ollama");
+                assert_eq!(llm_model, "qwen3");
+                assert_eq!(llm_base_url, "http://localhost:11434");
+                assert!(dreaming_enabled);
+                assert_eq!(dreaming_interval_secs, 1800);
+                assert_eq!(archive_after_days, 7);
+            }
+            other => panic!("expected SetBackendTasksSettings, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_ws_auth_settings_emits_command_and_decodes_view() {
+        let client = RecordingClient::new(api::CommandResult::WsAuthSettings(
+            api::WsAuthSettingsView {
+                methods: vec!["password".into()],
+                oidc_issuer: "https://issuer.example".into(),
+                oidc_auth_endpoint: String::new(),
+                oidc_token_endpoint: String::new(),
+                oidc_client_id: String::new(),
+                oidc_scopes: String::new(),
+            },
+        ));
+        let view = client.get_ws_auth_settings().await.unwrap();
+        assert_eq!(view.methods, vec!["password".to_string()]);
+        assert_eq!(view.oidc_issuer, "https://issuer.example");
+        assert!(matches!(client.last(), api::Command::GetWsAuthSettings));
+    }
+
+    #[tokio::test]
+    async fn set_ws_auth_settings_emits_command_with_args() {
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        client
+            .set_ws_auth_settings(
+                vec!["password".into(), "oidc".into()],
+                "https://issuer.example",
+                "https://issuer.example/authorize",
+                "https://issuer.example/token",
+                "client-123",
+                "openid profile",
+            )
+            .await
+            .unwrap();
+        match client.last() {
+            api::Command::SetWsAuthSettings {
+                methods,
+                oidc_issuer,
+                oidc_client_id,
+                ..
+            } => {
+                assert_eq!(methods, vec!["password".to_string(), "oidc".to_string()]);
+                assert_eq!(oidc_issuer, "https://issuer.example");
+                assert_eq!(oidc_client_id, "client-123");
+            }
+            other => panic!("expected SetWsAuthSettings, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_getters_reject_unexpected_result() {
+        // A mismatched result variant must be a clean error, not a panic.
+        let client = RecordingClient::new(api::CommandResult::Ack);
+        assert!(client.get_database_settings().await.is_err());
+        assert!(client.get_backend_tasks_settings().await.is_err());
+        assert!(client.get_ws_auth_settings().await.is_err());
     }
 }
