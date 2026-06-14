@@ -301,7 +301,7 @@ mod tests {
             _tag_filter: Option<Vec<String>>,
         ) -> Result<Vec<KnowledgeEntry>, CoreError> {
             let guard = self.entries.lock().unwrap();
-            Ok(guard.iter().cloned().skip(offset).take(limit).collect())
+            Ok(guard.iter().skip(offset).take(limit).cloned().collect())
         }
 
         async fn delete(&self, id: &str) -> Result<(), CoreError> {
@@ -319,8 +319,8 @@ mod tests {
     #[tokio::test]
     async fn create_assigns_id_and_persists() {
         let store = Arc::new(InMemoryStore::default());
-        let service = DaemonKnowledgeService::new(Arc::clone(&store))
-            .with_id_generator(|| "fixed-id".into());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store)).with_id_generator(|| "fixed-id".into());
 
         let entry = service
             .create_entry(
@@ -344,8 +344,8 @@ mod tests {
         // Embedding is decoupled from the write path: the service holds no
         // embedding closure and create must persist without one.
         let store = Arc::new(InMemoryStore::default());
-        let service = DaemonKnowledgeService::new(Arc::clone(&store))
-            .with_id_generator(|| "kb-c".into());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store)).with_id_generator(|| "kb-c".into());
 
         service
             .create_entry("payload".into(), vec![], serde_json::json!({}))
@@ -360,8 +360,8 @@ mod tests {
     #[tokio::test]
     async fn update_replaces_in_place() {
         let store = Arc::new(InMemoryStore::default());
-        let service = DaemonKnowledgeService::new(Arc::clone(&store))
-            .with_id_generator(|| "kb-x".into());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store)).with_id_generator(|| "kb-x".into());
 
         service
             .create_entry("orig".into(), vec![], serde_json::json!({}))

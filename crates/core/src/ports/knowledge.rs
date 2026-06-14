@@ -99,7 +99,10 @@ pub type KnowledgeDeleteFn = Arc<
 /// Boxed async closure for fetching a single entry by id (used by the write
 /// tool to support partial updates that omit `content`).
 pub type KnowledgeGetFn = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Option<KnowledgeEntry>, CoreError>> + Send>>
+    dyn Fn(
+            String,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Option<KnowledgeEntry>, CoreError>> + Send>>
         + Send
         + Sync,
 >;
@@ -162,10 +165,7 @@ mod tests {
     struct MockKnowledgeStore;
 
     impl KnowledgeBaseStore for MockKnowledgeStore {
-        async fn write(
-            &self,
-            entry: KnowledgeEntry,
-        ) -> Result<KnowledgeEntry, CoreError> {
+        async fn write(&self, entry: KnowledgeEntry) -> Result<KnowledgeEntry, CoreError> {
             Ok(entry)
         }
 
@@ -218,7 +218,10 @@ mod tests {
     #[tokio::test]
     async fn mock_knowledge_store_search_returns_empty() {
         let store = MockKnowledgeStore;
-        let results = store.search("test", vec![0.0], None, None, 10).await.unwrap();
+        let results = store
+            .search("test", vec![0.0], None, None, 10)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
