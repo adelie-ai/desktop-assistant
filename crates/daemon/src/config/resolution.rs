@@ -205,6 +205,19 @@ pub fn resolve_backend_tasks_llm_config(config: Option<&DaemonConfig>) -> Resolv
     }
 }
 
+/// Resolve the holistic-consolidation LLM: `[backend_tasks.consolidation_llm]`
+/// if set, otherwise the same resolution as the rest of the backend tasks
+/// (`[backend_tasks.llm]` → top-level `[llm]`). This lets extraction run on a
+/// cheap model while consolidation uses a stronger one.
+pub fn resolve_consolidation_llm_config(config: Option<&DaemonConfig>) -> ResolvedLlmConfig {
+    let consolidation_llm = config.and_then(|c| c.backend_tasks.consolidation_llm.as_ref());
+    if consolidation_llm.is_some() {
+        resolve_llm_config_from(consolidation_llm)
+    } else {
+        resolve_backend_tasks_llm_config(config)
+    }
+}
+
 /// Resolve the LLM config for a given [`PurposeKind`] when the user has
 /// configured `[purposes.<kind>]`. Returns `None` when no purpose is set
 /// (callers fall back to the legacy resolvers — `resolve_embeddings_config`

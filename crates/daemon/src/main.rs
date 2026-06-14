@@ -1376,6 +1376,106 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Spawn the holistic-consolidation task. Separate from extraction so it can
+    // run on a much slower cadence (daily by default) and on a stronger model
+    // (`[backend_tasks.consolidation_llm]`). Gated by the same `dreaming_enabled`
+    // master switch and a non-zero interval.
+    let consolidation_interval_secs = daemon_config
+        .as_ref()
+        .map(|c| c.backend_tasks.consolidation_interval_secs)
+        .unwrap_or(86400);
+    let (consolidation_shutdown_tx, consolidation_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let consolidation_task = if dreaming_enabled && consolidation_interval_secs > 0 {
+        if let Some(pool) = &pg_pool {
+            let resolved = config::resolve_consolidation_llm_config(daemon_config.as_ref());
+            tracing::info!(
+                "consolidation LLM connector={}, model={}, every {}s",
+                resolved.connector,
+                resolved.model,
+                consolidation_interval_secs
+            );
+            let consolidation_llm = build_llm_client(resolved);
+            let consolidation_llm = RetryingLlmClient::new(consolidation_llm, 3);
+            let consolidation_llm = MaybeProfiled::from_config(
+                consolidation_llm,
+                profiling.enabled,
+                profiling.log_path.as_deref(),
+                profiling.full_content,
+            );
+            let consolidation_llm = Arc::new(consolidation_llm);
+            let pool = pool.clone();
+
+            Some(tokio::spawn(async move {
+                let mut shutdown_rx = consolidation_shutdown_rx;
+
+                // Longer initial delay than extraction — let the daemon settle
+                // and let an extraction pass or two accumulate facts first.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {}
+                    _ = &mut shutdown_rx => {
+                        tracing::info!("consolidation cancelled before first scan");
+                        return;
+                    }
+                }
+
+                let llm_fn: desktop_assistant_storage::dreaming::DreamingLlmFn =
+                    Box::new(move |system_prompt, user_prompt| {
+                        let llm = Arc::clone(&consolidation_llm);
+                        Box::pin(async move {
+                            let messages = vec![
+                                Message::new(Role::System, system_prompt),
+                                Message::new(Role::User, user_prompt),
+                            ];
+                            let response = llm
+                                .stream_completion(
+                                    messages,
+                                    &[],
+                                    Default::default(),
+                                    Box::new(|_| true),
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            Ok(response.text)
+                        })
+                    });
+
+                loop {
+                    tracing::info!("consolidation: starting scan");
+                    let started = std::time::Instant::now();
+                    match desktop_assistant_storage::dreaming::run_consolidation_scan(
+                        &pool, &llm_fn,
+                    )
+                    .await
+                    {
+                        Ok(_) => tracing::info!(
+                            "consolidation: scan finished in {:.2?}",
+                            started.elapsed()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "consolidation: scan failed after {:.2?}: {e}",
+                            started.elapsed()
+                        ),
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(consolidation_interval_secs)) => {}
+                        _ = &mut shutdown_rx => {
+                            tracing::info!("consolidation: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            drop(consolidation_shutdown_rx);
+            None
+        }
+    } else {
+        drop(consolidation_shutdown_rx);
+        None
+    };
+
     // Spawn the interactive-model keep-warm task. When the interactive
     // purpose resolves to an Ollama connection with `keep_warm = true`, a
     // light background loop re-loads that one model into Ollama's memory on a
@@ -1996,6 +2096,13 @@ async fn main() -> Result<()> {
         && let Err(e) = task.await
     {
         tracing::warn!("dreaming task join error during shutdown: {e}");
+    }
+
+    let _ = consolidation_shutdown_tx.send(());
+    if let Some(task) = consolidation_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("consolidation task join error during shutdown: {e}");
     }
 
     let _ = keep_warm_shutdown_tx.send(());

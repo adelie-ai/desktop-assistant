@@ -99,42 +99,6 @@ pub async fn load_new_transcript(
     Ok(transcript)
 }
 
-/// Load the full message history for a conversation (used by consolidation
-/// when the LLM requests source disambiguation).
-///
-/// Returns an empty string if the conversation has been hard-deleted —
-/// callers must handle that case (consolidation falls through to KB-only
-/// judgment). Scoped to the task-local user id.
-pub async fn load_full_transcript(
-    pool: &PgPool,
-    conversation_id: &str,
-) -> Result<String, CoreError> {
-    let user_id = current_user_id();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT role, content FROM messages \
-         WHERE user_id = $1 AND conversation_id = $2 \
-           AND role IN ('user', 'assistant') \
-         ORDER BY ordinal ASC",
-    )
-    .bind(user_id.as_str())
-    .bind(conversation_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| CoreError::Storage(format!("dreaming: failed to load full transcript: {e}")))?;
-
-    let mut transcript = String::new();
-    for (role, content) in rows {
-        let truncated = if content.len() > MAX_MESSAGE_CHARS {
-            let end = content.floor_char_boundary(MAX_MESSAGE_CHARS);
-            format!("{}…", &content[..end])
-        } else {
-            content
-        };
-        transcript.push_str(&format!("[{role}]: {truncated}\n\n"));
-    }
-    Ok(transcript)
-}
-
 /// Get the maximum message ordinal for a conversation. Scoped to the
 /// task-local user id.
 pub async fn get_max_ordinal(pool: &PgPool, conversation_id: &str) -> Result<i32, CoreError> {
