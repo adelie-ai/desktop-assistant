@@ -10,6 +10,12 @@ pub struct KnowledgeEntry {
     pub metadata: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+    /// First-class provenance: `extraction` | `consolidation` | `explicit`,
+    /// or `None` when unknown (legacy rows, or read paths that don't select
+    /// it). On write, `None` preserves any existing value rather than clearing
+    /// it.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl KnowledgeEntry {
@@ -21,7 +27,14 @@ impl KnowledgeEntry {
             metadata: serde_json::json!({}),
             created_at: String::new(),
             updated_at: String::new(),
+            source: None,
         }
+    }
+
+    /// Builder-style setter for provenance.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 }
 

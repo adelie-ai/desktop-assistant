@@ -227,7 +227,8 @@ pub async fn apply_ops(
 
         sqlx::query(
             "UPDATE knowledge_base \
-             SET content = $1, metadata = $2, updated_at = NOW(), \
+             SET content = $1, metadata = $2, source = 'consolidation', \
+                 updated_at = NOW(), \
                  reviewed_at = NOW(), \
                  review_generation = LEAST(review_generation + 1, $3) \
              WHERE user_id = $5 AND id = $4",
@@ -272,7 +273,7 @@ pub async fn apply_ops(
     for (id, new_content) in buffer.standalone_updates() {
         sqlx::query(
             "UPDATE knowledge_base \
-             SET content = $1, updated_at = NOW(), \
+             SET content = $1, source = 'consolidation', updated_at = NOW(), \
                  reviewed_at = NOW(), \
                  review_generation = LEAST(review_generation + 1, $2) \
              WHERE user_id = $4 AND id = $3",

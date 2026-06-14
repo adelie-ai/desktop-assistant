@@ -310,8 +310,8 @@ async fn write_extracted_fact(
         }
     }
 
-    // Always include the source-tag for provenance lookups.
-    final_tags.insert("source:dreaming".to_string());
+    // Provenance is recorded in the first-class `source` column ('extraction'),
+    // not the legacy `source:dreaming` tag.
 
     // Build structured metadata.
     let metadata = KbMetadata {
@@ -331,8 +331,8 @@ async fn write_extracted_fact(
     // for tag-registry similarity matching.)
     sqlx::query(
         "INSERT INTO knowledge_base \
-            (id, user_id, content, tags, metadata) \
-         VALUES ($1, $2, $3, $4, $5)",
+            (id, user_id, content, tags, metadata, source) \
+         VALUES ($1, $2, $3, $4, $5, 'extraction')",
     )
     .bind(&id)
     .bind(user_id.as_str())

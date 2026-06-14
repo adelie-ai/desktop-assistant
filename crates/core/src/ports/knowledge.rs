@@ -22,11 +22,14 @@ pub trait KnowledgeBaseStore: Send + Sync {
 
     /// Hybrid search combining vector similarity and full-text search via RRF.
     /// The caller generates the embedding; Postgres runs both searches.
+    /// `tags` requires at least one matching tag (overlap); `exclude_tags`
+    /// removes any row carrying one of those tags.
     fn search(
         &self,
         query: &str,
         query_embedding: Vec<f32>,
         tags: Option<Vec<String>>,
+        exclude_tags: Option<Vec<String>>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
 
@@ -71,11 +74,13 @@ pub type KnowledgeWriteFn = Arc<
         + Sync,
 >;
 
-/// Boxed async closure for searching the knowledge base.
+/// Boxed async closure for searching the knowledge base. Args:
+/// `(query, query_embedding, include_tags, exclude_tags, limit)`.
 pub type KnowledgeSearchFn = Arc<
     dyn Fn(
             String,
             Vec<f32>,
+            Option<Vec<String>>,
             Option<Vec<String>>,
             usize,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send>>
@@ -83,9 +88,71 @@ pub type KnowledgeSearchFn = Arc<
         + Sync,
 >;
 
-/// Boxed async closure for deleting knowledge entries.
+/// Boxed async closure for deleting knowledge entries by id. Takes a batch of
+/// ids and returns how many rows were deleted.
 pub type KnowledgeDeleteFn = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>> + Send + Sync,
+    dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Boxed async closure for fetching a single entry by id (used by the write
+/// tool to support partial updates that omit `content`).
+pub type KnowledgeGetFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Option<KnowledgeEntry>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Direction for a paginated [`KnowledgeListQuery`]. Surfaced explicitly to the
+/// LLM so it always knows which way it is paging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListOrder {
+    OldestFirst,
+    NewestFirst,
+}
+
+/// Parameters for a non-semantic, keyset-paginated listing of the knowledge
+/// base. Pagination is a keyset cursor on `(created_at, id)`; `after` is the
+/// opaque cursor returned by the previous page.
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeListQuery {
+    pub limit: usize,
+    pub after: Option<String>,
+    pub order: ListOrderOpt,
+    /// Rows must carry at least one of these tags (overlap). `None` = no filter.
+    pub tags: Option<Vec<String>>,
+    /// Rows carrying any of these tags are excluded. `None` = no filter.
+    pub exclude_tags: Option<Vec<String>>,
+    /// Restrict to a single `source` value. `None` = no filter.
+    pub source: Option<String>,
+}
+
+/// `ListOrder` with a `Default` of newest-first, for `KnowledgeListQuery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListOrderOpt(pub ListOrder);
+
+impl Default for ListOrderOpt {
+    fn default() -> Self {
+        ListOrderOpt(ListOrder::NewestFirst)
+    }
+}
+
+/// One page of a [`KnowledgeListQuery`]: the entries plus an opaque cursor to
+/// pass as `after` for the next page (`None` when the last page was reached).
+#[derive(Debug, Clone)]
+pub struct KnowledgeListPage {
+    pub entries: Vec<KnowledgeEntry>,
+    pub next_cursor: Option<String>,
+}
+
+/// Boxed async closure for the paginated list tool.
+pub type KnowledgeListFn = Arc<
+    dyn Fn(
+            KnowledgeListQuery,
+        ) -> Pin<Box<dyn Future<Output = Result<KnowledgeListPage, CoreError>> + Send>>
+        + Send
+        + Sync,
 >;
 
 #[cfg(test)]
@@ -107,6 +174,7 @@ mod tests {
             _query: &str,
             _query_embedding: Vec<f32>,
             _tags: Option<Vec<String>>,
+            _exclude_tags: Option<Vec<String>>,
             _limit: usize,
         ) -> Result<Vec<KnowledgeEntry>, CoreError> {
             Ok(vec![])
@@ -150,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn mock_knowledge_store_search_returns_empty() {
         let store = MockKnowledgeStore;
-        let results = store.search("test", vec![0.0], None, 10).await.unwrap();
+        let results = store.search("test", vec![0.0], None, None, 10).await.unwrap();
         assert!(results.is_empty());
     }
 

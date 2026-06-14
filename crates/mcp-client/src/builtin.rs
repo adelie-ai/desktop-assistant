@@ -10,7 +10,8 @@ use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{
-    KnowledgeDeleteFn, KnowledgeSearchFn, KnowledgeWriteFn,
+    KnowledgeDeleteFn, KnowledgeGetFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
+    KnowledgeWriteFn, ListOrder, ListOrderOpt,
 };
 use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_RESULTS_CEILING, NewScratchpadNote,
@@ -24,6 +25,7 @@ use crate::executor::McpControlHandle;
 const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
 const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
+const TOOL_KB_LIST: &str = "builtin_knowledge_base_list";
 const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
 const TOOL_DB_QUERY: &str = "builtin_db_query";
@@ -52,6 +54,8 @@ pub struct BuiltinToolService {
     kb_write_fn: Option<KnowledgeWriteFn>,
     kb_search_fn: Option<KnowledgeSearchFn>,
     kb_delete_fn: Option<KnowledgeDeleteFn>,
+    kb_list_fn: Option<KnowledgeListFn>,
+    kb_get_fn: Option<KnowledgeGetFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
@@ -81,6 +85,8 @@ impl BuiltinToolService {
             kb_write_fn: None,
             kb_search_fn: None,
             kb_delete_fn: None,
+            kb_list_fn: None,
+            kb_get_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
             db_query_fn: None,
@@ -107,10 +113,14 @@ impl BuiltinToolService {
         write_fn: KnowledgeWriteFn,
         search_fn: KnowledgeSearchFn,
         delete_fn: KnowledgeDeleteFn,
+        list_fn: KnowledgeListFn,
+        get_fn: KnowledgeGetFn,
     ) -> Self {
         self.kb_write_fn = Some(write_fn);
         self.kb_search_fn = Some(search_fn);
         self.kb_delete_fn = Some(delete_fn);
+        self.kb_list_fn = Some(list_fn);
+        self.kb_get_fn = Some(get_fn);
         self
     }
 
@@ -204,10 +214,13 @@ impl BuiltinToolService {
         vec![
             ToolDefinition::new(
                 TOOL_KB_WRITE,
-                "Write or update a knowledge base entry. Use for storing preferences, facts, \
+                "Write or update knowledge base entries. Use for storing preferences, facts, \
                  instructions, project context, or any durable information the user wants remembered. \
                  Content should be self-contained prose that describes both the context (when/why \
-                 this information is useful) and the information itself.",
+                 this information is useful) and the information itself. Provide either a single \
+                 entry (top-level `content`/`tags`/`id`) or a batch via `entries`. To update only \
+                 the tags of an existing entry, pass its `id` and omit `content` — the existing \
+                 content is preserved.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -216,7 +229,7 @@ impl BuiltinToolService {
                             "description": "Self-contained prose describing the context and information. \
                                             Write naturally, e.g. 'The user lives at 123 Main St, Springfield. \
                                             Use this as their default location for weather, directions, and local searches.' \
-                                            Do not use key-value format."
+                                            Do not use key-value format. Optional when `id` is given (tags-only update)."
                         },
                         "tags": {
                             "type": "array",
@@ -226,9 +239,20 @@ impl BuiltinToolService {
                         "id": {
                             "type": "string",
                             "description": "Optional ID for updates. Omit to create a new entry."
+                        },
+                        "entries": {
+                            "type": "array",
+                            "description": "Batch form: a list of {content?, tags?, id?} objects. When present, the top-level content/tags/id are ignored.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {"type": "string"},
+                                    "tags": {"type": "array", "items": {"type": "string"}},
+                                    "id": {"type": "string"}
+                                }
+                            }
                         }
-                    },
-                    "required": ["content"]
+                    }
                 }),
             ),
             ToolDefinition::new(
@@ -245,7 +269,12 @@ impl BuiltinToolService {
                         "tags": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Filter results by tags"
+                            "description": "Only return entries carrying at least one of these tags"
+                        },
+                        "exclude_tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exclude entries carrying any of these tags"
                         },
                         "limit": {
                             "type": "integer",
@@ -258,16 +287,60 @@ impl BuiltinToolService {
             ),
             ToolDefinition::new(
                 TOOL_KB_DELETE,
-                "Delete a knowledge base entry by ID",
+                "Delete knowledge base entries by ID. Accepts a single `id` or a list of `ids`.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
                         "id": {
                             "type": "string",
-                            "description": "ID of the entry to delete"
+                            "description": "ID of a single entry to delete"
+                        },
+                        "ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "IDs of multiple entries to delete in one call"
                         }
-                    },
-                    "required": ["id"]
+                    }
+                }),
+            ),
+            ToolDefinition::new(
+                TOOL_KB_LIST,
+                "List knowledge base entries without a search query — a straight paginated \
+                 enumeration for audits and review. Returns entries plus a `next_cursor`; pass it \
+                 back as `cursor` to fetch the next page (null when there are no more).",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "description": "Max entries per page (default 50)"
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "description": "Opaque pagination cursor from a previous page's next_cursor. Omit for the first page."
+                        },
+                        "order": {
+                            "type": "string",
+                            "enum": ["newest_first", "oldest_first"],
+                            "description": "Sort direction by creation time (default newest_first)"
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Only include entries carrying at least one of these tags"
+                        },
+                        "exclude_tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exclude entries carrying any of these tags"
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Only include entries with this provenance: 'extraction', 'consolidation', or 'explicit'"
+                        }
+                    }
                 }),
             ),
             ToolDefinition::new(
@@ -512,6 +585,7 @@ impl BuiltinToolService {
             TOOL_KB_WRITE => self.kb_write(arguments).await,
             TOOL_KB_SEARCH => self.kb_search(arguments).await,
             TOOL_KB_DELETE => self.kb_delete(arguments).await,
+            TOOL_KB_LIST => self.kb_list(arguments).await,
             TOOL_SEARCH => self.tool_search(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
             TOOL_DB_QUERY => self.db_query(arguments).await,
@@ -558,17 +632,89 @@ impl BuiltinToolService {
             .as_ref()
             .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
 
-        let content = required_string(&arguments, "content")?;
-        let tags = optional_string_array(&arguments, "tags");
-        let mut metadata = arguments
-            .get("metadata")
-            .cloned()
+        // Batch form (`entries`) takes precedence over the single top-level
+        // form. Each spec is one {content?, tags?, id?} object.
+        let specs: Vec<serde_json::Value> = match arguments.get("entries") {
+            Some(serde_json::Value::Array(items)) => items.clone(),
+            _ => vec![arguments.clone()],
+        };
+
+        let mut saved_out = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let entry = self.build_write_entry(spec).await?;
+            // Embedding generation is decoupled from the write: the entry lands
+            // immediately (NULL embedding on create, stale embedding left in
+            // place on update) and the background embedding-backfill task
+            // generates the vector within its next pass. The row is
+            // keyword-searchable (FTS) right away; semantic recall follows.
+            let saved = write_fn(entry).await?;
+            saved_out.push(serde_json::json!({
+                "id": saved.id,
+                "created_at": saved.created_at,
+                "updated_at": saved.updated_at,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "count": saved_out.len(),
+            "entries": saved_out,
+        })
+        .to_string())
+    }
+
+    /// Build a [`KnowledgeEntry`] from one write spec. When `content` is
+    /// omitted and an `id` is given, the existing entry is fetched and its
+    /// content (and, if `tags` is also omitted, its tags) are preserved — a
+    /// tags-only / re-tag / promote-to-explicit update. Tool-authored writes
+    /// always carry `source = "explicit"`.
+    async fn build_write_entry(
+        &self,
+        spec: &serde_json::Value,
+    ) -> Result<desktop_assistant_core::domain::KnowledgeEntry, CoreError> {
+        use desktop_assistant_core::domain::KnowledgeEntry;
+
+        let content_opt = optional_string(spec, "content");
+        let id_opt = optional_string(spec, "id");
+        let tags_present = spec.get("tags").is_some();
+        let tags = optional_string_array(spec, "tags");
+
+        // Partial update: no content, but an id to look up.
+        let existing = if content_opt.is_none() {
+            let id = id_opt.clone().ok_or_else(|| {
+                CoreError::ToolExecution(
+                    "knowledge_base write requires `content`, or an `id` of an existing entry to \
+                     update its tags"
+                        .to_string(),
+                )
+            })?;
+            let get_fn = self.kb_get_fn.as_ref().ok_or_else(|| {
+                CoreError::ToolExecution("knowledge base not configured".to_string())
+            })?;
+            Some(get_fn(id.clone()).await?.ok_or_else(|| {
+                CoreError::ToolExecution(format!("no knowledge entry with id {id}"))
+            })?)
+        } else {
+            None
+        };
+
+        let id = id_opt.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let content = content_opt
+            .or_else(|| existing.as_ref().map(|e| e.content.clone()))
+            .ok_or_else(|| CoreError::ToolExecution("knowledge_base write requires content".into()))?;
+        let tags = if tags_present {
+            tags
+        } else {
+            existing.as_ref().map(|e| e.tags.clone()).unwrap_or_default()
+        };
+        let mut metadata = existing
+            .as_ref()
+            .map(|e| e.metadata.clone())
             .unwrap_or_else(|| serde_json::json!({}));
-        // Provenance (#240): stamp the originating conversation so a promoted
-        // finding is traceable back to where it was learned, mirroring the
-        // dreaming extractor. Only when a conversation scope is active (the
-        // task-local installed by the dispatch loop) and the model didn't set
-        // it explicitly. Tool-written entries previously carried no provenance.
+
+        // Provenance (#240): stamp the originating conversation so a tool-saved
+        // finding is traceable back to where it was learned. Only when a
+        // conversation scope is active and it isn't already set.
         if let Some(conv) = current_conversation_id()
             && let Some(obj) = metadata.as_object_mut()
             && !obj.contains_key("source_conversation_id")
@@ -578,32 +724,16 @@ impl BuiltinToolService {
                 serde_json::Value::String(conv.0),
             );
         }
-        let id =
-            optional_string(&arguments, "id").unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
-        let entry = desktop_assistant_core::domain::KnowledgeEntry {
+        Ok(KnowledgeEntry {
             id,
-            content: content.clone(),
+            content,
             tags,
             metadata,
             created_at: String::new(),
             updated_at: String::new(),
-        };
-
-        // Embedding generation is decoupled from the write: the entry lands
-        // immediately (NULL embedding on create, stale embedding left in place
-        // on update) and the background embedding-backfill task generates the
-        // vector within its next pass. The row is keyword-searchable (FTS)
-        // right away; semantic recall follows shortly after.
-        let saved = write_fn(entry).await?;
-
-        Ok(serde_json::json!({
-            "ok": true,
-            "id": saved.id,
-            "created_at": saved.created_at,
-            "updated_at": saved.updated_at,
+            source: Some("explicit".to_string()),
         })
-        .to_string())
     }
 
     async fn kb_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -614,16 +744,17 @@ impl BuiltinToolService {
 
         let query = required_string(&arguments, "query")?;
         let tags = optional_string_array_nonempty(&arguments, "tags");
+        let exclude_tags = optional_string_array_nonempty(&arguments, "exclude_tags");
         let limit = arguments
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(10) as usize;
 
-        tracing::info!(query = %query, ?tags, limit, "knowledge base search");
+        tracing::info!(query = %query, ?tags, ?exclude_tags, limit, "knowledge base search");
 
         let query_embedding = self.embed_text(&query).await.unwrap_or_default();
 
-        let results = search_fn(query, query_embedding, tags, limit).await?;
+        let results = search_fn(query, query_embedding, tags, exclude_tags, limit).await?;
 
         let items: Vec<serde_json::Value> = results
             .into_iter()
@@ -709,12 +840,73 @@ impl BuiltinToolService {
             .as_ref()
             .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
 
-        let id = required_string(&arguments, "id")?;
-        delete_fn(id.clone()).await?;
+        // Accept either a single `id` or a list of `ids`.
+        let mut ids = optional_string_array(&arguments, "ids");
+        if let Some(id) = optional_string(&arguments, "id") {
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "knowledge_base delete requires `id` or `ids`".to_string(),
+            ));
+        }
+
+        let deleted = delete_fn(ids.clone()).await?;
 
         Ok(serde_json::json!({
             "ok": true,
-            "deleted": id,
+            "deleted": deleted,
+            "ids": ids,
+        })
+        .to_string())
+    }
+
+    async fn kb_list(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let list_fn = self
+            .kb_list_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+
+        let limit = arguments
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(50) as usize;
+        let order = match arguments.get("order").and_then(serde_json::Value::as_str) {
+            Some("oldest_first") => ListOrder::OldestFirst,
+            _ => ListOrder::NewestFirst,
+        };
+        let query = KnowledgeListQuery {
+            limit,
+            after: optional_string(&arguments, "cursor"),
+            order: ListOrderOpt(order),
+            tags: optional_string_array_nonempty(&arguments, "tags"),
+            exclude_tags: optional_string_array_nonempty(&arguments, "exclude_tags"),
+            source: optional_string(&arguments, "source"),
+        };
+
+        let page = list_fn(query).await?;
+
+        let items: Vec<serde_json::Value> = page
+            .entries
+            .into_iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "content": entry.content,
+                    "tags": entry.tags,
+                    "metadata": entry.metadata,
+                    "source": entry.source,
+                    "created_at": entry.created_at,
+                    "updated_at": entry.updated_at,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "count": items.len(),
+            "entries": items,
+            "next_cursor": page.next_cursor,
         })
         .to_string())
     }
@@ -2095,23 +2287,58 @@ mod tests {
             Box::pin(async move {
                 entry.created_at = "2024-01-01".to_string();
                 entry.updated_at = "2024-01-01".to_string();
-                s.lock().unwrap().push(entry.clone());
+                // Upsert by id, mirroring the store's ON CONFLICT semantics.
+                let mut g = s.lock().unwrap();
+                g.retain(|e| e.id != entry.id);
+                g.push(entry.clone());
                 Ok(entry)
             })
         });
 
         let search_store = Arc::clone(&store);
-        let search_fn: KnowledgeSearchFn = Arc::new(move |_query, _emb, _tags, limit| {
-            let s = Arc::clone(&search_store);
+        let search_fn: KnowledgeSearchFn =
+            Arc::new(move |_query, _emb, _tags, _exclude_tags, limit| {
+                let s = Arc::clone(&search_store);
+                Box::pin(async move {
+                    let entries = s.lock().unwrap();
+                    Ok(entries.iter().take(limit).cloned().collect())
+                })
+            });
+
+        let delete_store = Arc::clone(&store);
+        let delete_fn: KnowledgeDeleteFn = Arc::new(move |ids| {
+            let s = Arc::clone(&delete_store);
             Box::pin(async move {
-                let entries = s.lock().unwrap();
-                Ok(entries.iter().take(limit).cloned().collect())
+                let mut g = s.lock().unwrap();
+                let before = g.len();
+                g.retain(|e| !ids.contains(&e.id));
+                Ok(before - g.len())
             })
         });
 
-        let delete_fn: KnowledgeDeleteFn = Arc::new(|_id| Box::pin(async { Ok(()) }));
+        let list_store = Arc::clone(&store);
+        let list_fn: KnowledgeListFn = Arc::new(move |q| {
+            let s = Arc::clone(&list_store);
+            Box::pin(async move {
+                let g = s.lock().unwrap();
+                let entries = g.iter().take(q.limit.max(1)).cloned().collect();
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries,
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
 
-        let service = BuiltinToolService::new().with_knowledge_base(write_fn, search_fn, delete_fn);
+        let get_store = Arc::clone(&store);
+        let get_fn: KnowledgeGetFn = Arc::new(move |id| {
+            let s = Arc::clone(&get_store);
+            Box::pin(async move { Ok(s.lock().unwrap().iter().find(|e| e.id == id).cloned()) })
+        });
+
+        let service = BuiltinToolService::new()
+            .with_knowledge_base(write_fn, search_fn, delete_fn, list_fn, get_fn);
 
         // Write
         let write_result = service
@@ -2126,7 +2353,8 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&write_result).unwrap();
         assert_eq!(json["ok"], true);
-        assert!(json["id"].as_str().is_some());
+        assert_eq!(json["count"], 1);
+        assert!(json["entries"][0]["id"].as_str().is_some());
 
         // Search
         let search_result = service
@@ -2143,6 +2371,42 @@ mod tests {
                 .unwrap()
                 .contains("dark mode")
         );
+
+        // List surfaces the entry with its provenance ('explicit' for a
+        // tool-authored write) and an id we can operate on.
+        let list_result = service
+            .execute_tool(TOOL_KB_LIST, serde_json::json!({"limit": 10}))
+            .await
+            .unwrap();
+        let lj: serde_json::Value = serde_json::from_str(&list_result).unwrap();
+        assert_eq!(lj["count"], 1);
+        assert_eq!(lj["entries"][0]["source"], "explicit");
+        let id = lj["entries"][0]["id"].as_str().unwrap().to_string();
+
+        // Partial update: tags only, `content` omitted — existing content is
+        // preserved.
+        service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({"id": id, "tags": ["preference", "retagged"]}),
+            )
+            .await
+            .unwrap();
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(g.len(), 1);
+            assert_eq!(g[0].content, "User prefers dark mode");
+            assert!(g[0].tags.iter().any(|t| t == "retagged"));
+        }
+
+        // Bulk delete by ids.
+        let del = service
+            .execute_tool(TOOL_KB_DELETE, serde_json::json!({"ids": [id]}))
+            .await
+            .unwrap();
+        let dj: serde_json::Value = serde_json::from_str(&del).unwrap();
+        assert_eq!(dj["deleted"], 1);
+        assert!(store.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

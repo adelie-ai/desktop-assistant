@@ -271,6 +271,7 @@ mod tests {
             _query: &str,
             _query_embedding: Vec<f32>,
             _tags: Option<Vec<String>>,
+            _exclude_tags: Option<Vec<String>>,
             _limit: usize,
         ) -> Result<Vec<KnowledgeEntry>, CoreError> {
             Ok(Vec::new())
