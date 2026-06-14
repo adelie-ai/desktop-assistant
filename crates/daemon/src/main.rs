@@ -18,6 +18,7 @@ mod config;
 mod connections;
 mod knowledge_service;
 mod model_defaults;
+mod notifications;
 mod purposes;
 mod registry;
 mod routing_llm;
@@ -905,6 +906,12 @@ async fn main() -> Result<()> {
                 Box::pin(async move { store.get(&id).await })
             }),
         );
+    }
+
+    // Desktop notifications (builtin_notify). Capability-gated: only wired when
+    // a freedesktop notification server answers on the session bus.
+    if let Some(notify_fn) = notifications::build_notify_fn().await {
+        builtin_tools = builtin_tools.with_notify(notify_fn);
     }
 
     // Background-task registry (#111/#115). Constructed BEFORE the scratchpad

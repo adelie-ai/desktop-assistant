@@ -13,6 +13,7 @@ use desktop_assistant_core::ports::knowledge::{
     KnowledgeDeleteFn, KnowledgeGetFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
     KnowledgeWriteFn, ListOrder, ListOrderOpt,
 };
+use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_RESULTS_CEILING, NewScratchpadNote,
     RESPONSE_BYTE_BUDGET, ScratchpadClearFn, ScratchpadDeleteManyFn, ScratchpadGetManyFn,
@@ -27,6 +28,7 @@ const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_KB_LIST: &str = "builtin_knowledge_base_list";
 const TOOL_SEARCH: &str = "builtin_tool_search";
+const TOOL_NOTIFY: &str = "builtin_notify";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
 const TOOL_DB_QUERY: &str = "builtin_db_query";
 const TOOL_MCP_CONTROL: &str = "builtin_mcp_control";
@@ -68,6 +70,7 @@ pub struct BuiltinToolService {
     scratchpad_search_fn: Option<ScratchpadSearchFn>,
     scratchpad_delete_many_fn: Option<ScratchpadDeleteManyFn>,
     scratchpad_clear_fn: Option<ScratchpadClearFn>,
+    notify_fn: Option<NotifyFn>,
 }
 
 impl Default for BuiltinToolService {
@@ -98,12 +101,23 @@ impl BuiltinToolService {
             scratchpad_search_fn: None,
             scratchpad_delete_many_fn: None,
             scratchpad_clear_fn: None,
+            notify_fn: None,
         }
     }
 
     /// Configure the embedding function for generating query vectors.
     pub fn with_embedding(mut self, embed_fn: EmbedFn) -> Self {
         self.embed_fn = Some(embed_fn);
+        self
+    }
+
+    /// Configure the desktop-notification closure (#`builtin_notify`).
+    ///
+    /// Capability-gated: the daemon only calls this when a notification
+    /// service is present on the session bus, so the tool is simply absent on a
+    /// headless host rather than failing at call time.
+    pub fn with_notify(mut self, notify_fn: NotifyFn) -> Self {
+        self.notify_fn = Some(notify_fn);
         self
     }
 
@@ -211,7 +225,7 @@ impl BuiltinToolService {
     }
 
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        vec![
+        let mut defs = vec![
             ToolDefinition::new(
                 TOOL_KB_WRITE,
                 "Write or update knowledge base entries. Use for storing preferences, facts, \
@@ -556,7 +570,42 @@ impl BuiltinToolService {
                     }
                 }),
             ),
-        ]
+        ];
+
+        // Capability-gated: only advertise the notification tool when a
+        // notification service was wired (present on the session bus).
+        if self.notify_fn.is_some() {
+            defs.push(ToolDefinition::new(
+                TOOL_NOTIFY,
+                "Show a desktop notification to the user via the system notification service. \
+                 Use to surface something the user should see now — e.g. a long-running task \
+                 finished, or a time-sensitive finding worth interrupting for. Prefer the normal \
+                 reply for ordinary output; reserve notifications for things that warrant the \
+                 user's attention away from the chat. Only available when a desktop notification \
+                 service is present.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Short title line (a few words)."
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional longer detail shown under the title."
+                        },
+                        "urgency": {
+                            "type": "string",
+                            "enum": ["low", "normal", "critical"],
+                            "description": "Urgency (default normal). 'critical' stays on screen until dismissed; use sparingly."
+                        }
+                    },
+                    "required": ["summary"]
+                }),
+            ));
+        }
+
+        defs
     }
 
     pub fn supports_tool(name: &str) -> bool {
@@ -587,6 +636,7 @@ impl BuiltinToolService {
             TOOL_KB_DELETE => self.kb_delete(arguments).await,
             TOOL_KB_LIST => self.kb_list(arguments).await,
             TOOL_SEARCH => self.tool_search(arguments).await,
+            TOOL_NOTIFY => self.notify(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
             TOOL_DB_QUERY => self.db_query(arguments).await,
             TOOL_MCP_CONTROL => self.mcp_control(arguments).await,
@@ -914,6 +964,30 @@ impl BuiltinToolService {
             "next_cursor": page.next_cursor,
         })
         .to_string())
+    }
+
+    async fn notify(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let notify_fn = self.notify_fn.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution("desktop notifications are not available".to_string())
+        })?;
+
+        let summary = required_string(&arguments, "summary")?;
+        let body = optional_string(&arguments, "body").unwrap_or_default();
+        let urgency = NotifyUrgency::parse(
+            arguments.get("urgency").and_then(serde_json::Value::as_str),
+        );
+
+        match notify_fn(summary, body, urgency).await? {
+            Some(id) => Ok(serde_json::json!({ "ok": true, "shown": true, "id": id }).to_string()),
+            // Suppressed by rate-limiting (e.g. an identical notification just
+            // fired) — report it without making it an error.
+            None => Ok(serde_json::json!({
+                "ok": true,
+                "shown": false,
+                "reason": "suppressed (duplicate of a recent notification)"
+            })
+            .to_string()),
+        }
     }
 
     async fn tool_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -2441,6 +2515,76 @@ mod tests {
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "jira__create_issue");
+    }
+
+    #[tokio::test]
+    async fn notify_absent_and_errors_without_capability() {
+        let service = BuiltinToolService::new();
+        // Not advertised when no notification capability is wired.
+        assert!(
+            !service
+                .tool_definitions()
+                .iter()
+                .any(|t| t.name == TOOL_NOTIFY)
+        );
+        // Calling it anyway is a clean error, not a panic.
+        let err = service
+            .execute_tool(TOOL_NOTIFY, serde_json::json!({"summary": "hi"}))
+            .await;
+        assert!(matches!(err, Err(CoreError::ToolExecution(_))));
+    }
+
+    #[tokio::test]
+    async fn notify_with_closure_reports_shown_and_suppressed() {
+        use std::sync::Arc;
+
+        // Returns an id for "show me", None for "duplicate" — keyed off summary.
+        let notify_fn: NotifyFn = Arc::new(|summary, _body, _urgency| {
+            Box::pin(async move {
+                if summary == "dup" {
+                    Ok(None)
+                } else {
+                    Ok(Some(42u32))
+                }
+            })
+        });
+        let service = BuiltinToolService::new().with_notify(notify_fn);
+
+        // Advertised once wired.
+        assert!(
+            service
+                .tool_definitions()
+                .iter()
+                .any(|t| t.name == TOOL_NOTIFY)
+        );
+
+        // summary is required.
+        assert!(
+            service
+                .execute_tool(TOOL_NOTIFY, serde_json::json!({"body": "no summary"}))
+                .await
+                .is_err()
+        );
+
+        let shown = service
+            .execute_tool(
+                TOOL_NOTIFY,
+                serde_json::json!({"summary": "Build done", "urgency": "low"}),
+            )
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["shown"], true);
+        assert_eq!(json["id"], 42);
+
+        let suppressed = service
+            .execute_tool(TOOL_NOTIFY, serde_json::json!({"summary": "dup"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&suppressed).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["shown"], false);
     }
 
     #[tokio::test(start_paused = true)]
