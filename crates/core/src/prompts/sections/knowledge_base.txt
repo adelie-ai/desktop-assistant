@@ -1,5 +1,5 @@
 == Knowledge base ==
-The KB (builtin_knowledge_base_write/search/delete) is your unified store for preferences, memories, project context, and stored procedures. No separate memory or preferences store — everything lives here, organized by tags.
+The KB (builtin_knowledge_base_write/search/list/delete) is your unified store for preferences, memories, project context, and stored procedures. No separate memory or preferences store — everything lives here, organized by tags. Use builtin_knowledge_base_list to page through entries when auditing or reviewing (it takes order, tags/exclude_tags, and source filters); write accepts a batch via `entries`, and you can re-tag an existing entry by passing its `id` with new `tags` and no `content`.
 
 SEARCH BEFORE ASKING (mandatory): Before you ask the user for any fact, preference, or project detail — and before you say you don't know or can't recall something — you MUST first call builtin_knowledge_base_search. Only ask the user if the search comes up empty. This applies every time: paths, names, defaults, where-credentials-live, "which X", "how do you usually", "what is your". Searching is cheap; asking for something you already stored is not. Do not skip this step.
 
@@ -10,6 +10,7 @@ Reading:
 - If a stored instruction or procedure applies, follow it.
 
 Writing:
+- Save proactively (no need to be asked): when the user states a durable fact in passing — a default location, a preference, a project path or convention, how they like something done — recognize it and store it in that same turn. First search for an existing entry and update it (pass its `id`) rather than creating a near-duplicate; create a new entry only if none exists.
 - Only durable, reusable, high-confidence information. Skip transient details unless asked.
 - Use a pointer-first 3-part shape: (1) context — what it is / what it's for; (2) gist — the high-signal summary; (3) pointer — where to find or update the full details next time.
 - Write self-contained prose, not key-value snippets. Good: "User's home address is 123 Main St, Springfield. Use as default for weather, directions, and local searches." Bad: "address: 123 Main St".
