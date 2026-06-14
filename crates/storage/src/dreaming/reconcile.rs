@@ -9,12 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use desktop_assistant_core::ports::auth::current_user_id;
-use pgvector::Vector;
 use sqlx::PgPool;
 
-use super::types::{BackfillEmbedFn, ConsolidationStats, MAX_REVIEW_GENERATION};
+use super::types::{ConsolidationStats, MAX_REVIEW_GENERATION};
 use crate::kb_metadata::{KbMetadata, KbScope};
 
 /// Operations a per-memory review can propose.
@@ -180,8 +178,6 @@ impl OpBuffer {
 /// Returns counts of applied operations.
 pub async fn apply_ops(
     pool: &PgPool,
-    embed_fn: &BackfillEmbedFn,
-    embedding_model: &str,
     buffer: &OpBuffer,
     synthesized: &[SynthesizedMerge],
     soft_delete_ttl_days: i32,
@@ -210,19 +206,10 @@ pub async fn apply_ops(
     .await
     .map_err(|e| CoreError::Storage(format!("dreaming: TTL reap failed: {e}")))?;
 
-    // Apply merges: update canonical row, soft-delete cluster members.
+    // Apply merges: update canonical row, soft-delete cluster members. The
+    // canonical row's embedding is left stale (not regenerated here) — the
+    // bumped `updated_at` marks it for the background embedding-backfill task.
     for merge in synthesized {
-        let chunks = chunk_text(&merge.new_content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        let embeddings = embed_fn(chunks).await.map_err(CoreError::Storage)?;
-        if embeddings.is_empty() {
-            tracing::warn!(
-                "dreaming: synthesis embedding empty for cluster canonical {}",
-                merge.canonical_id
-            );
-            continue;
-        }
-        let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
-
         // Preserve source_conversation_id of the canonical row but apply
         // the new scope.
         let existing_metadata: Option<(serde_json::Value,)> =
@@ -240,16 +227,13 @@ pub async fn apply_ops(
 
         sqlx::query(
             "UPDATE knowledge_base \
-             SET content = $1, metadata = $2, embedding = $3::vector[], \
-                 embedding_model = $4, updated_at = NOW(), \
+             SET content = $1, metadata = $2, updated_at = NOW(), \
                  reviewed_at = NOW(), \
-                 review_generation = LEAST(review_generation + 1, $5) \
-             WHERE user_id = $7 AND id = $6",
+                 review_generation = LEAST(review_generation + 1, $3) \
+             WHERE user_id = $5 AND id = $4",
         )
         .bind(&merge.new_content)
         .bind(metadata.to_json())
-        .bind(&embedding_vecs)
-        .bind(embedding_model)
         .bind(MAX_REVIEW_GENERATION)
         .bind(&merge.canonical_id)
         .bind(user_id.as_str())
@@ -283,26 +267,17 @@ pub async fn apply_ops(
         stats.merged_clusters += 1;
     }
 
-    // Standalone updates (not in any merge cluster).
+    // Standalone updates (not in any merge cluster). Embedding left stale for
+    // the background backfill task; only content + watermarks change here.
     for (id, new_content) in buffer.standalone_updates() {
-        let chunks = chunk_text(&new_content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        let embeddings = embed_fn(chunks).await.map_err(CoreError::Storage)?;
-        if embeddings.is_empty() {
-            continue;
-        }
-        let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
-
         sqlx::query(
             "UPDATE knowledge_base \
-             SET content = $1, embedding = $2::vector[], embedding_model = $3, \
-                 updated_at = NOW(), \
+             SET content = $1, updated_at = NOW(), \
                  reviewed_at = NOW(), \
-                 review_generation = LEAST(review_generation + 1, $4) \
-             WHERE user_id = $6 AND id = $5",
+                 review_generation = LEAST(review_generation + 1, $2) \
+             WHERE user_id = $4 AND id = $3",
         )
         .bind(&new_content)
-        .bind(&embedding_vecs)
-        .bind(embedding_model)
         .bind(MAX_REVIEW_GENERATION)
         .bind(&id)
         .bind(user_id.as_str())

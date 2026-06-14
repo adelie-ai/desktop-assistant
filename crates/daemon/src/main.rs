@@ -861,10 +861,6 @@ async fn main() -> Result<()> {
 
     // Build the MCP tool executor with builtin tools
     let mut builtin_tools = BuiltinToolService::new();
-    // Hold an extra clone for the knowledge management service (#73) so
-    // both the LLM-tool path and the client-facing service embed via
-    // the same closure.
-    let embedding_fn_for_kb_service: Option<EmbedFn> = embedding_fn.clone();
     if let Some(embed_fn) = embedding_fn {
         tracing::info!(
             "enabling built-in vector search with model={}",
@@ -880,17 +876,11 @@ async fn main() -> Result<()> {
         let kb_w = Arc::clone(kb);
         let kb_s = Arc::clone(kb);
         let kb_d = Arc::clone(kb);
-        let kb_emb_model = embedding_model_id.clone();
         use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
         builtin_tools = builtin_tools.with_knowledge_base(
-            Arc::new(move |entry, embedding: Option<Vec<Vec<f32>>>| {
+            Arc::new(move |entry| {
                 let store = Arc::clone(&kb_w);
-                let model = if embedding.is_some() {
-                    Some(kb_emb_model.clone())
-                } else {
-                    None
-                };
-                Box::pin(async move { store.write(entry, embedding, model).await })
+                Box::pin(async move { store.write(entry).await })
             }),
             Arc::new(move |query, embedding, tags, limit| {
                 let store = Arc::clone(&kb_s);
@@ -1165,23 +1155,33 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Spawn background embedding backfill task
+    // Spawn the background embedding backfill task. Embedding generation is
+    // decoupled from content writes — writes leave the embedding NULL (create)
+    // or stale (update) and this task regenerates vectors periodically, so it
+    // must run on an interval rather than once at startup.
+    let backfill_interval_secs = daemon_config
+        .as_ref()
+        .map(|c| c.backend_tasks.embedding_backfill_interval_secs)
+        .unwrap_or(300);
     let (backfill_shutdown_tx, backfill_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let backfill_task = if let (Some(pool), Some(client)) = (&pg_pool, &embedding_client) {
         let pool = pool.clone();
         let client = Arc::clone(client);
         let model = embedding_model_id.clone();
         Some(tokio::spawn(async move {
+            let mut shutdown_rx = backfill_shutdown_rx;
             // Let tool registration and MCP connections settle.
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-                _ = backfill_shutdown_rx => {
+                _ = &mut shutdown_rx => {
                     tracing::info!("embedding backfill cancelled before start");
                     return;
                 }
             }
 
-            tracing::info!("starting embedding backfill (model={model})");
+            tracing::info!(
+                "starting embedding backfill (model={model}, every {backfill_interval_secs}s)"
+            );
 
             let embed_fn: desktop_assistant_storage::embedding_backfill::BackfillEmbedFn =
                 Box::new(move |texts| {
@@ -1189,24 +1189,34 @@ async fn main() -> Result<()> {
                     Box::pin(async move { client.embed(texts).await.map_err(|e| e.to_string()) })
                 });
 
-            match desktop_assistant_storage::embedding_backfill::backfill_tool_embeddings(
-                &pool, &embed_fn, &model,
-            )
-            .await
-            {
-                Ok(n) if n > 0 => tracing::info!("backfilled {n} tool embedding(s)"),
-                Ok(_) => tracing::debug!("no tool embeddings to backfill"),
-                Err(e) => tracing::warn!("tool embedding backfill failed: {e}"),
-            }
+            loop {
+                match desktop_assistant_storage::embedding_backfill::backfill_tool_embeddings(
+                    &pool, &embed_fn, &model,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::info!("backfilled {n} tool embedding(s)"),
+                    Ok(_) => tracing::debug!("no tool embeddings to backfill"),
+                    Err(e) => tracing::warn!("tool embedding backfill failed: {e}"),
+                }
 
-            match desktop_assistant_storage::embedding_backfill::backfill_knowledge_embeddings(
-                &pool, &embed_fn, &model,
-            )
-            .await
-            {
-                Ok(n) if n > 0 => tracing::info!("backfilled {n} knowledge embedding(s)"),
-                Ok(_) => tracing::debug!("no knowledge embeddings to backfill"),
-                Err(e) => tracing::warn!("knowledge embedding backfill failed: {e}"),
+                match desktop_assistant_storage::embedding_backfill::backfill_knowledge_embeddings(
+                    &pool, &embed_fn, &model,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::info!("backfilled {n} knowledge embedding(s)"),
+                    Ok(_) => tracing::debug!("no knowledge embeddings to backfill"),
+                    Err(e) => tracing::warn!("knowledge embedding backfill failed: {e}"),
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backfill_interval_secs)) => {}
+                    _ = &mut shutdown_rx => {
+                        tracing::info!("embedding backfill: shutdown signal received");
+                        break;
+                    }
+                }
             }
         }))
     } else {
@@ -1642,22 +1652,18 @@ async fn main() -> Result<()> {
             .with_registry(Arc::clone(&registry_handle)),
     );
 
-    // Knowledge management service (#73). When a Postgres pool is
-    // configured, wire the embedding closure so client-authored entries
-    // are discoverable by the LLM tool. Without a pool, every method
-    // surfaces a uniform "not configured" error.
-    let knowledge_service = Arc::new(match (&kb_store, embedding_fn_for_kb_service.clone()) {
-        (Some(store), embed_fn) => {
+    // Knowledge management service (#73). Client-authored entries are
+    // discoverable by the LLM tool once the background embedding-backfill
+    // task generates their vectors — writes no longer embed inline. Without a
+    // pool, every method surfaces a uniform "not configured" error.
+    let knowledge_service = Arc::new(match &kb_store {
+        Some(store) => {
             tracing::info!("knowledge management service ready");
             knowledge_service::AnyKnowledgeService::Configured(
-                knowledge_service::DaemonKnowledgeService::new(
-                    Arc::clone(store),
-                    embed_fn,
-                    Some(embedding_model_id.clone()),
-                ),
+                knowledge_service::DaemonKnowledgeService::new(Arc::clone(store)),
             )
         }
-        (None, _) => {
+        None => {
             tracing::info!("knowledge management service unavailable (no Postgres pool)");
             knowledge_service::AnyKnowledgeService::Unconfigured(
                 knowledge_service::UnconfiguredKnowledgeService,

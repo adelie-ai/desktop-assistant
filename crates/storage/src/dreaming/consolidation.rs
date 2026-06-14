@@ -28,8 +28,8 @@ use sqlx::PgPool;
 use super::common::{extract_json_payload, load_full_transcript};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
-    BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, MAX_REVIEW_CANDIDATES,
-    MAX_REVIEW_GENERATION, MAX_REVIEWS_PER_CYCLE, SOFT_DELETE_TTL_DAYS,
+    ConsolidationStats, DreamingLlmFn, MAX_REVIEW_CANDIDATES, MAX_REVIEW_GENERATION,
+    MAX_REVIEWS_PER_CYCLE, SOFT_DELETE_TTL_DAYS,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 
@@ -47,8 +47,6 @@ struct KbRow {
 pub async fn run_consolidation_phase(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
-    embed_fn: &BackfillEmbedFn,
-    embedding_model: &str,
 ) -> Result<ConsolidationStats, CoreError> {
     // Load focals across all users, grouped by user. The cross-user
     // scan is audit-allowlisted (background-worker entry point); from
@@ -73,7 +71,7 @@ pub async fn run_consolidation_phase(
         );
 
         let stats = with_user_id(UserId::new(user_id_str.clone()), async {
-            consolidate_user_focals(pool, llm_fn, embed_fn, embedding_model, focals).await
+            consolidate_user_focals(pool, llm_fn, focals).await
         })
         .await?;
 
@@ -90,8 +88,6 @@ pub async fn run_consolidation_phase(
 async fn consolidate_user_focals(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
-    embed_fn: &BackfillEmbedFn,
-    embedding_model: &str,
     focals: Vec<KbRow>,
 ) -> Result<ConsolidationStats, CoreError> {
     let mut buffer = OpBuffer::new();
@@ -153,15 +149,7 @@ async fn consolidate_user_focals(
         }
     }
 
-    let stats = apply_ops(
-        pool,
-        embed_fn,
-        embedding_model,
-        &buffer,
-        &synthesized,
-        SOFT_DELETE_TTL_DAYS,
-    )
-    .await?;
+    let stats = apply_ops(pool, &buffer, &synthesized, SOFT_DELETE_TTL_DAYS).await?;
 
     Ok(stats)
 }

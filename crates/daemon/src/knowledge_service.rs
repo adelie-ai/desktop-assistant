@@ -13,21 +13,21 @@
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use desktop_assistant_core::domain::KnowledgeEntry;
-use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::inbound::KnowledgeService;
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 
 /// Concrete [`KnowledgeService`] backed by a Postgres-backed
 /// [`KnowledgeBaseStore`] (or an in-memory test double).
+///
+/// Writes never embed inline; the background embedding-backfill task owns
+/// vector (re)generation, so this service no longer holds an embedding
+/// closure.
 pub struct DaemonKnowledgeService<S>
 where
     S: KnowledgeBaseStore + 'static,
 {
     store: Arc<S>,
-    embed_fn: Option<EmbedFn>,
-    embedding_model: Option<String>,
     id_generator: Box<dyn Fn() -> String + Send + Sync>,
 }
 
@@ -35,11 +35,9 @@ impl<S> DaemonKnowledgeService<S>
 where
     S: KnowledgeBaseStore + 'static,
 {
-    pub fn new(store: Arc<S>, embed_fn: Option<EmbedFn>, embedding_model: Option<String>) -> Self {
+    pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
-            embed_fn,
-            embedding_model,
             id_generator: Box::new(|| uuid::Uuid::now_v7().to_string()),
         }
     }
@@ -51,28 +49,6 @@ where
     ) -> Self {
         self.id_generator = Box::new(gen_fn);
         self
-    }
-
-    /// Chunk + embed `content` using the configured embedding closure.
-    /// Returns `Ok(None)` when no embedding closure is wired (KB writes
-    /// still succeed, just without semantic search coverage — same
-    /// behaviour as the builtin tool's `embed_chunks` path).
-    async fn embed_chunks(&self, content: &str) -> Result<Option<Vec<Vec<f32>>>, CoreError> {
-        let Some(embed_fn) = self.embed_fn.as_ref() else {
-            return Ok(None);
-        };
-        let chunks = chunk_text(content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        if chunks.is_empty() {
-            return Ok(None);
-        }
-        match embed_fn(chunks).await {
-            Ok(vecs) if !vecs.is_empty() => Ok(Some(vecs)),
-            Ok(_) => Ok(None),
-            Err(e) => {
-                tracing::warn!("knowledge service: embedding failed: {e}");
-                Ok(None)
-            }
-        }
     }
 }
 
@@ -111,9 +87,7 @@ where
         let id = (self.id_generator)();
         let mut entry = KnowledgeEntry::new(id, content, tags);
         entry.metadata = metadata;
-        let embedding = self.embed_chunks(&entry.content).await?;
-        let model = embedding.as_ref().and(self.embedding_model.clone());
-        self.store.write(entry, embedding, model).await
+        self.store.write(entry).await
     }
 
     async fn update_entry(
@@ -125,12 +99,12 @@ where
     ) -> Result<KnowledgeEntry, CoreError> {
         let mut entry = KnowledgeEntry::new(id, content, tags);
         entry.metadata = metadata;
-        let embedding = self.embed_chunks(&entry.content).await?;
-        let model = embedding.as_ref().and(self.embedding_model.clone());
         // The store's `write` upserts on id collision, which is exactly
         // the update semantics we want; created_at is preserved by the
-        // ON CONFLICT clause.
-        self.store.write(entry, embedding, model).await
+        // ON CONFLICT clause. The edited content's embedding is regenerated
+        // later by the background backfill task (the bumped `updated_at`
+        // marks the existing vector stale).
+        self.store.write(entry).await
     }
 
     async fn delete_entry(&self, id: String) -> Result<(), CoreError> {
@@ -280,23 +254,15 @@ mod tests {
 
     #[derive(Default)]
     struct InMemoryStore {
-        // Captures the exact arg tuple of `KnowledgeBaseStore::write` for test
-        // assertions; a type alias would just rename the method's own shape.
-        #[allow(clippy::type_complexity)]
-        entries: Mutex<Vec<(KnowledgeEntry, Option<Vec<Vec<f32>>>, Option<String>)>>,
+        entries: Mutex<Vec<KnowledgeEntry>>,
     }
 
     impl KnowledgeBaseStore for InMemoryStore {
-        async fn write(
-            &self,
-            entry: KnowledgeEntry,
-            embedding: Option<Vec<Vec<f32>>>,
-            embedding_model: Option<String>,
-        ) -> Result<KnowledgeEntry, CoreError> {
+        async fn write(&self, entry: KnowledgeEntry) -> Result<KnowledgeEntry, CoreError> {
             let mut guard = self.entries.lock().unwrap();
             // Upsert by id — drop any prior entry with the same id.
-            guard.retain(|(e, _, _)| e.id != entry.id);
-            guard.push((entry.clone(), embedding, embedding_model));
+            guard.retain(|e| e.id != entry.id);
+            guard.push(entry.clone());
             Ok(entry)
         }
 
@@ -320,8 +286,8 @@ mod tests {
             let guard = self.entries.lock().unwrap();
             let mut hits: Vec<KnowledgeEntry> = guard
                 .iter()
-                .filter(|(e, _, _)| e.content.contains(query))
-                .map(|(e, _, _)| e.clone())
+                .filter(|e| e.content.contains(query))
+                .cloned()
                 .collect();
             hits.truncate(limit);
             Ok(hits)
@@ -334,33 +300,25 @@ mod tests {
             _tag_filter: Option<Vec<String>>,
         ) -> Result<Vec<KnowledgeEntry>, CoreError> {
             let guard = self.entries.lock().unwrap();
-            Ok(guard
-                .iter()
-                .map(|(e, _, _)| e.clone())
-                .skip(offset)
-                .take(limit)
-                .collect())
+            Ok(guard.iter().cloned().skip(offset).take(limit).collect())
         }
 
         async fn delete(&self, id: &str) -> Result<(), CoreError> {
             let mut guard = self.entries.lock().unwrap();
-            guard.retain(|(e, _, _)| e.id != id);
+            guard.retain(|e| e.id != id);
             Ok(())
         }
 
         async fn get(&self, id: &str) -> Result<Option<KnowledgeEntry>, CoreError> {
             let guard = self.entries.lock().unwrap();
-            Ok(guard
-                .iter()
-                .find(|(e, _, _)| e.id == id)
-                .map(|(e, _, _)| e.clone()))
+            Ok(guard.iter().find(|e| e.id == id).cloned())
         }
     }
 
     #[tokio::test]
     async fn create_assigns_id_and_persists() {
         let store = Arc::new(InMemoryStore::default());
-        let service = DaemonKnowledgeService::new(Arc::clone(&store), None, None)
+        let service = DaemonKnowledgeService::new(Arc::clone(&store))
             .with_id_generator(|| "fixed-id".into());
 
         let entry = service
@@ -381,54 +339,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_embeds_when_embed_fn_configured() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_closure = Arc::clone(&calls);
-        let embed_fn: EmbedFn = Arc::new(move |chunks| {
-            calls_for_closure.fetch_add(1, Ordering::SeqCst);
-            let n = chunks.len();
-            Box::pin(async move { Ok(vec![vec![0.1, 0.2]; n]) })
-        });
-
+    async fn create_does_not_embed_inline() {
+        // Embedding is decoupled from the write path: the service holds no
+        // embedding closure and create must persist without one.
         let store = Arc::new(InMemoryStore::default());
-        let service = DaemonKnowledgeService::new(
-            Arc::clone(&store),
-            Some(embed_fn),
-            Some("test-model".into()),
-        );
+        let service = DaemonKnowledgeService::new(Arc::clone(&store))
+            .with_id_generator(|| "kb-c".into());
 
         service
             .create_entry("payload".into(), vec![], serde_json::json!({}))
             .await
             .unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "embed closure must be invoked exactly once"
-        );
 
         let stored = store.entries.lock().unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].2.as_deref(), Some("test-model"));
-        assert!(stored[0].1.is_some(), "embedding must be persisted");
+        assert_eq!(stored[0].content, "payload");
     }
 
     #[tokio::test]
-    async fn update_replaces_in_place_and_re_embeds() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_closure = Arc::clone(&calls);
-        let embed_fn: EmbedFn = Arc::new(move |chunks| {
-            calls_for_closure.fetch_add(1, Ordering::SeqCst);
-            let n = chunks.len();
-            Box::pin(async move { Ok(vec![vec![1.0]; n]) })
-        });
-
+    async fn update_replaces_in_place() {
         let store = Arc::new(InMemoryStore::default());
-        let service =
-            DaemonKnowledgeService::new(Arc::clone(&store), Some(embed_fn), Some("m".into()))
-                .with_id_generator(|| "kb-x".into());
+        let service = DaemonKnowledgeService::new(Arc::clone(&store))
+            .with_id_generator(|| "kb-x".into());
 
         service
             .create_entry("orig".into(), vec![], serde_json::json!({}))
@@ -444,15 +376,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "create + update each embed once"
-        );
         let stored = store.entries.lock().unwrap();
         assert_eq!(stored.len(), 1, "update must not create a duplicate");
-        assert_eq!(stored[0].0.content, "updated");
-        assert_eq!(stored[0].0.tags, vec!["t"]);
+        assert_eq!(stored[0].content, "updated");
+        assert_eq!(stored[0].tags, vec!["t"]);
     }
 
     #[tokio::test]

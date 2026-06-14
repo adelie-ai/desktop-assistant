@@ -590,23 +590,16 @@ impl BuiltinToolService {
             updated_at: String::new(),
         };
 
-        // Generate chunked embeddings for the content.
-        // If embedding fails, save the entry anyway with a NULL embedding so
-        // the background backfill/dreaming cycle re-embeds it later.
-        let embedding = self.embed_chunks(&content).await;
-        let embedded = embedding.is_some();
-        if self.embed_fn.is_some() && !embedded {
-            tracing::warn!(
-                "embedding failed for knowledge entry; saving without embedding (backfill will retry)"
-            );
-        }
-
-        let saved = write_fn(entry, embedding).await?;
+        // Embedding generation is decoupled from the write: the entry lands
+        // immediately (NULL embedding on create, stale embedding left in place
+        // on update) and the background embedding-backfill task generates the
+        // vector within its next pass. The row is keyword-searchable (FTS)
+        // right away; semantic recall follows shortly after.
+        let saved = write_fn(entry).await?;
 
         Ok(serde_json::json!({
             "ok": true,
             "id": saved.id,
-            "embedded": embedded,
             "created_at": saved.created_at,
             "updated_at": saved.updated_at,
         })
@@ -1105,29 +1098,6 @@ impl BuiltinToolService {
         }
     }
 
-    /// Chunk text and embed each chunk, returning None if embeddings are unavailable.
-    /// Used for KB writes where content may exceed the model's context window.
-    async fn embed_chunks(&self, text: &str) -> Option<Vec<Vec<f32>>> {
-        use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
-
-        let embed_fn = self.embed_fn.as_ref()?;
-        let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-        match tokio::time::timeout(EMBED_TIMEOUT, embed_fn(chunks)).await {
-            Ok(Ok(vecs)) if !vecs.is_empty() => Some(vecs),
-            Ok(Ok(_)) => None,
-            Ok(Err(e)) => {
-                tracing::warn!("failed to embed chunks: {e}");
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    timeout = ?EMBED_TIMEOUT,
-                    "embedding timed out; saving without embedding for backfill to retry"
-                );
-                None
-            }
-        }
-    }
 }
 
 fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreError> {
@@ -2120,16 +2090,15 @@ mod tests {
         let store: Arc<Mutex<Vec<KnowledgeEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
         let write_store = Arc::clone(&store);
-        let write_fn: KnowledgeWriteFn =
-            Arc::new(move |mut entry, _embedding: Option<Vec<Vec<f32>>>| {
-                let s = Arc::clone(&write_store);
-                Box::pin(async move {
-                    entry.created_at = "2024-01-01".to_string();
-                    entry.updated_at = "2024-01-01".to_string();
-                    s.lock().unwrap().push(entry.clone());
-                    Ok(entry)
-                })
-            });
+        let write_fn: KnowledgeWriteFn = Arc::new(move |mut entry| {
+            let s = Arc::clone(&write_store);
+            Box::pin(async move {
+                entry.created_at = "2024-01-01".to_string();
+                entry.updated_at = "2024-01-01".to_string();
+                s.lock().unwrap().push(entry.clone());
+                Ok(entry)
+            })
+        });
 
         let search_store = Arc::clone(&store);
         let search_fn: KnowledgeSearchFn = Arc::new(move |_query, _emb, _tags, limit| {

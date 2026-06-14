@@ -18,9 +18,7 @@
 use std::collections::BTreeSet;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
-use pgvector::Vector;
 use sqlx::PgPool;
 
 use super::common::{
@@ -322,32 +320,25 @@ async fn write_extracted_fact(
         ..Default::default()
     };
 
-    // Embed content for the row's `embedding` array.
-    let chunks = chunk_text(&proposal.content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
-    let embeddings = embed_fn(chunks).await.map_err(CoreError::Storage)?;
-    if embeddings.is_empty() {
-        return Err(CoreError::Storage(
-            "dreaming: embedding returned no vectors".to_string(),
-        ));
-    }
-    let embedding_vecs: Vec<Vector> = embeddings.into_iter().map(Vector::from).collect();
-
     let id = uuid::Uuid::now_v7().to_string();
     let tags_vec: Vec<String> = final_tags.into_iter().collect();
     let user_id = current_user_id();
 
+    // Insert with a NULL embedding: vector generation is decoupled from the
+    // write and owned by the background embedding-backfill task, which embeds
+    // rows where `embedding IS NULL`. This also means a wedged embedding
+    // backend can no longer fail extraction. (`embed_fn` above is still used
+    // for tag-registry similarity matching.)
     sqlx::query(
         "INSERT INTO knowledge_base \
-            (id, user_id, content, tags, metadata, embedding, embedding_model) \
-         VALUES ($1, $2, $3, $4, $5, $6::vector[], $7)",
+            (id, user_id, content, tags, metadata) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(&id)
     .bind(user_id.as_str())
     .bind(&proposal.content)
     .bind(&tags_vec)
     .bind(metadata.to_json())
-    .bind(&embedding_vecs)
-    .bind(embedding_model)
     .execute(pool)
     .await
     .map_err(|e| CoreError::Storage(format!("dreaming: insert fact failed: {e}")))?;

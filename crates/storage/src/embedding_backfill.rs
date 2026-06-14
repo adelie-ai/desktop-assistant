@@ -103,14 +103,24 @@ pub async fn backfill_knowledge_embeddings(
     let mut consecutive_failures = 0u32;
 
     loop {
-        // Select rows needing embedding.  Rows where embedding_model already
-        // matches the current model are either already done (embedding present)
-        // or failed individually on a prior iteration (embedding NULL, model
-        // stamped) — skip both to avoid an infinite retry loop.
+        // Select rows needing embedding:
+        //   * never embedded / embedded by a different model
+        //     (`embedding_model IS NULL OR != $1`), or
+        //   * content changed since the last embed attempt
+        //     (`embeddings_updated_at IS NULL OR < updated_at`) — writes bump
+        //     `updated_at` but never touch the embedding, so this is how a
+        //     decoupled edit gets its vector regenerated.
+        //
+        // Every processed row (success or failure below) gets both
+        // `embedding_model` and `embeddings_updated_at = NOW()` stamped, which
+        // makes all four clauses false on the next pass — so a persistently
+        // failing row is attempted once per content change, not in a tight loop.
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, content FROM knowledge_base
              WHERE embedding_model IS NULL
                 OR embedding_model != $1
+                OR embeddings_updated_at IS NULL
+                OR embeddings_updated_at < updated_at
              LIMIT $2",
         )
         .bind(current_model)
@@ -144,7 +154,8 @@ pub async fn backfill_knowledge_embeddings(
                 for ((id, _), vecs) in rows.iter().zip(row_embeddings) {
                     sqlx::query(
                         "UPDATE knowledge_base
-                         SET embedding = $1::vector[], embedding_model = $2
+                         SET embedding = $1::vector[], embedding_model = $2,
+                             embeddings_updated_at = NOW()
                          WHERE id = $3",
                     )
                     .bind(&vecs)
@@ -168,7 +179,8 @@ pub async fn backfill_knowledge_embeddings(
                                 embeddings.into_iter().map(Vector::from).collect();
                             sqlx::query(
                                 "UPDATE knowledge_base
-                                 SET embedding = $1::vector[], embedding_model = $2
+                                 SET embedding = $1::vector[], embedding_model = $2,
+                                     embeddings_updated_at = NOW()
                                  WHERE id = $3",
                             )
                             .bind(&vecs)
@@ -182,10 +194,11 @@ pub async fn backfill_knowledge_embeddings(
                         }
                         Err(e2) => {
                             tracing::warn!("skipping knowledge entry {id}: {e2}");
-                            // Mark it so we don't retry it every startup.
+                            // Stamp both markers so a persistently failing row is
+                            // not retried until its content changes again.
                             sqlx::query(
                                 "UPDATE knowledge_base
-                                 SET embedding_model = $1
+                                 SET embedding_model = $1, embeddings_updated_at = NOW()
                                  WHERE id = $2",
                             )
                             .bind(current_model)

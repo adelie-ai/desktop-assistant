@@ -16,16 +16,16 @@ impl PgKnowledgeBaseStore {
 }
 
 impl KnowledgeBaseStore for PgKnowledgeBaseStore {
-    async fn write(
-        &self,
-        entry: KnowledgeEntry,
-        embedding: Option<Vec<Vec<f32>>>,
-        embedding_model: Option<String>,
-    ) -> Result<KnowledgeEntry, CoreError> {
+    async fn write(&self, entry: KnowledgeEntry) -> Result<KnowledgeEntry, CoreError> {
         let user_id = current_user_id();
-        let embedding_vecs: Option<Vec<Vector>> =
-            embedding.map(|chunks| chunks.into_iter().map(Vector::from).collect());
 
+        // Embedding generation is decoupled from content writes: this query
+        // never touches the `embedding`/`embedding_model`/`embeddings_updated_at`
+        // columns. New rows insert with a NULL embedding; on update the existing
+        // embedding is left in place (now stale relative to the bumped
+        // `updated_at`). The background backfill task regenerates vectors for
+        // rows where `embedding IS NULL` or `embeddings_updated_at < updated_at`.
+        //
         // ON CONFLICT (id) inherently respects the schema's unique
         // constraint on `id`; since the KB id is a UUID we don't expect
         // collisions across users in practice. The upsert path still
@@ -35,14 +35,12 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         // from the current request.
         let row: KbRow = sqlx::query_as(
             "INSERT INTO knowledge_base \
-                (id, user_id, content, tags, metadata, embedding, embedding_model) \
-             VALUES ($1, $2, $3, $4, $5, $6::vector[], $7) \
+                (id, user_id, content, tags, metadata) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (id) DO UPDATE \
                 SET content = EXCLUDED.content, \
                     tags = EXCLUDED.tags, \
                     metadata = EXCLUDED.metadata, \
-                    embedding = EXCLUDED.embedding, \
-                    embedding_model = EXCLUDED.embedding_model, \
                     updated_at = NOW() \
                 WHERE knowledge_base.user_id = $2 \
              RETURNING id, content, tags, metadata, created_at, updated_at",
@@ -52,8 +50,6 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(&entry.content)
         .bind(&entry.tags)
         .bind(&entry.metadata)
-        .bind(&embedding_vecs)
-        .bind(&embedding_model)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
