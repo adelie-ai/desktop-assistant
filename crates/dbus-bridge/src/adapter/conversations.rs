@@ -594,6 +594,64 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         tool_name: &str,
         arguments_json: &str,
     ) -> zbus::Result<()>;
+
+    /// Signal emitted for the assistant's transient "thinking…" status during a
+    /// turn (#401), unicast on the caller's per-conversation fan-out. Forwarded
+    /// from `Event::AssistantStatus`; carries no persistent state.
+    #[zbus(signal)]
+    async fn status(
+        emitter: &SignalEmitter<'_>,
+        conversation_id: &str,
+        request_id: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
+
+    /// Signal emitted with the per-turn context-window fill report (#341):
+    /// `used_tokens` of `budget_tokens` consumed, plus whether proactive
+    /// compaction ran (#401). Unicast on the per-conversation fan-out. Forwarded
+    /// from `Event::ContextUsage`.
+    #[zbus(signal)]
+    async fn context_usage(
+        emitter: &SignalEmitter<'_>,
+        conversation_id: &str,
+        request_id: &str,
+        used_tokens: u64,
+        budget_tokens: u64,
+        compaction_active: bool,
+    ) -> zbus::Result<()>;
+
+    /// Signal emitted when a conversation's title changed (#401). Broadcast to
+    /// every D-Bus client (a per-user list-shape change, like
+    /// `conversation_list_changed`) so sidebars refresh the label. Forwarded from
+    /// `Event::ConversationTitleChanged`.
+    #[zbus(signal)]
+    async fn title_changed(
+        emitter: &SignalEmitter<'_>,
+        conversation_id: &str,
+        title: &str,
+    ) -> zbus::Result<()>;
+
+    /// Signal emitted for a one-time conversation advisory (#401, e.g. a dangling
+    /// model selection was cleared). The structured `api::ConversationWarning`
+    /// rides as a JSON string (`warning_json`) — the client parses it back.
+    /// Unicast on the per-conversation fan-out. Forwarded from
+    /// `Event::ConversationWarningEmitted`.
+    #[zbus(signal)]
+    async fn conversation_warning(
+        emitter: &SignalEmitter<'_>,
+        conversation_id: &str,
+        warning_json: &str,
+    ) -> zbus::Result<()>;
+
+    /// Signal emitted when a conversation's scratchpad changed (#190/#401), by
+    /// the LLM's tools or a client command. Unicast on the per-conversation
+    /// fan-out; carries only the `conversation_id` (clients re-read the
+    /// scratchpad). Forwarded from `Event::ScratchpadChanged`.
+    #[zbus(signal)]
+    async fn scratchpad_changed(
+        emitter: &SignalEmitter<'_>,
+        conversation_id: &str,
+    ) -> zbus::Result<()>;
 }
 
 #[cfg(test)]

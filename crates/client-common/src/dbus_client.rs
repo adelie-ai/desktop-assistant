@@ -114,6 +114,41 @@ trait Conversations {
         request_id: &str,
         error: &str,
     ) -> zbus::fdo::Result<()>;
+
+    // --- #401: full UDS/WS signal parity for the shared reducer ---------------
+
+    #[zbus(signal)]
+    fn status(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        message: &str,
+    ) -> zbus::fdo::Result<()>;
+
+    #[zbus(signal)]
+    fn context_usage(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        used_tokens: u64,
+        budget_tokens: u64,
+        compaction_active: bool,
+    ) -> zbus::fdo::Result<()>;
+
+    #[zbus(signal)]
+    fn title_changed(&self, conversation_id: &str, title: &str) -> zbus::fdo::Result<()>;
+
+    /// The structured `api::ConversationWarning` rides as a JSON string; the
+    /// handler parses it back (mirrors how the bridge serializes it out).
+    #[zbus(signal)]
+    fn conversation_warning(
+        &self,
+        conversation_id: &str,
+        warning_json: &str,
+    ) -> zbus::fdo::Result<()>;
+
+    #[zbus(signal)]
+    fn scratchpad_changed(&self, conversation_id: &str) -> zbus::fdo::Result<()>;
 }
 
 #[zbus::proxy(interface = "org.desktopAssistant.Settings")]
@@ -440,13 +475,96 @@ impl DbusClient {
         });
 
         let mut error_stream = self.proxy.receive_response_error().await?;
+        let tx_error = tx.clone();
         tokio::spawn(async move {
             while let Some(signal) = error_stream.next().await {
                 if let Ok(args) = signal.args() {
-                    let _ = tx.send(SignalEvent::Error {
+                    let _ = tx_error.send(SignalEvent::Error {
                         conversation_id: args.conversation_id.to_string(),
                         request_id: args.request_id.to_string(),
                         error: args.error.to_string(),
+                    });
+                }
+            }
+        });
+
+        // --- #401: the five events the bridge previously dropped. Each is mapped
+        // back to its `SignalEvent` so a `Connector` in `TransportMode::Dbus`
+        // reaches full UDS/WS parity (a new KDE client consumes the shared
+        // reducer over this transport). ---
+
+        let mut status_stream = self.proxy.receive_status().await?;
+        let tx_status = tx.clone();
+        tokio::spawn(async move {
+            while let Some(signal) = status_stream.next().await {
+                if let Ok(args) = signal.args() {
+                    let _ = tx_status.send(SignalEvent::Status {
+                        conversation_id: args.conversation_id.to_string(),
+                        request_id: args.request_id.to_string(),
+                        message: args.message.to_string(),
+                    });
+                }
+            }
+        });
+
+        let mut usage_stream = self.proxy.receive_context_usage().await?;
+        let tx_usage = tx.clone();
+        tokio::spawn(async move {
+            while let Some(signal) = usage_stream.next().await {
+                if let Ok(args) = signal.args() {
+                    let _ = tx_usage.send(SignalEvent::ContextUsage {
+                        conversation_id: args.conversation_id.to_string(),
+                        request_id: args.request_id.to_string(),
+                        used_tokens: args.used_tokens,
+                        budget_tokens: args.budget_tokens,
+                        compaction_active: args.compaction_active,
+                    });
+                }
+            }
+        });
+
+        let mut title_stream = self.proxy.receive_title_changed().await?;
+        let tx_title = tx.clone();
+        tokio::spawn(async move {
+            while let Some(signal) = title_stream.next().await {
+                if let Ok(args) = signal.args() {
+                    let _ = tx_title.send(SignalEvent::TitleChanged {
+                        conversation_id: args.conversation_id.to_string(),
+                        title: args.title.to_string(),
+                    });
+                }
+            }
+        });
+
+        let mut warning_stream = self.proxy.receive_conversation_warning().await?;
+        let tx_warning = tx.clone();
+        tokio::spawn(async move {
+            while let Some(signal) = warning_stream.next().await {
+                if let Ok(args) = signal.args() {
+                    // The warning crossed D-Bus as a JSON string; parse it back to
+                    // the structured enum. Drop the event if it doesn't parse
+                    // rather than fabricate a warning.
+                    match serde_json::from_str(args.warning_json) {
+                        Ok(warning) => {
+                            let _ = tx_warning.send(SignalEvent::ConversationWarning {
+                                conversation_id: args.conversation_id.to_string(),
+                                warning,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!("dropping conversation warning: bad JSON ({e})");
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut scratchpad_stream = self.proxy.receive_scratchpad_changed().await?;
+        tokio::spawn(async move {
+            while let Some(signal) = scratchpad_stream.next().await {
+                if let Ok(args) = signal.args() {
+                    let _ = tx.send(SignalEvent::ScratchpadChanged {
+                        conversation_id: args.conversation_id.to_string(),
                     });
                 }
             }
@@ -481,5 +599,45 @@ impl AssistantCommands for DbusClient {
         let raw = self.commands.send_command(&command_json).await?;
         serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("decoding D-Bus command result: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #401: `ConversationWarning` is the one non-trivial transform on the
+    /// consume side — the structured enum crosses D-Bus as a JSON string and the
+    /// `conversation_warning` handler parses it back. The bridge serializes it
+    /// with the same `serde_json::to_string`, so this asserts the wire contract
+    /// the two sides share: a warning round-trips through its JSON string to the
+    /// identical value the reducer will receive.
+    #[test]
+    fn conversation_warning_round_trips_through_its_dbus_json_string() {
+        let warning = api::ConversationWarning::DanglingModelSelection {
+            previous_selection: api::ConversationModelSelectionView {
+                connection_id: "old".into(),
+                model_id: "m1".into(),
+                effort: None,
+            },
+            fallback_to: api::ConversationModelSelectionView {
+                connection_id: "new".into(),
+                model_id: "m2".into(),
+                effort: None,
+            },
+        };
+        // What the bridge puts on the wire (warning_json).
+        let on_wire = serde_json::to_string(&warning).expect("serialize");
+        // What the consume side does with the signal's `warning_json` arg.
+        let parsed: api::ConversationWarning = serde_json::from_str(&on_wire).expect("parse back");
+        assert_eq!(parsed, warning);
+    }
+
+    /// A malformed `warning_json` must be dropped, never panic the signal pump:
+    /// the handler's parse path returns `Err` and skips the event.
+    #[test]
+    fn malformed_conversation_warning_json_is_an_error_not_a_panic() {
+        let parsed: Result<api::ConversationWarning, _> = serde_json::from_str("not json");
+        assert!(parsed.is_err());
     }
 }

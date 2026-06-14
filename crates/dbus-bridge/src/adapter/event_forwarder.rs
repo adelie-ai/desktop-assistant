@@ -13,11 +13,16 @@
 //! | `UserMessageAdded`      | `Conversations.UserMessageAdded` (#367)        |
 //! | `ConversationListChanged`| `Conversations.ConversationListChanged` (#367)|
 //! | `ClientToolCall`        | `Conversations.ClientToolCall` (#320)          |
+//! | `Status`                | `Conversations.Status` (#401)                  |
+//! | `ContextUsage`          | `Conversations.ContextUsage` (#341/#401)       |
+//! | `TitleChanged`          | `Conversations.TitleChanged` (#401)            |
+//! | `ConversationWarning`   | `Conversations.ConversationWarning` (#401)     |
+//! | `ScratchpadChanged`     | `Conversations.ScratchpadChanged` (#401)       |
 //! | `TaskStarted`           | `BackgroundTasks.TaskStarted` (#116)           |
 //! | `TaskProgress`          | `BackgroundTasks.TaskProgress` (#116)          |
 //! | `TaskLogAppended`       | `BackgroundTasks.TaskLogAppended` (#116)       |
 //! | `TaskCompleted`         | `BackgroundTasks.TaskCompleted` (#116)         |
-//! | other                   | dropped (Status/ContextUsage/Title/Warning/Scratch)|
+//! | `Disconnected`          | dropped (control signal, handled by `run`)     |
 //!
 //! `Settings.ConfigChanged` is **not** forwarded here: the decoded
 //! [`SignalEvent`] stream carries no config event, and the bridge's
@@ -102,6 +107,43 @@ pub enum ForwardAction {
         tool_name: String,
         arguments_json: String,
     },
+    /// The assistant's transient "thinking…" status for a turn (#401). Unicast
+    /// (same class as the response stream): it rides a session's
+    /// `SubscribeConversations` fan-out, scoped to one conversation/turn.
+    Status {
+        conversation_id: String,
+        request_id: String,
+        message: String,
+    },
+    /// Per-turn context-window fill report (#341): `used`/`budget` token counts
+    /// plus whether proactive compaction ran (#401). Unicast — delivered on the
+    /// same per-conversation stream as `Status`.
+    ContextUsage {
+        conversation_id: String,
+        request_id: String,
+        used_tokens: u64,
+        budget_tokens: u64,
+        compaction_active: bool,
+    },
+    /// A conversation's title changed (#401). Classified like
+    /// `ConversationListChanged` — a per-user list-shape change — so it rides the
+    /// shared broadcast stream and every D-Bus client can refresh its sidebar
+    /// label.
+    TitleChanged {
+        conversation_id: String,
+        title: String,
+    },
+    /// A one-time advisory for a conversation (#401, e.g. a dangling model
+    /// selection was cleared). The structured `api::ConversationWarning` rides as
+    /// a JSON string (mirroring `ClientToolCall`'s `arguments_json`). Unicast —
+    /// scoped to the conversation, on the per-conversation fan-out.
+    ConversationWarning {
+        conversation_id: String,
+        warning_json: String,
+    },
+    /// A conversation's scratchpad changed (#190/#401). Unicast — scoped to the
+    /// conversation; carries only the id (clients re-read the scratchpad).
+    ScratchpadChanged { conversation_id: String },
     /// Task is now `Pending`/`Running`. `task` is the JSON-keyed `TaskView`
     /// encoded as `a{sv}`.
     TaskStarted {
@@ -150,6 +192,11 @@ impl ForwardAction {
                 | ForwardAction::TaskLogAppended { .. }
                 | ForwardAction::TaskCompleted { .. }
                 | ForwardAction::ConversationListChanged { .. }
+                // #401: a title change is a per-user list-shape change, classed
+                // with `ConversationListChanged` (shared broadcast); the other
+                // four #401 events (Status/ContextUsage/Warning/Scratchpad) are
+                // per-conversation/turn and stay unicast like the response stream.
+                | ForwardAction::TitleChanged { .. }
         )
     }
 }
@@ -239,24 +286,54 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
             status: task_status_str(status).to_string(),
             last_error: last_error.unwrap_or_default(),
         },
-        // --- not (yet) forwarded: no D-Bus signal for these. Status/ContextUsage/
-        // TitleChanged are richer-parity follow-ups; ClientToolCall is #320;
-        // recorded as a deliberate ignore rather than a missed translation. ---
-        SignalEvent::Status { .. } => ForwardAction::Ignored {
-            kind: "assistant_status",
+        // #401: forwarded for full UDS/WS parity (a new KDE client consumes the
+        // shared reducer over this transport). Status/ContextUsage/Warning/
+        // Scratchpad are per-conversation (unicast, like the response stream);
+        // TitleChanged rides the shared broadcast (a list-shape change).
+        SignalEvent::Status {
+            conversation_id,
+            request_id,
+            message,
+        } => ForwardAction::Status {
+            conversation_id,
+            request_id,
+            message,
         },
-        SignalEvent::ContextUsage { .. } => ForwardAction::Ignored {
-            kind: "context_usage",
+        SignalEvent::ContextUsage {
+            conversation_id,
+            request_id,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
+        } => ForwardAction::ContextUsage {
+            conversation_id,
+            request_id,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
         },
-        SignalEvent::TitleChanged { .. } => ForwardAction::Ignored {
-            kind: "conversation_title_changed",
+        SignalEvent::TitleChanged {
+            conversation_id,
+            title,
+        } => ForwardAction::TitleChanged {
+            conversation_id,
+            title,
         },
-        SignalEvent::ConversationWarning { .. } => ForwardAction::Ignored {
-            kind: "conversation_warning",
+        // The structured warning rides as a JSON string (mirrors `ClientToolCall`
+        // serializing its args Value); the client parses it back.
+        SignalEvent::ConversationWarning {
+            conversation_id,
+            warning,
+        } => ForwardAction::ConversationWarning {
+            conversation_id,
+            warning_json: serde_json::to_string(&warning).unwrap_or_else(|e| {
+                warn!("serializing conversation warning failed: {e}");
+                String::new()
+            }),
         },
-        SignalEvent::ScratchpadChanged { .. } => ForwardAction::Ignored {
-            kind: "scratchpad_changed",
-        },
+        SignalEvent::ScratchpadChanged { conversation_id } => {
+            ForwardAction::ScratchpadChanged { conversation_id }
+        }
         // Control signal handled by `run` before it reaches `translate`; mapped
         // here only for match exhaustiveness.
         SignalEvent::Disconnected { .. } => ForwardAction::Ignored {
@@ -515,6 +592,103 @@ async fn emit(connection: &Connection, destination: Option<&str>, action: Forwar
                 warn!("client_tool_call emit failed: {e}");
             }
         }
+        ForwardAction::Status {
+            conversation_id,
+            request_id,
+            message,
+        } => {
+            let body = (conversation_id, request_id, message);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "Status",
+                    &body,
+                )
+                .await
+            {
+                warn!("status emit failed: {e}");
+            }
+        }
+        ForwardAction::ContextUsage {
+            conversation_id,
+            request_id,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
+        } => {
+            let body = (
+                conversation_id,
+                request_id,
+                used_tokens,
+                budget_tokens,
+                compaction_active,
+            );
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "ContextUsage",
+                    &body,
+                )
+                .await
+            {
+                warn!("context_usage emit failed: {e}");
+            }
+        }
+        ForwardAction::TitleChanged {
+            conversation_id,
+            title,
+        } => {
+            let body = (conversation_id, title);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "TitleChanged",
+                    &body,
+                )
+                .await
+            {
+                warn!("title_changed emit failed: {e}");
+            }
+        }
+        ForwardAction::ConversationWarning {
+            conversation_id,
+            warning_json,
+        } => {
+            let body = (conversation_id, warning_json);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "ConversationWarning",
+                    &body,
+                )
+                .await
+            {
+                warn!("conversation_warning emit failed: {e}");
+            }
+        }
+        ForwardAction::ScratchpadChanged { conversation_id } => {
+            let body = (conversation_id,);
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::CONVERSATIONS,
+                    CONV_INTERFACE,
+                    "ScratchpadChanged",
+                    &body,
+                )
+                .await
+            {
+                warn!("scratchpad_changed emit failed: {e}");
+            }
+        }
         ForwardAction::TaskStarted { id, task } => {
             let body = (id, task);
             if let Err(e) = connection
@@ -675,5 +849,138 @@ mod tests {
             }
             .is_broadcast()
         );
+    }
+
+    /// #401: classification for the five newly-forwarded events. `TitleChanged`
+    /// is a per-user list-shape change (broadcast, like `ConversationListChanged`);
+    /// the other four are per-conversation/turn and must stay unicast (like the
+    /// response stream) or `run_unicast` would drop them.
+    #[test]
+    fn is_broadcast_classifies_the_401_parity_events() {
+        // Broadcast: title rides the shared per-user stream.
+        assert!(
+            ForwardAction::TitleChanged {
+                conversation_id: "c".into(),
+                title: "New".into(),
+            }
+            .is_broadcast()
+        );
+        // Unicast (NOT broadcast): per-conversation/turn events.
+        assert!(
+            !ForwardAction::Status {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                message: "thinking".into(),
+            }
+            .is_broadcast()
+        );
+        assert!(
+            !ForwardAction::ContextUsage {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                used_tokens: 1,
+                budget_tokens: 2,
+                compaction_active: false,
+            }
+            .is_broadcast()
+        );
+        assert!(
+            !ForwardAction::ConversationWarning {
+                conversation_id: "c".into(),
+                warning_json: "{}".into(),
+            }
+            .is_broadcast()
+        );
+        assert!(
+            !ForwardAction::ScratchpadChanged {
+                conversation_id: "c".into(),
+            }
+            .is_broadcast()
+        );
+    }
+
+    /// #401: each of the five events `translate`s to its matching action,
+    /// carrying every field through (so the bridge no longer drops them as
+    /// `Ignored`). `ConversationWarning` serializes its structured payload to the
+    /// JSON string the client parses back.
+    #[test]
+    fn translate_maps_the_401_parity_events() {
+        assert_eq!(
+            translate(SignalEvent::Status {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                message: "thinking".into(),
+            }),
+            ForwardAction::Status {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                message: "thinking".into(),
+            }
+        );
+        assert_eq!(
+            translate(SignalEvent::ContextUsage {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                used_tokens: 100,
+                budget_tokens: 8192,
+                compaction_active: true,
+            }),
+            ForwardAction::ContextUsage {
+                conversation_id: "c".into(),
+                request_id: "r".into(),
+                used_tokens: 100,
+                budget_tokens: 8192,
+                compaction_active: true,
+            }
+        );
+        assert_eq!(
+            translate(SignalEvent::TitleChanged {
+                conversation_id: "c".into(),
+                title: "Renamed".into(),
+            }),
+            ForwardAction::TitleChanged {
+                conversation_id: "c".into(),
+                title: "Renamed".into(),
+            }
+        );
+        assert_eq!(
+            translate(SignalEvent::ScratchpadChanged {
+                conversation_id: "c".into(),
+            }),
+            ForwardAction::ScratchpadChanged {
+                conversation_id: "c".into(),
+            }
+        );
+
+        // The structured warning crosses D-Bus as a JSON string; assert it
+        // round-trips back to the same `api::ConversationWarning`.
+        let warning = api::ConversationWarning::DanglingModelSelection {
+            previous_selection: api::ConversationModelSelectionView {
+                connection_id: "old".into(),
+                model_id: "m1".into(),
+                effort: None,
+            },
+            fallback_to: api::ConversationModelSelectionView {
+                connection_id: "new".into(),
+                model_id: "m2".into(),
+                effort: None,
+            },
+        };
+        let action = translate(SignalEvent::ConversationWarning {
+            conversation_id: "c".into(),
+            warning: warning.clone(),
+        });
+        match action {
+            ForwardAction::ConversationWarning {
+                conversation_id,
+                warning_json,
+            } => {
+                assert_eq!(conversation_id, "c");
+                let parsed: api::ConversationWarning =
+                    serde_json::from_str(&warning_json).expect("warning JSON round-trips");
+                assert_eq!(parsed, warning);
+            }
+            other => panic!("expected ConversationWarning, got {other:?}"),
+        }
     }
 }

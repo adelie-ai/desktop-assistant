@@ -106,6 +106,28 @@ const ADDITIONS: &[(&str, &str)] = &[
         "org.desktopAssistant.Conversations",
         "signal ClientToolCall(:s:task_id, :s:conversation_id, :s:tool_call_id, :s:tool_name, :s:arguments_json)",
     ),
+    // #401 — full UDS/WS signal parity for the shared reducer (new KDE client):
+    // the five events the bridge previously dropped.
+    (
+        "org.desktopAssistant.Conversations",
+        "signal Status(:s:conversation_id, :s:request_id, :s:message)",
+    ),
+    (
+        "org.desktopAssistant.Conversations",
+        "signal ContextUsage(:s:conversation_id, :s:request_id, :t:used_tokens, :t:budget_tokens, :b:compaction_active)",
+    ),
+    (
+        "org.desktopAssistant.Conversations",
+        "signal TitleChanged(:s:conversation_id, :s:title)",
+    ),
+    (
+        "org.desktopAssistant.Conversations",
+        "signal ConversationWarning(:s:conversation_id, :s:warning_json)",
+    ),
+    (
+        "org.desktopAssistant.Conversations",
+        "signal ScratchpadChanged(:s:conversation_id)",
+    ),
 ];
 
 // --- fake transport ---------------------------------------------------------
