@@ -137,36 +137,29 @@ impl<T: BridgeTransport + 'static> DbusCommandsAdapter<T> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use tokio::sync::broadcast;
 
     /// Records every command it sees and replies with a canned result (or a
-    /// daemon error). `subscribe_events` is unused by this adapter but required
-    /// by the trait, so it returns a live-but-idle receiver.
+    /// daemon error).
     struct FakeTransport {
         seen: Mutex<Vec<api::Command>>,
         reply: api::CommandResult,
         fail_with: Option<String>,
-        events_tx: broadcast::Sender<api::Event>,
     }
 
     impl FakeTransport {
         fn replying(reply: api::CommandResult) -> Arc<Self> {
-            let (events_tx, _rx) = broadcast::channel(4);
             Arc::new(Self {
                 seen: Mutex::new(Vec::new()),
                 reply,
                 fail_with: None,
-                events_tx,
             })
         }
 
         fn failing(message: &str) -> Arc<Self> {
-            let (events_tx, _rx) = broadcast::channel(4);
             Arc::new(Self {
                 seen: Mutex::new(Vec::new()),
                 reply: api::CommandResult::Ack,
                 fail_with: Some(message.to_string()),
-                events_tx,
             })
         }
 
@@ -195,10 +188,6 @@ mod tests {
                 Some(msg) => Err(BridgeTransportError::Daemon(msg.clone())),
                 None => Ok(self.reply.clone()),
             }
-        }
-
-        fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
-            self.events_tx.subscribe()
         }
     }
 

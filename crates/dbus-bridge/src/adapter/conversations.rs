@@ -483,7 +483,6 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
 mod tests {
     use super::*;
     use tokio::sync::Mutex;
-    use tokio::sync::broadcast;
 
     /// Recording [`BridgeTransport`] that captures every dispatched
     /// command so a test can assert the exact `api::Command` the adapter
@@ -512,14 +511,6 @@ mod tests {
                 request_id: "req-1".to_string(),
                 task_id: "task-1".to_string(),
             })
-        }
-
-        fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
-            let (tx, rx) = broadcast::channel(1);
-            // Keep the sender alive for the lifetime of the receiver so
-            // it isn't immediately closed; tests here don't emit events.
-            std::mem::forget(tx);
-            rx
         }
     }
 
@@ -624,12 +615,6 @@ mod tests {
         ) -> Result<api::CommandResult, BridgeTransportError> {
             self.commands.lock().await.push(command);
             Ok(self.result.clone())
-        }
-
-        fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
-            let (tx, rx) = broadcast::channel(1);
-            std::mem::forget(tx);
-            rx
         }
     }
 

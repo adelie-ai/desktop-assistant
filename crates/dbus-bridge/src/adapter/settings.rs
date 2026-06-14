@@ -721,22 +721,18 @@ mod tests {
     use super::*;
     use crate::transport::BridgeTransport;
     use std::sync::Mutex;
-    use tokio::sync::broadcast;
 
     /// Records each dispatched command and replies with a canned result.
     struct FakeTransport {
         seen: Mutex<Vec<api::Command>>,
         reply: api::CommandResult,
-        events_tx: broadcast::Sender<api::Event>,
     }
 
     impl FakeTransport {
         fn replying(reply: api::CommandResult) -> Arc<Self> {
-            let (events_tx, _rx) = broadcast::channel(1);
             Arc::new(Self {
                 seen: Mutex::new(Vec::new()),
                 reply,
-                events_tx,
             })
         }
 
@@ -758,10 +754,6 @@ mod tests {
         ) -> Result<api::CommandResult, BridgeTransportError> {
             self.seen.lock().unwrap().push(command);
             Ok(self.reply.clone())
-        }
-
-        fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
-            self.events_tx.subscribe()
         }
     }
 

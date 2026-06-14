@@ -1,52 +1,60 @@
-//! Pump `WsFrame::Event`s from the transport into D-Bus signals.
+//! Pump the daemon's signal stream into D-Bus signals.
 //!
-//! Subscribes to [`BridgeTransport::subscribe_events`] and dispatches
-//! each event to the matching object path on a [`zbus::Connection`].
-//! Translation mirrors the in-process daemon's signal vocabulary
-//! one-for-one:
+//! Subscribes to the client-common [`Connector`]'s [`SignalEvent`] stream (#316,
+//! the same stream every UDS/WS client consumes) and dispatches each event to
+//! the matching object path on a [`zbus::Connection`]. Translation mirrors the
+//! in-process daemon's signal vocabulary one-for-one:
 //!
-//! | Wire event              | D-Bus signal                                  |
-//! | ----------------------- | --------------------------------------------- |
-//! | `AssistantDelta`        | `Conversations.ResponseChunk`                 |
-//! | `AssistantCompleted`    | `Conversations.ResponseComplete`              |
-//! | `AssistantError`        | `Conversations.ResponseError`                 |
-//! | `ConfigChanged`         | `Settings.ConfigChanged`                      |
-//! | `TaskStarted`           | `BackgroundTasks.TaskStarted` (#116)          |
-//! | `TaskProgress`          | `BackgroundTasks.TaskProgress` (#116)         |
-//! | `TaskLogAppended`       | `BackgroundTasks.TaskLogAppended` (#116)      |
-//! | `TaskCompleted`         | `BackgroundTasks.TaskCompleted` (#116)        |
-//! | other (`AssistantStatus`, ...) | dropped                                |
+//! | Signal event       | D-Bus signal                              |
+//! | ------------------ | ----------------------------------------- |
+//! | `Chunk`            | `Conversations.ResponseChunk`             |
+//! | `Complete`         | `Conversations.ResponseComplete`          |
+//! | `Error`            | `Conversations.ResponseError`             |
+//! | `TaskStarted`      | `BackgroundTasks.TaskStarted` (#116)      |
+//! | `TaskProgress`     | `BackgroundTasks.TaskProgress` (#116)     |
+//! | `TaskLogAppended`  | `BackgroundTasks.TaskLogAppended` (#116)  |
+//! | `TaskCompleted`    | `BackgroundTasks.TaskCompleted` (#116)    |
+//! | other              | dropped (see #367 for the parity follow-up)|
 //!
-//! Returned future runs until the inbound channel closes or
-//! `shutdown` resolves.
+//! `Settings.ConfigChanged` is **not** forwarded here: the decoded
+//! [`SignalEvent`] stream carries no config event, and the bridge's
+//! `Settings.set_config` adapter already emits `ConfigChanged` directly after a
+//! successful write — so there is no regression (the in-process surface only
+//! ever delivered a config change to the connection that made it, which over the
+//! bridge is the bridge's own `set_config`).
 //!
-//! Signals are emitted via `zbus::Connection::emit_signal` rather than
-//! the auto-generated signal helpers on the adapter types — those
-//! helpers are made private by the `#[interface]` macro, and the
-//! forwarder needs to emit from a context that doesn't own a typed
-//! `&Adapter` reference. Using `emit_signal` directly also keeps the
-//! cross-module surface narrow.
-
-use desktop_assistant_api_model as api;
-use tokio::sync::broadcast;
-use tracing::{debug, warn};
-use zbus::Connection;
+//! ## Reconnect (#316)
+//!
+//! On a daemon restart the Connector drops the underlying socket, delivers a
+//! terminal [`SignalEvent::Disconnected`] to this subscriber (closing it), and
+//! reconnects in the background. This loop re-`subscribe()`s for a fresh stream
+//! and re-issues `SubscribeBackgroundTasks` (the Connector replays only
+//! client-tool registrations, not this subscription), so `Task*` signals resume
+//! once the daemon is back. The conversation response signals resume on their
+//! own — they ride whatever turn a D-Bus client drives next.
+//!
+//! Signals are emitted via `zbus::Connection::emit_signal` rather than the
+//! adapter types' generated helpers (made private by `#[interface]`); the
+//! forwarder emits from a context that doesn't own a typed adapter reference.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
+use desktop_assistant_api_model as api;
+use desktop_assistant_client_common::{Connector, SignalEvent};
+use tracing::{debug, warn};
+use zbus::Connection;
 use zbus::zvariant::OwnedValue;
 
 use super::background_tasks::{log_entry_to_dict, task_view_to_dict};
 use super::paths;
-use super::settings::{ConfigData, config_data_from_event};
 
 const CONV_INTERFACE: &str = "org.desktopAssistant.Conversations";
-const SETTINGS_INTERFACE: &str = "org.desktopAssistant.Settings";
 const BG_INTERFACE: &str = "org.desktopAssistant.BackgroundTasks";
 
-/// Map a single wire event onto its D-Bus signal. Public so tests can
-/// drive it without a live zbus connection — the `ForwardAction` enum
-/// is the testable surface; `run` is the wiring loop.
+/// The result of translating one [`SignalEvent`] — the testable surface; `run`
+/// is the wiring loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ForwardAction {
     ResponseChunk {
@@ -64,47 +72,38 @@ pub enum ForwardAction {
         request_id: String,
         error: String,
     },
-    ConfigChanged {
-        config: ConfigData,
-    },
-    /// Task is now `Pending`/`Running`. `task` is the JSON-keyed
-    /// `TaskView` encoded as `a{sv}`.
+    /// Task is now `Pending`/`Running`. `task` is the JSON-keyed `TaskView`
+    /// encoded as `a{sv}`.
     TaskStarted {
         id: String,
         task: HashMap<String, OwnedValue>,
     },
-    /// Lightweight progress hint between log entries. `hint` is `""`
-    /// when the wire event carried `None`.
-    TaskProgress {
-        id: String,
-        hint: String,
-    },
-    /// A new log entry was appended to the task's bounded buffer.
-    /// `entry` is the JSON-keyed `TaskLogEntry` encoded as `a{sv}`.
+    /// Lightweight progress hint. `hint` is `""` when the event carried `None`.
+    TaskProgress { id: String, hint: String },
+    /// A new log entry, encoded as `a{sv}`.
     TaskLogAppended {
         id: String,
         entry: HashMap<String, OwnedValue>,
     },
-    /// Terminal event: `status` is the snake_case `TaskStatus`;
-    /// `last_error` is `""` when none.
+    /// Terminal: `status` is the snake_case `TaskStatus`; `last_error` is `""`
+    /// when none.
     TaskCompleted {
         id: String,
         status: String,
         last_error: String,
     },
-    /// Event has no matching D-Bus signal in this bridge. Recorded so
-    /// tests can assert "we deliberately ignored X" without that being
-    /// confused for a translation bug.
-    Ignored {
-        kind: &'static str,
-    },
+    /// No matching D-Bus signal in this bridge (v1). Recorded so tests can
+    /// assert a deliberate ignore rather than a missed translation. Forwarding
+    /// these to D-Bus (UserMessageAdded / ConversationListChanged / …) for full
+    /// UDS/WS parity is the #367 follow-up.
+    Ignored { kind: &'static str },
 }
 
-/// Pure translator: wire event → D-Bus action. Pure / sync /
-/// no-side-effects so tests can assert each variant in isolation.
-pub fn translate(event: api::Event) -> ForwardAction {
+/// Pure translator: one signal event → a D-Bus action. Sync / no-side-effects so
+/// tests can assert each variant in isolation.
+pub fn translate(event: SignalEvent) -> ForwardAction {
     match event {
-        api::Event::AssistantDelta {
+        SignalEvent::Chunk {
             conversation_id,
             request_id,
             chunk,
@@ -113,7 +112,7 @@ pub fn translate(event: api::Event) -> ForwardAction {
             request_id,
             chunk,
         },
-        api::Event::AssistantCompleted {
+        SignalEvent::Complete {
             conversation_id,
             request_id,
             full_response,
@@ -122,7 +121,7 @@ pub fn translate(event: api::Event) -> ForwardAction {
             request_id,
             full_response,
         },
-        api::Event::AssistantError {
+        SignalEvent::Error {
             conversation_id,
             request_id,
             error,
@@ -131,53 +130,22 @@ pub fn translate(event: api::Event) -> ForwardAction {
             request_id,
             error,
         },
-        api::Event::ConfigChanged { config } => ForwardAction::ConfigChanged {
-            config: config_data_from_event(&config),
-        },
-        // Live user-message echo (#1) is a UDS/WS-protocol concern — the GUI
-        // clients that render an external turn's user bubble live (adele-gtk,
-        // adele-tui) subscribe over UDS/WS. The sole D-Bus client (voice) is the
-        // *producer* of these turns, not a renderer, so there is no D-Bus signal
-        // for it. Deliberate ignore rather than a missed translation.
-        api::Event::UserMessageAdded { .. } => ForwardAction::Ignored {
-            kind: "user_message_added",
-        },
-        api::Event::AssistantStatus { .. } => ForwardAction::Ignored {
-            kind: "assistant_status",
-        },
-        // Context-usage fill (issue #341) is a UDS/WS-protocol concern — the
-        // clients that render the indicator (adele-tui, adele-gtk, KDE) all
-        // subscribe over UDS/WS. The sole D-Bus client (voice) does not show
-        // a context indicator, so there is no D-Bus signal for it. Recorded
-        // as a deliberate ignore rather than a missed translation.
-        api::Event::ContextUsage { .. } => ForwardAction::Ignored {
-            kind: "context_usage",
-        },
-        api::Event::ConversationTitleChanged { .. } => ForwardAction::Ignored {
-            kind: "conversation_title_changed",
-        },
-        // The conversation-list refresh (#1) is a UDS/WS sidebar concern; the
-        // D-Bus client (voice) renders no conversation list.
-        api::Event::ConversationListChanged { .. } => ForwardAction::Ignored {
-            kind: "conversation_list_changed",
-        },
-        api::Event::ConversationWarningEmitted { .. } => ForwardAction::Ignored {
-            kind: "conversation_warning_emitted",
-        },
-        api::Event::TaskStarted { task } => {
+        SignalEvent::TaskStarted { task } => {
             let id = task.id.0.clone();
-            let dict = task_view_to_dict(&task);
-            ForwardAction::TaskStarted { id, task: dict }
+            ForwardAction::TaskStarted {
+                id,
+                task: task_view_to_dict(&task),
+            }
         }
-        api::Event::TaskProgress { id, progress_hint } => ForwardAction::TaskProgress {
+        SignalEvent::TaskProgress { id, progress_hint } => ForwardAction::TaskProgress {
             id,
             hint: progress_hint.unwrap_or_default(),
         },
-        api::Event::TaskLogAppended { id, entry } => {
-            let dict = log_entry_to_dict(&entry);
-            ForwardAction::TaskLogAppended { id, entry: dict }
-        }
-        api::Event::TaskCompleted {
+        SignalEvent::TaskLogAppended { id, entry } => ForwardAction::TaskLogAppended {
+            id,
+            entry: log_entry_to_dict(&entry),
+        },
+        SignalEvent::TaskCompleted {
             id,
             status,
             last_error,
@@ -186,36 +154,52 @@ pub fn translate(event: api::Event) -> ForwardAction {
             status: task_status_str(status).to_string(),
             last_error: last_error.unwrap_or_default(),
         },
-        // Conversation scratchpad (issue #190): not forwarded over D-Bus —
-        // the scratchpad side pane is a WebSocket/UDS-protocol concern
-        // (adele-gtk subscribes via the command channel). A D-Bus client that
-        // wants live scratchpad updates would need its own forwarding arm.
-        api::Event::ScratchpadChanged { .. } => ForwardAction::Ignored {
+        // --- deliberately not forwarded in v1 (see the module docs + #367) ---
+        SignalEvent::UserMessageAdded { .. } => ForwardAction::Ignored {
+            kind: "user_message_added",
+        },
+        SignalEvent::Status { .. } => ForwardAction::Ignored {
+            kind: "assistant_status",
+        },
+        SignalEvent::ContextUsage { .. } => ForwardAction::Ignored {
+            kind: "context_usage",
+        },
+        SignalEvent::TitleChanged { .. } => ForwardAction::Ignored {
+            kind: "conversation_title_changed",
+        },
+        SignalEvent::ConversationListChanged { .. } => ForwardAction::Ignored {
+            kind: "conversation_list_changed",
+        },
+        SignalEvent::ConversationWarning { .. } => ForwardAction::Ignored {
+            kind: "conversation_warning",
+        },
+        SignalEvent::ScratchpadChanged { .. } => ForwardAction::Ignored {
             kind: "scratchpad_changed",
         },
-        // Client-side tool execution (issue #107): the bridge does not
-        // forward `ClientToolCall` to D-Bus subscribers because client-
-        // side execution is a WebSocket-protocol concern. The D-Bus
-        // bridge IS a client — if the daemon ever picks a tool that's
-        // registered on a D-Bus-attached client, the bridge would need
-        // its own dispatch path; today the bridge does not register
-        // any client-local tools, so this is unreachable in practice.
-        api::Event::ClientToolCall { .. } => ForwardAction::Ignored {
+        SignalEvent::ClientToolCall { .. } => ForwardAction::Ignored {
             kind: "client_tool_call",
+        },
+        // Control signal handled by `run` before it reaches `translate`; mapped
+        // here only for match exhaustiveness.
+        SignalEvent::Disconnected { .. } => ForwardAction::Ignored {
+            kind: "disconnected",
         },
     }
 }
 
-/// Run the forwarder loop until the inbound channel closes or
-/// `shutdown` resolves. Lagged subscribers drop a warning and continue
-/// (broadcast semantics) — losing an old D-Bus signal is better than
-/// blocking the demux task.
+/// Run the forwarder until `shutdown` resolves. Survives daemon restarts: on a
+/// [`SignalEvent::Disconnected`] it re-subscribes for a fresh stream and
+/// re-issues the background-task subscription once the Connector reconnects.
 pub async fn run<F: std::future::Future<Output = ()> + Send + 'static>(
-    mut events: broadcast::Receiver<api::Event>,
+    connector: Arc<Connector>,
     connection: Connection,
     shutdown: F,
 ) {
     tokio::pin!(shutdown);
+    let mut events = connector.subscribe();
+    // Initial background-task subscription (retries until the daemon answers).
+    spawn_background_task_subscription(&connector);
+
     loop {
         tokio::select! {
             biased;
@@ -223,20 +207,63 @@ pub async fn run<F: std::future::Future<Output = ()> + Send + 'static>(
                 debug!("event forwarder shutting down");
                 return;
             }
-            recv = events.recv() => {
-                match recv {
-                    Ok(event) => emit(&connection, translate(event)).await,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("event forwarder lagged; dropped {n} events");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!("event channel closed; forwarder exiting");
-                        return;
-                    }
+            recv = events.recv() => match recv {
+                Some(SignalEvent::Disconnected { reason }) => {
+                    debug!("event forwarder: transport dropped ({reason}); re-subscribing");
+                    events = connector.subscribe();
+                    spawn_background_task_subscription(&connector);
+                }
+                Some(event) => emit(&connection, translate(event)).await,
+                None => {
+                    // Sender dropped without a Disconnected (shouldn't happen while
+                    // the bridge holds the Connector). Re-subscribe defensively.
+                    events = connector.subscribe();
                 }
             }
         }
     }
+}
+
+/// Spawn a detached task that issues `SubscribeBackgroundTasks`, retrying with
+/// backoff until the (re)connection answers. Holds only a `Weak<Connector>` so a
+/// pending retry can't keep the Connector — and thus the bridge's reconnect
+/// supervisor — alive past shutdown.
+fn spawn_background_task_subscription(connector: &Arc<Connector>) {
+    let weak = Arc::downgrade(connector);
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            let Some(connector) = weak.upgrade() else {
+                return; // Connector gone — nothing to subscribe.
+            };
+            let outcome = match connector.client().as_commands() {
+                Some(commands) => commands
+                    .send_command(api::Command::SubscribeBackgroundTasks)
+                    .await
+                    .map(|_| ()),
+                None => return, // no command channel (not a socket transport)
+            };
+            drop(connector); // don't hold the Arc across the sleep
+            match outcome {
+                Ok(()) => {
+                    debug!("event forwarder: subscribed to background-task events");
+                    return;
+                }
+                Err(e) => {
+                    debug!("event forwarder: background-task subscribe failed ({e}); retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+            }
+        }
+    });
+}
+
+/// Translate and emit one signal event as its D-Bus signal. The single-event
+/// seam `run` uses internally, exposed so integration tests can drive the emit
+/// path over a p2p connection without standing up a full Connector.
+pub async fn forward_one(connection: &Connection, event: SignalEvent) {
+    emit(connection, translate(event)).await;
 }
 
 async fn emit(connection: &Connection, action: ForwardAction) {
@@ -296,20 +323,6 @@ async fn emit(connection: &Connection, action: ForwardAction) {
                 .await
             {
                 warn!("response_error emit failed: {e}");
-            }
-        }
-        ForwardAction::ConfigChanged { config } => {
-            if let Err(e) = connection
-                .emit_signal::<&str, _, _, _, _>(
-                    None,
-                    paths::SETTINGS,
-                    SETTINGS_INTERFACE,
-                    "ConfigChanged",
-                    &config,
-                )
-                .await
-            {
-                warn!("config_changed emit failed: {e}");
             }
         }
         ForwardAction::TaskStarted { id, task } => {
@@ -382,9 +395,9 @@ async fn emit(connection: &Connection, action: ForwardAction) {
     }
 }
 
-/// Snake-case wire string for `api::TaskStatus`. Mirrors the
-/// `#[serde(rename_all = "snake_case")]` attribute on the enum so
-/// D-Bus clients see the same wire vocabulary as the JSON/WS surface.
+/// Snake-case wire string for `api::TaskStatus`, matching the enum's
+/// `#[serde(rename_all = "snake_case")]` so D-Bus clients see the same
+/// vocabulary as the JSON/WS surface.
 fn task_status_str(status: api::TaskStatus) -> &'static str {
     match status {
         api::TaskStatus::Pending => "pending",

@@ -15,25 +15,21 @@
 //! still ships the in-process surface for Option A
 //! (independently-shippable transition — see PR #106).
 //!
-//! The split between `lib.rs` and `main.rs` is deliberate: the binary
-//! wires together a [`minter::Minter`] and a [`transport::BridgeTransport`]
-//! in a way that needs root, signals, and a real D-Bus connection;
+//! The split between `lib.rs` and `main.rs` is deliberate: the binary wires a
+//! client-common [`Connector`](desktop_assistant_client_common::Connector) to a
+//! real D-Bus connection in a way that needs signals and the session bus;
 //! everything testable is exposed as library API.
 //!
 //! ## Modules
 //!
-//! - [`minter`]: line-delimited JSON client for the local `adelie-mint`
-//!   socket. Returns a freshly-minted JWT or an explicit error.
-//! - [`transport`]: a [`BridgeTransport`](transport::BridgeTransport)
-//!   trait + a concrete UDS impl that frames length-prefixed JSON to
-//!   the daemon, performs the JWT handshake, and demuxes
-//!   `WsFrame::Result`/`Error` (by request id) from `WsFrame::Event`
-//!   (broadcast to subscribers).
+//! - [`transport`]: the [`BridgeTransport`](transport::BridgeTransport) trait the
+//!   adapters dispatch through, and [`ConnectorBridgeTransport`](transport::ConnectorBridgeTransport),
+//!   a thin forwarder over the shared client-common `Connector` (which owns the
+//!   authenticated UDS connection, reconnect, and JWT minting — #316).
 //! - [`adapter`]: D-Bus adapter structs (one per object path) that
 //!   speak only `api-model` types — no `core`/`application` deps.
 
 pub mod adapter;
-pub mod minter;
 pub mod transport;
 
-pub use transport::{BridgeTransport, BridgeTransportError, UdsBridgeTransport};
+pub use transport::{BridgeTransport, BridgeTransportError, ConnectorBridgeTransport};
