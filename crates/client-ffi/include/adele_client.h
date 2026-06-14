@@ -71,6 +71,123 @@ char *adele_client_send_prompt(struct AdeleClient *client,
                                const char *prompt);
 
 /**
+ * List the user's conversations as a JSON array of `ConversationSummary` (the
+ * daemon's order, newest-first). `include_archived` adds archived ones. Returns
+ * NULL on a bad handle / dispatch failure; caller frees with [`adele_string_free`].
+ *
+ * # Safety
+ * `client` must be a live handle from [`adele_client_connect`].
+ */
+char *adele_client_list_conversations(struct AdeleClient *client, bool include_archived);
+
+/**
+ * Fetch a window of a conversation's messages as a JSON `MessagesView`
+ * (`{messages, message_count, truncated, ...}`). `tail` caps to the most recent
+ * N (`<= 0` = no cap); `after_count` returns only messages past that many
+ * already-seen (incremental refresh; `<= 0` = from the start);
+ * `include_roles_json` is a JSON array of role names to include (NULL/empty =
+ * all roles). Returns NULL on failure; caller frees.
+ *
+ * # Safety
+ * `client` must be live; `conversation_id` a valid C string; `include_roles_json`
+ * NULL or a valid C string.
+ */
+char *adele_client_get_messages(struct AdeleClient *client,
+                                const char *conversation_id,
+                                int32_t tail,
+                                int32_t after_count,
+                                const char *include_roles_json);
+
+/**
+ * Create a conversation with `title`; returns the new conversation id as an
+ * owned C string (caller frees), or NULL on failure.
+ *
+ * # Safety
+ * `client` must be live; `title` a valid C string.
+ */
+char *adele_client_create_conversation(struct AdeleClient *client, const char *title);
+
+/**
+ * Delete a conversation. Returns `false` on a bad handle / failure.
+ *
+ * # Safety
+ * `client` must be live; `conversation_id` a valid C string.
+ */
+bool adele_client_delete_conversation(struct AdeleClient *client, const char *conversation_id);
+
+/**
+ * Send a prompt with an optional per-message model override. `override_json`,
+ * when non-NULL, is `{"connection_id":"..","model_id":"..","effort":"low|medium|high"?}`
+ * (a malformed value is treated as no override). Returns the turn request-id as
+ * an owned C string (caller frees), or NULL on failure.
+ *
+ * # Safety
+ * `client` must be live; `conversation_id` and `prompt` valid C strings;
+ * `override_json` NULL or a valid C string.
+ */
+char *adele_client_send_prompt_with_override(struct AdeleClient *client,
+                                             const char *conversation_id,
+                                             const char *prompt,
+                                             const char *override_json);
+
+/**
+ * List available models as a JSON array of `ModelListing`. `connection_id`, when
+ * non-NULL, scopes to one connection; `refresh` forces a provider refetch.
+ * Returns NULL on failure; caller frees.
+ *
+ * # Safety
+ * `client` must be live; `connection_id` NULL or a valid C string.
+ */
+char *adele_client_list_available_models(struct AdeleClient *client,
+                                         const char *connection_id,
+                                         bool refresh);
+
+/**
+ * Subscribe this connection to background-task events (`task_started`,
+ * `task_progress`, `task_log_appended`, `task_completed`) and
+ * `scratchpad_changed`, which then arrive on the signal callback. Returns
+ * `false` on a bad handle / failure.
+ *
+ * # Safety
+ * `client` must be a live handle from [`adele_client_connect`].
+ */
+bool adele_client_subscribe_background_tasks(struct AdeleClient *client);
+
+/**
+ * List background tasks as a JSON array of `TaskView`. `include_finished` adds
+ * terminal tasks; `limit` caps the count (`<= 0` = no limit). Returns NULL on
+ * failure; caller frees.
+ *
+ * # Safety
+ * `client` must be a live handle from [`adele_client_connect`].
+ */
+char *adele_client_list_background_tasks(struct AdeleClient *client,
+                                         bool include_finished,
+                                         int32_t limit);
+
+/**
+ * Cancel a background task. Returns `false` on a bad handle / failure.
+ *
+ * # Safety
+ * `client` must be live; `task_id` a valid C string.
+ */
+bool adele_client_cancel_background_task(struct AdeleClient *client, const char *task_id);
+
+/**
+ * Fetch a page of a background task's logs as JSON
+ * (`{"entries":[TaskLogEntry...],"next_seq":N}`). `after_seq` skips already-seen
+ * entries (`< 0` = from oldest); `limit` caps the page (`<= 0` = server
+ * default). Returns NULL on failure; caller frees.
+ *
+ * # Safety
+ * `client` must be live; `task_id` a valid C string.
+ */
+char *adele_client_get_background_task_logs(struct AdeleClient *client,
+                                            const char *task_id,
+                                            int64_t after_seq,
+                                            int32_t limit);
+
+/**
  * Free a string returned by this library.
  *
  * # Safety
