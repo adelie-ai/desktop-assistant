@@ -31,6 +31,10 @@ pub mod tool_registry;
 /// Database query port — closure type for read-only SQL queries.
 pub mod database;
 
+/// Desktop-notification port — capability-gated closure for posting a desktop
+/// notification (freedesktop `org.freedesktop.Notifications`).
+pub mod notify;
+
 /// Conversation search port — outbound trait for full-text search over past messages.
 pub mod conversation_search;
 
