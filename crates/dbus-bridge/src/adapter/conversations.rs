@@ -11,11 +11,8 @@ use desktop_assistant_api_model as api;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
 
+use crate::session::SessionRegistry;
 use crate::transport::{BridgeTransport, BridgeTransportError};
-
-fn to_fdo<E: std::fmt::Display>(error: E) -> fdo::Error {
-    fdo::Error::Failed(error.to_string())
-}
 
 /// D-Bus ordinal contract for one personality-override trait (#227): `-1` =
 /// unset (fall back to global), `0..=4` pins the level (Never=0 … Always=4).
@@ -97,45 +94,81 @@ fn map_transport_err(error: BridgeTransportError) -> fdo::Error {
 /// `ResponseError` signals by [`super::event_forwarder`].
 pub struct DbusConversationsAdapter<T: BridgeTransport + 'static> {
     transport: Arc<T>,
+    /// Per-sender daemon sessions (#367/#320). Wired in production via
+    /// [`with_sessions`](Self::with_sessions); `None` in unit tests, where
+    /// turn-driving falls back to the shared `transport`.
+    sessions: Option<Arc<SessionRegistry>>,
 }
 
 impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
     pub fn new(transport: Arc<T>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            sessions: None,
+        }
+    }
+
+    /// Wire the per-sender session registry (production). Turn-driving methods
+    /// then dispatch through the *caller's* own daemon session, so a turn's
+    /// streamed events come back on that session and unicast to only that caller
+    /// (#367/#320). Without it (unit tests), they use the shared transport.
+    pub fn with_sessions(mut self, sessions: Arc<SessionRegistry>) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 
     async fn dispatch(&self, cmd: api::Command) -> fdo::Result<api::CommandResult> {
         self.transport.request(cmd).await.map_err(map_transport_err)
     }
 
+    /// Dispatch a turn-driving command. With the registry wired and the caller
+    /// known, route through that caller's per-sender session (so the daemon
+    /// streams the turn's events back on that session, which the unicast
+    /// forwarder delivers to only this caller); otherwise fall back to the shared
+    /// transport. `caller` is the D-Bus sender's unique bus name from the message
+    /// header.
+    async fn dispatch_turn(
+        &self,
+        caller: Option<&str>,
+        cmd: api::Command,
+    ) -> fdo::Result<api::CommandResult> {
+        match self.sessions.as_ref() {
+            Some(registry) => registry
+                .route(caller, cmd, self.transport.as_ref())
+                .await
+                .map_err(map_transport_err),
+            None => self.transport.request(cmd).await.map_err(map_transport_err),
+        }
+    }
+
     /// Shared body for `SendPrompt` / `SendPromptWithSystemRefinement`:
     /// builds the `SendMessage` command (with the given
-    /// `system_refinement`; empty = none), dispatches it, and maps the
-    /// immediate result to a correlation id for the caller. Keeping this
-    /// in one place guarantees the two D-Bus methods stay
+    /// `system_refinement`; empty = none), dispatches it **through the caller's
+    /// session**, and maps the immediate result to a correlation id for the
+    /// caller. Keeping this in one place guarantees the two D-Bus methods stay
     /// byte-identical apart from the refinement.
     async fn dispatch_send_message(
         &self,
+        caller: Option<&str>,
         conversation_id: &str,
         prompt: &str,
         system_refinement: String,
     ) -> fdo::Result<String> {
+        // SendMessage returns an immediate Ack/SendMessageAck; a daemon refusal
+        // before streaming surfaces here as the mapped transport error.
         let result = self
-            .dispatch(api::Command::SendMessage {
-                conversation_id: conversation_id.to_string(),
-                content: prompt.to_string(),
-                override_selection: None,
-                system_refinement,
-                // The D-Bus bridge does not originate idempotency keys (#204).
-                idempotency_key: None,
-            })
-            .await
-            .map_err(|e| {
-                // SendMessage returns an immediate Ack on success; if
-                // the daemon refused the request before streaming, we
-                // surface the error directly.
-                to_fdo(e)
-            })?;
+            .dispatch_turn(
+                caller,
+                api::Command::SendMessage {
+                    conversation_id: conversation_id.to_string(),
+                    content: prompt.to_string(),
+                    override_selection: None,
+                    system_refinement,
+                    // The D-Bus bridge does not originate idempotency keys (#204).
+                    idempotency_key: None,
+                },
+            )
+            .await?;
 
         match result {
             api::CommandResult::Ack => {
@@ -404,8 +437,14 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
     /// and the daemon's id is what shows up on the signal — same as
     /// the in-process adapter where the dbus-interface created its
     /// own request id.
-    async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> fdo::Result<String> {
-        self.dispatch_send_message(conversation_id, prompt, String::new())
+    async fn send_prompt(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        conversation_id: &str,
+        prompt: &str,
+    ) -> fdo::Result<String> {
+        let caller = hdr.sender().map(|s| s.as_str());
+        self.dispatch_send_message(caller, conversation_id, prompt, String::new())
             .await
     }
 
@@ -423,12 +462,19 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
     /// byte-identical for existing chat clients.
     async fn send_prompt_with_system_refinement(
         &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
         conversation_id: &str,
         prompt: &str,
         system_refinement: &str,
     ) -> fdo::Result<String> {
-        self.dispatch_send_message(conversation_id, prompt, system_refinement.to_string())
-            .await
+        let caller = hdr.sender().map(|s| s.as_str());
+        self.dispatch_send_message(
+            caller,
+            conversation_id,
+            prompt,
+            system_refinement.to_string(),
+        )
+        .await
     }
 
     /// Signal emitted for each chunk of a streaming response.
@@ -509,11 +555,15 @@ mod tests {
         let transport = Arc::new(RecordingTransport::new());
         let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
 
+        // Drives the shared body directly (the `#[interface]` method only adds
+        // header→caller extraction, which zbus fills at dispatch). `None` caller
+        // ⇒ shared transport, exactly what a registry-less adapter does.
         let request_id = adapter
-            .send_prompt_with_system_refinement(
+            .dispatch_send_message(
+                None,
                 "conv-1",
                 "what's the weather?",
-                "Respond briefly, by voice.",
+                "Respond briefly, by voice.".to_string(),
             )
             .await
             .expect("send returns the daemon correlation id");
@@ -550,7 +600,10 @@ mod tests {
         let transport = Arc::new(RecordingTransport::new());
         let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
 
-        adapter.send_prompt("conv-2", "hello").await.unwrap();
+        adapter
+            .dispatch_send_message(None, "conv-2", "hello", String::new())
+            .await
+            .unwrap();
 
         let commands = transport.commands.lock().await;
         assert_eq!(commands.len(), 1);
@@ -971,7 +1024,7 @@ mod tests {
             task_id: "t".into(),
         }));
         DbusConversationsAdapter::new(Arc::clone(&t))
-            .send_prompt("c1", "hello there")
+            .dispatch_send_message(None, "c1", "hello there", String::new())
             .await
             .unwrap();
         match only_command(&t).await {

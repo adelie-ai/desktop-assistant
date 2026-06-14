@@ -18,7 +18,7 @@
 //! or `.Dev` to run a side-by-side instance for QA without colliding.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -31,6 +31,9 @@ use desktop_assistant_dbus_bridge::adapter::{
     DBUS_SERVICE_NAME, DbusBackgroundTasksAdapter, DbusCommandsAdapter, DbusConnectionsAdapter,
     DbusConversationsAdapter, DbusKnowledgeAdapter, DbusReloadAdapter, DbusSettingsAdapter,
     event_forwarder, paths,
+};
+use desktop_assistant_dbus_bridge::session::{
+    ConnectorSessionFactory, SessionRegistry, spawn_name_owner_watcher,
 };
 use desktop_assistant_dbus_bridge::transport::ConnectorBridgeTransport;
 use tokio::signal::unix::{SignalKind, signal};
@@ -115,14 +118,33 @@ async fn main() -> anyhow::Result<()> {
     })?;
     let connector = Arc::new(connector);
 
+    // Per-sender daemon sessions (#367/#320). The shared `connector` above stays
+    // the bridge's connection for stateless request/response (and the broadcast
+    // `Task*` stream); but a turn a D-Bus caller drives needs its OWN daemon
+    // session so the turn's events come back on that session and unicast to only
+    // that caller. The registry mints one such session per sender on demand
+    // (same `config`), and the name-owner watcher evicts it when the sender
+    // leaves the bus. The forwarders emit on the bus connection, which only
+    // exists after the name is bound below, so it's supplied through a slot
+    // filled immediately after `build()` (before any session can be requested —
+    // a session is only created from inside a served method).
+    let bus_connection: Arc<OnceLock<zbus::Connection>> = Arc::new(OnceLock::new());
+    let session_factory = Arc::new(ConnectorSessionFactory::new(
+        config.clone(),
+        Arc::clone(&bus_connection),
+    ));
+    let sessions = Arc::new(SessionRegistry::new(session_factory));
+
     // 2. Stand up adapters over a Connector-backed transport + bind the name.
     tracing::info!(name = %cli.name, "binding D-Bus name");
     let _ = DBUS_SERVICE_NAME; // referenced for symmetry; CLI flag overrides
     let transport = Arc::new(ConnectorBridgeTransport::new(Arc::clone(&connector)));
     // Generic command channel (#213 / #315 G1): the JSON-in/JSON-out surface
-    // tui/gtk use on `--transport dbus`.
-    let commands = DbusCommandsAdapter::new(Arc::clone(&transport));
-    let conversations = DbusConversationsAdapter::new(Arc::clone(&transport));
+    // tui/gtk use on `--transport dbus`. Turn-driving commands route per-sender.
+    let commands =
+        DbusCommandsAdapter::new(Arc::clone(&transport)).with_sessions(Arc::clone(&sessions));
+    let conversations =
+        DbusConversationsAdapter::new(Arc::clone(&transport)).with_sessions(Arc::clone(&sessions));
     let settings = DbusSettingsAdapter::new(Arc::clone(&transport));
     let connections = DbusConnectionsAdapter::new(Arc::clone(&transport));
     let knowledge = DbusKnowledgeAdapter::new(Arc::clone(&transport));
@@ -146,6 +168,16 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to build D-Bus connection")?;
     tracing::info!(name = %cli.name, "D-Bus bridge ready");
 
+    // Hand the per-sender session forwarders the live bus connection. Safe to set
+    // now: a session is only ever created from inside a served D-Bus method,
+    // which cannot dispatch until this point.
+    let _ = bus_connection.set(connection.clone());
+
+    // Evict a sender's session when it drops off the bus, so a crashed/exited
+    // D-Bus client can't leak its daemon session (and — post-#320 — can't wedge a
+    // turn on a tool call it will never answer).
+    let name_owner_watcher = spawn_name_owner_watcher(connection.clone(), Arc::clone(&sessions));
+
     // 3. Event forwarder. It issues the initial `SubscribeBackgroundTasks` and
     //    re-issues it (and re-subscribes the stream) across daemon restarts.
     let forwarder_shutdown = build_shutdown_signal()?;
@@ -163,9 +195,13 @@ async fn main() -> anyhow::Result<()> {
     // Dropping the connection stops serving; the forwarder exits on its own
     // shutdown signal. Give it a moment to drain, then drop the Connector
     // (which aborts its reconnect supervisor).
+    name_owner_watcher.abort();
     let _ = tokio::time::timeout(Duration::from_secs(2), forwarder).await;
     drop(connection);
     drop(connector);
+    // Drop every per-sender session: each session's `Drop` aborts its forwarder
+    // and releases its `Connector`, disconnecting it from the daemon.
+    drop(sessions);
     Ok(())
 }
 

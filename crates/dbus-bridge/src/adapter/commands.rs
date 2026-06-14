@@ -47,6 +47,7 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 use zbus::{fdo, interface};
 
+use crate::session::SessionRegistry;
 use crate::transport::{BridgeTransport, BridgeTransportError};
 
 /// Translate a transport error into the `fdo::Error` the D-Bus caller sees.
@@ -95,11 +96,54 @@ fn reject_reason(command: &api::Command) -> Option<&'static str> {
 /// [`BridgeTransport`] instead of into an in-process handler.
 pub struct DbusCommandsAdapter<T: BridgeTransport + 'static> {
     transport: Arc<T>,
+    /// Per-sender daemon sessions (#367/#320). Wired in production via
+    /// [`with_sessions`](Self::with_sessions); `None` in unit tests.
+    sessions: Option<Arc<SessionRegistry>>,
 }
 
 impl<T: BridgeTransport + 'static> DbusCommandsAdapter<T> {
     pub fn new(transport: Arc<T>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            sessions: None,
+        }
+    }
+
+    /// Wire the per-sender session registry (production) so a turn-driving command
+    /// arriving on this generic JSON channel routes through the *caller's* own
+    /// session — identical to the typed Conversations methods. Without it (unit
+    /// tests), everything uses the shared transport.
+    pub fn with_sessions(mut self, sessions: Arc<SessionRegistry>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Parse, policy-check, and dispatch one serialized `api::Command`, returning
+    /// the serialized `api::CommandResult`. The testable core of `send_command`;
+    /// `caller` is the D-Bus sender's unique name (from the message header), used
+    /// to route turn-driving commands to that caller's session.
+    async fn run_command(&self, caller: Option<&str>, command_json: &str) -> fdo::Result<String> {
+        let command: api::Command = serde_json::from_str(command_json)
+            .map_err(|e| fdo::Error::InvalidArgs(format!("invalid command JSON: {e}")))?;
+
+        if let Some(reason) = reject_reason(&command) {
+            return Err(fdo::Error::NotSupported(reason.to_string()));
+        }
+
+        let result = match self.sessions.as_ref() {
+            Some(registry) => registry
+                .route(caller, command, self.transport.as_ref())
+                .await
+                .map_err(map_transport_err)?,
+            None => self
+                .transport
+                .request(command)
+                .await
+                .map_err(map_transport_err)?,
+        };
+
+        serde_json::to_string(&result)
+            .map_err(|e| fdo::Error::Failed(format!("serialize command result: {e}")))
     }
 }
 
@@ -114,22 +158,13 @@ impl<T: BridgeTransport + 'static> DbusCommandsAdapter<T> {
     /// authenticated UDS session, whose minted identity is the user scope —
     /// there is no `$USER` resolution here (contrast the in-process adapter),
     /// because the daemon derives the user from the bridge's JWT.
-    async fn send_command(&self, command_json: &str) -> fdo::Result<String> {
-        let command: api::Command = serde_json::from_str(command_json)
-            .map_err(|e| fdo::Error::InvalidArgs(format!("invalid command JSON: {e}")))?;
-
-        if let Some(reason) = reject_reason(&command) {
-            return Err(fdo::Error::NotSupported(reason.to_string()));
-        }
-
-        let result = self
-            .transport
-            .request(command)
-            .await
-            .map_err(map_transport_err)?;
-
-        serde_json::to_string(&result)
-            .map_err(|e| fdo::Error::Failed(format!("serialize command result: {e}")))
+    async fn send_command(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        command_json: &str,
+    ) -> fdo::Result<String> {
+        let caller = hdr.sender().map(|s| s.as_str());
+        self.run_command(caller, command_json).await
     }
 }
 
@@ -213,7 +248,7 @@ mod tests {
         })
         .unwrap();
 
-        let raw = adapter.send_command(&request).await.unwrap();
+        let raw = adapter.run_command(None, &request).await.unwrap();
         let decoded: api::CommandResult = serde_json::from_str(&raw).unwrap();
         assert_eq!(decoded, reply);
         assert!(matches!(
@@ -236,7 +271,7 @@ mod tests {
             let request = serde_json::to_string(&cmd).unwrap();
 
             let err = adapter
-                .send_command(&request)
+                .run_command(None, &request)
                 .await
                 .expect_err("streaming subscription must be rejected");
             assert!(matches!(err, fdo::Error::NotSupported(_)), "got {err:?}");
@@ -258,7 +293,7 @@ mod tests {
         .unwrap();
 
         let err = adapter
-            .send_command(&request)
+            .run_command(None, &request)
             .await
             .expect_err("conversation subscription must be rejected over D-Bus");
         assert!(matches!(err, fdo::Error::NotSupported(_)), "got {err:?}");
@@ -282,7 +317,7 @@ mod tests {
             let request = serde_json::to_string(&cmd).unwrap();
 
             let err = adapter
-                .send_command(&request)
+                .run_command(None, &request)
                 .await
                 .expect_err("client-tool commands must be rejected over D-Bus");
             assert!(matches!(err, fdo::Error::NotSupported(_)), "got {err:?}");
@@ -297,7 +332,7 @@ mod tests {
         let request = serde_json::to_string(&api::Command::Ping).unwrap();
 
         let err = adapter
-            .send_command(&request)
+            .run_command(None, &request)
             .await
             .expect_err("a daemon error must surface as an fdo error");
         assert!(matches!(err, fdo::Error::Failed(_)));
@@ -313,7 +348,7 @@ mod tests {
         let adapter = adapter(Arc::clone(&transport));
 
         let err = adapter
-            .send_command("{not valid json")
+            .run_command(None, "{not valid json")
             .await
             .expect_err("malformed command JSON must be rejected");
         assert!(matches!(err, fdo::Error::InvalidArgs(_)), "got {err:?}");

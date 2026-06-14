@@ -213,7 +213,10 @@ pub async fn run<F: std::future::Future<Output = ()> + Send + 'static>(
                     events = connector.subscribe();
                     spawn_background_task_subscription(&connector);
                 }
-                Some(event) => emit(&connection, translate(event)).await,
+                // Broadcast (destination `None`): this shared connection carries
+                // the per-user stream (`Task*`, and post-#367 the conversation-list
+                // signal). Per-sender turn responses ride `run_unicast` instead.
+                Some(event) => emit(&connection, None, translate(event)).await,
                 None => {
                     // Sender dropped without a Disconnected (shouldn't happen while
                     // the bridge holds the Connector). Re-subscribe defensively.
@@ -262,11 +265,48 @@ fn spawn_background_task_subscription(connector: &Arc<Connector>) {
 /// Translate and emit one signal event as its D-Bus signal. The single-event
 /// seam `run` uses internally, exposed so integration tests can drive the emit
 /// path over a p2p connection without standing up a full Connector.
-pub async fn forward_one(connection: &Connection, event: SignalEvent) {
-    emit(connection, translate(event)).await;
+///
+/// `destination` mirrors [`emit`]: `None` broadcasts, `Some(unique_name)`
+/// unicasts to one D-Bus sender (the per-sender session path).
+pub async fn forward_one(connection: &Connection, destination: Option<&str>, event: SignalEvent) {
+    emit(connection, destination, translate(event)).await;
 }
 
-async fn emit(connection: &Connection, action: ForwardAction) {
+/// Run a **per-sender** forwarder until the task is aborted (on session
+/// eviction). Unlike [`run`], this pumps one [`SenderSession`](crate::session)'s
+/// own daemon connection — which carries only that session's turn responses
+/// (`AssistantDelta`/`Completed`/`Error`), because the sub-session holds no
+/// `SubscribeBackgroundTasks`/`SubscribeConversations` registration of its own —
+/// and emits each as a signal **unicast to `destination`** (the sender's unique
+/// bus name). So a turn driven by one D-Bus caller streams back only to that
+/// caller, never broadcast across the session bus.
+///
+/// No shutdown future and no background-task subscription: the session owns this
+/// task's `JoinHandle` and aborts it on eviction, and there is nothing to
+/// re-subscribe across a reconnect (the sub-session carries no subscriptions).
+pub async fn run_unicast(connector: Arc<Connector>, connection: Connection, destination: String) {
+    let mut events = connector.subscribe();
+    loop {
+        match events.recv().await {
+            Some(SignalEvent::Disconnected { reason }) => {
+                debug!(
+                    "unicast forwarder for {destination}: transport dropped ({reason}); re-subscribing"
+                );
+                events = connector.subscribe();
+            }
+            Some(event) => emit(&connection, Some(&destination), translate(event)).await,
+            None => events = connector.subscribe(),
+        }
+    }
+}
+
+/// Emit `action` as its D-Bus signal. `destination` is the signal's intended
+/// recipient: `None` broadcasts (the shared per-user stream — `Task*` and, post
+/// #367, the conversation-list signal), `Some(unique_name)` **unicasts** to one
+/// D-Bus sender (a per-sender session's own turn responses — #367/#320). A
+/// unicast signal still matches an ordinary member match rule at the recipient,
+/// so a client subscribed the usual way receives it transparently.
+async fn emit(connection: &Connection, destination: Option<&str>, action: ForwardAction) {
     match action {
         ForwardAction::ResponseChunk {
             conversation_id,
@@ -276,7 +316,7 @@ async fn emit(connection: &Connection, action: ForwardAction) {
             let body = (conversation_id, request_id, chunk);
             if let Err(e) = connection
                 .emit_signal::<&str, _, _, _, _>(
-                    None,
+                    destination,
                     paths::CONVERSATIONS,
                     CONV_INTERFACE,
                     "ResponseChunk",
@@ -295,7 +335,7 @@ async fn emit(connection: &Connection, action: ForwardAction) {
             let body = (conversation_id, request_id, full_response);
             if let Err(e) = connection
                 .emit_signal::<&str, _, _, _, _>(
-                    None,
+                    destination,
                     paths::CONVERSATIONS,
                     CONV_INTERFACE,
                     "ResponseComplete",
@@ -314,7 +354,7 @@ async fn emit(connection: &Connection, action: ForwardAction) {
             let body = (conversation_id, request_id, error);
             if let Err(e) = connection
                 .emit_signal::<&str, _, _, _, _>(
-                    None,
+                    destination,
                     paths::CONVERSATIONS,
                     CONV_INTERFACE,
                     "ResponseError",
@@ -329,7 +369,7 @@ async fn emit(connection: &Connection, action: ForwardAction) {
             let body = (id, task);
             if let Err(e) = connection
                 .emit_signal::<&str, _, _, _, _>(
-                    None,
+                    destination,
                     paths::BACKGROUND_TASKS,
                     BG_INTERFACE,
                     "TaskStarted",
@@ -344,7 +384,7 @@ async fn emit(connection: &Connection, action: ForwardAction) {
             let body = (id, hint);
             if let Err(e) = connection
                 .emit_signal::<&str, _, _, _, _>(
-                    None,
+                    destination,
                     paths::BACKGROUND_TASKS,
                     BG_INTERFACE,
                     "TaskProgress",
@@ -359,7 +399,7 @@ async fn emit(connection: &Connection, action: ForwardAction) {
             let body = (id, entry);
             if let Err(e) = connection
                 .emit_signal::<&str, _, _, _, _>(
-                    None,
+                    destination,
                     paths::BACKGROUND_TASKS,
                     BG_INTERFACE,
                     "TaskLogAppended",
@@ -378,7 +418,7 @@ async fn emit(connection: &Connection, action: ForwardAction) {
             let body = (id, status, last_error);
             if let Err(e) = connection
                 .emit_signal::<&str, _, _, _, _>(
-                    None,
+                    destination,
                     paths::BACKGROUND_TASKS,
                     BG_INTERFACE,
                     "TaskCompleted",
