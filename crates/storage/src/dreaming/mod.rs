@@ -1,19 +1,18 @@
 //! Periodic extraction, consolidation, and archival of long-term knowledge
 //! ("dreaming"). See issue #108 for the design.
 //!
-//! Each scan cycle runs three phases:
+//! Work is split across two clocks:
 //!
-//! 1. **Extraction** — scans conversations for new messages beyond their
-//!    watermark, asks an LLM to extract durable facts, persists them with
-//!    structured scope (project/tool/null) and a source-conversation
-//!    pointer. Tags are constrained to a formal registry.
-//! 2. **Consolidation** — per-memory review of entries that haven't been
-//!    reviewed yet (gated by `reviewed_at IS NULL`). Retrieves related
-//!    candidates by tag overlap + embedding similarity, proposes
-//!    operations (keep/update/merge/add-scope/delete), buffers them,
-//!    union-finds merge clusters, synthesizes unified content per cluster,
-//!    and applies everything in a single transaction with soft-delete.
-//! 3. **Archival** — marks long-quiet conversations as archived.
+//! 1. **Extraction** (frequent, cheap) — scans conversations for new messages
+//!    beyond their watermark, asks an LLM to extract durable facts, persists
+//!    them with structured scope and a source-conversation pointer. Tags are
+//!    constrained to a formal registry. Run by [`run_dreaming_scan`].
+//! 2. **Archival** — marks long-quiet conversations as archived. Also part of
+//!    [`run_dreaming_scan`].
+//! 3. **Consolidation** (infrequent, strong model) — loads a user's entire
+//!    active KB and recomputes it holistically (prune / merge / tighten),
+//!    applying explicit operations in one transaction with soft-delete. Run on
+//!    its own slower cadence by [`run_consolidation_scan`].
 
 mod archival;
 mod common;
@@ -27,9 +26,9 @@ use sqlx::PgPool;
 
 pub use types::{BackfillEmbedFn, ConsolidationStats, DreamingLlmFn};
 
-/// Run one dreaming scan cycle: extract new facts, consolidate existing
-/// memories, archive old conversations. Returns the number of new facts
-/// written during extraction.
+/// Run one dreaming scan cycle: extract new facts and archive old
+/// conversations. Consolidation runs separately (see [`run_consolidation_scan`])
+/// on a slower cadence. Returns the number of new facts written.
 pub async fn run_dreaming_scan(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
@@ -37,39 +36,12 @@ pub async fn run_dreaming_scan(
     embedding_model: &str,
     archive_after_days: u32,
 ) -> Result<usize, CoreError> {
-    tracing::info!("dreaming: phase 1/3 extraction");
+    tracing::info!("dreaming: extraction phase");
     let new_facts =
         extraction::run_extraction_phase(pool, llm_fn, embed_fn, embedding_model).await?;
 
-    tracing::info!("dreaming: phase 2/3 consolidation");
-    match consolidation::run_consolidation_phase(pool, llm_fn).await {
-        Ok(stats) => {
-            if stats.merged_clusters > 0
-                || stats.updated > 0
-                || stats.soft_deleted > 0
-                || stats.scope_added > 0
-            {
-                tracing::info!(
-                    "dreaming: consolidation reviewed {}, merged {} cluster(s), updated {}, scope-added {}, soft-deleted {}",
-                    stats.reviewed,
-                    stats.merged_clusters,
-                    stats.updated,
-                    stats.scope_added,
-                    stats.soft_deleted,
-                );
-            } else {
-                tracing::debug!(
-                    "dreaming: consolidation reviewed {} entr{}, no changes",
-                    stats.reviewed,
-                    if stats.reviewed == 1 { "y" } else { "ies" }
-                );
-            }
-        }
-        Err(e) => tracing::warn!("dreaming: consolidation phase failed: {e}"),
-    }
-
     if archive_after_days > 0 {
-        tracing::info!("dreaming: phase 3/3 archival");
+        tracing::info!("dreaming: archival phase");
         match archival::run_archival_phase(pool, archive_after_days).await {
             Ok(n) if n > 0 => tracing::info!(
                 "dreaming: archived {n} conversation(s) older than {archive_after_days} day(s)"
@@ -80,4 +52,35 @@ pub async fn run_dreaming_scan(
     }
 
     Ok(new_facts)
+}
+
+/// Run one holistic-consolidation scan across all users. Loads each user's
+/// entire active KB and recomputes it with the (typically stronger) backend
+/// model. Returns aggregate operation counts.
+pub async fn run_consolidation_scan(
+    pool: &PgPool,
+    llm_fn: &DreamingLlmFn,
+) -> Result<ConsolidationStats, CoreError> {
+    let stats = consolidation::run_consolidation_phase(pool, llm_fn).await?;
+    if stats.merged_clusters > 0
+        || stats.updated > 0
+        || stats.soft_deleted > 0
+        || stats.scope_added > 0
+    {
+        tracing::info!(
+            "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, soft-deleted {}",
+            stats.reviewed,
+            stats.merged_clusters,
+            stats.updated,
+            stats.scope_added,
+            stats.soft_deleted,
+        );
+    } else {
+        tracing::debug!(
+            "consolidation: reviewed {} entr{}, no changes",
+            stats.reviewed,
+            if stats.reviewed == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(stats)
 }

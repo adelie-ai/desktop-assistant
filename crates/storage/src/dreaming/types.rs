@@ -22,17 +22,6 @@ pub const MAX_MESSAGE_CHARS: usize = 2000;
 /// Maximum number of conversations to process in a single extraction scan.
 pub const MAX_CONVERSATIONS_PER_SCAN: i64 = 10;
 
-/// Maximum number of KB entries to review per consolidation cycle.
-///
-/// Reviews are gated by `reviewed_at IS NULL`, so unreviewed entries
-/// distribute across cycles rather than re-running on a static window.
-pub const MAX_REVIEWS_PER_CYCLE: i64 = 20;
-
-/// Maximum number of retrieval candidates surfaced to the LLM during
-/// per-memory review. Small enough to keep prompts tight; large enough to
-/// catch likely-related entries.
-pub const MAX_REVIEW_CANDIDATES: i64 = 8;
-
 /// Cap on how many times an entry can be re-reviewed across cycles.
 ///
 /// Generation 0 = never reviewed; bumps on mutation (merge target, update
@@ -42,6 +31,18 @@ pub const MAX_REVIEW_GENERATION: i16 = 2;
 
 /// Soft-delete TTL. Entries with `deleted_at` older than this are reaped.
 pub const SOFT_DELETE_TTL_DAYS: i32 = 30;
+
+/// Character budget for one holistic-consolidation prompt. A user's active KB
+/// is recomputed in a single LLM call when it fits under this; otherwise it is
+/// sliced into tag-grouped chunks under this budget. ~200k chars ≈ 50k tokens,
+/// comfortably within a strong model's context with room for the response.
+pub const MAX_HOLISTIC_PROMPT_CHARS: usize = 200_000;
+
+/// Safety cap: the fraction of a user's active entries a single holistic run
+/// may delete outright. Merges (which preserve content in a canonical row)
+/// don't count. Protects against a bad run gutting the store; excess deletes
+/// are dropped with a warning.
+pub const MAX_DELETE_FRACTION: f64 = 0.5;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConsolidationStats {

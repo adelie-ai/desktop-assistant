@@ -52,9 +52,9 @@ pub use oidc::OidcValidator;
 pub use resolution::DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS;
 pub use resolution::{
     apply_learned_cap, purpose_max_context_override, resolve_backend_tasks_llm_config,
-    resolve_connection_llm_config, resolve_context_budget, resolve_database_config,
-    resolve_embeddings_config, resolve_llm_config, resolve_persistence_config,
-    resolve_purpose_llm_config,
+    resolve_connection_llm_config, resolve_consolidation_llm_config, resolve_context_budget,
+    resolve_database_config, resolve_embeddings_config, resolve_llm_config,
+    resolve_persistence_config, resolve_purpose_llm_config,
 };
 pub(super) use resolution::{
     default_backend_llm_model, default_base_url, default_llm_model, normalize_optional_value,
@@ -327,6 +327,16 @@ pub struct BackendTasksConfig {
     /// search coverage. A few minutes is a good default.
     #[serde(default = "default_embedding_backfill_interval_secs")]
     pub embedding_backfill_interval_secs: u64,
+    /// How often the holistic knowledge-base consolidation runs (0 = disabled).
+    /// Consolidation loads a user's whole KB and recomputes it, so it runs on a
+    /// much slower cadence than extraction — daily by default.
+    #[serde(default = "default_consolidation_interval_secs")]
+    pub consolidation_interval_secs: u64,
+    /// Optional dedicated LLM for holistic consolidation. Falls back to
+    /// `[backend_tasks.llm]`, then the top-level `[llm]`. Lets extraction run on
+    /// a cheap/local model while consolidation uses a stronger one.
+    #[serde(default)]
+    pub consolidation_llm: Option<LlmConfig>,
 }
 
 impl Default for BackendTasksConfig {
@@ -337,6 +347,8 @@ impl Default for BackendTasksConfig {
             dreaming_interval_secs: default_dreaming_interval_secs(),
             archive_after_days: default_archive_after_days(),
             embedding_backfill_interval_secs: default_embedding_backfill_interval_secs(),
+            consolidation_interval_secs: default_consolidation_interval_secs(),
+            consolidation_llm: None,
         }
     }
 }
@@ -351,6 +363,10 @@ pub(super) fn default_dreaming_interval_secs() -> u64 {
 
 pub(super) fn default_embedding_backfill_interval_secs() -> u64 {
     300
+}
+
+pub(super) fn default_consolidation_interval_secs() -> u64 {
+    86400
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

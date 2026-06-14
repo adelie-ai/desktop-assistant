@@ -1,896 +1,486 @@
-//! Phase 2: per-memory consolidation review (issue #108).
+//! Phase 2: holistic knowledge-base consolidation (issue #394).
 //!
-//! For each KB entry that needs review (gated by `reviewed_at IS NULL`):
+//! Rather than reviewing entries one-by-one against a handful of neighbours,
+//! this loads the user's entire active knowledge base and asks a strong model
+//! to recompute what it should look like — pruning trivia, merging duplicates,
+//! tightening verbose entries — emitting explicit operations against existing
+//! ids. The operations are applied transactionally with soft-delete via
+//! [`reconcile::apply_ops`]; a deletion cap and a logged op-diff guard against
+//! a bad run gutting the store.
 //!
-//! 1. Retrieve candidate related entries by tag overlap + embedding
-//!    similarity (high-precision filter: candidates likely interact with
-//!    the focal entry).
-//! 2. Ask the LLM to review the focal entry in context of its candidates
-//!    and propose actions: keep, update, add scope, merge, delete, or
-//!    request the source transcript for disambiguation.
-//! 3. Buffer all proposed ops; do not apply during the review loop.
-//! 4. After the loop: compute merge clusters via union-find. Clusters of
-//!    size > 2 get an n-ary confirmation call. Each confirmed cluster gets
-//!    a synthesis call to produce unified content.
-//! 5. Apply everything in a single transaction (see `reconcile::apply_ops`).
-//!
-//! Prompt is biased toward "keep both". Merging requires same scope plus
-//! evidence of contradiction or true duplication; different scopes never
-//! merge.
+//! When a user's KB is too large for a single prompt it is sliced into
+//! tag-grouped chunks under a character budget and each chunk is recomputed
+//! independently — redundancy clusters by tag, so near-duplicates stay in the
+//! same slice. Slicing is logged so coverage is never silently bounded.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashSet;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
-use pgvector::Vector;
+use serde::Deserialize;
 use sqlx::PgPool;
 
-use super::common::{extract_json_payload, load_full_transcript};
+use super::common::extract_json_payload;
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
-    ConsolidationStats, DreamingLlmFn, MAX_REVIEW_CANDIDATES, MAX_REVIEW_GENERATION,
-    MAX_REVIEWS_PER_CYCLE, SOFT_DELETE_TTL_DAYS,
+    ConsolidationStats, DreamingLlmFn, MAX_DELETE_FRACTION, MAX_HOLISTIC_PROMPT_CHARS,
+    SOFT_DELETE_TTL_DAYS,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 
-#[derive(Debug, Clone)]
-struct KbRow {
+/// One active KB entry loaded for holistic review.
+struct KbEntry {
     id: String,
     content: String,
     tags: Vec<String>,
     metadata: KbMetadata,
-    /// For candidates: min cosine distance to the focal embedding. NaN for
-    /// the focal itself.
-    distance: f64,
 }
 
+/// Entry point for the consolidation scan. Recomputes each user's active
+/// knowledge base holistically. Cross-user iteration is audit-allowlisted (a
+/// background-worker entry point); every per-user pass installs a `with_user_id`
+/// scope so all sub-queries land in the right partition.
 pub async fn run_consolidation_phase(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
 ) -> Result<ConsolidationStats, CoreError> {
-    // Load focals across all users, grouped by user. The cross-user
-    // scan is audit-allowlisted (background-worker entry point); from
-    // here on every per-user batch installs a `with_user_id` scope so
-    // all sub-queries land in the right partition.
-    let focals_by_user = load_entries_needing_review_by_user(pool).await?;
-    if focals_by_user.is_empty() {
-        tracing::debug!("dreaming: no entries needing review");
+    let user_ids = load_user_ids_with_active_entries(pool).await?;
+    if user_ids.is_empty() {
+        tracing::debug!("dreaming: no active knowledge entries to consolidate");
         return Ok(ConsolidationStats::default());
     }
 
     let mut total = ConsolidationStats::default();
-
-    for (user_id_str, focals) in focals_by_user {
-        if focals.is_empty() {
-            continue;
-        }
-        tracing::info!(
-            "dreaming: consolidation reviewing {} focal entr{} for user {user_id_str}",
-            focals.len(),
-            if focals.len() == 1 { "y" } else { "ies" }
-        );
-
-        let stats = with_user_id(UserId::new(user_id_str.clone()), async {
-            consolidate_user_focals(pool, llm_fn, focals).await
+    for user_id_str in user_ids {
+        let result = with_user_id(UserId::new(user_id_str.clone()), async {
+            consolidate_user(pool, llm_fn).await
         })
-        .await?;
+        .await;
 
-        total.reviewed += stats.reviewed;
-        total.merged_clusters += stats.merged_clusters;
-        total.updated += stats.updated;
-        total.scope_added += stats.scope_added;
-        total.soft_deleted += stats.soft_deleted;
+        match result {
+            Ok(stats) => {
+                total.reviewed += stats.reviewed;
+                total.merged_clusters += stats.merged_clusters;
+                total.updated += stats.updated;
+                total.scope_added += stats.scope_added;
+                total.soft_deleted += stats.soft_deleted;
+            }
+            Err(e) => {
+                tracing::warn!("dreaming: holistic consolidation failed for user {user_id_str}: {e}")
+            }
+        }
     }
 
     Ok(total)
 }
 
-async fn consolidate_user_focals(
+/// Holistically recompute the current user's active KB.
+async fn consolidate_user(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
-    focals: Vec<KbRow>,
 ) -> Result<ConsolidationStats, CoreError> {
+    let entries = load_active_entries(pool).await?;
+    let total_entries = entries.len();
+    if total_entries == 0 {
+        return Ok(ConsolidationStats::default());
+    }
+
+    let slices = slice_entries(entries);
+    if slices.len() > 1 {
+        tracing::info!(
+            "dreaming: KB ({total_entries} entries) exceeds the holistic prompt budget; \
+             recomputing in {} tag-grouped slices",
+            slices.len()
+        );
+    }
+
     let mut buffer = OpBuffer::new();
+    // Merge groups are routed through the buffer's union-find (pairwise) so a
+    // member can't also be edited/deleted standalone, and the model's
+    // synthesized content is recorded keyed by the group's lowest id.
+    let mut merge_content: std::collections::HashMap<String, (String, Option<KbScope>)> =
+        std::collections::HashMap::new();
+    // Deletes are collected across slices so the per-run deletion cap applies
+    // to the user's whole KB, not each slice.
+    let mut delete_ops: Vec<(String, String)> = Vec::new();
 
-    for focal in &focals {
-        let candidates = match retrieve_candidates(pool, focal).await {
-            Ok(c) => c,
+    for slice in &slices {
+        let valid: HashSet<&str> = slice.iter().map(|e| e.id.as_str()).collect();
+
+        let response = match llm_fn(build_system_prompt(), build_user_prompt(slice)).await {
+            Ok(r) => r,
             Err(e) => {
-                tracing::warn!("dreaming: candidate retrieval failed for {}: {e}", focal.id);
-                buffer.mark_reviewed(&focal.id);
+                tracing::warn!("dreaming: consolidation LLM call failed: {e}");
                 continue;
             }
         };
 
-        // Always mark the focal as reviewed even if the LLM call fails —
-        // we don't want failed calls to wedge a row above the watermark
-        // forever.
-        buffer.mark_reviewed(&focal.id);
-
-        let actions = match review_focal(llm_fn, pool, focal, &candidates, false).await {
-            Ok(a) => a,
+        let ops = match parse_operations(&response) {
+            Ok(ops) => ops,
             Err(e) => {
-                tracing::warn!("dreaming: review failed for {}: {e}", focal.id);
+                tracing::warn!("dreaming: could not parse consolidation operations: {e}");
                 continue;
             }
         };
 
-        for action in actions {
-            if let Some(op) = action.into_op(&focal.id) {
-                buffer.absorb(op);
-            }
-        }
-    }
-
-    // Merge-cluster confirmation + synthesis (outside the apply transaction).
-    let clusters = buffer.merge_clusters();
-    let id_to_row: HashMap<String, &KbRow> = focals.iter().map(|r| (r.id.clone(), r)).collect();
-
-    let mut synthesized: Vec<SynthesizedMerge> = Vec::new();
-
-    for cluster in clusters {
-        let refined = if cluster.len() > 2 {
-            confirm_cluster(pool, llm_fn, &cluster, &id_to_row).await
-        } else {
-            cluster.clone()
-        };
-        if refined.len() < 2 {
-            continue;
-        }
-
-        match synthesize_cluster(pool, llm_fn, &refined, &id_to_row).await {
-            Ok(merge) => synthesized.push(merge),
-            Err(e) => {
-                tracing::warn!(
-                    "dreaming: synthesis failed for cluster of {}: {e}",
-                    refined.len()
-                );
-            }
-        }
-    }
-
-    let stats = apply_ops(pool, &buffer, &synthesized, SOFT_DELETE_TTL_DAYS).await?;
-
-    Ok(stats)
-}
-
-async fn load_entries_needing_review_by_user(
-    pool: &PgPool,
-) -> Result<Vec<(String, Vec<KbRow>)>, CoreError> {
-    // Audit-allowlisted: cross-user scan in the dreaming background
-    // worker. The caller groups by user_id and installs a per-user
-    // task-local scope before doing anything else with each row.
-    let rows: Vec<(String, String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT user_id, id, content, tags, metadata \
-         FROM knowledge_base \
-         WHERE reviewed_at IS NULL \
-           AND deleted_at IS NULL \
-           AND review_generation < $1 \
-         ORDER BY user_id, created_at ASC \
-         LIMIT $2",
-    )
-    .bind(MAX_REVIEW_GENERATION)
-    .bind(MAX_REVIEWS_PER_CYCLE)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| CoreError::Storage(format!("dreaming: load focals failed: {e}")))?;
-
-    let mut grouped: BTreeMap<String, Vec<KbRow>> = BTreeMap::new();
-    for (user_id, id, content, tags, metadata_json) in rows {
-        grouped.entry(user_id).or_default().push(KbRow {
-            id,
-            content,
-            tags,
-            metadata: KbMetadata::from_json(&metadata_json),
-            distance: f64::NAN,
-        });
-    }
-    Ok(grouped.into_iter().collect())
-}
-
-/// Legacy helper kept for symmetry; tests still construct KbRows with
-/// the same factory shape.
-#[cfg(test)]
-#[allow(dead_code)]
-async fn load_entries_needing_review(pool: &PgPool) -> Result<Vec<KbRow>, CoreError> {
-    let user_id = current_user_id();
-    let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, content, tags, metadata \
-         FROM knowledge_base \
-         WHERE user_id = $1 \
-           AND reviewed_at IS NULL \
-           AND deleted_at IS NULL \
-           AND review_generation < $2 \
-         ORDER BY created_at ASC \
-         LIMIT $3",
-    )
-    .bind(user_id.as_str())
-    .bind(MAX_REVIEW_GENERATION)
-    .bind(MAX_REVIEWS_PER_CYCLE)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| CoreError::Storage(format!("dreaming: load focals failed: {e}")))?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(id, content, tags, metadata_json)| KbRow {
-            id,
-            content,
-            tags,
-            metadata: KbMetadata::from_json(&metadata_json),
-            distance: f64::NAN,
-        })
-        .collect())
-}
-
-async fn retrieve_candidates(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, CoreError> {
-    let user_id = current_user_id();
-    // Pull the focal's first embedding chunk to use as the similarity probe.
-    let focal_chunk: Option<(Vec<Vector>,)> =
-        sqlx::query_as("SELECT embedding FROM knowledge_base WHERE user_id = $1 AND id = $2")
-            .bind(user_id.as_str())
-            .bind(&focal.id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| {
-                CoreError::Storage(format!("dreaming: load focal embedding failed: {e}"))
-            })?;
-
-    let probe = match focal_chunk.and_then(|(v,)| v.into_iter().next()) {
-        Some(v) => v,
-        None => {
-            // No embedding for focal — fall back to tag-overlap only.
-            return retrieve_by_tags_only(pool, focal).await;
-        }
-    };
-
-    let mut by_id: BTreeMap<String, KbRow> = BTreeMap::new();
-
-    // Tag-overlap search. Scoped to the same user — candidates from
-    // other users' KBs must never reach the LLM's review window.
-    if !focal.tags.is_empty() {
-        let tag_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> = sqlx::query_as(
-            "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
-                        COALESCE(MIN(u.chunk <=> $1), 2.0) AS distance \
-                 FROM knowledge_base kb \
-                 LEFT JOIN LATERAL unnest(kb.embedding) AS u(chunk) ON true \
-                 WHERE kb.user_id = $5 \
-                   AND kb.id != $2 \
-                   AND kb.deleted_at IS NULL \
-                   AND kb.tags && $3 \
-                 GROUP BY kb.id, kb.content, kb.tags, kb.metadata \
-                 ORDER BY distance ASC \
-                 LIMIT $4",
-        )
-        .bind(&probe)
-        .bind(&focal.id)
-        .bind(&focal.tags)
-        .bind(MAX_REVIEW_CANDIDATES)
-        .bind(user_id.as_str())
-        .fetch_all(pool)
-        .await
-        .map_err(|e| CoreError::Storage(format!("dreaming: tag-overlap retrieve failed: {e}")))?;
-
-        for (id, content, tags, metadata_json, distance) in tag_rows {
-            by_id.insert(
-                id.clone(),
-                KbRow {
+        for op in ops {
+            match op {
+                RawOp::Delete { ids, id, reason } => {
+                    for did in ids.into_iter().chain(id) {
+                        if valid.contains(did.as_str()) {
+                            delete_ops.push((did, reason.clone()));
+                        } else {
+                            tracing::debug!("dreaming: ignoring delete of unknown id {did}");
+                        }
+                    }
+                }
+                RawOp::Merge {
+                    ids,
+                    content,
+                    scope,
+                } => {
+                    let members: Vec<String> = ids
+                        .into_iter()
+                        .filter(|i| valid.contains(i.as_str()))
+                        .collect();
+                    if members.len() < 2 {
+                        tracing::debug!("dreaming: skipping merge with <2 valid members");
+                        continue;
+                    }
+                    // Chain pairwise merges so the union-find groups the members;
+                    // record the synthesized content under the lowest id.
+                    let canonical = members.iter().min().cloned().unwrap();
+                    for other in members.iter().skip(1) {
+                        buffer.absorb(ProposedOp::Merge {
+                            a: members[0].clone(),
+                            b: other.clone(),
+                        });
+                    }
+                    merge_content.insert(canonical, (content, scope.filter(|s| !s.is_empty())));
+                }
+                RawOp::Edit {
                     id,
                     content,
-                    tags,
-                    metadata: KbMetadata::from_json(&metadata_json),
-                    distance,
-                },
-            );
-        }
-    }
-
-    // Embedding-similarity search (catches related-by-content entries
-    // that don't share tags). Scoped to the same user.
-    let emb_rows: Vec<(String, String, Vec<String>, serde_json::Value, f64)> = sqlx::query_as(
-        "SELECT kb.id, kb.content, kb.tags, kb.metadata, \
-                    MIN(u.chunk <=> $1) AS distance \
-             FROM knowledge_base kb, \
-                  LATERAL unnest(kb.embedding) AS u(chunk) \
-             WHERE kb.user_id = $4 \
-               AND kb.id != $2 \
-               AND kb.deleted_at IS NULL \
-               AND kb.embedding IS NOT NULL \
-             GROUP BY kb.id, kb.content, kb.tags, kb.metadata \
-             ORDER BY distance ASC \
-             LIMIT $3",
-    )
-    .bind(&probe)
-    .bind(&focal.id)
-    .bind(MAX_REVIEW_CANDIDATES)
-    .bind(user_id.as_str())
-    .fetch_all(pool)
-    .await
-    .map_err(|e| CoreError::Storage(format!("dreaming: embedding retrieve failed: {e}")))?;
-
-    for (id, content, tags, metadata_json, distance) in emb_rows {
-        let entry = KbRow {
-            id: id.clone(),
-            content,
-            tags,
-            metadata: KbMetadata::from_json(&metadata_json),
-            distance,
-        };
-        by_id
-            .entry(id)
-            .and_modify(|existing| {
-                if distance < existing.distance {
-                    existing.distance = distance;
+                    scope,
+                } => {
+                    if !valid.contains(id.as_str()) {
+                        tracing::debug!("dreaming: ignoring edit of unknown id {id}");
+                        continue;
+                    }
+                    if let Some(content) = content {
+                        buffer.absorb(ProposedOp::Update {
+                            id: id.clone(),
+                            new_content: content,
+                        });
+                    }
+                    if let Some(scope) = scope.filter(|s| !s.is_empty()) {
+                        buffer.absorb(ProposedOp::AddScope { id, scope });
+                    }
                 }
-            })
-            .or_insert(entry);
-    }
-
-    let mut combined: Vec<KbRow> = by_id.into_values().collect();
-    combined.sort_by(|a, b| {
-        a.distance
-            .partial_cmp(&b.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    combined.truncate(MAX_REVIEW_CANDIDATES as usize);
-    Ok(combined)
-}
-
-async fn retrieve_by_tags_only(pool: &PgPool, focal: &KbRow) -> Result<Vec<KbRow>, CoreError> {
-    if focal.tags.is_empty() {
-        return Ok(Vec::new());
-    }
-    let user_id = current_user_id();
-    let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, content, tags, metadata \
-         FROM knowledge_base \
-         WHERE user_id = $4 \
-           AND id != $1 AND deleted_at IS NULL AND tags && $2 \
-         ORDER BY updated_at DESC \
-         LIMIT $3",
-    )
-    .bind(&focal.id)
-    .bind(&focal.tags)
-    .bind(MAX_REVIEW_CANDIDATES)
-    .bind(user_id.as_str())
-    .fetch_all(pool)
-    .await
-    .map_err(|e| CoreError::Storage(format!("dreaming: tag-only retrieve failed: {e}")))?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(id, content, tags, metadata_json)| KbRow {
-            id,
-            content,
-            tags,
-            metadata: KbMetadata::from_json(&metadata_json),
-            distance: f64::NAN,
-        })
-        .collect())
-}
-
-// ── Review action types ──────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-enum ReviewAction {
-    Keep,
-    Update(String),
-    AddScope(KbScope),
-    MergeWith(String),
-    Delete(String),
-    FetchSource,
-}
-
-impl ReviewAction {
-    fn into_op(self, focal_id: &str) -> Option<ProposedOp> {
-        match self {
-            ReviewAction::Keep | ReviewAction::FetchSource => None,
-            ReviewAction::Update(content) => Some(ProposedOp::Update {
-                id: focal_id.to_string(),
-                new_content: content,
-            }),
-            ReviewAction::AddScope(scope) => Some(ProposedOp::AddScope {
-                id: focal_id.to_string(),
-                scope,
-            }),
-            ReviewAction::MergeWith(target) => Some(ProposedOp::Merge {
-                a: focal_id.to_string(),
-                b: target,
-            }),
-            ReviewAction::Delete(reason) => Some(ProposedOp::Delete {
-                id: focal_id.to_string(),
-                reason,
-            }),
-        }
-    }
-}
-
-async fn review_focal(
-    llm_fn: &DreamingLlmFn,
-    pool: &PgPool,
-    focal: &KbRow,
-    candidates: &[KbRow],
-    transcript_included: bool,
-) -> Result<Vec<ReviewAction>, CoreError> {
-    let system_prompt = build_review_system_prompt();
-    let user_prompt = build_review_user_prompt(focal, candidates, None);
-
-    let response = llm_fn(system_prompt.clone(), user_prompt)
-        .await
-        .map_err(CoreError::Storage)?;
-    let actions = parse_review_response(&response);
-
-    // If the LLM asked for the source and we haven't already provided it,
-    // re-call once with the transcript appended.
-    let wants_source = actions
-        .iter()
-        .any(|a| matches!(a, ReviewAction::FetchSource));
-    if wants_source && !transcript_included {
-        let transcript = if let Some(conv_id) = &focal.metadata.source_conversation_id {
-            load_full_transcript(pool, conv_id)
-                .await
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        if transcript.is_empty() {
-            tracing::debug!(
-                "dreaming: focal {} requested source but it's gone — proceeding on KB alone",
-                focal.id
-            );
-            // Strip FetchSource from the action list; everything else stands.
-            return Ok(actions
-                .into_iter()
-                .filter(|a| !matches!(a, ReviewAction::FetchSource))
-                .collect());
-        }
-
-        let user_prompt_with_source =
-            build_review_user_prompt(focal, candidates, Some(&transcript));
-        let response = llm_fn(system_prompt, user_prompt_with_source)
-            .await
-            .map_err(CoreError::Storage)?;
-        return Ok(parse_review_response(&response)
-            .into_iter()
-            .filter(|a| !matches!(a, ReviewAction::FetchSource))
-            .collect());
-    }
-
-    Ok(actions)
-}
-
-fn build_review_system_prompt() -> String {
-    String::from(
-        "You are a memory consolidation reviewer. You see one knowledge-base entry \
-        (the FOCAL) plus a small set of CANDIDATES that may interact with it. \
-        Your job is to decide what to do with the focal entry.\n\
-        \n\
-        ## Bias toward KEEP\n\
-        \n\
-        The default action is `keep`. Only propose other actions when you have \
-        clear evidence. Specifically:\n\
-        \n\
-        - **Different scopes never merge.** Two facts with different `scope` \
-        objects are about different contexts and must both be preserved, \
-        even if their content looks similar (e.g. \"project dir is /a\" with \
-        `scope: {project: \"adelie-ai\"}` vs \"project dir is /b\" with \
-        `scope: {project: \"other\"}` — KEEP BOTH).\n\
-        - **Merge only on same scope + duplication or contradiction.** If \
-        two facts share scope AND say the same thing in different words, \
-        propose `merge_with`. If they share scope AND contradict each \
-        other, the newer one supersedes — propose `merge_with` and let \
-        synthesis pick the right text.\n\
-        - **Missing scope is a signal.** If the focal has `scope: null` but \
-        all its candidates share the same non-null scope, the focal was \
-        probably mis-extracted — propose `add_scope` with the inferred \
-        scope, NOT a merge.\n\
-        - **Use `fetch_source` when unsure.** If you can't decide because \
-        the focal's wording is ambiguous, request the source transcript. \
-        Don't guess.\n\
-        \n\
-        ## Output\n\
-        \n\
-        Return a JSON object with an `actions` array. Available actions:\n\
-        \n\
-        - `{\"op\": \"keep\"}` — no change (default).\n\
-        - `{\"op\": \"update\", \"new_content\": \"...\"}` — rewrite the \
-        focal for clarity. Use sparingly; the existing content is usually \
-        fine.\n\
-        - `{\"op\": \"add_scope\", \"scope\": {\"project\": \"adelie-ai\"}}` \
-        — annotate a scope-naked focal with the scope its peers all share.\n\
-        - `{\"op\": \"merge_with\", \"target_id\": \"<candidate id>\"}` — \
-        propose merging focal with that candidate. Multiple `merge_with` \
-        actions are allowed.\n\
-        - `{\"op\": \"delete\", \"reason\": \"...\"}` — soft-delete the \
-        focal (e.g. it's clearly noise, not a real fact). Recoverable for \
-        a TTL window. Avoid unless confident.\n\
-        - `{\"op\": \"fetch_source\"}` — ask for the source transcript.\n\
-        \n\
-        You may emit multiple actions in one response (e.g. `add_scope` + \
-        `merge_with`). If unsure, just `keep`.",
-    )
-}
-
-fn format_scope(scope: Option<&KbScope>) -> String {
-    match scope {
-        None => "null".to_string(),
-        Some(s) => serde_json::to_string(&s.0).unwrap_or_else(|_| "{}".to_string()),
-    }
-}
-
-fn build_review_user_prompt(
-    focal: &KbRow,
-    candidates: &[KbRow],
-    transcript: Option<&str>,
-) -> String {
-    let mut prompt = String::from("## FOCAL entry\n\n");
-    prompt.push_str(&format!("- id: `{}`\n", focal.id));
-    prompt.push_str(&format!("- content: {}\n", focal.content));
-    prompt.push_str(&format!("- tags: [{}]\n", focal.tags.join(", ")));
-    prompt.push_str(&format!(
-        "- scope: {}\n",
-        format_scope(focal.metadata.effective_scope())
-    ));
-
-    if candidates.is_empty() {
-        prompt.push_str("\n## CANDIDATES\n\n(no related entries found)\n");
-    } else {
-        prompt.push_str("\n## CANDIDATES (potentially related)\n\n");
-        for c in candidates {
-            prompt.push_str(&format!("- id: `{}`\n", c.id));
-            prompt.push_str(&format!("  content: {}\n", c.content));
-            prompt.push_str(&format!("  tags: [{}]\n", c.tags.join(", ")));
-            prompt.push_str(&format!(
-                "  scope: {}\n",
-                format_scope(c.metadata.effective_scope())
-            ));
-            if c.distance.is_finite() {
-                prompt.push_str(&format!("  similarity-distance: {:.3}\n", c.distance));
+                RawOp::Keep => {}
             }
         }
     }
 
-    if let Some(t) = transcript {
-        prompt.push_str("\n## SOURCE TRANSCRIPT (you requested this)\n\n");
-        prompt.push_str(t);
-        prompt.push('\n');
+    // Mark every loaded entry reviewed so first-review timestamps advance even
+    // for entries the model left untouched.
+    for slice in &slices {
+        for e in slice {
+            buffer.mark_reviewed(&e.id);
+        }
     }
 
+    // Resolve merge clusters (union-find over the chained pairwise merges) into
+    // synthesized merges, pulling the recorded content for each group.
+    let mut synthesized: Vec<SynthesizedMerge> = Vec::new();
+    for cluster in buffer.merge_clusters() {
+        let Some((_, (new_content, new_scope))) = cluster
+            .iter()
+            .find_map(|id| merge_content.get(id).map(|c| (id, c)))
+        else {
+            tracing::warn!("dreaming: merge cluster without synthesized content; skipping");
+            continue;
+        };
+        let canonical_id = OpBuffer::canonical_of(&cluster)
+            .cloned()
+            .expect("non-empty cluster has a canonical id");
+        synthesized.push(SynthesizedMerge {
+            canonical_id,
+            member_ids: cluster.iter().cloned().collect(),
+            new_content: new_content.clone(),
+            new_scope: new_scope.clone(),
+        });
+    }
+
+    // Deletion cap over the whole KB.
+    let cap = ((total_entries as f64) * MAX_DELETE_FRACTION).ceil() as usize;
+    let cap = cap.max(1);
+    if delete_ops.len() > cap {
+        tracing::warn!(
+            "dreaming: holistic consolidation proposed {} deletes for {total_entries} entries; \
+             capping at {cap} (excess dropped this run)",
+            delete_ops.len()
+        );
+        delete_ops.truncate(cap);
+    }
+    for (id, reason) in &delete_ops {
+        tracing::debug!("dreaming: consolidation delete {id}: {reason}");
+        buffer.absorb(ProposedOp::Delete {
+            id: id.clone(),
+            reason: reason.clone(),
+        });
+    }
+
+    tracing::info!(
+        "dreaming: holistic consolidation plan for {total_entries} entries — \
+         {} merge(s), {} edit(s)/scope-add(s), {} delete(s)",
+        synthesized.len(),
+        buffer.standalone_updates().len() + buffer.standalone_scope_adds().len(),
+        delete_ops.len(),
+    );
+
+    apply_ops(pool, &buffer, &synthesized, SOFT_DELETE_TTL_DAYS).await
+}
+
+/// Distinct users that have at least one non-deleted KB entry. Audit-allowlisted
+/// cross-user scan (background worker); callers immediately scope per user.
+async fn load_user_ids_with_active_entries(pool: &PgPool) -> Result<Vec<String>, CoreError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT user_id FROM knowledge_base WHERE deleted_at IS NULL ORDER BY user_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("dreaming: load user ids failed: {e}")))?;
+    Ok(rows.into_iter().map(|(u,)| u).collect())
+}
+
+/// All active entries for the current user, ordered by tags so that slicing
+/// (when needed) groups likely-related entries together.
+async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
+    let user_id = current_user_id();
+    let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, content, tags, metadata \
+         FROM knowledge_base \
+         WHERE user_id = $1 AND deleted_at IS NULL \
+         ORDER BY tags, created_at ASC",
+    )
+    .bind(user_id.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("dreaming: load active entries failed: {e}")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, content, tags, md)| KbEntry {
+            id,
+            content,
+            tags,
+            metadata: KbMetadata::from_json(&md),
+        })
+        .collect())
+}
+
+/// Greedily pack tag-ordered entries into slices under the prompt char budget.
+fn slice_entries(entries: Vec<KbEntry>) -> Vec<Vec<KbEntry>> {
+    const PER_ENTRY_OVERHEAD: usize = 200;
+    let mut slices: Vec<Vec<KbEntry>> = Vec::new();
+    let mut current: Vec<KbEntry> = Vec::new();
+    let mut current_chars = 0usize;
+
+    for e in entries {
+        let cost = e.content.len()
+            + e.tags.iter().map(|t| t.len() + 2).sum::<usize>()
+            + PER_ENTRY_OVERHEAD;
+        if !current.is_empty() && current_chars + cost > MAX_HOLISTIC_PROMPT_CHARS {
+            slices.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(e);
+        current_chars += cost;
+    }
+    if !current.is_empty() {
+        slices.push(current);
+    }
+    slices
+}
+
+fn build_system_prompt() -> String {
+    String::from(
+        "You are curating a personal long-term knowledge base. You are shown the COMPLETE set \
+         of entries (or a self-contained slice of it). Recompute what this set SHOULD look like \
+         and return the operations that get it there.\n\
+         \n\
+         Bias toward a lean, high-signal store:\n\
+         - DELETE entries that are trivial, transient, or circumstantial — facts that mattered \
+           only in the moment, are no longer useful going forward, or are obvious/generic.\n\
+         - MERGE entries that are duplicates, near-duplicates, or that together describe one \
+           thing, into a single clear entry. Only merge entries about the SAME subject and scope.\n\
+         - EDIT entries that are correct but verbose, vague, or missing their scope: tighten the \
+           prose and/or attach a scope.\n\
+         - KEEP (do nothing) for entries that are already good, durable, and distinct.\n\
+         \n\
+         Preserve genuinely useful durable knowledge — preferences, decisions, project facts, \
+         recurring solutions. When in doubt about a unique, useful fact, keep it. When in doubt \
+         about a near-duplicate or a trivial note, prune it.\n\
+         \n\
+         Each entry shows its id, tags, scope, and content. Refer to entries ONLY by the ids \
+         shown. Do not invent ids.\n\
+         \n\
+         ## Output format\n\
+         \n\
+         Return a JSON object with an `operations` array. Each operation is one of:\n\
+         - {\"op\":\"delete\",\"ids\":[\"<id>\",...],\"reason\":\"<why, short>\"}\n\
+         - {\"op\":\"merge\",\"ids\":[\"<id>\",\"<id>\",...],\"content\":\"<unified self-contained prose>\",\"scope\":{<dim>:<value>}|null}\n\
+         - {\"op\":\"edit\",\"id\":\"<id>\",\"content\":\"<rewritten prose, optional>\",\"scope\":{<dim>:<value>}|null}\n\
+         \n\
+         Only emit operations for entries that should change; omit anything you would keep \
+         as-is. `scope` is an object of string dimensions (e.g. {\"project\":\"adelie-ai\"}) or \
+         null for universal facts. Output ONLY the JSON object.",
+    )
+}
+
+fn build_user_prompt(entries: &[KbEntry]) -> String {
+    let mut prompt = String::with_capacity(entries.len() * 256);
+    prompt.push_str("# Knowledge base entries\n\n");
+    for e in entries {
+        prompt.push_str("## ");
+        prompt.push_str(&e.id);
+        prompt.push('\n');
+
+        prompt.push_str("tags: ");
+        if e.tags.is_empty() {
+            prompt.push_str("(none)");
+        } else {
+            prompt.push_str(&e.tags.join(", "));
+        }
+        prompt.push('\n');
+
+        prompt.push_str("scope: ");
+        match e.metadata.effective_scope() {
+            Some(scope) => {
+                let dims: Vec<String> =
+                    scope.0.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                prompt.push_str(&dims.join(", "));
+            }
+            None => prompt.push_str("(universal)"),
+        }
+        prompt.push('\n');
+
+        prompt.push_str(&e.content);
+        prompt.push_str("\n\n");
+    }
     prompt.push_str(
-        "\nDecide what to do with the focal. Return a JSON object with an `actions` array. \
-        Default to `keep` unless you have clear evidence.",
+        "Return the operations (delete / merge / edit) that improve this set. \
+         Omit entries you would keep unchanged.",
     );
     prompt
 }
 
-fn parse_review_response(response: &str) -> Vec<ReviewAction> {
-    let payload = extract_json_payload(response.trim());
-    let root: serde_json::Value = match serde_json::from_str(&payload) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("dreaming: review response not JSON: {e}");
-            return vec![ReviewAction::Keep];
-        }
-    };
-
-    let actions_array = match root.get("actions").and_then(|v| v.as_array()) {
-        Some(a) => a.clone(),
-        None => match root.as_array() {
-            Some(a) => a.clone(),
-            None => return vec![ReviewAction::Keep],
-        },
-    };
-
-    let parsed: Vec<ReviewAction> = actions_array.iter().filter_map(parse_one_action).collect();
-    if parsed.is_empty() {
-        vec![ReviewAction::Keep]
-    } else {
-        parsed
-    }
+/// One operation in the model's recompute plan. `keep` (and any unrecognized
+/// op) is a no-op via `#[serde(other)]`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum RawOp {
+    Delete {
+        #[serde(default)]
+        ids: Vec<String>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        reason: String,
+    },
+    Merge {
+        #[serde(default)]
+        ids: Vec<String>,
+        content: String,
+        #[serde(default)]
+        scope: Option<KbScope>,
+    },
+    Edit {
+        id: String,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        scope: Option<KbScope>,
+    },
+    #[serde(other)]
+    Keep,
 }
 
-fn parse_one_action(value: &serde_json::Value) -> Option<ReviewAction> {
-    let obj = value.as_object()?;
-    let op = obj.get("op")?.as_str()?;
-    match op {
-        "keep" => Some(ReviewAction::Keep),
-        "update" => {
-            let new_content = obj.get("new_content")?.as_str()?.trim().to_string();
-            if new_content.is_empty() {
-                None
-            } else {
-                Some(ReviewAction::Update(new_content))
-            }
-        }
-        "add_scope" => {
-            let scope_val = obj.get("scope")?.as_object()?;
-            let mut scope = KbScope::new();
-            for (k, v) in scope_val {
-                if let Some(s) = v.as_str() {
-                    scope = scope.with(k.clone(), s.to_string());
-                }
-            }
-            if scope.is_empty() {
-                None
-            } else {
-                Some(ReviewAction::AddScope(scope))
-            }
-        }
-        "merge_with" => {
-            let target = obj.get("target_id")?.as_str()?.trim().to_string();
-            if target.is_empty() {
-                None
-            } else {
-                Some(ReviewAction::MergeWith(target))
-            }
-        }
-        "delete" => {
-            let reason = obj
-                .get("reason")
-                .and_then(|r| r.as_str())
-                .unwrap_or("no reason given")
-                .to_string();
-            Some(ReviewAction::Delete(reason))
-        }
-        "fetch_source" => Some(ReviewAction::FetchSource),
-        other => {
-            tracing::warn!("dreaming: unknown review op '{other}'");
-            None
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct OpsEnvelope {
+    #[serde(default)]
+    operations: Vec<RawOp>,
 }
 
-// ── Cluster confirmation + synthesis ─────────────────────────────────
-
-/// For clusters of size > 2, ask the LLM whether all members truly belong.
-/// Returns the subset confirmed as belonging; non-confirmed ids drop back to
-/// standalone (no merge).
-async fn confirm_cluster(
-    pool: &PgPool,
-    llm_fn: &DreamingLlmFn,
-    cluster: &BTreeSet<String>,
-    id_to_focal: &HashMap<String, &KbRow>,
-) -> BTreeSet<String> {
-    let members = load_cluster_members(pool, cluster, id_to_focal).await;
-    if members.len() < 2 {
-        return BTreeSet::new();
-    }
-
-    let mut user = String::from(
-        "Several entries have been transitively grouped as potentially the \
-        same fact. Confirm which ones actually belong together (same scope, \
-        same factual claim). It's fine to confirm only a subset; non-\
-        confirmed entries stay standalone.\n\n## Candidates\n\n",
-    );
-    for m in &members {
-        user.push_str(&format!("- id: `{}`\n", m.id));
-        user.push_str(&format!("  content: {}\n", m.content));
-        user.push_str(&format!(
-            "  scope: {}\n",
-            format_scope(m.metadata.effective_scope())
-        ));
-    }
-    user.push_str(
-        "\nReturn a JSON object: `{\"confirmed\": [\"id1\", \"id2\", ...]}` \
-        listing the ids that truly belong to a single merged entry. If fewer \
-        than 2 belong, return `{\"confirmed\": []}`.",
-    );
-
-    let system = String::from(
-        "You confirm whether a transitively-built merge cluster is genuine. \
-        Be conservative: it's better to split a real cluster than to merge \
-        unrelated entries.",
-    );
-
-    let response = match llm_fn(system, user).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("dreaming: confirm cluster LLM call failed: {e}");
-            return BTreeSet::new();
-        }
-    };
-
-    parse_confirmed_ids(&response, cluster)
-}
-
-fn parse_confirmed_ids(response: &str, cluster: &BTreeSet<String>) -> BTreeSet<String> {
-    let payload = extract_json_payload(response.trim());
-    let parsed: serde_json::Value = match serde_json::from_str(&payload) {
-        Ok(v) => v,
-        Err(_) => return BTreeSet::new(),
-    };
-    let arr = match parsed.get("confirmed").and_then(|v| v.as_array()) {
-        Some(a) => a.clone(),
-        None => return BTreeSet::new(),
-    };
-    arr.into_iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .filter(|id| cluster.contains(id))
-        .collect()
-}
-
-async fn load_cluster_members(
-    pool: &PgPool,
-    cluster: &BTreeSet<String>,
-    id_to_focal: &HashMap<String, &KbRow>,
-) -> Vec<KbRow> {
-    // Use focal rows when available (already in memory); otherwise hit DB.
-    let mut have: Vec<KbRow> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
-    for id in cluster {
-        if let Some(row) = id_to_focal.get(id) {
-            have.push((*row).clone());
-        } else {
-            missing.push(id.clone());
-        }
-    }
-    if !missing.is_empty() {
-        let user_id = current_user_id();
-        type KbRowTuple = (String, String, Vec<String>, serde_json::Value);
-        let rows: Result<Vec<KbRowTuple>, _> = sqlx::query_as(
-            "SELECT id, content, tags, metadata FROM knowledge_base \
-             WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
-        )
-        .bind(user_id.as_str())
-        .bind(&missing)
-        .fetch_all(pool)
-        .await;
-        if let Ok(rows) = rows {
-            for (id, content, tags, metadata_json) in rows {
-                have.push(KbRow {
-                    id,
-                    content,
-                    tags,
-                    metadata: KbMetadata::from_json(&metadata_json),
-                    distance: f64::NAN,
-                });
-            }
-        }
-    }
-    have
-}
-
-async fn synthesize_cluster(
-    pool: &PgPool,
-    llm_fn: &DreamingLlmFn,
-    cluster: &BTreeSet<String>,
-    id_to_focal: &HashMap<String, &KbRow>,
-) -> Result<SynthesizedMerge, CoreError> {
-    let members = load_cluster_members(pool, cluster, id_to_focal).await;
-    if members.len() < 2 {
-        return Err(CoreError::Storage(
-            "synthesize: fewer than 2 members".to_string(),
-        ));
-    }
-
-    let canonical_id = OpBuffer::canonical_of(cluster)
-        .cloned()
-        .ok_or_else(|| CoreError::Storage("synthesize: empty cluster".to_string()))?;
-
-    let mut user = String::from(
-        "Merge the following entries into a single unified knowledge-base \
-        entry. Preserve all factual content; remove only redundancy. The \
-        merged entry must keep the same scope as the inputs (they should \
-        already share scope at this stage).\n\n## Entries to merge\n\n",
-    );
-    for m in &members {
-        user.push_str(&format!("- id: `{}`\n", m.id));
-        user.push_str(&format!("  content: {}\n", m.content));
-        user.push_str(&format!(
-            "  scope: {}\n",
-            format_scope(m.metadata.effective_scope())
-        ));
-    }
-    user.push_str(
-        "\nReturn JSON: `{\"content\": \"<unified prose sentence(s)>\", \
-        \"scope\": null | {<dimensions>}}`. The scope should reflect the \
-        agreed-upon scope of the inputs.",
-    );
-
-    let system = String::from(
-        "You synthesize a set of related knowledge-base entries into a single \
-        unified entry. Preserve all factual claims; deduplicate redundant \
-        phrasing; keep the entry self-contained and concise.",
-    );
-
-    let response = llm_fn(system, user).await.map_err(CoreError::Storage)?;
-    let payload = extract_json_payload(response.trim());
-    let parsed: serde_json::Value = serde_json::from_str(&payload)
-        .map_err(|e| CoreError::Storage(format!("synthesize: response not JSON: {e}")))?;
-
-    let new_content = parsed
-        .get("content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| CoreError::Storage("synthesize: missing content".to_string()))?;
-    if new_content.is_empty() {
-        return Err(CoreError::Storage("synthesize: empty content".to_string()));
-    }
-
-    let new_scope = match parsed.get("scope") {
-        Some(serde_json::Value::Object(map)) => {
-            let mut scope = KbScope::new();
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    scope = scope.with(k.clone(), s.to_string());
-                }
-            }
-            if scope.is_empty() { None } else { Some(scope) }
-        }
-        _ => None,
-    };
-
-    Ok(SynthesizedMerge {
-        canonical_id,
-        member_ids: cluster.iter().cloned().collect(),
-        new_content,
-        new_scope,
-    })
+fn parse_operations(response: &str) -> Result<Vec<RawOp>, CoreError> {
+    let payload = extract_json_payload(response);
+    let env: OpsEnvelope = serde_json::from_str(&payload)
+        .map_err(|e| CoreError::Storage(format!("dreaming: bad consolidation JSON: {e}")))?;
+    Ok(env.operations)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_keep_action() {
-        let r = parse_review_response(r#"{"actions": [{"op": "keep"}]}"#);
-        assert_eq!(r.len(), 1);
-        assert!(matches!(r[0], ReviewAction::Keep));
-    }
-
-    #[test]
-    fn parses_multiple_actions() {
-        let r = parse_review_response(
-            r#"{"actions": [
-              {"op": "add_scope", "scope": {"project": "adelie-ai"}},
-              {"op": "merge_with", "target_id": "xyz"}
-            ]}"#,
-        );
-        assert_eq!(r.len(), 2);
-        assert!(matches!(r[0], ReviewAction::AddScope(_)));
-        assert!(matches!(r[1], ReviewAction::MergeWith(_)));
-    }
-
-    #[test]
-    fn empty_actions_defaults_to_keep() {
-        let r = parse_review_response(r#"{"actions": []}"#);
-        assert!(matches!(r[0], ReviewAction::Keep));
-    }
-
-    #[test]
-    fn invalid_json_defaults_to_keep() {
-        let r = parse_review_response("not json");
-        assert!(matches!(r[0], ReviewAction::Keep));
-    }
-
-    #[test]
-    fn delete_without_reason_uses_placeholder() {
-        let r = parse_review_response(r#"{"actions":[{"op":"delete"}]}"#);
-        assert_eq!(r.len(), 1);
-        if let ReviewAction::Delete(reason) = &r[0] {
-            assert_eq!(reason, "no reason given");
-        } else {
-            panic!("expected delete");
+    fn entry(id: &str, content: &str, tags: &[&str]) -> KbEntry {
+        KbEntry {
+            id: id.to_string(),
+            content: content.to_string(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            metadata: KbMetadata::default(),
         }
     }
 
     #[test]
-    fn unknown_op_skipped_but_others_kept() {
-        let r = parse_review_response(r#"{"actions":[{"op":"weird"},{"op":"keep"}]}"#);
-        assert_eq!(r.len(), 1);
-        assert!(matches!(r[0], ReviewAction::Keep));
+    fn parses_all_op_kinds_and_ignores_keep() {
+        let resp = r#"```json
+        {"operations": [
+            {"op": "delete", "ids": ["a", "b"], "reason": "trivial"},
+            {"op": "merge", "ids": ["c", "d"], "content": "unified", "scope": {"project": "x"}},
+            {"op": "edit", "id": "e", "content": "tighter"},
+            {"op": "keep", "ids": ["f"]},
+            {"op": "something_new", "id": "g"}
+        ]}
+        ```"#;
+        let ops = parse_operations(resp).unwrap();
+        assert_eq!(ops.len(), 5);
+        assert!(matches!(&ops[0], RawOp::Delete { ids, reason, .. }
+            if ids == &["a", "b"] && reason == "trivial"));
+        assert!(matches!(&ops[1], RawOp::Merge { ids, content, scope }
+            if ids == &["c", "d"] && content == "unified" && scope.is_some()));
+        assert!(matches!(&ops[2], RawOp::Edit { id, content, .. }
+            if id == "e" && content.as_deref() == Some("tighter")));
+        // "keep" and unknown ops both fold into the Keep no-op variant.
+        assert!(matches!(ops[3], RawOp::Keep));
+        assert!(matches!(ops[4], RawOp::Keep));
     }
 
     #[test]
-    fn confirm_ids_filters_to_cluster_membership() {
-        let cluster: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        let response = r#"{"confirmed": ["a", "b", "d"]}"#;
-        let confirmed = parse_confirmed_ids(response, &cluster);
-        assert_eq!(confirmed.len(), 2);
-        assert!(confirmed.contains("a"));
-        assert!(confirmed.contains("b"));
-        assert!(!confirmed.contains("d"));
+    fn missing_operations_key_is_empty() {
+        let ops = parse_operations("{}").unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn slice_entries_splits_over_budget() {
+        // Each entry ~ MAX/3 chars, so 4 entries span 2 slices.
+        let big = "x".repeat(MAX_HOLISTIC_PROMPT_CHARS / 3);
+        let entries: Vec<KbEntry> = (0..4).map(|i| entry(&format!("id{i}"), &big, &[])).collect();
+        let slices = slice_entries(entries);
+        assert!(slices.len() >= 2, "expected multiple slices, got {}", slices.len());
+        // Every entry is preserved across slices.
+        let total: usize = slices.iter().map(|s| s.len()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn slice_entries_keeps_small_kb_in_one_slice() {
+        let entries: Vec<KbEntry> =
+            (0..10).map(|i| entry(&format!("id{i}"), "short", &["t"])).collect();
+        let slices = slice_entries(entries);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].len(), 10);
     }
 }
