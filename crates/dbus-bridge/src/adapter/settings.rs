@@ -1,38 +1,35 @@
 //! D-Bus adapter for `/org/desktopAssistant/Settings`.
 //!
-//! ## Coverage gap
+//! Mirrors the in-process settings adapter
+//! (`crates/dbus-interface/src/settings.rs`) method-for-method, dispatching
+//! each method as an [`api::Command`] over the [`BridgeTransport`] instead of
+//! calling `SettingsService` directly. The introspection parity gate
+//! (`tests/introspection.rs`) enforces that the surface matches.
 //!
-//! The in-process settings adapter
-//! (`crates/dbus-interface/src/settings.rs`) calls methods on
-//! `SettingsService`. Most now have an `api::Command` wire equivalent;
-//! the bridge adapter below still proxies only a subset of them.
+//! ## Intentional surface differences (the introspection gate's Q2 carve-out)
 //!
-//! - `GetDatabaseSettings` / `SetDatabaseSettings`,
-//!   `GetBackendTasksSettings` / `SetBackendTasksSettings`,
-//!   `GetWsAuthSettings` / `SetWsAuthSettings`: **wire-modeled as of
-//!   #314** (bridge cutover 2/7). Proxying them through this adapter is
-//!   the next step (#315); they are not yet exposed here.
-//! - The MCP server CRUD methods
-//!   (`AddMcpServer`/`RemoveMcpServer`/`SetMcpServerEnabled`/
-//!   `McpServerAction`) are wire-modeled and now fully round-trip
-//!   `command`/`args`/`namespace` (#314 surfaced them on
-//!   `McpServerStatusInfo`); the bridge still proxies only
-//!   `ListMcpServers`, with CRUD proxying deferred to #315.
-//! - `GetLlmSettings` / `SetLlmSettings` (legacy single-connection
-//!   surface, removed from `api-model`; supplanted by named
-//!   connections via the `Connections` adapter) and `ValidateWsJwt`
-//!   have **no callers in adele-kde** (#314 Q2) and are intentionally
-//!   NOT wire-modeled.
-//! - `GenerateWsJwt` (#314 Q1, gated on a security review) is also not
-//!   wire-modeled; the bridge already has a JWT from the local minter,
-//!   and clients that need their own should call the minter directly.
+//! Three methods on the in-process surface are **deliberately not** mirrored
+//! here (#314 Q1/Q2); they have no caller in adele-kde and no `api::Command`
+//! wire equivalent:
 //!
-//! Per Option A in PR #106, this is acceptable: the daemon still
-//! ships the in-process surface, and existing TUI/KCM/plasmoid clients
-//! talk to that. The bridge exposes the wire-proxyable subset under a
-//! configurable name (default `org.desktopAssistant.Bridge`), and the
-//! follow-up step (#315) proxies the now-wire-modeled settings methods
-//! through this adapter.
+//! - `GetLlmSettings` / `SetLlmSettings` — the legacy single-connection LLM
+//!   surface, removed from `api-model` and supplanted by named connections
+//!   (the `Connections` adapter). No KDE caller.
+//! - `GenerateWsJwt` — JWT minting is **off D-Bus entirely** (#281): the
+//!   bridge already holds a JWT from the local minter, and any client that
+//!   needs one calls the minter directly. JWT generation/validation stays
+//!   factored in `auth-jwt` / `jwt-minter`, a WS/web concern.
+//!
+//! These are the only entries the parity gate is allowed to find missing; see
+//! the `Q2_DROPS` list in `tests/introspection.rs`.
+//!
+//! ## Database settings carry a secret
+//!
+//! `get_database_settings` returns the connection `url` verbatim, which for a
+//! password-auth deployment embeds the DB password. This faithfully mirrors
+//! the in-process method (no regression); removing the password from the
+//! returned URL is tracked in the secrets-hardening epic (#365), a prerequisite
+//! before this surface is exposed to any less-trusted (e.g. remote WS) client.
 
 use std::sync::Arc;
 
@@ -443,6 +440,231 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         }
     }
 
+    /// Return database settings: `(url, max_connections)`.
+    ///
+    /// SECURITY: `url` is the raw connection string and, for password auth,
+    /// embeds the password inline — returned verbatim, exactly as the
+    /// in-process `get_database_settings` does (#314 / #365 walks this back).
+    async fn get_database_settings(&self) -> fdo::Result<(String, u32)> {
+        let result = self.dispatch(api::Command::GetDatabaseSettings).await?;
+        match result {
+            api::CommandResult::DatabaseSettings(v) => Ok((v.url, v.max_connections)),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected GetDatabaseSettings result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Update database settings. An empty `url` clears it — the daemon's
+    /// `SetDatabaseSettings` handler normalizes the empty string, so the
+    /// bridge forwards it verbatim (no client-side normalization).
+    async fn set_database_settings(&self, url: &str, max_connections: u32) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::SetDatabaseSettings {
+                url: url.to_string(),
+                max_connections,
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetDatabaseSettings result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Return backend-tasks settings: `(has_separate_llm, llm_connector,
+    /// llm_model, llm_base_url, dreaming_enabled, dreaming_interval_secs,
+    /// archive_after_days)`.
+    async fn get_backend_tasks_settings(
+        &self,
+    ) -> fdo::Result<(bool, String, String, String, bool, u64, u32)> {
+        let result = self.dispatch(api::Command::GetBackendTasksSettings).await?;
+        match result {
+            api::CommandResult::BackendTasksSettings(v) => Ok((
+                v.has_separate_llm,
+                v.llm_connector,
+                v.llm_model,
+                v.llm_base_url,
+                v.dreaming_enabled,
+                v.dreaming_interval_secs,
+                v.archive_after_days,
+            )),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected GetBackendTasksSettings result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Update backend-tasks settings. Empty `llm_connector`/`llm_model`/
+    /// `llm_base_url` clear the override; the daemon normalizes the empties, so
+    /// the bridge forwards them verbatim.
+    async fn set_backend_tasks_settings(
+        &self,
+        llm_connector: &str,
+        llm_model: &str,
+        llm_base_url: &str,
+        dreaming_enabled: bool,
+        dreaming_interval_secs: u64,
+        archive_after_days: u32,
+    ) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::SetBackendTasksSettings {
+                llm_connector: llm_connector.to_string(),
+                llm_model: llm_model.to_string(),
+                llm_base_url: llm_base_url.to_string(),
+                dreaming_enabled,
+                dreaming_interval_secs,
+                archive_after_days,
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetBackendTasksSettings result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Add a new MCP server. `args` is whitespace-split into argv (matching the
+    /// in-process adapter), and an empty `namespace` clears it.
+    async fn add_mcp_server(
+        &self,
+        name: &str,
+        command: &str,
+        args: &str,
+        namespace: &str,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let args: Vec<String> = if args.trim().is_empty() {
+            Vec::new()
+        } else {
+            args.split_whitespace().map(|s| s.to_string()).collect()
+        };
+        let result = self
+            .dispatch(api::Command::AddMcpServer {
+                name: name.to_string(),
+                command: command.to_string(),
+                args,
+                namespace: normalize(namespace),
+                enabled,
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected AddMcpServer result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Remove an MCP server by name.
+    async fn remove_mcp_server(&self, name: &str) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::RemoveMcpServer {
+                name: name.to_string(),
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected RemoveMcpServer result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Enable or disable an MCP server.
+    async fn set_mcp_server_enabled(&self, name: &str, enabled: bool) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::SetMcpServerEnabled {
+                name: name.to_string(),
+                enabled,
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetMcpServerEnabled result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Perform an action (status/start/stop/restart) on MCP server(s). An empty
+    /// `server` targets all of them. Returns the resulting server list as
+    /// `Vec<(name, command, enabled, status, tool_count)>`.
+    async fn mcp_server_action(
+        &self,
+        action: &str,
+        server: &str,
+    ) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
+        let result = self
+            .dispatch(api::Command::McpServerAction {
+                action: action.to_string(),
+                server: normalize(server),
+            })
+            .await?;
+        match result {
+            api::CommandResult::McpServers(servers) => Ok(servers
+                .into_iter()
+                .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
+                .collect()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected McpServerAction result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Return WebSocket auth settings: `(methods, oidc_issuer,
+    /// oidc_auth_endpoint, oidc_token_endpoint, oidc_client_id, oidc_scopes)`.
+    /// No secret is returned (the HS256 signing key never leaves the daemon).
+    async fn get_ws_auth_settings(
+        &self,
+    ) -> fdo::Result<(Vec<String>, String, String, String, String, String)> {
+        let result = self.dispatch(api::Command::GetWsAuthSettings).await?;
+        match result {
+            api::CommandResult::WsAuthSettings(v) => Ok((
+                v.methods,
+                v.oidc_issuer,
+                v.oidc_auth_endpoint,
+                v.oidc_token_endpoint,
+                v.oidc_client_id,
+                v.oidc_scopes,
+            )),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected GetWsAuthSettings result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Update WebSocket auth settings. Strings are forwarded verbatim (the
+    /// in-process adapter does no normalization here either).
+    async fn set_ws_auth_settings(
+        &self,
+        methods: Vec<String>,
+        oidc_issuer: &str,
+        oidc_auth_endpoint: &str,
+        oidc_token_endpoint: &str,
+        oidc_client_id: &str,
+        oidc_scopes: &str,
+    ) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::SetWsAuthSettings {
+                methods,
+                oidc_issuer: oidc_issuer.to_string(),
+                oidc_auth_endpoint: oidc_auth_endpoint.to_string(),
+                oidc_token_endpoint: oidc_token_endpoint.to_string(),
+                oidc_client_id: oidc_client_id.to_string(),
+                oidc_scopes: oidc_scopes.to_string(),
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetWsAuthSettings result: {other:?}"
+            ))),
+        }
+    }
+
     /// Signal emitted after a successful aggregate config update.
     #[zbus(signal)]
     async fn config_changed(emitter: &SignalEmitter<'_>, config: &ConfigData) -> zbus::Result<()>;
@@ -490,3 +712,201 @@ pub fn config_data_from_event(c: &api::Config) -> ConfigData {
 // adapter modules without crossing privacy. Quieten the compiler if
 // it's unused inside this module's body.
 const _: fn(&str) -> fdo::Error = |s| to_fdo(s);
+
+#[cfg(test)]
+mod tests {
+    //! Behaviour tests for the #315 G2 settings methods: command construction
+    //! and result mapping. Signature parity is covered separately by
+    //! `tests/introspection.rs`.
+    use super::*;
+    use crate::transport::BridgeTransport;
+    use std::sync::Mutex;
+    use tokio::sync::broadcast;
+
+    /// Records each dispatched command and replies with a canned result.
+    struct FakeTransport {
+        seen: Mutex<Vec<api::Command>>,
+        reply: api::CommandResult,
+        events_tx: broadcast::Sender<api::Event>,
+    }
+
+    impl FakeTransport {
+        fn replying(reply: api::CommandResult) -> Arc<Self> {
+            let (events_tx, _rx) = broadcast::channel(1);
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                reply,
+                events_tx,
+            })
+        }
+
+        fn last(&self) -> api::Command {
+            self.seen
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("no command dispatched")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeTransport for FakeTransport {
+        async fn request(
+            &self,
+            command: api::Command,
+        ) -> Result<api::CommandResult, BridgeTransportError> {
+            self.seen.lock().unwrap().push(command);
+            Ok(self.reply.clone())
+        }
+
+        fn subscribe_events(&self) -> broadcast::Receiver<api::Event> {
+            self.events_tx.subscribe()
+        }
+    }
+
+    fn settings(transport: Arc<FakeTransport>) -> DbusSettingsAdapter<FakeTransport> {
+        DbusSettingsAdapter::new(transport)
+    }
+
+    #[tokio::test]
+    async fn get_database_settings_maps_view_to_tuple() {
+        let t = FakeTransport::replying(api::CommandResult::DatabaseSettings(
+            api::DatabaseSettingsView {
+                url: "postgres://u:p@h/db".into(),
+                max_connections: 7,
+            },
+        ));
+        let (url, max) = settings(Arc::clone(&t))
+            .get_database_settings()
+            .await
+            .unwrap();
+        assert_eq!(url, "postgres://u:p@h/db");
+        assert_eq!(max, 7);
+        assert!(matches!(t.last(), api::Command::GetDatabaseSettings));
+    }
+
+    #[tokio::test]
+    async fn set_database_settings_forwards_url_verbatim() {
+        // The bridge does NOT normalize; the daemon collapses the empty string.
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .set_database_settings("   ", 3)
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::SetDatabaseSettings {
+                url,
+                max_connections,
+            } => {
+                assert_eq!(url, "   ");
+                assert_eq!(max_connections, 3);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_mcp_server_splits_args_and_clears_empty_namespace() {
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .add_mcp_server("srv", "/usr/bin/mcp", "--port 8080  --verbose", "", true)
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::AddMcpServer {
+                name,
+                command,
+                args,
+                namespace,
+                enabled,
+            } => {
+                assert_eq!(name, "srv");
+                assert_eq!(command, "/usr/bin/mcp");
+                assert_eq!(args, vec!["--port", "8080", "--verbose"]);
+                assert_eq!(namespace, None);
+                assert!(enabled);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_mcp_server_keeps_namespace_and_handles_blank_args() {
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .add_mcp_server("srv", "cmd", "   ", "tools", false)
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::AddMcpServer {
+                args,
+                namespace,
+                enabled,
+                ..
+            } => {
+                assert!(args.is_empty());
+                assert_eq!(namespace, Some("tools".to_string()));
+                assert!(!enabled);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_action_maps_to_five_tuples_and_clears_blank_server() {
+        let t = FakeTransport::replying(api::CommandResult::McpServers(vec![api::McpServerView {
+            name: "a".into(),
+            command: "c".into(),
+            args: vec!["x".into()],
+            namespace: Some("ns".into()),
+            enabled: true,
+            status: "running".into(),
+            tool_count: 4,
+        }]));
+        let rows = settings(Arc::clone(&t))
+            .mcp_server_action("restart", "")
+            .await
+            .unwrap();
+        // The D-Bus tuple intentionally drops args/namespace (5-wide for parity).
+        assert_eq!(
+            rows,
+            vec![(
+                "a".to_string(),
+                "c".to_string(),
+                true,
+                "running".to_string(),
+                4
+            )]
+        );
+        match t.last() {
+            api::Command::McpServerAction { action, server } => {
+                assert_eq!(action, "restart");
+                assert_eq!(server, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_ws_auth_settings_maps_view_without_secret() {
+        let t = FakeTransport::replying(api::CommandResult::WsAuthSettings(
+            api::WsAuthSettingsView {
+                methods: vec!["jwt".into(), "oidc".into()],
+                oidc_issuer: "iss".into(),
+                oidc_auth_endpoint: "auth".into(),
+                oidc_token_endpoint: "tok".into(),
+                oidc_client_id: "cid".into(),
+                oidc_scopes: "openid".into(),
+            },
+        ));
+        let (methods, issuer, _auth, _tok, cid, scopes) = settings(Arc::clone(&t))
+            .get_ws_auth_settings()
+            .await
+            .unwrap();
+        assert_eq!(methods, vec!["jwt", "oidc"]);
+        assert_eq!(issuer, "iss");
+        assert_eq!(cid, "cid");
+        assert_eq!(scopes, "openid");
+    }
+}
