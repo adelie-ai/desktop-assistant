@@ -901,4 +901,275 @@ mod tests {
         assert_eq!(cid, "cid");
         assert_eq!(scopes, "openid");
     }
+
+    // --- pure helpers ---------------------------------------------------------
+
+    #[test]
+    fn normalize_trims_and_maps_blank_to_none() {
+        assert_eq!(normalize(""), None);
+        assert_eq!(normalize("   "), None);
+        assert_eq!(normalize("  ollama  "), Some("ollama".to_string()));
+    }
+
+    #[test]
+    fn ordinal_to_level_pins_in_range_unsets_absent_and_rejects_out_of_range() {
+        // Not set → the field is left untouched (it stays at the ConfigChanges
+        // default of None for that trait); the ordinal is ignored.
+        let mut slot = Some(api::PersonalityLevel::Always);
+        ordinal_to_level(false, 0, &mut slot).unwrap();
+        assert_eq!(
+            slot,
+            Some(api::PersonalityLevel::Always),
+            "an unset trait must not be mutated"
+        );
+
+        // In-range bounds pin the level.
+        let mut slot = None;
+        ordinal_to_level(true, 0, &mut slot).unwrap();
+        assert_eq!(slot, Some(api::PersonalityLevel::Never));
+        let mut slot = None;
+        ordinal_to_level(true, 4, &mut slot).unwrap();
+        assert_eq!(slot, Some(api::PersonalityLevel::Always));
+
+        // Out of range (>4) is a clean error, not a silent clamp.
+        let mut slot = None;
+        assert!(ordinal_to_level(true, 5, &mut slot).is_err());
+    }
+
+    #[test]
+    fn config_from_wire_carries_embeddings_persistence_and_sentinels_llm() {
+        let wire = api::Config {
+            embeddings: api::EmbeddingsSettingsView {
+                connector: "openai".into(),
+                model: "text-embedding-3-small".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                has_api_key: true,
+                available: true,
+                is_default: false,
+            },
+            persistence: api::PersistenceSettingsView {
+                enabled: true,
+                remote_url: "git@h:r.git".into(),
+                remote_name: "origin".into(),
+                push_on_update: false,
+            },
+            personality: api::PersonalitySettingsView::default(),
+        };
+        let data = config_from_wire(&wire);
+        assert_eq!(data.embeddings_connector, "openai");
+        assert!(data.embeddings_has_api_key);
+        assert!(data.persistence_enabled);
+        assert_eq!(data.persistence_remote_name, "origin");
+        // The legacy LLM block is no longer on `Config`; the bridge surfaces
+        // stable sentinels so the D-Bus signature doesn't drift.
+        assert_eq!(data.llm_connector, "");
+        assert_eq!(data.llm_max_tokens, 0);
+    }
+
+    // --- untested methods: command construction + result mapping --------------
+
+    #[tokio::test]
+    async fn set_api_key_builds_command_and_acks() {
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .set_api_key("sk-123")
+            .await
+            .unwrap();
+        assert!(matches!(t.last(), api::Command::SetApiKey { api_key } if api_key == "sk-123"));
+    }
+
+    #[tokio::test]
+    async fn get_embeddings_settings_maps_view_to_tuple() {
+        let t = FakeTransport::replying(api::CommandResult::EmbeddingsSettings(
+            api::EmbeddingsSettingsView {
+                connector: "openai".into(),
+                model: "m".into(),
+                base_url: "u".into(),
+                has_api_key: true,
+                available: true,
+                is_default: false,
+            },
+        ));
+        let (connector, model, _url, has_key, available, is_default) = settings(Arc::clone(&t))
+            .get_embeddings_settings()
+            .await
+            .unwrap();
+        assert_eq!(connector, "openai");
+        assert_eq!(model, "m");
+        assert!(has_key && available && !is_default);
+    }
+
+    #[tokio::test]
+    async fn set_embeddings_settings_normalizes_blank_fields_to_none() {
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .set_embeddings_settings("ollama", "  ", "")
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::SetEmbeddingsSettings {
+                connector,
+                model,
+                base_url,
+            } => {
+                assert_eq!(connector, Some("ollama".to_string()));
+                assert_eq!(model, None, "blank model clears the field");
+                assert_eq!(base_url, None, "blank base_url clears the field");
+            }
+            other => panic!("expected SetEmbeddingsSettings, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_connector_defaults_passes_connector_and_maps_result() {
+        let t = FakeTransport::replying(api::CommandResult::ConnectorDefaults(
+            api::ConnectorDefaultsView {
+                llm_model: "claude".into(),
+                llm_base_url: "lu".into(),
+                embeddings_model: "emb".into(),
+                embeddings_base_url: "eu".into(),
+                embeddings_available: true,
+                hosted_tool_search_available: false,
+                backend_llm_model: "haiku".into(),
+            },
+        ));
+        let (llm_model, ..) = settings(Arc::clone(&t))
+            .get_connector_defaults("anthropic")
+            .await
+            .unwrap();
+        assert_eq!(llm_model, "claude");
+        assert!(matches!(
+            t.last(),
+            api::Command::GetConnectorDefaults { connector } if connector == "anthropic"
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_persistence_settings_normalizes_blank_remote_fields() {
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .set_persistence_settings(true, "", "  ", false)
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::SetPersistenceSettings {
+                enabled,
+                remote_url,
+                remote_name,
+                push_on_update,
+            } => {
+                assert!(enabled);
+                assert_eq!(remote_url, None);
+                assert_eq!(remote_name, None);
+                assert!(!push_on_update);
+            }
+            other => panic!("expected SetPersistenceSettings, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_config_maps_wire_config_via_config_from_wire() {
+        let t = FakeTransport::replying(api::CommandResult::Config(api::Config {
+            embeddings: api::EmbeddingsSettingsView {
+                connector: "openai".into(),
+                model: "m".into(),
+                base_url: "u".into(),
+                has_api_key: false,
+                available: true,
+                is_default: true,
+            },
+            persistence: api::PersistenceSettingsView {
+                enabled: false,
+                remote_url: String::new(),
+                remote_name: "origin".into(),
+                push_on_update: true,
+            },
+            personality: api::PersonalitySettingsView::default(),
+        }));
+        let data = settings(Arc::clone(&t)).get_config().await.unwrap();
+        assert_eq!(data.embeddings_connector, "openai");
+        assert!(matches!(t.last(), api::Command::GetConfig));
+    }
+
+    #[tokio::test]
+    async fn list_mcp_servers_maps_to_five_tuples() {
+        let t = FakeTransport::replying(api::CommandResult::McpServers(vec![api::McpServerView {
+            name: "weather".into(),
+            command: "weather-mcp".into(),
+            args: vec!["serve".into()],
+            namespace: None,
+            enabled: true,
+            status: "running".into(),
+            tool_count: 2,
+        }]));
+        let rows = settings(Arc::clone(&t)).list_mcp_servers().await.unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "weather".to_string(),
+                "weather-mcp".to_string(),
+                true,
+                "running".to_string(),
+                2
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_backend_tasks_settings_maps_view_to_tuple() {
+        let t = FakeTransport::replying(api::CommandResult::BackendTasksSettings(
+            api::BackendTasksSettingsView {
+                has_separate_llm: true,
+                llm_connector: "ollama".into(),
+                llm_model: "qwen".into(),
+                llm_base_url: "u".into(),
+                dreaming_enabled: true,
+                dreaming_interval_secs: 3600,
+                archive_after_days: 30,
+            },
+        ));
+        let (has_separate, connector, model, _u, dreaming, interval, archive) =
+            settings(Arc::clone(&t))
+                .get_backend_tasks_settings()
+                .await
+                .unwrap();
+        assert!(has_separate && dreaming);
+        assert_eq!(
+            (connector, model, interval, archive),
+            ("ollama".to_string(), "qwen".to_string(), 3600, 30)
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_and_toggle_mcp_server_build_their_commands() {
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .remove_mcp_server("weather")
+            .await
+            .unwrap();
+        assert!(matches!(t.last(), api::Command::RemoveMcpServer { name } if name == "weather"));
+
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .set_mcp_server_enabled("weather", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            t.last(),
+            api::Command::SetMcpServerEnabled { name, enabled } if name == "weather" && !enabled
+        ));
+    }
+
+    #[tokio::test]
+    async fn unexpected_result_variant_is_a_clean_error() {
+        // Representative: a getter that receives the wrong CommandResult must
+        // surface an error rather than panic. The same match-arm guards every
+        // method.
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        let err = settings(Arc::clone(&t))
+            .get_embeddings_settings()
+            .await
+            .expect_err("a non-EmbeddingsSettings result must error");
+        assert!(matches!(err, fdo::Error::Failed(_)));
+    }
 }
