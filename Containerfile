@@ -23,6 +23,15 @@
 FROM rust:1-bookworm AS builder
 
 WORKDIR /workspace
+
+# The daemon FFI-links libpam (crates/daemon/src/config/pam_auth.rs) for the
+# WS local-system password auth path — it is NOT feature-gated, so `-lpam` is
+# required at link time even when that auth method is disabled at runtime.
+# libpam0-dev provides the linkable libpam.so.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpam0g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 # Build only the two binaries we ship; --locked keeps Cargo.lock authoritative.
@@ -69,10 +78,12 @@ RUN set -eux; \
 FROM debian:bookworm-slim
 
 # ca-certificates for outbound TLS (Bedrock, MCP HTTP fetches, etc.).
+# libpam0 is the runtime shared lib the daemon dynamically links (see builder
+# note above); without it the daemon fails to start with a loader error.
 # /bin/sh is already present in the base image and is intentionally kept —
 # terminal-mcp shells out via `sh -c`.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libpam0g \
     && rm -rf /var/lib/apt/lists/*
 
 # Unprivileged runtime user with a real home for the XDG dirs below.
