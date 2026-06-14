@@ -66,7 +66,9 @@ pub async fn run_consolidation_phase(
                 total.soft_deleted += stats.soft_deleted;
             }
             Err(e) => {
-                tracing::warn!("dreaming: holistic consolidation failed for user {user_id_str}: {e}")
+                tracing::warn!(
+                    "dreaming: holistic consolidation failed for user {user_id_str}: {e}"
+                )
             }
         }
     }
@@ -158,11 +160,7 @@ async fn consolidate_user(
                     }
                     merge_content.insert(canonical, (content, scope.filter(|s| !s.is_empty())));
                 }
-                RawOp::Edit {
-                    id,
-                    content,
-                    scope,
-                } => {
+                RawOp::Edit { id, content, scope } => {
                     if !valid.contains(id.as_str()) {
                         tracing::debug!("dreaming: ignoring edit of unknown id {id}");
                         continue;
@@ -358,8 +356,7 @@ fn build_user_prompt(entries: &[KbEntry]) -> String {
         prompt.push_str("scope: ");
         match e.metadata.effective_scope() {
             Some(scope) => {
-                let dims: Vec<String> =
-                    scope.0.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                let dims: Vec<String> = scope.0.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 prompt.push_str(&dims.join(", "));
             }
             None => prompt.push_str("(universal)"),
@@ -467,9 +464,15 @@ mod tests {
     fn slice_entries_splits_over_budget() {
         // Each entry ~ MAX/3 chars, so 4 entries span 2 slices.
         let big = "x".repeat(MAX_HOLISTIC_PROMPT_CHARS / 3);
-        let entries: Vec<KbEntry> = (0..4).map(|i| entry(&format!("id{i}"), &big, &[])).collect();
+        let entries: Vec<KbEntry> = (0..4)
+            .map(|i| entry(&format!("id{i}"), &big, &[]))
+            .collect();
         let slices = slice_entries(entries);
-        assert!(slices.len() >= 2, "expected multiple slices, got {}", slices.len());
+        assert!(
+            slices.len() >= 2,
+            "expected multiple slices, got {}",
+            slices.len()
+        );
         // Every entry is preserved across slices.
         let total: usize = slices.iter().map(|s| s.len()).sum();
         assert_eq!(total, 4);
@@ -477,8 +480,9 @@ mod tests {
 
     #[test]
     fn slice_entries_keeps_small_kb_in_one_slice() {
-        let entries: Vec<KbEntry> =
-            (0..10).map(|i| entry(&format!("id{i}"), "short", &["t"])).collect();
+        let entries: Vec<KbEntry> = (0..10)
+            .map(|i| entry(&format!("id{i}"), "short", &["t"]))
+            .collect();
         let slices = slice_entries(entries);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].len(), 10);

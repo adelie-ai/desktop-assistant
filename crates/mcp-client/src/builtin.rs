@@ -701,11 +701,16 @@ impl BuiltinToolService {
         let id = id_opt.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         let content = content_opt
             .or_else(|| existing.as_ref().map(|e| e.content.clone()))
-            .ok_or_else(|| CoreError::ToolExecution("knowledge_base write requires content".into()))?;
+            .ok_or_else(|| {
+                CoreError::ToolExecution("knowledge_base write requires content".into())
+            })?;
         let tags = if tags_present {
             tags
         } else {
-            existing.as_ref().map(|e| e.tags.clone()).unwrap_or_default()
+            existing
+                .as_ref()
+                .map(|e| e.tags.clone())
+                .unwrap_or_default()
         };
         let mut metadata = existing
             .as_ref()
@@ -1289,7 +1294,6 @@ impl BuiltinToolService {
             }
         }
     }
-
 }
 
 fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreError> {
