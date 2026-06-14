@@ -204,43 +204,71 @@ fn translate_covers_streaming_response_variants() {
 }
 
 #[test]
-fn translate_marks_unforwarded_variants_explicitly() {
-    // Variants with no D-Bus signal must hit `Ignored` with a stable kind, so a
-    // future parity step is deliberate rather than silent drift. (UserMessageAdded
-    // + ConversationListChanged ARE now forwarded — see the next test. Task*
-    // variants are forwarded and covered in `tests/background_tasks.rs`.)
-    let cases: Vec<(SignalEvent, &str)> = vec![
-        (
-            SignalEvent::Status {
-                conversation_id: "c".into(),
-                request_id: "r".into(),
-                message: "...".into(),
+fn translate_forwards_the_401_parity_events() {
+    // #401: the five events that were `Ignored` now translate to real D-Bus
+    // signals (full UDS/WS parity for the shared reducer). Field-level mapping is
+    // unit-tested in the forwarder module; here we pin the integration contract
+    // that none of them lands on `Ignored` anymore.
+    assert!(matches!(
+        translate(SignalEvent::Status {
+            conversation_id: "c".into(),
+            request_id: "r".into(),
+            message: "thinking".into(),
+        }),
+        ForwardAction::Status { .. }
+    ));
+    assert!(matches!(
+        translate(SignalEvent::ContextUsage {
+            conversation_id: "c".into(),
+            request_id: "r".into(),
+            used_tokens: 12_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        }),
+        ForwardAction::ContextUsage { .. }
+    ));
+    assert!(matches!(
+        translate(SignalEvent::TitleChanged {
+            conversation_id: "c".into(),
+            title: "t".into(),
+        }),
+        ForwardAction::TitleChanged { .. }
+    ));
+    assert!(matches!(
+        translate(SignalEvent::ConversationWarning {
+            conversation_id: "c".into(),
+            warning: api::ConversationWarning::DanglingModelSelection {
+                previous_selection: api::ConversationModelSelectionView {
+                    connection_id: "old".into(),
+                    model_id: "m1".into(),
+                    effort: None,
+                },
+                fallback_to: api::ConversationModelSelectionView {
+                    connection_id: "new".into(),
+                    model_id: "m2".into(),
+                    effort: None,
+                },
             },
-            "assistant_status",
-        ),
-        (
-            SignalEvent::TitleChanged {
-                conversation_id: "c".into(),
-                title: "t".into(),
-            },
-            "conversation_title_changed",
-        ),
-        (
-            SignalEvent::ContextUsage {
-                conversation_id: "c".into(),
-                request_id: "r".into(),
-                used_tokens: 12_000,
-                budget_tokens: 32_000,
-                compaction_active: false,
-            },
-            "context_usage",
-        ),
-    ];
-    for (event, expected_kind) in cases {
-        match translate(event) {
-            ForwardAction::Ignored { kind } => assert_eq!(kind, expected_kind),
-            other => panic!("expected Ignored {expected_kind}, got {other:?}"),
-        }
+        }),
+        ForwardAction::ConversationWarning { .. }
+    ));
+    assert!(matches!(
+        translate(SignalEvent::ScratchpadChanged {
+            conversation_id: "c".into(),
+        }),
+        ForwardAction::ScratchpadChanged { .. }
+    ));
+}
+
+#[test]
+fn translate_marks_control_signal_as_ignored() {
+    // The only `Ignored` left is the `Disconnected` control signal, which `run`
+    // handles before `translate`; it maps here only for match exhaustiveness.
+    match translate(SignalEvent::Disconnected {
+        reason: "socket closed".into(),
+    }) {
+        ForwardAction::Ignored { kind } => assert_eq!(kind, "disconnected"),
+        other => panic!("expected Ignored disconnected, got {other:?}"),
     }
 }
 
