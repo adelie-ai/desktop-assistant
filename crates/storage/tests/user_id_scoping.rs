@@ -363,13 +363,13 @@ async fn knowledge_writes_are_isolated_per_user() {
 
         with_user_id(UserId::new("alice"), async {
             let entry = KnowledgeEntry::new("kb-alice", "alice loves rust", vec!["pref".into()]);
-            store.write(entry, None, None).await.expect("alice write");
+            store.write(entry).await.expect("alice write");
         })
         .await;
 
         with_user_id(UserId::new("bob"), async {
             let entry = KnowledgeEntry::new("kb-bob", "bob loves zig", vec!["pref".into()]);
-            store.write(entry, None, None).await.expect("bob write");
+            store.write(entry).await.expect("bob write");
         })
         .await;
 
@@ -408,7 +408,7 @@ async fn knowledge_search_does_not_leak_across_users() {
                     "Alice's private project notes about widget refactoring",
                     vec!["project".into()],
                 );
-                store.write(entry, None, None).await.expect("alice index");
+                store.write(entry).await.expect("alice index");
             })
             .await;
 
@@ -447,14 +447,10 @@ async fn knowledge_search_with_empty_embedding_falls_back_to_fts() {
                     "Quarterly forecast planning for the widget team",
                     vec!["project".into()],
                 );
-                store
-                    .write(
-                        entry,
-                        Some(vec![vec![0.1_f32, 0.2, 0.3, 0.4]]),
-                        Some("test-model".into()),
-                    )
-                    .await
-                    .expect("write with embedding");
+                // Writes never embed inline; the row lands with a NULL
+                // embedding, which is exactly the condition this test exercises
+                // (search must fall back to FTS rather than erroring).
+                store.write(entry).await.expect("write");
 
                 let hits = store
                     .search("forecast planning", Vec::new(), None, 10)
@@ -483,7 +479,7 @@ async fn knowledge_get_by_id_does_not_leak_across_users() {
             with_user_id(UserId::new("alice"), async {
                 let entry =
                     KnowledgeEntry::new("kb-shared-id", "alice content", vec!["pref".into()]);
-                store.write(entry, None, None).await.expect("alice write");
+                store.write(entry).await.expect("alice write");
             })
             .await;
 

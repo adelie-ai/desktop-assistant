@@ -321,6 +321,12 @@ pub struct BackendTasksConfig {
     /// Archive conversations older than this many days (0 = disabled).
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
+    /// How often the background task regenerates missing/stale knowledge &
+    /// tool embeddings. Embedding generation is decoupled from content writes,
+    /// so this is the cadence at which new and edited entries gain semantic
+    /// search coverage. A few minutes is a good default.
+    #[serde(default = "default_embedding_backfill_interval_secs")]
+    pub embedding_backfill_interval_secs: u64,
 }
 
 impl Default for BackendTasksConfig {
@@ -330,6 +336,7 @@ impl Default for BackendTasksConfig {
             dreaming_enabled: false,
             dreaming_interval_secs: default_dreaming_interval_secs(),
             archive_after_days: default_archive_after_days(),
+            embedding_backfill_interval_secs: default_embedding_backfill_interval_secs(),
         }
     }
 }
@@ -340,6 +347,10 @@ pub(super) fn default_archive_after_days() -> u32 {
 
 pub(super) fn default_dreaming_interval_secs() -> u64 {
     3600
+}
+
+pub(super) fn default_embedding_backfill_interval_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

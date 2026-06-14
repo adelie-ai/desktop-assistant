@@ -7,13 +7,17 @@ use crate::domain::KnowledgeEntry;
 
 /// Outbound port for the unified knowledge base (replaces preferences + memory).
 pub trait KnowledgeBaseStore: Send + Sync {
-    /// Write (upsert) a knowledge entry. If an entry with the same id exists, it is replaced.
-    /// Embedding is a list of chunk vectors (one per chunk of the entry's content).
+    /// Write (upsert) a knowledge entry. If an entry with the same id exists,
+    /// its content/tags/metadata are replaced and `updated_at` is bumped.
+    ///
+    /// Writes never touch the embedding columns: embedding generation is
+    /// decoupled from content writes. New rows land with a NULL embedding and
+    /// updates leave the existing (now stale) embedding in place; the
+    /// background embedding-backfill task regenerates vectors for rows where
+    /// `embedding IS NULL` or `embeddings_updated_at < updated_at`.
     fn write(
         &self,
         entry: KnowledgeEntry,
-        embedding: Option<Vec<Vec<f32>>>,
-        embedding_model: Option<String>,
     ) -> impl Future<Output = Result<KnowledgeEntry, CoreError>> + Send;
 
     /// Hybrid search combining vector similarity and full-text search via RRF.
@@ -56,12 +60,12 @@ pub trait KnowledgeBaseStore: Send + Sync {
     ) -> impl Future<Output = Result<Option<KnowledgeEntry>, CoreError>> + Send;
 }
 
-/// Boxed async closure for writing knowledge entries through non-generic boundaries.
-/// Embedding is a list of chunk vectors (one per chunk of the entry's content).
+/// Boxed async closure for writing knowledge entries through non-generic
+/// boundaries. Embeddings are owned by the background backfill task, not the
+/// write path (see [`KnowledgeBaseStore::write`]).
 pub type KnowledgeWriteFn = Arc<
     dyn Fn(
             KnowledgeEntry,
-            Option<Vec<Vec<f32>>>,
         ) -> Pin<Box<dyn Future<Output = Result<KnowledgeEntry, CoreError>> + Send>>
         + Send
         + Sync,
@@ -94,8 +98,6 @@ mod tests {
         async fn write(
             &self,
             entry: KnowledgeEntry,
-            _embedding: Option<Vec<Vec<f32>>>,
-            _embedding_model: Option<String>,
         ) -> Result<KnowledgeEntry, CoreError> {
             Ok(entry)
         }
@@ -141,7 +143,7 @@ mod tests {
     async fn mock_knowledge_store_write_returns_entry() {
         let store = MockKnowledgeStore;
         let entry = KnowledgeEntry::new("kb-1", "test", vec![]);
-        let result = store.write(entry, None, None).await.unwrap();
+        let result = store.write(entry).await.unwrap();
         assert_eq!(result.id, "kb-1");
     }
 
