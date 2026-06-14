@@ -20,17 +20,20 @@ The project follows a ports-and-adapters (hexagonal) layout:
 - Outbound traits (`LlmClient`, `ConversationStore`, `ToolExecutor`)
 - `ConversationHandler` orchestration (including tool-call loop)
 
-## `dbus-interface`
+## `dbus-bridge`
 
-- Exposes `org.desktopAssistant.Conversations`
-- Maps D-Bus methods to `ConversationService`
-- Emits streaming signals for chunk/complete/error events
+- Standalone per-user binary `adelie-dbus-bridge` that owns `org.desktopAssistant`
+- Translates D-Bus method calls into `api::Command`s and ships them to the daemon
+  over an authenticated UDS connection — the same hardened path UDS/WS clients use
+- Forwards the daemon's signal stream to D-Bus signals
+- Replaced the daemon's former in-process `dbus-interface` adapters (cutover #281/#319);
+  see [dbus-bridge.md](dbus-bridge.md)
 
 ## `daemon`
 
 - Initializes logging, LLM, MCP executor, persistent conversation store
 - Wires `ConversationHandler` with adapters
-- Registers service on session bus name `org.desktopAssistant`
+- Serves the local UDS frontend (+ optional WS); no longer claims a session-bus name
 
 ## `llm-openai`
 

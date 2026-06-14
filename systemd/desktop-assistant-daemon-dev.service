@@ -3,16 +3,14 @@ Description=Desktop Assistant Backend Daemon (Development)
 After=default.target
 
 [Service]
-Type=dbus
-BusName=org.desktopAssistant.Dev
+# Type=simple: the dev daemon serves UDS only — there is no in-process D-Bus
+# surface since the cutover (#319). For a dev D-Bus surface, run a side-name
+# bridge: `ADELIE_BRIDGE_NAME=org.desktopAssistant.Dev adelie-dbus-bridge`.
+Type=simple
 ExecStart=%h/.cargo/bin/desktop-assistant-daemon
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
-Environment=DESKTOP_ASSISTANT_DBUS_SERVICE=org.desktopAssistant.Dev
-# The dev daemon keeps serving the in-process surface at .Dev (the cutover
-# default is off; re-enable it here so Type=dbus/BusName works for dev QA).
-Environment=DESKTOP_ASSISTANT_DBUS_INPROCESS=true
 
 [Install]
 WantedBy=default.target

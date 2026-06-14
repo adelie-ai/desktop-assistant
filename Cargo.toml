@@ -7,7 +7,6 @@ members = [
     "crates/auth-jwt",
     "crates/ws-interface",
     "crates/core",
-    "crates/dbus-interface",
     "crates/daemon",
     "crates/llm-openai",
     "crates/llm-bedrock",
@@ -46,7 +45,6 @@ serde = { version = "1", features = ["derive"] }
 
 desktop-assistant-core = { path = "crates/core" }
 desktop-assistant-auth-jwt = { path = "crates/auth-jwt" }
-desktop-assistant-dbus = { path = "crates/dbus-interface" }
 desktop-assistant-llm-anthropic = { path = "crates/llm-anthropic" }
 desktop-assistant-llm-openai = { path = "crates/llm-openai" }
 desktop-assistant-llm-ollama = { path = "crates/llm-ollama" }
