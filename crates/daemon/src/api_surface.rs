@@ -533,6 +533,10 @@ impl ConnectionsService for DaemonConnectionsService {
                 .purposes
                 .get(PurposeKind::Dreaming)
                 .map(purpose_to_payload),
+            consolidation: config
+                .purposes
+                .get(PurposeKind::Consolidation)
+                .map(purpose_to_payload),
             embedding: config
                 .purposes
                 .get(PurposeKind::Embedding)

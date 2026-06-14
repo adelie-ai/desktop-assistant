@@ -1388,11 +1388,26 @@ async fn main() -> Result<()> {
         tokio::sync::oneshot::channel::<()>();
     let consolidation_task = if dreaming_enabled && consolidation_interval_secs > 0 {
         if let Some(pool) = &pg_pool {
-            let resolved = config::resolve_consolidation_llm_config(daemon_config.as_ref());
+            // Prefer `[purposes.consolidation]` (settable from the KCM Purposes
+            // tab); fall back to `[backend_tasks.consolidation_llm]` →
+            // backend_tasks.llm → top-level `[llm]`.
+            let (resolved, consolidation_reasoning, source) =
+                match api_surface::resolve_purpose_dispatch(
+                    daemon_config.as_ref(),
+                    purposes::PurposeKind::Consolidation,
+                ) {
+                    Some((r, c)) => (r, c, "purposes.consolidation"),
+                    None => (
+                        config::resolve_consolidation_llm_config(daemon_config.as_ref()),
+                        Default::default(),
+                        "backend_tasks.consolidation_llm",
+                    ),
+                };
             tracing::info!(
-                "consolidation LLM connector={}, model={}, every {}s",
+                "consolidation LLM connector={}, model={}, source={}, every {}s",
                 resolved.connector,
                 resolved.model,
+                source,
                 consolidation_interval_secs
             );
             let consolidation_llm = build_llm_client(resolved);
@@ -1422,18 +1437,14 @@ async fn main() -> Result<()> {
                 let llm_fn: desktop_assistant_storage::dreaming::DreamingLlmFn =
                     Box::new(move |system_prompt, user_prompt| {
                         let llm = Arc::clone(&consolidation_llm);
+                        let reasoning = consolidation_reasoning;
                         Box::pin(async move {
                             let messages = vec![
                                 Message::new(Role::System, system_prompt),
                                 Message::new(Role::User, user_prompt),
                             ];
                             let response = llm
-                                .stream_completion(
-                                    messages,
-                                    &[],
-                                    Default::default(),
-                                    Box::new(|_| true),
-                                )
+                                .stream_completion(messages, &[], reasoning, Box::new(|_| true))
                                 .await
                                 .map_err(|e| e.to_string())?;
                             Ok(response.text)

@@ -251,7 +251,8 @@ mod purposes_serde {
                         let Some(kind) = PurposeKind::from_key(&key) else {
                             return Err(M::Error::custom(format!(
                                 "unknown purpose `{key}`; expected one of \
-                                 `interactive`, `dreaming`, `embedding`, `titling`"
+                                 `interactive`, `dreaming`, `consolidation`, \
+                                 `embedding`, `titling`"
                             )));
                         };
                         if out.get(kind).is_some() {

@@ -2581,6 +2581,10 @@ y = 2
             connection = "bedrock"
             model = "anthropic.claude-haiku-4-5"
 
+            [purposes.consolidation]
+            connection = "bedrock"
+            model = "us.anthropic.claude-sonnet-4-6"
+
             [purposes.embedding]
             connection = "local"
             model = "mxbai-embed-large:335m"

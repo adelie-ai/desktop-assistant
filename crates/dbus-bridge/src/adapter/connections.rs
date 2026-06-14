@@ -382,6 +382,7 @@ mod tests {
         let purposes = api::PurposesView {
             interactive: None,
             dreaming: None,
+            consolidation: None,
             embedding: None,
             titling: None,
         };

@@ -32,7 +32,7 @@ pub enum Effort {
 // PurposeKind
 // ---------------------------------------------------------------------------
 
-/// The four LLM purposes the daemon resolves independently. Used as a stable
+/// The LLM purposes the daemon resolves independently. Used as a stable
 /// keyed map via [`Self::as_key`] / [`Self::from_key`].
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -41,8 +41,11 @@ pub enum Effort {
 pub enum PurposeKind {
     /// The user-facing chat LLM. Cannot inherit (nothing to inherit from).
     Interactive,
-    /// Periodic fact extraction (the "dreaming" background task).
+    /// Periodic fact extraction (the frequent, cheap "dreaming" pass).
     Dreaming,
+    /// Holistic knowledge-base consolidation (the slower, heavier daily pass
+    /// that recomputes the whole KB — typically a stronger model).
+    Consolidation,
     /// Vector embeddings for memory and retrieval.
     Embedding,
     /// Short-title generation for conversations.
@@ -55,6 +58,7 @@ impl PurposeKind {
         match self {
             Self::Interactive => "interactive",
             Self::Dreaming => "dreaming",
+            Self::Consolidation => "consolidation",
             Self::Embedding => "embedding",
             Self::Titling => "titling",
         }
@@ -66,6 +70,7 @@ impl PurposeKind {
         match key {
             "interactive" => Some(Self::Interactive),
             "dreaming" => Some(Self::Dreaming),
+            "consolidation" => Some(Self::Consolidation),
             "embedding" => Some(Self::Embedding),
             "titling" => Some(Self::Titling),
             _ => None,
@@ -76,10 +81,11 @@ impl PurposeKind {
     /// tests and serialization round-trips. Order matches the schema
     /// migration order (interactive first because every other purpose
     /// can inherit from it).
-    pub fn all() -> [Self; 4] {
+    pub fn all() -> [Self; 5] {
         [
             Self::Interactive,
             Self::Dreaming,
+            Self::Consolidation,
             Self::Embedding,
             Self::Titling,
         ]

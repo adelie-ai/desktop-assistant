@@ -1729,6 +1729,7 @@ where
                 Ok(api::CommandResult::Purposes(api::PurposesView {
                     interactive: p.interactive.map(core_purpose_to_api),
                     dreaming: p.dreaming.map(core_purpose_to_api),
+                    consolidation: p.consolidation.map(core_purpose_to_api),
                     embedding: p.embedding.map(core_purpose_to_api),
                     titling: p.titling.map(core_purpose_to_api),
                 }))
