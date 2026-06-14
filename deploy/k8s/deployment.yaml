@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: desktop-assistant
+  labels:
+    app: desktop-assistant
+spec:
+  # replicas: 1 is REQUIRED, not a starting point. Conversation/turn state is
+  # held per-daemon in memory (and WebSocket sessions are sticky to the pod that
+  # accepted them). Running >1 replica would split clients across daemons that
+  # don't share live state. Scale by running separate daemons, not replicas.
+  replicas: 1
+  # Recreate (not RollingUpdate) so the old pod releases before the new one binds
+  # — avoids two daemons briefly contending. With replicas:1 there is a short gap.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: desktop-assistant
+  template:
+    metadata:
+      labels:
+        app: desktop-assistant
+    spec:
+      # initContainer: copy the ConfigMap files into a writable emptyDir.
+      # A ConfigMap volume is mounted read-only, but the daemon chmods
+      # mcp_servers.toml to 0600 on load — on a read-only mount that fails (EROFS)
+      # and ALL MCP servers are silently dropped. Copying into an emptyDir that
+      # the daemon mounts read-write lets the chmod succeed.
+      initContainers:
+        - name: copy-config
+          # Reuse the app image (it has /bin/sh); any tiny image with cp works.
+          image: adelie:latest
+          command:
+            - /bin/sh
+            - -c
+            - "cp /config-src/daemon.toml /config-src/mcp_servers.toml /config-dst/ && chmod 0644 /config-dst/daemon.toml /config-dst/mcp_servers.toml"
+          volumeMounts:
+            - name: config-src
+              mountPath: /config-src
+              readOnly: true
+            - name: config
+              mountPath: /config-dst
+      containers:
+        - name: daemon
+          # Image built per issue C-1 (repo-root Containerfile). Push it to your
+          # registry and pin a digest/tag in production, e.g.
+          #   registry.example.com/adelie/desktop-assistant@sha256:...
+          image: adelie:latest
+          # Role-selecting entrypoint (deploy/docker/entrypoint.sh): first arg is
+          # the role. "daemon" -> desktop-assistant-daemon.
+          args: ["daemon"]
+          ports:
+            - name: ws
+              containerPort: 11339
+          env:
+            # WebSocket on, plaintext (TLS terminated at the ingress).
+            - name: DESKTOP_ASSISTANT_WS_ENABLED
+              value: "true"
+            - name: DESKTOP_ASSISTANT_WS_BIND
+              value: "0.0.0.0:11339"
+            - name: DESKTOP_ASSISTANT_WS_TLS
+              value: "false"
+            # No UDS / D-Bus / local-system login in a cluster.
+            - name: DESKTOP_ASSISTANT_UDS_ENABLED
+              value: "false"
+            - name: DESKTOP_ASSISTANT_DBUS_REQUIRED
+              value: "false"
+            - name: DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH
+              value: "false"
+            - name: RUST_LOG
+              value: "info"
+          # DB URL + LLM credentials come from the Secret (see secret.example.yaml).
+          # DESKTOP_ASSISTANT_DATABASE_URL overrides [database].url from the
+          # ConfigMap; the LLM keys are read by whichever connector is configured.
+          envFrom:
+            - secretRef:
+                name: desktop-assistant-secrets
+          volumeMounts:
+            # Writable config dir (populated by the initContainer). XDG_CONFIG_HOME
+            # in the image is /home/assistant/.config, so the daemon reads
+            # daemon.toml + mcp_servers.toml from here.
+            - name: config
+              mountPath: /home/assistant/.config/desktop-assistant
+          # TCP probes on the WS port — the daemon accepts the connection only
+          # after it is listening; the OIDC handshake happens at the HTTP upgrade,
+          # which a bare TCP probe does not trigger.
+          readinessProbe:
+            tcpSocket:
+              port: 11339
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 11339
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: config-src
+          configMap:
+            name: desktop-assistant-config
+        # Writable scratch dir the initContainer copies into and the daemon reads.
+        - name: config
+          emptyDir: {}

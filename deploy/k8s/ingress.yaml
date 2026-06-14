@@ -1,0 +1,44 @@
+# Ingress for the daemon's WebSocket endpoint (nginx ingress controller).
+#
+# TLS IS TERMINATED HERE: clients connect over wss:// to the host below; the
+# ingress terminates TLS using `assistant-tls` and proxies plaintext ws:// to the
+# ClusterIP Service (the daemon runs with DESKTOP_ASSISTANT_WS_TLS=false). OIDC
+# RS256 bearer-token validation still happens end-to-end at the daemon.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: desktop-assistant
+  labels:
+    app: desktop-assistant
+  annotations:
+    # WebSocket upgrades are long-lived: bump proxy read/send timeouts well past
+    # the nginx 60s default so idle streaming connections aren't cut.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # nginx auto-detects the Upgrade/Connection headers for WS; these make the
+    # intent explicit and ensure the upgrade headers are forwarded.
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        # PLACEHOLDER host — replace with your real DNS name.
+        - assistant.example.com
+      # TLS cert Secret (type kubernetes.io/tls). Provision it yourself or via
+      # cert-manager (a Certificate resource producing this secret).
+      secretName: assistant-tls
+  rules:
+    - host: assistant.example.com
+      http:
+        paths:
+          # The daemon serves the WebSocket at /ws.
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: desktop-assistant
+                port:
+                  number: 11339

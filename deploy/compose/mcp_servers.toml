@@ -1,0 +1,36 @@
+# MCP server fleet — compose reference stack.
+#
+# Mounted read-only into the assistant container at
+#   /home/assistant/.config/desktop-assistant/mcp_servers.toml
+#
+# The daemon spawns each enabled server as a stdio child process. The `command`
+# MUST be a binary present on the image's PATH (all fleet binaries are installed
+# to /usr/local/bin by the Containerfile). The daemon degrades gracefully if a
+# server fails to start, so this list can be trimmed freely.
+#
+# FULL fleet baked into the image (see Containerfile MCP_SERVERS):
+#   fileio-mcp, terminal-mcp, tasks-mcp, timeclock-mcp, web-mcp, cve-mcp,
+#   geocode-mcp, openstreetmap-mcp, weather-forecast-mcp, internet-radio-mcp,
+#   skills-mcp, gen-mcp
+#
+# Below is a representative subset; add `[[servers]]` entries for any others.
+
+[[servers]]
+name = "fileio"
+command = "fileio-mcp"
+args = ["serve", "--mode", "stdio"]
+
+[[servers]]
+name = "web"
+command = "web-mcp"
+args = ["serve", "--mode", "stdio"]
+
+[[servers]]
+name = "tasks"
+command = "tasks-mcp"
+args = ["serve", "--mode", "stdio"]
+
+[[servers]]
+name = "cve"
+command = "cve-mcp"
+args = ["serve", "--mode", "stdio"]

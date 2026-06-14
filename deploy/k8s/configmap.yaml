@@ -1,0 +1,155 @@
+# ConfigMap holding the daemon's two config files: daemon.toml and
+# mcp_servers.toml.
+#
+# These are copied (by the Deployment's initContainer) into a writable emptyDir
+# that is mounted at the daemon's config dir
+#   /home/assistant/.config/desktop-assistant/
+# (the C-1 image sets XDG_CONFIG_HOME=/home/assistant/.config).
+#
+# WHY THE COPY (mcp_servers.toml 0600 gotcha): on load the daemon chmods
+# mcp_servers.toml to 0600 (crates/mcp-client/src/config.rs, in case it carries
+# secrets). A ConfigMap volume is mounted READ-ONLY, so that chmod fails (EROFS)
+# and the daemon SILENTLY DROPS ALL MCP servers. Copying the files into a
+# writable emptyDir before the daemon starts makes the chmod succeed. See the
+# initContainer in deployment.yaml.
+#
+# Substantive config (no env override exists for these, so they MUST live here):
+#   [ws_auth] + [ws_auth.oidc], [connections], [purposes].
+# Transport/TLS/database-URL also have DESKTOP_ASSISTANT_* env overrides (set in
+# the Deployment) and the env wins; the values below are documented fallbacks.
+# The DB URL is deliberately NOT here — it carries a password and comes from the
+# Secret via env (DESKTOP_ASSISTANT_DATABASE_URL).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: desktop-assistant-config
+  labels:
+    app: desktop-assistant
+data:
+  daemon.toml: |
+    # ── Transports ──────────────────────────────────────────────────────────
+    # WS only in-cluster; no D-Bus, no UDS. Overridden by env in the Deployment
+    # (DESKTOP_ASSISTANT_WS_ENABLED / _WS_BIND / _UDS_ENABLED); shown for clarity.
+    [transports]
+    ws_enabled = true
+    ws_bind = "0.0.0.0:11339"
+    uds_enabled = false
+
+    # ── TLS ─────────────────────────────────────────────────────────────────
+    # TLS is TERMINATED AT THE INGRESS. The daemon speaks plaintext ws:// inside
+    # the cluster (also forced off via DESKTOP_ASSISTANT_WS_TLS=false). RS256
+    # OIDC bearer tokens are validated regardless of transport TLS.
+    [tls]
+    enabled = false
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    # The real connection URL (with password) is injected as
+    # DESKTOP_ASSISTANT_DATABASE_URL from the Secret. Only the pool size is set
+    # here.
+    [database]
+    max_connections = 10
+
+    # ── WebSocket auth (OIDC, RS256) ──────────────────────────────────────────
+    # methods=["oidc"] makes the daemon validate `Authorization: Bearer <jwt>`
+    # against the IdP below. RS256 only — HMAC is disallowed. allowed_origins
+    # governs browser clients that send an Origin header; native clients / wscat
+    # send none and are always allowed, so an empty list is fine for testing.
+    # Add your web client origins (e.g. "https://app.example.com") for browsers.
+    [ws_auth]
+    methods = ["oidc"]
+    allowed_origins = []
+
+    [ws_auth.oidc]
+    # PLACEHOLDER IdP. Swap every URL below for your real provider, e.g.:
+    #   Cognito: https://cognito-idp.<region>.amazonaws.com/<user-pool-id>
+    #   Okta:    https://<org>.okta.com
+    #   Auth0:   https://<tenant>.us.auth0.com
+    # With a real https:// issuer there is no loopback concern (the daemon
+    # accepts any https:// issuer; only http:// is restricted to loopback).
+    # Most providers expose discovery at <issuer>/.well-known/openid-configuration
+    # so authorization_endpoint/token_endpoint/jwks_uri match that document.
+    issuer_url = "https://idp.example.com"
+    authorization_endpoint = "https://idp.example.com/authorize"
+    token_endpoint = "https://idp.example.com/oauth/token"
+    jwks_uri = "https://idp.example.com/.well-known/jwks.json"
+    client_id = "desktop-assistant"
+    # audience is REQUIRED and must be NON-EMPTY (an empty audience is rejected at
+    # startup — it would accept any token the issuer ever minted). Set it to the
+    # API/audience identifier your IdP stamps into the token's `aud` claim. With
+    # Cognito/Dex this is typically the client id; with Auth0 it is the API
+    # identifier you configure.
+    audience = "desktop-assistant"
+    scopes = "openid profile email"
+
+    # ── LLM connections ────────────────────────────────────────────────────────
+    # Default: one credential-free Ollama connection pointing at an in-cluster (or
+    # otherwise reachable) Ollama. [connections] has NO env override, so the literal
+    # below is what takes effect — edit it to match your Ollama Service. Make sure
+    # the chat model named in [purposes.interactive] is pulled on that Ollama.
+    #
+    # To use a cloud provider instead, replace this block with one of:
+    #   [connections.default]
+    #   type = "anthropic"        # reads ANTHROPIC_API_KEY from env (Secret)
+    #
+    #   [connections.default]
+    #   type = "openai"           # reads OPENAI_API_KEY from env (Secret)
+    #
+    #   [connections.default]
+    #   type = "bedrock"          # reads AWS_BEDROCK_API_KEY (ACCESS:SECRET[:TOKEN])
+    #   region = "us-east-1"      # or the standard AWS credential chain
+    # ...and set [purposes.interactive].model to that provider's model id (e.g.
+    # claude-sonnet-4 / gpt-4o / us.anthropic.claude-sonnet-4-6). The matching
+    # credential env vars are supplied by the Secret (see secret.example.yaml).
+    [connections.default]
+    type = "ollama"
+    base_url = "http://ollama.default.svc.cluster.local:11434"
+
+    # ── Purposes ────────────────────────────────────────────────────────────────
+    # `interactive` is the required anchor — it must name a concrete connection and
+    # model. Background purposes inherit via the literal "primary" sentinel.
+    [purposes.interactive]
+    connection = "default"
+    model = "llama3.2"
+
+    [purposes.titling]
+    connection = "primary"
+    model = "primary"
+
+    [purposes.dreaming]
+    connection = "primary"
+    model = "primary"
+
+  mcp_servers.toml: |
+    # MCP server fleet. The daemon spawns each as a stdio child process; the
+    # `command` must be a binary on the image PATH (the C-1 Containerfile installs
+    # the full fleet to /usr/local/bin). The daemon degrades gracefully if a
+    # server fails to start, so trim freely.
+    #
+    # FULL fleet baked into the image: fileio-mcp, terminal-mcp, tasks-mcp,
+    # timeclock-mcp, web-mcp, cve-mcp, geocode-mcp, openstreetmap-mcp,
+    # weather-forecast-mcp, internet-radio-mcp, skills-mcp, gen-mcp. Add a
+    # [[servers]] entry for any of them.
+    #
+    # NOTE: terminal-mcp gives the model an in-pod shell. It is intentionally left
+    # OUT of this default list for a server-side/multi-tenant deployment — see the
+    # security note in README.md. Add it only if you accept that exposure.
+
+    [[servers]]
+    name = "fileio"
+    command = "fileio-mcp"
+    args = ["serve", "--mode", "stdio"]
+
+    [[servers]]
+    name = "web"
+    command = "web-mcp"
+    args = ["serve", "--mode", "stdio"]
+
+    [[servers]]
+    name = "tasks"
+    command = "tasks-mcp"
+    args = ["serve", "--mode", "stdio"]
+
+    [[servers]]
+    name = "cve"
+    command = "cve-mcp"
+    args = ["serve", "--mode", "stdio"]
