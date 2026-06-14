@@ -22,6 +22,9 @@ bridge_service_dst := systemd_user_dir + "/adelie-dbus-bridge.service"
 mint_service_dst := systemd_user_dir + "/adelie-mint.service"
 container_cli := env_var_or_default("CONTAINER_CLI", "docker")
 container_security_opts := env_var_or_default("CONTAINER_SECURITY_OPTS", "--security-opt label=disable")
+# Multi-role daemon/bridge/MCP image + reference compose stack (epic #378).
+image_tag := env_var_or_default("IMAGE_TAG", "adelie:latest")
+compose_file := "deploy/compose/podman-compose.yml"
 debian_builder_image := env_var_or_default("DEBIAN_BUILDER_IMAGE", "debian:trixie")
 rpm_builder_image := env_var_or_default("RPM_BUILDER_IMAGE", "fedora:43")
 flatpak_builder_image := env_var_or_default("FLATPAK_BUILDER_IMAGE", "fedora:43")
@@ -244,6 +247,41 @@ uninstall:
 # Clean build artifacts
 clean:
     cargo clean
+
+# --- Containers / deploy (epic #378) ------------------------------------------
+# Build the multi-role image (daemon + bridge + MCP fleet) and drive the
+# reference compose stack / k8s manifests under deploy/. Override the runtime
+# with CONTAINER_CLI=podman (default: docker). The reference stack needs a
+# bridge network — rootless hosts that can't create one (netavark "create
+# bridge: Operation not supported") can't run compose-up.
+
+# Build the container image (Containerfile): daemon + bridge + full MCP fleet
+image-build:
+    {{container_cli}} build -t {{image_tag}} -f Containerfile .
+
+# Bring up the reference stack (daemon + Postgres + Dex) — see deploy/compose
+compose-up:
+    {{container_cli}} compose -f {{compose_file}} up -d
+
+# Bring up the reference stack with the optional D-Bus bridge profile
+compose-up-dbus:
+    {{container_cli}} compose -f {{compose_file}} --profile dbus up -d
+
+# Tail logs from the reference stack
+compose-logs:
+    {{container_cli}} compose -f {{compose_file}} logs -f
+
+# Tear down the reference stack (add `-v` yourself to drop volumes)
+compose-down:
+    {{container_cli}} compose -f {{compose_file}} down
+
+# Apply the Kubernetes manifests (deploy/k8s) with kustomize
+k8s-apply:
+    kubectl apply -k deploy/k8s
+
+# Delete the Kubernetes resources
+k8s-delete:
+    kubectl delete -k deploy/k8s
 
 # Validate packaging manifests and metadata
 packaging-check:

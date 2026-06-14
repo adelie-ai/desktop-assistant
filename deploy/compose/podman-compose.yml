@@ -1,0 +1,133 @@
+# Reference compose stack for the desktop-assistant daemon.
+#
+#   postgres   — persistent store (conversations, scratchpad, KB)
+#   dex        — OIDC identity provider (issues the bearer tokens the daemon validates)
+#   assistant  — the daemon (C-1 image), WebSocket on :11339, OIDC-gated
+#   bridge     — OPTIONAL D-Bus bridge (profile: dbus), documents UDS wiring only
+#
+# Run with podman-compose (or `docker compose`):
+#   cp .env.example .env
+#   podman-compose up --build
+#
+# See README.md for the end-to-end walkthrough (token, wscat, persistence).
+#
+# ── NETWORK NAMESPACE NOTE ───────────────────────────────────────────────────
+# The `assistant` service uses `network_mode: "service:dex"` so that
+# `localhost:5556` inside the daemon container resolves to Dex. This is required
+# because the daemon's OIDC validator only accepts an https:// or loopback
+# http:// issuer, and Dex's issuer must be one value shared by daemon + host +
+# wscat — `http://localhost:5556/dex`. A consequence of sharing Dex's namespace:
+#   * the assistant has NO `ports:` of its own — port 11339 is published on the
+#     `dex` service instead (both containers share one network stack);
+#   * the assistant reaches Postgres at `localhost:5432` (also via the shared
+#     stack), NOT at `postgres:5432`.
+# The alternative (an `extra_hosts: ["dex:host-gateway"]` style alias) is
+# discussed in the README; the shared-namespace approach is the simplest one
+# that keeps a single issuer URL working everywhere.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dex:
+    image: ghcr.io/dexidp/dex:latest
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./dex-config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      # Dex itself, AND (because `assistant` shares this namespace) the daemon's
+      # WebSocket endpoint, are published here.
+      - "5556:5556"
+      - "11339:11339"
+    healthcheck:
+      # wget is present in the dex image; hit the discovery document.
+      test:
+        - "CMD"
+        - "wget"
+        - "--quiet"
+        - "--tries=1"
+        - "--spider"
+        - "http://localhost:5556/dex/.well-known/openid-configuration"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  assistant:
+    # Build the C-1 image from the repo root Containerfile. Alternatively,
+    # pre-build it and replace the `build:` block with `image: adelie:latest`.
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    # image: adelie:latest
+    command: ["daemon"]
+    # Share Dex's network namespace so `localhost:5556` == Dex and the published
+    # ports above cover both. See the NETWORK NAMESPACE NOTE at the top.
+    network_mode: "service:dex"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dex:
+        condition: service_healthy
+    environment:
+      DESKTOP_ASSISTANT_WS_ENABLED: "true"
+      DESKTOP_ASSISTANT_WS_BIND: "0.0.0.0:11339"
+      DESKTOP_ASSISTANT_WS_TLS: "false"
+      DESKTOP_ASSISTANT_UDS_ENABLED: "true"
+      # Pin the UDS to a shared, writable dir so the optional `bridge` can reach
+      # it. (The default path is XDG_RUNTIME_DIR-based, which isn't set in the
+      # image.) The dir is backed by the `assistant-run` named volume.
+      DESKTOP_ASSISTANT_UDS_SOCKET: "/home/assistant/.local/state/adelie.sock"
+      # Shared namespace with dex → Postgres is reachable at localhost:5432.
+      DESKTOP_ASSISTANT_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:5432/${POSTGRES_DB}"
+      RUST_LOG: "info"
+      DESKTOP_ASSISTANT_DBUS_REQUIRED: "false"
+    volumes:
+      - ./daemon.toml:/home/assistant/.config/desktop-assistant/daemon.toml:ro
+      # NOT mounted read-only: the daemon chmods mcp_servers.toml to 0600 on load
+      # (it may carry secrets). A `:ro` mount makes that chmod fail (EROFS), which
+      # silently drops ALL MCP servers. A read-write bind mount lets the chmod
+      # succeed. The host file is unaffected in practice (perms-only).
+      - ./mcp_servers.toml:/home/assistant/.config/desktop-assistant/mcp_servers.toml
+      # Persist the daemon's local UDS socket dir so the optional bridge can
+      # share it (and so the socket survives restarts within a run).
+      - assistant-run:/home/assistant/.local/state
+
+  # OPTIONAL D-Bus bridge. Brought up only with the `dbus` profile:
+  #   podman-compose --profile dbus up
+  # Here it exists to DOCUMENT the wiring: it runs the same image with the
+  # `bridge` role and shares the daemon's UDS via the `assistant-run` volume.
+  # A full session-bus deployment (the bridge owning `org.desktopAssistant` on a
+  # real D-Bus) is the quadlet pod in issue C-7 — this compose service only
+  # demonstrates how the bridge attaches to the daemon's local socket.
+  bridge:
+    profiles: ["dbus"]
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    # image: adelie:latest
+    command: ["bridge"]
+    network_mode: "service:dex"
+    depends_on:
+      - assistant
+    environment:
+      RUST_LOG: "info"
+      DESKTOP_ASSISTANT_DBUS_REQUIRED: "false"
+      # Same socket the daemon serves on, via the shared volume below.
+      DESKTOP_ASSISTANT_UDS_SOCKET: "/home/assistant/.local/state/adelie.sock"
+    volumes:
+      - assistant-run:/home/assistant/.local/state
+
+volumes:
+  pgdata:
+  assistant-run:

@@ -1,0 +1,17 @@
+# ClusterIP service fronting the daemon's WebSocket port. The Ingress routes to
+# this; nothing else in the cluster should need it directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: desktop-assistant
+  labels:
+    app: desktop-assistant
+spec:
+  type: ClusterIP
+  selector:
+    app: desktop-assistant
+  ports:
+    - name: ws
+      port: 11339
+      targetPort: 11339
+      protocol: TCP

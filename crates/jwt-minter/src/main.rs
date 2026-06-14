@@ -1,3 +1,13 @@
+//! # DEPRECATED (#383, containerization epic #378)
+//!
+//! `adelie-mint` is **deprecated**. The decision in #383 makes an OIDC
+//! provider the sole token issuer (default FOSS provider: Dex), and the
+//! daemon already validates OIDC RS256 tokens over both UDS and WebSocket
+//! with one shared validator — so this local HS256 minter is redundant.
+//! See `docs/oidc-auth.md`. Removal is tracked once the client token path
+//! (#384) lands (D-Bus bridge + `Connector` obtain OIDC tokens instead of
+//! minting). See also `crates/jwt-minter/README.md`.
+//!
 //! `adelie-mint` — local JWT minter binary (issue #101).
 //!
 //! Listens on a Unix domain socket and mints short-lived HS256 JWTs for

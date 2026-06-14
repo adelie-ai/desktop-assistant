@@ -1,0 +1,85 @@
+# desktop-assistant daemon configuration — compose reference stack.
+#
+# Mounted read-only into the assistant container at
+#   /home/assistant/.config/desktop-assistant/daemon.toml
+#
+# What lives here vs. in env vars:
+#   * Transport enable/bind, TLS on/off, and the database URL ALSO have
+#     `DESKTOP_ASSISTANT_*` env overrides (set in podman-compose.yml), and the
+#     env value wins when present. We rely on the env vars for those so the
+#     compose file is the single source of truth for wiring; the values below
+#     are documented defaults / fallbacks.
+#   * `[ws_auth]`, `[connections]`, and `[purposes]` have NO env overrides, so
+#     they MUST be configured here. These are the substantive parts of this file.
+
+# ── Transports ─────────────────────────────────────────────────────────────
+# Overridden by DESKTOP_ASSISTANT_WS_ENABLED / _WS_BIND / _UDS_ENABLED in the
+# compose env. Listed here for clarity.
+[transports]
+ws_enabled = true
+ws_bind = "0.0.0.0:11339"
+uds_enabled = true
+
+# ── TLS ──────────────────────────────────────────────────────────────────
+# Disabled in this dev stack via DESKTOP_ASSISTANT_WS_TLS=false (compose env) so
+# you can connect with plain `ws://`. For anything beyond local dev, terminate
+# TLS (real cert) and drop that env override. RS256 OIDC tokens are still
+# validated regardless of transport TLS.
+[tls]
+enabled = false
+
+# ── Database ───────────────────────────────────────────────────────────────
+# The real URL is supplied by DESKTOP_ASSISTANT_DATABASE_URL in the compose env
+# (points at the `postgres` service). This block only sets the pool size.
+[database]
+max_connections = 5
+
+# ── WebSocket auth (OIDC via Dex) ────────────────────────────────────────────
+# methods=["oidc"] makes the daemon validate an `Authorization: Bearer <jwt>`
+# against Dex. allowed_origins governs browser clients (those that send an
+# Origin header); native clients / wscat send no Origin and are always allowed,
+# so the list can stay empty for the curl/wscat walkthrough.
+[ws_auth]
+methods = ["oidc"]
+allowed_origins = []
+
+[ws_auth.oidc]
+# Must match Dex's `issuer` exactly. http://localhost is permitted because the
+# assistant container shares Dex's network namespace (see dex-config.yaml and
+# the README). A non-loopback http issuer (e.g. http://dex:5556) would be
+# rejected by the validator.
+issuer_url = "http://localhost:5556/dex"
+authorization_endpoint = "http://localhost:5556/dex/auth"
+token_endpoint = "http://localhost:5556/dex/token"
+jwks_uri = "http://localhost:5556/dex/keys"
+client_id = "desktop-assistant"
+# Audience is REQUIRED and must be non-empty — an empty audience is rejected at
+# startup (it would accept any token the issuer ever minted). Dex sets the
+# token's `aud` to the requesting client id, so pin it to the client id.
+audience = "desktop-assistant"
+scopes = "openid profile email"
+
+# ── LLM connections ──────────────────────────────────────────────────────────
+# One credential-free Ollama connection pointed at a host-reachable Ollama. The
+# base_url here is a fallback; the compose file injects OLLAMA_BASE_URL into the
+# container, but `[connections]` has no env override, so the literal below is
+# what actually takes effect. Edit it (or the .env default) to match your host.
+[connections.default]
+type = "ollama"
+base_url = "http://host.containers.internal:11434"
+
+# ── Purposes ───────────────────────────────────────────────────────────────
+# `interactive` is the required anchor; it must name a concrete connection and
+# model. Background purposes inherit via the literal "primary" sentinel, so a
+# single local model serves chat, titling, and dreaming.
+[purposes.interactive]
+connection = "default"
+model = "llama3.2"
+
+[purposes.titling]
+connection = "primary"
+model = "primary"
+
+[purposes.dreaming]
+connection = "primary"
+model = "primary"

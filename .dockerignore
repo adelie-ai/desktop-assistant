@@ -1,8 +1,24 @@
+# VCS
 .git
 .github
+.worktrees
+
+# Rust / build outputs
 target
 build
+
+# Deploy build outputs (compose state, generated configs, etc.)
+deploy/**/target
+deploy/**/build
+
+# Python / virtualenvs
 .venv
+
+# Env files
 .env
 .envrc
+
+# Logs and editor cruft
 **/*.log
+**/*.swp
+.DS_Store
