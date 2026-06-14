@@ -11,11 +11,11 @@
 //!    across reconnects).
 //! 4. Wait for SIGTERM / SIGINT; tear down cleanly.
 //!
-//! The well-known bus name is configurable (`--name`, default
-//! `org.desktopAssistant.Bridge`). This default deliberately differs from the
-//! daemon's in-process name (`org.desktopAssistant`) so the bridge can run
-//! alongside it during the transition (PR #106 Option A); a follow-up flips the
-//! default and removes the in-process surface.
+//! The well-known bus name is configurable (`--name`); it defaults to
+//! `org.desktopAssistant` — the bridge is the live D-Bus surface as of the
+//! cutover name flip (#318), and the daemon no longer claims the name (its
+//! in-process surface is off by default). Pass `--name org.desktopAssistant.Bridge`
+//! or `.Dev` to run a side-by-side instance for QA without colliding.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +35,12 @@ use desktop_assistant_dbus_bridge::adapter::{
 use desktop_assistant_dbus_bridge::transport::ConnectorBridgeTransport;
 use tokio::signal::unix::{SignalKind, signal};
 
-const DEFAULT_BRIDGE_NAME: &str = "org.desktopAssistant.Bridge";
+// The bridge is the live D-Bus surface as of the cutover's name flip (#318):
+// it claims `org.desktopAssistant` and the daemon steps off the name (its
+// in-process surface is off by default; `DESKTOP_ASSISTANT_DBUS_INPROCESS=true`
+// re-enables it as a revert). Use `--name org.desktopAssistant.Bridge`/`.Dev`
+// to run a side-by-side instance for QA without colliding.
+const DEFAULT_BRIDGE_NAME: &str = "org.desktopAssistant";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -54,11 +59,9 @@ struct Cli {
     #[arg(long, env = "ADELIE_BRIDGE_DAEMON_SOCKET")]
     daemon_socket: Option<PathBuf>,
 
-    /// D-Bus well-known name to bind. Defaults to
-    /// `org.desktopAssistant.Bridge` so the bridge can run alongside
-    /// the daemon's in-process surface during the Option-A
-    /// transition. Set to `org.desktopAssistant` (and remove the
-    /// daemon's surface) to flip the cutover.
+    /// D-Bus well-known name to bind. Defaults to `org.desktopAssistant` — the
+    /// bridge is the live D-Bus surface (#318). Use `org.desktopAssistant.Bridge`
+    /// or `.Dev` to run a side-by-side instance for QA.
     #[arg(long, env = "ADELIE_BRIDGE_NAME", default_value = DEFAULT_BRIDGE_NAME)]
     name: String,
 

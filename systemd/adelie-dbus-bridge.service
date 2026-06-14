@@ -25,19 +25,19 @@ PartOf=default.target
 # With the bridge, a missing/crashed bridge leaves D-Bus clients (KDE) dark even
 # while the daemon is healthy. Observe liveness with:
 #   systemctl --user is-active adelie-dbus-bridge.service
-#   busctl --user list | grep org.desktopAssistant.Bridge
+#   busctl --user list | grep org.desktopAssistant
 
 [Service]
 Type=simple
 ExecStart=%h/.cargo/bin/adelie-dbus-bridge
 Restart=on-failure
 RestartSec=2
-# Default well-known name is `org.desktopAssistant.Bridge` so the bridge can run
-# alongside the daemon's in-process D-Bus surface during the Option-A
-# transition (PR #106). The flip to `org.desktopAssistant` — and removing the
-# daemon's in-process surface + the DESKTOP_ASSISTANT_DBUS_SERVICE/REQUIRED
-# env knobs — is the cutover's steps 6/7 (#318/#319).
-Environment=ADELIE_BRIDGE_NAME=org.desktopAssistant.Bridge
+# The bridge IS the live D-Bus surface (#318 name flip): it claims
+# `org.desktopAssistant`, and the daemon no longer serves the in-process surface
+# (DESKTOP_ASSISTANT_DBUS_INPROCESS=false by default — set it true + stop the
+# bridge to revert). For a side-by-side QA instance, run a second bridge with
+# ADELIE_BRIDGE_NAME=org.desktopAssistant.Bridge or .Dev.
+Environment=ADELIE_BRIDGE_NAME=org.desktopAssistant
 Environment=RUST_LOG=info,desktop_assistant_dbus_bridge=debug
 
 [Install]

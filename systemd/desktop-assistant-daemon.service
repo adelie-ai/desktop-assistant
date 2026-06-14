@@ -3,8 +3,13 @@ Description=Desktop Assistant Backend Daemon
 After=default.target
 
 [Service]
-Type=dbus
-BusName=org.desktopAssistant
+# Type=simple (not dbus): since the cutover name flip (#318) the daemon no longer
+# claims a session-bus name — the standalone adelie-dbus-bridge owns
+# org.desktopAssistant. The daemon serves UDS (and optionally WS); its readiness
+# is process start, not a bus-name acquisition. To run the legacy in-process
+# D-Bus surface instead, set Type=dbus + BusName=org.desktopAssistant and
+# Environment=DESKTOP_ASSISTANT_DBUS_INPROCESS=true (and stop the bridge).
+Type=simple
 ExecStart=%h/.cargo/bin/desktop-assistant-daemon
 Restart=on-failure
 RestartSec=2
