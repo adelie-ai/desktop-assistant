@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.desktopAssistant.Bridge
+Exec=/bin/false
+SystemdService=adelie-dbus-bridge.service

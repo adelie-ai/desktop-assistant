@@ -1,5 +1,8 @@
 # D-Bus API
 
+> Deployment + the `adelie-dbus-bridge` that serves this surface during the
+> cutover: see [dbus-bridge.md](dbus-bridge.md).
+
 Service name: `org.desktopAssistant`  
 Object path: `/org/desktopAssistant/Conversations`  
 Interface: `org.desktopAssistant.Conversations`
