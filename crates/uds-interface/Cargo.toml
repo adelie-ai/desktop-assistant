@@ -18,6 +18,8 @@ desktop-assistant-api-model = { path = "../api-model" }
 desktop-assistant-application = { path = "../application" }
 desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
 desktop-assistant-frame-codec = { workspace = true }
+# Kernel peer-credential auth for local connections (#407).
+desktop-assistant-peer-cred = { workspace = true }
 # System-id co-location comparison (#248).
 desktop-assistant-core = { path = "../core" }
 

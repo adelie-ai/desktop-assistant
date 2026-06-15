@@ -1,0 +1,16 @@
+[package]
+name = "desktop-assistant-peer-cred"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+libc = "0.2"
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net"] }
+
+[lints]
+workspace = true

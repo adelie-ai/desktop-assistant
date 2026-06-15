@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 desktop-assistant-auth-jwt = { path = "../auth-jwt" }
+desktop-assistant-peer-cred.workspace = true
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
