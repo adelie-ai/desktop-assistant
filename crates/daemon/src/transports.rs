@@ -97,31 +97,66 @@ impl ws::WsAuthDiscovery for WsAuthDiscoveryProvider {
     }
 }
 
-/// Adapter: reuses the WS bearer-token validator for UDS connections so
-/// both transports honor the same JWT policy (local HS256 + OIDC RS256
-/// fallback) per `architecture-evolution.md` rule #2 (uniform JWT auth).
-pub(crate) struct WsAsUdsAuth {
-    validator: Arc<dyn ws::WsAuthValidator>,
+/// UDS auth for the **local trust model** (#407): authenticate by kernel
+/// peer-credentials, deriving the `UserId` from the connecting peer's username.
+/// No bearer token is required on a local Unix socket — the kernel-attested peer
+/// UID (`SO_PEERCRED`, unforgeable) *is* the authentication. This is the
+/// username the retired `adelie-mint` minter used to stamp as the JWT `sub`, so
+/// per-user identity is preserved.
+///
+/// This **reverses** `architecture-evolution.md` rule #2 (uniform JWT on every
+/// transport): JWT auth now belongs to the *remote* WS door only.
+///
+/// During the migration off the minter this stays **tolerant**: if the OS can't
+/// supply peer credentials but the client still presents a valid bearer token
+/// (the old uniform-JWT path), the token is accepted as a fallback. Once every
+/// local client has stopped minting tokens (#407 step 3) the fallback can go.
+pub(crate) struct PeerCredUdsAuth {
+    /// JWT fallback for the (rare) peer-cred-unavailable case during migration.
+    jwt_fallback: Arc<dyn ws::WsAuthValidator>,
 }
 
-impl WsAsUdsAuth {
-    pub(crate) fn new(validator: Arc<dyn ws::WsAuthValidator>) -> Self {
-        Self { validator }
+impl PeerCredUdsAuth {
+    pub(crate) fn new(jwt_fallback: Arc<dyn ws::WsAuthValidator>) -> Self {
+        Self { jwt_fallback }
     }
 }
 
 #[async_trait]
-impl uds::UdsAuthValidator for WsAsUdsAuth {
+impl uds::UdsAuthValidator for PeerCredUdsAuth {
     async fn validate_bearer_token(&self, token: &str) -> bool {
-        self.validator.validate_bearer_token(token).await
+        self.jwt_fallback.validate_bearer_token(token).await
     }
 
     async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
-        // Delegate to the same WS validator so UDS and WS share the
-        // JWT-to-user_id mapping. The bridge above already enforces
-        // uniform validation; #105's identity extraction follows the
-        // same path.
-        self.validator.extract_user_id(token).await
+        self.jwt_fallback.extract_user_id(token).await
+    }
+
+    async fn authenticate(
+        &self,
+        token: Option<&str>,
+        peer: Option<&uds::PeerIdentity>,
+    ) -> uds::UdsAuth {
+        // Local trust: the kernel-attested peer is the authentication. Derive
+        // the per-user identity from the peer username.
+        if let Some(peer) = peer {
+            return uds::UdsAuth::Allow(desktop_assistant_application::UserId::from(
+                peer.username.clone(),
+            ));
+        }
+        // Peer-cred unavailable — fall back to a valid bearer token (migration
+        // tolerance; see the struct docs).
+        match token {
+            Some(t) if self.jwt_fallback.validate_bearer_token(t).await => uds::UdsAuth::Allow(
+                self.jwt_fallback
+                    .extract_user_id(t)
+                    .await
+                    .unwrap_or_default(),
+            ),
+            _ => uds::UdsAuth::Reject(
+                "auth: no peer credentials and no valid bearer token".to_string(),
+            ),
+        }
     }
 }
 
@@ -407,5 +442,85 @@ mod tests {
         let result =
             resolve_ws_login_mode_decision("local-user".to_string(), None, None, false, false);
         assert!(result.is_none());
+    }
+
+    mod peer_cred_uds_auth {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use desktop_assistant_application::UserId;
+        use desktop_assistant_uds::{PeerIdentity, UdsAuth, UdsAuthValidator};
+        use desktop_assistant_ws as ws;
+
+        use crate::transports::PeerCredUdsAuth;
+
+        /// JWT fallback stub: accepts only the literal token `"good"`, whose
+        /// `sub` is `"jwtuser"`.
+        struct StubJwt;
+
+        #[async_trait]
+        impl ws::WsAuthValidator for StubJwt {
+            async fn validate_bearer_token(&self, token: &str) -> bool {
+                token == "good"
+            }
+            async fn extract_user_id(&self, token: &str) -> Option<UserId> {
+                (token == "good").then(|| UserId::from("jwtuser"))
+            }
+        }
+
+        fn auth() -> PeerCredUdsAuth {
+            PeerCredUdsAuth::new(Arc::new(StubJwt))
+        }
+
+        fn peer(username: &str) -> PeerIdentity {
+            PeerIdentity {
+                uid: 1000,
+                username: username.to_string(),
+            }
+        }
+
+        fn allowed(outcome: UdsAuth) -> UserId {
+            match outcome {
+                UdsAuth::Allow(user) => user,
+                UdsAuth::Reject(reason) => panic!("expected Allow, got Reject({reason})"),
+            }
+        }
+
+        /// Peer-cred alone (no token) authenticates, and the `UserId` is the
+        /// peer's username — the local trust model (#407).
+        #[tokio::test]
+        async fn peer_cred_without_token_authenticates_as_peer_user() {
+            let outcome = auth().authenticate(None, Some(&peer("dave"))).await;
+            assert_eq!(allowed(outcome), UserId::from("dave"));
+        }
+
+        /// Peer-cred wins even when a (valid) token is also presented — the
+        /// kernel identity is ground truth on a local socket.
+        #[tokio::test]
+        async fn peer_cred_takes_precedence_over_a_token() {
+            let outcome = auth().authenticate(Some("good"), Some(&peer("dave"))).await;
+            assert_eq!(allowed(outcome), UserId::from("dave"));
+        }
+
+        /// Migration tolerance: with no peer-cred but a valid token, the token
+        /// is accepted and its `sub` is the identity.
+        #[tokio::test]
+        async fn valid_token_is_accepted_when_peer_cred_is_unavailable() {
+            let outcome = auth().authenticate(Some("good"), None).await;
+            assert_eq!(allowed(outcome), UserId::from("jwtuser"));
+        }
+
+        /// Neither peer-cred nor a valid token → rejected.
+        #[tokio::test]
+        async fn no_peer_cred_and_no_valid_token_is_rejected() {
+            assert!(matches!(
+                auth().authenticate(None, None).await,
+                UdsAuth::Reject(_)
+            ));
+            assert!(matches!(
+                auth().authenticate(Some("bogus"), None).await,
+                UdsAuth::Reject(_)
+            ));
+        }
     }
 }

@@ -37,7 +37,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::AssistantApiHandler;
+use desktop_assistant_application::{AssistantApiHandler, UserId};
+use desktop_assistant_peer_cred::extract_peer_identity;
 use desktop_assistant_transport_dispatch::{AuthContext, TransportKind, dispatch_loop};
 use futures::stream;
 use tokio::io::AsyncWriteExt;
@@ -46,6 +47,7 @@ use tokio_util::sync::PollSender;
 use tracing::{debug, info, warn};
 
 pub use api::{WsFrame, WsRequest};
+pub use desktop_assistant_peer_cred::PeerIdentity;
 
 /// Default desktop path. The system-service flavor (`/run/adelie/sock`)
 /// is the daemon's responsibility — it picks the right default based
@@ -54,17 +56,32 @@ pub fn default_desktop_socket_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("adelie").join("sock"))
 }
 
-/// Result of the JWT handshake.
+/// Outcome of authenticating a UDS connection (#407).
 ///
-/// The validator only owns the bool/claims decision; the listener
-/// owns the wire framing. This means the validator can be implemented
-/// against any JWT library / claim shape without dragging
-/// `auth-jwt` into this crate's public API.
+/// The listener owns the wire framing; the validator only renders a verdict.
+pub enum UdsAuth {
+    /// Authenticated as this user — enter the dispatcher loop.
+    Allow(UserId),
+    /// Rejected — the listener writes `reason` as an error frame and closes.
+    Reject(String),
+}
+
+/// Result of the connection handshake.
+///
+/// The validator only owns the auth decision; the listener owns the wire
+/// framing. This means the validator can be implemented against any JWT
+/// library / claim shape without dragging `auth-jwt` into this crate's public
+/// API.
+///
+/// Authentication has two inputs: an optional handshake bearer token and the
+/// kernel-attested peer credentials of the connecting process. The default
+/// policy is **token-only** (back-compat with the uniform-JWT model): a valid
+/// token is required and peer-cred is ignored. A daemon that trusts local peers
+/// (issue #407) overrides [`Self::authenticate`] to accept the peer identity
+/// without a token.
 #[async_trait::async_trait]
 pub trait UdsAuthValidator: Send + Sync {
-    /// Validate a bearer token. Returning `true` enters the dispatcher
-    /// loop; returning `false` causes the listener to write an error
-    /// frame and close.
+    /// Validate a bearer token. Returning `true` accepts it; `false` rejects.
     async fn validate_bearer_token(&self, token: &str) -> bool;
 
     /// Extract the user id ([JWT `sub`]) from a bearer token that
@@ -75,9 +92,26 @@ pub trait UdsAuthValidator: Send + Sync {
     /// installs that don't care about identity can keep the default;
     /// multi-tenant or multi-user-host deploys override this method
     /// to return the JWT subject so storage queries scope per-user.
-    async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
+    async fn extract_user_id(&self, token: &str) -> Option<UserId> {
         let _ = token;
         None
+    }
+
+    /// Authenticate a connection from its handshake `token` (if any) and the
+    /// kernel-attested `peer` credentials (if the OS provided them).
+    ///
+    /// The default implementation is the historical token-only policy: require
+    /// a valid bearer token and ignore peer credentials. Local-trust daemons
+    /// override this to authenticate by `peer` instead (#407).
+    async fn authenticate(&self, token: Option<&str>, peer: Option<&PeerIdentity>) -> UdsAuth {
+        let _ = peer;
+        match token {
+            Some(t) if self.validate_bearer_token(t).await => {
+                UdsAuth::Allow(self.extract_user_id(t).await.unwrap_or_default())
+            }
+            Some(_) => UdsAuth::Reject("auth: invalid jwt".to_string()),
+            None => UdsAuth::Reject("auth: missing jwt in handshake".to_string()),
+        }
     }
 }
 
@@ -352,14 +386,20 @@ async fn handle_connection(
     daemon_system_id: Arc<Option<String>>,
     handshake_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
+    // Read the kernel-attested peer identity before splitting the stream
+    // (`peer_cred` is a `UnixStream` method). On local transports this is the
+    // authentication (#407); `None` if the OS couldn't supply it (the auth
+    // policy then falls back to the bearer token, if any).
+    let peer = extract_peer_identity(&stream).ok();
+
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // Handshake: first frame is the JWT plus, optionally, the client's
+    // Handshake: first frame may carry a JWT plus, optionally, the client's
     // per-machine system id + host label for co-location (#248). Anything that
-    // isn't valid JSON, or has a missing/blank `jwt`, is rejected with an
-    // explicit error frame so clients can tell auth from framing problems. An
-    // older client sends the bare `{"jwt": "<token>"}`, which still parses (the
-    // id fields default to absent).
+    // isn't valid JSON is rejected with an explicit error frame so clients can
+    // tell auth from framing problems. The `jwt` field is optional — a
+    // local-trust daemon authenticates by peer-cred (above) and needs no token;
+    // an older client sends the bare `{"jwt": "<token>"}`, which still parses.
     //
     // The read is bounded by `handshake_timeout` (DT-7): a client that
     // connects and sends nothing must not pin a connection task forever.
@@ -386,34 +426,27 @@ async fn handle_connection(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let token = match token {
-        Some(t) => t,
-        None => {
-            write_error(&mut write_half, "", "auth: missing jwt in handshake").await?;
-            return Ok(());
-        }
-    };
-
     // System-id co-location (#248): compare the client's reported id to the
     // daemon's own. `None` (older client / unresolved daemon id) defers to the
     // transport heuristic. The id is a routing HINT, not a trust boundary — it
-    // is self-reported and no privilege is gated on it (auth is the JWT above).
+    // is self-reported and no privilege is gated on it (auth is below).
     let co_located = desktop_assistant_core::system_id::co_location_from_ids(
         daemon_system_id.as_deref(),
         handshake.system_id.as_deref(),
     );
     let client_label = handshake.host_label;
 
-    if !auth.validate_bearer_token(&token).await {
-        write_error(&mut write_half, "", "auth: invalid jwt").await?;
-        return Ok(());
-    }
-
-    // Identity (#105): the validator either returns the `sub` (multi-
-    // tenant deploys) or `None` (single-tenant fallback, mapped to
-    // the schema sentinel). The dispatcher installs this into the
-    // per-task task-local before each command runs.
-    let user_id = auth.extract_user_id(&token).await.unwrap_or_default();
+    // Authenticate from the (optional) token and the kernel peer-cred. The
+    // default validator requires a valid token; a local-trust daemon (#407)
+    // accepts the peer identity. Identity (#105): the resolved `UserId` is
+    // installed into the per-task task-local before each command runs.
+    let user_id = match auth.authenticate(token.as_deref(), peer.as_ref()).await {
+        UdsAuth::Allow(user_id) => user_id,
+        UdsAuth::Reject(reason) => {
+            write_error(&mut write_half, "", &reason).await?;
+            return Ok(());
+        }
+    };
 
     // Auth passed; enter the shared dispatcher.
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<anyhow::Result<WsRequest>>(16);

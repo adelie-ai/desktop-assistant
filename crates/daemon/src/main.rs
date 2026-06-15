@@ -38,8 +38,8 @@ use desktop_assistant_ws as ws;
 use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
 use transports::{
-    OidcAwareAuth, WsAsUdsAuth, WsAuthDiscoveryProvider, WsBasicLogin, WsLoginMode, WsSettingsAuth,
-    daemon_host_label, env_bool, resolve_uds_socket_path, resolve_ws_login_mode,
+    OidcAwareAuth, PeerCredUdsAuth, WsAuthDiscoveryProvider, WsBasicLogin, WsLoginMode,
+    WsSettingsAuth, daemon_host_label, env_bool, resolve_uds_socket_path, resolve_ws_login_mode,
 };
 
 async fn shutdown_signal() {
@@ -2078,8 +2078,11 @@ async fn main() -> Result<()> {
             let uds_daemon_system_id = daemon_system_id.clone();
             tracing::info!("UDS listening on {}", path.display());
             Some(tokio::spawn(async move {
+                // Local transports authenticate by kernel peer-cred (#407);
+                // the WS validator is retained only as a migration-tolerant
+                // JWT fallback for the peer-cred-unavailable case.
                 let auth: Arc<dyn uds::UdsAuthValidator> =
-                    Arc::new(WsAsUdsAuth::new(ws_auth_for_uds));
+                    Arc::new(PeerCredUdsAuth::new(ws_auth_for_uds));
                 let config =
                     uds::UdsServerConfig::new(path).with_daemon_system_id(uds_daemon_system_id);
                 let server = uds::UdsServer::new(api_handler, auth, config);

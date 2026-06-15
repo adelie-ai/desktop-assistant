@@ -28,11 +28,18 @@ single-tenant deploy of the same server.
    load-bearing for correctness. Warm-process caches are valid as opportunistic
    optimization only. Forced by Lambda; healthy for k8s scaling.
 
-2. **JWT-only auth.** The daemon validates JWTs and extracts `sub` for
-   `user_id`. It trusts a configured set of issuers' JWKS. Production uses an
-   external IdP (Cognito, Authentik, Keycloak, etc.); desktop installs use a
-   local JWT minter that authenticates the OS user via `SO_PEERCRED`. No
-   peer-cred or session-based auth in the daemon's request path.
+2. **JWT on the remote door; peer-cred locally.** *(Revised 2026-06-14, issue
+   #407 — supersedes the original "JWT-only auth on every transport" rule.)* JWT
+   is a **remote-client** concern: the daemon validates JWTs and extracts `sub`
+   for `user_id` on the **WebSocket** door, trusting a configured set of issuers'
+   JWKS (external IdP — Cognito, Authentik, Keycloak — or the built-in HS256
+   issuer for the local single-user network door). **Local transports (UDS,
+   D-Bus) authenticate by kernel peer-credentials** (`SO_PEERCRED`): the
+   unforgeable peer UID *is* the auth, the `user_id` is the peer's username, and
+   **no bearer token is required**. The standalone `adelie-mint` JWT minter that
+   used to issue UDS tokens is therefore retired. (Rationale: peer-cred is
+   already the trust boundary on a per-user socket; requiring a JWT there forced
+   running a minter just to talk to your own daemon.)
 
 3. **Shared Postgres, user_id-scoped.** All personal-data tables carry
    `user_id`; queries are always scoped. Single-tenant desktop installs
@@ -136,8 +143,11 @@ single-tenant deploy of the same server.
   about; user_id scoping in code is the standard SaaS pattern and works at
   both desktop and multi-tenant scales.
 - **Custom OIDC IdP.** Too much engineering. Use Cognito / Authentik /
-  Keycloak in production. The local JWT minter is a desktop dev convenience,
-  not a real IdP.
-- **Peer-cred auth in the daemon's request path.** UDS endpoints stay
-  available for local clients but auth is still JWT (issued by the local
-  minter). Keeps the auth path uniform across deployments.
+  Keycloak in production. The built-in HS256 issuer is a desktop convenience
+  for the local single-user network door, not a real IdP.
+- ~~**Peer-cred auth in the daemon's request path.**~~ *(Reversed 2026-06-14,
+  issue #407.)* Local transports (UDS, D-Bus) now **do** authenticate by
+  `SO_PEERCRED` — see rule #2 above. The "keep auth uniform across deployments"
+  goal was outweighed by the cost of forcing a JWT minter onto every desktop
+  just to reach a per-user local socket; remote deployments still use JWT, so
+  the uniformity that matters (the network door) is preserved.

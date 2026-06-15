@@ -681,3 +681,97 @@ async fn socket_file_and_parent_dir_permissions_are_tightened() {
 
     let _ = shutdown.send(());
 }
+
+// --- Peer-credential auth (#407) ---------------------------------------------
+
+/// A local-trust validator that mirrors the daemon's `PeerCredUdsAuth`:
+/// authenticate by the kernel peer identity, no bearer token required.
+struct PeerCredAuth;
+
+#[async_trait::async_trait]
+impl UdsAuthValidator for PeerCredAuth {
+    async fn validate_bearer_token(&self, _token: &str) -> bool {
+        // This validator never accepts tokens — peer-cred is the only path.
+        false
+    }
+
+    async fn authenticate(
+        &self,
+        _token: Option<&str>,
+        peer: Option<&desktop_assistant_uds::PeerIdentity>,
+    ) -> desktop_assistant_uds::UdsAuth {
+        match peer {
+            Some(p) => desktop_assistant_uds::UdsAuth::Allow(
+                desktop_assistant_application::UserId::from(p.username.clone()),
+            ),
+            None => desktop_assistant_uds::UdsAuth::Reject("auth: no peer credentials".to_string()),
+        }
+    }
+}
+
+fn start_server_with(
+    socket_path: PathBuf,
+    auth: Arc<dyn UdsAuthValidator>,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(PingHandler);
+    let config = UdsServerConfig::new(socket_path);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = UdsServer::new(handler, auth, config);
+    let join = tokio::spawn(async move {
+        server
+            .serve_with_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await
+    });
+    (join, tx)
+}
+
+/// With a peer-cred validator, a handshake carrying **no** jwt is accepted —
+/// the kernel-attested peer identity is the authentication (#407). The
+/// connection then services commands normally.
+#[tokio::test]
+async fn uds_connection_without_jwt_proceeds_under_peer_cred() {
+    let dir = TempDir::new().unwrap();
+    let path = socket_path(&dir);
+    let (_join, shutdown) = start_server_with(path.clone(), Arc::new(PeerCredAuth));
+    wait_for_socket(&path).await;
+
+    let mut stream = UnixStream::connect(&path).await.unwrap();
+    // Tokenless handshake — not even a `jwt` field.
+    let handshake = serde_json::json!({});
+    write_frame(&mut stream, &serde_json::to_vec(&handshake).unwrap())
+        .await
+        .unwrap();
+
+    let req = api::WsRequest {
+        id: "1".into(),
+        command: api::Command::Ping,
+    };
+    write_frame(&mut stream, &serde_json::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+
+    let raw = timeout(Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .expect("no response within 2s — tokenless peer-cred handshake should proceed")
+        .expect("io error on read_frame");
+    let frame: api::WsFrame = serde_json::from_slice(&raw).unwrap();
+    match frame {
+        api::WsFrame::Result { id, result } => {
+            assert_eq!(id, "1");
+            assert_eq!(
+                result,
+                api::CommandResult::Pong {
+                    value: "pong".into()
+                }
+            );
+        }
+        other => panic!("expected Pong, got {other:?}"),
+    }
+
+    let _ = shutdown.send(());
+}
