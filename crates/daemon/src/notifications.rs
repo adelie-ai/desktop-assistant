@@ -81,50 +81,52 @@ pub async fn build_notify_fn() -> Option<NotifyFn> {
     // Last (content-hash, instant) for the dedup window.
     let last: Arc<Mutex<Option<(u64, Instant)>>> = Arc::new(Mutex::new(None));
 
-    let notify_fn: NotifyFn = Arc::new(move |summary: String, body: String, urgency: NotifyUrgency| {
-        let proxy = Arc::clone(&proxy);
-        let last = Arc::clone(&last);
-        Box::pin(async move {
-            let key = {
-                let mut hasher = DefaultHasher::new();
-                summary.hash(&mut hasher);
-                body.hash(&mut hasher);
-                urgency.hint().hash(&mut hasher);
-                hasher.finish()
-            };
+    let notify_fn: NotifyFn = Arc::new(
+        move |summary: String, body: String, urgency: NotifyUrgency| {
+            let proxy = Arc::clone(&proxy);
+            let last = Arc::clone(&last);
+            Box::pin(async move {
+                let key = {
+                    let mut hasher = DefaultHasher::new();
+                    summary.hash(&mut hasher);
+                    body.hash(&mut hasher);
+                    urgency.hint().hash(&mut hasher);
+                    hasher.finish()
+                };
 
-            // Dedup. The guard is dropped before the await below — never held
-            // across a suspension point.
-            {
-                let mut guard = last.lock().unwrap();
-                if let Some((prev_key, when)) = *guard
-                    && prev_key == key
-                    && when.elapsed() < DEDUP_WINDOW
+                // Dedup. The guard is dropped before the await below — never held
+                // across a suspension point.
                 {
-                    return Ok(None);
+                    let mut guard = last.lock().unwrap();
+                    if let Some((prev_key, when)) = *guard
+                        && prev_key == key
+                        && when.elapsed() < DEDUP_WINDOW
+                    {
+                        return Ok(None);
+                    }
+                    *guard = Some((key, Instant::now()));
                 }
-                *guard = Some((key, Instant::now()));
-            }
 
-            let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-            hints.insert("urgency", zbus::zvariant::Value::U8(urgency.hint()));
+                let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+                hints.insert("urgency", zbus::zvariant::Value::U8(urgency.hint()));
 
-            let id = proxy
-                .notify(
-                    APP_NAME,
-                    0,
-                    "dialog-information",
-                    &summary,
-                    &body,
-                    &[],
-                    hints,
-                    -1, // let the server choose the timeout
-                )
-                .await
-                .map_err(|e| CoreError::ToolExecution(format!("notification failed: {e}")))?;
-            Ok(Some(id))
-        })
-    });
+                let id = proxy
+                    .notify(
+                        APP_NAME,
+                        0,
+                        "dialog-information",
+                        &summary,
+                        &body,
+                        &[],
+                        hints,
+                        -1, // let the server choose the timeout
+                    )
+                    .await
+                    .map_err(|e| CoreError::ToolExecution(format!("notification failed: {e}")))?;
+                Ok(Some(id))
+            })
+        },
+    );
 
     Some(notify_fn)
 }

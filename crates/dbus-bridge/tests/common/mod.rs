@@ -1,102 +1,18 @@
-//! Shared test fixtures: a stub minter that returns a canned JWT and
-//! a stub daemon UDS server that does the handshake + a configurable
-//! request/response/event script.
+//! Shared test fixtures: a stub daemon UDS server that does the handshake + a
+//! configurable request/response/event script.
 //!
-//! Kept small on purpose — these are the only two external surfaces
-//! the bridge talks to, so a small fake of each is enough to exercise
-//! every code path.
+//! Kept small on purpose — the daemon is the only external surface the bridge
+//! talks to (since #407 the local UDS hop is peer-cred authenticated, so there's
+//! no minter), so a small fake is enough to exercise every code path.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_dbus_bridge::transport::{read_frame, write_frame};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
-
-/// Whether the stub minter should succeed and what token to return.
-///
-/// The non-`Success` variants are reusable failure-simulation scaffolding for
-/// the bridge's failure-path / soak tests (#317/#318); the minter's own error
-/// handling is unit-tested in `client-common`, so they're currently unused here.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum MinterScript {
-    /// Return a one-shot success token.
-    Success { token: String },
-    /// Return an error string in the response body.
-    Error { message: String },
-    /// Hang (never reply) so the caller observes a timeout.
-    HangForever,
-    /// Reply with malformed JSON.
-    MalformedReply,
-}
-
-/// Spawn a stub minter on `path`. Records each received request body.
-pub async fn spawn_stub_minter(
-    path: &Path,
-    script: MinterScript,
-) -> (Arc<Mutex<Vec<String>>>, oneshot::Sender<()>) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path).expect("bind minter socket");
-    let received = Arc::new(Mutex::new(Vec::<String>::new()));
-    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-
-    let received_clone = Arc::clone(&received);
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut stop_rx => break,
-                accept = listener.accept() => {
-                    let Ok((mut stream, _)) = accept else { continue };
-                    let received_clone = Arc::clone(&received_clone);
-                    let script = script.clone();
-                    tokio::spawn(async move {
-                        let (read_half, mut write_half) = stream.split();
-                        let mut reader = BufReader::new(read_half);
-                        let mut line = String::new();
-                        let _ = reader.read_line(&mut line).await;
-                        received_clone.lock().await.push(line.trim().to_string());
-
-                        match script {
-                            MinterScript::Success { token } => {
-                                let reply = serde_json::json!({
-                                    "token": token,
-                                    "exp": 9_999_999_999_u64,
-                                });
-                                let _ = write_half.write_all(reply.to_string().as_bytes()).await;
-                                let _ = write_half.write_all(b"\n").await;
-                            }
-                            MinterScript::Error { message } => {
-                                let reply = serde_json::json!({
-                                    "error": message,
-                                });
-                                let _ = write_half.write_all(reply.to_string().as_bytes()).await;
-                                let _ = write_half.write_all(b"\n").await;
-                            }
-                            MinterScript::HangForever => {
-                                // Hold the stream forever.
-                                tokio::time::sleep(Duration::from_secs(60)).await;
-                            }
-                            MinterScript::MalformedReply => {
-                                let _ = write_half.write_all(b"not json").await;
-                                let _ = write_half.write_all(b"\n").await;
-                            }
-                        }
-                        let _ = write_half.flush().await;
-                    });
-                }
-            }
-        }
-    });
-    (received, stop_tx)
-}
 
 /// What a stub daemon does after the handshake.
 ///

@@ -77,33 +77,13 @@ pub async fn request_ws_login_token(
     Ok(token.to_string())
 }
 
+/// Resolve a bearer token for the **network** door (WebSocket). Local UDS no
+/// longer calls this — it authenticates by kernel peer-cred (#407) — so this is
+/// the remote-client path only: an explicit `ws_jwt`, else a D-Bus `GenerateWsJwt`
+/// (built-in HS256 issuer), else a `/login` password exchange.
 pub async fn resolve_ws_bearer_token(config: &ConnectionConfig) -> Result<String> {
     if let Some(token) = config.ws_jwt.clone() {
         return Ok(token);
-    }
-
-    // Local-minter source (#101/#316): mint a fresh token on every (re)connect.
-    // Preferred over the D-Bus minter below — it keeps JWT minting off D-Bus
-    // (#281) and, because the reconnect supervisor re-runs this resolver, a
-    // long-lived socket client (the dbus-bridge) never ends up holding an
-    // expired static token after a daemon restart.
-    if let Some(minter_socket) = config.minter_socket.as_deref() {
-        const MINTER_TIMEOUT: Duration = Duration::from_secs(10);
-        return crate::minter::fetch_jwt(
-            minter_socket,
-            crate::minter::MintRequest {
-                ttl_seconds: config.minter_ttl_seconds,
-                audience: None,
-            },
-            MINTER_TIMEOUT,
-        )
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to mint a bearer token from the local minter at {}: {e}",
-                minter_socket.display()
-            )
-        });
     }
 
     #[cfg(feature = "dbus")]
