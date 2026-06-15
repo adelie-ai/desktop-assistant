@@ -11,6 +11,7 @@
 //! changes.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
@@ -27,22 +28,85 @@ fn ws_jwt_signing_key_account() -> &'static str {
     "ws_jwt_hs256_signing_key"
 }
 
-pub(super) fn default_ws_jwt_issuer() -> &'static str {
-    "org.desktopAssistant.local"
+/// The resolved built-in HS256 issuer identity (`iss`/`aud`), shared by the
+/// issue and validate paths so they can never drift. Seeded once at daemon
+/// startup from `[ws_auth.hs256]` via [`init_hs256_identity`]; any access before
+/// that (e.g. a unit test) lazily falls back to the per-host default.
+#[derive(Debug, Clone)]
+struct Hs256Identity {
+    issuer: String,
+    audience: String,
 }
 
-pub(super) fn default_ws_jwt_audience() -> &'static str {
-    "desktop-assistant-ws"
+static HS256_IDENTITY: OnceLock<Hs256Identity> = OnceLock::new();
+
+/// Best-effort local hostname for the default `iss`. Dependency-free, mirroring
+/// `client-common`'s resolver: kernel hostname, then `/etc/hostname`, then
+/// `$HOSTNAME`. Falls back to a fixed label so a token always has an issuer.
+fn local_hostname() -> String {
+    let from_file = |path: &str| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    from_file("/proc/sys/kernel/hostname")
+        .or_else(|| from_file("/etc/hostname"))
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "desktop-assistant.local".to_string())
+}
+
+/// The per-host default identity used when config leaves a field unset:
+/// `iss` = local hostname, `aud` = `"<user>.adelie-ai"`.
+fn default_hs256_identity() -> Hs256Identity {
+    Hs256Identity {
+        issuer: local_hostname(),
+        audience: format!("{}.adelie-ai", current_username()),
+    }
+}
+
+/// Resolve the effective identity from config fields: a non-empty `issuer` /
+/// `audience` wins, otherwise the per-host default. Pure (no global state) so it
+/// can be unit-tested directly.
+fn resolve_hs256_identity(issuer: Option<String>, audience: Option<String>) -> Hs256Identity {
+    let non_empty = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let default = default_hs256_identity();
+    Hs256Identity {
+        issuer: non_empty(issuer).unwrap_or(default.issuer),
+        audience: non_empty(audience).unwrap_or(default.audience),
+    }
+}
+
+/// Seed the process-wide HS256 issuer identity from `[ws_auth.hs256]`. Call once
+/// at daemon startup, before serving. Empty/`None` fields fall back to the
+/// per-host default. First call wins; later calls are ignored (the identity is
+/// immutable for the process lifetime, which is what keeps issue == validate).
+pub(crate) fn init_hs256_identity(issuer: Option<String>, audience: Option<String>) {
+    let _ = HS256_IDENTITY.set(resolve_hs256_identity(issuer, audience));
+}
+
+fn hs256_identity() -> &'static Hs256Identity {
+    HS256_IDENTITY.get_or_init(default_hs256_identity)
+}
+
+pub(super) fn ws_jwt_issuer() -> &'static str {
+    &hs256_identity().issuer
+}
+
+pub(super) fn ws_jwt_audience() -> &'static str {
+    &hs256_identity().audience
 }
 
 /// Default lifetime of a daemon-minted WS JWT.
 ///
-/// DT-3 (#269): dropped from 30 days to 1 hour to match the jwt-minter's own
-/// default (`dbus-bridge`'s `token_ttl_seconds`). A leaked token is now a
-/// one-hour exposure, not a month, and clients re-mint transparently on
-/// expiry (the `Connector` already reconnects and replays). Existing configs
-/// that explicitly request a longer TTL via the minter keep working — this is
-/// only the default applied when no TTL is supplied.
+/// DT-3 (#269): dropped from 30 days to 1 hour. A leaked token is now a
+/// one-hour exposure, not a month, and clients re-issue transparently on expiry
+/// (the `Connector` already reconnects and replays).
 pub(super) fn default_ws_jwt_ttl_seconds() -> u64 {
     60 * 60
 }
@@ -98,20 +162,15 @@ pub(super) fn decode_ws_jwt_claims(token: &str) -> anyhow::Result<WsJwtClaims> {
 pub(super) fn decode_ws_jwt_claims_ignoring_revocation(token: &str) -> anyhow::Result<WsJwtClaims> {
     let signing_key = auth_jwt::read_signing_key_at(&signing_key_path())
         .ok_or_else(|| anyhow!("ws jwt signing key is not initialized"))?;
-    auth_jwt::decode(
-        token,
-        &signing_key,
-        default_ws_jwt_issuer(),
-        default_ws_jwt_audience(),
-    )
+    auth_jwt::decode(token, &signing_key, ws_jwt_issuer(), ws_jwt_audience())
 }
 
 pub fn generate_ws_jwt(subject: Option<String>) -> anyhow::Result<String> {
     let now = unix_timestamp_seconds()?;
     let claims = WsJwtClaims {
-        iss: default_ws_jwt_issuer().to_string(),
+        iss: ws_jwt_issuer().to_string(),
         sub: normalize_ws_jwt_subject(subject),
-        aud: default_ws_jwt_audience().to_string(),
+        aud: ws_jwt_audience().to_string(),
         exp: now.saturating_add(default_ws_jwt_ttl_seconds()),
         iat: now,
         nbf: now.saturating_sub(1),
@@ -259,4 +318,51 @@ pub(super) fn record_revocation_for_test(jti: &str, exp: u64) {
     let mut map = read_revocations();
     map.insert(jti.to_string(), exp);
     write_revocations(&map).expect("write test revocation");
+}
+
+#[cfg(test)]
+mod hs256_identity_tests {
+    //! Unit tests for the HS256 issuer-identity resolution (#407 step 5). These
+    //! exercise the pure `resolve_hs256_identity` so they don't touch the
+    //! process-global `OnceLock` (which would race other tests in this binary).
+
+    use super::{current_username, local_hostname, resolve_hs256_identity};
+
+    #[test]
+    fn config_values_win_when_present() {
+        let id = resolve_hs256_identity(
+            Some("issuer.example.com".to_string()),
+            Some("team.adelie-ai".to_string()),
+        );
+        assert_eq!(id.issuer, "issuer.example.com");
+        assert_eq!(id.audience, "team.adelie-ai");
+    }
+
+    #[test]
+    fn unset_fields_fall_back_to_per_host_defaults() {
+        let id = resolve_hs256_identity(None, None);
+        assert_eq!(id.issuer, local_hostname(), "default iss is the hostname");
+        assert_eq!(
+            id.audience,
+            format!("{}.adelie-ai", current_username()),
+            "default aud is <user>.adelie-ai"
+        );
+    }
+
+    #[test]
+    fn blank_fields_are_treated_as_unset() {
+        // Whitespace-only config values must not become the literal issuer/aud —
+        // they fall back to the defaults, so a stray empty string can't lock you
+        // out by minting tokens with an `aud` the validator won't expect.
+        let id = resolve_hs256_identity(Some("   ".to_string()), Some(String::new()));
+        assert_eq!(id.issuer, local_hostname());
+        assert_eq!(id.audience, format!("{}.adelie-ai", current_username()));
+    }
+
+    #[test]
+    fn one_field_overridden_other_defaulted() {
+        let id = resolve_hs256_identity(Some("pinned-issuer".to_string()), None);
+        assert_eq!(id.issuer, "pinned-issuer");
+        assert_eq!(id.audience, format!("{}.adelie-ai", current_username()));
+    }
 }

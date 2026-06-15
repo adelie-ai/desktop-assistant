@@ -560,6 +560,20 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Seed the built-in HS256 issuer identity (iss/aud) once, before serving, so
+    // the issue and validate paths share a single immutable identity (#407 step
+    // 5). Unset `[ws_auth.hs256]` fields fall back to per-host defaults
+    // (hostname / "<user>.adelie-ai"). JWT is a network-door concern only —
+    // local transports authenticate by peer-cred — so this governs just the WS
+    // `/login` tokens.
+    {
+        let hs256 = daemon_config
+            .as_ref()
+            .map(|c| c.ws_auth.hs256.clone())
+            .unwrap_or_default();
+        config::init_hs256_identity(hs256.issuer, hs256.audience);
+    }
+
     // Transport enable/bind config (#279 item 3): the `[transports]` table is
     // the baseline; the matching `DESKTOP_ASSISTANT_*` env var overrides each
     // field when set. Absent table => historical defaults.
