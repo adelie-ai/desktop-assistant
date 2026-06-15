@@ -38,6 +38,8 @@ pub use jwt::{
     current_username, generate_ws_jwt, prune_revocations, revoke_ws_jwt, validate_ws_jwt,
     ws_jwt_sub,
 };
+// Crate-internal: seeded once from main at startup (not part of the public API).
+pub(crate) use jwt::init_hs256_identity;
 pub use oidc::OidcValidator;
 
 // Resolution helpers — public API stays at `config::` for callers in
@@ -194,6 +196,12 @@ pub struct WsAuthConfig {
     pub methods: Vec<String>,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    /// Built-in HS256 issuer claims (`iss`/`aud`) for the daemon's own WS
+    /// `/login` tokens. Both fields default per-host (see [`Hs256Config`]); set
+    /// them to pin a stable identity (e.g. behind a load balancer). Omitted from
+    /// serialized config when left at its all-default (empty) form.
+    #[serde(default, skip_serializing_if = "Hs256Config::is_default")]
+    pub hs256: Hs256Config,
     /// Allowed browser origins for WebSocket and login requests.
     /// Empty (default) means no browser clients are permitted.
     /// Native clients (which do not send an Origin header) are always allowed.
@@ -206,8 +214,35 @@ impl Default for WsAuthConfig {
         Self {
             methods: default_ws_auth_methods(),
             oidc: None,
+            hs256: Hs256Config::default(),
             allowed_origins: vec![],
         }
+    }
+}
+
+/// Claims policy for the built-in HS256 issuer (the daemon's WS `/login`).
+///
+/// JWT is a network-door concern only — local transports authenticate by
+/// peer-cred (#407) — so this governs just the WebSocket door's own tokens. Both
+/// fields are issued **and** validated from this same config, so they can't
+/// drift. Unset (`None`) ⇒ a per-host default resolved at startup:
+/// `issuer` = the local hostname, `audience` = `"<user>.adelie-ai"` (a per-user
+/// daemon is a distinct service instance, so the user-scoped audience is honest).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Hs256Config {
+    /// JWT `iss`. `None`/empty ⇒ the local hostname.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// JWT `aud`. `None`/empty ⇒ `"<user>.adelie-ai"`.
+    #[serde(default)]
+    pub audience: Option<String>,
+}
+
+impl Hs256Config {
+    /// `true` when both fields are unset — the all-default form, omitted from
+    /// serialized config so an empty `[ws_auth.hs256]` table isn't emitted.
+    fn is_default(&self) -> bool {
+        self.issuer.is_none() && self.audience.is_none()
     }
 }
 
@@ -1361,8 +1396,8 @@ uds_socket = "/tmp/adelie.sock"
         let claims_2 = jwt::decode_ws_jwt_claims(&token_2).expect("decode second jwt");
         assert_eq!(claims_1.sub, "tui");
         assert_eq!(claims_2.sub, "plasmoid");
-        assert_eq!(claims_1.iss, jwt::default_ws_jwt_issuer());
-        assert_eq!(claims_1.aud, jwt::default_ws_jwt_audience());
+        assert_eq!(claims_1.iss, jwt::ws_jwt_issuer());
+        assert_eq!(claims_1.aud, jwt::ws_jwt_audience());
 
         // SAFETY: same scope as the matching `set_var` above; clean up
         // before exiting the test so we don't leak state between runs.
