@@ -975,9 +975,8 @@ impl BuiltinToolService {
 
         let summary = required_string(&arguments, "summary")?;
         let body = optional_string(&arguments, "body").unwrap_or_default();
-        let urgency = NotifyUrgency::parse(
-            arguments.get("urgency").and_then(serde_json::Value::as_str),
-        );
+        let urgency =
+            NotifyUrgency::parse(arguments.get("urgency").and_then(serde_json::Value::as_str));
 
         match notify_fn(summary, body, urgency).await? {
             Some(id) => Ok(serde_json::json!({ "ok": true, "shown": true, "id": id }).to_string()),

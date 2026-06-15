@@ -64,18 +64,6 @@ pub struct ConnectionConfig {
     /// to make the remote tool note nicer (e.g. the client's hostname). Stored
     /// on the config for the same reconnect reason.
     pub host_label: Option<String>,
-    /// Path to the local `adelie-mint` UDS (#101). When set (and [`Self::ws_jwt`]
-    /// is `None`), [`resolve_ws_bearer_token`](crate::auth::resolve_ws_bearer_token)
-    /// mints a **fresh** bearer token from it on every connect — and, because the
-    /// reconnect supervisor re-reads this config, on every reconnect too. This is
-    /// the JWT source for a long-lived socket client (the dbus-bridge): it avoids
-    /// a daemon restart leaving the client holding an expired static token (#316),
-    /// and keeps JWT minting off D-Bus (#281).
-    pub minter_socket: Option<PathBuf>,
-    /// Requested TTL (seconds) for tokens minted via [`Self::minter_socket`].
-    /// `None` lets the minter apply its own default. The token is validated once
-    /// at handshake, so a modest TTL is fine.
-    pub minter_ttl_seconds: Option<u64>,
 }
 
 impl Default for ConnectionConfig {
@@ -91,8 +79,6 @@ impl Default for ConnectionConfig {
             socket_path: None,
             system_id: None,
             host_label: None,
-            minter_socket: None,
-            minter_ttl_seconds: None,
         }
     }
 }

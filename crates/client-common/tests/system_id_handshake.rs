@@ -132,7 +132,7 @@ async fn no_system_id_yields_legacy_handshake_shape() {
     spawn_handshake_capture_server(path.clone(), tx);
     wait_for_socket(&path).await;
 
-    let (_client, _signals, _drop) = UdsClient::connect(&path, "legacy-token", None, None)
+    let (_client, _signals, _drop) = UdsClient::connect(&path, Some("legacy-token"), None, None)
         .await
         .expect("raw uds connect");
 
@@ -142,5 +142,31 @@ async fn no_system_id_yields_legacy_handshake_shape() {
         .expect("handshake present");
     assert_eq!(frame.jwt.as_deref(), Some("legacy-token"));
     assert_eq!(frame.system_id, None, "no-id client must omit system_id");
+    assert_eq!(frame.host_label, None);
+}
+
+#[tokio::test]
+async fn peer_cred_handshake_omits_jwt() {
+    // The local peer-cred path (#407) sends no bearer token: the daemon
+    // authenticates the connection by its kernel `SO_PEERCRED`. Assert the
+    // handshake frame omits `jwt` entirely so the wire shape is honest.
+    use desktop_assistant_client_common::uds_client::UdsClient;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("peercred.sock");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    spawn_handshake_capture_server(path.clone(), tx);
+    wait_for_socket(&path).await;
+
+    let (_client, _signals, _drop) = UdsClient::connect(&path, None, None, None)
+        .await
+        .expect("raw uds connect");
+
+    let frame = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("handshake captured")
+        .expect("handshake present");
+    assert_eq!(frame.jwt, None, "peer-cred client must omit jwt");
+    assert_eq!(frame.system_id, None);
     assert_eq!(frame.host_label, None);
 }

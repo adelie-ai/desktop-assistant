@@ -99,10 +99,10 @@ impl TransportClient {
     /// `TransportClient` (and any `&TransportClient` a caller holds) keeps
     /// working without the Connector swapping the client. The socket transports
     /// (UDS/WS) support this; the D-Bus transport doesn't reconnect this way and
-    /// returns an error (its clients don't use the Connector). Resolves the
-    /// bearer token from `config` on each attempt so a freshly-minted local JWT
-    /// is used (a long outage can still outlive a token's validity — surfaced as
-    /// an auth error the supervisor retries with backoff).
+    /// returns an error (its clients don't use the Connector). UDS re-auths by
+    /// peer-cred (#407, no token); WS re-resolves its bearer token from `config`
+    /// on each attempt (a long outage can still outlive a token's validity —
+    /// surfaced as an auth error the supervisor retries with backoff).
     pub async fn reconnect(&self, config: &ConnectionConfig) -> Result<()> {
         match self {
             #[cfg(feature = "dbus")]
@@ -125,7 +125,8 @@ impl TransportClient {
                     .await
             }
             Self::Uds(client) => {
-                let token = resolve_ws_bearer_token(config).await?;
+                // Peer-cred (#407): reconnect carries no minted token, only an
+                // explicit static `ws_jwt` if one was configured.
                 let path = config
                     .socket_path
                     .clone()
@@ -138,7 +139,7 @@ impl TransportClient {
                 client
                     .reconnect(
                         &path,
-                        &token,
+                        config.ws_jwt.as_deref(),
                         config.system_id.as_deref(),
                         config.host_label.as_deref(),
                     )
@@ -424,9 +425,10 @@ pub async fn connect_transport(
             Ok((TransportClient::Ws(client), signal_rx, Some(drop_rx)))
         }
         TransportMode::Uds => {
-            // The local minter issues the same JWT the UDS server's handshake
-            // expects, so the existing resolver is reused unchanged.
-            let token = resolve_ws_bearer_token(config).await?;
+            // Local UDS authenticates by kernel peer-cred (#407): the daemon
+            // reads the connection's `SO_PEERCRED`, so no token is minted. An
+            // explicitly-configured static `ws_jwt` is still forwarded (the
+            // tolerant daemon honors it), but the common path sends none.
             let path = config
                 .socket_path
                 .clone()
@@ -437,10 +439,10 @@ pub async fn connect_transport(
                     )
                 })?;
             // Carry the #248 system id + host label from the config into the
-            // JWT handshake frame; the Connector stamps them on.
+            // handshake frame; the Connector stamps them on.
             let (client, signal_rx, drop_rx) = UdsClient::connect(
                 &path,
-                &token,
+                config.ws_jwt.as_deref(),
                 config.system_id.as_deref(),
                 config.host_label.as_deref(),
             )

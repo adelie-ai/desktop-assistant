@@ -109,12 +109,17 @@ impl UdsClient {
     /// stream, and a drop-notifier receiver that fires once per underlying
     /// socket close (#246) — the Connector uses the latter to drive reconnect.
     ///
-    /// `system_id` / `host_label` (#248) ride the JWT handshake frame so the
-    /// daemon can compute exact co-location; `None`/`None` reproduces the
-    /// pre-#248 `{"jwt": "…"}` handshake byte-for-byte.
+    /// `system_id` / `host_label` (#248) ride the handshake frame so the daemon
+    /// can compute exact co-location.
+    ///
+    /// `bearer_token` is `None` for the local peer-cred path (#407): the daemon
+    /// authenticates the connection by its kernel `SO_PEERCRED`, so no JWT is
+    /// sent and the handshake omits the `jwt` field entirely. A `Some(token)` is
+    /// still forwarded (an explicitly-configured static token) and honored by the
+    /// tolerant daemon, but local clients no longer mint one.
     pub async fn connect(
         socket_path: &Path,
-        bearer_token: &str,
+        bearer_token: Option<&str>,
         system_id: Option<&str>,
         host_label: Option<&str>,
     ) -> Result<(
@@ -159,7 +164,7 @@ impl UdsClient {
     /// [`connect`](Self::connect) and [`reconnect`](Self::reconnect) (#246).
     async fn spawn_connection(
         socket_path: &Path,
-        bearer_token: &str,
+        bearer_token: Option<&str>,
         system_id: Option<&str>,
         host_label: Option<&str>,
         pending: Arc<Mutex<PendingState>>,
@@ -171,15 +176,15 @@ impl UdsClient {
             .map_err(|e| anyhow!("failed to connect uds {}: {e}", socket_path.display()))?;
         let (mut read_half, mut write_half) = stream.into_split();
 
-        // Handshake: the first frame carries the JWT plus, optionally, the
-        // client's per-machine system id + host label for co-location (#248).
-        // The optional fields are skipped when absent, so a no-id client sends
-        // the byte-identical pre-#248 `{"jwt": "…"}`. On success the server sends
-        // nothing back and proceeds straight to the dispatcher; on failure it
-        // writes an error frame and closes, which the reader below turns into a
-        // connection-level failure.
+        // Handshake: the first frame optionally carries a JWT plus, optionally,
+        // the client's per-machine system id + host label for co-location (#248).
+        // Absent fields are skipped — the local peer-cred path (#407) sends no
+        // `jwt` at all (the daemon authenticates by `SO_PEERCRED`). On success the
+        // server sends nothing back and proceeds straight to the dispatcher; on
+        // failure it writes an error frame and closes, which the reader below
+        // turns into a connection-level failure.
         let handshake = serde_json::to_vec(&api::UdsHandshake {
-            jwt: Some(bearer_token.to_string()),
+            jwt: bearer_token.map(str::to_string),
             system_id: system_id.map(str::to_string),
             host_label: host_label.map(str::to_string),
         })?;
@@ -265,7 +270,7 @@ impl UdsClient {
     pub(crate) async fn reconnect(
         &self,
         socket_path: &Path,
-        bearer_token: &str,
+        bearer_token: Option<&str>,
         system_id: Option<&str>,
         host_label: Option<&str>,
     ) -> Result<()> {

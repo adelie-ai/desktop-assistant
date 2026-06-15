@@ -2,14 +2,15 @@
 //!
 //! Each acceptance criterion is a named `#[tokio::test]` so the output reads as
 //! the spec. Since #316 the bridge talks to the daemon through the shared
-//! client-common `Connector`; the bespoke UDS client (and its JWT/minter/framing
-//! tests) is gone — that path is now covered in `client-common`. What's
-//! exercised here:
+//! client-common `Connector`; the bespoke UDS client (and its framing tests) is
+//! gone — that path is now covered in `client-common`. Since #407 the local UDS
+//! hop authenticates by kernel peer-cred, so the bridge no longer mints a token.
+//! What's exercised here:
 //!
 //! - End-to-end command dispatch through `ConnectorBridgeTransport` against a
-//!   stub minter + stub daemon (the Connector mints, handshakes, and forwards).
-//! - **Reconnect (#316):** the bridge survives a daemon restart, re-mints a
-//!   fresh token, and resumes serving — the acceptance criterion for this step.
+//!   stub daemon (the Connector handshakes tokenless and forwards).
+//! - **Reconnect (#316):** the bridge survives a daemon restart and resumes
+//!   serving — the acceptance criterion for this step.
 //! - The event translator (`event_forwarder::translate`) over each
 //!   `SignalEvent` variant.
 //! - The frozen D-Bus object paths + well-known name.
@@ -23,33 +24,23 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{
-    DaemonScript, MinterScript, StubDaemonHandle, spawn_stub_daemon, spawn_stub_minter,
-    unique_socket_path,
-};
+use common::{DaemonScript, StubDaemonHandle, spawn_stub_daemon, unique_socket_path};
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{ConnectionConfig, Connector, SignalEvent, TransportMode};
 use desktop_assistant_dbus_bridge::adapter::event_forwarder::{ForwardAction, translate};
 use desktop_assistant_dbus_bridge::transport::{BridgeTransport, ConnectorBridgeTransport};
 use tempfile::TempDir;
 
-const TEST_TOKEN: &str = "test.jwt.token";
-
 fn tempdir() -> TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
-/// Build a bridge Connector pointed at the given daemon + minter sockets (UDS,
-/// no static JWT — it mints from the stub minter on every (re)connect).
-async fn connect_bridge(
-    daemon_socket: std::path::PathBuf,
-    minter_socket: std::path::PathBuf,
-) -> Arc<Connector> {
+/// Build a bridge Connector pointed at the given daemon socket (UDS, tokenless —
+/// the daemon authenticates by peer-cred since #407).
+async fn connect_bridge(daemon_socket: std::path::PathBuf) -> Arc<Connector> {
     let config = ConnectionConfig {
         transport_mode: TransportMode::Uds,
         socket_path: Some(daemon_socket),
-        minter_socket: Some(minter_socket),
-        minter_ttl_seconds: Some(3600),
         ws_jwt: None,
         ..ConnectionConfig::default()
     };
@@ -72,17 +63,9 @@ fn drop_handle(handle: StubDaemonHandle) {
 async fn connector_request_reaches_daemon_and_returns_result() {
     let dir = tempdir();
     let daemon_socket = unique_socket_path(dir.path(), "daemon");
-    let minter_socket = unique_socket_path(dir.path(), "mint");
-    let (minted, _minter_stop) = spawn_stub_minter(
-        &minter_socket,
-        MinterScript::Success {
-            token: TEST_TOKEN.to_string(),
-        },
-    )
-    .await;
     let handle = spawn_stub_daemon(&daemon_socket, DaemonScript::EchoAck).await;
 
-    let connector = connect_bridge(daemon_socket, minter_socket).await;
+    let connector = connect_bridge(daemon_socket).await;
     let transport = ConnectorBridgeTransport::new(Arc::clone(&connector));
 
     let cmd = api::Command::CreateConversation {
@@ -91,14 +74,12 @@ async fn connector_request_reaches_daemon_and_returns_result() {
     let result = transport.request(cmd.clone()).await.expect("request ok");
     assert_eq!(result, api::CommandResult::Ack);
 
-    // The daemon saw the command verbatim...
+    // The daemon saw the command verbatim.
     let requests = handle.requests.lock().await.clone();
     assert!(
         requests.iter().any(|r| r.command == cmd),
         "the daemon must receive the dispatched command; saw {requests:?}"
     );
-    // ...and the Connector minted a token to authenticate.
-    assert_eq!(minted.lock().await.len(), 1, "exactly one mint at connect");
 
     drop_handle(handle);
 }
@@ -106,22 +87,14 @@ async fn connector_request_reaches_daemon_and_returns_result() {
 #[tokio::test]
 async fn bridge_survives_daemon_restart_and_resumes() {
     // The #316 acceptance test: a daemon restart drops the bridge's connection;
-    // the Connector must reconnect, *re-mint a fresh token*, and resume serving
-    // — so KDE stays live without restarting the bridge.
+    // the Connector must reconnect (tokenless peer-cred since #407) and resume
+    // serving — so KDE stays live without restarting the bridge.
     let dir = tempdir();
     let daemon_socket = unique_socket_path(dir.path(), "daemon");
-    let minter_socket = unique_socket_path(dir.path(), "mint");
-    let (minted, _minter_stop) = spawn_stub_minter(
-        &minter_socket,
-        MinterScript::Success {
-            token: TEST_TOKEN.to_string(),
-        },
-    )
-    .await;
 
     // First daemon instance — bridge connects and serves.
     let daemon1 = spawn_stub_daemon(&daemon_socket, DaemonScript::EchoAck).await;
-    let connector = connect_bridge(daemon_socket.clone(), minter_socket.clone()).await;
+    let connector = connect_bridge(daemon_socket.clone()).await;
     let transport = ConnectorBridgeTransport::new(Arc::clone(&connector));
     assert_eq!(
         transport
@@ -131,8 +104,6 @@ async fn bridge_survives_daemon_restart_and_resumes() {
         api::CommandResult::Ack,
         "the bridge serves before the restart"
     );
-    let mints_before = minted.lock().await.len();
-    assert_eq!(mints_before, 1, "one mint at the initial connect");
 
     // Restart: kill daemon1 (closes the connection → Connector sees the drop),
     // let the socket free, then bring a fresh daemon up on the same path.
@@ -158,14 +129,6 @@ async fn bridge_survives_daemon_restart_and_resumes() {
     assert!(
         resumed,
         "the bridge must resume serving methods after a daemon restart"
-    );
-
-    // And it minted a *fresh* token to re-authenticate — the core #316 fix
-    // (a static token would have stranded it on an expired credential).
-    assert!(
-        minted.lock().await.len() > mints_before,
-        "reconnect must re-mint a token (saw {} mints, started at {mints_before})",
-        minted.lock().await.len()
     );
 
     drop_handle(daemon2);
