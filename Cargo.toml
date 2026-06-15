@@ -18,7 +18,6 @@ members = [
     "crates/mcp-client",
     "crates/storage",
     "crates/client-common",
-    "crates/jwt-minter",
     "crates/transport-dispatch",
     "crates/uds-interface",
     "crates/dbus-bridge",

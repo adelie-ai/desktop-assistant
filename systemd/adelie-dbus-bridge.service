@@ -3,17 +3,15 @@ Description=Adelie D-Bus bridge (per-user)
 Documentation=https://github.com/adelie-ai/desktop-assistant/issues/281
 # The bridge re-exposes the daemon's session-bus surface (the
 # org.desktopAssistant.* object paths) but speaks to the daemon as an ordinary
-# authenticated UDS client: it mints a JWT from adelie-mint, opens a UDS
-# connection to the daemon, and forwards method calls + signals.
+# local UDS client: it opens a UDS connection to the daemon — authenticated by
+# kernel peer-cred, no JWT (#407) — and forwards method calls + signals.
 #
 # Soft Wants=/After= (not BindsTo=/Requires=): since #316 the bridge reconnects
-# to the daemon on its own — and re-mints a fresh token each time — so a brief
-# daemon restart no longer needs the bridge restarted; it reconnects in place.
-# The dependencies only express ordering + best-effort co-start.
+# to the daemon on its own, so a brief daemon restart no longer needs the bridge
+# restarted; it reconnects in place. The dependencies only express ordering +
+# best-effort co-start.
 Wants=desktop-assistant-daemon.service
 After=desktop-assistant-daemon.service
-Wants=adelie-mint.service
-After=adelie-mint.service
 After=default.target
 PartOf=default.target
 # Q4 (issue #281): restarting the bridge drops its single UDS connection, which

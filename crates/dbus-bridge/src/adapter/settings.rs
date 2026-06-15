@@ -15,10 +15,11 @@
 //! - `GetLlmSettings` / `SetLlmSettings` — the legacy single-connection LLM
 //!   surface, removed from `api-model` and supplanted by named connections
 //!   (the `Connections` adapter). No KDE caller.
-//! - `GenerateWsJwt` — JWT minting is **off D-Bus entirely** (#281): the
-//!   bridge already holds a JWT from the local minter, and any client that
-//!   needs one calls the minter directly. JWT generation/validation stays
-//!   factored in `auth-jwt` / `jwt-minter`, a WS/web concern.
+//! - `GenerateWsJwt` — JWT minting is **off D-Bus entirely** (#281). Local
+//!   transports no longer use a JWT at all: the bridge reaches the daemon over a
+//!   peer-cred-authenticated UDS (#407). A JWT is only a network-door (WebSocket)
+//!   concern, where clients obtain one via the daemon's WS `/login`; generation
+//!   and validation stay factored in `auth-jwt`.
 //!
 //! These are the only entries the parity gate is allowed to find missing; see
 //! the `Q2_DROPS` list in `tests/introspection.rs`.

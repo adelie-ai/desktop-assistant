@@ -3,8 +3,9 @@
 `adelie-dbus-bridge` is a per-user binary that exposes the daemon's session-bus
 surface (`org.desktopAssistant.*`) **without** linking the daemon's business
 logic. Every D-Bus method call is translated into an `api::Command` and shipped
-over an authenticated UDS connection to the daemon; signals coming back over
-that connection are re-emitted on the bus.
+over a local UDS connection to the daemon — authenticated by kernel peer-cred
+(#407), no token; signals coming back over that connection are re-emitted on the
+bus.
 
 It exists to retire the daemon's weaker *in-process* D-Bus surface
 (`crates/dbus-interface`), which bypasses the shared dispatcher — and so misses
@@ -16,9 +17,8 @@ plan; this page is the operator's view.
 
 ```
 KDE plasmoid / KCM ─┐
-tui/gtk --transport dbus ─┤ session bus  ┌─ adelie-dbus-bridge ─ UDS+JWT ─ daemon
-                          └ org.desktopAssistant.* ┘        ▲
-                                                  adelie-mint (JWT) ┘
+tui/gtk --transport dbus ─┤ session bus  ┌─ adelie-dbus-bridge ─ UDS (peer-cred) ─ daemon
+                          └ org.desktopAssistant.* ┘
 ```
 
 ## Components
@@ -26,37 +26,36 @@ tui/gtk --transport dbus ─┤ session bus  ┌─ adelie-dbus-bridge ─ UDS+J
 | Unit | Binary | Role |
 | --- | --- | --- |
 | `desktop-assistant-daemon.service` | `desktop-assistant-daemon` | the daemon; owns the UDS frontend |
-| `adelie-mint.service` | `adelie-mint` | mints short-lived HS256 JWTs over a local UDS (`SO_PEERCRED`-authenticated) |
-| `adelie-dbus-bridge.service` | `adelie-dbus-bridge` | the bridge; mints a JWT, connects to the daemon over UDS, serves the bus |
+| `adelie-dbus-bridge.service` | `adelie-dbus-bridge` | the bridge; connects to the daemon over UDS (peer-cred authenticated), serves the bus |
 
-The minter's signing key defaults to the same file the daemon uses
-(`$XDG_DATA_HOME/desktop-assistant/secrets`), so minted tokens validate against
-the daemon with no extra configuration on a single-user desktop. Hardening that
-secret's storage is tracked in
+The bridge needs no credential: the daemon authenticates the local UDS
+connection by the kernel's `SO_PEERCRED` (#407), so on a single-user desktop the
+bridge just connects — no signing key, no token. A JWT is only needed on the
+network (WebSocket) door; that signing key is tracked in
 [#365](https://github.com/adelie-ai/desktop-assistant/issues/365).
 
 ## Install / deploy
 
 User systemd units live in `systemd/`. With binaries installed (`cargo install
---path crates/daemon`, `--path crates/jwt-minter`, `--path crates/dbus-bridge`):
+--path crates/daemon`, `--path crates/dbus-bridge`):
 
 ```sh
 just install-service     # daemon unit + the org.desktopAssistant activation (→ the bridge)
-just install-bridge      # bridge + minter units
+just install-bridge      # bridge unit
 just backend-enable      # enable + start the daemon
-just bridge-enable       # enable + start the minter, then the bridge
+just bridge-enable       # enable + start the bridge
 ```
 
 Redeploy after a merged batch (see the deploy-cadence convention) with:
 
 ```sh
-just bridge-reinstall    # cargo install minter + bridge, restart both
+just bridge-reinstall    # cargo install bridge, restart it
 ```
 
 Homebrew: the bridge ships as its own formula in the `adelie-ai/homebrew-adelie`
-tap (Linux-only, alongside `adelie-mint`). `brew install` lays down the binaries;
-the systemd units above are installed separately (Homebrew does not manage user
-services). The tap is currently untested end-to-end — see the homebrew-tap notes.
+tap (Linux-only). `brew install` lays down the binary; the systemd units above
+are installed separately (Homebrew does not manage user services). The tap is
+currently untested end-to-end — see the homebrew-tap notes.
 
 ## The name flip (#318)
 
@@ -83,16 +82,16 @@ Before the cutover, *daemon up ⇒ D-Bus up*. With the bridge, a missing or
 crashed bridge leaves D-Bus clients (KDE) **dark even while the daemon is
 healthy** — a new failure mode. The bridge mitigates the common case itself:
 since [#316](https://github.com/adelie-ai/desktop-assistant/issues/316) it
-reconnects to the daemon (re-minting a fresh token each time), so a daemon
-restart does **not** require restarting the bridge. That's also why its unit
-uses soft `Wants=`/`After=` rather than `BindsTo=`.
+reconnects to the daemon on its own, so a daemon restart does **not** require
+restarting the bridge. That's also why its unit uses soft `Wants=`/`After=`
+rather than `BindsTo=`.
 
 The authoritative "is the bridge up?" fact is the unit's own state:
 
 ```sh
 systemctl --user is-active adelie-dbus-bridge.service   # active | failed | inactive
 busctl --user list | grep org.desktopAssistant          # is the name claimed (by the bridge)?
-just bridge-status                                       # bridge + minter at a glance
+just bridge-status                                       # bridge status at a glance
 ```
 
 Surfacing `bridge: down` inside a client's Health/diagnostics page (the

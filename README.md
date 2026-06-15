@@ -53,19 +53,20 @@ The application layer is transport-agnostic
 
 - **WebSocket** (`crates/ws-interface`) — primary remote transport; HS256 JWT in
   the auth handshake.
-- **UDS** (`crates/uds-interface`) — local-only transport with `SO_PEERCRED`
-  and a HS256 JWT handshake. Pair it with the local minter for desktop apps
-  that don't want to manage credentials.
+- **UDS** (`crates/uds-interface`) — local-only transport authenticated by kernel
+  `SO_PEERCRED`; no token. The kernel-attested peer UID *is* the credential, so
+  desktop apps reach their own daemon without managing any secret.
 - **D-Bus** (`crates/dbus-bridge`) — a standalone `adelie-dbus-bridge` binary
   that fronts the daemon for legacy session-bus consumers. The daemon also
   still hosts an in-process D-Bus interface for coexistence; the bridge is the
   forward direction.
 
-Auth is **JWT-only on the request path** (HS256, shared via `crates/auth-jwt`).
-The `adelie-mint` binary (`crates/jwt-minter`) is a local UDS minter that
-authenticates the OS user with `SO_PEERCRED` and an optional Unix-group gate,
-then issues a short-lived JWT for the daemon. Production deployments are
-expected to use an external IdP (Cognito, Authentik, Keycloak, …); see
+Auth follows the **remote-door** rule (#407): the **WebSocket** door requires a
+JWT (HS256, shared via `crates/auth-jwt`, issued by the daemon's own WS `/login`
+or an external IdP), while **local transports (UDS, D-Bus) authenticate by kernel
+peer-cred** and carry no token. The former standalone `adelie-mint` UDS minter is
+retired. Production deployments are expected to use an external IdP (Cognito,
+Authentik, Keycloak, …); see
 [docs/architecture-evolution.md](docs/architecture-evolution.md).
 
 ## Multi-tenant by construction
