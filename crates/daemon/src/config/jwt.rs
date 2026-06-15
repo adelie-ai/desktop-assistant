@@ -1,7 +1,8 @@
 //! WebSocket JWT signing — delegates to the shared `auth-jwt` crate
 //! (extracted in #?). The daemon owns the issuer/audience/TTL policy and
-//! the key-file path; the codec and atomic file IO live in `auth-jwt` so
-//! the JWT minter can produce tokens this validator accepts.
+//! the key-file path; the codec and atomic file IO live in `auth-jwt`. JWT is a
+//! network-door (WebSocket) concern only — local transports authenticate by
+//! kernel peer-cred (#407), and the standalone `adelie-mint` minter is retired.
 //!
 //! Public API (`current_username`, `generate_ws_jwt`, `validate_ws_jwt`)
 //! is preserved exactly. The `pub(super)` test API
