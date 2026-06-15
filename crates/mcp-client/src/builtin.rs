@@ -614,7 +614,9 @@ impl BuiltinToolService {
             TOOL_KB_WRITE
                 | TOOL_KB_SEARCH
                 | TOOL_KB_DELETE
+                | TOOL_KB_LIST
                 | TOOL_SEARCH
+                | TOOL_NOTIFY
                 | TOOL_SYS_PROPS
                 | TOOL_DB_QUERY
                 | TOOL_MCP_CONTROL
@@ -2515,6 +2517,25 @@ mod tests {
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "jira__create_issue");
+    }
+
+    #[test]
+    fn every_advertised_builtin_is_routable() {
+        // Regression guard: a tool that `tool_definitions()` advertises but
+        // `supports_tool()` doesn't recognize gets routed to MCP at execution
+        // and fails with "unknown tool" (this bit builtin_knowledge_base_list
+        // and builtin_notify). Wiring notify makes the full builtin set appear.
+        use std::sync::Arc;
+        let notify_fn: NotifyFn = Arc::new(|_, _, _| Box::pin(async { Ok(Some(1u32)) }));
+        let service = BuiltinToolService::new().with_notify(notify_fn);
+        for def in service.tool_definitions() {
+            assert!(
+                BuiltinToolService::supports_tool(&def.name),
+                "tool '{}' is advertised by tool_definitions() but supports_tool() rejects it — \
+                 it would fail to route at execution time",
+                def.name
+            );
+        }
     }
 
     #[tokio::test]
