@@ -223,3 +223,36 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every `.sql` file in `migrations/` must be wired into `run_migrations`
+    /// above. Migrations are a hand-maintained `include_str!` list, NOT
+    /// auto-discovered from the directory — so a new migration file that nobody
+    /// registers compiles fine and silently never runs, surfacing only as a
+    /// runtime "column does not exist" error against the live DB. This guard
+    /// turns that into a build-time failure instead.
+    ///
+    /// (The reverse direction — a registered file that doesn't exist — is
+    /// already caught at compile time, since `include_str!` fails to build.)
+    #[test]
+    fn every_migration_is_registered() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+        let source = include_str!("pool.rs");
+
+        let mut unregistered: Vec<String> = std::fs::read_dir(dir)
+            .expect("read migrations/ dir")
+            .map(|e| e.expect("dir entry").file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".sql"))
+            .filter(|name| !source.contains(name.as_str()))
+            .collect();
+        unregistered.sort();
+
+        assert!(
+            unregistered.is_empty(),
+            "migration file(s) exist in migrations/ but are not referenced in \
+             run_migrations() in pool.rs — add an \
+             `sqlx::raw_sql(include_str!(\"../migrations/<name>\"))` call: {unregistered:?}"
+        );
+    }
+}
