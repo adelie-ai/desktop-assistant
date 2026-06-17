@@ -215,5 +215,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Per-conversation tags (`TEXT[]`) so callers can label conversations at
+    // creation time (e.g. "voice") and the UI can filter on them.
+    sqlx::raw_sql(include_str!("../migrations/027_conversation_tags.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
