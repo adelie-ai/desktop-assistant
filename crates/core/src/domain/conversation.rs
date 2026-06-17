@@ -70,6 +70,8 @@ pub struct Conversation {
     /// on-task across compaction and windowing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl Conversation {
@@ -85,6 +87,7 @@ impl Conversation {
             summaries: Vec::new(),
             archived_at: None,
             active_task: None,
+            tags: Vec::new(),
         }
     }
 }
@@ -98,6 +101,7 @@ pub struct ConversationSummary {
     pub updated_at: String,
     pub message_count: usize,
     pub archived: bool,
+    pub tags: Vec<String>,
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -109,6 +113,7 @@ impl From<&Conversation> for ConversationSummary {
             updated_at: conv.updated_at.clone(),
             message_count: conv.messages.len(),
             archived: conv.archived_at.is_some(),
+            tags: conv.tags.clone(),
         }
     }
 }

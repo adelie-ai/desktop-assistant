@@ -181,8 +181,8 @@ impl ConversationStore for PgConversationStore {
         sqlx::query(
             "INSERT INTO conversations \
                 (id, user_id, title, created_at, updated_at, context_summary, \
-                 compacted_through, archived_at, active_task) \
-             VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6, $7, $8, $9)",
+                 compacted_through, archived_at, active_task, tags) \
+             VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6, $7, $8, $9, $10)",
         )
         .bind(&conv.id.0)
         .bind(user_id.as_str())
@@ -193,6 +193,7 @@ impl ConversationStore for PgConversationStore {
         .bind(conv.compacted_through as i32)
         .bind(conv.archived_at.as_deref().map(parse_timestamp))
         .bind(conv.active_task.as_deref())
+        .bind(&conv.tags)
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -211,7 +212,7 @@ impl ConversationStore for PgConversationStore {
         let user_id = current_user_id();
         let row: Option<ConvRow> = sqlx::query_as(
             "SELECT id, title, created_at, updated_at, context_summary, \
-                    compacted_through, archived_at, active_task \
+                    compacted_through, archived_at, active_task, tags \
              FROM conversations WHERE user_id = $1 AND id = $2",
         )
         .bind(user_id.as_str())
@@ -267,6 +268,7 @@ impl ConversationStore for PgConversationStore {
             summaries,
             archived_at: row.archived_at.map(format_timestamp),
             active_task: row.active_task,
+            tags: row.tags,
         })
     }
 
@@ -280,12 +282,12 @@ impl ConversationStore for PgConversationStore {
         let user_id = current_user_id();
         let rows: Vec<ConvListRow> = sqlx::query_as(
             "SELECT c.id, c.title, c.created_at, c.updated_at, \
-                    c.archived_at, COUNT(m.id) AS message_count \
+                    c.archived_at, c.tags, COUNT(m.id) AS message_count \
              FROM conversations c \
              LEFT JOIN messages m \
                     ON m.user_id = c.user_id AND m.conversation_id = c.id \
              WHERE c.user_id = $1 \
-             GROUP BY c.id, c.title, c.created_at, c.updated_at, c.archived_at \
+             GROUP BY c.id, c.title, c.created_at, c.updated_at, c.archived_at, c.tags \
              ORDER BY c.updated_at DESC",
         )
         .bind(user_id.as_str())
@@ -302,6 +304,7 @@ impl ConversationStore for PgConversationStore {
                 updated_at: format_timestamp(row.updated_at),
                 message_count: row.message_count.max(0) as usize,
                 archived: row.archived_at.is_some(),
+                tags: row.tags,
             })
             .collect())
     }
@@ -645,6 +648,7 @@ struct ConvRow {
     compacted_through: i32,
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
     active_task: Option<String>,
+    tags: Vec<String>,
 }
 
 /// Light projection for [`ConversationStore::list`] (DS-6 #295): conversation
@@ -656,6 +660,7 @@ struct ConvListRow {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    tags: Vec<String>,
     message_count: i64,
 }
 

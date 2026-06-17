@@ -397,6 +397,28 @@ impl Connector {
         self.client.create_conversation(title).await
     }
 
+    /// Create a conversation with tags. Socket transports carry the tags on the
+    /// wire; the D-Bus transport (which has no tags field) silently drops them
+    /// and creates a plain conversation — acceptable because D-Bus callers never
+    /// pass non-empty tags today.
+    pub async fn create_conversation_with_tags(&self, title: &str, tags: Vec<String>) -> Result<String> {
+        if let Some(commands) = self.client.as_commands() {
+            commands.create_conversation_with_tags(title, tags).await
+        } else {
+            self.client.create_conversation(title).await
+        }
+    }
+
+    /// Archive a conversation (move it out of active without deleting).
+    pub async fn archive_conversation(&self, id: &str) -> Result<()> {
+        self.client.archive_conversation(id).await
+    }
+
+    /// Permanently delete a conversation and all its messages.
+    pub async fn delete_conversation(&self, id: &str) -> Result<()> {
+        self.client.delete_conversation(id).await
+    }
+
     /// Send a prompt (works over every transport).
     ///
     /// While the transport is mid-reconnect (the daemon is down), the underlying

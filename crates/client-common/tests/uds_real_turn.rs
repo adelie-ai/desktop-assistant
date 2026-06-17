@@ -83,7 +83,7 @@ struct StreamingConversations;
 
 #[async_trait::async_trait]
 impl ConversationService for StreamingConversations {
-    async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+    async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
         Ok(Conversation::new("conv-1", title))
     }
     async fn list_conversations(

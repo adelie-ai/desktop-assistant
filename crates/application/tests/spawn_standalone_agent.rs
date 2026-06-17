@@ -372,7 +372,7 @@ impl RecordingConversations {
 
 #[async_trait::async_trait]
 impl ConversationService for RecordingConversations {
-    async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+    async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
         let observed = current_user_id();
         self.creates.lock().unwrap().push(CreateCall {
             title: title.clone(),
