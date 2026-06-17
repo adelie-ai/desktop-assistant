@@ -219,6 +219,7 @@ mod tests {
             message_count: 3,
             updated_at: "2026-06-13T00:00:00Z".into(),
             archived: false,
+            tags: vec![],
         }]);
         let transport = FakeTransport::replying(reply.clone());
         let adapter = adapter(Arc::clone(&transport));

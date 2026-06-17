@@ -1133,10 +1133,10 @@ where
                 Ok(api::CommandResult::Config(config))
             }
 
-            api::Command::CreateConversation { title } => {
+            api::Command::CreateConversation { title, tags } => {
                 let conv = self
                     .conversations
-                    .create_conversation(title)
+                    .create_conversation(title, tags)
                     .await
                     .map_err(Self::map_core_err)?;
                 let id = conv.id.0;
@@ -1161,6 +1161,7 @@ where
                             message_count: s.message_count as u32,
                             updated_at: s.updated_at,
                             archived: s.archived,
+                            tags: s.tags,
                         })
                         .collect(),
                 ))
@@ -1843,7 +1844,7 @@ where
                 let title = format!("Standalone: {name}");
                 let conv = self
                     .conversations
-                    .create_conversation(title.clone())
+                    .create_conversation(title.clone(), vec![])
                     .await
                     .map_err(Self::map_core_err)?;
                 let conversation_id = conv.id.0.clone();
@@ -3103,7 +3104,7 @@ mod tests {
     struct FakeConversations;
     #[async_trait::async_trait]
     impl ConversationService for FakeConversations {
-        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(
@@ -3713,7 +3714,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ConversationService for AbortAwareConversations {
-        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(
@@ -4982,7 +4983,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ConversationService for CountingConversations {
-        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(
@@ -5334,7 +5335,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ConversationService for GatedConversations {
-        async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(

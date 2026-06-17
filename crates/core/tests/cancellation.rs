@@ -317,7 +317,7 @@ async fn send_prompt_returns_cancelled_when_token_fires_between_turns() {
     let llm = ScriptedLlm::new(responses);
     let executor = ScriptedToolExecutor::new(tools, results, Duration::ZERO);
     let handler = make_handler(llm, executor);
-    let conv = handler.create_conversation("c".into()).await.unwrap();
+    let conv = handler.create_conversation("c".into(), vec![]).await.unwrap();
 
     let token = CancellationToken::new();
     // Schedule cancellation between the first tool result and the second
@@ -381,7 +381,7 @@ async fn send_prompt_returns_cancelled_when_token_fires_mid_stream() {
             format!("conv-{n}")
         }),
     );
-    let conv = handler.create_conversation("c".into()).await.unwrap();
+    let conv = handler.create_conversation("c".into(), vec![]).await.unwrap();
 
     let token = CancellationToken::new();
     let cancel_handle = token.clone();
@@ -431,7 +431,7 @@ async fn send_prompt_succeeds_when_token_never_fires() {
     let llm = ScriptedLlm::new(responses);
     let executor = ScriptedToolExecutor::new(tools, results, Duration::ZERO);
     let handler = make_handler(llm, executor);
-    let conv = handler.create_conversation("c".into()).await.unwrap();
+    let conv = handler.create_conversation("c".into(), vec![]).await.unwrap();
 
     let outcome: PromptDispatchOutcome = handler
         .send_prompt_with_override(
@@ -470,7 +470,7 @@ async fn cancellation_during_tool_dispatch_aborts_before_next_llm_call() {
     let llm_calls = llm.counter();
     let executor = ScriptedToolExecutor::new(tools, results, Duration::from_millis(200));
     let handler = make_handler(llm, executor);
-    let conv = handler.create_conversation("c".into()).await.unwrap();
+    let conv = handler.create_conversation("c".into(), vec![]).await.unwrap();
 
     let token = CancellationToken::new();
     let cancel_handle = token.clone();

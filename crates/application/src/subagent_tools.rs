@@ -276,7 +276,7 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
         // `TaskKind`.
         let child_conv = self
             .conversations
-            .create_conversation(format!("Subagent: {name}"))
+            .create_conversation(format!("Subagent: {name}"), vec![])
             .await?;
         let child_conversation_id = child_conv.id.0.clone();
 

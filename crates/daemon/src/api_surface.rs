@@ -956,8 +956,8 @@ where
     S: ConversationSelectionStore + 'static,
     Inner: ConversationService + 'static,
 {
-    async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
-        self.inner.create_conversation(title).await
+    async fn create_conversation(&self, title: String, tags: Vec<String>) -> Result<Conversation, CoreError> {
+        self.inner.create_conversation(title, tags).await
     }
 
     async fn list_conversations(
@@ -2167,7 +2167,7 @@ api_key_env = "{unused}"
 
         #[async_trait::async_trait]
         impl ConversationService for CapturingInner {
-            async fn create_conversation(&self, title: String) -> Result<Conversation, CoreError> {
+            async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
                 Ok(Conversation::new("c1", title))
             }
             async fn list_conversations(

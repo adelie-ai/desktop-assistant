@@ -30,6 +30,8 @@ pub enum Command {
     // Conversations
     CreateConversation {
         title: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     ListConversations {
         max_age_days: Option<u32>,
@@ -801,6 +803,8 @@ pub struct ConversationSummary {
     pub updated_at: String,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

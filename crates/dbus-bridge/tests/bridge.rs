@@ -70,6 +70,7 @@ async fn connector_request_reaches_daemon_and_returns_result() {
 
     let cmd = api::Command::CreateConversation {
         title: "lunch plans".to_string(),
+        tags: vec![],
     };
     let result = transport.request(cmd.clone()).await.expect("request ok");
     assert_eq!(result, api::CommandResult::Ack);

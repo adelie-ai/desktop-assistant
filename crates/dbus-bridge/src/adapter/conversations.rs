@@ -228,6 +228,7 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         let result = self
             .dispatch(api::Command::CreateConversation {
                 title: title.to_string(),
+                tags: vec![],
             })
             .await?;
         match result {
@@ -897,7 +898,7 @@ mod tests {
         assert_eq!(id, "new-id");
         assert!(matches!(
             only_command(&t).await,
-            api::Command::CreateConversation { title } if title == "Trip planning"
+            api::Command::CreateConversation { title, .. } if title == "Trip planning"
         ));
     }
 
@@ -955,6 +956,7 @@ mod tests {
                 message_count: 3,
                 updated_at: "2026-06-14".into(),
                 archived: false,
+                tags: vec![],
             }],
         )));
         let rows = DbusConversationsAdapter::new(Arc::clone(&t))
