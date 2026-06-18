@@ -33,6 +33,8 @@
 //! pumping for the next turn (voice#49/#241). An idle connection (no
 //! subscribers, no traffic) is never torn down or reconnected.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,9 +42,11 @@ use anyhow::Result;
 use desktop_assistant_api_model as api;
 use tokio::sync::mpsc;
 
-use crate::config::ConnectionConfig;
+use crate::config::{ConnectionConfig, TransportMode};
 use crate::signal::SignalEvent;
-use crate::timeouts::{EVENT_STALL_TIMEOUT, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX};
+use crate::timeouts::{
+    DISPATCH_TIMEOUT, EVENT_STALL_TIMEOUT, RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX,
+};
 use crate::transport::{
     AssistantClient, DropNotifier, TransportClient, connect_transport, transport_label,
 };
@@ -80,9 +84,18 @@ type RememberedTools = Arc<Mutex<Option<Vec<api::ClientToolRegistration>>>>;
 /// stall and the pump would die before the first turn ever arrived, so every
 /// later subscriber would be attached to a dead pump and receive ZERO events
 /// (the reopened voice#49).
+/// A liveness probe: resolves `true` if the connection is still alive. The
+/// fanout uses it to tell an idle-but-alive link from a wedged/dead one before
+/// declaring a stall — essential on a transport WITHOUT a keepalive (D-Bus),
+/// where an idle connection produces no events and would otherwise trip the
+/// stall window despite being healthy. `None` keeps the original blind stall (the
+/// socket transports' pings already prevent false idle stalls).
+type LivenessProbe = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
 fn spawn_fanout_with_stall_timeout(
     mut signal_rx: mpsc::UnboundedReceiver<SignalEvent>,
     stall_timeout: Duration,
+    liveness: Option<LivenessProbe>,
 ) -> Subscribers {
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
     let pump = Arc::clone(&subscribers);
@@ -97,10 +110,19 @@ fn spawn_fanout_with_stall_timeout(
                 match tokio::time::timeout(stall_timeout, signal_rx.recv()).await {
                     Ok(item) => item,
                     Err(_elapsed) => {
-                        // No progress for a turn that had a waiter: unstick the
-                        // current subscribers, but KEEP the pump alive so the
-                        // next turn still streams. This is a per-turn stall, NOT
-                        // a transport close — no reconnect (#246).
+                        // Silent for the whole stall window with a waiter attached.
+                        // With a liveness probe (D-Bus, which has no keepalive) a
+                        // silent window usually just means the link is IDLE — so
+                        // probe before tearing waiters off: alive ⇒ keep waiting,
+                        // dead ⇒ disconnect. Without a probe (socket transports,
+                        // whose pings keep events flowing) it's a genuine per-turn
+                        // stall: unstick the current subscribers but KEEP the pump
+                        // alive for the next turn (#221 / voice#49 / #246).
+                        if let Some(probe) = &liveness
+                            && probe().await
+                        {
+                            continue;
+                        }
                         let reason = format!(
                             "connection stalled: no events for {}s",
                             stall_timeout.as_secs()
@@ -337,7 +359,31 @@ impl Connector {
         // trigger the background reconnect loop.
         let (client, signal_rx, drop_rx) = connect_transport(&config).await?;
         let client = Arc::new(client);
-        let subscribers = spawn_fanout_with_stall_timeout(signal_rx, stall_timeout);
+        // D-Bus has no keepalive, so an idle connection emits no events and would
+        // trip the stall window despite being healthy. Give the fanout a liveness
+        // probe (a `Ping` round-trip) so it only stalls a D-Bus link that is
+        // genuinely dead, not merely idle. Socket transports keep their pings, so
+        // they get no probe and retain the original blind stall.
+        let liveness: Option<LivenessProbe> = if config.transport_mode == TransportMode::Dbus {
+            let probe_client = Arc::clone(&client);
+            Some(Arc::new(move || {
+                let probe_client = Arc::clone(&probe_client);
+                Box::pin(async move {
+                    match probe_client.as_commands() {
+                        Some(cmds) => tokio::time::timeout(
+                            DISPATCH_TIMEOUT,
+                            cmds.send_command(api::Command::Ping),
+                        )
+                        .await
+                        .is_ok_and(|r| r.is_ok()),
+                        None => false,
+                    }
+                })
+            }))
+        } else {
+            None
+        };
+        let subscribers = spawn_fanout_with_stall_timeout(signal_rx, stall_timeout, liveness);
         let tools: RememberedTools = Arc::new(Mutex::new(None));
 
         // Only the socket transports hand back a drop-notifier; D-Bus doesn't
@@ -558,7 +604,7 @@ mod tests {
     /// Fan-out with the production stall window — the default `connect` path —
     /// for tests that exercise delivery/close, not the stall itself.
     fn spawn_fanout(rx: mpsc::UnboundedReceiver<SignalEvent>) -> Subscribers {
-        spawn_fanout_with_stall_timeout(rx, EVENT_STALL_TIMEOUT)
+        spawn_fanout_with_stall_timeout(rx, EVENT_STALL_TIMEOUT, None)
     }
 
     #[tokio::test]
@@ -624,7 +670,7 @@ mod tests {
     async fn fanout_emits_disconnected_on_stall() {
         // Keep `tx` alive for the whole test: the stream is OPEN, just silent.
         let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
-        let subs = spawn_fanout_with_stall_timeout(rx, Duration::from_millis(50));
+        let subs = spawn_fanout_with_stall_timeout(rx, Duration::from_millis(50), None);
         let mut a = register(&subs);
 
         let event = tokio::time::timeout(Duration::from_secs(2), a.recv())
@@ -647,7 +693,7 @@ mod tests {
     #[tokio::test]
     async fn fanout_received_events_reset_the_stall_clock() {
         let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
-        let subs = spawn_fanout_with_stall_timeout(rx, Duration::from_millis(80));
+        let subs = spawn_fanout_with_stall_timeout(rx, Duration::from_millis(80), None);
         let mut a = register(&subs);
 
         // Send three events spaced under the stall window; none should trip it.
@@ -676,7 +722,7 @@ mod tests {
     async fn fanout_idle_without_subscribers_does_not_stall_out() {
         let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
         let stall = Duration::from_millis(40);
-        let subs = spawn_fanout_with_stall_timeout(rx, stall);
+        let subs = spawn_fanout_with_stall_timeout(rx, stall, None);
 
         // Idle well past the stall window with NO subscribers (the
         // connect→first-turn gap). The pump must survive.
@@ -701,6 +747,57 @@ mod tests {
         drop(tx);
     }
 
+    /// With a liveness probe (the D-Bus path), a connection that is silent past
+    /// the stall window but whose probe reports ALIVE must NOT be stalled out —
+    /// an idle-but-healthy link keeps waiting instead of getting a spurious
+    /// Disconnected. (This is the KDE-widget idle-stall fix.)
+    #[tokio::test]
+    async fn fanout_alive_probe_suppresses_idle_stall() {
+        let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let stall = Duration::from_millis(40);
+        let probe: LivenessProbe = Arc::new(|| Box::pin(async { true }));
+        let subs = spawn_fanout_with_stall_timeout(rx, stall, Some(probe));
+        let mut a = register(&subs);
+
+        // Several stall windows pass; an alive probe must suppress the stall, so
+        // the subscriber receives nothing (no Disconnected) and keeps waiting.
+        let res = tokio::time::timeout(stall * 4, a.recv()).await;
+        assert!(
+            res.is_err(),
+            "an alive probe must suppress the idle stall (no Disconnected)"
+        );
+
+        // A real event still flows after the idle period.
+        tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
+            request_id: "r".into(),
+            chunk: "hi".into(),
+        })
+        .unwrap();
+        assert!(matches!(a.recv().await, Some(SignalEvent::Chunk { .. })));
+        drop(tx);
+    }
+
+    /// A silent connection whose liveness probe reports DEAD is still stalled out
+    /// — the waiter gets a terminal Disconnected instead of hanging (#221).
+    #[tokio::test]
+    async fn fanout_dead_probe_still_stalls() {
+        let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let stall = Duration::from_millis(40);
+        let probe: LivenessProbe = Arc::new(|| Box::pin(async { false }));
+        let subs = spawn_fanout_with_stall_timeout(rx, stall, Some(probe));
+        let mut a = register(&subs);
+
+        let event = tokio::time::timeout(Duration::from_secs(2), a.recv())
+            .await
+            .expect("a dead probe must still surface a terminal stall");
+        assert!(
+            matches!(event, Some(SignalEvent::Disconnected { ref reason }) if reason.contains("stalled")),
+            "expected Disconnected(stalled) when the probe reports dead, got {event:?}"
+        );
+        drop(tx);
+    }
+
     /// A stall unsticks the *current* subscribers (so a wedged turn errors out)
     /// but must NOT kill the pump: a fresh subscriber for the next turn still
     /// gets its events. This is the per-turn-vs-terminal distinction at the
@@ -709,7 +806,7 @@ mod tests {
     async fn fanout_stall_unsticks_waiters_but_keeps_serving_later_turns() {
         let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
         let stall = Duration::from_millis(40);
-        let subs = spawn_fanout_with_stall_timeout(rx, stall);
+        let subs = spawn_fanout_with_stall_timeout(rx, stall, None);
 
         // Turn 1: a subscriber waits on a wedged (silent) connection → gets a
         // terminal Disconnected once the stall fires.
