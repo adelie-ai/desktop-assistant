@@ -377,6 +377,22 @@ pub trait AssistantCommands: Send + Sync {
         Ok(())
     }
 
+    /// Trigger an on-demand knowledge-maintenance pass (the "dream cycle"
+    /// controls). Returns immediately with the background task's id; progress
+    /// and completion arrive as `Task*` signals, and the pass broadcasts
+    /// `KnowledgeChanged` as entries land. Cancel it via the task id.
+    async fn start_knowledge_maintenance(&self, op: api::MaintenanceOp) -> Result<String> {
+        let result = self
+            .send_command(api::Command::StartKnowledgeMaintenance { op })
+            .await?;
+        let api::CommandResult::MaintenanceTaskStarted { task_id } = result else {
+            return Err(anyhow!(
+                "unexpected response for start_knowledge_maintenance"
+            ));
+        };
+        Ok(task_id)
+    }
+
     // --- Conversation scratchpad (issue #190) -----------------------------
 
     /// Read a conversation's scratchpad notes (ordered by type then sequence).

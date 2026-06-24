@@ -18,8 +18,8 @@ use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::client_tools::with_client_tools;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
-    ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeService,
-    PromptSelectionOverride, PurposeConfigPayload, SettingsService,
+    ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeMaintenanceService,
+    KnowledgeService, PromptSelectionOverride, PurposeConfigPayload, SettingsService,
 };
 use desktop_assistant_core::ports::request_scope::RequestScope;
 use desktop_assistant_core::ports::scratchpad::{
@@ -451,6 +451,13 @@ where
     /// every other connection viewing that conversation. `None` keeps the prior
     /// behaviour: turn events reach only the initiating connection.
     conversation_subs: Option<Arc<crate::conversation_subs::ConversationSubscriptions>>,
+    /// Optional on-demand knowledge-maintenance service (dream-cycle controls).
+    /// When attached, `StartKnowledgeMaintenance` spawns the requested pass
+    /// (extraction / consolidation / embedding recompute) as a tracked,
+    /// cancellable background task. `None` (no DB / tests) makes the command
+    /// return a clear "not configured" error. Held as a trait object (the port
+    /// is `async_trait`) so no extra generic threads through the handler.
+    maintenance: Option<Arc<dyn KnowledgeMaintenanceService>>,
 }
 
 /// The handler-resident client-tool dependencies (#234). Both halves are
@@ -494,6 +501,7 @@ where
             inflight: Arc::new(InFlightRegistry::default()),
             client_tools: None,
             conversation_subs: None,
+            maintenance: None,
         }
     }
 
@@ -540,6 +548,31 @@ where
     pub fn with_registry(mut self, registry: Arc<BackgroundTaskRegistry>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    /// Attach the on-demand knowledge-maintenance service (dream-cycle controls)
+    /// so `StartKnowledgeMaintenance` spawns extraction / consolidation /
+    /// embedding-recompute passes as tracked, cancellable background tasks. The
+    /// daemon wires this in `main.rs`, sharing the same implementation the
+    /// periodic timers use; callers that skip it make the command a clear error.
+    pub fn with_maintenance_service(
+        mut self,
+        service: Arc<dyn KnowledgeMaintenanceService>,
+    ) -> Self {
+        self.maintenance = Some(service);
+        self
+    }
+
+    /// Broadcast a knowledge-base change to the calling user's subscribed
+    /// connections so every open knowledge panel refetches live. No-op without a
+    /// registry attached. Used after a manual create/update/delete so a second
+    /// connected client stays in sync (maintenance passes notify from within).
+    fn notify_knowledge_changed(&self) {
+        if let Some(reg) = &self.registry {
+            reg.notify_knowledge_changed(
+                &desktop_assistant_core::ports::auth::current_user_id(),
+            );
+        }
     }
 
     /// Attach the per-connection conversation-subscription registry (#1) so the
@@ -1566,6 +1599,8 @@ where
                     .create_entry(content, tags, metadata)
                     .await
                     .map_err(Self::map_core_err)?;
+                // Live sync: let the user's other connected panels refetch.
+                self.notify_knowledge_changed();
                 Ok(api::CommandResult::KnowledgeEntryWritten(
                     knowledge_entry_to_view(entry),
                 ))
@@ -1581,6 +1616,7 @@ where
                     .update_entry(id, content, tags, metadata)
                     .await
                     .map_err(Self::map_core_err)?;
+                self.notify_knowledge_changed();
                 Ok(api::CommandResult::KnowledgeEntryWritten(
                     knowledge_entry_to_view(entry),
                 ))
@@ -1590,7 +1626,62 @@ where
                     .delete_entry(id)
                     .await
                     .map_err(Self::map_core_err)?;
+                self.notify_knowledge_changed();
                 Ok(api::CommandResult::Ack)
+            }
+            api::Command::StartKnowledgeMaintenance { op } => {
+                // Run the requested pass as a tracked, cancellable background
+                // task via the registry, returning its id immediately — never
+                // inline, so the (serial, per-connection) dispatch loop is not
+                // blocked for the multi-minute LLM/embedding work. Progress and
+                // completion arrive as `Task*` events; the pass itself
+                // broadcasts `KnowledgeChanged` as entries land.
+                let service = self.maintenance.clone().ok_or_else(|| {
+                    ApiError::Core("knowledge maintenance not configured".to_string())
+                })?;
+                let registry = self.registry.clone().ok_or_else(|| {
+                    ApiError::Core(
+                        "knowledge maintenance requires the background-task registry".to_string(),
+                    )
+                })?;
+                let user_id = desktop_assistant_core::ports::auth::current_user_id();
+                let name = match op {
+                    api::MaintenanceOp::Extraction => "Knowledge extraction",
+                    api::MaintenanceOp::Consolidation => "Knowledge consolidation",
+                    api::MaintenanceOp::RecalculateEmbeddings => "Recalculate embeddings",
+                };
+                let task_id = registry.spawn(
+                    user_id,
+                    api::TaskKind::Maintenance {
+                        name: name.to_string(),
+                    },
+                    name.to_string(),
+                    move |ctx| async move {
+                        let token = ctx.token.clone();
+                        let result = match op {
+                            api::MaintenanceOp::Extraction => service.run_extraction(token).await,
+                            api::MaintenanceOp::Consolidation => {
+                                service.run_consolidation(token).await
+                            }
+                            api::MaintenanceOp::RecalculateEmbeddings => {
+                                service.recalculate_embeddings(token).await
+                            }
+                        };
+                        match result {
+                            Ok(n) => {
+                                ctx.logs.append(
+                                    api::LogLevel::Info,
+                                    api::LogCategory::Lifecycle,
+                                    format!("{name}: {n} change(s)"),
+                                    None,
+                                );
+                                Ok(())
+                            }
+                            Err(e) => Err(anyhow::anyhow!("{name} failed: {e}")),
+                        }
+                    },
+                );
+                Ok(api::CommandResult::MaintenanceTaskStarted { task_id: task_id.0 })
             }
 
             // MCP server management

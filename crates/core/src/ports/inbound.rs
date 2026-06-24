@@ -685,6 +685,38 @@ pub trait KnowledgeService: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 }
 
+/// On-demand knowledge-maintenance passes, triggered from the knowledge panels
+/// (the "dream cycle" controls). These mirror the daemon's periodic background
+/// passes so a manual trigger shares the same implementation, configured LLM,
+/// and per-op mutual exclusion as the timers.
+///
+/// Each method is long-running and runs as a tracked background task; the
+/// supplied `cancellation` token (the task's `ctx.token`) is observed at batch
+/// boundaries and before each external (LLM/embedding) call, so the existing
+/// task-cancel command stops a run promptly. Returns a count of work done
+/// (facts written / entries changed / rows re-embedded). Implementations reject
+/// a concurrent run of the same op with `CoreError`.
+///
+/// Object-safe (`async_trait`) so the API handler can hold it as an optional
+/// `Arc<dyn KnowledgeMaintenanceService>` rather than threading another generic.
+#[async_trait::async_trait]
+pub trait KnowledgeMaintenanceService: Send + Sync {
+    /// Run one extraction pass (scan conversations for new facts + archival).
+    async fn run_extraction(&self, cancellation: CancellationToken) -> Result<usize, CoreError>;
+
+    /// Run one holistic consolidation pass over the active knowledge base.
+    async fn run_consolidation(&self, cancellation: CancellationToken)
+    -> Result<usize, CoreError>;
+
+    /// Force-recompute embeddings for EVERY active knowledge entry, regardless
+    /// of model stamp or freshness (for out-of-band cases). Returns the number
+    /// of entries re-embedded.
+    async fn recalculate_embeddings(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<usize, CoreError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

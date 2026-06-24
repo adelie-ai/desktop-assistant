@@ -1507,6 +1507,7 @@ dependencies = [
  "sqlparser",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

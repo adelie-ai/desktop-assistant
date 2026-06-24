@@ -61,6 +61,10 @@ pub trait AssistantClient: Send + Sync {
         metadata: serde_json::Value,
     ) -> Result<api::KnowledgeEntryView>;
     async fn delete_knowledge_entry(&self, id: &str) -> Result<()>;
+    /// Trigger an on-demand knowledge-maintenance pass (dream-cycle controls).
+    /// Returns the background task id; progress/completion arrive as `Task*`
+    /// signals and the pass broadcasts `KnowledgeChanged`.
+    async fn start_knowledge_maintenance(&self, op: api::MaintenanceOp) -> Result<String>;
 }
 
 pub enum TransportClient {
@@ -372,6 +376,15 @@ impl AssistantClient for TransportClient {
             Self::Dbus(client) => client.delete_knowledge_entry(id).await,
             Self::Ws(client) => client.delete_knowledge_entry(id).await,
             Self::Uds(client) => client.delete_knowledge_entry(id).await,
+        }
+    }
+
+    async fn start_knowledge_maintenance(&self, op: api::MaintenanceOp) -> Result<String> {
+        match self {
+            #[cfg(feature = "dbus")]
+            Self::Dbus(client) => client.start_knowledge_maintenance(op).await,
+            Self::Ws(client) => client.start_knowledge_maintenance(op).await,
+            Self::Uds(client) => client.start_knowledge_maintenance(op).await,
         }
     }
 }

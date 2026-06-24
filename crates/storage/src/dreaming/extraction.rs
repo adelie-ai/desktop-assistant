@@ -21,20 +21,28 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use sqlx::PgPool;
 
+use tokio_util::sync::CancellationToken;
+
 use super::common::{
     extract_json_payload, find_conversations_with_new_messages, get_max_ordinal,
     load_new_transcript, update_watermark,
 };
-use super::types::{BackfillEmbedFn, DreamingLlmFn};
+use super::types::{BackfillEmbedFn, DreamingLlmFn, KnowledgeChangeFn};
 use crate::kb_metadata::{KbMetadata, KbScope};
 use crate::tag_registry::{self, CreateTagOutcome, TagProposal, TagRecord, normalize_tag_name};
 
 /// Run the extraction phase. Returns the count of new facts written.
+///
+/// `cancellation` is checked before each conversation so an on-demand run stops
+/// promptly; `on_change` (when set) fires after a conversation writes facts so
+/// connected knowledge panels refetch live.
 pub async fn run_extraction_phase(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
+    cancellation: &CancellationToken,
+    on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<usize, CoreError> {
     let conversations = find_conversations_with_new_messages(pool).await?;
     if conversations.is_empty() {
@@ -49,6 +57,13 @@ pub async fn run_extraction_phase(
     let mut total_written = 0usize;
 
     for (conv_id, user_id_str, watermark, context_summary) in conversations {
+        // Stop promptly between conversations when the task is cancelled — the
+        // per-conversation LLM call is the long pole, so bailing here (and via
+        // the cancellation-aware llm_fn) keeps cancellation responsive.
+        if cancellation.is_cancelled() {
+            tracing::info!("dreaming: extraction cancelled; stopping scan");
+            break;
+        }
         // Install the conversation's owning user as the request-scoped
         // identity for the duration of this conversation's processing.
         // Every sub-query (`tag_registry::list_active_tags`,
@@ -75,6 +90,13 @@ pub async fn run_extraction_phase(
                 tracing::info!(
                     "dreaming: conversation {conv_id} (user {user_id_str}) wrote {n} fact(s)"
                 );
+                // Live refresh: this user's KB grew, so let connected panels
+                // refetch as the scan progresses (not just at completion).
+                if n > 0
+                    && let Some(notify) = on_change
+                {
+                    notify(&UserId::new(user_id_str.clone()));
+                }
             }
             Err(e) => tracing::warn!(
                 "dreaming: extraction for conversation {conv_id} (user {user_id_str}) failed: {e}"

@@ -38,6 +38,9 @@ pub use migrate_json::{
     migrate_knowledge,
 };
 pub use pool::{create_pool, run_migrations};
+/// Re-exported so daemon-side consumers can name the pool type (e.g. the
+/// knowledge-maintenance service) without taking a direct `sqlx` dependency.
+pub use sqlx::PgPool;
 pub use scratchpad::PgScratchpadStore;
 pub use tool_registry::PgToolRegistryStore;
 pub use turn_state::PgTurnStateStore;

@@ -60,6 +60,7 @@ use super::paths;
 
 const CONV_INTERFACE: &str = "org.desktopAssistant.Conversations";
 const BG_INTERFACE: &str = "org.desktopAssistant.BackgroundTasks";
+const KNOWLEDGE_INTERFACE: &str = "org.desktopAssistant.Knowledge";
 
 /// The result of translating one [`SignalEvent`] — the testable surface; `run`
 /// is the wiring loop.
@@ -144,6 +145,10 @@ pub enum ForwardAction {
     /// A conversation's scratchpad changed (#190/#401). Unicast — scoped to the
     /// conversation; carries only the id (clients re-read the scratchpad).
     ScratchpadChanged { conversation_id: String },
+    /// The user's knowledge base changed — a manual edit or a maintenance pass
+    /// (dream-cycle controls). Rides the shared per-user broadcast (like
+    /// `ConversationListChanged`); carries no args (clients refetch the list).
+    KnowledgeChanged,
     /// Task is now `Pending`/`Running`. `task` is the JSON-keyed `TaskView`
     /// encoded as `a{sv}`.
     TaskStarted {
@@ -197,6 +202,9 @@ impl ForwardAction {
                 // four #401 events (Status/ContextUsage/Warning/Scratchpad) are
                 // per-conversation/turn and stay unicast like the response stream.
                 | ForwardAction::TitleChanged { .. }
+                // Knowledge changes ride the shared per-user broadcast (the
+                // daemon emits `KnowledgeChanged` on that tap, like Task*).
+                | ForwardAction::KnowledgeChanged
         )
     }
 }
@@ -334,6 +342,7 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
         SignalEvent::ScratchpadChanged { conversation_id } => {
             ForwardAction::ScratchpadChanged { conversation_id }
         }
+        SignalEvent::KnowledgeChanged => ForwardAction::KnowledgeChanged,
         // Control signal handled by `run` before it reaches `translate`; mapped
         // here only for match exhaustiveness.
         SignalEvent::Disconnected { .. } => ForwardAction::Ignored {
@@ -751,6 +760,21 @@ async fn emit(connection: &Connection, destination: Option<&str>, action: Forwar
                 .await
             {
                 warn!("task_completed emit failed: {e}");
+            }
+        }
+        ForwardAction::KnowledgeChanged => {
+            let body = ();
+            if let Err(e) = connection
+                .emit_signal::<&str, _, _, _, _>(
+                    destination,
+                    paths::KNOWLEDGE,
+                    KNOWLEDGE_INTERFACE,
+                    "EntriesChanged",
+                    &body,
+                )
+                .await
+            {
+                warn!("knowledge entries_changed emit failed: {e}");
             }
         }
         ForwardAction::Ignored { kind } => {
