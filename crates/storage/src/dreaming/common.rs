@@ -192,9 +192,35 @@ pub fn extract_json_payload(text: &str) -> String {
     text.to_string()
 }
 
+/// Whether a maintenance pass that attempted `attempted` independent units
+/// (conversations / users / prompt slices), of which `failed` errored, should
+/// be treated as a hard failure rather than a no-op "0 changes" success.
+///
+/// The distinction matters for the maintenance task UI: a pass where the model
+/// legitimately kept everything (0 operations) must finalize as `Completed`,
+/// but a pass where **every** LLM call failed — e.g. the configured model is
+/// unauthorized (HTTP 401) or unreachable — must finalize as `Failed`.
+/// Otherwise a broken configuration is indistinguishable from a successful
+/// no-op, which is exactly what made a 401 on the consolidation model look like
+/// "consolidation did nothing." A cancelled pass is never a failure: it may
+/// have intentionally attempted nothing.
+pub fn is_total_failure(attempted: usize, failed: usize, cancelled: bool) -> bool {
+    !cancelled && attempted > 0 && failed == attempted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn total_failure_only_when_all_attempts_failed_and_not_cancelled() {
+        assert!(is_total_failure(3, 3, false)); // every unit failed → failure
+        assert!(!is_total_failure(3, 2, false)); // one succeeded → not a failure
+        assert!(!is_total_failure(0, 0, false)); // nothing attempted → not a failure
+        assert!(!is_total_failure(3, 3, true)); // cancelled → never a failure
+        assert!(is_total_failure(1, 1, false)); // single unit, failed → failure
+        assert!(!is_total_failure(1, 0, false)); // single unit, succeeded → ok
+    }
 
     #[test]
     fn extract_json_array_from_code_fence() {
