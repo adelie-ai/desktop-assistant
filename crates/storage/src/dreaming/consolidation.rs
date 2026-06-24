@@ -21,7 +21,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-use super::common::extract_json_payload;
+use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
     ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_FRACTION,
@@ -54,6 +54,12 @@ pub async fn run_consolidation_phase(
     }
 
     let mut total = ConsolidationStats::default();
+    // If every user we attempt fails outright, the whole pass is broken (the
+    // model is unauthorized/unreachable) — surface it rather than returning an
+    // empty success.
+    let user_count = user_ids.len();
+    let mut failed_users = 0usize;
+    let mut last_failure: Option<String> = None;
     for user_id_str in user_ids {
         // Stop promptly between users when cancelled (each user is a full
         // holistic recompute — potentially several LLM calls).
@@ -85,11 +91,20 @@ pub async fn run_consolidation_phase(
                 }
             }
             Err(e) => {
+                failed_users += 1;
+                last_failure = Some(e.to_string());
                 tracing::warn!(
                     "dreaming: holistic consolidation failed for user {user_id_str}: {e}"
                 )
             }
         }
+    }
+
+    if is_total_failure(user_count, failed_users, cancellation.is_cancelled()) {
+        return Err(CoreError::Storage(format!(
+            "consolidation failed for all {user_count} user(s); last error: {}",
+            last_failure.as_deref().unwrap_or("unknown")
+        )));
     }
 
     Ok(total)
@@ -125,6 +140,12 @@ async fn consolidate_user(
     // Deletes are collected across slices so the per-run deletion cap applies
     // to the user's whole KB, not each slice.
     let mut delete_ops: Vec<(String, String)> = Vec::new();
+    // Track per-slice LLM/parse failures so a pass where EVERY slice failed
+    // (e.g. the consolidation model is unauthorized or unreachable) surfaces as
+    // an error instead of a silent "0 changes" success.
+    let slice_count = slices.len();
+    let mut failed_slices = 0usize;
+    let mut last_failure: Option<String> = None;
 
     for slice in &slices {
         // Bail between slices when cancelled — each slice is its own LLM call.
@@ -137,6 +158,8 @@ async fn consolidate_user(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("dreaming: consolidation LLM call failed: {e}");
+                failed_slices += 1;
+                last_failure = Some(e);
                 continue;
             }
         };
@@ -145,6 +168,8 @@ async fn consolidate_user(
             Ok(ops) => ops,
             Err(e) => {
                 tracing::warn!("dreaming: could not parse consolidation operations: {e}");
+                failed_slices += 1;
+                last_failure = Some(e.to_string());
                 continue;
             }
         };
@@ -202,6 +227,16 @@ async fn consolidate_user(
                 RawOp::Keep => {}
             }
         }
+    }
+
+    // Every slice we attempted failed (LLM call or parse) — this is a broken
+    // pass, not a "model kept everything" success. Surface it instead of
+    // applying an empty plan, so the maintenance task finalizes as Failed.
+    if is_total_failure(slice_count, failed_slices, cancellation.is_cancelled()) {
+        return Err(CoreError::Storage(format!(
+            "consolidation failed: all {slice_count} slice(s) failed; last error: {}",
+            last_failure.as_deref().unwrap_or("unknown")
+        )));
     }
 
     // Mark every loaded entry reviewed so first-review timestamps advance even

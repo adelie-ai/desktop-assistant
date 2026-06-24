@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use super::common::{
-    extract_json_payload, find_conversations_with_new_messages, get_max_ordinal,
+    extract_json_payload, find_conversations_with_new_messages, get_max_ordinal, is_total_failure,
     load_new_transcript, update_watermark,
 };
 use super::types::{BackfillEmbedFn, DreamingLlmFn, KnowledgeChangeFn};
@@ -55,6 +55,12 @@ pub async fn run_extraction_phase(
     );
 
     let mut total_written = 0usize;
+    // If every conversation we attempt fails its LLM call, the extraction model
+    // is broken (unauthorized/unreachable) — surface it instead of reporting a
+    // successful "0 facts" scan.
+    let conv_count = conversations.len();
+    let mut failed_convs = 0usize;
+    let mut last_failure: Option<String> = None;
 
     for (conv_id, user_id_str, watermark, context_summary) in conversations {
         // Stop promptly between conversations when the task is cancelled — the
@@ -98,10 +104,21 @@ pub async fn run_extraction_phase(
                     notify(&UserId::new(user_id_str.clone()));
                 }
             }
-            Err(e) => tracing::warn!(
-                "dreaming: extraction for conversation {conv_id} (user {user_id_str}) failed: {e}"
-            ),
+            Err(e) => {
+                failed_convs += 1;
+                last_failure = Some(e.to_string());
+                tracing::warn!(
+                    "dreaming: extraction for conversation {conv_id} (user {user_id_str}) failed: {e}"
+                )
+            }
         }
+    }
+
+    if is_total_failure(conv_count, failed_convs, cancellation.is_cancelled()) {
+        return Err(CoreError::Storage(format!(
+            "extraction failed for all {conv_count} conversation(s); last error: {}",
+            last_failure.as_deref().unwrap_or("unknown")
+        )));
     }
 
     Ok(total_written)
@@ -139,9 +156,15 @@ async fn process_one_conversation_for_extraction(
 
     let response = match llm_fn(system_prompt, user_prompt).await {
         Ok(r) => r,
+        // A failed LLM call is an error, not "0 facts" — return Err (the
+        // watermark is intentionally NOT advanced above, so the conversation is
+        // retried next run) so the phase can tell a broken model (every call
+        // failing) from a quiet one. The phase logs it with conversation
+        // context.
         Err(e) => {
-            tracing::warn!("dreaming: extraction LLM call failed for {conv_id}: {e}");
-            return Ok(0);
+            return Err(CoreError::Storage(format!(
+                "extraction LLM call failed: {e}"
+            )));
         }
     };
 
