@@ -690,14 +690,17 @@ where
     false
 }
 
-/// #246 invariant guard: a per-turn **stall** (a waiter on an open-but-silent
-/// connection) must surface the stall `Disconnected` to the waiter (#221)
-/// WITHOUT tearing the transport down or reconnecting. A reconnect would emit a
-/// *second*, "signal stream closed" Disconnected and would replay the tool
-/// registration; neither must happen. After the stall, the SAME connection must
-/// still stream the next turn.
+/// #246 invariant guard (refined): a subscriber attached to an open, healthy
+/// connection with **no turn in flight** — exactly what a GUI holds for its
+/// whole session — must be neither stalled nor reconnected, even well past the
+/// stall window. A spurious stall would surface a `Disconnected`/`Error`, and a
+/// reconnect would emit a "signal stream closed" Disconnected and replay the
+/// tool registration; none must happen. The SAME connection must still stream
+/// the next turn. (A genuinely wedged *in-flight* turn surfacing as a per-turn
+/// `Error` is covered by the `connector` unit tests; the real UDS server here
+/// always completes turns, so it can't model a mid-turn wedge.)
 #[tokio::test]
-async fn per_turn_stall_does_not_trigger_a_reconnect() {
+async fn subscribed_but_idle_connection_does_not_stall_or_reconnect() {
     let dir = TempDir::new().unwrap();
     let signing_key = "deadbeef".repeat(8);
     let path = dir.path().join("adelie.sock");
@@ -706,37 +709,23 @@ async fn per_turn_stall_does_not_trigger_a_reconnect() {
 
     let cfg = uds_config(path.clone(), mint_test_jwt(&signing_key, "dave"));
     // A short stall window. The server stays up the whole time; the connection
-    // is open and healthy — it just has a waiter with no in-flight events.
+    // is open and healthy — it just has a subscriber with no in-flight turn.
     let stall = Duration::from_millis(200);
     let connector = Connector::connect_with_stall_timeout(&cfg, stall)
         .await
         .expect("connector over uds");
 
-    // A waiter on a silent connection (subscribe, but send nothing) trips the
-    // per-turn stall. It must get a "stalled" Disconnected, NOT a close.
+    // A subscriber that sends nothing (an idle persistent listener) must NOT be
+    // stalled out: no `Disconnected` and no per-turn `Error` may arrive, even
+    // well past the window. (A reconnect would also surface a "signal stream
+    // closed" Disconnected here.)
     let mut waiter = connector.subscribe();
-    let event = timeout(stall * 5, waiter.recv())
-        .await
-        .expect("the stall must unstick the waiter")
-        .expect("a terminal event");
-    match event {
-        SignalEvent::Disconnected { reason } => assert!(
-            reason.contains("stalled"),
-            "a per-turn stall must surface a 'stalled' Disconnected, not a close: {reason}"
-        ),
-        other => panic!("expected a stall Disconnected, got {other:?}"),
+    if let Ok(event) = timeout(stall * 4, waiter.recv()).await {
+        panic!("an idle subscriber must not be stalled or reconnected, but got: {event:?}");
     }
+    drop(waiter);
 
-    // No reconnect happened, so there must be NO follow-up "signal stream
-    // closed" Disconnected on a fresh subscriber, and the SAME connection must
-    // still stream the next turn (the transport was never torn down).
-    let mut probe = connector.subscribe();
-    // Give any (erroneous) reconnect a window to fire its close-Disconnected.
-    if let Ok(Some(SignalEvent::Disconnected { reason })) = timeout(stall, probe.recv()).await {
-        panic!("a stall must NOT trigger a transport close/reconnect, but got: {reason}");
-    }
-    drop(probe);
-
+    // The transport was never torn down: the SAME connection still streams a turn.
     drive_one_turn(&connector).await;
 
     drop(server);

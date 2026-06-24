@@ -7,8 +7,9 @@
 //! goes silent, and assert that:
 //!
 //!   1. command dispatch times out with a clear transport error (doesn't hang),
-//!   2. the open-but-silent connection surfaces a terminal `Disconnected`
-//!      through the high-level `Connector` (the stall is detected).
+//!   2. an open-but-silent connection with **no turn in flight** is NOT stalled
+//!      out through the high-level `Connector` — a persistently-subscribed but
+//!      idle client must stay connected, not be bounced every stall window.
 //!
 //! Unlike `uds_transport.rs` / `uds_streaming.rs`, which drive the *real*
 //! `desktop-assistant-uds` server (which always replies), the silent behaviour
@@ -22,7 +23,7 @@ use std::time::Duration;
 
 use desktop_assistant_client_common::uds_client::UdsClient;
 use desktop_assistant_client_common::{
-    AssistantCommands, ConnectionConfig, Connector, SignalEvent, TransportMode,
+    AssistantCommands, ConnectionConfig, Connector, TransportMode,
 };
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
@@ -129,35 +130,34 @@ async fn uds_pending_slot_is_reclaimed_after_a_timeout() {
     }
 }
 
-/// End-to-end stall detection (#221, part 2): a `Connector` over an
-/// open-but-silent UDS connection must surface a terminal `Disconnected` to its
-/// subscribers once the stall window elapses, instead of hanging forever. The
-/// old fan-out only detected *closure*, so this connection (open, never EOF,
-/// never an event) would have hung a subscriber's `recv()` indefinitely.
+/// End-to-end idle-safety (#221, part 2, refined): a `Connector` over an
+/// open-but-silent UDS connection with a subscriber attached but **no turn in
+/// flight** must NOT be stalled out — it stays quietly connected. The stall is a
+/// per-turn timeout (it arms only once the stream has delivered a turn event);
+/// an idle persistent subscription is exactly what a GUI holds for its whole
+/// session, and the old "any attached subscriber arms the stall" behaviour
+/// bounced such GUIs with a spurious `Disconnected` every window. (A *command*
+/// against this silent server still fails fast via the dispatch timeout — see
+/// the two tests above — so a genuinely wedged turn is never silently lost.)
 #[tokio::test]
-async fn connector_over_silent_uds_surfaces_a_stall() {
+async fn connector_over_silent_uds_does_not_stall_an_idle_subscriber() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("silent3.sock");
     spawn_silent_server(path.clone()).await;
     wait_for_socket(&path).await;
 
     // Short stall window so the test doesn't wait the production 90s.
-    let connector =
-        Connector::connect_with_stall_timeout(&uds_config(path), Duration::from_millis(150))
-            .await
-            .expect("connector over silent uds");
+    let stall = Duration::from_millis(150);
+    let connector = Connector::connect_with_stall_timeout(&uds_config(path), stall)
+        .await
+        .expect("connector over silent uds");
     let mut events = connector.subscribe();
 
-    let event = timeout(Duration::from_secs(2), events.recv())
-        .await
-        .expect("a stalled connection must produce a terminal event, not hang");
-    match event {
-        Some(SignalEvent::Disconnected { reason }) => {
-            assert!(
-                reason.contains("stalled"),
-                "expected a stall reason distinguishable from a clean close, got: {reason}"
-            );
-        }
-        other => panic!("expected SignalEvent::Disconnected on stall, got {other:?}"),
-    }
+    // Wait well past the window with a subscriber but no in-flight turn: nothing
+    // must arrive — no spurious stall `Disconnected` and no `Error`.
+    let res = timeout(stall * 4, events.recv()).await;
+    assert!(
+        res.is_err(),
+        "an idle subscriber (no turn in flight) must not be stalled out, got: {res:?}"
+    );
 }

@@ -28,11 +28,13 @@
 //! across reconnects — callers holding that reference don't have to re-fetch it.
 //!
 //! Reconnect is triggered **only** by an actual transport close (the transport's
-//! drop-notifier fires), never by a per-turn *stall*: an open-but-silent
-//! connection still unsticks its waiters (#221) and keeps the same connection
-//! pumping for the next turn (voice#49/#241). An idle connection (no
-//! subscribers, no traffic) is never torn down or reconnected.
+//! drop-notifier fires), never by a per-turn *stall*: a turn that goes silent
+//! past the stall window is failed for its waiter with a per-turn `Error` (#221)
+//! while the same connection keeps pumping for the next turn (voice#49/#241). An
+//! idle connection — one with no turn in flight, whether or not a persistent
+//! listener is subscribed — is never stalled out, torn down, or reconnected.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,7 +57,8 @@ type Subscribers = Arc<Mutex<Vec<mpsc::UnboundedSender<SignalEvent>>>>;
 /// remembered too (it clears the daemon's set on every connect).
 type RememberedTools = Arc<Mutex<Option<Vec<api::ClientToolRegistration>>>>;
 
-/// Pump a transport's signal stream out to subscribers (#241 semantics).
+/// Pump a transport's signal stream out to subscribers (#241 semantics, refined
+/// so an idle persistent subscriber is never stalled out).
 ///
 /// Closing the upstream stream is terminal *for this pump*: it stops and every
 /// subscriber gets a `Disconnected { reason: "signal stream closed" }`. With the
@@ -65,21 +68,26 @@ type RememberedTools = Arc<Mutex<Option<Vec<api::ClientToolRegistration>>>>;
 /// dropped. The terminal-on-close behaviour is retained for the D-Bus transport
 /// (no reconnect) and as a safety net.
 ///
-/// A *stall* (open but silent) is treated as a **per-turn** signal, not a reason
-/// to tear the connection down (voice#49, reopened #241). The stall clock only
-/// runs while at least one subscriber is attached — i.e. a turn is potentially
-/// in flight: if no event arrives within `stall_timeout`, every *current*
-/// subscriber gets a terminal `Disconnected { reason: "…stalled…" }` so a client
-/// waiting on a wedged turn errors out instead of hanging (#221), but the pump
-/// **keeps reading** so the next turn still streams.
+/// A *stall* (open but silent) is a **per-turn timeout**, never a connection
+/// close (voice#49, reopened #241). The stall clock runs only while a turn is
+/// genuinely **in flight** — the stream has delivered a turn event
+/// (`UserMessageAdded` / `Chunk` / `Status` / `ContextUsage`) whose terminal
+/// (`Complete` / `Error`) has not yet arrived (see [`track_turn_lifecycle`]). If
+/// such a turn then emits nothing for `stall_timeout`, every in-flight turn is
+/// failed with a synthetic `Error { request_id, … }` so a client waiting on a
+/// wedged turn errors out instead of hanging (#221) — but the subscribers and
+/// the pump are **kept**, so the connection is *not* torn down and the next turn
+/// still streams.
 ///
-/// While there are no subscribers, the connection is simply idle — the gap
-/// between connecting and the first request, or between turns — and the pump
-/// waits without a stall deadline. This is essential on transports without a
-/// keepalive (UDS): otherwise a healthy-but-idle connection would trip the
-/// stall and the pump would die before the first turn ever arrived, so every
-/// later subscriber would be attached to a dead pump and receive ZERO events
-/// (the reopened voice#49).
+/// Crucially, a connection with **no turn in flight is never stalled**, even
+/// when a persistent listener is subscribed. The old code armed the stall on
+/// mere subscriber presence as a proxy for "a turn may be in flight"; but a
+/// persistently-subscribed GUI (adele-gtk / adele-tui) holds one subscription
+/// for the whole session, so every idle gap longer than the window (UDS has no
+/// keepalive) tripped a spurious `Disconnected` and bounced the client into a
+/// full reconnect. Gating on an actual in-flight turn fixes that while still
+/// catching a genuinely wedged turn. An idle pump (no in-flight turn) waits
+/// unbounded, so a later subscriber is never attached to a dead pump (voice#49).
 fn spawn_fanout_with_stall_timeout(
     mut signal_rx: mpsc::UnboundedReceiver<SignalEvent>,
     stall_timeout: Duration,
@@ -87,27 +95,41 @@ fn spawn_fanout_with_stall_timeout(
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
     let pump = Arc::clone(&subscribers);
     tokio::spawn(async move {
+        // request_id -> conversation_id for turns whose terminal event has not
+        // arrived yet. Non-empty == "a turn is in flight"; only then does the
+        // stall clock run. Keeping the conversation_id lets a stalled turn be
+        // reported as a per-turn `Error` on the right conversation.
+        let mut in_flight: HashMap<String, String> = HashMap::new();
         loop {
-            // The stall clock only applies while a subscriber is waiting (a turn
-            // may be in flight). With no subscribers the connection is idle, not
-            // wedged, so we wait unbounded — never stalling out a healthy link
-            // that simply has no traffic yet (voice#49).
-            let has_subscribers = !pump.lock().unwrap().is_empty();
-            let next = if has_subscribers {
+            // Arm the stall only when a turn is actually in flight AND someone is
+            // listening. An idle connection (no in-flight turn) waits unbounded,
+            // so a persistently-subscribed but idle GUI is never stalled out.
+            let arm = !in_flight.is_empty() && !pump.lock().unwrap().is_empty();
+            let next = if arm {
                 match tokio::time::timeout(stall_timeout, signal_rx.recv()).await {
                     Ok(item) => item,
                     Err(_elapsed) => {
-                        // No progress for a turn that had a waiter: unstick the
-                        // current subscribers, but KEEP the pump alive so the
-                        // next turn still streams. This is a per-turn stall, NOT
-                        // a transport close — no reconnect (#246).
-                        let reason = format!(
-                            "connection stalled: no events for {}s",
+                        // The in-flight turn(s) went silent past the window: fail
+                        // each one for its waiter with a terminal `Error`, but
+                        // KEEP the subscribers and the pump. A stall is a per-turn
+                        // timeout, NOT a transport close — the connection stays up
+                        // and the next turn still streams (#246/voice#49). Clients
+                        // already treat `Error { request_id }` as "this turn
+                        // failed", so no client-side change is needed.
+                        let error = format!(
+                            "no response from the daemon for {}s; the turn was abandoned",
                             stall_timeout.as_secs()
                         );
-                        for tx in pump.lock().unwrap().drain(..) {
-                            let _ = tx.send(SignalEvent::Disconnected {
-                                reason: reason.clone(),
+                        let stalled: Vec<(String, String)> = in_flight.drain().collect();
+                        let mut subs = pump.lock().unwrap();
+                        for (request_id, conversation_id) in stalled {
+                            subs.retain(|tx| {
+                                tx.send(SignalEvent::Error {
+                                    conversation_id: conversation_id.clone(),
+                                    request_id: request_id.clone(),
+                                    error: error.clone(),
+                                })
+                                .is_ok()
                             });
                         }
                         continue;
@@ -119,6 +141,7 @@ fn spawn_fanout_with_stall_timeout(
 
             match next {
                 Some(event) => {
+                    track_turn_lifecycle(&mut in_flight, &event);
                     // Deliver to every live subscriber; drop those whose receiver
                     // is gone. Receipt resets the stall clock implicitly — the
                     // next iteration re-arms the timeout from now.
@@ -139,6 +162,57 @@ fn spawn_fanout_with_stall_timeout(
         }
     });
     subscribers
+}
+
+/// Update the in-flight-turn set from a freshly-received event, so
+/// [`spawn_fanout_with_stall_timeout`] can run the stall clock only while a turn
+/// is genuinely awaiting more events.
+///
+/// A turn is "in flight" from its first streamed event (`UserMessageAdded` /
+/// `Chunk` / `Status` / `ContextUsage`, all keyed by `request_id`) until its
+/// terminal `Complete` / `Error`. A `ClientToolCall` *parks* the turn pending a
+/// client-local tool result — the daemon is legitimately quiet while the client
+/// runs the tool, so the affected conversation's turns leave the in-flight set
+/// (they must not be mistaken for a stall) and re-arm when the turn resumes
+/// streaming. All other events (titles, task/scratchpad/knowledge signals,
+/// disconnects) carry no turn and don't touch the set.
+fn track_turn_lifecycle(in_flight: &mut HashMap<String, String>, event: &SignalEvent) {
+    match event {
+        SignalEvent::UserMessageAdded {
+            request_id,
+            conversation_id,
+            ..
+        }
+        | SignalEvent::Chunk {
+            request_id,
+            conversation_id,
+            ..
+        }
+        | SignalEvent::Status {
+            request_id,
+            conversation_id,
+            ..
+        }
+        | SignalEvent::ContextUsage {
+            request_id,
+            conversation_id,
+            ..
+        } => {
+            in_flight.insert(request_id.clone(), conversation_id.clone());
+        }
+        SignalEvent::Complete { request_id, .. } | SignalEvent::Error { request_id, .. } => {
+            in_flight.remove(request_id);
+        }
+        SignalEvent::ClientToolCall {
+            conversation_id, ..
+        } => {
+            // The turn is parked on the client; can't map task_id→request_id
+            // here, so disarm every turn for this conversation. It re-arms on the
+            // next streamed event once the turn resumes.
+            in_flight.retain(|_, conv| conv != conversation_id);
+        }
+        _ => {}
+    }
 }
 
 fn register(subscribers: &Subscribers) -> mpsc::UnboundedReceiver<SignalEvent> {
@@ -312,14 +386,15 @@ impl Connector {
     }
 
     /// Like [`connect`](Self::connect) but with an explicit event-stream stall
-    /// window (#221). While a subscriber is attached (a turn may be in flight), a
-    /// connection that stays open but emits no event for `stall_timeout` surfaces
-    /// a terminal [`SignalEvent::Disconnected`] to the *current* subscribers — but
-    /// the pump keeps running so later turns still stream (voice#49) and the
-    /// transport is NOT torn down or reconnected (a stall is per-turn, not a
-    /// close). An idle connection with no subscribers is never stalled out.
-    /// Mainly for tests; production callers normally want the default via
-    /// [`connect`](Self::connect).
+    /// window (#221). While a turn is **in flight** (the stream has delivered a
+    /// turn event whose terminal hasn't arrived), a connection that then emits
+    /// nothing for `stall_timeout` fails that turn for its waiter with a per-turn
+    /// [`SignalEvent::Error`] — but the subscribers and the pump are kept, so
+    /// later turns still stream (voice#49) and the transport is NOT torn down or
+    /// reconnected (a stall is per-turn, not a close). A connection with no turn
+    /// in flight is never stalled out, even with a persistent listener
+    /// subscribed. Mainly for tests; production callers normally want the default
+    /// via [`connect`](Self::connect).
     pub async fn connect_with_stall_timeout(
         config: &ConnectionConfig,
         stall_timeout: Duration,
@@ -617,28 +692,59 @@ mod tests {
         ));
     }
 
-    /// #221: a connection that stays *open but silent* (sender held, no events)
-    /// must surface a terminal `Disconnected` once the stall window elapses —
-    /// otherwise a subscriber waiting on `recv()` hangs forever.
+    /// The bug this fix targets: a subscriber that is attached but has **no turn
+    /// in flight** (a persistently-subscribed but idle GUI) must NOT be stalled
+    /// out. The old fan-out armed the stall on mere subscriber presence, so an
+    /// idle GUI was bounced with a spurious `Disconnected` every window.
     #[tokio::test]
-    async fn fanout_emits_disconnected_on_stall() {
+    async fn fanout_idle_subscriber_with_no_turn_does_not_stall() {
         // Keep `tx` alive for the whole test: the stream is OPEN, just silent.
         let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
-        let subs = spawn_fanout_with_stall_timeout(rx, Duration::from_millis(50));
+        let stall = Duration::from_millis(40);
+        let subs = spawn_fanout_with_stall_timeout(rx, stall);
         let mut a = register(&subs);
 
-        let event = tokio::time::timeout(Duration::from_secs(2), a.recv())
-            .await
-            .expect("stall must produce a terminal event, not hang");
-        match event {
-            Some(SignalEvent::Disconnected { reason }) => {
-                assert!(
-                    reason.contains("stalled"),
-                    "stall reason should be distinguishable from a clean close, got: {reason}"
-                );
-            }
-            other => panic!("expected SignalEvent::Disconnected on stall, got {other:?}"),
-        }
+        // Wait well past the window with a subscriber attached but no turn in
+        // flight: nothing must be delivered — no spurious stall/Disconnected.
+        let res = tokio::time::timeout(stall * 4, a.recv()).await;
+        assert!(
+            res.is_err(),
+            "an idle subscriber with no in-flight turn must not receive a stall event, got {res:?}"
+        );
+        drop(tx);
+    }
+
+    /// Once a turn reaches its terminal `Complete` it leaves the in-flight set,
+    /// so a subsequent silent gap is just an idle connection and must NOT stall.
+    #[tokio::test]
+    async fn fanout_completed_turn_disarms_the_stall() {
+        let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
+        let stall = Duration::from_millis(40);
+        let subs = spawn_fanout_with_stall_timeout(rx, stall);
+        let mut a = register(&subs);
+
+        // Arm a turn, then complete it.
+        tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
+            request_id: "r".into(),
+            chunk: "hi".into(),
+        })
+        .unwrap();
+        assert!(matches!(a.recv().await, Some(SignalEvent::Chunk { .. })));
+        tx.send(SignalEvent::Complete {
+            conversation_id: "c".into(),
+            request_id: "r".into(),
+            full_response: "hi there".into(),
+        })
+        .unwrap();
+        assert!(matches!(a.recv().await, Some(SignalEvent::Complete { .. })));
+
+        // Turn done → idle → the silent gap must not stall the subscriber.
+        let res = tokio::time::timeout(stall * 4, a.recv()).await;
+        assert!(
+            res.is_err(),
+            "a connection idle after a completed turn must not stall, got {res:?}"
+        );
         drop(tx);
     }
 
@@ -701,42 +807,54 @@ mod tests {
         drop(tx);
     }
 
-    /// A stall unsticks the *current* subscribers (so a wedged turn errors out)
-    /// but must NOT kill the pump: a fresh subscriber for the next turn still
-    /// gets its events. This is the per-turn-vs-terminal distinction at the
-    /// heart of the voice#49 fix.
+    /// A turn that is in flight (armed by a streamed event) and then goes silent
+    /// past the window is failed with a per-turn `Error` for its `request_id` —
+    /// NOT a connection `Disconnected` — and the subscriber + pump are kept, so
+    /// the SAME subscriber still receives the next turn. This is the per-turn
+    /// timeout vs. transport-close distinction at the heart of the voice#49 fix.
     #[tokio::test]
-    async fn fanout_stall_unsticks_waiters_but_keeps_serving_later_turns() {
+    async fn fanout_stall_fails_the_in_flight_turn_but_keeps_the_connection() {
         let (tx, rx) = mpsc::unbounded_channel::<SignalEvent>();
         let stall = Duration::from_millis(40);
         let subs = spawn_fanout_with_stall_timeout(rx, stall);
+        let mut a = register(&subs);
 
-        // Turn 1: a subscriber waits on a wedged (silent) connection → gets a
-        // terminal Disconnected once the stall fires.
-        let mut first = register(&subs);
-        let event = tokio::time::timeout(Duration::from_secs(2), first.recv())
+        // Arm a turn: one chunk for request "r1", then go silent.
+        tx.send(SignalEvent::Chunk {
+            conversation_id: "c".into(),
+            request_id: "r1".into(),
+            chunk: "partial".into(),
+        })
+        .unwrap();
+        assert!(matches!(a.recv().await, Some(SignalEvent::Chunk { .. })));
+
+        // The silent gap past the window fails the in-flight turn with an Error
+        // keyed by its request_id, not a Disconnected.
+        let event = tokio::time::timeout(Duration::from_secs(2), a.recv())
             .await
-            .expect("the waiting subscriber must be unstuck by the stall");
-        assert!(
-            matches!(event, Some(SignalEvent::Disconnected { ref reason }) if reason.contains("stalled")),
-            "the waiter on a wedged turn should get a stall Disconnected, got {event:?}"
-        );
+            .expect("a stalled in-flight turn must produce a terminal event");
+        match event {
+            Some(SignalEvent::Error { request_id, .. }) => assert_eq!(
+                request_id, "r1",
+                "the stalled turn's request_id must be the one failed"
+            ),
+            other => panic!("expected a per-turn Error on stall, got {other:?}"),
+        }
 
-        // Turn 2: a NEW subscriber on the SAME (still-open) connection must
-        // still receive events — the pump survived the stall.
-        let mut second = register(&subs);
+        // The connection survived: the SAME subscriber (not drained) still gets
+        // the next turn, and the now-idle connection doesn't stall again.
         tx.send(SignalEvent::Chunk {
             conversation_id: "c".into(),
             request_id: "r2".into(),
             chunk: "next".into(),
         })
         .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(2), second.recv())
+        let event = tokio::time::timeout(Duration::from_secs(2), a.recv())
             .await
             .expect("the next turn must still stream after a prior stall");
         assert!(
             matches!(event, Some(SignalEvent::Chunk { ref chunk, .. }) if chunk == "next"),
-            "expected the next turn's chunk, got {event:?}"
+            "expected the next turn's chunk on the same subscriber, got {event:?}"
         );
         drop(tx);
     }

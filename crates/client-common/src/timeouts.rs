@@ -25,11 +25,15 @@ use std::time::Duration;
 /// latency while still catching a wedged server.
 pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum gap between events on the signal stream before the connection is
-/// treated as stalled (open but silent). Any received event resets the clock,
-/// and the orchestrator emits periodic `AssistantStatus`, so a live connection
-/// stays well under this even mid-turn. On expiry the fan-out surfaces a
-/// terminal `Disconnected` so a waiting client errors instead of hanging.
+/// Maximum gap between events **while a turn is in flight** before that turn is
+/// treated as stalled (the connection is open but silent). The stall clock runs
+/// only while a turn is awaiting events; any received event resets it, and the
+/// orchestrator emits periodic `AssistantStatus`, so a live turn stays well
+/// under this. On expiry the fan-out fails the stalled turn with a per-turn
+/// `Error` (not a connection `Disconnected`), so a waiting client errors instead
+/// of hanging while the connection itself stays up. An idle connection with no
+/// turn in flight is never stalled — even with a persistent listener subscribed,
+/// which is what a GUI holds for its whole session.
 pub const EVENT_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How often the WebSocket client sends a keepalive `Ping`. A dead-but-open
