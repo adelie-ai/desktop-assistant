@@ -11,6 +11,7 @@ use std::pin::Pin;
 use desktop_assistant_core::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use pgvector::Vector;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 /// Boxed async embedding function: takes a list of texts, returns a list of vectors.
 pub type BackfillEmbedFn = Box<
@@ -87,6 +88,24 @@ pub async fn invalidate_stale_embeddings(
     Ok((kb_total, tool_total))
 }
 
+/// Invalidate (NULL-out) the embedding on EVERY active `knowledge_base` row,
+/// regardless of model stamp or freshness, so the next backfill pass
+/// re-embeds the entire knowledge base. Backs the "Recalculate Embeddings"
+/// force button — for out-of-band cases (rows edited by raw SQL, corrupted
+/// vectors) that the model-stamp comparison in [`invalidate_stale_embeddings`]
+/// won't catch. Soft-deleted rows are skipped. Returns the row count touched.
+pub async fn invalidate_all_knowledge_embeddings(pool: &PgPool) -> Result<u64, String> {
+    let res = sqlx::query(
+        "UPDATE knowledge_base
+         SET embedding = NULL, embedding_model = NULL
+         WHERE deleted_at IS NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(res.rows_affected())
+}
+
 /// Backfill embeddings for `knowledge_base` rows that are missing or stale.
 ///
 /// Each entry's content is split into chunks, all chunks are batch-embedded,
@@ -94,15 +113,24 @@ pub async fn invalidate_stale_embeddings(
 ///
 /// Continues past batch failures so that a single bad batch does not block the
 /// entire backfill.  Returns the total number of rows successfully updated.
+///
+/// `cancellation` is checked before each batch so an on-demand recompute (the
+/// "Recalculate Embeddings" button) can be stopped via the task registry.
 pub async fn backfill_knowledge_embeddings(
     pool: &PgPool,
     embed_fn: &BackfillEmbedFn,
     current_model: &str,
+    cancellation: &CancellationToken,
 ) -> Result<usize, String> {
     let mut total = 0usize;
     let mut consecutive_failures = 0u32;
 
     loop {
+        // Stop promptly between batches when cancelled.
+        if cancellation.is_cancelled() {
+            tracing::info!("knowledge embedding backfill cancelled after {total} row(s)");
+            break;
+        }
         // Select rows needing embedding:
         //   * never embedded / embedded by a different model
         //     (`embedding_model IS NULL OR != $1`), or

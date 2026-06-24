@@ -289,6 +289,14 @@ pub enum Command {
     DeleteKnowledgeEntry {
         id: String,
     },
+    /// Trigger an on-demand knowledge-maintenance run (issue: dream-cycle
+    /// controls). Runs as a tracked, cancellable background task; the daemon
+    /// replies `MaintenanceTaskStarted { task_id }` immediately and the work
+    /// proceeds in the background, emitting `Task*` and `KnowledgeChanged`
+    /// events. See [`MaintenanceOp`].
+    StartKnowledgeMaintenance {
+        op: MaintenanceOp,
+    },
 
     // MCP server management
     ListMcpServers,
@@ -528,6 +536,12 @@ pub enum CommandResult {
     BackgroundTaskSpawned {
         id: String,
     },
+    /// Response to `StartKnowledgeMaintenance`: the registered background-task
+    /// id for the run. Progress/completion arrive via `Task*` events; the run
+    /// can be cancelled with `CancelBackgroundTask { id: task_id }`.
+    MaintenanceTaskStarted {
+        task_id: String,
+    },
     /// Ack for `SendMessage`, carrying both correlation ids the streamed
     /// events use:
     ///
@@ -570,6 +584,23 @@ pub struct KnowledgeEntryView {
     pub metadata: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Which knowledge-maintenance pass [`Command::StartKnowledgeMaintenance`]
+/// should run. These mirror the daemon's background passes so a manual trigger
+/// shares the same implementation (and per-op mutual exclusion) as the timers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceOp {
+    /// Scan conversations for new facts (the fast "dreaming" pass) + archival.
+    Extraction,
+    /// Holistic recompute/prune of the active knowledge base (the slow pass).
+    Consolidation,
+    /// Force-recompute embeddings for EVERY active knowledge entry, regardless
+    /// of model/freshness — for out-of-band cases (e.g. rows edited by raw SQL
+    /// or corrupted vectors). Routine model changes are handled automatically
+    /// by the periodic backfill.
+    RecalculateEmbeddings,
 }
 
 /// Wire-format view of a scratchpad note. Mirrors
@@ -727,6 +758,16 @@ pub enum Event {
     ScratchpadChanged {
         conversation_id: String,
     },
+
+    // --- Knowledge base (dream-cycle controls) ----------------------------
+    /// The calling user's knowledge base changed — an entry was created,
+    /// updated, deleted, or (re)written by a maintenance pass (extraction /
+    /// consolidation / embedding recompute). Broadcast to ALL of the user's
+    /// subscribed connections so every open knowledge panel refetches and
+    /// stays in sync. Carries no payload (the change kind is intentionally not
+    /// encoded — a debounced refetch is simplest and correct for all cases),
+    /// mirroring `ConversationListChanged` / `ScratchpadChanged`.
+    KnowledgeChanged,
 
     // --- Client-side tool execution (issue #107) --------------------------
     /// The daemon's turn has suspended on a client-local MCP tool call.
@@ -1281,6 +1322,12 @@ pub enum TaskKind {
     Standalone {
         name: String,
         conversation_id: String,
+    },
+    /// A knowledge-maintenance pass (dream-cycle extraction/consolidation or an
+    /// embedding recompute). Not tied to any conversation; `name` is the
+    /// human-friendly label shown in the task UI.
+    Maintenance {
+        name: String,
     },
 }
 

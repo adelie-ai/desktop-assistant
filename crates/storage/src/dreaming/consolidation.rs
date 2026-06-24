@@ -19,12 +19,13 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use serde::Deserialize;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 use super::common::extract_json_payload;
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
-    ConsolidationStats, DreamingLlmFn, MAX_DELETE_FRACTION, MAX_HOLISTIC_PROMPT_CHARS,
-    SOFT_DELETE_TTL_DAYS,
+    ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_FRACTION,
+    MAX_HOLISTIC_PROMPT_CHARS, SOFT_DELETE_TTL_DAYS,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 
@@ -43,6 +44,8 @@ struct KbEntry {
 pub async fn run_consolidation_phase(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
+    cancellation: &CancellationToken,
+    on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<ConsolidationStats, CoreError> {
     let user_ids = load_user_ids_with_active_entries(pool).await?;
     if user_ids.is_empty() {
@@ -52,8 +55,14 @@ pub async fn run_consolidation_phase(
 
     let mut total = ConsolidationStats::default();
     for user_id_str in user_ids {
+        // Stop promptly between users when cancelled (each user is a full
+        // holistic recompute — potentially several LLM calls).
+        if cancellation.is_cancelled() {
+            tracing::info!("dreaming: consolidation cancelled; stopping scan");
+            break;
+        }
         let result = with_user_id(UserId::new(user_id_str.clone()), async {
-            consolidate_user(pool, llm_fn).await
+            consolidate_user(pool, llm_fn, cancellation).await
         })
         .await;
 
@@ -64,6 +73,16 @@ pub async fn run_consolidation_phase(
                 total.updated += stats.updated;
                 total.scope_added += stats.scope_added;
                 total.soft_deleted += stats.soft_deleted;
+                // Live refresh: if this user's KB actually changed, let connected
+                // panels refetch as the scan progresses.
+                if (stats.merged_clusters > 0
+                    || stats.updated > 0
+                    || stats.soft_deleted > 0
+                    || stats.scope_added > 0)
+                    && let Some(notify) = on_change
+                {
+                    notify(&UserId::new(user_id_str.clone()));
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -80,6 +99,7 @@ pub async fn run_consolidation_phase(
 async fn consolidate_user(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
+    cancellation: &CancellationToken,
 ) -> Result<ConsolidationStats, CoreError> {
     let entries = load_active_entries(pool).await?;
     let total_entries = entries.len();
@@ -107,6 +127,10 @@ async fn consolidate_user(
     let mut delete_ops: Vec<(String, String)> = Vec::new();
 
     for slice in &slices {
+        // Bail between slices when cancelled — each slice is its own LLM call.
+        if cancellation.is_cancelled() {
+            break;
+        }
         let valid: HashSet<&str> = slice.iter().map(|e| e.id.as_str()).collect();
 
         let response = match llm_fn(build_system_prompt(), build_user_prompt(slice)).await {

@@ -128,6 +128,15 @@ const ADDITIONS: &[(&str, &str)] = &[
         "org.desktopAssistant.Conversations",
         "signal ScratchpadChanged(:s:conversation_id)",
     ),
+    // Dream-cycle controls — on-demand knowledge maintenance + live panel sync.
+    (
+        "org.desktopAssistant.Knowledge",
+        "method StartMaintenance(in:s:op, out:s:)",
+    ),
+    (
+        "org.desktopAssistant.Knowledge",
+        "signal EntriesChanged()",
+    ),
 ];
 
 // --- fake transport ---------------------------------------------------------

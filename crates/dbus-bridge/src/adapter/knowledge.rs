@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
+use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
 
 use crate::transport::{BridgeTransport, BridgeTransportError};
@@ -159,6 +160,44 @@ impl<T: BridgeTransport + 'static> DbusKnowledgeAdapter<T> {
                 "unexpected DeleteKnowledgeEntry result: {other:?}"
             ))),
         }
+    }
+
+    /// Trigger an on-demand knowledge-maintenance pass (the "dream cycle"
+    /// controls). `op` is one of `extraction` / `consolidation` /
+    /// `recalculate_embeddings`. Returns the JSON envelope
+    /// `{"maintenance_task_started":{"task_id":"…"}}`; progress/completion arrive
+    /// as `BackgroundTasks.Task*` signals and the pass emits `EntriesChanged`.
+    async fn start_maintenance(&self, op: &str) -> fdo::Result<String> {
+        let op = parse_maintenance_op(op)?;
+        let result = self
+            .dispatch(api::Command::StartKnowledgeMaintenance { op })
+            .await?;
+        match &result {
+            api::CommandResult::MaintenanceTaskStarted { .. } => {
+                serde_json::to_string(&result).map_err(to_fdo)
+            }
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected StartKnowledgeMaintenance result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Emitted when the knowledge base changes — a manual edit on another client
+    /// or a maintenance pass rewrote entries. Carries no args; clients refetch.
+    #[zbus(signal)]
+    async fn entries_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+/// Map the wire op string to [`api::MaintenanceOp`]. Rejects unknown ops without
+/// dispatching, mirroring the tag/metadata parsers above.
+pub(crate) fn parse_maintenance_op(raw: &str) -> fdo::Result<api::MaintenanceOp> {
+    match raw.trim() {
+        "extraction" => Ok(api::MaintenanceOp::Extraction),
+        "consolidation" => Ok(api::MaintenanceOp::Consolidation),
+        "recalculate_embeddings" => Ok(api::MaintenanceOp::RecalculateEmbeddings),
+        other => Err(fdo::Error::Failed(format!(
+            "unknown maintenance op: {other:?} (expected extraction / consolidation / recalculate_embeddings)"
+        ))),
     }
 }
 

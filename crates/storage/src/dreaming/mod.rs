@@ -23,22 +23,30 @@ mod types;
 
 use desktop_assistant_core::CoreError;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
-pub use types::{BackfillEmbedFn, ConsolidationStats, DreamingLlmFn};
+pub use types::{BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn};
 
 /// Run one dreaming scan cycle: extract new facts and archive old
 /// conversations. Consolidation runs separately (see [`run_consolidation_scan`])
 /// on a slower cadence. Returns the number of new facts written.
+///
+/// `cancellation` is observed between conversations so an on-demand run can be
+/// stopped via the task registry. `on_change`, when set, is invoked after each
+/// conversation that writes facts so connected knowledge panels refetch live.
 pub async fn run_dreaming_scan(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
     embed_fn: &BackfillEmbedFn,
     embedding_model: &str,
     archive_after_days: u32,
+    cancellation: &CancellationToken,
+    on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<usize, CoreError> {
     tracing::info!("dreaming: extraction phase");
     let new_facts =
-        extraction::run_extraction_phase(pool, llm_fn, embed_fn, embedding_model).await?;
+        extraction::run_extraction_phase(pool, llm_fn, embed_fn, embedding_model, cancellation, on_change)
+            .await?;
 
     if archive_after_days > 0 {
         tracing::info!("dreaming: archival phase");
@@ -57,11 +65,17 @@ pub async fn run_dreaming_scan(
 /// Run one holistic-consolidation scan across all users. Loads each user's
 /// entire active KB and recomputes it with the (typically stronger) backend
 /// model. Returns aggregate operation counts.
+///
+/// `cancellation` is observed between users (and between prompt slices) so an
+/// on-demand run can be stopped via the task registry. `on_change`, when set, is
+/// invoked after each user whose KB changed so connected panels refetch live.
 pub async fn run_consolidation_scan(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
+    cancellation: &CancellationToken,
+    on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<ConsolidationStats, CoreError> {
-    let stats = consolidation::run_consolidation_phase(pool, llm_fn).await?;
+    let stats = consolidation::run_consolidation_phase(pool, llm_fn, cancellation, on_change).await?;
     if stats.merged_clusters > 0
         || stats.updated > 0
         || stats.soft_deleted > 0

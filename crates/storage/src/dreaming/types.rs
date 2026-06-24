@@ -2,6 +2,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+
+use desktop_assistant_core::ports::auth::UserId;
+
+/// Callback a maintenance pass invokes after a batch of knowledge changes lands
+/// for a given user, so the daemon can broadcast a `KnowledgeChanged` event and
+/// connected panels refetch live ("live as entries change"). Invoked per
+/// conversation (extraction) and per user (consolidation), as work progresses.
+pub type KnowledgeChangeFn = Arc<dyn Fn(&UserId) + Send + Sync>;
 
 /// Boxed async LLM function: `(system_prompt, user_prompt) → Result<response, error>`.
 ///

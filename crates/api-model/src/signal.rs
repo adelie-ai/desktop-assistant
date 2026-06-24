@@ -109,6 +109,11 @@ pub enum SignalEvent {
     ScratchpadChanged {
         conversation_id: String,
     },
+    /// The calling user's knowledge base changed (an entry was created, updated,
+    /// deleted, or rewritten by a maintenance pass). Delivered on connections
+    /// subscribed via `Command::SubscribeBackgroundTasks`; carries no payload so
+    /// the client debounce-refetches its knowledge list (dream-cycle controls).
+    KnowledgeChanged,
     /// The daemon's turn has suspended on a client-local MCP tool call (#107).
     /// The client is expected to execute `tool_name` with `arguments` against
     /// its local environment and post the outcome back via
@@ -234,6 +239,7 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
         api::Event::ScratchpadChanged { conversation_id } => {
             Some(SignalEvent::ScratchpadChanged { conversation_id })
         }
+        api::Event::KnowledgeChanged => Some(SignalEvent::KnowledgeChanged),
         // Client-side tool execution (#107/#231): surfaced on the signal
         // stream so a client that advertised client-local tools (voice first)
         // can execute the requested tool and post the result back via

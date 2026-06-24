@@ -570,6 +570,16 @@ impl BackgroundTaskRegistry {
         );
     }
 
+    /// Notify a user's subscribed connections that their knowledge base changed
+    /// — a manual create/update/delete on another connection, or a maintenance
+    /// pass (extraction / consolidation / embedding recompute) rewrote entries.
+    /// Rides the same per-user broadcast as `Task*`/`ScratchpadChanged`; every
+    /// open knowledge panel debounce-refetches. Best-effort (dropped if no
+    /// connection for the user is currently subscribed).
+    pub fn notify_knowledge_changed(&self, user_id: &UserId) {
+        self.inner.broadcast(user_id, api::Event::KnowledgeChanged);
+    }
+
     /// Notify a user's subscribed connections that their conversation list
     /// changed — created/renamed/deleted/(un)archived (#1) — so every client's
     /// sidebar refreshes regardless of which client made the change. Rides the
@@ -703,6 +713,12 @@ impl BackgroundTaskRegistry {
                     // message so the UI can surface the "we lost it"
                     // case differently from a genuine error.
                     "daemon restarted; resume not yet implemented"
+                }
+                api::TaskKind::Maintenance { .. } => {
+                    // Maintenance passes (dream cycle / embedding recompute)
+                    // are idempotent and re-run on their timers, so a lost one
+                    // is harmless — mark Failed with a distinct message.
+                    "daemon restarted; maintenance pass not resumed"
                 }
             };
             let now = now_ms();

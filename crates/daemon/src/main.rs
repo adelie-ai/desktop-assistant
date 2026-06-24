@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Message, Role};
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
+use desktop_assistant_core::ports::inbound::KnowledgeMaintenanceService;
 use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 mod api_surface;
@@ -17,6 +18,7 @@ mod classifying_llm;
 mod config;
 mod connections;
 mod knowledge_service;
+mod maintenance_service;
 mod model_defaults;
 mod notifications;
 mod purposes;
@@ -1235,8 +1237,15 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("tool embedding backfill failed: {e}"),
                 }
 
+                // The periodic backfill only fills missing/stale rows; it runs
+                // to completion on its own cadence, so it uses a never-cancelled
+                // token (manual force-recompute goes through the maintenance
+                // service, which threads the task's real token).
                 match desktop_assistant_storage::embedding_backfill::backfill_knowledge_embeddings(
-                    &pool, &embed_fn, &model,
+                    &pool,
+                    &embed_fn,
+                    &model,
+                    &CancellationToken::new(),
                 )
                 .await
                 {
@@ -1273,16 +1282,19 @@ async fn main() -> Result<()> {
         .map(|c| c.backend_tasks.archive_after_days)
         .unwrap_or(7);
 
-    let (dreaming_shutdown_tx, dreaming_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let dreaming_task = if dreaming_enabled {
+    // On-demand knowledge-maintenance service (dream-cycle controls). Built
+    // whenever a Postgres pool + embeddings are available — independent of
+    // whether the periodic timers are enabled — so the knowledge panels'
+    // "Run Extraction" / "Run Consolidation" / "Recalculate Embeddings" buttons
+    // work even with the timers off. The dreaming and consolidation timer loops
+    // below drive this same service, so a button press and a timer tick share one
+    // implementation, one configured LLM per pass, and one per-op exclusion lock.
+    let maintenance_service: Option<Arc<maintenance_service::DaemonKnowledgeMaintenanceService>> =
         if let (Some(pool), Some(emb_client)) = (&pg_pool, &embedding_client) {
-            // Prefer `[purposes.dreaming]` when configured; fall back to
-            // the legacy `[backend_tasks.llm]` block otherwise so installs
-            // that haven't migrated still work. Effort threading is
-            // computed once at startup and copied into the closure — the
-            // resolved purpose is fixed for this daemon run, and
-            // `ReasoningConfig` is `Copy`.
-            let (resolved_dreaming, dreaming_reasoning, source) =
+            // Resolve each pass's LLM: prefer the `[purposes.*]` override, else
+            // the `[backend_tasks.*]` fallback (mirrors the historical timer
+            // resolution). `ReasoningConfig` is `Copy` and fixed for this run.
+            let (resolved_dreaming, dreaming_reasoning, dsource) =
                 match api_surface::resolve_purpose_dispatch(
                     daemon_config.as_ref(),
                     purposes::PurposeKind::Dreaming,
@@ -1290,31 +1302,75 @@ async fn main() -> Result<()> {
                     Some((r, c)) => (r, c, "purposes.dreaming"),
                     None => (
                         config::resolve_backend_tasks_llm_config(daemon_config.as_ref()),
-                        Default::default(),
+                        ReasoningConfig::default(),
                         "backend_tasks.llm",
                     ),
                 };
+            let (resolved_consolidation, consolidation_reasoning, csource) =
+                match api_surface::resolve_purpose_dispatch(
+                    daemon_config.as_ref(),
+                    purposes::PurposeKind::Consolidation,
+                ) {
+                    Some((r, c)) => (r, c, "purposes.consolidation"),
+                    None => (
+                        config::resolve_consolidation_llm_config(daemon_config.as_ref()),
+                        ReasoningConfig::default(),
+                        "backend_tasks.consolidation_llm",
+                    ),
+                };
             tracing::info!(
-                "dreaming LLM connector={}, model={}, source={}",
+                "knowledge maintenance ready: dreaming {}/{} ({dsource}), consolidation {}/{} ({csource})",
                 resolved_dreaming.connector,
                 resolved_dreaming.model,
-                source
+                resolved_consolidation.connector,
+                resolved_consolidation.model,
             );
+            // Wrap each resolved client in the same retry + profiling chain the
+            // foreground/turn paths use, erased to `Arc<dyn LlmClient>`.
+            let dreaming_llm: Arc<dyn LlmClient> = {
+                let c = build_llm_client(resolved_dreaming);
+                let c = RetryingLlmClient::new(c, 3);
+                Arc::new(MaybeProfiled::from_config(
+                    c,
+                    profiling.enabled,
+                    profiling.log_path.as_deref(),
+                    profiling.full_content,
+                ))
+            };
+            let consolidation_llm: Arc<dyn LlmClient> = {
+                let c = build_llm_client(resolved_consolidation);
+                let c = RetryingLlmClient::new(c, 3);
+                Arc::new(MaybeProfiled::from_config(
+                    c,
+                    profiling.enabled,
+                    profiling.log_path.as_deref(),
+                    profiling.full_content,
+                ))
+            };
+            let on_change = maintenance_service::knowledge_change_notifier(Arc::clone(
+                &background_task_registry,
+            ));
+            Some(Arc::new(
+                maintenance_service::DaemonKnowledgeMaintenanceService::new(
+                    pool.clone(),
+                    dreaming_llm,
+                    dreaming_reasoning,
+                    consolidation_llm,
+                    consolidation_reasoning,
+                    Arc::clone(emb_client),
+                    embedding_model_id.clone(),
+                    archive_after_days,
+                    on_change,
+                ),
+            ))
+        } else {
+            None
+        };
 
-            let dreaming_llm = build_llm_client(resolved_dreaming);
-            let dreaming_llm = RetryingLlmClient::new(dreaming_llm, 3);
-            let dreaming_llm = MaybeProfiled::from_config(
-                dreaming_llm,
-                profiling.enabled,
-                profiling.log_path.as_deref(),
-                profiling.full_content,
-            );
-            let dreaming_llm = Arc::new(dreaming_llm);
-
-            let pool = pool.clone();
-            let emb_client = Arc::clone(emb_client);
-            let emb_model = embedding_model_id.clone();
-
+    let (dreaming_shutdown_tx, dreaming_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let dreaming_task = if dreaming_enabled {
+        if let Some(service) = &maintenance_service {
+            let service = Arc::clone(service);
             Some(tokio::spawn(async move {
                 let mut shutdown_rx = dreaming_shutdown_rx;
 
@@ -1327,42 +1383,14 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let llm_fn: desktop_assistant_storage::dreaming::DreamingLlmFn =
-                    Box::new(move |system_prompt, user_prompt| {
-                        let llm = Arc::clone(&dreaming_llm);
-                        let reasoning = dreaming_reasoning;
-                        Box::pin(async move {
-                            let messages = vec![
-                                Message::new(Role::System, system_prompt),
-                                Message::new(Role::User, user_prompt),
-                            ];
-                            let response = llm
-                                .stream_completion(messages, &[], reasoning, Box::new(|_| true))
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            Ok(response.text)
-                        })
-                    });
-
-                let embed_fn: desktop_assistant_storage::dreaming::BackfillEmbedFn =
-                    Box::new(move |texts| {
-                        let client = Arc::clone(&emb_client);
-                        Box::pin(
-                            async move { client.embed(texts).await.map_err(|e| e.to_string()) },
-                        )
-                    });
-
                 loop {
                     tracing::info!("dreaming: starting scan cycle");
                     let cycle_start = std::time::Instant::now();
-                    let result = desktop_assistant_storage::dreaming::run_dreaming_scan(
-                        &pool,
-                        &llm_fn,
-                        &embed_fn,
-                        &emb_model,
-                        archive_after_days,
-                    )
-                    .await;
+                    // Timer-driven runs aren't user-cancellable; a fresh
+                    // never-cancelled token keeps the scan's per-call timeouts
+                    // and signature satisfied. Shutdown is handled by the select
+                    // between cycles, as before.
+                    let result = service.run_extraction(CancellationToken::new()).await;
                     let elapsed = cycle_start.elapsed();
                     match result {
                         Ok(n) => tracing::info!(
@@ -1408,40 +1436,9 @@ async fn main() -> Result<()> {
     let (consolidation_shutdown_tx, consolidation_shutdown_rx) =
         tokio::sync::oneshot::channel::<()>();
     let consolidation_task = if dreaming_enabled && consolidation_interval_secs > 0 {
-        if let Some(pool) = &pg_pool {
-            // Prefer `[purposes.consolidation]` (settable from the KCM Purposes
-            // tab); fall back to `[backend_tasks.consolidation_llm]` →
-            // backend_tasks.llm → top-level `[llm]`.
-            let (resolved, consolidation_reasoning, source) =
-                match api_surface::resolve_purpose_dispatch(
-                    daemon_config.as_ref(),
-                    purposes::PurposeKind::Consolidation,
-                ) {
-                    Some((r, c)) => (r, c, "purposes.consolidation"),
-                    None => (
-                        config::resolve_consolidation_llm_config(daemon_config.as_ref()),
-                        Default::default(),
-                        "backend_tasks.consolidation_llm",
-                    ),
-                };
-            tracing::info!(
-                "consolidation LLM connector={}, model={}, source={}, every {}s",
-                resolved.connector,
-                resolved.model,
-                source,
-                consolidation_interval_secs
-            );
-            let consolidation_llm = build_llm_client(resolved);
-            let consolidation_llm = RetryingLlmClient::new(consolidation_llm, 3);
-            let consolidation_llm = MaybeProfiled::from_config(
-                consolidation_llm,
-                profiling.enabled,
-                profiling.log_path.as_deref(),
-                profiling.full_content,
-            );
-            let consolidation_llm = Arc::new(consolidation_llm);
-            let pool = pool.clone();
-
+        if let Some(service) = &maintenance_service {
+            tracing::info!("consolidation enabled, every {consolidation_interval_secs}s");
+            let service = Arc::clone(service);
             Some(tokio::spawn(async move {
                 let mut shutdown_rx = consolidation_shutdown_rx;
 
@@ -1455,31 +1452,11 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let llm_fn: desktop_assistant_storage::dreaming::DreamingLlmFn =
-                    Box::new(move |system_prompt, user_prompt| {
-                        let llm = Arc::clone(&consolidation_llm);
-                        let reasoning = consolidation_reasoning;
-                        Box::pin(async move {
-                            let messages = vec![
-                                Message::new(Role::System, system_prompt),
-                                Message::new(Role::User, user_prompt),
-                            ];
-                            let response = llm
-                                .stream_completion(messages, &[], reasoning, Box::new(|_| true))
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            Ok(response.text)
-                        })
-                    });
-
                 loop {
                     tracing::info!("consolidation: starting scan");
                     let started = std::time::Instant::now();
-                    match desktop_assistant_storage::dreaming::run_consolidation_scan(
-                        &pool, &llm_fn,
-                    )
-                    .await
-                    {
+                    // Timer runs aren't user-cancellable (see dreaming above).
+                    match service.run_consolidation(CancellationToken::new()).await {
                         Ok(_) => tracing::info!(
                             "consolidation: scan finished in {:.2?}",
                             started.elapsed()
@@ -1844,6 +1821,15 @@ async fn main() -> Result<()> {
     if let Some((write, get_many, list, delete_many, clear)) = scratchpad_handler_fns {
         api_handler_impl =
             api_handler_impl.with_scratchpad(write, get_many, list, delete_many, clear);
+    }
+    // Dream-cycle controls (#knowledge maintenance): when a pool + embeddings
+    // are configured, serve `StartKnowledgeMaintenance` by spawning the requested
+    // pass through the shared service. The same `Arc` the timer loops drive, so
+    // the per-op exclusion lock is shared across timer- and button-triggered runs.
+    if let Some(service) = &maintenance_service {
+        api_handler_impl = api_handler_impl.with_maintenance_service(
+            Arc::clone(service) as Arc<dyn KnowledgeMaintenanceService>,
+        );
     }
     // Idempotency-key dedup (#204): when a database is available, attach the
     // store so a retried `SendMessage` carrying an `idempotency_key` whose turn
