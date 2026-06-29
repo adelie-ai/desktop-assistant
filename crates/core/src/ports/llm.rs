@@ -196,6 +196,28 @@ tokio::task_local! {
     /// any caller that doesn't route through the dispatch wrapper still get the
     /// default Expressive-7 disposition.
     static PERSONALITY: crate::prompts::Personality;
+
+    /// Pre-rendered ambient "now" line for this turn — e.g.
+    /// `Sunday, 2026-06-28, 2:32 PM EDT`. Installed by the daemon's dispatch
+    /// wrapper via [`with_now_context`] from a single [`crate::clock::NowSnapshot`]
+    /// captured at turn entry, and read by the context assembler via
+    /// [`current_now_context`], which surfaces it as a `[Now]` system message so
+    /// the assistant has a standing sense of the current date/time without
+    /// spending a `builtin_sys_props` tool round to find out.
+    ///
+    /// Captured once per turn (not per tool round) so every assembly pass within
+    /// the turn — including the budget shrink loop's repeat passes — sees a
+    /// stable value. The string is rendered from the same snapshot logic that
+    /// backs the `builtin_sys_props` tool, so the ambient block and the tool can
+    /// never disagree about the clock.
+    ///
+    /// Unset (or empty) outside the daemon dispatch path — which
+    /// [`current_now_context`] returns as an empty string — so tests, dreaming
+    /// jobs, and any caller that doesn't route through the dispatch wrapper get
+    /// the unchanged "no `[Now]` block" behaviour. Mirrors [`SYSTEM_REFINEMENT`]:
+    /// request-scoped, never persisted, threaded via a task-local so the
+    /// `send_prompt` and `LlmClient` signatures stay unchanged.
+    static NOW_CONTEXT: String;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -252,6 +274,24 @@ where
 /// context.
 pub fn current_personality() -> crate::prompts::Personality {
     PERSONALITY.try_with(|p| *p).unwrap_or_default()
+}
+
+/// Run `fut` with `now_line` installed as this turn's ambient "now" context.
+/// The context assembler reads it via [`current_now_context`] and surfaces it
+/// as a `[Now]` system message for the turn. Pass the rendered output of
+/// [`crate::clock::NowSnapshot::ambient_line`]. See [`NOW_CONTEXT`].
+pub async fn with_now_context<F, T>(now_line: String, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    NOW_CONTEXT.scope(now_line, fut).await
+}
+
+/// Current task-local ambient "now" line, or an empty string when not set. An
+/// empty result means "no `[Now]` block" — the assembler surfaces nothing and
+/// the message list is unchanged. Safe to call from any async context.
+pub fn current_now_context() -> String {
+    NOW_CONTEXT.try_with(|n| n.clone()).unwrap_or_default()
 }
 
 /// Run `fut` with `model` installed as the current turn's model override.

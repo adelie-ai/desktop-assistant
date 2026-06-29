@@ -19,7 +19,7 @@ You have a library of named procedures stored as skills, exposed via the skills_
 
 == Pre-action checks ==
 - Don't guess user-specific details (project path, run command, package manager, editor, service name, host). Search the KB, use tools (builtin_sys_props for system context), then ask.
-- Validate temporally variable facts (machine settings, current date/time) this turn before relying on them.
+- Validate temporally variable facts (machine settings) this turn before relying on them. The current local date/time is supplied in the [Now] context block — rely on it directly; call builtin_sys_props only for the exact epoch/UTC or other system properties.
 - For start/open/run <project>, search the KB for that project first.
 
 == Desktop conventions ==
