@@ -760,6 +760,19 @@ fn assemble_messages_inner(
     let mut messages = Vec::with_capacity(windowed.len() + 2);
     messages.push(Message::new(Role::System, system_instruction));
 
+    // Ambient "now": a tiny, always-present line giving the assistant a
+    // sense of the current date/time without spending a `builtin_sys_props`
+    // tool round to find out. Installed per turn by the daemon dispatch wrapper
+    // as a task-local (rendered from the same `NowSnapshot` that backs the
+    // tool, so the two never disagree) and empty for callers that don't route
+    // through it (tests, dreaming jobs). Pushed here as a per-turn system
+    // message — deliberately NOT folded into the cached system instruction
+    // above — so the volatile timestamp never busts the prompt-prefix cache.
+    let now_context = crate::ports::llm::current_now_context();
+    if !now_context.is_empty() {
+        messages.push(Message::new(Role::System, format!("[Now] {now_context}")));
+    }
+
     // Inject rolling context summary when windowing is active and summary exists.
     if is_windowed && !context_summary.is_empty() {
         messages.push(Message::new(
@@ -1283,6 +1296,61 @@ mod tests {
         assert!(
             assembled.contains(&default_blurb),
             "default personality must be injected even without a scope:\n{assembled}"
+        );
+    }
+
+    #[tokio::test]
+    async fn now_block_surfaced_right_after_system_instruction_when_scope_installed() {
+        use crate::ports::llm::with_now_context;
+
+        let now_line = "Sunday, 2026-06-28, 2:32 PM EDT";
+        let msgs = vec![Message::new(Role::User, "what's the date?")];
+        let assembled = with_now_context(now_line.to_string(), async {
+            llm_messages_for_turn(
+                &msgs,
+                &[],
+                &[],
+                &[],
+                "",
+                MAX_CONTEXT_MESSAGES,
+                None,
+                0,
+                "",
+                None,
+                None,
+                &default_estimate,
+            )
+        })
+        .await;
+
+        // [0] is always the system instruction; the ambient [Now] block is
+        // surfaced immediately after it as its own system message.
+        assert_eq!(assembled[1].role, Role::System);
+        assert_eq!(assembled[1].content, format!("[Now] {now_line}"));
+    }
+
+    #[test]
+    fn no_now_block_without_scope() {
+        // No `with_now_context` scope installed (the common test / dreaming-job
+        // path) → no [Now] message and the list is unchanged.
+        let msgs = vec![Message::new(Role::User, "hi")];
+        let assembled = llm_messages_for_turn(
+            &msgs,
+            &[],
+            &[],
+            &[],
+            "",
+            MAX_CONTEXT_MESSAGES,
+            None,
+            0,
+            "",
+            None,
+            None,
+            &default_estimate,
+        );
+        assert!(
+            !assembled.iter().any(|m| m.content.starts_with("[Now]")),
+            "no [Now] block should appear without an installed scope"
         );
     }
 

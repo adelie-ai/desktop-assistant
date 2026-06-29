@@ -1,6 +1,7 @@
 //! Core domain model, ports, and services for the assistant (hexagonal-architecture core).
 
 pub mod chunking;
+pub mod clock;
 pub mod context;
 pub mod domain;
 pub mod error_classify;

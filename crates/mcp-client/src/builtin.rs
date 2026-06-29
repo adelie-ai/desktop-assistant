@@ -1,9 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{Local, SecondsFormat, Utc};
 use desktop_assistant_core::CoreError;
+use desktop_assistant_core::clock::NowSnapshot;
 use desktop_assistant_core::domain::{Role, ToolDefinition};
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
@@ -43,13 +42,6 @@ const TOOL_SCRATCHPAD_DELETE: &str = "builtin_scratchpad_delete";
 /// KB writes persist without an embedding for the background dreaming/backfill
 /// cycle to fill in later.
 const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-fn now_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 pub struct BuiltinToolService {
     embed_fn: Option<EmbedFn>,
@@ -653,15 +645,15 @@ impl BuiltinToolService {
     }
 
     fn sys_props(&self) -> String {
-        let local_now = Local::now();
+        let now = NowSnapshot::now();
         serde_json::json!({
             "ok": true,
             "props": {
                 "note": "Relative paths are interpreted from daemon_cwd unless a tool specifies otherwise.",
-                "generated_at_epoch": now_ts(),
-                "generated_at_utc": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                "generated_at_local": local_now.to_rfc3339_opts(SecondsFormat::Secs, false),
-                "timezone": format!("{} ({})", local_now.format("%:z"), local_now.format("%Z")),
+                "generated_at_epoch": now.epoch_secs(),
+                "generated_at_utc": now.utc_rfc3339(),
+                "generated_at_local": now.local_rfc3339(),
+                "timezone": now.timezone(),
                 "username": detect_username(),
                 "home_dir": detect_home_dir(),
                 "daemon_cwd": detect_daemon_cwd(),

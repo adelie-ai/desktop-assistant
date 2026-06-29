@@ -1192,6 +1192,14 @@ where
         // doesn't outlive the `'static` dispatch future.
         let effective_personality = self.resolve_personality(conversation_id).await;
 
+        // Capture the ambient "now" once per turn and render the line the core
+        // assembler surfaces as a `[Now]` system message, giving the assistant a
+        // standing sense of the current date/time. Rendered from the same
+        // `NowSnapshot` logic that backs `builtin_sys_props`, so the ambient
+        // block and the tool never disagree. Captured here (before the dispatch
+        // future) so every assembly pass in the turn sees one stable value.
+        let now_line = desktop_assistant_core::clock::NowSnapshot::now().ambient_line();
+
         let inner = Arc::clone(&self.inner);
         let conv_id = conversation_id.clone();
         let response = {
@@ -1211,6 +1219,11 @@ where
             // personality, identical to Phase-1 behaviour; the core read side
             // (`current_personality`) is unchanged.
             let dispatch = with_personality(effective_personality, dispatch);
+            // Install the ambient "now" line so the core assembler surfaces a
+            // `[Now]` system message for this turn. Request-scoped, never
+            // persisted; see `NOW_CONTEXT`.
+            let dispatch =
+                desktop_assistant_core::ports::llm::with_now_context(now_line, dispatch);
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch = with_context_budget(budget, dispatch);
             let dispatch =
