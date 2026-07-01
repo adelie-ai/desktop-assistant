@@ -43,13 +43,22 @@ use crate::current_user_id;
 //    rewrite mistake re-introduces a write under a SELECT-shaped
 //    statement (e.g. `WITH … DELETE … SELECT *`).
 //
-// The list of personal-data tables mirrors the one the static audit
-// in `tests/audit_user_id_scoping.rs` enforces — they're the same
-// tables migration `016_multi_tenant_user_id.sql` adds `user_id`
-// columns to, plus `background_tasks` and `turn_state` which were
-// added in 017 and 018 with their own `user_id` columns. Keep this
-// list in sync with the audit's `PERSONAL_DATA_TABLES`; the
-// `assert_personal_tables_match_audit` test below makes drift loud.
+// This list is the single source of truth for "what is a personal-data
+// table". It is the same set migration `016_multi_tenant_user_id.sql`
+// adds `user_id` columns to, plus the per-user tables added in later
+// migrations (`turns` in 017, `background_tasks` in 018, `scratchpads`
+// in 019, `idempotency_keys` in 023). The static audit in
+// `tests/audit_user_id_scoping.rs` consumes THIS constant (via
+// [`personal_data_tables`]) rather than keeping its own copy, so the two
+// can't drift; `assert_personal_tables_match_audit` there pins that. The
+// DB-gated `personal_data_tables_cover_every_user_id_column` test derives
+// the set from `information_schema` so a new `user_id` table that forgets
+// to register here fails loudly.
+//
+// NOTE (#431): entries must match the *actual* table name in the schema —
+// `turns` (not `turn_state`, the migration's filename) — or the read-path
+// graft silently no-ops and the write-path refusal never fires, leaving
+// the table readable/writable cross-tenant through the db_query tool.
 
 /// Personal-data tables — every reference to these in user-supplied
 /// SQL must either be grafted with a `user_id = $N` predicate (read
@@ -63,13 +72,29 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     "dreaming_watermarks",
     "tag_registry",
     // 017 + 018 — these also carry `user_id` columns and are written
-    // by per-user code paths.
+    // by per-user code paths. `turns` is the table created by
+    // `017_turn_state.sql` (the file is named for the feature, the
+    // table is `turns`).
+    "turns",
     "background_tasks",
-    "turn_state",
     // 019 — per-conversation scratchpad notes carry `user_id` and must be
     // scoped so LLM-supplied SQL can't read another user's notes.
     "scratchpads",
+    // 023 — idempotency keys store the full committed assistant response
+    // keyed by (user_id, conversation_id, key); scope so LLM-supplied SQL
+    // can't read another user's replies.
+    "idempotency_keys",
 ];
+
+/// The canonical set of personal-data tables (see [`PERSONAL_DATA_TABLES`]).
+///
+/// Exposed so the static audit in `tests/audit_user_id_scoping.rs` can
+/// consume the same list instead of maintaining a second copy that drifts
+/// out of sync (the drift that left `turns` and `idempotency_keys`
+/// reachable cross-tenant — #431).
+pub fn personal_data_tables() -> &'static [&'static str] {
+    PERSONAL_DATA_TABLES
+}
 
 /// Output of `prepare_select_for_user` — the rewritten SELECT (with
 /// `user_id = '<user_id>'` predicates grafted onto every personal-data
@@ -1064,6 +1089,83 @@ mod tests {
         assert!(
             result.is_err(),
             "writes to the scratchpads personal-data table must be refused"
+        );
+    }
+
+    // #431: the personal-data list named `turn_state` (the migration's
+    // *filename*) while the real table is `turns`, and omitted
+    // `idempotency_keys` entirely — so both were readable/writable
+    // cross-tenant through the db_query tool. These pin the corrected list.
+
+    #[test]
+    fn rewrite_grafts_user_id_into_turns_select() {
+        // The `turns` table (017) carries `user_id` and per-user turn state
+        // (tool args, pending client-tool paths). A SELECT via db_query must
+        // be scoped or one user reads another's turns.
+        let rewritten = rewrite_select("SELECT id FROM turns", "alice").expect("rewrite");
+        let lower = rewritten.to_ascii_lowercase();
+        assert!(
+            lower.contains("user_id ="),
+            "turns SELECT must be user-scoped, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn write_to_turns_is_refused() {
+        // Regression for the `turn_state`→`turns` name drift: the write
+        // validator must refuse UPDATE/DELETE/DROP against `turns`.
+        for sql in [
+            "UPDATE turns SET status = 'x'",
+            "DELETE FROM turns",
+            "DROP TABLE turns",
+        ] {
+            assert!(
+                validate_write(sql).is_err(),
+                "write to the turns personal-data table must be refused: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_grafts_user_id_into_idempotency_keys_select() {
+        // `idempotency_keys` (023) stores the full committed assistant
+        // response per (user, conversation, key). A SELECT via db_query must
+        // be scoped so the LLM can't read another user's replies.
+        let rewritten =
+            rewrite_select("SELECT response FROM idempotency_keys", "alice").expect("rewrite");
+        let lower = rewritten.to_ascii_lowercase();
+        assert!(
+            lower.contains("user_id ="),
+            "idempotency_keys SELECT must be user-scoped, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn write_to_idempotency_keys_is_refused() {
+        for sql in [
+            "DELETE FROM idempotency_keys",
+            "UPDATE idempotency_keys SET response = 'x'",
+        ] {
+            assert!(
+                validate_write(sql).is_err(),
+                "write to the idempotency_keys personal-data table must be refused: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn personal_data_tables_have_no_stale_filename_entries() {
+        // The bug was a table named for a migration *file* (`turn_state`)
+        // rather than the table it creates (`turns`). Guard against the
+        // specific stale names re-appearing.
+        let tables = super::PERSONAL_DATA_TABLES;
+        assert!(
+            tables.contains(&"turns") && !tables.contains(&"turn_state"),
+            "expected `turns` (real table), not `turn_state` (migration filename)"
+        );
+        assert!(
+            tables.contains(&"idempotency_keys"),
+            "idempotency_keys must be a scoped personal-data table"
         );
     }
 

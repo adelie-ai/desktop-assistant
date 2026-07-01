@@ -54,7 +54,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, Message, Role};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::{
-    PgConversationStore, UserId, execute_database_query, run_migrations, with_user_id,
+    PgConversationStore, UserId, execute_database_query, personal_data_tables, run_migrations,
+    with_user_id,
 };
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -588,6 +589,49 @@ async fn select_against_system_catalog_passes_through_ungrafted() {
             assert!(
                 !rows.is_empty(),
                 "expected at least one row from pg_catalog"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+/// #431 schema-derived drift guard. Rather than trust the hand-maintained
+/// `personal_data_tables()` list, derive the expectation from the live
+/// schema: every table with a `user_id` column MUST be registered, or the
+/// db_query tool would leave it readable/writable cross-tenant. This is
+/// what would have caught the `turn_state`→`turns` typo and the missing
+/// `idempotency_keys` — a new personal-data table that forgets to register
+/// now fails loudly here instead of silently leaking.
+#[tokio::test]
+async fn personal_data_tables_cover_every_user_id_column() {
+    with_fixture(
+        "personal_data_tables_cover_every_user_id_column",
+        |fx| async move {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT table_name FROM information_schema.columns \
+                 WHERE table_schema = $1 AND column_name = 'user_id' \
+                 ORDER BY table_name",
+            )
+            .bind(&fx.schema)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("query information_schema for user_id columns");
+
+            let registered: std::collections::HashSet<&str> =
+                personal_data_tables().iter().copied().collect();
+
+            let missing: Vec<String> = rows
+                .into_iter()
+                .map(|(t,)| t)
+                .filter(|t| !registered.contains(t.as_str()))
+                .collect();
+
+            assert!(
+                missing.is_empty(),
+                "these tables have a `user_id` column but are NOT registered in \
+                 personal_data_tables(), so the db_query tool would leave them \
+                 unscoped cross-tenant: {missing:?}"
             );
             fx
         },
