@@ -2,6 +2,8 @@
 //! tier 2). Gated on `TEST_DATABASE_URL`; pass-skips without a DB. Runs in a
 //! private throwaway schema, so it never touches live tables.
 
+mod support;
+
 use std::sync::Arc;
 
 use desktop_assistant_core::ports::store::ErrorClassificationStore;
@@ -18,7 +20,7 @@ struct SchemaFixture {
 
 impl SchemaFixture {
     async fn try_new() -> Option<Self> {
-        let url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let url = support::test_database_url()?;
         let schema = format!("ec_test_{}", Uuid::now_v7().simple());
         let admin = PgPoolOptions::new()
             .max_connections(1)
