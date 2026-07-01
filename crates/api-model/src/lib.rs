@@ -1326,9 +1326,7 @@ pub enum TaskKind {
     /// A knowledge-maintenance pass (dream-cycle extraction/consolidation or an
     /// embedding recompute). Not tied to any conversation; `name` is the
     /// human-friendly label shown in the task UI.
-    Maintenance {
-        name: String,
-    },
+    Maintenance { name: String },
 }
 
 /// Lifecycle status of a background task. `Cancelled` requires the

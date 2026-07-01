@@ -956,7 +956,11 @@ where
     S: ConversationSelectionStore + 'static,
     Inner: ConversationService + 'static,
 {
-    async fn create_conversation(&self, title: String, tags: Vec<String>) -> Result<Conversation, CoreError> {
+    async fn create_conversation(
+        &self,
+        title: String,
+        tags: Vec<String>,
+    ) -> Result<Conversation, CoreError> {
         self.inner.create_conversation(title, tags).await
     }
 
@@ -1222,8 +1226,7 @@ where
             // Install the ambient "now" line so the core assembler surfaces a
             // `[Now]` system message for this turn. Request-scoped, never
             // persisted; see `NOW_CONTEXT`.
-            let dispatch =
-                desktop_assistant_core::ports::llm::with_now_context(now_line, dispatch);
+            let dispatch = desktop_assistant_core::ports::llm::with_now_context(now_line, dispatch);
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch = with_context_budget(budget, dispatch);
             let dispatch =
@@ -2180,7 +2183,11 @@ api_key_env = "{unused}"
 
         #[async_trait::async_trait]
         impl ConversationService for CapturingInner {
-            async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
+            async fn create_conversation(
+                &self,
+                title: String,
+                _tags: Vec<String>,
+            ) -> Result<Conversation, CoreError> {
                 Ok(Conversation::new("c1", title))
             }
             async fn list_conversations(

@@ -133,10 +133,7 @@ const ADDITIONS: &[(&str, &str)] = &[
         "org.desktopAssistant.Knowledge",
         "method StartMaintenance(in:s:op, out:s:)",
     ),
-    (
-        "org.desktopAssistant.Knowledge",
-        "signal EntriesChanged()",
-    ),
+    ("org.desktopAssistant.Knowledge", "signal EntriesChanged()"),
 ];
 
 // --- fake transport ---------------------------------------------------------

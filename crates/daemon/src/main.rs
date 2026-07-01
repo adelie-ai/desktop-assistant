@@ -1827,9 +1827,8 @@ async fn main() -> Result<()> {
     // pass through the shared service. The same `Arc` the timer loops drive, so
     // the per-op exclusion lock is shared across timer- and button-triggered runs.
     if let Some(service) = &maintenance_service {
-        api_handler_impl = api_handler_impl.with_maintenance_service(
-            Arc::clone(service) as Arc<dyn KnowledgeMaintenanceService>,
-        );
+        api_handler_impl = api_handler_impl
+            .with_maintenance_service(Arc::clone(service) as Arc<dyn KnowledgeMaintenanceService>);
     }
     // Idempotency-key dedup (#204): when a database is available, attach the
     // store so a retried `SendMessage` carrying an `idempotency_key` whose turn

@@ -44,9 +44,15 @@ pub async fn run_dreaming_scan(
     on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<usize, CoreError> {
     tracing::info!("dreaming: extraction phase");
-    let new_facts =
-        extraction::run_extraction_phase(pool, llm_fn, embed_fn, embedding_model, cancellation, on_change)
-            .await?;
+    let new_facts = extraction::run_extraction_phase(
+        pool,
+        llm_fn,
+        embed_fn,
+        embedding_model,
+        cancellation,
+        on_change,
+    )
+    .await?;
 
     if archive_after_days > 0 {
         tracing::info!("dreaming: archival phase");
@@ -75,7 +81,8 @@ pub async fn run_consolidation_scan(
     cancellation: &CancellationToken,
     on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<ConsolidationStats, CoreError> {
-    let stats = consolidation::run_consolidation_phase(pool, llm_fn, cancellation, on_change).await?;
+    let stats =
+        consolidation::run_consolidation_phase(pool, llm_fn, cancellation, on_change).await?;
     if stats.merged_clusters > 0
         || stats.updated > 0
         || stats.soft_deleted > 0

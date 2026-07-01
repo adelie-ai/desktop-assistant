@@ -569,9 +569,7 @@ where
     /// connected client stays in sync (maintenance passes notify from within).
     fn notify_knowledge_changed(&self) {
         if let Some(reg) = &self.registry {
-            reg.notify_knowledge_changed(
-                &desktop_assistant_core::ports::auth::current_user_id(),
-            );
+            reg.notify_knowledge_changed(&desktop_assistant_core::ports::auth::current_user_id());
         }
     }
 
@@ -3195,7 +3193,11 @@ mod tests {
     struct FakeConversations;
     #[async_trait::async_trait]
     impl ConversationService for FakeConversations {
-        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(
@@ -3805,7 +3807,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ConversationService for AbortAwareConversations {
-        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(
@@ -5074,7 +5080,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ConversationService for CountingConversations {
-        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(
@@ -5426,7 +5436,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ConversationService for GatedConversations {
-        async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
             Ok(Conversation::new("c1", title))
         }
         async fn list_conversations(

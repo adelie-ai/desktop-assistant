@@ -122,7 +122,11 @@ pub trait AssistantService: Send + Sync {
 /// [`crate::ports::llm::LlmClient`] already makes (#207).
 #[async_trait::async_trait]
 pub trait ConversationService: Send + Sync {
-    async fn create_conversation(&self, title: String, tags: Vec<String>) -> Result<Conversation, CoreError>;
+    async fn create_conversation(
+        &self,
+        title: String,
+        tags: Vec<String>,
+    ) -> Result<Conversation, CoreError>;
 
     async fn list_conversations(
         &self,
@@ -705,8 +709,7 @@ pub trait KnowledgeMaintenanceService: Send + Sync {
     async fn run_extraction(&self, cancellation: CancellationToken) -> Result<usize, CoreError>;
 
     /// Run one holistic consolidation pass over the active knowledge base.
-    async fn run_consolidation(&self, cancellation: CancellationToken)
-    -> Result<usize, CoreError>;
+    async fn run_consolidation(&self, cancellation: CancellationToken) -> Result<usize, CoreError>;
 
     /// Force-recompute embeddings for EVERY active knowledge entry, regardless
     /// of model stamp or freshness (for out-of-band cases). Returns the number

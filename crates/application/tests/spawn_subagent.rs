@@ -102,7 +102,11 @@ impl FakeConversations {
 
 #[async_trait::async_trait]
 impl ConversationService for FakeConversations {
-    async fn create_conversation(&self, title: String, _tags: Vec<String>) -> Result<Conversation, CoreError> {
+    async fn create_conversation(
+        &self,
+        title: String,
+        _tags: Vec<String>,
+    ) -> Result<Conversation, CoreError> {
         let id = self.next_id();
         let conv = Conversation::new(id.clone(), title);
         self.state

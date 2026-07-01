@@ -476,7 +476,11 @@ impl Connector {
     /// wire; the D-Bus transport (which has no tags field) silently drops them
     /// and creates a plain conversation — acceptable because D-Bus callers never
     /// pass non-empty tags today.
-    pub async fn create_conversation_with_tags(&self, title: &str, tags: Vec<String>) -> Result<String> {
+    pub async fn create_conversation_with_tags(
+        &self,
+        title: &str,
+        tags: Vec<String>,
+    ) -> Result<String> {
         if let Some(commands) = self.client.as_commands() {
             commands.create_conversation_with_tags(title, tags).await
         } else {

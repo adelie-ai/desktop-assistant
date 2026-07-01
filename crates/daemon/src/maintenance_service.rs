@@ -23,13 +23,13 @@ use desktop_assistant_core::ports::auth::UserId;
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::inbound::KnowledgeMaintenanceService;
 use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, with_cancellation_token};
+use desktop_assistant_storage::PgPool;
 use desktop_assistant_storage::dreaming::{
     BackfillEmbedFn, DreamingLlmFn, KnowledgeChangeFn, run_consolidation_scan, run_dreaming_scan,
 };
 use desktop_assistant_storage::embedding_backfill::{
     backfill_knowledge_embeddings, invalidate_all_knowledge_embeddings,
 };
-use desktop_assistant_storage::PgPool;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -168,10 +168,7 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
         .await
     }
 
-    async fn run_consolidation(
-        &self,
-        cancellation: CancellationToken,
-    ) -> Result<usize, CoreError> {
+    async fn run_consolidation(&self, cancellation: CancellationToken) -> Result<usize, CoreError> {
         let _guard = self
             .consolidation_lock
             .try_lock()
@@ -193,10 +190,9 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
         &self,
         cancellation: CancellationToken,
     ) -> Result<usize, CoreError> {
-        let _guard = self
-            .embeddings_lock
-            .try_lock()
-            .map_err(|_| CoreError::Storage("embedding recompute is already running".to_string()))?;
+        let _guard = self.embeddings_lock.try_lock().map_err(|_| {
+            CoreError::Storage("embedding recompute is already running".to_string())
+        })?;
         // Force path: NULL out every active row's vector (catches out-of-band
         // edits the model-stamp comparison would miss), then drive the existing
         // batched backfill to re-embed them. No `on_change` — embeddings don't
@@ -209,14 +205,9 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
             "recalculate embeddings: invalidated {invalidated} row(s); re-embedding all"
         );
         let embed_fn = Self::build_embed_fn(Arc::clone(&self.embed_client));
-        backfill_knowledge_embeddings(
-            &self.pool,
-            &embed_fn,
-            &self.embedding_model,
-            &cancellation,
-        )
-        .await
-        .map_err(CoreError::Storage)
+        backfill_knowledge_embeddings(&self.pool, &embed_fn, &self.embedding_model, &cancellation)
+            .await
+            .map_err(CoreError::Storage)
     }
 }
 

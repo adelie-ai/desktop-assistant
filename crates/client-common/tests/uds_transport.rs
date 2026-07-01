@@ -55,9 +55,11 @@ impl AssistantApiHandler for TestHandler {
             api::Command::ListConversations { .. } => {
                 Ok(api::CommandResult::Conversations(Vec::new()))
             }
-            api::Command::CreateConversation { title, .. } => Ok(api::CommandResult::ConversationId {
-                id: format!("id-for-{title}"),
-            }),
+            api::Command::CreateConversation { title, .. } => {
+                Ok(api::CommandResult::ConversationId {
+                    id: format!("id-for-{title}"),
+                })
+            }
             api::Command::ListAvailableModels { .. } => Ok(api::CommandResult::Models(Vec::new())),
             _ => Err(ApiError::Unsupported),
         }

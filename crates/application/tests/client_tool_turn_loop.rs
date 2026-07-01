@@ -207,7 +207,10 @@ async fn turn_loop_suspends_on_client_tool_then_resumes_on_result() {
         LlmResponse::text("The hosts file maps 127.0.0.1 to localhost"),
     ];
     let handler = Arc::new(make_handler(responses));
-    let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+    let conv = handler
+        .create_conversation("Test".into(), vec![])
+        .await
+        .unwrap();
     let conv_id = conv.id.0.clone();
 
     let coord = Arc::new(ClientToolCoordinator::new());

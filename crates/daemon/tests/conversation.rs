@@ -166,7 +166,10 @@ async fn full_conversation_lifecycle() {
     let service = make_service(vec!["Hello", ", ", "world", "!"]);
 
     // 1. Create a conversation
-    let conv = service.create_conversation("My Chat".into(), vec![]).await.unwrap();
+    let conv = service
+        .create_conversation("My Chat".into(), vec![])
+        .await
+        .unwrap();
     assert_eq!(conv.id.as_str(), "conv-1");
     assert_eq!(conv.title, "My Chat");
     assert!(conv.messages.is_empty());
@@ -223,8 +226,14 @@ async fn full_conversation_lifecycle() {
 async fn multiple_conversations() {
     let service = make_service(vec!["response"]);
 
-    let c1 = service.create_conversation("Chat 1".into(), vec![]).await.unwrap();
-    let c2 = service.create_conversation("Chat 2".into(), vec![]).await.unwrap();
+    let c1 = service
+        .create_conversation("Chat 1".into(), vec![])
+        .await
+        .unwrap();
+    let c2 = service
+        .create_conversation("Chat 2".into(), vec![])
+        .await
+        .unwrap();
 
     assert_ne!(c1.id, c2.id);
 

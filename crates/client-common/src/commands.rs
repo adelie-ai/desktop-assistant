@@ -94,7 +94,11 @@ pub trait AssistantCommands: Send + Sync {
         self.create_conversation_with_tags(title, vec![]).await
     }
 
-    async fn create_conversation_with_tags(&self, title: &str, tags: Vec<String>) -> Result<String> {
+    async fn create_conversation_with_tags(
+        &self,
+        title: &str,
+        tags: Vec<String>,
+    ) -> Result<String> {
         let result = self
             .send_command(api::Command::CreateConversation {
                 title: title.to_string(),

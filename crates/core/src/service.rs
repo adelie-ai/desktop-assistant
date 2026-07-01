@@ -616,7 +616,11 @@ impl<S, L: LlmClient, T> ConversationHandler<S, L, T> {
 impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
     for ConversationHandler<S, L, T>
 {
-    async fn create_conversation(&self, title: String, tags: Vec<String>) -> Result<Conversation, CoreError> {
+    async fn create_conversation(
+        &self,
+        title: String,
+        tags: Vec<String>,
+    ) -> Result<Conversation, CoreError> {
         let id = (self.id_generator)();
         let mut conv = Conversation::new(id, title);
         let timestamp = now_timestamp();
@@ -1818,8 +1822,14 @@ mod tests {
     #[tokio::test]
     async fn create_assigns_unique_ids() {
         let handler = make_handler(vec![]);
-        let c1 = handler.create_conversation("A".into(), vec![]).await.unwrap();
-        let c2 = handler.create_conversation("B".into(), vec![]).await.unwrap();
+        let c1 = handler
+            .create_conversation("A".into(), vec![])
+            .await
+            .unwrap();
+        let c2 = handler
+            .create_conversation("B".into(), vec![])
+            .await
+            .unwrap();
         assert_ne!(c1.id, c2.id);
         assert_eq!(c1.id.as_str(), "conv-1");
         assert_eq!(c2.id.as_str(), "conv-2");
@@ -1828,7 +1838,10 @@ mod tests {
     #[tokio::test]
     async fn create_sets_human_readable_timestamps() {
         let handler = make_handler(vec![]);
-        let conv = handler.create_conversation("A".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("A".into(), vec![])
+            .await
+            .unwrap();
         assert!(!conv.created_at.is_empty());
         assert!(!conv.updated_at.is_empty());
         assert_eq!(conv.created_at.len(), 19);
@@ -1839,7 +1852,10 @@ mod tests {
     #[tokio::test]
     async fn create_stores_conversation() {
         let handler = make_handler(vec![]);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let retrieved = handler.get_conversation(&conv.id).await.unwrap();
         assert_eq!(retrieved.title, "Test");
     }
@@ -1847,8 +1863,14 @@ mod tests {
     #[tokio::test]
     async fn list_returns_summaries() {
         let handler = make_handler(vec![]);
-        handler.create_conversation("A".into(), vec![]).await.unwrap();
-        handler.create_conversation("B".into(), vec![]).await.unwrap();
+        handler
+            .create_conversation("A".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .create_conversation("B".into(), vec![])
+            .await
+            .unwrap();
 
         let summaries = handler.list_conversations(None, false).await.unwrap();
         assert_eq!(summaries.len(), 2);
@@ -1896,7 +1918,10 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_conversation() {
         let handler = make_handler(vec![]);
-        let conv = handler.create_conversation("Gone".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Gone".into(), vec![])
+            .await
+            .unwrap();
         handler.delete_conversation(&conv.id).await.unwrap();
 
         let result = handler.get_conversation(&conv.id).await;
@@ -1906,8 +1931,14 @@ mod tests {
     #[tokio::test]
     async fn clear_all_history_removes_all_conversations() {
         let handler = make_handler(vec![]);
-        handler.create_conversation("A".into(), vec![]).await.unwrap();
-        handler.create_conversation("B".into(), vec![]).await.unwrap();
+        handler
+            .create_conversation("A".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .create_conversation("B".into(), vec![])
+            .await
+            .unwrap();
 
         let deleted = handler.clear_all_history().await.unwrap();
         assert_eq!(deleted, 2);
@@ -1919,7 +1950,10 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_adds_messages_to_history() {
         let handler = make_handler(vec!["Hello", " there"]);
-        let conv = handler.create_conversation("Chat".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
 
         let response = handler
             .send_prompt(&conv.id, "Hi".into(), noop_callback(), noop_status())
@@ -1938,7 +1972,10 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_streams_chunks() {
         let handler = make_handler(vec!["a", "b", "c"]);
-        let conv = handler.create_conversation("Chat".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
 
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let chunks_clone = Arc::clone(&chunks);
@@ -1961,7 +1998,10 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_hides_thinking_blocks_in_final_response() {
         let handler = make_handler(vec!["<think>internal reasoning</think>\n\nVisible answer"]);
-        let conv = handler.create_conversation("Chat".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
 
         let response = handler
             .send_prompt(&conv.id, "Hi".into(), noop_callback(), noop_status())
@@ -1977,7 +2017,10 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_hides_thinking_blocks_in_streamed_chunks() {
         let handler = make_handler(vec!["Visible ", "<th", "ink>internal</think>", "answer"]);
-        let conv = handler.create_conversation("Chat".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
 
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let chunks_clone = Arc::clone(&chunks);
@@ -2140,7 +2183,10 @@ mod tests {
         tool_results.insert("read_file".to_string(), "hello world".to_string());
 
         let handler = make_tool_handler(responses, vec![tool_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(
@@ -2204,7 +2250,10 @@ mod tests {
         tool_results.insert("delete_file".to_string(), "boom".to_string());
 
         let handler = make_tool_handler(responses, vec![read_def, delete_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = crate::ports::llm::with_tool_allowlist(
             vec!["read_file".to_string()],
@@ -2260,7 +2309,10 @@ mod tests {
         tool_results.insert("read_file".to_string(), "hello world".to_string());
 
         let handler = make_tool_handler(responses, vec![read_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = crate::ports::llm::with_tool_allowlist(
             vec!["read_file".to_string()],
@@ -2300,7 +2352,10 @@ mod tests {
         tool_results.insert("read_file".to_string(), "hello world".to_string());
 
         let handler = make_tool_handler(responses, vec![read_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         handler
             .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
@@ -2321,7 +2376,10 @@ mod tests {
         let mut tr2 = HashMap::new();
         tr2.insert("read_file".to_string(), "hello world".to_string());
         let handler2 = make_tool_handler(responses2, vec![read_def2], tr2);
-        let conv2 = handler2.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv2 = handler2
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         crate::ports::llm::with_tool_allowlist(
             Vec::new(),
@@ -2368,7 +2426,10 @@ mod tests {
         tool_results.insert("read_file".to_string(), "data".to_string());
 
         let handler = make_tool_handler(responses, vec![tool_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let streamed = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&streamed);
@@ -2407,7 +2468,10 @@ mod tests {
         tool_results.insert("read_file".to_string(), "data".to_string());
 
         let handler = make_tool_handler(responses, vec![tool_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let streamed = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&streamed);
@@ -2450,7 +2514,10 @@ mod tests {
         tool_results.insert("read_file".to_string(), "hello world".to_string());
 
         let handler = make_tool_handler(responses, vec![tool_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
@@ -2492,7 +2559,10 @@ mod tests {
         tool_results.insert("list_files".to_string(), "a.txt".to_string());
 
         let handler = make_tool_handler(responses, vec![tool_def], tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         handler
             .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
@@ -2619,7 +2689,10 @@ mod tests {
         .with_scratchpad_write(write)
         .with_scratchpad_list(list);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let result = handler
             .send_prompt(&conv.id, "weather?".into(), noop_callback(), noop_status())
             .await
@@ -2683,7 +2756,10 @@ mod tests {
         )
         .with_scratchpad_write(Arc::clone(&write))
         .with_scratchpad_list(Arc::clone(&list));
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         handler
             .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
             .await
@@ -2719,7 +2795,10 @@ mod tests {
         .with_scratchpad_list(Arc::clone(&list));
         // Re-create the conversation in handler2's store and pre-seed nothing;
         // the scratchpad (the source of step keys) is shared via the closures.
-        let conv2 = handler2.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv2 = handler2
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         handler2
             .send_prompt(&conv2.id, "again".into(), noop_callback(), noop_status())
             .await
@@ -2799,7 +2878,10 @@ mod tests {
         .with_scratchpad_write(write)
         .with_scratchpad_list(list);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         handler
             .send_prompt(
                 &conv.id,
@@ -2847,7 +2929,10 @@ mod tests {
         tool_results.insert("notes_search".to_string(), "ok".to_string());
 
         let handler = make_tool_handler(responses, tools, tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let (status_cb, status_log) = recording_status();
         let result = handler
@@ -2892,7 +2977,10 @@ mod tests {
         .with_scratchpad_write(write)
         .with_scratchpad_list(list);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let (status_cb, status_log) = recording_status();
         handler
             .send_prompt(
@@ -3018,7 +3106,10 @@ mod tests {
         // loop tried to run it server-side it would error, proving the client
         // path is the one taken.
         let handler = make_tool_handler(responses, vec![], HashMap::new());
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let executed = Arc::new(Mutex::new(Vec::new()));
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
@@ -3078,7 +3169,10 @@ mod tests {
             )],
         )];
         let handler = make_tool_handler(responses, vec![], HashMap::new());
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let executed = Arc::new(Mutex::new(Vec::new()));
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
@@ -3136,7 +3230,10 @@ mod tests {
             LlmResponse::text("recovered"),
         ];
         let handler = make_tool_handler(responses, vec![], HashMap::new());
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let executed = Arc::new(Mutex::new(Vec::new()));
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
@@ -3194,7 +3291,10 @@ mod tests {
         // not `result`.
         let handler = make_tool_handler(responses, vec![tool_def], tool_results)
             .with_max_tool_result_bytes(16);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let (_result, events) = capture_tool_events(handler.send_prompt(
             &conv.id,
@@ -3238,7 +3338,10 @@ mod tests {
             )],
             tool_results,
         );
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
@@ -3259,7 +3362,10 @@ mod tests {
         // A plain text turn (no tools, no steps) is a "quick answer": it
         // narrates nothing and just streams its reply.
         let handler = make_handler(vec!["Hello there"]);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let (status_cb, status_log) = recording_status();
         handler
@@ -3289,7 +3395,10 @@ mod tests {
 
         let handler = make_tool_handler(responses, vec![tool_def], tool_results)
             .with_max_tool_result_bytes(1_024);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         handler
             .send_prompt(&conv.id, "dump it".into(), noop_callback(), noop_status())
             .await
@@ -3331,7 +3440,10 @@ mod tests {
         tool_results.insert("tool_b".to_string(), "result_b".to_string());
 
         let handler = make_tool_handler(responses, tools, tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(&conv.id, "Do both".into(), noop_callback(), noop_status())
@@ -3359,7 +3471,10 @@ mod tests {
 
         // No results configured — tool will return error
         let handler = make_tool_handler(responses, tools, HashMap::new());
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(
@@ -3400,7 +3515,10 @@ mod tests {
         tool_results.insert("loop_tool".to_string(), "ok".to_string());
 
         let handler = make_tool_handler(responses, tools, tool_results);
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(
@@ -3518,7 +3636,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(
@@ -3564,7 +3685,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status())
@@ -3677,7 +3801,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let result = handler
             .send_prompt(
@@ -3761,7 +3888,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let _ = handler
             .send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status())
             .await
@@ -4000,7 +4130,10 @@ mod tests {
                 format!("conv-{n}")
             }),
         );
-        let conv = handler.create_conversation("My Chat".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("My Chat".into(), vec![])
+            .await
+            .unwrap();
 
         handler
             .send_prompt(&conv.id, "Hi".into(), noop_callback(), noop_status())
@@ -4037,7 +4170,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let _ = handler
             .send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status())
             .await
@@ -4085,7 +4221,10 @@ mod tests {
         )
         .with_host("daemon-host");
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         // Client registers a tool with the SAME name as the server-side one.
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
@@ -4158,7 +4297,10 @@ mod tests {
         )
         .with_host("daemon-host");
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
             Arc::new(FakeClientToolPort::ok(
                 vec![ToolDefinition::new(
@@ -4232,7 +4374,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
         // Build two payloads where byte length and estimated tokens
         // give different rankings. Both clear MIN_TRUNCATION_TOKENS so
@@ -4356,7 +4501,10 @@ mod tests {
 
         // Prime the conversation with enough messages to exceed the default
         // window, so shrinking it triggers a new compaction range.
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
         for i in 0..(MAX_CONTEXT_MESSAGES + 20) {
             if i % 2 == 0 {
@@ -4418,7 +4566,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         // Small conversation: no windowing, no compaction expected.
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
         for _ in 0..5 {
@@ -4472,7 +4623,10 @@ mod tests {
             Box::new(|| "conv-1".to_string()),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         if prime_messages > 0 {
             let mut stored = handler.get_conversation(&conv.id).await.unwrap();
             for i in 0..prime_messages {
@@ -4576,7 +4730,10 @@ mod tests {
             },
             Box::new(|| "conv-1".to_string()),
         );
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_for_sink = Arc::clone(&captured);
@@ -4660,7 +4817,10 @@ mod tests {
         // Prime the conversation with three tool results: one tiny, one
         // medium-but-still-below-threshold, one well above the threshold.
         // Only the third should be truncated.
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
         stored
             .messages
@@ -4764,7 +4924,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
         // Four tool-pair groups, all with tiny results (below
         // MIN_TRUNCATION_TOKENS in estimated tokens) so step 1 declines.
@@ -4874,7 +5037,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         // Prime with enough plain User/Assistant turns to push the window
         // past `MAX_CONTEXT_MESSAGES`, so step 3 has a non-empty range to
         // summarise. No tool calls are present, so steps 1 and 2 decline.
@@ -4958,7 +5124,10 @@ mod tests {
             }),
         );
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
         stored
             .messages
@@ -4989,7 +5158,10 @@ mod tests {
     #[tokio::test]
     async fn active_task_anchor_set_on_user_prompt() {
         let handler = make_handler(vec!["ok"]);
-        let conv = handler.create_conversation("Chat".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
 
         handler
             .send_prompt(
@@ -5180,7 +5352,10 @@ mod tests {
         let calls = llm.calls();
         let handler = build_categorization_handler(executor, llm);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         handler
             .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
@@ -5207,7 +5382,10 @@ mod tests {
         let calls = llm.calls();
         let handler = build_categorization_handler(executor, llm);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         handler
             .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
@@ -5242,7 +5420,10 @@ mod tests {
         let calls = llm.calls();
         let handler = build_categorization_handler(executor, llm);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         handler
             .send_prompt(&conv.id, "first".into(), noop_callback(), noop_status())
@@ -5288,8 +5469,14 @@ mod tests {
         // Two distinct conversations so the turns take different per-conversation
         // turn locks and genuinely run in parallel (only the categorization
         // single-flight may serialize them).
-        let conv_a = handler.create_conversation("A".into(), vec![]).await.unwrap();
-        let conv_b = handler.create_conversation("B".into(), vec![]).await.unwrap();
+        let conv_a = handler
+            .create_conversation("A".into(), vec![])
+            .await
+            .unwrap();
+        let conv_b = handler
+            .create_conversation("B".into(), vec![])
+            .await
+            .unwrap();
 
         let h1 = handler.clone();
         let ida = conv_a.id.clone();
@@ -5327,7 +5514,10 @@ mod tests {
         let calls = llm.calls();
         let handler = build_categorization_handler(executor, llm);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let budget = ContextBudget {
             max_input_tokens: 200_000,
@@ -5371,7 +5561,10 @@ mod tests {
         let calls = llm.calls();
         let handler = build_categorization_handler(executor, llm);
 
-        let conv = handler.create_conversation("Test".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
 
         let budget = ContextBudget {
             max_input_tokens: 200_000,
@@ -5440,7 +5633,10 @@ mod tests {
             executor,
             Box::new(|| "conv-scope-1".to_string()),
         );
-        let conv = handler.create_conversation("t".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
         handler
             .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
             .await
@@ -5515,7 +5711,10 @@ mod tests {
         )
         .with_scratchpad_goal(goal_reader("Ship the scratchpad, then promote learnings"));
 
-        let conv = handler.create_conversation("t".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
         handler
             .send_prompt(
                 &conv.id,
@@ -5556,7 +5755,10 @@ mod tests {
         )
         .with_scratchpad_goal(empty_reader);
 
-        let conv = handler.create_conversation("t".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
         handler
             .send_prompt(&conv.id, "just this".into(), noop_callback(), noop_status())
             .await
@@ -5601,7 +5803,10 @@ mod tests {
             NoopToolExecutor,
             Box::new(|| "conv-refine-1".to_string()),
         );
-        let conv = handler.create_conversation("t".into(), vec![]).await.unwrap();
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
 
         // Install the per-request refinement the way the daemon dispatch
         // wrapper does (a task-local around the send), then send a clean
@@ -5673,7 +5878,10 @@ mod tests {
                 NoopToolExecutor,
                 Box::new(|| "conv-refine-2".to_string()),
             );
-            let conv = handler.create_conversation("t".into(), vec![]).await.unwrap();
+            let conv = handler
+                .create_conversation("t".into(), vec![])
+                .await
+                .unwrap();
             let send = async {
                 handler
                     .send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status())

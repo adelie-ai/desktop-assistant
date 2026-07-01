@@ -60,11 +60,7 @@ impl NowSnapshot {
 
     /// Timezone as numeric offset plus abbreviation — e.g. `-04:00 (EDT)`.
     pub fn timezone(&self) -> String {
-        format!(
-            "{} ({})",
-            self.local.format("%:z"),
-            self.local.format("%Z")
-        )
+        format!("{} ({})", self.local.format("%:z"), self.local.format("%Z"))
     }
 
     /// Human-facing "now" line for the ambient `[Now]` context block — e.g.
