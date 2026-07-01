@@ -1,8 +1,8 @@
 use crate::CoreError;
 use crate::context::{
-    COMPACTION_TOKEN_RATIO, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
-    MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolLocalityContext, cap_tool_result,
-    compaction_range, generate_context_summary, llm_messages_for_turn_with_plan,
+    COMPACTION_TOKEN_RATIO, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
+    MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolContext, ToolLocalityContext, TurnAnchors,
+    cap_tool_result, compaction_range, generate_context_summary, llm_messages_for_turn_with_plan,
     recover_from_overflow,
 };
 use crate::domain::{
@@ -1053,19 +1053,25 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
             let llm_messages = llm_messages_for_turn_with_plan(
-                &conv.messages,
-                &conv.summaries,
-                &tool_defs,
-                deferred_ns,
-                &conv.context_summary,
+                &ConversationView {
+                    messages: &conv.messages,
+                    summaries: &conv.summaries,
+                    context_summary: &conv.context_summary,
+                },
+                &ToolContext {
+                    tool_defs: &tool_defs,
+                    deferred_namespaces: deferred_ns,
+                    locality: Some(&tool_locality),
+                },
+                &TurnAnchors {
+                    active_task: anchor,
+                    plan: plan.as_deref(),
+                    scratchpad_index: scratchpad_index.as_deref(),
+                    tool_rounds_since_anchor,
+                },
                 target_window,
-                anchor,
-                plan.as_deref(),
-                scratchpad_index.as_deref(),
-                tool_rounds_since_anchor,
                 &system_refinement,
                 current_context_budget(),
-                Some(&tool_locality),
                 &estimate,
             );
             // Incremental sanitizer: carries think-block parser state across
