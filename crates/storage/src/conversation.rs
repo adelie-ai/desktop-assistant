@@ -428,7 +428,14 @@ impl ConversationStore for PgConversationStore {
             // different user — `SELECT 1 …` distinguishes. The
             // existence probe is itself user-scoped so a cross-user
             // lookup still returns "not found" without leaking.
-            let exists: Option<(i64,)> =
+            //
+            // The literal `1` is Postgres `int4`, so it must decode into an
+            // `i32`: decoding into `i64` errored ("Rust type i64 … not
+            // compatible with SQL type INT4") only when a row actually
+            // matched — i.e. re-archiving your OWN already-archived
+            // conversation returned a Storage error instead of Ok. The
+            // not-found path never decoded a row, which is why the bug hid.
+            let exists: Option<(i32,)> =
                 sqlx::query_as("SELECT 1 FROM conversations WHERE user_id = $1 AND id = $2")
                     .bind(user_id.as_str())
                     .bind(&id.0)
