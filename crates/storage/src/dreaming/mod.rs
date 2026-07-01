@@ -27,6 +27,14 @@ use tokio_util::sync::CancellationToken;
 
 pub use types::{BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn};
 
+/// Surfaced for the DB-gated watermark-scoping integration test (#435). The
+/// `(user_id, conversation_id)` upsert guard on `dreaming_watermarks` (a second
+/// user cannot clobber a watermark keyed by a conversation id it does not own)
+/// cannot be reached through the extraction entry points, because conversation
+/// ids are globally unique — a single conversation belongs to exactly one user,
+/// so the cross-user ON CONFLICT branch never fires via normal extraction.
+pub use common::update_watermark;
+
 /// Run one dreaming scan cycle: extract new facts and archive old
 /// conversations. Consolidation runs separately (see [`run_consolidation_scan`])
 /// on a slower cadence. Returns the number of new facts written.

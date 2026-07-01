@@ -12,7 +12,12 @@
 //! Included by each integration test via `mod support;` (it lives in a
 //! subdirectory so cargo does not compile it as its own test binary).
 
+use std::sync::Arc;
 use std::sync::Once;
+
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
+use uuid::Uuid;
 
 static SKIP_BANNER: Once = Once::new();
 
@@ -58,5 +63,94 @@ fn print_skip_banner() {
             let _ = tty.write_all(banner.as_bytes());
         }
         Err(_) => eprintln!("{banner}"),
+    }
+}
+
+/// RAII fixture for the DB-touching dreaming / embedding suites: a freshly
+/// created private schema, a pool whose connections pin `search_path` to it,
+/// and all migrations applied. Dropping the schema is done explicitly via
+/// [`DbFixture::cleanup`] so a panicking test still tears down.
+///
+/// `public` stays on the search path so the pgvector `vector` type (created
+/// there by the test harness) remains resolvable inside the private schema.
+pub struct DbFixture {
+    pub pool: PgPool,
+    schema: String,
+    admin_url: String,
+}
+
+impl DbFixture {
+    /// Build a fixture against `TEST_DATABASE_URL`, or `None` when it is unset
+    /// (callers pass-skip). `prefix` disambiguates schemas across suites so a
+    /// leaked schema is traceable to the suite that made it.
+    pub async fn try_new(prefix: &str) -> Option<Self> {
+        let url = test_database_url()?;
+        let schema = format!("{prefix}_{}", Uuid::now_v7().simple());
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to TEST_DATABASE_URL");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
+            .execute(&admin)
+            .await
+            .expect("create test schema");
+        admin.close().await;
+
+        let schema_for_hook = Arc::new(schema.clone());
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .after_connect(move |conn, _meta| {
+                let schema = Arc::clone(&schema_for_hook);
+                Box::pin(async move {
+                    let sql = format!("SET search_path TO \"{schema}\", public");
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect per-test pool");
+
+        desktop_assistant_storage::run_migrations(&pool)
+            .await
+            .expect("run_migrations succeeds against test schema");
+
+        Some(Self {
+            pool,
+            schema,
+            admin_url: url,
+        })
+    }
+
+    /// Drop the schema on a best-effort basis; failures log but don't fail the
+    /// test (they'd only mask the real assertion).
+    pub async fn cleanup(self) {
+        self.pool.close().await;
+        let admin = match PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.admin_url)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "cleanup: failed to reconnect to drop schema {}: {e}",
+                    self.schema
+                );
+                return;
+            }
+        };
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA \"{}\" CASCADE",
+            self.schema
+        )))
+        .execute(&admin)
+        .await
+        {
+            eprintln!("cleanup: failed to drop schema {}: {e}", self.schema);
+        }
+        admin.close().await;
     }
 }
