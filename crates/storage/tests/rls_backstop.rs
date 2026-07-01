@@ -9,29 +9,42 @@
 //! pinned, so Postgres itself filters rows to the caller — regardless of what
 //! the SQL text says.
 //!
+//! The migration is deliberately OWNER-ONLY (it can run as the daemon's
+//! un-privileged DB role); the privileged role + grants are a one-time
+//! superuser bootstrap (`bootstrap/rls_role.sql`). These suites stand in for
+//! that bootstrap via `support::provision_tool_role`.
+//!
 //! Acceptance criteria (from the issue), each a named test below:
 //! - `rls_blocks_cross_tenant_even_without_graft` — a query with grafting
 //!   deliberately bypassed still returns zero foreign rows.
 //! - `rls_role_cannot_bypass` — the tool role lacks BYPASSRLS (and superuser).
 //! - `trusted_owner_still_sees_all_users` — trusted app queries unaffected.
 //!
-//! Plus two guards beyond the issue's list:
-//! - `read_path_engages_rls_end_to_end` — the real `execute_database_query`
-//!   read path returns only the caller's rows with graft AND RLS both live.
+//! Plus guards beyond the issue's list:
+//! - `read_path_runs_as_the_restricted_tool_role` / `read_path_engages_rls_end_to_end`
+//!   — the real read path runs under `adele_query` and returns only caller rows.
+//! - `run_migrations_succeeds_as_unprivileged_table_owner` — the full migration
+//!   chain runs as a non-superuser owner (guards the owner/superuser split so a
+//!   stray privileged DDL can't crash-loop the daemon on startup).
 //! - `rls_enabled_on_every_user_scoped_table` — drift guard: every table with
-//!   a `user_id` column has RLS on and a policy, so a future table can't be
-//!   added user-scoped-but-unprotected.
+//!   a `user_id` column has RLS on and a policy.
 //!
 //! Gated on `TEST_DATABASE_URL`; pass-skips when unset (see `support`).
 
 mod support;
 
+use std::str::FromStr;
+use std::sync::Arc;
+
 use desktop_assistant_core::domain::{Conversation, Message, Role};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::{
-    PgConversationStore, TOOL_QUERY_ROLE, UserId, execute_database_query, with_user_id,
+    PgConversationStore, TOOL_QUERY_ROLE, UserId, execute_database_query, run_migrations,
+    with_user_id,
 };
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
+use uuid::Uuid;
 
 use support::DbFixture;
 
@@ -58,9 +71,9 @@ async fn seed_two_users(pool: &PgPool) {
 /// pass-skip when `TEST_DATABASE_URL` is unset.
 async fn fixture(prefix: &str) -> Option<DbFixture> {
     let fx = DbFixture::try_new(prefix).await?;
-    // Production tables live in `public` (granted by migration 029); this
-    // suite's live in a private schema, so grant the tool role there too.
-    support::grant_tool_role_on_schema(&fx.pool, fx.schema()).await;
+    // Migration 029 is owner-only; stand in for the superuser bootstrap
+    // (`bootstrap/rls_role.sql`) that provisions the role + grants in prod.
+    support::provision_tool_role(&fx.pool, fx.schema()).await;
     Some(fx)
 }
 
@@ -129,7 +142,7 @@ async fn rls_role_cannot_bypass() {
             .bind(TOOL_QUERY_ROLE)
             .fetch_one(&fx.pool)
             .await
-            .expect("adele_query role must exist after migration 029");
+            .expect("adele_query role must exist after bootstrap provisioning");
 
     assert!(
         !row.get::<bool, _>("rolbypassrls"),
@@ -226,6 +239,104 @@ async fn read_path_runs_as_the_restricted_tool_role() {
     );
 
     fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn run_migrations_succeeds_as_unprivileged_table_owner() {
+    // Regression guard for the crash-loop this migration's owner/superuser
+    // split prevents. The daemon's real DB role is deliberately un-privileged
+    // (not a superuser, no CREATEROLE) and merely OWNS its tables. If any
+    // auto-run migration ever needs more than table-owner privileges — e.g. a
+    // stray `CREATE ROLE` or `GRANT` of role membership — the daemon fails to
+    // start. This runs the FULL migration chain as exactly such a role and
+    // asserts it succeeds; the privileged role provisioning lives out of band
+    // in `bootstrap/rls_role.sql`.
+    let Some(url) = support::test_database_url() else {
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; run_migrations_succeeds_as_unprivileged_table_owner"
+        );
+        return;
+    };
+
+    let suffix = Uuid::now_v7().simple().to_string();
+    let role = format!("unpriv_{suffix}");
+    let schema = format!("unpriv_s_{suffix}");
+
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("admin connect");
+    // `vector` must already exist so run_migrations' `CREATE EXTENSION IF NOT
+    // EXISTS` no-ops — an un-privileged role cannot create extensions.
+    sqlx::raw_sql("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(&admin)
+        .await
+        .expect("ensure vector extension");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE \"{role}\" LOGIN PASSWORD 'probe_pw' \
+         NOSUPERUSER NOCREATEROLE NOCREATEDB NOBYPASSRLS"
+    )))
+    .execute(&admin)
+    .await
+    .expect("create un-privileged role");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA \"{schema}\" AUTHORIZATION \"{role}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create owned schema");
+    // Ensure the role can resolve the `vector` type living in public.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "GRANT USAGE ON SCHEMA public TO \"{role}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("grant usage on public");
+
+    // Connect AS the un-privileged owner; unqualified tables resolve to its
+    // own schema.
+    let schema_hook = Arc::new(schema.clone());
+    let opts = PgConnectOptions::from_str(&url)
+        .expect("parse url")
+        .username(&role)
+        .password("probe_pw");
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            let schema = Arc::clone(&schema_hook);
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SET search_path TO \"{schema}\", public"
+                )))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect_with(opts)
+        .await
+        .expect("connect as un-privileged owner");
+
+    // The point of the test: this must NOT error for an un-privileged owner.
+    let migrated = run_migrations(&owner_pool).await;
+    owner_pool.close().await;
+
+    // Tear down before asserting so a failure doesn't leak the role/schema.
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA \"{schema}\" CASCADE"
+    )))
+    .execute(&admin)
+    .await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE \"{role}\"")))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+
+    migrated.expect(
+        "run_migrations must succeed as an un-privileged table owner — \
+         migration 029 is owner-only (role/grants are a superuser bootstrap)",
+    );
 }
 
 #[tokio::test]

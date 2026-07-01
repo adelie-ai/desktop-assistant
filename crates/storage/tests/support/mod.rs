@@ -21,16 +21,37 @@ use uuid::Uuid;
 
 static SKIP_BANNER: Once = Once::new();
 
-/// Grant the #434 RLS tool role (`adele_query`, created by migration 029)
-/// `USAGE` + `SELECT` on `schema`, so a read-path suite whose tables live
-/// in a private test schema can `SET LOCAL ROLE adele_query` and still
-/// resolve them. Production tables live in `public`, which migration 029
-/// grants directly; this mirrors that grant for the private-schema layout
-/// the DB-gated suites use for parallel isolation. Without it every grafted
-/// SELECT under the tool role would fail with "permission denied".
-pub async fn grant_tool_role_on_schema(pool: &PgPool, schema: &str) {
+/// Provision the #434 RLS tool role for a DB-gated read-path suite,
+/// simulating the privileged bootstrap (`crates/storage/bootstrap/rls_role.sql`)
+/// that a superuser runs once in production.
+///
+/// Migration 029 (auto-run) is deliberately owner-only — it enables RLS and
+/// creates the policies but does NOT create the `adele_query` role or grant it
+/// anything, because the daemon's real DB role is un-privileged and cannot.
+/// So the tests, which connect as a superuser, stand in for the DBA: create
+/// the role, grant the connecting role membership so it can `SET LOCAL ROLE`,
+/// and grant `USAGE` + `SELECT` on the suite's private schema (production
+/// tables live in `public`; the private schema is a test-parallelism artifact).
+///
+/// Idempotent — the role is cluster-global and shared across suites.
+pub async fn provision_tool_role(pool: &PgPool, schema: &str) {
     let role = desktop_assistant_storage::TOOL_QUERY_ROLE;
+    // Create the restricted role once. This runs concurrently across the
+    // suite's parallel tests against one cluster-global role, so a plain
+    // `IF NOT EXISTS` check-then-create races; attempt the create and swallow
+    // the duplicate (either variant Postgres may raise under the race).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DO $$ BEGIN \
+           CREATE ROLE {role} NOLOGIN NOBYPASSRLS; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; \
+         END $$;"
+    )))
+    .execute(pool)
+    .await
+    .expect("create tool role");
     for stmt in [
+        // Membership so the (superuser) connecting role can SET LOCAL ROLE.
+        format!("GRANT {role} TO CURRENT_USER WITH ADMIN OPTION"),
         format!("GRANT USAGE ON SCHEMA \"{schema}\" TO {role}"),
         format!("GRANT SELECT ON ALL TABLES IN SCHEMA \"{schema}\" TO {role}"),
     ] {
