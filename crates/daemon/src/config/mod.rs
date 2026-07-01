@@ -3010,4 +3010,638 @@ max_context_tokens = 1000000
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(config.personality, reparsed.personality);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #438 — resolution.rs decision branches
+    // ─────────────────────────────────────────────────────────────────────
+
+    // --- resolve_consolidation_llm_config 3-level fallback (resolution.rs:213) --
+
+    #[test]
+    fn consolidation_llm_prefers_own_config() {
+        // A dedicated `[backend_tasks.consolidation_llm]` wins over both the
+        // backend-tasks LLM and the primary `[llm]` — so consolidation can run
+        // on a stronger model than extraction.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "openai"
+            model = "primary-model"
+
+            [backend_tasks.llm]
+            connector = "openai"
+            model = "backend-model"
+
+            [backend_tasks.consolidation_llm]
+            connector = "anthropic"
+            model = "consolidation-model"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_consolidation_llm_config(Some(&config));
+        assert_eq!(resolved.connector, "anthropic");
+        assert_eq!(resolved.model, "consolidation-model");
+    }
+
+    #[test]
+    fn consolidation_llm_falls_back_to_backend_tasks() {
+        // No `[backend_tasks.consolidation_llm]` → fall back to the shared
+        // backend-tasks LLM (NOT the primary), so consolidation follows the
+        // cheaper extraction model rather than silently landing on the primary.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "openai"
+            model = "primary-model"
+
+            [backend_tasks.llm]
+            connector = "anthropic"
+            model = "backend-model"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_consolidation_llm_config(Some(&config));
+        assert_eq!(resolved.connector, "anthropic");
+        assert_eq!(resolved.model, "backend-model");
+    }
+
+    #[test]
+    fn consolidation_llm_falls_back_to_primary() {
+        // Neither `consolidation_llm` nor `backend_tasks.llm` set → the primary
+        // `[llm]` block is used. This is the model-drift the dream-cycle overhaul
+        // depends on: without an override, everything routes to the primary.
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [llm]
+            connector = "openai"
+            model = "primary-model"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = resolve_consolidation_llm_config(Some(&config));
+        assert_eq!(resolved.connector, "openai");
+        assert_eq!(resolved.model, "primary-model");
+    }
+
+    // --- resolve_connection_llm_config connector-mismatch skip (resolution.rs:582-599) --
+
+    #[test]
+    fn fallback_llm_model_does_not_leak_across_connectors() {
+        use crate::connections::AnthropicConnection;
+
+        let anthropic_conn = ConnectionConfig::Anthropic(AnthropicConnection::default());
+
+        // A top-level `[llm]` for a *different* connector (openai) must NOT leak
+        // its model / tuning into an Anthropic connection — its values are wrong
+        // for that connector and would 400 at dispatch.
+        let openai_fallback = LlmConfig {
+            connector: "openai".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            temperature: Some(1.9),
+            top_p: Some(0.3),
+            max_tokens: Some(4096),
+            ..LlmConfig::default()
+        };
+        let resolved = resolve_connection_llm_config(&anthropic_conn, Some(&openai_fallback));
+        assert_eq!(resolved.connector, "anthropic");
+        assert_ne!(
+            resolved.model, "gpt-5.4",
+            "openai model must not leak into the anthropic connection"
+        );
+        assert_eq!(resolved.temperature, None, "openai temperature leaked");
+        assert_eq!(resolved.top_p, None, "openai top_p leaked");
+        assert_eq!(resolved.max_tokens, None, "openai max_tokens leaked");
+
+        // Sanity: a fallback whose connector *matches* IS honored — proving the
+        // leak-guard admits when it should, not just "always skip".
+        let anthropic_fallback = LlmConfig {
+            connector: "anthropic".to_string(),
+            model: Some("claude-custom".to_string()),
+            temperature: Some(0.5),
+            ..LlmConfig::default()
+        };
+        let resolved = resolve_connection_llm_config(&anthropic_conn, Some(&anthropic_fallback));
+        assert_eq!(resolved.model, "claude-custom");
+        assert_eq!(resolved.temperature, Some(0.5));
+    }
+
+    // --- Bedrock base_url-vs-region (resolution.rs:539-553) --
+
+    #[test]
+    fn bedrock_region_used_as_base_when_base_url_absent() {
+        use crate::connections::BedrockConnection;
+
+        // No explicit base_url → the region is used as the "base" (the historical
+        // Bedrock shape where `base_url` encoded the region).
+        let with_region = ConnectionConfig::Bedrock(BedrockConnection {
+            region: Some("us-west-2".to_string()),
+            base_url: None,
+            ..BedrockConnection::default()
+        });
+        assert_eq!(
+            resolve_connection_llm_config(&with_region, None).base_url,
+            "us-west-2"
+        );
+
+        // Explicit base_url wins over region (private-endpoint proxy case).
+        let with_base = ConnectionConfig::Bedrock(BedrockConnection {
+            region: Some("us-west-2".to_string()),
+            base_url: Some("https://bedrock.proxy.internal".to_string()),
+            ..BedrockConnection::default()
+        });
+        assert_eq!(
+            resolve_connection_llm_config(&with_base, None).base_url,
+            "https://bedrock.proxy.internal"
+        );
+
+        // Whitespace-only region is filtered → falls through to the connector's
+        // default HTTP base ("us-east-1"), never an empty string.
+        let blank_region = ConnectionConfig::Bedrock(BedrockConnection {
+            region: Some("   ".to_string()),
+            base_url: None,
+            ..BedrockConnection::default()
+        });
+        assert_eq!(
+            resolve_connection_llm_config(&blank_region, None).base_url,
+            "us-east-1"
+        );
+    }
+
+    // --- resolve_database_config env fallback (resolution.rs:135) --
+
+    fn db_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn database_url_env_used_when_config_absent() {
+        // Serialize against any other test touching this process-global env var.
+        let _guard = db_env_lock();
+        const ENV: &str = "DESKTOP_ASSISTANT_DATABASE_URL";
+        // SAFETY: single-threaded test scope, serialized via `db_env_lock`.
+        unsafe {
+            std::env::remove_var(ENV);
+        }
+
+        // Config has no `[database].url` → the env var is used as the fallback,
+        // and `max_connections` defaults. Without this branch the daemon would
+        // start with no persistence despite an env-configured DB.
+        // SAFETY: same scope as above.
+        unsafe {
+            std::env::set_var(ENV, "postgres://env-host/db");
+        }
+        let (url, max) = resolve_database_config(None);
+        assert_eq!(url.as_deref(), Some("postgres://env-host/db"));
+        assert_eq!(max, default_database_max_connections());
+
+        // An explicit config url wins over the env var.
+        let cfg: DaemonConfig = toml::from_str(
+            r#"
+            [database]
+            url = "postgres://config-host/db"
+            max_connections = 20
+            "#,
+        )
+        .unwrap();
+        let (url, max) = resolve_database_config(Some(&cfg));
+        assert_eq!(url.as_deref(), Some("postgres://config-host/db"));
+        assert_eq!(max, 20);
+
+        // Whitespace-only env value is filtered to None.
+        // SAFETY: same scope as above.
+        unsafe {
+            std::env::set_var(ENV, "   ");
+        }
+        let (url, _) = resolve_database_config(None);
+        assert_eq!(url, None);
+
+        // SAFETY: same scope as above; clean up before releasing the lock.
+        unsafe {
+            std::env::remove_var(ENV);
+        }
+    }
+
+    // --- Ollama keep_warm (resolution.rs:625-630) --
+
+    #[test]
+    fn keep_warm_only_on_ollama() {
+        use crate::connections::{
+            AnthropicConnection, BedrockConnection, OllamaConnection, OpenAiConnection,
+        };
+
+        // Ollama with keep_warm set → resolved true.
+        let warm = ConnectionConfig::Ollama(OllamaConnection {
+            keep_warm: Some(true),
+            ..OllamaConnection::default()
+        });
+        assert!(resolve_connection_llm_config(&warm, None).keep_warm);
+
+        // Ollama with keep_warm unset → false.
+        let unset = ConnectionConfig::Ollama(OllamaConnection {
+            keep_warm: None,
+            ..OllamaConnection::default()
+        });
+        assert!(!resolve_connection_llm_config(&unset, None).keep_warm);
+
+        // keep_warm is Ollama-only: every other connector resolves to false,
+        // regardless of any fallback config.
+        for conn in [
+            ConnectionConfig::Anthropic(AnthropicConnection::default()),
+            ConnectionConfig::OpenAi(OpenAiConnection::default()),
+            ConnectionConfig::Bedrock(BedrockConnection::default()),
+        ] {
+            assert!(!resolve_connection_llm_config(&conn, None).keep_warm);
+        }
+    }
+
+    // --- resolve_embeddings_config cross-connector key (resolution.rs:64-70) --
+
+    #[test]
+    fn embeddings_uses_own_env_key_when_connector_differs() {
+        // The `else` arm: when the embeddings connector differs from the LLM
+        // connector, the api_key must come from the embeddings connector's OWN
+        // env key — not be reused from the LLM's secret. Unique connector names
+        // keep the derived env-var names unique, so this needs no env lock.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let emb_connector = format!("testemb{suffix}");
+        let emb_env = default_api_key_env(&emb_connector);
+        let llm_env = format!("TESTLLMKEY{suffix}");
+
+        // SAFETY: env-var names are unique per run; single-threaded test scope.
+        unsafe {
+            std::env::set_var(&emb_env, "embeddings-own-secret");
+            std::env::set_var(&llm_env, "llm-shared-secret");
+        }
+
+        let config: DaemonConfig = toml::from_str(&format!(
+            r#"
+            [llm]
+            connector = "openai"
+            api_key_env = "{llm_env}"
+
+            [embeddings]
+            connector = "{emb_connector}"
+            "#
+        ))
+        .unwrap();
+
+        let view = resolve_embeddings_config(Some(&config));
+        assert_eq!(view.connector, emb_connector);
+        assert_eq!(
+            view.api_key, "embeddings-own-secret",
+            "must read the embeddings connector's own env key"
+        );
+        assert_ne!(
+            view.api_key, "llm-shared-secret",
+            "must NOT reuse the LLM's key when connectors differ"
+        );
+        assert!(view.has_api_key);
+        assert!(!view.is_default);
+
+        // SAFETY: same scope as the matching set_var above.
+        unsafe {
+            std::env::remove_var(&emb_env);
+            std::env::remove_var(&llm_env);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #439 — config views.rs validation + migration edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    // --- set_llm_settings bounds (views.rs:65-79) --
+
+    #[test]
+    fn set_llm_settings_rejects_out_of_range() {
+        let dir = unique_test_dir("da-test-setllm-range");
+        let path = dir.join("daemon.toml");
+
+        // temperature out of [0.0, 2.0].
+        let err =
+            set_llm_settings(&path, "openai", None, None, Some(2.5), None, None, None).unwrap_err();
+        assert!(err.to_string().contains("temperature"), "{err}");
+        assert!(
+            set_llm_settings(&path, "openai", None, None, Some(-0.1), None, None, None).is_err()
+        );
+
+        // top_p out of [0.0, 1.0].
+        let err =
+            set_llm_settings(&path, "openai", None, None, None, Some(1.5), None, None).unwrap_err();
+        assert!(err.to_string().contains("top_p"), "{err}");
+        assert!(
+            set_llm_settings(&path, "openai", None, None, None, Some(-0.01), None, None).is_err()
+        );
+
+        // max_tokens == 0.
+        let err =
+            set_llm_settings(&path, "openai", None, None, None, None, Some(0), None).unwrap_err();
+        assert!(err.to_string().contains("max_tokens"), "{err}");
+
+        // empty connector.
+        assert!(set_llm_settings(&path, "   ", None, None, None, None, None, None).is_err());
+
+        // No rejected call may have persisted anything.
+        assert!(
+            !path.exists(),
+            "rejected settings must not be written to disk"
+        );
+
+        // Valid values round-trip through the read view.
+        set_llm_settings(
+            &path,
+            "anthropic",
+            Some("claude-x"),
+            Some("https://api.anthropic.com"),
+            Some(0.7),
+            Some(0.9),
+            Some(1024),
+            Some(true),
+        )
+        .unwrap();
+        let view = get_llm_settings_view(&path).unwrap();
+        assert_eq!(view.connector, "anthropic");
+        assert_eq!(view.model, "claude-x");
+        assert_eq!(view.base_url, "https://api.anthropic.com");
+        assert_eq!(view.temperature, Some(0.7));
+        assert_eq!(view.top_p, Some(0.9));
+        assert_eq!(view.max_tokens, Some(1024));
+        assert_eq!(view.hosted_tool_search, Some(true));
+
+        // Boundary values are accepted (inclusive ranges).
+        set_llm_settings(
+            &path,
+            "openai",
+            None,
+            None,
+            Some(0.0),
+            Some(0.0),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        set_llm_settings(
+            &path,
+            "openai",
+            None,
+            None,
+            Some(2.0),
+            Some(1.0),
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- set_api_key (views.rs:92-140) --
+
+    #[test]
+    fn set_api_key_rejects_placeholder() {
+        // Empty and masked/placeholder values must be rejected BEFORE any secret
+        // write, so a redacted "sk-****" round-tripped from the UI can't wipe the
+        // stored key. Point the file-backend at a temp dir so the mutation-check
+        // (removing the guard) can't touch the real secret store.
+        let _guard = ws_jwt_env_lock();
+        let dir = unique_test_dir("da-test-setapikey-placeholder");
+        let data_home = dir.join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        // SAFETY: serialized via the shared env lock; unique per-run temp dir.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        let path = dir.join("daemon.toml");
+        std::fs::write(&path, "[llm]\nconnector = \"openai\"\n").unwrap();
+
+        let err = set_api_key(&path, "   ").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+
+        let err = set_api_key(&path, "sk-****").unwrap_err();
+        assert!(err.to_string().contains("placeholder"), "{err}");
+
+        // SAFETY: same scope as the matching set_var above.
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_api_key_empty_connector_uses_default() {
+        // An explicitly-empty `[llm].connector` must fall back to the default
+        // connector before deriving the secret account, so a real key still
+        // persists (under the openai account) instead of erroring or landing
+        // in a garbage bucket. Uses the file backend under a temp XDG dir.
+        let _guard = ws_jwt_env_lock();
+        let dir = unique_test_dir("da-test-setapikey-default");
+        let data_home = dir.join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        // SAFETY: serialized via the shared env lock; unique per-run temp dir.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+
+        let path = dir.join("daemon.toml");
+        std::fs::write(&path, "[llm]\nconnector = \"\"\n").unwrap();
+
+        set_api_key(&path, "sk-live-empty-connector-xyz").expect("set_api_key should succeed");
+
+        // Written under the default connector's account ("openai_api_key").
+        let secret_file = data_home
+            .join("desktop-assistant")
+            .join("secrets")
+            .join("openai_api_key");
+        let stored = std::fs::read_to_string(&secret_file).expect("secret file written");
+        assert_eq!(stored, "sk-live-empty-connector-xyz");
+
+        // SAFETY: same scope as the matching set_var above.
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- set_ws_auth_settings OIDC merge (views.rs:339-380) --
+
+    #[test]
+    fn set_ws_auth_preserves_jwks_and_audience_on_partial_update() {
+        let dir = unique_test_dir("da-test-wsauth-oidc");
+        let path = dir.join("daemon.toml");
+        // Seed a fully-populated OIDC block. `jwks_uri` + `audience` are NOT in
+        // the setter's argument list, so a partial update must preserve them.
+        let content = r#"
+[ws_auth]
+methods = ["oidc"]
+
+[ws_auth.oidc]
+issuer_url = "https://old.example.com"
+authorization_endpoint = "https://old.example.com/auth"
+token_endpoint = "https://old.example.com/token"
+client_id = "old-client"
+scopes = "openid profile"
+jwks_uri = "https://old.example.com/jwks"
+audience = "adelie-aud"
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        // Partial update: new issuer/endpoints, empty scopes (→ keep existing).
+        set_ws_auth_settings(
+            &path,
+            &["oidc".to_string()],
+            "https://new.example.com",
+            "https://new.example.com/auth",
+            "https://new.example.com/token",
+            "new-client",
+            "",
+        )
+        .unwrap();
+
+        let oidc = get_ws_auth_settings(&path)
+            .unwrap()
+            .oidc
+            .expect("oidc block preserved");
+        assert_eq!(oidc.issuer_url, "https://new.example.com");
+        assert_eq!(oidc.client_id, "new-client");
+        assert_eq!(
+            oidc.scopes, "openid profile",
+            "empty scopes must preserve the existing value"
+        );
+        assert_eq!(
+            oidc.jwks_uri, "https://old.example.com/jwks",
+            "jwks_uri must be preserved across a partial update"
+        );
+        assert_eq!(
+            oidc.audience, "adelie-aud",
+            "audience must be preserved across a partial update"
+        );
+
+        // Removing "oidc" from methods clears the block entirely.
+        set_ws_auth_settings(
+            &path,
+            &["password".to_string()],
+            "https://new.example.com",
+            "",
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        assert!(
+            get_ws_auth_settings(&path).unwrap().oidc.is_none(),
+            "oidc must be cleared when the method is removed"
+        );
+
+        // "oidc" present but empty issuer → no block created.
+        set_ws_auth_settings(&path, &["oidc".to_string()], "", "", "", "", "").unwrap();
+        assert!(
+            get_ws_auth_settings(&path).unwrap().oidc.is_none(),
+            "empty issuer must not create an oidc block"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- migration Case C: different connector, no model (migration.rs:221-233) --
+
+    #[test]
+    fn migration_synthesizes_default_model_for_backend_connector() {
+        // Case C with NO explicit backend model: the different-connector branch
+        // must fall back to `default_backend_llm_model(bt_connector)`, not leave
+        // the purpose model unset. The existing different-connector test always
+        // pins a model, so this `(Named, None)` arm was unexecuted.
+        let dir = unique_test_dir("da-test-mig-case-c-default-model");
+        let path = dir.join("daemon.toml");
+        let legacy = r#"[llm]
+connector = "openai"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-5.4"
+
+[backend_tasks]
+dreaming_enabled = true
+
+[backend_tasks.llm]
+connector = "anthropic"
+"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        // A second connection was synthesized for the different connector.
+        let backend = loaded
+            .connections
+            .get("backend")
+            .expect("synthesized backend connection");
+        assert_eq!(backend.connector_type(), "anthropic");
+
+        // Dreaming/titling point at it with the anthropic *backend* default model.
+        let dreaming = loaded.purposes.get(PurposeKind::Dreaming).unwrap();
+        assert_eq!(dreaming.connection.to_string(), "backend");
+        assert_eq!(dreaming.model.to_string(), "claude-haiku-4-5-20251001");
+        let titling = loaded.purposes.get(PurposeKind::Titling).unwrap();
+        assert_eq!(titling.model.to_string(), "claude-haiku-4-5-20251001");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- migration pick_free_connection_id collision (migration.rs:285) --
+
+    #[test]
+    fn migration_avoids_clobbering_existing_backend_connection() {
+        // A legacy config that already declares `[connections.backend]` must not
+        // have it overwritten when purpose-migration synthesizes a backend
+        // connection for a different-connector `[backend_tasks.llm]`. The
+        // collision resolver picks `backend_2` instead — no data loss.
+        let dir = unique_test_dir("da-test-mig-backend-collision");
+        let path = dir.join("daemon.toml");
+        let legacy = r#"[llm]
+connector = "openai"
+model = "gpt-5.4"
+
+[connections.backend]
+type = "ollama"
+base_url = "http://user-authored:11434"
+
+[backend_tasks]
+dreaming_enabled = true
+
+[backend_tasks.llm]
+connector = "anthropic"
+model = "claude-haiku-4-5-20251001"
+"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        // Exactly two connections: the user's `backend` + the synthesized one.
+        assert_eq!(loaded.connections.len(), 2);
+
+        // The user's original `backend` connection is untouched (still ollama).
+        let original = loaded
+            .connections
+            .get("backend")
+            .expect("original backend preserved");
+        assert_eq!(
+            original.connector_type(),
+            "ollama",
+            "user-authored backend connection must not be clobbered"
+        );
+
+        // The synthesized backend connection landed at `backend_2`.
+        let synthesized = loaded
+            .connections
+            .get("backend_2")
+            .expect("synthesized backend_2 connection");
+        assert_eq!(synthesized.connector_type(), "anthropic");
+
+        // Dreaming points at the synthesized connection, not the user's.
+        let dreaming = loaded.purposes.get(PurposeKind::Dreaming).unwrap();
+        assert_eq!(dreaming.connection.to_string(), "backend_2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
