@@ -3731,13 +3731,29 @@ mod tests {
     }
 
     #[test]
-    fn user_visible_error_for_overloaded_529() {
-        let err = CoreError::RateLimited {
-            retry_after: None,
-            detail: "overloaded".into(),
-        };
+    fn user_visible_error_for_overloaded_529_uses_generic_fallback() {
+        // Repaired (issue #441): the prior version built `CoreError::RateLimited`
+        // and asserted the rate-limit message — byte-for-byte the same arm as
+        // `user_visible_error_for_rate_limit_429`, so it proved nothing new. A
+        // 529 "overloaded" is a *transient* server error: `error_classify` maps
+        // "overloaded" to `NormalizedCause::Transient`, which `cause_to_core_error`
+        // leaves unmapped, so it surfaces as a bare `CoreError::Llm` and lands on
+        // the generic fallback arm — NOT the rate-limit arm. This asserts that
+        // distinct arm.
+        let err = CoreError::Llm("Overloaded (529): the model is overloaded".into());
         let msg = user_visible_llm_error_message(&err);
-        assert!(msg.contains("rate limit was exceeded"));
+        assert!(
+            msg.contains("LLM backend error"),
+            "a 529/overloaded transient error must use the generic fallback, got: {msg}"
+        );
+        assert!(
+            msg.contains("overloaded"),
+            "the underlying detail must be surfaced"
+        );
+        assert!(
+            !msg.contains("rate limit was exceeded"),
+            "must NOT reuse the rate-limit (429) arm"
+        );
     }
 
     #[test]
@@ -4669,7 +4685,10 @@ mod tests {
         // A modest fill well under the 0.85 line: report used/budget verbatim,
         // compaction not active.
         let reports = capture_context_usage(12_000, 32_000, 4).await;
-        assert_eq!(reports.len(), 1, "exactly one usage report per turn");
+        // One report for THIS single-round turn. Per-round cadence (a turn with
+        // N tool rounds emits N reports) is covered by
+        // `multi_round_turn_emits_one_usage_report_per_round`.
+        assert_eq!(reports.len(), 1, "one usage report for a single-round turn");
         let r = reports[0];
         assert_eq!(r.used_tokens, 12_000);
         assert_eq!(r.budget_tokens, 32_000);
@@ -5913,6 +5932,596 @@ mod tests {
         assert!(
             !no_scope.contains(REFINEMENT_MARKER),
             "no refinement marker should leak into the baseline prompt"
+        );
+    }
+
+    // ================================================================
+    // Round-loop fallback/branch coverage (issue #441).
+    // ================================================================
+
+    /// A batch of tool calls in one assistant turn where the middle call has
+    /// malformed JSON arguments: the parse error must be folded into a
+    /// `tool_result` for *that* call while the good calls on either side still
+    /// execute and pair. Guards the `continue` at the parse-error arm — a
+    /// `break`/`return` there would strand the later calls unpaired (a provider
+    /// 400) and skip real tool work.
+    #[tokio::test]
+    async fn malformed_arg_in_batch_still_pairs_all_calls() {
+        let tool_def = ToolDefinition::new("read_file", "Read", serde_json::json!({}));
+        let good1 = ToolCall::new("c1", "read_file", r#"{"path":"/a"}"#);
+        let bad = ToolCall::new("c2", "read_file", "{ this is not json");
+        let good2 = ToolCall::new("c3", "read_file", r#"{"path":"/b"}"#);
+
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![good1, bad, good2]),
+            LlmResponse::text("done"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("read_file".to_string(), "content".to_string());
+
+        let handler = make_tool_handler(responses, vec![tool_def], tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "done");
+
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let tool_msg = |id: &str| {
+            updated
+                .messages
+                .iter()
+                .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("a tool_result must be paired for {id}"))
+                .content
+                .clone()
+        };
+        // All three calls paired.
+        assert_eq!(tool_msg("c1"), "content", "first good call must execute");
+        assert!(
+            tool_msg("c2").contains("not valid JSON"),
+            "malformed call must surface a parse error, got: {}",
+            tool_msg("c2")
+        );
+        assert_eq!(
+            tool_msg("c3"),
+            "content",
+            "the good call AFTER the malformed one must still execute"
+        );
+    }
+
+    /// After a tool round that yields empty visible text, the loop substitutes a
+    /// fixed "tools returned errors" recovery message — but ONLY when `round >
+    /// 0`. An empty text-only reply on round 0 stays empty.
+    #[tokio::test]
+    async fn empty_after_tool_round_uses_canned_text() {
+        // Case A: empty text on round 1 (after a tool round) → canned recovery.
+        let tool_def = ToolDefinition::new("t", "T", serde_json::json!({}));
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "t", "{}")]),
+            LlmResponse::text(""), // empty visible text on round 1
+        ];
+        let mut tr = HashMap::new();
+        tr.insert("t".to_string(), "ran".to_string());
+        let handler = make_tool_handler(responses, vec![tool_def], tr);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert!(
+            result.contains("tools I tried") && result.contains("returned errors"),
+            "empty text after a tool round must use the canned recovery message, got: {result:?}"
+        );
+
+        // Case B: empty text on round 0 (no prior tool round) stays empty.
+        let handler0 = make_handler(vec![]); // MockLlm returns "" for empty chunks
+        let conv0 = handler0
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let result0 = handler0
+            .send_prompt(&conv0.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(
+            result0, "",
+            "an empty reply on round 0 must stay empty, not use the canned text"
+        );
+    }
+
+    /// PINS CURRENT BEHAVIOUR (possible data-loss defect — see PR #445 design
+    /// triage). When the tool loop exhausts `MAX_TOOL_ROUNDS`, it returns
+    /// `Err(Llm(..))` WITHOUT a `store.update`, so the user's prompt and all the
+    /// turn's tool churn are discarded — unlike the non-context-error path,
+    /// which persists a friendly assistant message. This test documents that
+    /// the persisted conversation is left EMPTY after exhaustion.
+    #[tokio::test]
+    async fn max_rounds_exhaustion_persistence() {
+        let tools = vec![ToolDefinition::new(
+            "loop_tool",
+            "Loops",
+            serde_json::json!({}),
+        )];
+        let responses: Vec<LlmResponse> = (0..MAX_TOOL_ROUNDS + 1)
+            .map(|i| {
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(format!("c{i}"), "loop_tool", "{}")],
+                )
+            })
+            .collect();
+        let mut tool_results = HashMap::new();
+        tool_results.insert("loop_tool".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let result = handler
+            .send_prompt(
+                &conv.id,
+                "loop forever".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await;
+        assert!(matches!(result, Err(CoreError::Llm(_))));
+
+        // The data-loss: nothing this turn was persisted. The user's prompt and
+        // every tool result are gone — the stored conversation is still empty.
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            persisted.messages.is_empty(),
+            "PINNED: exhaustion discards the whole turn; expected 0 persisted \
+             messages (the user prompt itself is lost), got {}",
+            persisted.messages.len()
+        );
+        assert!(
+            !persisted
+                .messages
+                .iter()
+                .any(|m| m.content == "loop forever"),
+            "the user's prompt must be absent under the current (lossy) behaviour"
+        );
+    }
+
+    /// A connector that supports hosted tool search but returns text-only on an
+    /// early round is demoted to `builtin_tool_search` with a one-shot system
+    /// nudge — but the demotion is gated to `round < 2`. Asserts both: the nudge
+    /// is injected on a round-0 text-only reply, and no demotion happens when a
+    /// text-only reply first arrives on round 2+.
+    #[tokio::test]
+    async fn hosted_search_demotion_injects_nudge_and_gates_round() {
+        // A hosted-search-capable LLM that replays a scripted response list.
+        struct HostedSearchLlm {
+            responses: Mutex<Vec<LlmResponse>>,
+        }
+        #[async_trait::async_trait]
+        impl LlmClient for HostedSearchLlm {
+            fn supports_hosted_tool_search(&self) -> bool {
+                true
+            }
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                mut on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                let resp = {
+                    let mut r = self.responses.lock().unwrap();
+                    if r.is_empty() {
+                        return Ok(LlmResponse::text("fallback"));
+                    }
+                    r.remove(0)
+                };
+                if !resp.text.is_empty() {
+                    on_chunk(resp.text.clone());
+                }
+                Ok(resp)
+            }
+        }
+
+        // 2-tool namespace (<=10 → no categorization LLM call), so hosted
+        // search is active with a non-empty namespace set.
+        fn ns() -> Vec<ToolNamespace> {
+            vec![ToolNamespace::new(
+                "grp",
+                "a group",
+                vec![
+                    ToolDefinition::new("ns_tool_a", "a", serde_json::json!({})),
+                    ToolDefinition::new("ns_tool_b", "b", serde_json::json!({})),
+                ],
+            )]
+        }
+        const NUDGE: &str = "server-side tool search was unable";
+
+        // --- Case 1: round-0 text-only → demote + inject nudge. ---
+        let llm = HostedSearchLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::text("thinking out loud"), // round 0 text-only
+                LlmResponse::text("final answer"),      // round 1 (demoted)
+            ]),
+        };
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            NamespacedToolExecutor::new(ns()),
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let result = handler
+            .send_prompt(&conv.id, "help".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "final answer");
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            updated
+                .messages
+                .iter()
+                .any(|m| m.role == Role::System && m.content.contains(NUDGE)),
+            "a demotion nudge must be injected on an early text-only round"
+        );
+        // The pre-demotion assistant text is kept for context.
+        assert!(
+            updated
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content == "thinking out loud"),
+            "the pre-demotion assistant text must be preserved"
+        );
+
+        // --- Case 2: text-only first arrives on round 2 → NO demotion. ---
+        // Rounds 0 and 1 make tool calls (so they're never text-only and never
+        // demote); the text-only reply lands on round 2, where `round < 2` is
+        // false, so no nudge is injected.
+        let llm2 = HostedSearchLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t0", "ns_tool_a", "{}")]),
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "ns_tool_a", "{}")]),
+                LlmResponse::text("done late"),
+            ]),
+        };
+        let handler2 = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm2,
+            NamespacedToolExecutor::new(ns()),
+            id_gen(),
+        );
+        let conv2 = handler2
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let result2 = handler2
+            .send_prompt(&conv2.id, "help".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result2, "done late");
+        let updated2 = handler2.get_conversation(&conv2.id).await.unwrap();
+        assert!(
+            !updated2.messages.iter().any(|m| m.content.contains(NUDGE)),
+            "no demotion nudge when the text-only reply first arrives on round 2+"
+        );
+    }
+
+    /// Cooperative-cancel conversion (issue #109): a connector that returns
+    /// `Ok(partial)` because its chunk callback returned `false` after
+    /// cancellation must still surface `Cancelled` at the post-stream
+    /// `bail_if_cancelled()` — and the partial assistant text must NOT leak into
+    /// history. All the other cancel tests use `Err(Cancelled)` directly; this
+    /// exercises the `Ok`-then-bail conversion.
+    #[tokio::test]
+    async fn ok_partial_after_cancel_becomes_cancelled() {
+        // Cancels the ambient turn token from inside the stream (simulating the
+        // adapter observing cancellation) and then returns Ok with partial text.
+        struct OkPartialThenCancelLlm;
+        #[async_trait::async_trait]
+        impl LlmClient for OkPartialThenCancelLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                mut on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                if let Some(token) = current_cancellation_token() {
+                    token.cancel();
+                }
+                // The real adapter would see this return `false` and stop; we
+                // still hand back what was streamed so far as `Ok`.
+                let _ = on_chunk("partial ".to_string());
+                Ok(LlmResponse::text("partial text"))
+            }
+        }
+
+        let handler = ConversationHandler::new(MockStore::new(), OkPartialThenCancelLlm, id_gen());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let result = crate::ports::llm::with_cancellation_token(
+            token,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "an Ok(partial) after cancellation must convert to Cancelled, got {result:?}"
+        );
+        // The partial text must not have been persisted.
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            !persisted
+                .messages
+                .iter()
+                .any(|m| m.content.contains("partial")),
+            "partial post-cancel text must not leak into history, got {:?}",
+            persisted.messages
+        );
+    }
+
+    /// `step_stack.clear()` after overflow recovery (issue #240 / #441): a
+    /// `begin_step` then an in-turn ContextOverflow recovery (which can drain
+    /// messages and invalidate the frame's absolute watermark) must drop the
+    /// step frames, so a later `complete_step` finds NO active step and does not
+    /// evict via a stale watermark. Without the `clear()`, `complete_step` would
+    /// pop the frame and act on the now-invalid watermark.
+    #[tokio::test]
+    async fn overflow_recovery_invalidates_step_watermarks() {
+        // A scripted LLM that can inject a ContextOverflow on a chosen call.
+        enum Step {
+            Resp(LlmResponse),
+            Overflow,
+        }
+        struct ScriptedOverflowLlm {
+            steps: Mutex<Vec<Step>>,
+        }
+        #[async_trait::async_trait]
+        impl LlmClient for ScriptedOverflowLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                mut on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                let step = {
+                    let mut s = self.steps.lock().unwrap();
+                    if s.is_empty() {
+                        return Ok(LlmResponse::text("fallback"));
+                    }
+                    s.remove(0)
+                };
+                match step {
+                    Step::Overflow => Err(CoreError::ContextOverflow {
+                        prompt_tokens: Some(203_524),
+                        max_tokens: Some(200_000),
+                        detail: "prompt is too long".into(),
+                    }),
+                    Step::Resp(r) => {
+                        if !r.text.is_empty() {
+                            on_chunk(r.text.clone());
+                        }
+                        Ok(r)
+                    }
+                }
+            }
+        }
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let llm = ScriptedOverflowLlm {
+            steps: Mutex::new(vec![
+                Step::Resp(LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new("b1", "begin_step", r#"{"goal":"do work"}"#)],
+                )),
+                Step::Overflow, // triggers recover_from_overflow + step_stack.clear()
+                Step::Resp(LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new("c1", "complete_step", "{}")],
+                )),
+                Step::Resp(LlmResponse::text("all done")),
+            ]),
+        };
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        // Prime several small tool-pair groups so: (a) is_first_message is
+        // false (no title call), and (b) overflow-recovery step 2 trims the
+        // oldest pairs, actually draining messages and shifting watermarks.
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for i in 0..3 {
+            stored
+                .messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("p{i}"),
+                    "prior",
+                    "{}",
+                )]));
+            stored
+                .messages
+                .push(Message::tool_result(format!("p{i}"), "ok"));
+        }
+        handler.store.update(stored).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "all done");
+
+        // The complete_step ack must report NO active step: the frame was
+        // cleared by overflow recovery, so it neither marked a todo done nor
+        // evicted via the stale watermark.
+        let updated = handler.get_conversation(&conv.id).await.unwrap();
+        let complete_ack = updated
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c1"))
+            .expect("complete_step ack must be recorded")
+            .content
+            .clone();
+        assert!(
+            complete_ack.contains("no active step to complete"),
+            "after overflow recovery cleared the stack, complete_step must find no \
+             active step (got: {complete_ack})"
+        );
+    }
+
+    /// Context-usage cadence across a multi-round turn: every round that reports
+    /// usage emits exactly one usage report (so a 2-round turn emits 2), and
+    /// `compaction_active` is per-round — false on an early below-threshold
+    /// round, true on a later round that crosses the threshold and shrinks.
+    #[tokio::test]
+    async fn multi_round_turn_emits_one_usage_report_per_round() {
+        use crate::ports::llm::{
+            ContextUsage, ContextUsageSink, with_context_budget, with_context_usage_sink,
+        };
+
+        // A tool-calling LLM that attaches per-call usage. Auxiliary calls
+        // (summary/title) return a canned response WITHOUT consuming the script.
+        struct MultiRoundUsageLlm {
+            script: Mutex<Vec<(LlmResponse, u64)>>,
+        }
+        #[async_trait::async_trait]
+        impl LlmClient for MultiRoundUsageLlm {
+            async fn stream_completion(
+                &self,
+                messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                mut on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                let is_aux = messages.iter().any(|m| {
+                    matches!(m.role, Role::System)
+                        && (m.content.contains("conversation summarizer")
+                            || m.content.contains("channel name"))
+                });
+                if is_aux {
+                    return Ok(LlmResponse::text("aux"));
+                }
+                let (resp, tokens) = {
+                    let mut s = self.script.lock().unwrap();
+                    if s.is_empty() {
+                        return Ok(LlmResponse::text("fallback"));
+                    }
+                    s.remove(0)
+                };
+                if !resp.text.is_empty() {
+                    on_chunk(resp.text.clone());
+                }
+                let usage = TokenUsage {
+                    input_tokens: Some(tokens),
+                    output_tokens: Some(1),
+                    ..Default::default()
+                };
+                Ok(resp.with_usage(usage))
+            }
+        }
+
+        let budget_max = 32_000u64; // threshold = 0.85 * 32_000 = 27_200
+        let llm = MultiRoundUsageLlm {
+            script: Mutex::new(vec![
+                // Round 0: tool call, below threshold → no compaction.
+                (
+                    LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "noop", "{}")]),
+                    12_000,
+                ),
+                // Round 1: text, above threshold → window shrinks → compaction.
+                (LlmResponse::text("final"), 40_000),
+            ]),
+        };
+        let mut tool_results = HashMap::new();
+        tool_results.insert("noop".to_string(), "ok".to_string());
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(
+                vec![ToolDefinition::new("noop", "N", serde_json::json!({}))],
+                tool_results,
+            ),
+            id_gen(),
+        );
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        // Prime 30 messages: below MAX_CONTEXT_MESSAGES (40) so no top-of-turn
+        // compaction, but above the shrunk window (20) so round 1 can compact.
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for i in 0..30 {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            stored.messages.push(Message::new(role, format!("m-{i}")));
+        }
+        handler.store.update(stored).await.unwrap();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_sink = Arc::clone(&captured);
+        let sink: ContextUsageSink = Arc::new(move |u: ContextUsage| {
+            captured_for_sink.lock().unwrap().push(u);
+        });
+        let budget = ContextBudget {
+            max_input_tokens: budget_max,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            with_context_usage_sink(sink, async {
+                handler
+                    .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                    .await
+                    .unwrap();
+            })
+            .await
+        })
+        .await;
+
+        let reports = captured.lock().unwrap().clone();
+        assert_eq!(
+            reports.len(),
+            2,
+            "a 2-round turn must emit one usage report PER ROUND, got {reports:?}"
+        );
+        assert_eq!(reports[0].used_tokens, 12_000);
+        assert!(
+            !reports[0].compaction_active,
+            "round 0 is below threshold → compaction not active"
+        );
+        assert_eq!(reports[1].used_tokens, 40_000);
+        assert!(
+            reports[1].compaction_active,
+            "round 1 crosses the threshold and shrinks the window → compaction active"
         );
     }
 }
