@@ -2,7 +2,7 @@ use crate::CoreError;
 use crate::context::{
     COMPACTION_TOKEN_RATIO, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
     MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolContext, ToolLocalityContext, TurnAnchors,
-    cap_tool_result, compaction_range, generate_context_summary, llm_messages_for_turn_with_plan,
+    assemble_turn_within_budget, cap_tool_result, compaction_range, generate_context_summary,
     recover_from_overflow,
 };
 use crate::domain::{
@@ -769,7 +769,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let is_first_message = conv.messages.is_empty();
         conv.messages.push(Message::new(Role::User, &prompt));
         // Capture the prompt as the active-task anchor for this turn. It is
-        // re-injected in `llm_messages_for_turn` when conditions indicate
+        // re-injected in `assemble_turn` when conditions indicate
         // the original message has drifted out of the model's view.
         conv.active_task = Some(prompt.clone());
 
@@ -1043,7 +1043,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
-            let llm_messages = llm_messages_for_turn_with_plan(
+            let llm_messages = assemble_turn_within_budget(
                 &ConversationView {
                     messages: &conv.messages,
                     summaries: &conv.summaries,

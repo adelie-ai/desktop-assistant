@@ -3,7 +3,7 @@
 //! This module groups three related concerns that conspire to keep the
 //! prompt under the model's input-token budget:
 //!
-//! - **Assembly** ([`llm_messages_for_turn`], [`assemble_messages_inner`]):
+//! - **Assembly** ([`assemble_turn_within_budget`], [`assemble_turn`]):
 //!   Builds the per-turn `Vec<Message>` from conversation history,
 //!   summaries, tool definitions, and the active-task anchor — applying
 //!   pre-flight token-budget checks and shrinking the window when the
@@ -139,7 +139,7 @@ const SYSTEM_BLOCK_BUDGET_RATIO: f64 = 0.20;
 const ACTIVE_TASK_ROUND_THRESHOLD: u32 = 5;
 
 /// Maximum number of pre-flight shrink iterations attempted by
-/// [`llm_messages_for_turn`] when the assembled prompt exceeds the budget.
+/// [`assemble_turn_within_budget`] when the assembled prompt exceeds the budget.
 /// Why bounded: each iteration halves the message window, so 5 iterations
 /// already drop the count by 32x — enough to reach [`MIN_CONTEXT_MESSAGES`]
 /// from any plausible starting point. The bound also guarantees termination
@@ -200,7 +200,7 @@ pub(crate) struct TurnAnchors<'a> {
 /// `[Now]` line, and any one-turn system-prompt refinement. These previously
 /// arrived three different ways (two task-locals read deep inside assembly,
 /// one threaded parameter). Grouped here and read once at the wrapper boundary
-/// via [`AmbientContext::current`] so [`assemble_messages_inner`] is a pure
+/// via [`AmbientContext::current`] so [`assemble_turn`] is a pure
 /// function of its inputs.
 #[derive(Clone, Default)]
 pub(crate) struct AmbientContext {
@@ -230,7 +230,7 @@ impl AmbientContext {
 /// Build the message list for a single turn, optionally enforcing a
 /// pre-flight token budget by shrinking the window before any LLM call.
 ///
-/// Why a separate wrapper around [`assemble_messages_inner`]: assembly is
+/// Why a separate wrapper around [`assemble_turn`]: assembly is
 /// pure — given the same inputs it returns the same `Vec<Message>` — but
 /// budget enforcement is iterative (try, measure, halve, retry). Splitting
 /// keeps the inner builder simple and lets the test suite call it directly
@@ -247,7 +247,7 @@ impl AmbientContext {
 /// When `budget` is `None`, the wrapper performs a single assembly pass —
 /// preserving pre-#65 behaviour for tests and background jobs that don't
 /// route through the daemon's dispatch wrapper.
-pub(crate) fn llm_messages_for_turn_with_plan(
+pub(crate) fn assemble_turn_within_budget(
     conversation: &ConversationView,
     tools: &ToolContext,
     anchors: &TurnAnchors,
@@ -256,7 +256,7 @@ pub(crate) fn llm_messages_for_turn_with_plan(
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
     // Read the per-turn ambient context (personality, `[Now]` line, refinement)
-    // once at this boundary. Passing it in keeps `assemble_messages_inner` a
+    // once at this boundary. Passing it in keeps `assemble_turn` a
     // pure function of its inputs, so the shrink loop's repeat passes stay
     // deterministic.
     let ambient = AmbientContext::current();
@@ -265,7 +265,7 @@ pub(crate) fn llm_messages_for_turn_with_plan(
     // across the shrink loop is `max_messages`, so everything else is captured
     // once here and the two call sites collapse to `assemble(current_max)`.
     let assemble = |max: usize| {
-        assemble_messages_inner(
+        assemble_turn(
             conversation,
             tools,
             anchors,
@@ -552,7 +552,7 @@ fn assemble_for_test(
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
-    llm_messages_for_turn_with_plan(
+    assemble_turn_within_budget(
         conversation,
         tools,
         anchors,
@@ -713,7 +713,7 @@ fn assemble_system_instruction(tool_note: String, ambient: &AmbientContext) -> S
     prompts::assemble(&sections)
 }
 
-fn assemble_messages_inner(
+fn assemble_turn(
     conversation: &ConversationView,
     tools: &ToolContext,
     anchors: &TurnAnchors,
@@ -1888,7 +1888,7 @@ mod tests {
     // --- Pure assembly tests (issue #65 + earlier) ---
 
     #[test]
-    fn llm_messages_for_turn_returns_all_when_under_limit() {
+    fn assemble_turn_returns_all_when_under_limit() {
         let msgs: Vec<Message> = (0..10)
             .map(|i| {
                 if i % 2 == 0 {
@@ -1917,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_windows_when_over_limit() {
+    fn assemble_turn_windows_when_over_limit() {
         // Build a conversation larger than MAX_CONTEXT_MESSAGES, using
         // simple User/Assistant alternation so the cut lands exactly.
         let count = MAX_CONTEXT_MESSAGES + 20;
@@ -1951,7 +1951,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_snaps_to_user_boundary() {
+    fn assemble_turn_snaps_to_user_boundary() {
         // Simulate a conversation where the naive cut point would land in
         // the middle of a tool-call/result group.
         let mut msgs = Vec::new();
@@ -2212,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_injects_summary_when_windowing() {
+    fn assemble_turn_injects_summary_when_windowing() {
         let count = MAX_CONTEXT_MESSAGES + 20;
         let msgs: Vec<Message> = (0..count)
             .map(|i| {
@@ -2252,7 +2252,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_omits_summary_when_under_limit() {
+    fn assemble_turn_omits_summary_when_under_limit() {
         let msgs: Vec<Message> = (0..10)
             .map(|i| {
                 if i % 2 == 0 {
@@ -2286,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_omits_empty_summary_when_windowing() {
+    fn assemble_turn_omits_empty_summary_when_windowing() {
         let count = MAX_CONTEXT_MESSAGES + 20;
         let msgs: Vec<Message> = (0..count)
             .map(|i| {
@@ -2644,7 +2644,7 @@ mod tests {
     // --- Message summary (collapsing) tests ---
 
     #[test]
-    fn llm_messages_for_turn_collapses_summarized_range() {
+    fn assemble_turn_collapses_summarized_range() {
         let mut msgs = vec![
             Message::new(Role::User, "start"),
             Message::new(Role::Assistant, "step 1"),
@@ -2687,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_no_summaries_passes_through() {
+    fn assemble_turn_no_summaries_passes_through() {
         let msgs = vec![
             Message::new(Role::User, "hi"),
             Message::new(Role::Assistant, "hello"),
@@ -2710,7 +2710,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_multiple_summaries() {
+    fn assemble_turn_multiple_summaries() {
         let mut msgs = vec![
             Message::new(Role::User, "start"),
             Message::new(Role::Assistant, "a1"),
@@ -2758,7 +2758,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_renders_absolute_ordinals_when_windowed() {
+    fn assemble_turn_renders_absolute_ordinals_when_windowed() {
         // Build a long conversation so windowing kicks in. Messages
         // alternate User/Assistant so window_start can land on a User.
         // We tag a contiguous run that survives the window; the rendered
@@ -2813,7 +2813,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_messages_for_turn_skips_summary_when_all_tagged_messages_outside_window() {
+    fn assemble_turn_skips_summary_when_all_tagged_messages_outside_window() {
         // Tag only messages that the window will exclude. With no tagged
         // message in the window, there's no anchor at which to inject the
         // summary, so it must not appear at all.
