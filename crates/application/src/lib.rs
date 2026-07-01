@@ -602,6 +602,12 @@ where
                 desktop_assistant_core::ports::session::current_session_id()
                     .as_str()
                     .to_string(),
+                // #432: capture the origin's user so fan-out only reaches this
+                // user's other connections, never a different tenant that
+                // subscribed to the conversation id.
+                desktop_assistant_core::ports::auth::current_user_id()
+                    .as_str()
+                    .to_string(),
             )),
             None => sink,
         }
@@ -4278,14 +4284,18 @@ mod tests {
 
         // A viewer connection looking at c1, on a different session than the
         // sender (whose session is "unscoped" with no `with_session_id` scope).
+        // The turn runs without a user scope, so the origin's user is the
+        // sentinel "default" (#432); register the viewers under the same user so
+        // fan-out reaches them (a different user would be filtered out — see the
+        // dedicated cross-user test in conversation_subs).
         let viewer = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
-        subs.register("viewer-session", viewer.clone());
+        subs.register("viewer-session", "default", viewer.clone());
         subs.set_subscriptions("viewer-session", vec!["c1".to_string()]);
 
         // A connection registered under the SENDER's own session, also viewing
         // c1 — it must NOT be fanned its own turn.
         let self_view = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
-        subs.register("unscoped", self_view.clone());
+        subs.register("unscoped", "default", self_view.clone());
         subs.set_subscriptions("unscoped", vec!["c1".to_string()]);
 
         let h = DefaultAssistantApiHandler::new(

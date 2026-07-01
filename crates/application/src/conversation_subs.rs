@@ -38,6 +38,13 @@ struct Inner {
     /// Per-session set of subscribed conversation ids (what each connection is
     /// viewing). Set-replaced wholesale by `SubscribeConversations`.
     subscribed: HashMap<String, HashSet<String>>,
+    /// Per-session owning `user_id`. Fan-out only ever delivers a turn's
+    /// events to sessions belonging to the SAME user as the turn's origin
+    /// (#432) — subscribing to a conversation id is not authorization to
+    /// receive its content. Without this, a session could subscribe to
+    /// another user's conversation UUID and receive its `AssistantDelta` /
+    /// `AssistantCompleted` (full message content).
+    users: HashMap<String, String>,
 }
 
 impl ConversationSubscriptions {
@@ -45,18 +52,23 @@ impl ConversationSubscriptions {
         Self::default()
     }
 
-    /// Register a connection's outbound sink, on connect. Idempotent.
-    pub fn register(&self, session_id: &str, sink: Arc<dyn EventSink>) {
+    /// Register a connection's outbound sink and owning `user_id`, on connect.
+    /// Idempotent. The `user_id` scopes fan-out so a turn's events never reach
+    /// a different user's connection (#432).
+    pub fn register(&self, session_id: &str, user_id: &str, sink: Arc<dyn EventSink>) {
         let mut inner = self.lock();
         inner.sinks.insert(session_id.to_string(), sink);
+        inner.users.insert(session_id.to_string(), user_id.to_string());
     }
 
-    /// Drop a connection on disconnect: forget its sink and its subscriptions so
-    /// the maps stay bounded by live connections and no dead sink is routed to.
+    /// Drop a connection on disconnect: forget its sink, subscriptions, and
+    /// user mapping so the maps stay bounded by live connections and no dead
+    /// sink is routed to.
     pub fn unregister(&self, session_id: &str) {
         let mut inner = self.lock();
         inner.sinks.remove(session_id);
         inner.subscribed.remove(session_id);
+        inner.users.remove(session_id);
     }
 
     /// Set-replace the conversations a connection is viewing. An empty list
@@ -71,13 +83,26 @@ impl ConversationSubscriptions {
     }
 
     /// Fan `event` (belonging to `conversation_id`) to every OTHER connection
-    /// subscribed to that conversation. The origin is excluded — it receives the
-    /// event via its own per-request sink. Best-effort: a sink whose connection
-    /// has gone simply fails its emit and is cleaned up on disconnect.
-    pub async fn route(&self, conversation_id: &str, event: &api::Event, origin_session: &str) {
+    /// subscribed to that conversation AND owned by the same user as the turn's
+    /// origin (`origin_user`). The origin is excluded — it receives the event
+    /// via its own per-request sink. Best-effort: a sink whose connection has
+    /// gone simply fails its emit and is cleaned up on disconnect.
+    ///
+    /// The `origin_user` filter is the authorization boundary (#432): a
+    /// conversation is owned by exactly one user, and the origin runs the turn
+    /// under its own user scope on its own conversation, so "same user as the
+    /// origin" is precisely "allowed to see this conversation". A session that
+    /// merely subscribed to a foreign conversation UUID is not delivered to.
+    pub async fn route(
+        &self,
+        conversation_id: &str,
+        event: &api::Event,
+        origin_session: &str,
+        origin_user: &str,
+    ) {
         // Snapshot the target sinks under the lock, then release it before the
         // async emits so a slow/contended emit never holds the registry lock.
-        let targets = self.subscribers_except(conversation_id, origin_session);
+        let targets = self.subscribers_except(conversation_id, origin_session, origin_user);
         for sink in targets {
             let _ = sink.emit(event.clone()).await;
         }
@@ -87,13 +112,18 @@ impl ConversationSubscriptions {
         &self,
         conversation_id: &str,
         origin_session: &str,
+        origin_user: &str,
     ) -> Vec<Arc<dyn EventSink>> {
         let inner = self.lock();
         inner
             .subscribed
             .iter()
             .filter(|(session, convs)| {
-                session.as_str() != origin_session && convs.contains(conversation_id)
+                session.as_str() != origin_session
+                    && convs.contains(conversation_id)
+                    // #432: only deliver to sessions owned by the same user as
+                    // the origin. A subscription is not authorization.
+                    && inner.users.get(*session).map(String::as_str) == Some(origin_user)
             })
             .filter_map(|(session, _)| inner.sinks.get(session).cloned())
             .collect()
@@ -142,6 +172,7 @@ pub struct FanOutSink {
     inner: Arc<dyn EventSink>,
     subscriptions: Arc<ConversationSubscriptions>,
     origin_session: String,
+    origin_user: String,
 }
 
 impl FanOutSink {
@@ -149,11 +180,13 @@ impl FanOutSink {
         inner: Arc<dyn EventSink>,
         subscriptions: Arc<ConversationSubscriptions>,
         origin_session: String,
+        origin_user: String,
     ) -> Self {
         Self {
             inner,
             subscriptions,
             origin_session,
+            origin_user,
         }
     }
 }
@@ -163,7 +196,12 @@ impl EventSink for FanOutSink {
     async fn emit(&self, event: api::Event) -> bool {
         if let Some(conversation_id) = turn_event_conversation_id(&event) {
             self.subscriptions
-                .route(conversation_id, &event, &self.origin_session)
+                .route(
+                    conversation_id,
+                    &event,
+                    &self.origin_session,
+                    &self.origin_user,
+                )
                 .await;
         }
         self.inner.emit(event).await
@@ -199,10 +237,10 @@ mod tests {
     async fn routes_to_other_subscribers_of_the_conversation() {
         let subs = ConversationSubscriptions::new();
         let viewer = Arc::new(RecordingSink::default());
-        subs.register("viewer", viewer.clone());
+        subs.register("viewer", "alice", viewer.clone());
         subs.set_subscriptions("viewer", vec!["c1".into()]);
 
-        subs.route("c1", &delta("c1"), "origin").await;
+        subs.route("c1", &delta("c1"), "origin", "alice").await;
 
         assert_eq!(
             viewer.0.lock().unwrap().len(),
@@ -215,10 +253,10 @@ mod tests {
     async fn excludes_the_origin_connection() {
         let subs = ConversationSubscriptions::new();
         let origin = Arc::new(RecordingSink::default());
-        subs.register("origin", origin.clone());
+        subs.register("origin", "alice", origin.clone());
         subs.set_subscriptions("origin", vec!["c1".into()]);
 
-        subs.route("c1", &delta("c1"), "origin").await;
+        subs.route("c1", &delta("c1"), "origin", "alice").await;
 
         assert!(
             origin.0.lock().unwrap().is_empty(),
@@ -230,10 +268,10 @@ mod tests {
     async fn does_not_route_to_subscribers_of_other_conversations() {
         let subs = ConversationSubscriptions::new();
         let viewer = Arc::new(RecordingSink::default());
-        subs.register("viewer", viewer.clone());
+        subs.register("viewer", "alice", viewer.clone());
         subs.set_subscriptions("viewer", vec!["c2".into()]);
 
-        subs.route("c1", &delta("c1"), "origin").await;
+        subs.route("c1", &delta("c1"), "origin", "alice").await;
 
         assert!(
             viewer.0.lock().unwrap().is_empty(),
@@ -242,15 +280,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn does_not_route_to_a_different_users_subscription() {
+        // #432: bob's session subscribes to alice's conversation id. When
+        // alice runs a turn on it, bob must receive nothing — subscribing to a
+        // conversation UUID is not authorization to see its content. Before the
+        // fix, only UUID-unguessability stood between bob and alice's replies.
+        let subs = ConversationSubscriptions::new();
+        let bob = Arc::new(RecordingSink::default());
+        subs.register("bob-sess", "bob", bob.clone());
+        subs.set_subscriptions("bob-sess", vec!["alice-conv".into()]);
+
+        // alice is the origin — she owns the conversation and runs the turn.
+        subs.route("alice-conv", &delta("alice-conv"), "alice-sess", "alice")
+            .await;
+
+        assert!(
+            bob.0.lock().unwrap().is_empty(),
+            "a different user's subscription must not receive the turn's content"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_to_same_user_other_connection() {
+        // alice viewing the same conversation from a second connection (e.g.
+        // gtk while the turn runs from voice) still gets live events — the
+        // user-scoping must not break legitimate same-user multi-client sync.
+        let subs = ConversationSubscriptions::new();
+        let gtk = Arc::new(RecordingSink::default());
+        subs.register("alice-gtk", "alice", gtk.clone());
+        subs.set_subscriptions("alice-gtk", vec!["c1".into()]);
+
+        subs.route("c1", &delta("c1"), "alice-voice", "alice").await;
+
+        assert_eq!(
+            gtk.0.lock().unwrap().len(),
+            1,
+            "alice's other connection must still receive live sync"
+        );
+    }
+
+    #[tokio::test]
     async fn set_replace_and_unregister_stop_delivery() {
         let subs = ConversationSubscriptions::new();
         let viewer = Arc::new(RecordingSink::default());
-        subs.register("viewer", viewer.clone());
+        subs.register("viewer", "alice", viewer.clone());
         subs.set_subscriptions("viewer", vec!["c1".into()]);
 
         // Switch away from c1 (set-replace to a different set).
         subs.set_subscriptions("viewer", vec!["c2".into()]);
-        subs.route("c1", &delta("c1"), "origin").await;
+        subs.route("c1", &delta("c1"), "origin", "alice").await;
         assert!(
             viewer.0.lock().unwrap().is_empty(),
             "after switching away, no c1 delivery"
@@ -259,7 +337,7 @@ mod tests {
         // Re-subscribe, then disconnect.
         subs.set_subscriptions("viewer", vec!["c1".into()]);
         subs.unregister("viewer");
-        subs.route("c1", &delta("c1"), "origin").await;
+        subs.route("c1", &delta("c1"), "origin", "alice").await;
         assert!(
             viewer.0.lock().unwrap().is_empty(),
             "after disconnect, no delivery"
