@@ -166,6 +166,36 @@ pub(crate) fn overflow_truncation_notice(
     )
 }
 
+/// The conversation material assembly draws on this turn: the live message
+/// log, any message summaries eligible for collapse, and the rolling context
+/// summary of already-dropped history.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConversationView<'a> {
+    pub messages: &'a [Message],
+    pub summaries: &'a [MessageSummary],
+    pub context_summary: &'a str,
+}
+
+/// The tools exposed this turn and where they run — drives the
+/// tool-availability section of the system prompt.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ToolContext<'a> {
+    pub tool_defs: &'a [ToolDefinition],
+    pub deferred_namespaces: &'a [ToolNamespace],
+    pub locality: Option<&'a ToolLocalityContext>,
+}
+
+/// Per-turn anchors re-surfaced as `[..]` system messages so the model stays
+/// on-task across windowing/compaction, plus the round counter that gates
+/// whether they re-surface.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TurnAnchors<'a> {
+    pub active_task: Option<&'a str>,
+    pub plan: Option<&'a str>,
+    pub scratchpad_index: Option<&'a str>,
+    pub tool_rounds_since_anchor: u32,
+}
+
 /// Build the message list for a single turn, optionally enforcing a
 /// pre-flight token budget by shrinking the window before any LLM call.
 ///
@@ -186,46 +216,34 @@ pub(crate) fn overflow_truncation_notice(
 /// When `budget` is `None`, the wrapper performs a single assembly pass —
 /// preserving pre-#65 behaviour for tests and background jobs that don't
 /// route through the daemon's dispatch wrapper.
-// Why allow: the inner builder coordinates several independent prompt slices
-// (windowed messages, summaries, tool sets, context summary, anchor); the
-// outer wrapper threads the same set plus the budget pair. Bundling them
-// just to satisfy the lint would obscure the code at every call site.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn llm_messages_for_turn_with_plan(
-    conversation_messages: &[Message],
-    summaries: &[MessageSummary],
-    tool_defs: &[ToolDefinition],
-    deferred_namespaces: &[ToolNamespace],
-    context_summary: &str,
+    conversation: &ConversationView,
+    tools: &ToolContext,
+    anchors: &TurnAnchors,
     max_messages: usize,
-    active_task: Option<&str>,
-    plan: Option<&str>,
-    scratchpad_index: Option<&str>,
-    tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
-    locality: Option<&ToolLocalityContext>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
-    let mut current_max = max_messages;
-    let mut assembled = assemble_messages_inner(
-        conversation_messages,
-        summaries,
-        tool_defs,
-        deferred_namespaces,
-        context_summary,
-        current_max,
-        active_task,
-        plan,
-        scratchpad_index,
-        tool_rounds_since_anchor,
-        system_refinement,
-        budget,
-        locality,
-        estimate,
-    );
+    // One assembly pass at a given window size. The only thing that varies
+    // across the shrink loop is `max_messages`, so everything else is captured
+    // once here and the two call sites collapse to `assemble(current_max)`.
+    let assemble = |max: usize| {
+        assemble_messages_inner(
+            conversation,
+            tools,
+            anchors,
+            max,
+            system_refinement,
+            budget,
+            estimate,
+        )
+    };
 
-    let Some(budget) = budget else {
+    let mut current_max = max_messages;
+    let mut assembled = assemble(current_max);
+
+    let Some(active_budget) = budget else {
         return assembled;
     };
 
@@ -240,9 +258,10 @@ pub(crate) fn llm_messages_for_turn_with_plan(
     // (issue #305 item 7). Account for it explicitly. The cost is constant
     // across shrink iterations (shrinking only drops *messages*), so it is
     // computed once here.
-    let max_input_tokens = budget.max_input_tokens;
+    let max_input_tokens = active_budget.max_input_tokens;
     let threshold = (max_input_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
-    let tool_schema_tokens = tool_schema_estimate(tool_defs, deferred_namespaces, estimate);
+    let tool_schema_tokens =
+        tool_schema_estimate(tools.tool_defs, tools.deferred_namespaces, estimate);
 
     for _ in 0..MAX_PREFLIGHT_SHRINK_ITERATIONS {
         let message_tokens: u64 = assembled.iter().map(|m| estimate(&m.content)).sum();
@@ -266,22 +285,7 @@ pub(crate) fn llm_messages_for_turn_with_plan(
             "assembly over budget, shrinking"
         );
         current_max = new_max;
-        assembled = assemble_messages_inner(
-            conversation_messages,
-            summaries,
-            tool_defs,
-            deferred_namespaces,
-            context_summary,
-            current_max,
-            active_task,
-            plan,
-            scratchpad_index,
-            tool_rounds_since_anchor,
-            system_refinement,
-            Some(budget),
-            locality,
-            estimate,
-        );
+        assembled = assemble(current_max);
     }
 
     assembled
@@ -498,40 +502,25 @@ fn render_locality_list(entries: &[ToolLocalityEntry], co_located: bool) -> Stri
         .join(", ")
 }
 
-/// Back-compat shim for [`llm_messages_for_turn_with_plan`] with no surfaced
-/// plan. The existing test suite exercises assembly through this plan-less
-/// form; production (the dispatch loop) calls the plan-aware entry directly
-/// (#240), so the shim is only compiled for tests.
+/// Concise test entry point for assembly: takes the grouped inputs and fills
+/// in the two values every test holds constant (`MAX_CONTEXT_MESSAGES` and no
+/// system refinement). Adding a per-turn field to any input struct leaves this
+/// helper and its callers untouched — the whole point of the grouping.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn llm_messages_for_turn(
-    conversation_messages: &[Message],
-    summaries: &[MessageSummary],
-    tool_defs: &[ToolDefinition],
-    deferred_namespaces: &[ToolNamespace],
-    context_summary: &str,
-    max_messages: usize,
-    active_task: Option<&str>,
-    tool_rounds_since_anchor: u32,
-    system_refinement: &str,
+fn assemble_for_test(
+    conversation: &ConversationView,
+    tools: &ToolContext,
+    anchors: &TurnAnchors,
     budget: Option<ContextBudget>,
-    locality: Option<&ToolLocalityContext>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
     llm_messages_for_turn_with_plan(
-        conversation_messages,
-        summaries,
-        tool_defs,
-        deferred_namespaces,
-        context_summary,
-        max_messages,
-        active_task,
-        None,
-        None,
-        tool_rounds_since_anchor,
-        system_refinement,
+        conversation,
+        tools,
+        anchors,
+        MAX_CONTEXT_MESSAGES,
+        "",
         budget,
-        locality,
         estimate,
     )
 }
@@ -693,23 +682,34 @@ fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> St
 // (windowed messages, summaries, tool sets, context summary, anchor) that
 // don't naturally cluster into a single struct. Bundling them just to
 // satisfy the lint would obscure the code at every call site.
-#[allow(clippy::too_many_arguments)]
 fn assemble_messages_inner(
-    conversation_messages: &[Message],
-    summaries: &[MessageSummary],
-    tool_defs: &[ToolDefinition],
-    deferred_namespaces: &[ToolNamespace],
-    context_summary: &str,
+    conversation: &ConversationView,
+    tools: &ToolContext,
+    anchors: &TurnAnchors,
     max_messages: usize,
-    active_task: Option<&str>,
-    plan: Option<&str>,
-    scratchpad_index: Option<&str>,
-    tool_rounds_since_anchor: u32,
     system_refinement: &str,
     budget: Option<ContextBudget>,
-    locality: Option<&ToolLocalityContext>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
+    // Destructure into the local names the body below already uses, so the
+    // assembly logic reads unchanged after the parameter grouping.
+    let ConversationView {
+        messages: conversation_messages,
+        summaries,
+        context_summary,
+    } = *conversation;
+    let ToolContext {
+        tool_defs,
+        deferred_namespaces,
+        locality,
+    } = *tools;
+    let TurnAnchors {
+        active_task,
+        plan,
+        scratchpad_index,
+        tool_rounds_since_anchor,
+    } = *anchors;
+
     let tool_note = build_full_tool_note(tool_defs, deferred_namespaces, locality);
     let system_instruction = assemble_system_instruction(tool_note, system_refinement);
 
@@ -1306,17 +1306,13 @@ mod tests {
         let now_line = "Sunday, 2026-06-28, 2:32 PM EDT";
         let msgs = vec![Message::new(Role::User, "what's the date?")];
         let assembled = with_now_context(now_line.to_string(), async {
-            llm_messages_for_turn(
-                &msgs,
-                &[],
-                &[],
-                &[],
-                "",
-                MAX_CONTEXT_MESSAGES,
-                None,
-                0,
-                "",
-                None,
+            assemble_for_test(
+                &ConversationView {
+                    messages: &msgs,
+                    ..Default::default()
+                },
+                &ToolContext::default(),
+                &TurnAnchors::default(),
                 None,
                 &default_estimate,
             )
@@ -1334,17 +1330,13 @@ mod tests {
         // No `with_now_context` scope installed (the common test / dreaming-job
         // path) → no [Now] message and the list is unchanged.
         let msgs = vec![Message::new(Role::User, "hi")];
-        let assembled = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let assembled = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -1837,17 +1829,13 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -1873,17 +1861,13 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -1919,17 +1903,13 @@ mod tests {
         msgs.push(Message::new(Role::User, "final-user"));
         msgs.push(Message::new(Role::Assistant, "final-reply"));
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -1959,17 +1939,13 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2003,18 +1979,14 @@ mod tests {
         };
         // Use a 1-char-per-token estimator so the size math is direct.
         let one_per_char = |s: &str| s.chars().count() as u64;
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             Some(budget),
-            None,
             &one_per_char,
         );
 
@@ -2094,18 +2066,17 @@ mod tests {
         let one_per_char = |s: &str| s.chars().count() as u64;
 
         let assemble = |tool: &ToolDefinition| {
-            llm_messages_for_turn(
-                &msgs,
-                &[],
-                std::slice::from_ref(tool),
-                &[],
-                "",
-                MAX_CONTEXT_MESSAGES,
-                None,
-                0,
-                "",
+            assemble_for_test(
+                &ConversationView {
+                    messages: &msgs,
+                    ..Default::default()
+                },
+                &ToolContext {
+                    tool_defs: std::slice::from_ref(tool),
+                    ..Default::default()
+                },
+                &TurnAnchors::default(),
                 Some(budget),
-                None,
                 &one_per_char,
             )
         };
@@ -2144,18 +2115,14 @@ mod tests {
             source: BudgetSource::ConnectorTable,
         };
         let one_per_char = |s: &str| s.chars().count() as u64;
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             Some(budget),
-            None,
             &one_per_char,
         );
 
@@ -2187,17 +2154,14 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "- User prefers dark mode",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                context_summary: "- User prefers dark mode",
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2229,17 +2193,14 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "- Some summary",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                context_summary: "- Some summary",
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2267,17 +2228,13 @@ mod tests {
             })
             .collect();
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2306,17 +2263,16 @@ mod tests {
             }
         }
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            Some(task),
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some(task),
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2340,17 +2296,16 @@ mod tests {
             Message::new(Role::Assistant, "ok, let's start"),
         ];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            Some(task),
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some(task),
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2375,17 +2330,17 @@ mod tests {
             Message::tool_result("c1", "result"),
         ];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            Some(task),
-            6,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some(task),
+                tool_rounds_since_anchor: 6,
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2403,17 +2358,13 @@ mod tests {
     #[test]
     fn active_task_not_injected_when_none() {
         let msgs = vec![Message::new(Role::User, "hello")];
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2430,17 +2381,17 @@ mod tests {
     #[test]
     fn active_task_not_injected_when_empty_string() {
         let msgs = vec![Message::new(Role::User, "hello")];
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            Some(""),
-            99,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some(""),
+                tool_rounds_since_anchor: 99,
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2468,17 +2419,17 @@ mod tests {
             }
         }
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "- earlier conversation summary",
-            MAX_CONTEXT_MESSAGES,
-            Some(task),
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                context_summary: "- earlier conversation summary",
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some(task),
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2517,19 +2468,17 @@ mod tests {
             Message::new(Role::Assistant, "on it"),
         ];
         let index = "Notes you've stashed (read with builtin_scratchpad_search): foo, bar.";
-        let result = llm_messages_for_turn_with_plan(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            Some("do a thing"),
-            None,
-            Some(index),
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("do a thing"),
+                scratchpad_index: Some(index),
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2552,19 +2501,16 @@ mod tests {
             }
         }
         let index = "Notes you've stashed (read with builtin_scratchpad_search): foo, bar.";
-        let result = llm_messages_for_turn_with_plan(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            None,
-            Some(index),
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                scratchpad_index: Some(index),
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2581,19 +2527,18 @@ mod tests {
             Message::tool_result("c1", "result"),
         ];
         let index = "Notes you've stashed (read with builtin_scratchpad_search): foo.";
-        let result = llm_messages_for_turn_with_plan(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            Some("trace it"),
-            None,
-            Some(index),
-            ACTIVE_TASK_ROUND_THRESHOLD + 1,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("trace it"),
+                scratchpad_index: Some(index),
+                tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
+                ..Default::default()
+            },
             None,
             &default_estimate,
         );
@@ -2610,19 +2555,13 @@ mod tests {
         for i in 0..total {
             msgs.push(Message::new(Role::User, format!("m-{i}")));
         }
-        let result = llm_messages_for_turn_with_plan(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            None,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2654,17 +2593,14 @@ mod tests {
             summary: "Assistant performed steps 1-3.".to_string(),
         }];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &summaries,
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                summaries: &summaries,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2687,17 +2623,13 @@ mod tests {
             Message::new(Role::Assistant, "hello"),
         ];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2734,17 +2666,14 @@ mod tests {
             },
         ];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &summaries,
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                summaries: &summaries,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2789,17 +2718,14 @@ mod tests {
             summary: "Tail collapsed.".to_string(),
         }];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &summaries,
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                summaries: &summaries,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2843,17 +2769,14 @@ mod tests {
             summary: "Old context.".to_string(),
         }];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &summaries,
-            &[],
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                summaries: &summaries,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
@@ -2996,18 +2919,17 @@ mod tests {
             source: BudgetSource::ConnectorTable,
         };
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &tools,
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext {
+                tool_defs: &tools,
+                ..Default::default()
+            },
+            &TurnAnchors::default(),
             Some(budget),
-            None,
             &default_estimate,
         );
 
@@ -3048,18 +2970,17 @@ mod tests {
             source: BudgetSource::ConnectorTable,
         };
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &tools,
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext {
+                tool_defs: &tools,
+                ..Default::default()
+            },
+            &TurnAnchors::default(),
             Some(budget),
-            None,
             &default_estimate,
         );
 
@@ -3090,17 +3011,16 @@ mod tests {
         let tools = make_huge_tool_set(60, 64);
         let msgs = vec![Message::new(Role::User, "hi")];
 
-        let result = llm_messages_for_turn(
-            &msgs,
-            &[],
-            &tools,
-            &[],
-            "",
-            MAX_CONTEXT_MESSAGES,
-            None,
-            0,
-            "",
-            None,
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext {
+                tool_defs: &tools,
+                ..Default::default()
+            },
+            &TurnAnchors::default(),
             None,
             &default_estimate,
         );
