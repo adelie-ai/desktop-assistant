@@ -1422,3 +1422,184 @@ async fn spawn_subagent_allowed_within_recursion_depth_limit() {
         "child text"
     );
 }
+
+// --------------------------------------------------------------------
+// 15. #440: a wait=true child that fails surfaces the error to the parent
+// --------------------------------------------------------------------
+
+#[tokio::test]
+async fn subagent_wait_true_child_error_surfaces_to_parent() {
+    // A wait=true subagent whose turn returns `Err` must make the parent's
+    // `execute_tool` return `ToolExecution("subagent failed: ...")` — NOT an
+    // empty-text success. Otherwise a failed delegation looks like a silent
+    // no-op to the parent LLM (subagent_tools.rs:366-374).
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    // The child conversation (conv-0) fails its turn.
+    let conversations = Arc::new(
+        FakeConversations::new("unused-default")
+            .with_behaviour("conv-0", move |_cid, _p| async move {
+                Err(CoreError::ToolExecution("upstream boom".to_string()))
+            }),
+    );
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    let user_for_body = user.clone();
+    let tools_for_body = tools.clone();
+    let (_parent_id, result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            async move {
+                with_user_id(user, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "doomed",
+                                "prompt": "do the thing",
+                                "wait": true,
+                            }),
+                        )
+                        .await
+                })
+                .await
+            }
+        })
+        .await;
+
+    let err = result.expect_err("a failed wait=true child must surface as Err");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("subagent failed"),
+        "error must name the subagent failure, got: {msg}"
+    );
+    assert!(
+        msg.contains("upstream boom"),
+        "error must carry the child's failure reason, got: {msg}"
+    );
+    assert!(
+        matches!(err, CoreError::ToolExecution(_)),
+        "the surfaced error must be a recoverable ToolExecution, got: {err:?}"
+    );
+}
+
+// --------------------------------------------------------------------
+// 16. #440: one failed sibling does not cancel the others
+// --------------------------------------------------------------------
+
+#[tokio::test]
+async fn one_failed_subagent_does_not_cancel_siblings() {
+    // A parent spawns three wait=false children; the middle one fails. Sibling
+    // isolation: the failure of one must NOT cancel or fail the others — they
+    // each reach Completed on their own.
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    // Children are created in spawn order: conv-0, conv-1, conv-2. The middle
+    // one fails; the outer two succeed.
+    let conversations = Arc::new(
+        FakeConversations::new("unused-default")
+            .with_behaviour(
+                "conv-0",
+                move |_c, _p| async move { Ok("done-0".to_string()) },
+            )
+            .with_behaviour("conv-1", move |_c, _p| async move {
+                Err(CoreError::ToolExecution("sibling boom".to_string()))
+            })
+            .with_behaviour(
+                "conv-2",
+                move |_c, _p| async move { Ok("done-2".to_string()) },
+            ),
+    );
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    // Subscribe before spawning so we capture every child's terminal event —
+    // finalize evicts the entry (#158), so the broadcast is the record.
+    let mut events = registry.subscribe(&user);
+
+    let user_for_body = user.clone();
+    let tools_for_body = tools.clone();
+    // The body spawns three wait=false children and returns their
+    // (task_id, conversation_id) pairs.
+    let (_parent_id, children): (api::TaskId, Vec<(String, String)>) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            async move {
+                with_user_id(user, async move {
+                    let mut out = Vec::new();
+                    for name in ["first", "second", "third"] {
+                        let r = tools
+                            .execute_tool(
+                                TOOL_SPAWN_SUBAGENT,
+                                serde_json::json!({
+                                    "name": name,
+                                    "prompt": "go",
+                                    "wait": false,
+                                }),
+                            )
+                            .await
+                            .expect("spawn ok");
+                        let parsed: serde_json::Value = serde_json::from_str(&r).unwrap();
+                        out.push((
+                            parsed["child_task_id"].as_str().unwrap().to_string(),
+                            parsed["child_conversation_id"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        ));
+                    }
+                    out
+                })
+                .await
+            }
+        })
+        .await;
+
+    assert_eq!(children.len(), 3, "three children spawned");
+
+    // Collect each child's terminal status from the broadcast stream.
+    let want: std::collections::HashSet<String> =
+        children.iter().map(|(tid, _)| tid.clone()).collect();
+    let mut statuses: HashMap<String, api::TaskStatus> = HashMap::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while statuses.len() < want.len() {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("timed out collecting child terminal events");
+        match timeout(remaining, events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted { id, status, .. })) if want.contains(&id) => {
+                statuses.insert(id, status);
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed early: {e:?}"),
+            Err(_) => panic!("timed out collecting child terminal events, got {statuses:?}"),
+        }
+    }
+
+    // Map task_id -> conversation_id so we can name the expected outcome.
+    let by_conv: HashMap<String, String> = children
+        .iter()
+        .map(|(tid, cid)| (cid.clone(), tid.clone()))
+        .collect();
+    let failing = &by_conv["conv-1"];
+    let ok_a = &by_conv["conv-0"];
+    let ok_c = &by_conv["conv-2"];
+
+    assert_eq!(
+        statuses.get(failing),
+        Some(&api::TaskStatus::Failed),
+        "the middle child failed"
+    );
+    assert_eq!(
+        statuses.get(ok_a),
+        Some(&api::TaskStatus::Completed),
+        "the first sibling completed despite the middle one failing"
+    );
+    assert_eq!(
+        statuses.get(ok_c),
+        Some(&api::TaskStatus::Completed),
+        "the last sibling completed despite the middle one failing"
+    );
+}

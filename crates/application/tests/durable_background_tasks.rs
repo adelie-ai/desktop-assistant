@@ -866,3 +866,291 @@ async fn business_outcome_user_sees_failed_status_in_list_after_restart() {
         "user-visible last_error must be set so the UI can show why",
     );
 }
+
+// ----------------------------------------------------------------------
+// #440: persistence-degradation + sweep unhappy branches.
+// ----------------------------------------------------------------------
+
+/// Store whose writes always fail. Proves the registry degrades (warn and
+/// continue) rather than wedging a task when persistence is down
+/// (background_tasks.rs:986 create / :1033 update).
+struct AlwaysErrStore;
+
+#[async_trait]
+impl BackgroundTaskStore for AlwaysErrStore {
+    async fn create_task(&self, _row: BackgroundTaskRow) -> Result<(), CoreError> {
+        Err(CoreError::Storage("create failed".into()))
+    }
+    async fn get_task(&self, _id: &str) -> Result<Option<BackgroundTaskRow>, CoreError> {
+        Ok(None)
+    }
+    async fn update_task(
+        &self,
+        _id: &str,
+        _status: BackgroundTaskStatus,
+        _last_error: Option<&str>,
+        _progress_hint: Option<&str>,
+        _ended_at: Option<i64>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Storage("update failed".into()))
+    }
+    async fn list_tasks_for_user(
+        &self,
+        _user_id: &str,
+        _include_finished: bool,
+        _limit: Option<u32>,
+    ) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(vec![])
+    }
+    async fn scan_non_terminal(&self) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(vec![])
+    }
+}
+
+/// Store that fails `update_task` for exactly one id, otherwise behaves like
+/// [`MockStore`]. Lets a sweep test drive the "one row's update failed; skip
+/// only that surface" branch (background_tasks.rs:751-753).
+struct FailUpdateForStore {
+    rows: Mutex<HashMap<String, BackgroundTaskRow>>,
+    fail_id: String,
+}
+
+impl FailUpdateForStore {
+    fn new(fail_id: &str) -> Self {
+        Self {
+            rows: Mutex::new(HashMap::new()),
+            fail_id: fail_id.to_string(),
+        }
+    }
+    fn get_raw(&self, id: &str) -> Option<BackgroundTaskRow> {
+        self.rows.lock().unwrap().get(id).cloned()
+    }
+}
+
+#[async_trait]
+impl BackgroundTaskStore for FailUpdateForStore {
+    async fn create_task(&self, row: BackgroundTaskRow) -> Result<(), CoreError> {
+        self.rows.lock().unwrap().insert(row.id.clone(), row);
+        Ok(())
+    }
+    async fn get_task(&self, id: &str) -> Result<Option<BackgroundTaskRow>, CoreError> {
+        Ok(self.rows.lock().unwrap().get(id).cloned())
+    }
+    async fn update_task(
+        &self,
+        id: &str,
+        status: BackgroundTaskStatus,
+        last_error: Option<&str>,
+        progress_hint: Option<&str>,
+        ended_at: Option<i64>,
+    ) -> Result<(), CoreError> {
+        if id == self.fail_id {
+            return Err(CoreError::Storage(format!("update failed for {id}")));
+        }
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows
+            .get_mut(id)
+            .ok_or_else(|| CoreError::Storage(format!("background task not found: {id}")))?;
+        row.status = status;
+        row.last_error = last_error.map(String::from);
+        row.progress_hint = progress_hint.map(String::from);
+        row.ended_at = ended_at;
+        Ok(())
+    }
+    async fn list_tasks_for_user(
+        &self,
+        _user_id: &str,
+        _include_finished: bool,
+        _limit: Option<u32>,
+    ) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(vec![])
+    }
+    async fn scan_non_terminal(&self) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| !r.status.is_terminal())
+            .cloned()
+            .collect())
+    }
+}
+
+/// Drain the broadcast until the terminal event for `id` arrives, returning its
+/// status.
+async fn completed_status(
+    events: &mut tokio::sync::broadcast::Receiver<api::Event>,
+    id: &api::TaskId,
+) -> api::TaskStatus {
+    let want = id.0.clone();
+    loop {
+        match timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(api::Event::TaskCompleted { id, status, .. })) if id == want => return status,
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("event channel closed before TaskCompleted: {e:?}"),
+            Err(_) => panic!("timed out waiting for TaskCompleted({want})"),
+        }
+    }
+}
+
+fn running_row(id: &str, user: &str, kind: &api::TaskKind) -> BackgroundTaskRow {
+    BackgroundTaskRow {
+        id: id.to_string(),
+        user_id: user.to_string(),
+        kind_json: serde_json::to_value(kind).unwrap(),
+        status: BackgroundTaskStatus::Running,
+        parent_task_id: None,
+        title: id.to_string(),
+        last_error: None,
+        progress_hint: None,
+        started_at: 1_700_000_000,
+        ended_at: None,
+    }
+}
+
+#[tokio::test]
+async fn task_reaches_terminal_state_even_if_store_errors() {
+    // #440 (background_tasks.rs:986/1033): persistence writes are best-effort.
+    // A store that errors on every write must NOT stop a task from reaching a
+    // terminal state — the registry warns and continues, `wait` resolves, and
+    // the lifecycle broadcast still fires Completed.
+    let store = Arc::new(AlwaysErrStore);
+    let registry = BackgroundTaskRegistry::new().with_store(store);
+    let user = UserId::new("alice");
+    let mut events = registry.subscribe(&user);
+
+    let task_id = registry.spawn(
+        user.clone(),
+        conv_kind("c-degrade"),
+        "degrade".into(),
+        move |_ctx| async move { Ok(()) },
+    );
+
+    timeout(Duration::from_secs(5), registry.wait(&task_id))
+        .await
+        .expect("wait() must resolve even when the persistence store errors");
+    let status = completed_status(&mut events, &task_id).await;
+    assert_eq!(
+        status,
+        api::TaskStatus::Completed,
+        "the task reaches a terminal state despite the store failing every write"
+    );
+}
+
+#[tokio::test]
+async fn sweep_skips_corrupt_kind_json_without_panic() {
+    // #440 (background_tasks.rs:695-705): a row whose kind_json can't be parsed
+    // is logged and SKIPPED — it must not panic the sweep or block sibling
+    // rows. A valid row alongside it is still swept.
+    let store = Arc::new(MockStore::new());
+    // Corrupt: not a valid TaskKind.
+    let mut corrupt = running_row("corrupt", "alice", &conv_kind("cv"));
+    corrupt.kind_json = serde_json::json!("this is not a task kind");
+    store.create_task(corrupt).await.unwrap();
+    // Valid conversation row.
+    store
+        .create_task(running_row("valid", "alice", &conv_kind("cv2")))
+        .await
+        .unwrap();
+
+    let registry = BackgroundTaskRegistry::new().with_store(store.clone());
+    let count = registry
+        .sweep_non_terminal_on_startup()
+        .await
+        .expect("sweep must not error on a corrupt row");
+
+    assert_eq!(
+        count, 1,
+        "only the valid row is swept; the corrupt one is skipped"
+    );
+    assert_eq!(
+        store.get_raw("corrupt").unwrap().status,
+        BackgroundTaskStatus::Running,
+        "the corrupt row is left untouched, not marked terminal"
+    );
+    assert_eq!(
+        store.get_raw("valid").unwrap().status,
+        BackgroundTaskStatus::Failed,
+        "the valid row is still swept to Failed"
+    );
+}
+
+#[tokio::test]
+async fn sweep_marks_maintenance_kind_not_resumed() {
+    // #440 (background_tasks.rs:717-722): a Maintenance kind gets the distinct
+    // "maintenance pass not resumed" message (it re-runs on its own timer).
+    let store = Arc::new(MockStore::new());
+    store
+        .create_task(running_row(
+            "maint",
+            "alice",
+            &api::TaskKind::Maintenance {
+                name: "dream-cycle".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    let registry = BackgroundTaskRegistry::new().with_store(store.clone());
+    let count = registry
+        .sweep_non_terminal_on_startup()
+        .await
+        .expect("sweep");
+    assert_eq!(count, 1);
+
+    let row = store.get_raw("maint").unwrap();
+    assert_eq!(row.status, BackgroundTaskStatus::Failed);
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some("daemon restarted; maintenance pass not resumed"),
+        "Maintenance rows carry their own resume message"
+    );
+    // Surfaced in the in-memory registry as Failed too.
+    let view = registry
+        .get(&UserId::new("alice"), &api::TaskId("maint".into()))
+        .expect("maintenance row surfaces");
+    assert_eq!(view.status, api::TaskStatus::Failed);
+}
+
+#[tokio::test]
+async fn sweep_one_row_update_failure_skips_only_that_surface() {
+    // #440 (background_tasks.rs:751-753): if the terminal update for ONE row
+    // fails, the sweep skips only that row's in-memory surface and presses on
+    // with the rest — a single flaky write can't strand every leftover.
+    let store = Arc::new(FailUpdateForStore::new("boom"));
+    store
+        .create_task(running_row("boom", "alice", &conv_kind("cv-boom")))
+        .await
+        .unwrap();
+    store
+        .create_task(running_row("keep", "alice", &conv_kind("cv-keep")))
+        .await
+        .unwrap();
+
+    let registry = BackgroundTaskRegistry::new().with_store(store.clone());
+    let count = registry
+        .sweep_non_terminal_on_startup()
+        .await
+        .expect("sweep");
+    assert_eq!(count, 1, "only the row whose update succeeded is surfaced");
+
+    let alice = UserId::new("alice");
+    // The good row surfaced as Failed.
+    let keep = registry
+        .get(&alice, &api::TaskId("keep".into()))
+        .expect("the good row surfaces");
+    assert_eq!(keep.status, api::TaskStatus::Failed);
+    // The row whose update failed is NOT surfaced in memory...
+    assert!(
+        registry.get(&alice, &api::TaskId("boom".into())).is_none(),
+        "the row whose update failed must not be surfaced"
+    );
+    // ...and its persisted state is untouched (still Running).
+    assert_eq!(
+        store.get_raw("boom").unwrap().status,
+        BackgroundTaskStatus::Running,
+        "a failed update leaves the row as it was"
+    );
+}

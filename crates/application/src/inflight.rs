@@ -378,8 +378,13 @@ mod tests {
         }
     }
 
+    /// Sequential semantics of the claim: a live key can be claimed once,
+    /// re-claims lose, independent tuples are independent, and a freed key can
+    /// be re-claimed. (Renamed from `register_is_an_atomic_claim` — #440: that
+    /// name promised concurrency this body never exercised; the genuine race is
+    /// covered by [`concurrent_register_same_key_yields_exactly_one_winner`].)
     #[test]
-    fn register_is_an_atomic_claim() {
+    fn register_rejects_a_duplicate_live_key() {
         let reg = InFlightRegistry::default();
         assert!(
             reg.register("u", "c", "k").is_some(),
@@ -401,5 +406,53 @@ mod tests {
             reg.register("u", "c", "k").is_some(),
             "a freed key can be claimed again"
         );
+    }
+
+    /// #440: the claim is atomic under genuine contention. Many threads race
+    /// `register` for one key behind a barrier; the check-and-insert under a
+    /// single lock must let *exactly one* win — never zero (a lost insert) and
+    /// never two (a duplicate hub that would double-run the turn). This is the
+    /// invariant `register` exists to hold; the old test asserted it only
+    /// sequentially.
+    #[test]
+    fn concurrent_register_same_key_yields_exactly_one_winner() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const THREADS: usize = 32;
+        // Repeat so a happens-to-serialize scheduling doesn't hide a race.
+        for _ in 0..50 {
+            let reg = Arc::new(InFlightRegistry::default());
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let winners = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let reg = Arc::clone(&reg);
+                    let barrier = Arc::clone(&barrier);
+                    let winners = Arc::clone(&winners);
+                    std::thread::spawn(move || {
+                        // Release all threads into `register` at once.
+                        barrier.wait();
+                        if reg.register("u", "c", "k").is_some() {
+                            winners.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert_eq!(
+                winners.load(Ordering::SeqCst),
+                1,
+                "exactly one racing claim must win the slot"
+            );
+            assert!(
+                reg.get("u", "c", "k").is_some(),
+                "the single winner's hub is visible"
+            );
+        }
     }
 }
