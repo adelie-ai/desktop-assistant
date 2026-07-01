@@ -2701,15 +2701,24 @@ y = 2
         assert_eq!(budget.max_input_tokens, 200_000);
     }
 
-    // --- apply_learned_cap: DOWN-ONLY learned safety net (issue #343) ----
+    // --- apply_learned_cap: snap-down cap + success-floor bracket (#343/#425) --
 
-    use crate::config::resolution::{MIN_LEARNED_WINDOW, apply_learned_cap};
+    use crate::config::resolution::apply_learned_cap;
     use desktop_assistant_core::ports::store::LearnedWindow;
 
     fn budget(max: u64, source: BudgetSource) -> ContextBudget {
         ContextBudget {
             max_input_tokens: max,
             source,
+        }
+    }
+
+    /// An overflow-only learned row (no success high-water yet).
+    fn overflow(observed: u64, configured: u64) -> LearnedWindow {
+        LearnedWindow {
+            observed_limit: Some(observed),
+            configured_window: Some(configured),
+            max_success_input: None,
         }
     }
 
@@ -2720,107 +2729,96 @@ y = 2
     }
 
     #[test]
-    fn learned_cap_mins_below_resolved_budget() {
-        // Resolved budget is 8192 (e.g. Ollama effective num_ctx), but we
-        // previously observed an overflow at 4096 under that same configured
-        // window: cap DOWN to 4096 and re-tag the source.
-        let b = budget(8_192, BudgetSource::ConnectorTable);
-        let learned = LearnedWindow {
-            observed_limit: 4_096,
-            configured_window: 8_192,
-        };
-        let capped = apply_learned_cap(b, Some(learned));
-        assert_eq!(capped.max_input_tokens, 4_096);
+    fn learned_cap_snaps_overflow_down_to_common_rung() {
+        // The incident's derived ceiling (202752 − 8192 = 194560) caps the
+        // 200k budget DOWN, snapped to the 192k rung and re-tagged.
+        let b = budget(200_000, BudgetSource::ConnectorTable);
+        let capped = apply_learned_cap(b, Some(overflow(194_560, 200_000)));
+        assert_eq!(capped.max_input_tokens, 192_000);
         assert_eq!(capped.source, BudgetSource::LearnedCap);
     }
 
     #[test]
     fn learned_cap_never_raises_budget() {
-        // A learned value HIGHER than the resolved budget must NOT raise it:
-        // the min() is a no-op and the original budget/source stand.
+        // A snapped cap at/above the resolved budget is a no-op; original stands.
         let b = budget(8_192, BudgetSource::ConnectorTable);
-        let learned = LearnedWindow {
-            observed_limit: 32_000,
-            configured_window: 8_192,
-        };
-        let capped = apply_learned_cap(b, Some(learned));
+        let capped = apply_learned_cap(b, Some(overflow(200_000, 8_192)));
         assert_eq!(capped.max_input_tokens, 8_192);
         assert_eq!(capped.source, BudgetSource::ConnectorTable);
     }
 
     #[test]
-    fn learned_cap_equal_to_budget_is_noop() {
-        let b = budget(8_192, BudgetSource::ConnectorTable);
-        let learned = LearnedWindow {
-            observed_limit: 8_192,
-            configured_window: 8_192,
-        };
-        let capped = apply_learned_cap(b, Some(learned));
-        assert_eq!(capped.max_input_tokens, 8_192);
-        assert_eq!(capped.source, BudgetSource::ConnectorTable);
-    }
-
-    #[test]
-    fn learned_cap_invalidated_when_configured_window_bumped_up() {
-        // The user raised the configured window from 8192 to 16384 (the new
-        // resolved budget). The learned 4096 was observed under the OLD 8192
-        // window, so it is stale and ignored — the higher ceiling stands.
+    fn learned_cap_invalidated_when_configured_window_changes() {
+        // The overflow was observed under an 8192 window; the budget is now
+        // 16384, so the observation is stale and ignored — the higher ceiling
+        // stands. This is how a config bump escapes a previously-learned cap.
         let b = budget(16_384, BudgetSource::PurposeOverride);
-        let learned = LearnedWindow {
-            observed_limit: 4_096,
-            configured_window: 8_192,
-        };
-        let capped = apply_learned_cap(b, Some(learned));
+        let capped = apply_learned_cap(b, Some(overflow(4_096, 8_192)));
         assert_eq!(capped.max_input_tokens, 16_384);
         assert_eq!(capped.source, BudgetSource::PurposeOverride);
     }
 
     #[test]
-    fn learned_cap_invalidated_when_configured_window_lowered() {
-        // Invalidation triggers on ANY mismatch, including a lowered window.
-        // The learned 4096 was observed under 8192; now the configured window
-        // is 2048, so the learned row is stale and ignored (2048 < 4096 anyway,
-        // but the invalidation, not the min, is what discards it).
-        let b = budget(2_048, BudgetSource::ConnectorTable);
-        let learned = LearnedWindow {
-            observed_limit: 4_096,
-            configured_window: 8_192,
-        };
-        let capped = apply_learned_cap(b, Some(learned));
-        assert_eq!(capped.max_input_tokens, 2_048);
-        assert_eq!(capped.source, BudgetSource::ConnectorTable);
-    }
-
-    #[test]
-    fn learned_cap_sanity_floor_rejects_pathological_value() {
-        // A provider error string yielding a parsed `0`/`1`/tiny value must
-        // NOT pin the budget — that would brick the assistant (no prompt fits).
-        for pathological in [0_u64, 1, MIN_LEARNED_WINDOW - 1] {
-            let b = budget(8_192, BudgetSource::ConnectorTable);
-            let learned = LearnedWindow {
-                observed_limit: pathological,
-                configured_window: 8_192,
-            };
-            let capped = apply_learned_cap(b, Some(learned));
+    fn pathological_observed_is_snapped_away_not_applied() {
+        // Issue #425: the 534-token poison (and any value below the smallest
+        // ladder rung) snaps to `None`, so it can NEVER pin the budget. This is
+        // the regression that bricked the assistant.
+        for poison in [0_u64, 1, 534, 4_095] {
+            let b = budget(200_000, BudgetSource::ConnectorTable);
+            let capped = apply_learned_cap(b, Some(overflow(poison, 200_000)));
             assert_eq!(
-                capped.max_input_tokens, 8_192,
-                "pathological observed_limit {pathological} must be ignored"
+                capped.max_input_tokens, 200_000,
+                "poison {poison} must never pin the budget"
             );
             assert_eq!(capped.source, BudgetSource::ConnectorTable);
         }
     }
 
     #[test]
-    fn learned_cap_at_sanity_floor_is_applied() {
-        // Exactly at the floor is a legitimately-tiny window, not pathological.
-        let b = budget(8_192, BudgetSource::ConnectorTable);
+    fn success_high_water_floors_an_overaggressive_cap() {
+        // Even a legitimate overflow cap can't drop the budget below a size the
+        // model has PROVEN it accepts — the #425 safety net / recovery basis.
+        let b = budget(200_000, BudgetSource::ConnectorTable);
         let learned = LearnedWindow {
-            observed_limit: MIN_LEARNED_WINDOW,
-            configured_window: 8_192,
+            observed_limit: Some(100_000),
+            configured_window: Some(200_000),
+            max_success_input: Some(160_000),
         };
         let capped = apply_learned_cap(b, Some(learned));
-        assert_eq!(capped.max_input_tokens, MIN_LEARNED_WINDOW);
+        assert_eq!(
+            capped.max_input_tokens, 160_000,
+            "floored up to proven-good"
+        );
         assert_eq!(capped.source, BudgetSource::LearnedCap);
+    }
+
+    #[test]
+    fn success_floor_never_exceeds_configured_budget() {
+        // A stale high-water larger than the (now lower) configured budget is
+        // clamped to it — the floor can raise, but never above the user's window.
+        let b = budget(100_000, BudgetSource::ConnectorTable);
+        let learned = LearnedWindow {
+            observed_limit: None,
+            configured_window: None,
+            max_success_input: Some(180_000),
+        };
+        let capped = apply_learned_cap(b, Some(learned));
+        assert_eq!(capped.max_input_tokens, 100_000);
+        assert_eq!(capped.source, BudgetSource::ConnectorTable);
+    }
+
+    #[test]
+    fn success_only_row_below_budget_is_noop() {
+        // A proven-good size under the budget doesn't move anything.
+        let b = budget(200_000, BudgetSource::ConnectorTable);
+        let learned = LearnedWindow {
+            observed_limit: None,
+            configured_window: None,
+            max_success_input: Some(150_000),
+        };
+        let capped = apply_learned_cap(b, Some(learned));
+        assert_eq!(capped.max_input_tokens, 200_000);
+        assert_eq!(capped.source, BudgetSource::ConnectorTable);
     }
 
     /// Integration (issue #342): a real Ollama connector with a small

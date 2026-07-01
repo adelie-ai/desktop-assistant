@@ -343,16 +343,25 @@ pub trait ErrorClassificationStore: Send + Sync {
 /// A learned effective context-window observation (issue #343): the smallest
 /// provider-rejected window we have seen for a `(connector, model)` pair, paired
 /// with the configured window that was in force when we saw it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LearnedWindow {
-    /// The provider-reported `max_tokens` from an overflow error — a window we
-    /// observed reject a prompt, so the real ceiling is at most this.
-    pub observed_limit: u64,
+    /// The derived input-token ceiling from an overflow error — a budget we
+    /// observed reject a prompt (post output-reservation), so the real input
+    /// ceiling is at most this. `None` when only successes have been recorded
+    /// for this `(connector, model)` and no overflow has been seen yet.
+    pub observed_limit: Option<u64>,
     /// The effective configured budget in force when the overflow happened.
     /// Used for invalidation: a row whose `configured_window` differs from the
     /// current effective budget is stale and must be ignored, so a config bump
     /// starts fresh from the new ceiling rather than the old observation.
-    pub configured_window: u64,
+    /// `None` on a success-only row.
+    pub configured_window: Option<u64>,
+    /// Largest provider-measured input-token count that COMPLETED for this
+    /// `(connector, model)` — the success high-water mark (issue #425). Floors
+    /// the learned cap so a garbage-low `observed_limit` can never pin the
+    /// budget below a size we've proven the model accepts, and lets the budget
+    /// recover. `None` until a successful turn is recorded.
+    pub max_success_input: Option<u64>,
 }
 
 /// Outbound port for the learned context-window cache (issue #343) — the
@@ -376,17 +385,30 @@ pub trait LearnedWindowStore: Send + Sync {
         model: &str,
     ) -> Result<Option<LearnedWindow>, CoreError>;
 
-    /// Record an observed overflow ceiling for `(connector, model)` under the
+    /// Record a derived overflow input-ceiling for `(connector, model)` under the
     /// given `configured_window`. Implementations enforce the down-only ratchet:
     /// when an existing row shares the same `configured_window`, only a SMALLER
     /// `observed_limit` overwrites it; a new (higher or equal) configured window
-    /// replaces the row entirely (a deliberate window change starts fresh).
-    async fn record(
+    /// replaces the observation (a deliberate window change starts fresh). The
+    /// success high-water mark on the same row is preserved.
+    async fn record_overflow(
         &self,
         connector: &str,
         model: &str,
         observed_limit: u64,
         configured_window: u64,
+    ) -> Result<(), CoreError>;
+
+    /// Record a provider-measured input-token count from a turn that COMPLETED
+    /// for `(connector, model)` (issue #425). Implementations keep the LARGEST
+    /// value ever seen (high-water) and leave any overflow observation on the
+    /// row untouched. Independent of `configured_window`: a size the model has
+    /// proven it accepts stays proven regardless of later config changes.
+    async fn record_success(
+        &self,
+        connector: &str,
+        model: &str,
+        input_tokens: u64,
     ) -> Result<(), CoreError>;
 }
 

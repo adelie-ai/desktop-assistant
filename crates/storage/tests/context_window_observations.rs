@@ -82,33 +82,33 @@ async fn learned_window_ratchets_down_invalidates_and_isolates() {
     };
     run_migrations(&fixture.pool)
         .await
-        .expect("migrations (incl. 025) apply");
+        .expect("migrations (incl. 025/028) apply");
     let store = PgLearnedWindowStore::new(fixture.pool.clone());
+
+    let observed = |w: Option<desktop_assistant_core::ports::store::LearnedWindow>| {
+        w.and_then(|w| w.observed_limit)
+    };
 
     // Turn 1: an overflow under an 8192 configured window observed a 4096
     // ceiling — record it.
     store
-        .record("ollama", "qwen2.5", 4_096, 8_192)
+        .record_overflow("ollama", "qwen2.5", 4_096, 8_192)
         .await
         .expect("record");
     let got = store.lookup("ollama", "qwen2.5").await.expect("lookup");
     assert_eq!(
         got.map(|w| (w.observed_limit, w.configured_window)),
-        Some((4_096, 8_192))
+        Some((Some(4_096), Some(8_192)))
     );
 
     // Ratchet DOWN: a smaller observation under the same configured window
     // overwrites.
     store
-        .record("ollama", "qwen2.5", 2_048, 8_192)
+        .record_overflow("ollama", "qwen2.5", 2_048, 8_192)
         .await
         .expect("record smaller");
     assert_eq!(
-        store
-            .lookup("ollama", "qwen2.5")
-            .await
-            .expect("lookup")
-            .map(|w| w.observed_limit),
+        observed(store.lookup("ollama", "qwen2.5").await.expect("lookup")),
         Some(2_048),
         "a smaller observation must ratchet the stored ceiling down"
     );
@@ -116,24 +116,20 @@ async fn learned_window_ratchets_down_invalidates_and_isolates() {
     // NEVER UP: a larger observation under the same configured window is
     // ignored (down-only).
     store
-        .record("ollama", "qwen2.5", 6_000, 8_192)
+        .record_overflow("ollama", "qwen2.5", 6_000, 8_192)
         .await
         .expect("record larger");
     assert_eq!(
-        store
-            .lookup("ollama", "qwen2.5")
-            .await
-            .expect("lookup")
-            .map(|w| w.observed_limit),
+        observed(store.lookup("ollama", "qwen2.5").await.expect("lookup")),
         Some(2_048),
         "a larger observation under the same configured window must NOT raise the stored ceiling"
     );
 
     // INVALIDATION: a record under a DIFFERENT configured window replaces the
-    // row wholesale — a deliberate window change starts fresh (even if the new
-    // observed value is larger than the old one).
+    // observation wholesale — a deliberate window change starts fresh (even if
+    // the new observed value is larger than the old one).
     store
-        .record("ollama", "qwen2.5", 12_000, 16_384)
+        .record_overflow("ollama", "qwen2.5", 12_000, 16_384)
         .await
         .expect("record new configured window");
     assert_eq!(
@@ -142,30 +138,82 @@ async fn learned_window_ratchets_down_invalidates_and_isolates() {
             .await
             .expect("lookup")
             .map(|w| (w.observed_limit, w.configured_window)),
-        Some((12_000, 16_384)),
+        Some((Some(12_000), Some(16_384))),
         "a new configured window must replace the stale lower observation"
     );
 
-    // CROSS-(connector, model) ISOLATION: a different model's cap doesn't leak.
+    // SUCCESS HIGH-WATER (#425): record_success keeps the LARGEST measured input
+    // and leaves the overflow observation untouched.
     store
-        .record("ollama", "llama3", 1_024, 8_192)
+        .record_success("ollama", "qwen2.5", 10_000)
         .await
-        .expect("record other model");
+        .expect("record success");
+    store
+        .record_success("ollama", "qwen2.5", 14_000)
+        .await
+        .expect("record larger success");
+    store
+        .record_success("ollama", "qwen2.5", 9_000)
+        .await
+        .expect("record smaller success is ignored");
+    let row = store
+        .lookup("ollama", "qwen2.5")
+        .await
+        .expect("lookup")
+        .expect("row exists");
+    assert_eq!(
+        row.max_success_input,
+        Some(14_000),
+        "success high-water keeps the largest measured input"
+    );
+    assert_eq!(
+        (row.observed_limit, row.configured_window),
+        (Some(12_000), Some(16_384)),
+        "recording a success must not disturb the overflow observation"
+    );
+
+    // And an overflow record must not clobber the success high-water.
+    store
+        .record_overflow("ollama", "qwen2.5", 11_000, 16_384)
+        .await
+        .expect("record overflow after success");
     assert_eq!(
         store
             .lookup("ollama", "qwen2.5")
             .await
             .expect("lookup")
-            .map(|w| w.observed_limit),
-        Some(12_000),
+            .and_then(|w| w.max_success_input),
+        Some(14_000),
+        "an overflow record must preserve the success high-water"
+    );
+
+    // SUCCESS-ONLY ROW: a model that has only ever succeeded gets a row with a
+    // NULL observed_limit.
+    store
+        .record_success("ollama", "success-only", 5_000)
+        .await
+        .expect("record success-only");
+    let so = store
+        .lookup("ollama", "success-only")
+        .await
+        .expect("lookup")
+        .expect("row exists");
+    assert_eq!(so.observed_limit, None);
+    assert_eq!(so.configured_window, None);
+    assert_eq!(so.max_success_input, Some(5_000));
+
+    // CROSS-(connector, model) ISOLATION: a different model's cap doesn't leak.
+    store
+        .record_overflow("ollama", "llama3", 1_024, 8_192)
+        .await
+        .expect("record other model");
+    assert_eq!(
+        observed(store.lookup("ollama", "qwen2.5").await.expect("lookup")),
+        Some(11_000),
         "another model's learned cap must not leak into qwen2.5"
     );
     assert_eq!(
-        store
-            .lookup("ollama", "llama3")
-            .await
-            .expect("lookup")
-            .map(|w| w.observed_limit),
+        observed(store.lookup("ollama", "llama3").await.expect("lookup")),
         Some(1_024)
     );
     // Different connector, same model name is also isolated.
@@ -182,12 +230,8 @@ async fn learned_window_ratchets_down_invalidates_and_isolates() {
     // value (the row outlives any in-process state).
     let reopened = PgLearnedWindowStore::new(fixture.pool.clone());
     assert_eq!(
-        reopened
-            .lookup("ollama", "qwen2.5")
-            .await
-            .expect("lookup")
-            .map(|w| w.observed_limit),
-        Some(12_000),
+        observed(reopened.lookup("ollama", "qwen2.5").await.expect("lookup")),
+        Some(11_000),
         "persisted observation must survive a store restart"
     );
 

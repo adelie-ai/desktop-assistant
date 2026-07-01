@@ -33,7 +33,8 @@ use std::time::Duration;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::error_classify::{
-    ErrorContext, NormalizedCause, cause_to_core_error, classify_builtin,
+    ErrorContext, NormalizedCause, OverflowFields, cause_to_core_error, classify_builtin,
+    derive_input_ceiling, extract_overflow_fields,
 };
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig, current_context_budget,
@@ -52,11 +53,11 @@ pub struct ClassificationDeps {
     /// Cheap LLM used to classify genuinely novel errors (tier 3). `None`
     /// disables tier 3 (tier 2 still runs).
     pub classifier: Option<Arc<dyn LlmClient>>,
-    /// Learned context-window cache (issue #343). When a context-overflow
-    /// error carries a parsed `max_tokens`, the observed ceiling is persisted
-    /// here per `(connector, model)` so the next turn's budget resolution can
-    /// cap DOWN to it. `None` disables window learning (classification still
-    /// works).
+    /// Learned context-window cache (issues #343/#425). A derived input ceiling
+    /// from a context-overflow error, and the success high-water mark from
+    /// completed turns, are persisted here per `(connector, model)` so the next
+    /// turn's budget resolution can cap DOWN (and recover). `None` disables
+    /// window learning (classification still works).
     pub window_store: Option<Arc<dyn LearnedWindowStore>>,
 }
 
@@ -79,6 +80,12 @@ const CLASSIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// generic to key future errors on, so tier 3 rejects it and the original
 /// error surfaces.
 const MIN_SIGNATURE_LEN: usize = 8;
+
+/// Floor for recording a success high-water mark (issue #425). A prompt smaller
+/// than this — or smaller than half the configured budget — tells us nothing
+/// useful about the ceiling, so we skip the DB write. Also the fallback gate
+/// when no per-turn budget is installed (background jobs).
+const SUCCESS_HIGH_WATER_MIN_TOKENS: u64 = 8_192;
 
 /// Wraps an [`LlmClient`] and remaps opaque `CoreError::Llm` errors into the
 /// structured variant the classifier recognizes. See module docs.
@@ -139,17 +146,25 @@ impl<L> ClassifyingLlmClient<L> {
     {
         let detail = match result {
             Err(CoreError::Llm(detail)) => detail,
+            Ok(resp) => {
+                // Issue #425: a successful call is a data point that this model
+                // ACCEPTED `usage.input_tokens` — record it as the success
+                // high-water mark that floors the learned cap and lets the
+                // budget recover. Best-effort and side-channel.
+                self.learn_success(&resp, deps).await;
+                return Ok(resp);
+            }
             other => return other,
         };
 
         // Tier 1: deterministic, pure — always safe.
         let cause = classify_builtin(&self.ctx(&detail));
         if !matches!(cause, NormalizedCause::Unknown) {
-            // Issue #343: when this is a context overflow that surfaced a real
-            // provider-reported ceiling, persist it as a DOWN-ONLY learned cap
-            // for the next turn. Best-effort and side-channel — never blocks or
-            // changes the error that flows on to the recovery ladder.
-            self.learn_window(&cause, deps).await;
+            // Issue #343/#425: when this is a context overflow, derive the real
+            // input ceiling from the error and persist it as a DOWN-ONLY learned
+            // cap for the next turn. Best-effort and side-channel — never blocks
+            // or changes the error that flows on to the recovery ladder.
+            self.learn_window(&cause, &detail, deps).await;
             return self.apply(cause, detail);
         }
 
@@ -197,33 +212,39 @@ impl<L> ClassifyingLlmClient<L> {
         Err(CoreError::Llm(detail))
     }
 
-    /// Issue #343: persist an observed context-overflow ceiling as a DOWN-ONLY
-    /// learned cap keyed by `(connector, model)`, tagged with the effective
-    /// configured window that was in force this turn (for invalidation).
+    /// Issue #343/#425: derive an input-token ceiling from a context-overflow
+    /// error and persist it as a DOWN-ONLY learned cap keyed by
+    /// `(connector, model)`, tagged with the configured window in force this
+    /// turn (for invalidation).
+    ///
+    /// The ceiling comes from keyword-anchored extraction
+    /// ([`extract_overflow_fields`]) first; when that can't yield a number the
+    /// fuzzy LLM extractor backfills it (the "let the LLM decipher it" path).
+    /// [`derive_input_ceiling`] then turns the numbers into an input budget
+    /// (subtracting the output reservation).
     ///
     /// Best-effort and defensive:
-    /// - only fires for `ContextOverflow { max_tokens: Some(n) }` — no parsed
-    ///   ceiling means nothing to learn (`max_tokens: None` persists nothing);
+    /// - only fires for `ContextOverflow`;
     /// - skipped while a classification is in progress, so the tier-3
     ///   classifier's own overflow can't be mislearned (and its model/budget
     ///   task-locals would be wrong);
     /// - requires both a window store and a live `current_context_budget()` —
     ///   without the in-flight budget we have nothing to key invalidation on;
-    /// - the persisted value is the raw provider ceiling; the sanity-floor and
-    ///   down-only/invalidation rules are enforced at apply time
+    /// - the persisted value is un-snapped; snapping, the success floor, and
+    ///   the down-only/invalidation rules are enforced at apply time
     ///   (`apply_learned_cap`) and in the store's ratchet, so a garbage parse
     ///   can never pin the budget even if it is written.
-    async fn learn_window(&self, cause: &NormalizedCause, deps: Option<&ClassificationDeps>)
-    where
+    async fn learn_window(
+        &self,
+        cause: &NormalizedCause,
+        detail: &str,
+        deps: Option<&ClassificationDeps>,
+    ) where
         L: LlmClient,
     {
-        let NormalizedCause::ContextOverflow {
-            max_tokens: Some(observed),
-            ..
-        } = cause
-        else {
+        if !matches!(cause, NormalizedCause::ContextOverflow { .. }) {
             return;
-        };
+        }
         if is_classification_in_progress() {
             return;
         }
@@ -236,12 +257,26 @@ impl<L> ClassifyingLlmClient<L> {
         let Some(budget) = current_context_budget() else {
             return;
         };
+
+        // Deterministic keyword extraction first; only pay for the LLM extractor
+        // when the message is a phrasing we can't anchor (issue #425).
+        let mut fields = extract_overflow_fields(detail);
+        if derive_input_ceiling(&fields).is_none()
+            && let Some(classifier) = deps.and_then(|d| d.classifier.as_deref())
+            && let Some(llm_fields) = self.extract_overflow_via_llm(classifier, detail).await
+        {
+            fields = fields.or(llm_fields);
+        }
+        let Some(ceiling) = derive_input_ceiling(&fields) else {
+            return; // no usable number in the message — nothing to learn
+        };
+
         let model = current_model_override()
             .or_else(|| self.inner.get_default_model().map(str::to_string))
             .unwrap_or_default();
 
         if let Err(e) = store
-            .record(&self.connector, &model, *observed, budget.max_input_tokens)
+            .record_overflow(&self.connector, &model, ceiling, budget.max_input_tokens)
             .await
         {
             tracing::warn!(error = %e, "failed to persist learned context window");
@@ -249,11 +284,87 @@ impl<L> ClassifyingLlmClient<L> {
             tracing::info!(
                 connector = %self.connector,
                 model = %model,
-                observed_limit = *observed,
+                observed_limit = ceiling,
                 configured_window = budget.max_input_tokens,
-                "learned observed context-window ceiling (#343)"
+                "learned observed context-window ceiling (#343/#425)"
             );
         }
+    }
+
+    /// Issue #425: record the largest provider-measured input-token count this
+    /// model has ACCEPTED as the success high-water mark.
+    ///
+    /// Best-effort and side-channel:
+    /// - skipped while classifying, so the tier-3 classifier's own calls (and
+    ///   any background classification traffic) aren't miscounted;
+    /// - requires the connector to report `usage.input_tokens` (measured, not
+    ///   estimated); a connector that omits usage records nothing;
+    /// - only records prompts large enough to be a useful floor — a tiny prompt
+    ///   succeeding says nothing about the ceiling, and we don't want a DB write
+    ///   on every small turn. The gate is half the configured budget (or, absent
+    ///   a budget, the smallest ladder rung).
+    async fn learn_success(&self, resp: &LlmResponse, deps: Option<&ClassificationDeps>)
+    where
+        L: LlmClient,
+    {
+        if is_classification_in_progress() {
+            return;
+        }
+        let Some(store) = deps.and_then(|d| d.window_store.as_deref()) else {
+            return;
+        };
+        let Some(input_tokens) = resp.usage.as_ref().and_then(|u| u.input_tokens) else {
+            return;
+        };
+        let floor = current_context_budget()
+            .map(|b| b.max_input_tokens / 2)
+            .unwrap_or(SUCCESS_HIGH_WATER_MIN_TOKENS);
+        if input_tokens < floor.max(SUCCESS_HIGH_WATER_MIN_TOKENS) {
+            return;
+        }
+        let model = current_model_override()
+            .or_else(|| self.inner.get_default_model().map(str::to_string))
+            .unwrap_or_default();
+        if let Err(e) = store
+            .record_success(&self.connector, &model, input_tokens)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to persist context-window success high-water");
+        }
+    }
+
+    /// Issue #425: fuzzy fallback that asks the classifier LLM to extract the
+    /// overflow numbers from a phrasing the deterministic parser couldn't
+    /// anchor. Strict JSON, nullable per field. Best-effort: secret-scrubbed,
+    /// time-bounded, reentrancy-guarded; any failure yields `None` and the
+    /// caller simply learns nothing this turn.
+    async fn extract_overflow_via_llm(
+        &self,
+        classifier: &dyn LlmClient,
+        detail: &str,
+    ) -> Option<OverflowFields>
+    where
+        L: LlmClient,
+    {
+        let prompt = build_overflow_extraction_prompt(&redact_secrets(detail));
+        let call = with_classification_in_progress(classifier.stream_completion(
+            vec![Message::new(Role::User, prompt)],
+            &[],
+            ReasoningConfig::default(),
+            Box::new(|_| true),
+        ));
+        let resp = match tokio::time::timeout(CLASSIFY_TIMEOUT, call).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "tier-3 overflow extraction LLM call failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!("tier-3 overflow extraction timed out");
+                return None;
+            }
+        };
+        parse_overflow_extraction_response(&resp.text)
     }
 
     /// Tier 3: ask the cheap classifier LLM to label this error. Best-effort:
@@ -336,6 +447,49 @@ fn parse_classifier_response(text: &str, original: &str) -> Option<(NormalizedCa
         return None;
     }
     Some((cause, signature.to_string()))
+}
+
+/// Build the tier-3 overflow-number extraction prompt (issue #425). `message`
+/// must already be secret-scrubbed. Asks for strict JSON with nullable numeric
+/// fields so the model reports only what the error actually states.
+fn build_overflow_extraction_prompt(message: &str) -> String {
+    format!(
+        "A context-window overflow error from an LLM backend is below. Extract the token \
+         numbers it states. Reply with ONLY a JSON object and nothing else:\n\
+         {{\"max_context_tokens\": <the model's total context window in tokens, or null>, \
+         \"prompt_tokens\": <the input/prompt token count, or null>, \
+         \"requested_output_tokens\": <the requested/reserved output tokens, or null>}}\n\
+         Use null for any field the error does not state. Copy the integers exactly; do not \
+         guess, round, or infer a number that is not written in the error.\n\n\
+         Error: {message}"
+    )
+}
+
+/// Parse the tier-3 overflow-extraction response into [`OverflowFields`].
+/// Tolerates JSON nulls and missing keys (both become `None`); returns `None`
+/// only when there is no parseable JSON object at all.
+fn parse_overflow_extraction_response(text: &str) -> Option<OverflowFields> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end < start {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Parsed {
+        #[serde(default)]
+        max_context_tokens: Option<u64>,
+        #[serde(default)]
+        prompt_tokens: Option<u64>,
+        #[serde(default)]
+        requested_output_tokens: Option<u64>,
+    }
+    let parsed: Parsed = serde_json::from_str(text.get(start..=end)?).ok()?;
+    Some(OverflowFields {
+        max_context_tokens: parsed.max_context_tokens,
+        prompt_tokens: parsed.prompt_tokens,
+        requested_output_tokens: parsed.requested_output_tokens,
+    })
 }
 
 #[async_trait::async_trait]
@@ -803,18 +957,24 @@ mod tests {
     };
     use desktop_assistant_core::ports::store::LearnedWindow;
 
-    /// Learned-window store double: records every `record()` call.
+    /// Learned-window store double: records every `record_overflow` and
+    /// `record_success` call so tests can assert what was learned.
     struct MockWindowStore {
         recorded: Mutex<Vec<(String, String, u64, u64)>>,
+        successes: Mutex<Vec<(String, String, u64)>>,
     }
     impl MockWindowStore {
         fn new() -> Self {
             Self {
                 recorded: Mutex::new(vec![]),
+                successes: Mutex::new(vec![]),
             }
         }
         fn recorded(&self) -> Vec<(String, String, u64, u64)> {
             self.recorded.lock().unwrap().clone()
+        }
+        fn successes(&self) -> Vec<(String, String, u64)> {
+            self.successes.lock().unwrap().clone()
         }
     }
     #[async_trait::async_trait]
@@ -826,7 +986,7 @@ mod tests {
         ) -> Result<Option<LearnedWindow>, CoreError> {
             Ok(None)
         }
-        async fn record(
+        async fn record_overflow(
             &self,
             connector: &str,
             model: &str,
@@ -841,6 +1001,18 @@ mod tests {
             ));
             Ok(())
         }
+        async fn record_success(
+            &self,
+            connector: &str,
+            model: &str,
+            input_tokens: u64,
+        ) -> Result<(), CoreError> {
+            self.successes
+                .lock()
+                .unwrap()
+                .push((connector.into(), model.into(), input_tokens));
+            Ok(())
+        }
     }
 
     fn budget(max: u64) -> ContextBudget {
@@ -850,11 +1022,27 @@ mod tests {
         }
     }
 
+    /// A successful `LlmResponse` reporting `input_tokens` in its usage (issue
+    /// #425 success high-water tests).
+    fn make_ok_response(input_tokens: Option<u64>) -> LlmResponse {
+        LlmResponse {
+            text: "ok".into(),
+            tool_calls: vec![],
+            usage: Some(desktop_assistant_core::ports::llm::TokenUsage {
+                input_tokens,
+                output_tokens: Some(10),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+        }
+    }
+
     #[tokio::test]
-    async fn overflow_with_max_tokens_persists_observed_window() {
-        // A `ContextOverflow { max_tokens: Some(n) }` persists `n` for the
-        // in-flight `(connector, model)`, keyed by the effective configured
-        // window in force this turn.
+    async fn overflow_persists_derived_input_ceiling_not_request_id_digits() {
+        // Issue #425: the real Bedrock/Mantle error whose requestId UUID
+        // (`f2e534ff`) poisoned the old positional parse to 534. We must now
+        // persist the DERIVED input ceiling (202752 window − 8192 output =
+        // 194560), keyed by the configured window in force this turn.
         let window = Arc::new(MockWindowStore::new());
         let deps = ClassificationDeps {
             store: Arc::new(MockStore::new(None)),
@@ -862,30 +1050,34 @@ mod tests {
             window_store: Some(window.clone()),
         };
         let c = wrapped(Behavior::Ok);
+        let msg = "Mantle streaming error for requestId f2e534ff-436e-461b-8d93-906629545d84: \
+                   This model's maximum context length is 202752 tokens. However, you \
+                   requested 8192 output tokens and your prompt contains at least 194561 \
+                   input tokens, for a total of at least 202753 tokens.";
         let _ = with_context_budget(
-            budget(8_192),
-            with_model_override("qwen2.5".to_string(), async {
-                c.reclassify_with(
-                    Err(CoreError::Llm(
-                        "Input length (479258) exceeds maximum context length (4096).".into(),
-                    )),
-                    Some(&deps),
-                )
-                .await
+            budget(200_000),
+            with_model_override("zai.glm-5".to_string(), async {
+                c.reclassify_with(Err(CoreError::Llm(msg.into())), Some(&deps))
+                    .await
             }),
         )
         .await;
         assert_eq!(
             window.recorded(),
-            vec![("bedrock".into(), "qwen2.5".into(), 4_096, 8_192)],
-            "observed ceiling + configured window must be persisted"
+            vec![(
+                "bedrock".into(),
+                "zai.glm-5".into(),
+                202_752 - 8_192,
+                200_000
+            )],
+            "must persist the derived input ceiling, not the requestId digits"
         );
     }
 
     #[tokio::test]
-    async fn overflow_without_max_tokens_persists_nothing() {
-        // No parsed ceiling → nothing to learn. (The overflow phrasing here
-        // carries no two numbers, so `max_tokens` is `None`.)
+    async fn overflow_without_numbers_persists_nothing() {
+        // No number anywhere in the message → nothing to derive, nothing to
+        // learn (and no classifier configured to fall back to).
         let window = Arc::new(MockWindowStore::new());
         let deps = ClassificationDeps {
             store: Arc::new(MockStore::new(None)),
@@ -911,7 +1103,117 @@ mod tests {
         );
         assert!(
             window.recorded().is_empty(),
-            "max_tokens=None must persist nothing"
+            "no derivable number must persist nothing"
+        );
+    }
+
+    #[test]
+    fn overflow_extraction_response_parses_nulls_and_missing_as_none() {
+        // Nulls and absent keys both become None (issue #425: "null if it can't
+        // find the field"); prose around the JSON is tolerated.
+        let f = parse_overflow_extraction_response(
+            "Here you go: {\"max_context_tokens\": 200000, \"prompt_tokens\": null}",
+        )
+        .expect("parses");
+        assert_eq!(f.max_context_tokens, Some(200_000));
+        assert_eq!(f.prompt_tokens, None);
+        assert_eq!(f.requested_output_tokens, None);
+        // No JSON at all → None.
+        assert!(parse_overflow_extraction_response("sorry, I can't tell").is_none());
+    }
+
+    #[tokio::test]
+    async fn overflow_falls_back_to_llm_extraction_for_novel_phrasing() {
+        // Issue #425 "let the LLM decipher it": a phrasing the keyword parser
+        // can't anchor ("too many tokens" with no adjacent numbers) still
+        // classifies as overflow, so we ask the classifier LLM for the numbers
+        // and derive the ceiling from its JSON (128000 − 4096 = 123904).
+        let classifier = Arc::new(MockClassifier::ok(
+            "{\"max_context_tokens\": 128000, \"prompt_tokens\": 150000, \
+             \"requested_output_tokens\": 4096}",
+        ));
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: Some(classifier.clone()),
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let _ = with_context_budget(
+            budget(200_000),
+            with_model_override("mystery-model".to_string(), async {
+                c.reclassify_with(
+                    Err(CoreError::Llm(
+                        "Request rejected: too many tokens for this model.".into(),
+                    )),
+                    Some(&deps),
+                )
+                .await
+            }),
+        )
+        .await;
+        assert_eq!(classifier.calls(), 1, "the LLM extractor must be consulted");
+        assert_eq!(
+            window.recorded(),
+            vec![(
+                "bedrock".into(),
+                "mystery-model".into(),
+                128_000 - 4_096,
+                200_000
+            )],
+            "the derived ceiling from the LLM's numbers must be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_turn_records_high_water_mark() {
+        // Issue #425: a completed call reports `usage.input_tokens`; when it's a
+        // meaningful fraction of the budget it's recorded as the success
+        // high-water mark for `(connector, model)`.
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: None,
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let _ = with_context_budget(
+            budget(200_000),
+            with_model_override("zai.glm-5".to_string(), async {
+                c.reclassify_with(Ok(make_ok_response(Some(180_000))), Some(&deps))
+                    .await
+            }),
+        )
+        .await;
+        assert_eq!(
+            window.successes(),
+            vec![("bedrock".into(), "zai.glm-5".into(), 180_000)],
+        );
+        assert!(window.recorded().is_empty(), "no overflow on a success");
+    }
+
+    #[tokio::test]
+    async fn small_successful_turn_skips_high_water_write() {
+        // A prompt well under half the budget says nothing about the ceiling and
+        // must not incur a DB write.
+        let window = Arc::new(MockWindowStore::new());
+        let deps = ClassificationDeps {
+            store: Arc::new(MockStore::new(None)),
+            classifier: None,
+            window_store: Some(window.clone()),
+        };
+        let c = wrapped(Behavior::Ok);
+        let _ = with_context_budget(
+            budget(200_000),
+            with_model_override("zai.glm-5".to_string(), async {
+                c.reclassify_with(Ok(make_ok_response(Some(5_000))), Some(&deps))
+                    .await
+            }),
+        )
+        .await;
+        assert!(
+            window.successes().is_empty(),
+            "tiny prompt is not a high-water"
         );
     }
 

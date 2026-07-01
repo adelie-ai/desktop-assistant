@@ -8,6 +8,7 @@
 //! stay in [`super`] because they are shared with serde defaults and
 //! the secret backends.
 
+use desktop_assistant_core::context_window::snap_down_to_common;
 use desktop_assistant_core::ports::llm::{BudgetSource, ContextBudget};
 use desktop_assistant_core::ports::store::LearnedWindow;
 
@@ -347,60 +348,67 @@ pub fn resolve_context_budget(
     }
 }
 
-/// Sanity floor for a learned (observed-overflow) context-window cap.
-///
-/// `observed_limit` is parsed out of an upstream provider's error STRING
-/// (`error_classify::first_two_numbers`), which is untrusted-ish: a malicious
-/// or garbled message could yield `0`, `1`, or some absurdly small number that,
-/// applied as a `min()` cap, would brick the assistant (no prompt fits). We
-/// refuse to learn — and refuse to apply — any cap below this floor. The floor
-/// is intentionally tiny (a few hundred tokens is a legitimately small window
-/// on some embedded models) so it rejects only pathological values, not
-/// genuinely-small-but-usable ones.
-pub const MIN_LEARNED_WINDOW: u64 = 256;
-
-/// Apply a learned (observed-overflow) window as a DOWN-ONLY cap on an already
-/// resolved [`ContextBudget`] (issue #343).
+/// Apply a learned context-window observation to an already-resolved
+/// [`ContextBudget`] (issues #343, #425).
 ///
 /// This composes *after* [`resolve_context_budget`] so the documented
-/// precedence holds: `purpose-override > learned (min, DOWN-ONLY) > connector /
-/// Ollama-effective-window > 200K fallback`. The learned value is a `min()`
-/// CAP, never an additive tier — it can only lower the budget, never raise it.
+/// precedence holds: `purpose-override > learned (DOWN-ONLY cap, floored by a
+/// proven success) > connector / Ollama-effective-window > 200K fallback`.
 ///
-/// Guards, in order:
-///   1. **Sanity floor.** A learned `observed_limit` below [`MIN_LEARNED_WINDOW`]
-///      is pathological (garbage/hostile parse) and is ignored — a parsed `0`
-///      or `1` must never pin the budget.
-///   2. **Invalidation.** The learned row carries the `configured_window` that
-///      was in force when the overflow was observed. If that differs from the
-///      *current* effective configured window (`budget.max_input_tokens`), the
-///      observation is stale — the user bumped (or lowered) the window — so it
-///      is discarded and the fresh, higher (or new) ceiling stands. This is how
-///      a config bump escapes a previously-learned-low value.
-///   3. **Down-only.** Even for a matching configured window, the cap only
-///      applies when it is strictly below the resolved budget; a learned value
-///      `>=` the budget never raises it (the `min()` is a no-op).
+/// Two forces combine, in order:
 ///
-/// Returns the (possibly unchanged) budget; when the cap applies, the source is
-/// re-tagged [`BudgetSource::LearnedCap`].
+/// **1. Overflow cap (down-only, snapped).** An observed overflow ceiling caps
+/// the budget DOWN, but never to the scraped integer directly — it is snapped to
+/// a stable rung via [`snap_down_to_common`]. Guards:
+///   - **Invalidation.** The observation carries the `configured_window` in
+///     force when it was seen; if that differs from the current budget the user
+///     changed the window, so the stale observation is ignored and the fresh
+///     ceiling stands.
+///   - **Snap sanity.** [`snap_down_to_common`] returns `None` for a value below
+///     its smallest rung, so a pathological parse (the 534-token poison of #425)
+///     can never pin the budget — it's simply not applied.
+///   - **Down-only.** The snapped cap applies only when strictly below the
+///     resolved budget.
+///
+/// **2. Success floor (recovery).** The largest provider-measured input we've
+/// seen this model ACCEPT floors the result (bounded by the configured budget so
+/// we never exceed it). This is the #425 safety net: even if an overflow cap or
+/// a bad parse tries to drop the budget below a size the model has demonstrably
+/// handled, the floor holds it up — and as larger prompts succeed the budget
+/// climbs back, which the old pure down-only ratchet could never do.
+///
+/// Returns the (possibly unchanged) budget; when either force moves it, the
+/// source is re-tagged [`BudgetSource::LearnedCap`].
 pub fn apply_learned_cap(budget: ContextBudget, learned: Option<LearnedWindow>) -> ContextBudget {
     let Some(learned) = learned else {
         return budget;
     };
-    // Guard 1: pathological observed value — refuse to apply.
-    if learned.observed_limit < MIN_LEARNED_WINDOW {
-        return budget;
+    let resolved = budget.max_input_tokens;
+    let mut effective = resolved;
+
+    // Force 1: down-only overflow cap, snapped. Invalidation (configured_window
+    // must match), snap-sanity (None for pathologically small), and down-only
+    // are all expressed in this single chained guard.
+    if let (Some(observed), Some(configured)) = (learned.observed_limit, learned.configured_window)
+        && configured == resolved
+        && let Some(snapped) = snap_down_to_common(observed)
+        && snapped < effective
+    {
+        effective = snapped;
     }
-    // Guard 2: invalidation — stale if the configured window has changed.
-    if learned.configured_window != budget.max_input_tokens {
-        return budget;
+
+    // Force 2: success floor — never cap below a size the model has proven it
+    // accepts (bounded by the configured budget). Independent of the overflow
+    // observation's invalidation: proven-good is proven-good.
+    if let Some(high_water) = learned.max_success_input {
+        effective = effective.max(high_water.min(resolved));
     }
-    // Guard 3: down-only — never raise the budget.
-    if learned.observed_limit >= budget.max_input_tokens {
-        return budget;
+
+    if effective == resolved {
+        return budget; // neither force moved it — keep the resolved tier/source
     }
     ContextBudget {
-        max_input_tokens: learned.observed_limit,
+        max_input_tokens: effective,
         source: BudgetSource::LearnedCap,
     }
 }

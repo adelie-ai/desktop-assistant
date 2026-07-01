@@ -221,6 +221,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Success high-water mark for learned context windows (#425): the other
+    // half of the #343 bracket, so a mis-parsed overflow can't pin the budget
+    // below a proven-good size and the budget can recover.
+    sqlx::raw_sql(include_str!(
+        "../migrations/028_context_window_success_watermark.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
