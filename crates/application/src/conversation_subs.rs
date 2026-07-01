@@ -58,7 +58,9 @@ impl ConversationSubscriptions {
     pub fn register(&self, session_id: &str, user_id: &str, sink: Arc<dyn EventSink>) {
         let mut inner = self.lock();
         inner.sinks.insert(session_id.to_string(), sink);
-        inner.users.insert(session_id.to_string(), user_id.to_string());
+        inner
+            .users
+            .insert(session_id.to_string(), user_id.to_string());
     }
 
     /// Drop a connection on disconnect: forget its sink, subscriptions, and

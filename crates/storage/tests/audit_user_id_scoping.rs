@@ -230,7 +230,12 @@ fn every_storage_query_targeting_a_personal_data_table_includes_user_id() {
 #[test]
 fn assert_personal_tables_match_audit() {
     let canonical = personal_data_tables();
-    for required in ["turns", "idempotency_keys", "background_tasks", "scratchpads"] {
+    for required in [
+        "turns",
+        "idempotency_keys",
+        "background_tasks",
+        "scratchpads",
+    ] {
         assert!(
             canonical.contains(&required),
             "canonical personal-data list must include `{required}`; dropping it \

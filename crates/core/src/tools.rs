@@ -472,7 +472,10 @@ mod tests {
             !out.contains("sk-abc123secret"),
             "secret in array-of-objects leaked: {out}"
         );
-        assert!(out.contains("‹redacted›"), "expected redaction marker: {out}");
+        assert!(
+            out.contains("‹redacted›"),
+            "expected redaction marker: {out}"
+        );
     }
 
     #[test]
@@ -486,7 +489,10 @@ mod tests {
             !out.contains("s3cr3t-value"),
             "secret in nested array leaked: {out}"
         );
-        assert!(out.contains("‹redacted›"), "expected redaction marker: {out}");
+        assert!(
+            out.contains("‹redacted›"),
+            "expected redaction marker: {out}"
+        );
     }
 
     #[test]
@@ -495,6 +501,9 @@ mod tests {
         // dropped or over-redacted).
         let out = summarize_tool_value(&json!({ "ids": [1, 2, 3] }));
         assert!(out.contains("ids="), "got: {out}");
-        assert!(out.contains('1') && out.contains('3'), "array content lost: {out}");
+        assert!(
+            out.contains('1') && out.contains('3'),
+            "array content lost: {out}"
+        );
     }
 }
