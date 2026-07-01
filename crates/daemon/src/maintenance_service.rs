@@ -221,3 +221,83 @@ pub fn knowledge_change_notifier(
         registry.notify_knowledge_changed(user_id);
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Timeout-wrapper coverage (issue #438): a wedged provider must fail the
+    //! maintenance pass instead of hanging extraction/consolidation forever.
+    //!
+    //! Both tests run on a paused clock (`start_paused = true`), so tokio
+    //! auto-advances virtual time to the [`MAINTENANCE_CALL_TIMEOUT`] deadline
+    //! the moment the (never-resolving) provider future parks — the wall-clock
+    //! test runs in microseconds while still exercising the real timeout branch.
+    use super::*;
+    use desktop_assistant_core::domain::ToolDefinition;
+    use desktop_assistant_core::ports::llm::{ChunkCallback, LlmResponse};
+
+    /// An `LlmClient` whose `stream_completion` never returns — models a hung /
+    /// unreachable provider endpoint.
+    struct HangingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for HangingLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            std::future::pending::<()>().await;
+            unreachable!("hung provider never resolves")
+        }
+    }
+
+    /// An `EmbeddingClient` whose `embed` never returns — models a hung embedding
+    /// endpoint.
+    struct HangingEmbedder;
+
+    #[async_trait::async_trait]
+    impl EmbeddingClient for HangingEmbedder {
+        async fn embed(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+            std::future::pending::<()>().await;
+            unreachable!("hung embedder never resolves")
+        }
+
+        async fn model_identifier(&self) -> Result<String, CoreError> {
+            Ok("hanging".to_string())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_llm_call_times_out() {
+        let llm: Arc<dyn LlmClient> = Arc::new(HangingLlm);
+        let llm_fn = DaemonKnowledgeMaintenanceService::build_llm_fn(
+            llm,
+            ReasoningConfig::default(),
+            CancellationToken::new(),
+        );
+
+        let result = llm_fn("system".to_string(), "user".to_string()).await;
+
+        let err = result.expect_err("a hung LLM provider must time out, not hang");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_embed_call_times_out() {
+        let client: Arc<dyn EmbeddingClient> = Arc::new(HangingEmbedder);
+        let embed_fn = DaemonKnowledgeMaintenanceService::build_embed_fn(client);
+
+        let result = embed_fn(vec!["text to embed".to_string()]).await;
+
+        let err = result.expect_err("a hung embedder must time out, not hang");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+    }
+}
