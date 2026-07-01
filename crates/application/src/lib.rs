@@ -38,6 +38,30 @@ use crate::client_tools::{
 };
 use crate::inflight::{InFlightRegistry, InFlightTurn, TeeSink, forward_inflight};
 
+/// Panic-safe free of a keyed turn's in-flight slot (#440).
+///
+/// The slot must be removed from the [`InFlightRegistry`] when the turn body
+/// ends so a later same-key send falls through to completed-dedup (or runs
+/// fresh). Doing that with an inline `remove` *after* `run_send_turn().await`
+/// is not panic-safe: a panicking turn unwinds past the inline call and orphans
+/// the slot, so the next same-key send re-attaches to a dead hub (whose
+/// broadcast sender never drops) and hangs forever. Holding the removal in a
+/// `Drop` guard makes it run on every exit path — normal return, `?`, or panic
+/// unwind — mirroring the registry's own panic-safe `finalize`.
+struct InFlightSlotGuard {
+    index: Arc<InFlightRegistry>,
+    user_id: String,
+    conversation_id: String,
+    key: String,
+}
+
+impl Drop for InFlightSlotGuard {
+    fn drop(&mut self) {
+        self.index
+            .remove(&self.user_id, &self.conversation_id, &self.key);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("core error: {0}")]
@@ -2343,11 +2367,20 @@ where
             None => Arc::clone(&sink),
         };
 
-        let inflight_index = Arc::clone(&self.inflight);
+        // Panic-safe free of the in-flight slot (#440). `turn_sink` (the
+        // `TeeSink`) already holds the hub for the turn's lifetime, so the
+        // slot's own hub `Arc` here is redundant and dropped now; the guard
+        // removes the registry entry when the body ends by ANY path — normal
+        // return or a panic that would otherwise orphan the slot and strand the
+        // next same-key re-attacher on a dead hub.
+        let inflight_guard = inflight_slot.map(|(key, _turn)| InFlightSlotGuard {
+            index: Arc::clone(&self.inflight),
+            user_id: user_id.as_str().to_string(),
+            conversation_id: conversation_id.clone(),
+            key,
+        });
         let conv_id_for_body = conversation_id.clone();
-        let conv_id_for_cleanup = conversation_id.clone();
         let request_id_for_body = request_id.clone();
-        let user_id_for_cleanup = user_id.clone();
         // Capture every request-scoped task-local before the spawn (#305 item
         // 4). `task_local`s don't cross `tokio::spawn`, so the body re-installs
         // the whole bundle in one call — user id (#105/#154), login session
@@ -2402,11 +2435,11 @@ where
 
             // Free the in-flight slot now the turn is done. `run_send_turn` has
             // returned, so its `TeeSink` (the other hub owner) is dropped here
-            // too — once the slot is removed the broadcast closes and any
-            // re-attach streams finish.
-            if let Some((key, _turn)) = inflight_slot {
-                inflight_index.remove(user_id_for_cleanup.as_str(), &conv_id_for_cleanup, &key);
-            }
+            // too — once the guard removes the slot the broadcast closes and any
+            // re-attach streams finish. Dropping the guard here keeps the normal
+            // path's timing identical to the old inline `remove`; on a panic the
+            // guard (a captured local) is dropped during unwind instead (#440).
+            drop(inflight_guard);
 
             match result {
                 Ok(()) => Ok(()),
@@ -5592,6 +5625,323 @@ mod tests {
         assert!(
             live2.contains("part2"),
             "re-attacher receives chunks emitted after it joined: {live2:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // #440: concurrency / failure edges for the in-flight slot and
+    // idempotency-on-failure.
+    // ----------------------------------------------------------------
+
+    /// Selects how [`ModeConversations::send_prompt`] behaves on its first
+    /// call. Both modes recover on the second call so a test can prove a
+    /// *fresh* re-run (not a re-attach to the failed turn) actually completes.
+    #[derive(Clone, Copy)]
+    enum ConvMode {
+        /// First turn panics mid-flight; later turns succeed.
+        PanicThenOk,
+        /// First turn returns `Err`; later turns succeed.
+        FailThenOk,
+    }
+
+    /// `ConversationService` double whose first turn fails (panics or `Err`,
+    /// per [`ConvMode`]) and whose subsequent turns emit `"recovered"` and
+    /// complete. `runs` counts every `send_prompt` entry so a test can assert
+    /// how many turns actually executed.
+    struct ModeConversations {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        mode: ConvMode,
+    }
+    #[async_trait::async_trait]
+    impl ConversationService for ModeConversations {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("c1", title))
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            let n = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                match self.mode {
+                    ConvMode::PanicThenOk => panic!("first keyed turn panics before completing"),
+                    ConvMode::FailThenOk => return Err(CoreError::Llm("first turn failed".into())),
+                }
+            }
+            on_chunk("recovered".to_string());
+            Ok("recovered".to_string())
+        }
+    }
+
+    /// #440 HIGH (`lib.rs:2403-2405`): the in-flight slot is freed inside the
+    /// turn body *after* `run_send_turn().await`, so a panic skips the inline
+    /// removal. Without a panic-safe free, the slot is orphaned and a later
+    /// same-key send re-attaches to a dead hub (its broadcast sender never
+    /// drops) and hangs forever instead of running fresh. This test drives a
+    /// keyed send whose first turn panics, then a second same-key send, and
+    /// asserts the second runs a *fresh* turn to completion.
+    #[tokio::test]
+    async fn panicking_turn_frees_inflight_slot() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(ModeConversations {
+            runs: Arc::clone(&runs),
+            mode: ConvMode::PanicThenOk,
+        });
+        let registry = Arc::new(crate::background_tasks::BackgroundTaskRegistry::new());
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            conv,
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_registry(Arc::clone(&registry));
+
+        // Request 1: a keyed send whose turn panics mid-flight.
+        let sink1 = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        let t1 = h
+            .start_send_message(
+                "c1".into(),
+                "hi".into(),
+                None,
+                String::new(),
+                "r1".into(),
+                Some("k1".into()),
+                sink1.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("task 1");
+        // The panicking turn still finalizes (as Failed) — the registry runs
+        // the body in a child task and catches the panic (#171). The slot must
+        // be freed by the time the task is terminal.
+        tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(&t1))
+            .await
+            .expect("panicking turn finalizes, not hangs");
+
+        // Request 2: same key, after the first turn died. It must NOT re-attach
+        // to the orphaned (dead) hub — it must claim a fresh slot and run.
+        let sink2 = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        let t2 = h
+            .start_send_message(
+                "c1".into(),
+                "hi".into(),
+                None,
+                String::new(),
+                "r2".into(),
+                Some("k1".into()),
+                sink2.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("task 2");
+        tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(&t2))
+            .await
+            .expect(
+                "second same-key send must run fresh and complete — a hang here means it \
+                 re-attached to the panicked turn's orphaned in-flight slot (dead hub)",
+            );
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the second same-key send must run a FRESH turn (not re-attach to the dead hub)"
+        );
+        let ev2 = sink2.0.lock().await.clone();
+        assert!(
+            ev2.iter().any(|e| matches!(
+                e,
+                api::Event::AssistantCompleted { request_id, full_response, .. }
+                    if request_id == "r2" && full_response == "recovered"
+            )),
+            "the fresh retry completes with its own reply, got {ev2:?}"
+        );
+    }
+
+    /// #440 HIGH (`lib.rs:2297-2311` + `inflight.rs:198-212`): two *concurrent*
+    /// same-key sends must run the turn exactly once — the loser re-attaches to
+    /// the winner's live turn. Unlike the existing sequential test
+    /// (`idempotency_inflight_reattach_does_not_rerun`), both requests race
+    /// through `start_send_message` behind a barrier, so this exercises the
+    /// atomic check-and-insert in `InFlightRegistry::register`.
+    #[tokio::test]
+    async fn two_concurrent_sends_same_key_run_once() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let conv = Arc::new(GatedConversations {
+            runs: Arc::clone(&runs),
+            release: Arc::clone(&release),
+        });
+        let registry = Arc::new(crate::background_tasks::BackgroundTaskRegistry::new());
+        let h = Arc::new(
+            DefaultAssistantApiHandler::new(
+                Arc::new(FakeAssistant),
+                conv,
+                Arc::new(FakeSettings),
+                Arc::new(FakeConnections),
+                Arc::new(FakeKnowledge),
+            )
+            .with_registry(Arc::clone(&registry)),
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for req in ["ra", "rb"] {
+            let h = Arc::clone(&h);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+                // Line the two calls up as closely as the runtime allows so
+                // they genuinely race on the in-flight registration.
+                barrier.wait().await;
+                let task_id = h
+                    .start_send_message(
+                        "c1".into(),
+                        "hi".into(),
+                        None,
+                        String::new(),
+                        req.to_string(),
+                        Some("shared-key".into()),
+                        sink.clone(),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("task id");
+                (task_id, sink)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.expect("send task joins"));
+        }
+
+        // Exactly one turn is blocked on the winner's gate; wake it.
+        release.notify_one();
+
+        for (task_id, _) in &results {
+            tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(task_id))
+                .await
+                .expect("both the winner and the re-attacher finish");
+        }
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "two concurrent same-key sends must run the turn exactly once"
+        );
+        for (_, sink) in &results {
+            let evs = sink.0.lock().await.clone();
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, api::Event::AssistantCompleted { .. })),
+                "both the winner and the re-attacher must complete, got {evs:?}"
+            );
+        }
+    }
+
+    /// #440 (`lib.rs:3031`): `record_response` runs only on the `Ok` branch, so
+    /// a *failed* keyed turn records nothing and a retry re-runs from scratch
+    /// (rather than replaying a phantom success). Uses the no-registry direct
+    /// path so the failure surfaces as an `Err` return.
+    #[tokio::test]
+    async fn failed_keyed_turn_records_nothing_and_retry_reruns() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(ModeConversations {
+            runs: Arc::clone(&runs),
+            mode: ConvMode::FailThenOk,
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        let store_dyn: Arc<dyn desktop_assistant_core::ports::store::IdempotencyKeyStore> =
+            store.clone();
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            conv,
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_idempotency_store(store_dyn);
+
+        // First attempt: the turn fails, so the handler returns Err.
+        let sink1 = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        let first = h
+            .handle_send_message_with_override(
+                "c1".into(),
+                "hi".into(),
+                None,
+                String::new(),
+                "r1".into(),
+                Some("k1".into()),
+                sink1.clone(),
+            )
+            .await;
+        assert!(first.is_err(), "a failed turn surfaces as Err");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the first turn ran");
+        assert!(
+            store.lookup_completed("c1", "k1").await.unwrap().is_none(),
+            "a failed keyed turn must record NOTHING for the key"
+        );
+
+        // Retry with the same key: nothing was recorded, so it re-runs (does
+        // not replay), and this time succeeds and records the reply.
+        let sink2 = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r2".into(),
+            Some("k1".into()),
+            sink2.clone(),
+        )
+        .await
+        .expect("retry succeeds");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the retry of a failed key must run a fresh turn, not replay"
+        );
+        assert_eq!(
+            store.lookup_completed("c1", "k1").await.unwrap().as_deref(),
+            Some("recovered"),
+            "the successful retry records its reply under the key"
         );
     }
 }

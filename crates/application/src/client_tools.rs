@@ -807,4 +807,183 @@ mod tests {
             .await;
         assert!(err.is_err(), "updating an unknown turn id must still error");
     }
+
+    // ----------------------------------------------------------------
+    // #440: result-size cap + double-resolve edges of
+    // `resolve_client_tool_result`.
+    // ----------------------------------------------------------------
+
+    struct NoopSink;
+    #[async_trait::async_trait]
+    impl EventSink for NoopSink {
+        async fn emit(&self, _event: api::Event) -> bool {
+            true
+        }
+    }
+
+    /// #440 (`client_tools.rs:447-465`): an `Ok` result body larger than
+    /// `MAX_CLIENT_TOOL_RESULT_BYTES` is rejected as `MalformedResult` before
+    /// any slot lookup, so a runaway client can't wedge the LLM context.
+    #[tokio::test]
+    async fn client_tool_result_over_1mib_rejected() {
+        let coord = ClientToolCoordinator::new();
+        let store = InMemoryTurnStateStore::new();
+        let oversized = "a".repeat(MAX_CLIENT_TOOL_RESULT_BYTES + 1);
+
+        let err = resolve_client_tool_result(
+            &coord,
+            &store,
+            UserId::new("alice"),
+            api::TaskId("task-x".into()),
+            "call-1".to_string(),
+            Ok(oversized),
+        )
+        .await
+        .expect_err("an oversized result body must be rejected");
+        match err {
+            ClientToolResolutionError::MalformedResult(msg) => assert!(
+                msg.contains("result body exceeds size cap"),
+                "wrong malformed message: {msg}"
+            ),
+            other => panic!("expected MalformedResult, got {other:?}"),
+        }
+    }
+
+    /// #440 (`client_tools.rs:447-465`): an `Err` reason larger than the cap is
+    /// likewise rejected — the size guard covers both arms of the payload.
+    #[tokio::test]
+    async fn client_tool_error_over_1mib_rejected() {
+        let coord = ClientToolCoordinator::new();
+        let store = InMemoryTurnStateStore::new();
+        let oversized = "e".repeat(MAX_CLIENT_TOOL_RESULT_BYTES + 1);
+
+        let err = resolve_client_tool_result(
+            &coord,
+            &store,
+            UserId::new("alice"),
+            api::TaskId("task-x".into()),
+            "call-1".to_string(),
+            Err(oversized),
+        )
+        .await
+        .expect_err("an oversized error reason must be rejected");
+        match err {
+            ClientToolResolutionError::MalformedResult(msg) => assert!(
+                msg.contains("error reason exceeds size cap"),
+                "wrong malformed message: {msg}"
+            ),
+            other => panic!("expected MalformedResult, got {other:?}"),
+        }
+    }
+
+    /// #440 (`client_tools.rs:468-491`): resolving a suspended turn removes its
+    /// pending slot, so a *second* result for the same task_id finds nothing
+    /// and returns `TurnNotFound` — a duplicate `ClientToolResult` can never
+    /// double-wake a turn or feed the LLM twice.
+    #[tokio::test]
+    async fn two_results_for_same_task_id_second_is_turn_not_found() {
+        use desktop_assistant_core::ports::auth::with_user_id;
+
+        let coord = Arc::new(ClientToolCoordinator::new());
+        let store: Arc<dyn TurnStateStore> = Arc::new(InMemoryTurnStateStore::new());
+        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
+        let user = UserId::new("alice");
+        let task_id = api::TaskId("task-dr".into());
+        let tool_call_id = "call-1".to_string();
+
+        // Register the tool and create the backing turn row under the user's
+        // scope, exactly as the live port does before suspending.
+        with_user_id(user.clone(), async {
+            coord
+                .register(&[api::ClientToolRegistration {
+                    name: "fs_read".into(),
+                    description: "read a file".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }])
+                .await;
+            store
+                .create_turn(TurnRow {
+                    id: task_id.0.clone(),
+                    user_id: user.as_str().to_string(),
+                    conversation_id: "c1".to_string(),
+                    status: TurnStatus::PendingLlm,
+                    state: TurnStateJson::default(),
+                    last_error: None,
+                })
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // Spawn the suspension (task-locals don't cross `spawn`, so re-install
+        // the user scope inside the task).
+        let coord_s = Arc::clone(&coord);
+        let store_s = Arc::clone(&store);
+        let sink_s = Arc::clone(&sink);
+        let user_s = user.clone();
+        let task_s = task_id.clone();
+        let tcid_s = tool_call_id.clone();
+        let suspended = tokio::spawn(async move {
+            with_user_id(user_s, async move {
+                suspend_for_client_tool(
+                    &coord_s,
+                    &*store_s,
+                    &*sink_s,
+                    task_s,
+                    "c1".to_string(),
+                    PendingClientToolCall {
+                        tool_call_id: tcid_s,
+                        tool_name: "fs_read".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                )
+                .await
+            })
+            .await
+        });
+
+        // Wait until the suspension has installed its pending slot.
+        let mut installed = false;
+        for _ in 0..2000 {
+            if coord.pending.lock().unwrap().contains_key(&task_id.0) {
+                installed = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(installed, "suspension must install a pending slot");
+
+        // First result wakes the turn and removes the slot.
+        resolve_client_tool_result(
+            &coord,
+            &*store,
+            user.clone(),
+            task_id.clone(),
+            tool_call_id.clone(),
+            Ok("first".to_string()),
+        )
+        .await
+        .expect("first result resolves the suspension");
+        let woke = tokio::time::timeout(Duration::from_secs(5), suspended)
+            .await
+            .expect("suspended turn wakes, not hangs")
+            .expect("suspension task joins");
+        assert_eq!(woke.unwrap(), "first", "the turn resumes with the result");
+
+        // Second result for the same task_id finds no slot.
+        let err = resolve_client_tool_result(
+            &coord,
+            &*store,
+            user,
+            task_id.clone(),
+            tool_call_id,
+            Ok("second".to_string()),
+        )
+        .await
+        .expect_err("a second result for a resolved turn must be rejected");
+        assert!(
+            matches!(err, ClientToolResolutionError::TurnNotFound { .. }),
+            "expected TurnNotFound, got {err:?}"
+        );
+    }
 }
