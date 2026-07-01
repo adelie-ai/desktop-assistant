@@ -15,7 +15,7 @@ use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
-    current_context_budget, current_system_refinement, current_tool_allowlist,
+    current_context_budget, current_tool_allowlist,
 };
 use crate::ports::scratchpad::{
     MAX_NOTE_BYTES, NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn, ScratchpadListFn,
@@ -781,15 +781,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // persistently-oversized request doesn't loop indefinitely.
         let mut overflow_retries: u32 = 0;
 
-        // Per-request system-prompt refinement (installed by the daemon
-        // dispatch wrapper from the client's `system_refinement` field; empty
-        // for callers that don't route through it). Read once here so the
-        // value is stable for every assembly pass in this turn. It is
-        // appended to the system prompt for THIS request only — it is never
-        // pushed onto `conv.messages` or otherwise persisted, so it stays out
-        // of chat history and never affects a later turn.
-        let system_refinement = current_system_refinement();
-
         // Run compaction if enough messages have been dropped by windowing.
         if let Some((from, to)) = compaction_range(&conv, target_window) {
             let summary = generate_context_summary(
@@ -1070,7 +1061,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     tool_rounds_since_anchor,
                 },
                 target_window,
-                &system_refinement,
                 current_context_budget(),
                 &estimate,
             );
