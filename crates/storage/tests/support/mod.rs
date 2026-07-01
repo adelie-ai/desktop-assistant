@@ -21,6 +21,26 @@ use uuid::Uuid;
 
 static SKIP_BANNER: Once = Once::new();
 
+/// Grant the #434 RLS tool role (`adele_query`, created by migration 029)
+/// `USAGE` + `SELECT` on `schema`, so a read-path suite whose tables live
+/// in a private test schema can `SET LOCAL ROLE adele_query` and still
+/// resolve them. Production tables live in `public`, which migration 029
+/// grants directly; this mirrors that grant for the private-schema layout
+/// the DB-gated suites use for parallel isolation. Without it every grafted
+/// SELECT under the tool role would fail with "permission denied".
+pub async fn grant_tool_role_on_schema(pool: &PgPool, schema: &str) {
+    let role = desktop_assistant_storage::TOOL_QUERY_ROLE;
+    for stmt in [
+        format!("GRANT USAGE ON SCHEMA \"{schema}\" TO {role}"),
+        format!("GRANT SELECT ON ALL TABLES IN SCHEMA \"{schema}\" TO {role}"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt))
+            .execute(pool)
+            .await
+            .expect("grant tool role on test schema");
+    }
+}
+
 /// The connection URL for the DB-gated suites, or `None` when no database is
 /// available (in which case the caller should pass-skip). On the first `None`
 /// in a test binary, prints a prominent, actionable banner so the skip is
@@ -80,6 +100,12 @@ pub struct DbFixture {
 }
 
 impl DbFixture {
+    /// The private schema this fixture's tables live in — for suites that
+    /// need to name it in a catalog query or a schema-scoped grant.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
     /// Build a fixture against `TEST_DATABASE_URL`, or `None` when it is unset
     /// (callers pass-skip). `prefix` disambiguates schemas across suites so a
     /// leaked schema is traceable to the suite that made it.

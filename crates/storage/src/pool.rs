@@ -230,6 +230,16 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // #434: Row-Level Security backstop for the LLM-facing db_query read
+    // path. Creates the un-privileged `adele_query` role and a per-user
+    // isolation policy on every user-scoped table, so Postgres itself
+    // enforces tenant scoping even if the AST grafter (#141) ever misses a
+    // table. Idempotent (re-run every startup); the daemon's owner role is
+    // exempt (non-FORCE RLS), so trusted paths are unaffected.
+    sqlx::raw_sql(include_str!("../migrations/029_rls_backstop.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 
