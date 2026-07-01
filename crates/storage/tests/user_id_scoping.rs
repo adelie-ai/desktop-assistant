@@ -27,6 +27,8 @@
 //! When `TEST_DATABASE_URL` is unset every test pass-skips with a log
 //! line so the suite stays green without a DB.
 
+mod support;
+
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
@@ -53,7 +55,7 @@ struct Fixture {
 
 impl Fixture {
     async fn try_new() -> Option<Self> {
-        let url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let url = support::test_database_url()?;
         let schema = format!("issue105_{}", Uuid::now_v7().simple());
 
         let admin = PgPoolOptions::new()

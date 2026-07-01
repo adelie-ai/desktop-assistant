@@ -63,17 +63,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Personal-data tables — every SQL targeting these must scope by
-/// `user_id`. Mirrors migration `016_multi_tenant_user_id.sql`.
-const PERSONAL_DATA_TABLES: &[&str] = &[
-    "conversations",
-    "messages",
-    "knowledge_base",
-    "message_summaries",
-    "dreaming_watermarks",
-    "tag_registry",
-    // 019 — per-conversation scratchpad notes (#184).
-    "scratchpads",
-];
+/// `user_id`. Consumes the single source of truth exported by the storage
+/// crate so this audit's scan set can never drift from the db_query tool's
+/// grafting set. That drift is exactly what left `turns` and
+/// `idempotency_keys` reachable cross-tenant (#431): this list used to
+/// keep its own copy that omitted them.
+fn personal_data_tables() -> &'static [&'static str] {
+    desktop_assistant_storage::personal_data_tables()
+}
 
 /// Allowlist for queries that legitimately span multiple users.
 ///
@@ -224,6 +221,33 @@ fn every_storage_query_targeting_a_personal_data_table_includes_user_id() {
     }
 }
 
+/// #431 drift-guard. The audit now consumes the storage crate's canonical
+/// personal-data list, so the db_query tool's grafting set and this scan's
+/// set are the same list by construction. This pins that the canonical
+/// list still contains the tables whose omission caused the cross-tenant
+/// hole — a regression that dropped them (or re-introduced the
+/// `turn_state` filename typo) fails here loudly.
+#[test]
+fn assert_personal_tables_match_audit() {
+    let canonical = personal_data_tables();
+    for required in [
+        "turns",
+        "idempotency_keys",
+        "background_tasks",
+        "scratchpads",
+    ] {
+        assert!(
+            canonical.contains(&required),
+            "canonical personal-data list must include `{required}`; dropping it \
+             unscopes that table in the db_query tool"
+        );
+    }
+    assert!(
+        !canonical.contains(&"turn_state"),
+        "`turn_state` is a migration filename, not a table — the real table is `turns`"
+    );
+}
+
 // ---------- helpers ---------------------------------------------------------
 
 fn crate_root() -> PathBuf {
@@ -368,7 +392,7 @@ fn line_of(content: &str, byte_offset: usize) -> usize {
 fn personal_tables_referenced(sql: &str) -> Vec<String> {
     let mut found: BTreeSet<&'static str> = BTreeSet::new();
     let lower = sql.to_ascii_lowercase();
-    for tbl in PERSONAL_DATA_TABLES {
+    for tbl in personal_data_tables() {
         if contains_whole_word(&lower, tbl) {
             found.insert(*tbl);
         }

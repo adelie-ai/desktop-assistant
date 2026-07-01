@@ -22,6 +22,8 @@
 //! When `TEST_DATABASE_URL` is unset (the default for `cargo test`), every
 //! test pass-skips with a log line so the suite stays green without a DB.
 
+mod support;
+
 use std::sync::Arc;
 
 use desktop_assistant_storage::run_migrations;
@@ -48,7 +50,7 @@ impl SchemaFixture {
     /// var is unset. Tests should pass-skip in the `None` case so the
     /// suite stays green without a DB.
     async fn try_new() -> Option<Self> {
-        let url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let url = support::test_database_url()?;
         let schema = format!("mt_test_{}", Uuid::now_v7().simple());
 
         // Admin connection just for schema lifecycle, kept short-lived

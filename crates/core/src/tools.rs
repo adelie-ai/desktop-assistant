@@ -104,6 +104,12 @@ fn compact_scalar(v: &serde_json::Value) -> String {
                 .join(",");
             format!("{{{inner}}}")
         }
+        // #433: an array value must be rendered through the redacting
+        // renderer, not `to_string()`. A top-level arg like
+        // `{"headers":[{"authorization":"Bearer …"}]}` would otherwise emit
+        // the token verbatim to the activity feed (the Object arm redacts,
+        // but arrays fell through to the raw `other` arm below).
+        serde_json::Value::Array(_) => compact_value_json(v),
         other => other.to_string(),
     }
 }
@@ -449,5 +455,55 @@ mod tests {
         // pairs come out alphabetically — assert on that ordering.
         let out = summarize_tool_value(&json!({ "path": "/tmp/x", "limit": 5 }));
         assert_eq!(out, "limit=5, path=/tmp/x");
+    }
+
+    #[test]
+    fn summarize_redacts_secret_in_array_of_objects() {
+        // #433: a secret nested inside an array-valued arg must be redacted.
+        // Before the fix, the array fell through to `to_string()` and the
+        // token leaked verbatim into the activity feed.
+        let out = summarize_tool_value(&json!({
+            "headers": [
+                { "name": "Accept", "value": "application/json" },
+                { "authorization": "Bearer sk-abc123secret" },
+            ]
+        }));
+        assert!(
+            !out.contains("sk-abc123secret"),
+            "secret in array-of-objects leaked: {out}"
+        );
+        assert!(
+            out.contains("‹redacted›"),
+            "expected redaction marker: {out}"
+        );
+    }
+
+    #[test]
+    fn summarize_redacts_secret_in_nested_array_under_object() {
+        // Array nested one level deeper (object -> object -> array) must
+        // also redact, exercising the recursive array walk.
+        let out = summarize_tool_value(&json!({
+            "request": { "cookies": [ { "session_token": "s3cr3t-value" } ] }
+        }));
+        assert!(
+            !out.contains("s3cr3t-value"),
+            "secret in nested array leaked: {out}"
+        );
+        assert!(
+            out.contains("‹redacted›"),
+            "expected redaction marker: {out}"
+        );
+    }
+
+    #[test]
+    fn summarize_renders_non_sensitive_array_readably() {
+        // Regression: non-sensitive array args must still render (not be
+        // dropped or over-redacted).
+        let out = summarize_tool_value(&json!({ "ids": [1, 2, 3] }));
+        assert!(out.contains("ids="), "got: {out}");
+        assert!(
+            out.contains('1') && out.contains('3'),
+            "array content lost: {out}"
+        );
     }
 }

@@ -64,11 +64,87 @@ lint:
 
 # Run the workspace test suite (excludes #[ignore] integration tests)
 test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "${TEST_DATABASE_URL:-}" ]; then
+      echo "⚠  TEST_DATABASE_URL unset — storage multi-tenant ISOLATION suites will pass-SKIP." >&2
+      echo "   A green run here does NOT verify cross-tenant safety. Run 'just test-db' for that." >&2
+    fi
     cargo test --workspace
 
 # Real-Secret-Service integration tests (needs a live session bus; mutates + cleans keyring)
 test-integration:
     cargo test --workspace -- --ignored
+
+# --- DB-gated storage isolation suites (#444) ------------------------------
+# The `crates/storage` isolation suites pass-skip when TEST_DATABASE_URL is
+# unset, so a bare `cargo test` proves nothing about multi-tenant safety.
+# These recipes boot a throwaway pgvector container (the `vector` extension is
+# pre-created by the auto-loaded init fixture under
+# crates/storage/tests/fixtures/initdb/), so a real isolation run is one
+# command. Honors CONTAINER_CLI, else auto-detects podman/docker.
+test_db_image := env_var_or_default("TEST_DB_IMAGE", "docker.io/pgvector/pgvector:pg17")
+test_db_name := "adele-storage-testdb"
+test_db_port := env_var_or_default("TEST_DB_PORT", "55432")
+test_db_initdb := justfile_directory() / "crates/storage/tests/fixtures/initdb"
+
+# Boot an ephemeral Postgres, run the storage suite against it, tear it down.
+# Extra args pass through to `cargo test` (e.g. `just test-db -- --nocapture`).
+test-db *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cli="${CONTAINER_CLI:-}"
+    if [ -z "$cli" ]; then
+      if podman info >/dev/null 2>&1; then cli=podman
+      elif docker info >/dev/null 2>&1; then cli=docker
+      else echo "no reachable container runtime (podman/docker); set CONTAINER_CLI" >&2; exit 1; fi
+    fi
+    echo "test-db: using container runtime '$cli'"
+    "$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true
+    trap '"$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true' EXIT
+    "$cli" run --rm -d --name {{test_db_name}} \
+      -e POSTGRES_PASSWORD=test -e POSTGRES_DB=postgres \
+      -p {{test_db_port}}:5432 \
+      -v "{{test_db_initdb}}:/docker-entrypoint-initdb.d:ro,z" \
+      {{test_db_image}} >/dev/null
+    printf 'test-db: waiting for postgres'
+    for i in $(seq 1 60); do
+      if "$cli" exec {{test_db_name}} pg_isready -U postgres -q 2>/dev/null; then echo ' ready'; break; fi
+      printf '.'; sleep 1
+      if [ "$i" -eq 60 ]; then echo ' timed out' >&2; exit 1; fi
+    done
+    export TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:{{test_db_port}}/postgres"
+    cargo test -p desktop-assistant-storage {{ARGS}}
+
+# Boot the ephemeral Postgres and leave it running for iterative test runs;
+# prints the TEST_DATABASE_URL to export. Tear down with `just test-db-down`.
+test-db-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cli="${CONTAINER_CLI:-}"
+    if [ -z "$cli" ]; then
+      if podman info >/dev/null 2>&1; then cli=podman
+      elif docker info >/dev/null 2>&1; then cli=docker
+      else echo "no reachable container runtime (podman/docker); set CONTAINER_CLI" >&2; exit 1; fi
+    fi
+    "$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true
+    "$cli" run --rm -d --name {{test_db_name}} \
+      -e POSTGRES_PASSWORD=test -e POSTGRES_DB=postgres \
+      -p {{test_db_port}}:5432 \
+      -v "{{test_db_initdb}}:/docker-entrypoint-initdb.d:ro,z" \
+      {{test_db_image}} >/dev/null
+    for i in $(seq 1 60); do
+      "$cli" exec {{test_db_name}} pg_isready -U postgres -q 2>/dev/null && break
+      sleep 1
+    done
+    echo 'export TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:{{test_db_port}}/postgres"'
+
+# Remove the ephemeral Postgres started by test-db-up.
+test-db-down:
+    #!/usr/bin/env bash
+    cli="${CONTAINER_CLI:-podman}"
+    "$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true
+    echo "test-db: removed {{test_db_name}}"
 
 # Rebase onto latest origin/main then run the gate (catches clean-rebase-but-broken-build)
 premerge:

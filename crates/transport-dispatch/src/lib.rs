@@ -258,6 +258,7 @@ pub async fn dispatch_loop<R, W>(
     if let Some(ref subs) = conv_subs {
         subs.register(
             &auth.session_id,
+            &auth.user_id,
             Arc::new(FanoutTargetSink { tx: out_tx.clone() }),
         );
     }
