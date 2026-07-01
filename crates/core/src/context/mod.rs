@@ -722,125 +722,144 @@ fn assemble_messages_inner(
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
-    // Destructure into the local names the body below already uses, so the
-    // assembly logic reads unchanged after the parameter grouping.
-    let ConversationView {
-        messages: conversation_messages,
-        summaries,
-        context_summary,
-    } = *conversation;
-    let ToolContext {
-        tool_defs,
-        deferred_namespaces,
-        locality,
-    } = *tools;
-    let TurnAnchors {
-        active_task,
-        plan,
-        scratchpad_index,
-        tool_rounds_since_anchor,
-    } = *anchors;
-
-    let tool_note = build_full_tool_note(tool_defs, deferred_namespaces, locality);
-    let system_instruction = assemble_system_instruction(tool_note, ambient);
-
-    // Measure the system block. The system instruction is always
-    // re-included in every turn, so any space it claims is permanently
-    // displaced from conversation history. When a budget is installed,
-    // record the size on every turn (observability) and demote the tool
-    // listing to a namespace-only summary if the block exceeds
-    // `SYSTEM_BLOCK_BUDGET_RATIO`.
-    let system_instruction = if let Some(b) = budget {
-        let system_tokens_before = estimate(&system_instruction);
-        tracing::info!(
-            system_tokens = system_tokens_before,
-            budget = b.max_input_tokens,
-            ratio = (system_tokens_before as f64 / b.max_input_tokens as f64),
-            "system block size"
-        );
-        let threshold = (b.max_input_tokens as f64 * SYSTEM_BLOCK_BUDGET_RATIO) as u64;
-        if system_tokens_before > threshold {
-            let demoted_note = build_demoted_tool_note(tool_defs, deferred_namespaces);
-            let demoted_system = assemble_system_instruction(demoted_note, ambient);
-            let system_tokens_after = estimate(&demoted_system);
-            tracing::warn!(
-                original_tokens = system_tokens_before,
-                demoted_tokens = system_tokens_after,
-                budget = b.max_input_tokens,
-                "system block exceeded budget threshold; demoted tool listing"
-            );
-            demoted_system
-        } else {
-            system_instruction
-        }
-    } else {
-        system_instruction
-    };
+    let system_instruction = system_block(tools, ambient, budget, estimate);
 
     // Apply context windowing: if the conversation exceeds the limit, keep
     // only the most recent messages, snapping the cut point forward to a
     // genuine User message so we never split tool-call/result pairs.
-    let start = window_start(conversation_messages, max_messages);
-    let windowed = &conversation_messages[start..];
+    let start = window_start(conversation.messages, max_messages);
+    let windowed = &conversation.messages[start..];
     let is_windowed = start > 0;
 
-    // Track which summary IDs are active so we know to skip their messages.
-    let active_summary_ids: std::collections::HashSet<&str> =
-        summaries.iter().map(|s| s.id.as_str()).collect();
+    // Summary IDs still active this turn. Their tagged messages collapse to a
+    // single marker in `expand_history`, and a message about to be replaced by
+    // summary text doesn't count as a "visible" anchor in `surfaced_blocks`.
+    let active_summary_ids: std::collections::HashSet<&str> = conversation
+        .summaries
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect();
 
+    // Assemble as a pipeline: the cached system instruction, then the per-turn
+    // `[..]` re-surfaced context blocks, then the windowed history (with
+    // collapsed runs replaced by summary markers).
     let mut messages = Vec::with_capacity(windowed.len() + 2);
     messages.push(Message::new(Role::System, system_instruction));
+    messages.extend(surfaced_blocks(
+        anchors,
+        ambient,
+        conversation.context_summary,
+        is_windowed,
+        windowed,
+        &active_summary_ids,
+    ));
+    messages.extend(expand_history(
+        windowed,
+        start,
+        conversation.summaries,
+        &active_summary_ids,
+    ));
+    messages
+}
 
-    // Ambient "now": a tiny, always-present line giving the assistant a
-    // sense of the current date/time without spending a `builtin_sys_props`
-    // tool round to find out. Installed per turn by the daemon dispatch wrapper
-    // as a task-local (rendered from the same `NowSnapshot` that backs the
-    // tool, so the two never disagree) and empty for callers that don't route
-    // through it (tests, dreaming jobs). Pushed here as a per-turn system
-    // message — deliberately NOT folded into the cached system instruction
-    // above — so the volatile timestamp never busts the prompt-prefix cache.
+/// Build the turn's system-instruction string: the assembled prompt sections
+/// plus the tool-availability note. When a budget is installed and the block
+/// exceeds `SYSTEM_BLOCK_BUDGET_RATIO` of it, the tool listing is demoted to a
+/// namespace-only summary — the system instruction is re-included verbatim on
+/// every turn, so any space it claims is permanently displaced from history.
+fn system_block(
+    tools: &ToolContext,
+    ambient: &AmbientContext,
+    budget: Option<ContextBudget>,
+    estimate: &dyn Fn(&str) -> u64,
+) -> String {
+    let tool_note =
+        build_full_tool_note(tools.tool_defs, tools.deferred_namespaces, tools.locality);
+    let system_instruction = assemble_system_instruction(tool_note, ambient);
+
+    // Without a budget there's nothing to measure against — emit as-is.
+    let Some(b) = budget else {
+        return system_instruction;
+    };
+
+    let system_tokens_before = estimate(&system_instruction);
+    tracing::info!(
+        system_tokens = system_tokens_before,
+        budget = b.max_input_tokens,
+        ratio = (system_tokens_before as f64 / b.max_input_tokens as f64),
+        "system block size"
+    );
+    let threshold = (b.max_input_tokens as f64 * SYSTEM_BLOCK_BUDGET_RATIO) as u64;
+    if system_tokens_before <= threshold {
+        return system_instruction;
+    }
+
+    let demoted_note = build_demoted_tool_note(tools.tool_defs, tools.deferred_namespaces);
+    let demoted_system = assemble_system_instruction(demoted_note, ambient);
+    let system_tokens_after = estimate(&demoted_system);
+    tracing::warn!(
+        original_tokens = system_tokens_before,
+        demoted_tokens = system_tokens_after,
+        budget = b.max_input_tokens,
+        "system block exceeded budget threshold; demoted tool listing"
+    );
+    demoted_system
+}
+
+/// Build the per-turn `[..]` system messages that re-surface durable context so
+/// the model stays oriented across windowing and compaction. Returned in
+/// display order; each block is gated independently:
+///
+/// - `[Now]` — the ambient date/time line, whenever one is installed.
+/// - `[Summary of earlier conversation]` — the rolling summary, once windowing
+///   has begun.
+/// - `[Current task]` — the anchor prompt, re-injected when it has drifted out
+///   of view (windowed out, or collapsed behind an active summary) or after a
+///   long agentic loop (`> ACTIVE_TASK_ROUND_THRESHOLD` rounds).
+/// - `[Plan]` — the open todo tree, whenever one exists.
+/// - `[Scratchpad]` — the free-form note-key index, gated on the same
+///   "context is dropping" signal as `[Current task]`.
+fn surfaced_blocks(
+    anchors: &TurnAnchors,
+    ambient: &AmbientContext,
+    context_summary: &str,
+    is_windowed: bool,
+    windowed: &[Message],
+    active_summary_ids: &std::collections::HashSet<&str>,
+) -> Vec<Message> {
+    let mut blocks = Vec::new();
+
+    // Ambient "now": a tiny, always-present line giving the assistant a sense of
+    // the current date/time without spending a `builtin_sys_props` tool round.
+    // Pushed as a per-turn system message — deliberately NOT folded into the
+    // cached system instruction — so the volatile timestamp never busts the
+    // prompt-prefix cache.
     if !ambient.now_line.is_empty() {
-        messages.push(Message::new(
+        blocks.push(Message::new(
             Role::System,
             format!("[Now] {}", ambient.now_line),
         ));
     }
 
-    // Inject rolling context summary when windowing is active and summary exists.
+    // Rolling context summary, once windowing has dropped earlier history.
     if is_windowed && !context_summary.is_empty() {
-        messages.push(Message::new(
+        blocks.push(Message::new(
             Role::System,
             format!("[Summary of earlier conversation]\n{context_summary}"),
         ));
     }
 
-    // Re-inject the active-task anchor when the original prompt has drifted
-    // out of the model's view. Three triggers, any one of which is enough:
-    //   1. Windowing is active and the anchor user message has been windowed
-    //      out (heuristic: no User message with matching content in `windowed`).
-    //   2. The anchor user message is still in `windowed` but has been
-    //      collapsed behind an active summary (its `summary_id` is set), so
-    //      the model only sees the summary text in this turn.
-    //   3. The dispatch loop has gone through more than
-    //      `ACTIVE_TASK_ROUND_THRESHOLD` tool rounds in the current turn — even
-    //      if the anchor is still visible, surfacing it again keeps the model
-    //      on-task during long agentic loops.
-    //
-    // Why: a long tool-calling session can bury the user's goal under many
-    // tool results; an explicit `[Current task]` re-statement keeps the
-    // assistant aligned with the original intent across compaction and
-    // windowing events.
-    // Shared "context is starting to drop" signal used both by the
-    // `[Current task]` re-injection and the `[Scratchpad]` index (#340): once a
-    // long agentic loop has run past the round threshold, surfacing durable
-    // anchors again keeps the model on-task even if they're nominally visible.
-    let many_tool_rounds = tool_rounds_since_anchor > ACTIVE_TASK_ROUND_THRESHOLD;
+    // Shared "context is starting to drop" signal, used by both `[Current task]`
+    // and `[Scratchpad]` (#340): once a long agentic loop has run past the round
+    // threshold, surfacing durable anchors again keeps the model on-task even if
+    // they're nominally still visible.
+    let many_tool_rounds = anchors.tool_rounds_since_anchor > ACTIVE_TASK_ROUND_THRESHOLD;
 
-    if let Some(task) = active_task.filter(|t| !t.is_empty()) {
-        // Find a non-collapsed User message in the window whose content
-        // matches the anchor. Messages with an active `summary_id` are
-        // about to be replaced by summary text below, so they don't count
-        // as "visible" for the purpose of this check.
+    // Re-inject the active-task anchor when the original prompt has drifted out
+    // of view: windowed out, or still present but collapsed behind an active
+    // summary (so the model only sees summary text) — or unconditionally once a
+    // long tool-calling session risks burying the goal under tool results.
+    if let Some(task) = anchors.active_task.filter(|t| !t.is_empty()) {
         let anchor_visible = windowed.iter().any(|m| {
             m.role == Role::User
                 && m.content == task
@@ -849,38 +868,45 @@ fn assemble_messages_inner(
                     .as_deref()
                     .is_some_and(|sid| active_summary_ids.contains(sid))
         });
-
         if !anchor_visible || many_tool_rounds {
-            messages.push(Message::new(Role::System, format!("[Current task] {task}")));
+            blocks.push(Message::new(Role::System, format!("[Current task] {task}")));
         }
     }
 
-    // Surface the open plan (#240) right after the task anchor. The dispatch
-    // loop renders the conversation's `todo` notes into a compact tree each
-    // round, so the plan stays in view (cheap) while the verbose raw work that
-    // produced it is evicted from the message log. Request-scoped — never
-    // persisted to `conv.messages`.
-    if let Some(plan) = plan.filter(|p| !p.is_empty()) {
-        messages.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
+    // Open plan (#240): the dispatch loop renders the conversation's `todo`
+    // notes into a compact tree each round, so the plan stays in view cheaply
+    // while the verbose work that produced it is evicted from the message log.
+    if let Some(plan) = anchors.plan.filter(|p| !p.is_empty()) {
+        blocks.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
     }
 
-    // Advertise the free-form scratchpad note keys (#340) right after the plan.
-    // These notes are durable in storage but otherwise invisible once the
-    // message that wrote them is windowed/compacted away — nothing re-surfaces a
-    // general note, so the model never thinks to `builtin_scratchpad_search` for
-    // it. The index lists the keys (recognition over recall), gated on the SAME
-    // "context is dropping" condition as `[Current task]`: windowing has begun
-    // (which also covers collapse-behind-summary, since summaries are only
-    // injected when windowed) OR the turn has run past the round threshold.
-    // Before that, the note content is usually still in the live conversation,
-    // so the index would only burn tokens.
-    if let Some(index) = scratchpad_index.filter(|s| !s.is_empty())
+    // Free-form scratchpad note keys (#340): durable in storage but otherwise
+    // invisible once the writing message is windowed/compacted away. The index
+    // lists the keys (recognition over recall), gated on the same "context is
+    // dropping" condition as `[Current task]` so it doesn't burn tokens while
+    // the note content is still live in the window.
+    if let Some(index) = anchors.scratchpad_index.filter(|s| !s.is_empty())
         && (is_windowed || many_tool_rounds)
     {
-        messages.push(Message::new(Role::System, format!("[Scratchpad] {index}")));
+        blocks.push(Message::new(Role::System, format!("[Scratchpad] {index}")));
     }
 
-    // Track which summaries have already been injected.
+    blocks
+}
+
+/// Expand the windowed message slice into final history: live messages pass
+/// through untouched, while each run of summary-collapsed messages is replaced
+/// by a single `[Summary of messages X–Y]` marker injected at the first
+/// collapsed message of the run. The absolute ordinal range is recovered from
+/// the tagged positions (offset by `start`), falling back to a range-less label
+/// when no tagged message is visible in the window.
+fn expand_history(
+    windowed: &[Message],
+    start: usize,
+    summaries: &[MessageSummary],
+    active_summary_ids: &std::collections::HashSet<&str>,
+) -> Vec<Message> {
+    let mut out = Vec::with_capacity(windowed.len());
     let mut injected_summaries: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for msg in windowed.iter() {
@@ -892,10 +918,6 @@ fn assemble_messages_inner(
             if !injected_summaries.contains(sid.as_str()) {
                 injected_summaries.insert(sid);
                 if let Some(s) = summaries.iter().find(|s| s.id == *sid) {
-                    // Recover the absolute ordinal range from the message
-                    // positions tagged with this summary_id. The window may
-                    // not contain the full range; fall back to a
-                    // range-less label when no tagged message is visible.
                     let mut first: Option<usize> = None;
                     let mut last: Option<usize> = None;
                     for (i, m) in windowed.iter().enumerate() {
@@ -913,16 +935,16 @@ fn assemble_messages_inner(
                         }
                         _ => format!("[Summary of earlier messages] {}", s.summary),
                     };
-                    messages.push(Message::new(Role::System, body));
+                    out.push(Message::new(Role::System, body));
                 }
             }
             continue;
         }
 
-        messages.push(msg.clone());
+        out.push(msg.clone());
     }
 
-    messages
+    out
 }
 
 /// Locate the largest `Role::Tool` message whose `content` length (bytes)
