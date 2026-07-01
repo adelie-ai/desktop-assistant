@@ -196,6 +196,37 @@ pub(crate) struct TurnAnchors<'a> {
     pub tool_rounds_since_anchor: u32,
 }
 
+/// The per-turn "ambient" context: the standing personality, the ambient
+/// `[Now]` line, and any one-turn system-prompt refinement. These previously
+/// arrived three different ways (two task-locals read deep inside assembly,
+/// one threaded parameter). Grouped here and read once at the wrapper boundary
+/// via [`AmbientContext::current`] so [`assemble_messages_inner`] is a pure
+/// function of its inputs.
+#[derive(Clone, Default)]
+pub(crate) struct AmbientContext {
+    /// Active assistant personality; rendered as the disposition section.
+    pub personality: crate::prompts::Personality,
+    /// Pre-rendered ambient "now" line, or empty for no `[Now]` block.
+    pub now_line: String,
+    /// One-turn system-prompt refinement, or empty for none.
+    pub system_refinement: String,
+}
+
+impl AmbientContext {
+    /// Read the per-turn ambient context from the task-locals the daemon
+    /// dispatch wrapper installs. The single place these task-locals are read;
+    /// unset (tests, background jobs) yields the defaults — the standard
+    /// personality, no `[Now]` block, no refinement — so those callers behave
+    /// exactly as before.
+    pub fn current() -> Self {
+        Self {
+            personality: crate::ports::llm::current_personality(),
+            now_line: crate::ports::llm::current_now_context(),
+            system_refinement: crate::ports::llm::current_system_refinement(),
+        }
+    }
+}
+
 /// Build the message list for a single turn, optionally enforcing a
 /// pre-flight token budget by shrinking the window before any LLM call.
 ///
@@ -221,10 +252,15 @@ pub(crate) fn llm_messages_for_turn_with_plan(
     tools: &ToolContext,
     anchors: &TurnAnchors,
     max_messages: usize,
-    system_refinement: &str,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
+    // Read the per-turn ambient context (personality, `[Now]` line, refinement)
+    // once at this boundary. Passing it in keeps `assemble_messages_inner` a
+    // pure function of its inputs, so the shrink loop's repeat passes stay
+    // deterministic.
+    let ambient = AmbientContext::current();
+
     // One assembly pass at a given window size. The only thing that varies
     // across the shrink loop is `max_messages`, so everything else is captured
     // once here and the two call sites collapse to `assemble(current_max)`.
@@ -233,8 +269,8 @@ pub(crate) fn llm_messages_for_turn_with_plan(
             conversation,
             tools,
             anchors,
+            &ambient,
             max,
-            system_refinement,
             budget,
             estimate,
         )
@@ -503,9 +539,11 @@ fn render_locality_list(entries: &[ToolLocalityEntry], co_located: bool) -> Stri
 }
 
 /// Concise test entry point for assembly: takes the grouped inputs and fills
-/// in the two values every test holds constant (`MAX_CONTEXT_MESSAGES` and no
-/// system refinement). Adding a per-turn field to any input struct leaves this
-/// helper and its callers untouched — the whole point of the grouping.
+/// in the window size every test holds constant (`MAX_CONTEXT_MESSAGES`).
+/// Ambient context (personality, `[Now]`, refinement) is read from task-locals
+/// by the wrapper, defaulting to empty when unset. Adding a per-turn field to
+/// any input struct leaves this helper and its callers untouched — the whole
+/// point of the grouping.
 #[cfg(test)]
 fn assemble_for_test(
     conversation: &ConversationView,
@@ -519,7 +557,6 @@ fn assemble_for_test(
         tools,
         anchors,
         MAX_CONTEXT_MESSAGES,
-        "",
         budget,
         estimate,
     )
@@ -644,19 +681,17 @@ fn build_demoted_tool_note(
 /// identical to the pre-refinement prompt. When present, it is appended
 /// last — after every static section and the tool note — so it can refine or
 /// override the standing guidance for this turn only.
-fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> String {
+fn assemble_system_instruction(tool_note: String, ambient: &AmbientContext) -> String {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
     let mut sections = prompts::static_sections();
 
-    // Personality disposition (#226): read the active personality the same way
-    // the per-turn refinement is read (a task-local installed by the daemon
-    // dispatch wrapper). Injected *before* the tool note and the per-turn
-    // refinement so the standing disposition is established up front while a
-    // one-turn refinement can still adjust tone last. Always rendered — the
-    // blurb at minimum carries the adaptation clause — so every turn carries a
-    // personality, with the default disposition for callers that install no
-    // scope.
-    let personality_blurb = crate::prompts::render_blurb(&crate::ports::llm::current_personality());
+    // Personality disposition (#226): injected *before* the tool note and the
+    // per-turn refinement so the standing disposition is established up front
+    // while a one-turn refinement can still adjust tone last. Always rendered —
+    // the blurb at minimum carries the adaptation clause — so every turn carries
+    // a personality, defaulting to the standard disposition when no personality
+    // scope was installed.
+    let personality_blurb = crate::prompts::render_blurb(&ambient.personality);
     if !personality_blurb.trim().is_empty() {
         sections.push(PromptSection::new(
             PromptSectionKind::Personality,
@@ -668,7 +703,7 @@ fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> St
         PromptSectionKind::ToolAvailability,
         tool_note,
     ));
-    let trimmed = system_refinement.trim();
+    let trimmed = ambient.system_refinement.trim();
     if !trimmed.is_empty() {
         sections.push(PromptSection::new(
             PromptSectionKind::SystemRefinement,
@@ -678,16 +713,12 @@ fn assemble_system_instruction(tool_note: String, system_refinement: &str) -> St
     prompts::assemble(&sections)
 }
 
-// Why allow: this builder coordinates several independent prompt slices
-// (windowed messages, summaries, tool sets, context summary, anchor) that
-// don't naturally cluster into a single struct. Bundling them just to
-// satisfy the lint would obscure the code at every call site.
 fn assemble_messages_inner(
     conversation: &ConversationView,
     tools: &ToolContext,
     anchors: &TurnAnchors,
+    ambient: &AmbientContext,
     max_messages: usize,
-    system_refinement: &str,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Vec<Message> {
@@ -711,7 +742,7 @@ fn assemble_messages_inner(
     } = *anchors;
 
     let tool_note = build_full_tool_note(tool_defs, deferred_namespaces, locality);
-    let system_instruction = assemble_system_instruction(tool_note, system_refinement);
+    let system_instruction = assemble_system_instruction(tool_note, ambient);
 
     // Measure the system block. The system instruction is always
     // re-included in every turn, so any space it claims is permanently
@@ -730,7 +761,7 @@ fn assemble_messages_inner(
         let threshold = (b.max_input_tokens as f64 * SYSTEM_BLOCK_BUDGET_RATIO) as u64;
         if system_tokens_before > threshold {
             let demoted_note = build_demoted_tool_note(tool_defs, deferred_namespaces);
-            let demoted_system = assemble_system_instruction(demoted_note, system_refinement);
+            let demoted_system = assemble_system_instruction(demoted_note, ambient);
             let system_tokens_after = estimate(&demoted_system);
             tracing::warn!(
                 original_tokens = system_tokens_before,
@@ -768,9 +799,11 @@ fn assemble_messages_inner(
     // through it (tests, dreaming jobs). Pushed here as a per-turn system
     // message — deliberately NOT folded into the cached system instruction
     // above — so the volatile timestamp never busts the prompt-prefix cache.
-    let now_context = crate::ports::llm::current_now_context();
-    if !now_context.is_empty() {
-        messages.push(Message::new(Role::System, format!("[Now] {now_context}")));
+    if !ambient.now_line.is_empty() {
+        messages.push(Message::new(
+            Role::System,
+            format!("[Now] {}", ambient.now_line),
+        ));
     }
 
     // Inject rolling context summary when windowing is active and summary exists.
@@ -1229,14 +1262,25 @@ mod tests {
 
     #[test]
     fn assemble_system_instruction_appends_refinement_last() {
-        let base = assemble_system_instruction("TOOLNOTE".to_string(), "");
-        let refined =
-            assemble_system_instruction("TOOLNOTE".to_string(), "Respond briefly, by voice.");
+        let base = assemble_system_instruction("TOOLNOTE".to_string(), &AmbientContext::default());
+        let refined = assemble_system_instruction(
+            "TOOLNOTE".to_string(),
+            &AmbientContext {
+                system_refinement: "Respond briefly, by voice.".to_string(),
+                ..Default::default()
+            },
+        );
 
         // Empty refinement is byte-identical to no refinement.
         assert_eq!(
             base,
-            assemble_system_instruction("TOOLNOTE".to_string(), "   "),
+            assemble_system_instruction(
+                "TOOLNOTE".to_string(),
+                &AmbientContext {
+                    system_refinement: "   ".to_string(),
+                    ..Default::default()
+                },
+            ),
             "whitespace-only refinement must be treated as empty"
         );
 
@@ -1256,9 +1300,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn assemble_system_instruction_injects_personality_before_tools_and_refinement() {
-        use crate::ports::llm::with_personality;
+    #[test]
+    fn assemble_system_instruction_injects_personality_before_tools_and_refinement() {
         use crate::prompts::{Personality, PersonalityLevel};
 
         // A personality with a recognizable trait so we can locate the
@@ -1267,10 +1310,14 @@ mod tests {
             sarcasm: PersonalityLevel::Always,
             ..Personality::default()
         };
-        let assembled = with_personality(personality, async {
-            assemble_system_instruction("TOOLNOTE".to_string(), "REFINEMENT")
-        })
-        .await;
+        let assembled = assemble_system_instruction(
+            "TOOLNOTE".to_string(),
+            &AmbientContext {
+                personality,
+                system_refinement: "REFINEMENT".to_string(),
+                ..Default::default()
+            },
+        );
 
         // The personality blurb is present.
         let blurb = crate::prompts::render_blurb(&personality);
@@ -1287,11 +1334,12 @@ mod tests {
         assert!(t_idx < r_idx, "tool note must precede the refinement");
     }
 
-    #[tokio::test]
-    async fn assemble_system_instruction_default_personality_present_without_scope() {
-        // No `with_personality` scope installed → the default disposition is
-        // still injected (global personality applies to every turn).
-        let assembled = assemble_system_instruction("TOOLNOTE".to_string(), "");
+    #[test]
+    fn assemble_system_instruction_default_personality_present_without_scope() {
+        // A default `AmbientContext` still injects the default disposition
+        // (the global personality applies to every turn).
+        let assembled =
+            assemble_system_instruction("TOOLNOTE".to_string(), &AmbientContext::default());
         let default_blurb = crate::prompts::render_blurb(&crate::prompts::Personality::default());
         assert!(
             assembled.contains(&default_blurb),
