@@ -154,10 +154,10 @@ pub fn classify_builtin(ctx: &ErrorContext) -> NormalizedCause {
         || (lower.contains("context length") && lower.contains("exceed"))
         || lower.contains("too many tokens")
     {
-        let (prompt_tokens, max_tokens) = first_two_numbers(ctx.message);
+        let fields = extract_overflow_fields(ctx.message);
         return NormalizedCause::ContextOverflow {
-            prompt_tokens,
-            max_tokens,
+            prompt_tokens: fields.prompt_tokens,
+            max_tokens: fields.max_context_tokens,
         };
     }
 
@@ -222,19 +222,123 @@ pub fn classify_builtin(ctx: &ErrorContext) -> NormalizedCause {
     NormalizedCause::Unknown
 }
 
-/// Extract the first two base-10 integers from `s`, in order. Across the
-/// recognized overflow phrasings the counts appear as `(prompt, max)`; fewer
-/// than two means the provider stated the overflow without numbers.
-fn first_two_numbers(s: &str) -> (Option<u64>, Option<u64>) {
-    let nums: Vec<u64> = s
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|t| !t.is_empty())
-        .filter_map(|t| t.parse::<u64>().ok())
-        .collect();
-    match nums.as_slice() {
-        [prompt, max, ..] => (Some(*prompt), Some(*max)),
-        _ => (None, None),
+/// Default output-token reservation assumed when a `max_context` overflow error
+/// doesn't state how many output tokens the request asked for. Providers report
+/// a *total* window (input + output); to turn that into an input-token ceiling
+/// we must subtract the output reservation, or the very next turn re-overflows
+/// by exactly the output headroom (issue #425 was over by its 8192-token
+/// reservation). A modest default keeps us safely under when the number is
+/// absent; snapping (`context_window::snap_down_to_common`) adds further margin.
+pub const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 8_192;
+
+/// Structured numbers parsed from a context-overflow error message.
+///
+/// Every field is best-effort (`None` when the provider didn't state it, or we
+/// couldn't anchor it). Provider phrasings diverge wildly and are wrapped in
+/// noise — a Bedrock/Mantle error prefixes a random `requestId` UUID
+/// (`f2e534ff-…`) and an HTTP status code *before* the real token counts, and
+/// the clause order differs (`prompt … N > M maximum` vs `maximum … is M …
+/// prompt … N input`). So we never read numbers positionally; each field is
+/// anchored on a nearby keyword. Reading positionally is exactly what poisoned
+/// the learned window at 534 tokens in issue #425 (`f2e534ff` → `2`, `534`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverflowFields {
+    /// The model's stated context ceiling. Usually the *total* window
+    /// (input + output); [`derive_input_ceiling`] subtracts output to get an
+    /// input budget.
+    pub max_context_tokens: Option<u64>,
+    /// The prompt/input token count the provider reported for the rejected
+    /// request.
+    pub prompt_tokens: Option<u64>,
+    /// Output tokens the request reserved/requested, when the error states it.
+    pub requested_output_tokens: Option<u64>,
+}
+
+impl OverflowFields {
+    /// Merge two extractions, preferring `self`'s populated fields and filling
+    /// its gaps from `other`. Used to backfill a deterministic parse with an
+    /// LLM extraction (issue #425) without letting the LLM overwrite a value we
+    /// already anchored confidently.
+    pub fn or(self, other: OverflowFields) -> OverflowFields {
+        OverflowFields {
+            max_context_tokens: self.max_context_tokens.or(other.max_context_tokens),
+            prompt_tokens: self.prompt_tokens.or(other.prompt_tokens),
+            requested_output_tokens: self
+                .requested_output_tokens
+                .or(other.requested_output_tokens),
+        }
     }
+}
+
+/// Keyword-anchored extraction of the token numbers from an overflow message.
+///
+/// Anchoring (rather than positional order) makes this robust to the requestId
+/// UUID / status-code noise and to differing clause order across providers.
+pub fn extract_overflow_fields(message: &str) -> OverflowFields {
+    // Digits are case-independent; lowercase once so keyword anchors match
+    // regardless of provider capitalization. ASCII-lowercasing preserves byte
+    // length, so offsets are stable.
+    let s = message.to_ascii_lowercase();
+    let max_context_tokens = number_after(&s, "maximum context length")
+        .or_else(|| number_after(&s, "context length is"))
+        .or_else(|| number_before(&s, "maximum"));
+    let prompt_tokens = number_after(&s, "prompt contains")
+        .or_else(|| number_after(&s, "prompt is too long"))
+        .or_else(|| number_after(&s, "input length"))
+        .or_else(|| number_before(&s, "input tokens"));
+    let requested_output_tokens =
+        number_before(&s, "output tokens").or_else(|| number_after(&s, "requested"));
+    OverflowFields {
+        max_context_tokens,
+        prompt_tokens,
+        requested_output_tokens,
+    }
+}
+
+/// Turn extracted overflow numbers into a safe **input-token** ceiling — the
+/// value the learned cap and budget resolution key on.
+///
+/// Precedence:
+///   1. `max_context − output_reserve` when the total window is known (the
+///      output reservation is what pushed issue #425 over by one token, so it
+///      must come off the top);
+///   2. otherwise the rejected `prompt_tokens` as-is — it was too big *with*
+///      output headroom, and snapping down provides that headroom;
+///   3. `None` when the message carried no usable number (nothing to learn).
+///
+/// The returned value is deliberately un-snapped; snapping to a common size
+/// happens at apply time so the ladder stays tunable without rewriting stored
+/// observations.
+pub fn derive_input_ceiling(fields: &OverflowFields) -> Option<u64> {
+    if let Some(max_context) = fields.max_context_tokens {
+        let reserve = fields
+            .requested_output_tokens
+            .unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS)
+            // Never reserve so much output that no input fits — cap at half the
+            // window. Guards tiny windows (where an 8192 default would exceed
+            // the model) and an implausibly large stated output.
+            .min(max_context / 2);
+        return Some(max_context - reserve);
+    }
+    fields.prompt_tokens
+}
+
+/// First base-10 integer at or after the first occurrence of `keyword`.
+fn number_after(haystack: &str, keyword: &str) -> Option<u64> {
+    let idx = haystack.find(keyword)?;
+    haystack[idx + keyword.len()..]
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|t| !t.is_empty())
+        .and_then(|t| t.parse().ok())
+}
+
+/// Last base-10 integer appearing before the first occurrence of `keyword`.
+fn number_before(haystack: &str, keyword: &str) -> Option<u64> {
+    let idx = haystack.find(keyword)?;
+    haystack[..idx]
+        .split(|c: char| !c.is_ascii_digit())
+        .rfind(|t| !t.is_empty())
+        .and_then(|t| t.parse().ok())
 }
 
 #[cfg(test)]
@@ -281,6 +385,75 @@ mod tests {
                 max_tokens: Some(131_072)
             }
         );
+    }
+
+    /// Issue #425 regression: the real Bedrock/Mantle error that bricked the
+    /// budget. A positional parse grabbed `2` and `534` from the requestId
+    /// UUID (`f2e534ff`) instead of the real counts. Keyword anchoring must
+    /// ignore the UUID and read the true numbers.
+    #[test]
+    fn extracts_overflow_fields_ignoring_request_id_uuid() {
+        let msg = "validation error: The model returned the following errors: Mantle \
+                   streaming error for requestId f2e534ff-436e-461b-8d93-906629545d84: \
+                   ErrorEvent { error: APIError { type: \"BadRequestError\", code: \
+                   Some(400), message: \"This model's maximum context length is 202752 \
+                   tokens. However, you requested 8192 output tokens and your prompt \
+                   contains at least 194561 input tokens, for a total of at least 202753 \
+                   tokens. Please reduce the length of the input prompt or the number of \
+                   requested output tokens. (parameter=input_tokens, value=194561)\", \
+                   param: None } }";
+        let f = extract_overflow_fields(msg);
+        assert_eq!(f.max_context_tokens, Some(202_752));
+        assert_eq!(f.prompt_tokens, Some(194_561));
+        assert_eq!(f.requested_output_tokens, Some(8_192));
+        // And the derived INPUT ceiling reserves output off the total window —
+        // NOT the poisoned 534.
+        assert_eq!(derive_input_ceiling(&f), Some(202_752 - 8_192));
+
+        // The full classifier path must agree (no more 2 / 534).
+        assert_eq!(
+            classify_builtin(&ctx(msg)),
+            NormalizedCause::ContextOverflow {
+                prompt_tokens: Some(194_561),
+                max_tokens: Some(202_752),
+            }
+        );
+    }
+
+    /// The Anthropic ordering puts the max *after* the prompt
+    /// (`prompt is too long: N tokens > M maximum`) — the opposite of the
+    /// OpenAI/GLM phrasing. Anchoring reads both correctly.
+    #[test]
+    fn extracts_overflow_fields_anthropic_ordering() {
+        let f = extract_overflow_fields("prompt is too long: 219473 tokens > 200000 maximum");
+        assert_eq!(f.prompt_tokens, Some(219_473));
+        assert_eq!(f.max_context_tokens, Some(200_000));
+        assert_eq!(f.requested_output_tokens, None);
+    }
+
+    #[test]
+    fn extracts_no_overflow_fields_when_absent() {
+        let f = extract_overflow_fields("Input is too long for requested model.");
+        assert_eq!(f, OverflowFields::default());
+        assert_eq!(derive_input_ceiling(&f), None);
+    }
+
+    #[test]
+    fn overflow_fields_or_backfills_gaps_only() {
+        let anchored = OverflowFields {
+            max_context_tokens: Some(202_752),
+            prompt_tokens: None,
+            requested_output_tokens: None,
+        };
+        let llm = OverflowFields {
+            max_context_tokens: Some(999), // must NOT overwrite the anchored value
+            prompt_tokens: Some(194_561),
+            requested_output_tokens: Some(8_192),
+        };
+        let merged = anchored.or(llm);
+        assert_eq!(merged.max_context_tokens, Some(202_752));
+        assert_eq!(merged.prompt_tokens, Some(194_561));
+        assert_eq!(merged.requested_output_tokens, Some(8_192));
     }
 
     #[test]

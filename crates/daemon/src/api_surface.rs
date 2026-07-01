@@ -2330,12 +2330,20 @@ api_key_env = "{unused}"
             {
                 Ok(self.0)
             }
-            async fn record(
+            async fn record_overflow(
                 &self,
                 _connector: &str,
                 _model: &str,
                 _observed_limit: u64,
                 _configured_window: u64,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn record_success(
+                &self,
+                _connector: &str,
+                _model: &str,
+                _input_tokens: u64,
             ) -> Result<(), CoreError> {
                 Ok(())
             }
@@ -2357,8 +2365,9 @@ api_key_env = "{unused}"
             // configured window and observed 4096, so it must cap DOWN.
             let window = Arc::new(FixedWindowStore(Some(
                 desktop_assistant_core::ports::store::LearnedWindow {
-                    observed_limit: 4_096,
-                    configured_window: 8_192,
+                    observed_limit: Some(4_096),
+                    configured_window: Some(8_192),
+                    max_success_input: None,
                 },
             )));
             let routing = Arc::new(
@@ -2406,8 +2415,9 @@ api_key_env = "{unused}"
             // resolver now produces 8192, so this row is stale and ignored.
             let window = Arc::new(FixedWindowStore(Some(
                 desktop_assistant_core::ports::store::LearnedWindow {
-                    observed_limit: 4_096,
-                    configured_window: 2_048,
+                    observed_limit: Some(4_096),
+                    configured_window: Some(2_048),
+                    max_success_input: None,
                 },
             )));
             let routing = Arc::new(
