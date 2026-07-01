@@ -1885,6 +1885,32 @@ mod tests {
         assert!(out.contains("truncated"));
     }
 
+    /// PINS CURRENT BEHAVIOUR (possible defect — see PR #445 design triage).
+    /// When `max_bytes` is smaller than the truncation notice itself,
+    /// `body_budget` saturates to 0 and the function returns the notice alone —
+    /// a string LONGER than `max_bytes`. The doc comment acknowledges this as a
+    /// "pathological case (real caps dwarf the notice)", so this test documents
+    /// the overflow rather than asserting the cap is honoured. If the caller
+    /// contract is ever tightened to guarantee `<= max_bytes`, this test is the
+    /// canary that must change.
+    #[test]
+    fn cap_tool_result_smaller_than_notice_is_pinned() {
+        let content = "z".repeat(50);
+        let max_bytes = 10; // far smaller than the notice
+        let out = cap_tool_result(&content, max_bytes).expect("over-cap must truncate");
+
+        // No body prefix survives — the result is exactly the notice.
+        let notice = tool_result_truncation_notice(content.len());
+        assert_eq!(out, notice);
+        // ...and that notice is LONGER than the requested cap. This is the
+        // pinned overflow: the output does NOT stay within `max_bytes`.
+        assert!(
+            out.len() > max_bytes,
+            "documented overflow: notice-only result ({} bytes) exceeds cap ({max_bytes})",
+            out.len()
+        );
+    }
+
     // --- Pure assembly tests (issue #65 + earlier) ---
 
     #[test]

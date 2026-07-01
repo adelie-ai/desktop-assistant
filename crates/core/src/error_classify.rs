@@ -542,6 +542,32 @@ mod tests {
         assert_eq!(NormalizedCause::from_key("nonsense"), None);
     }
 
+    /// `derive_input_ceiling` reserves output tokens off a stated total window,
+    /// but on a tiny window an 8192-token default reservation would exceed the
+    /// window and underflow `max_context - reserve` (u64). The `.min(max/2)`
+    /// clamp must keep the reservation to at most half the window so the result
+    /// is always a positive input ceiling, never a panic.
+    #[test]
+    fn derive_input_ceiling_clamps_small_windows() {
+        // 4096 window, no stated output: the 8192 default is clamped to 2048
+        // (half the window) → 4096 - 2048 = 2048 (NOT a 4096 - 8192 underflow).
+        let tiny = OverflowFields {
+            max_context_tokens: Some(4096),
+            prompt_tokens: None,
+            requested_output_tokens: None,
+        };
+        assert_eq!(derive_input_ceiling(&tiny), Some(2048));
+
+        // 1000 window with an implausibly large stated output (50000): clamp to
+        // half (500) → 1000 - 500 = 500.
+        let huge_output = OverflowFields {
+            max_context_tokens: Some(1000),
+            prompt_tokens: None,
+            requested_output_tokens: Some(50_000),
+        };
+        assert_eq!(derive_input_ceiling(&huge_output), Some(500));
+    }
+
     #[test]
     fn cause_maps_to_core_error_variants() {
         assert!(matches!(

@@ -506,4 +506,114 @@ mod tests {
             "array content lost: {out}"
         );
     }
+
+    /// `summarize_tool_text` (→ `truncate_single_line`) must: collapse internal
+    /// whitespace runs to single spaces, cap the output at
+    /// `TOOL_EVENT_SUMMARY_MAX` (200) *characters* plus a one-char ellipsis, and
+    /// never split a multibyte char (it counts/takes `char`s, not bytes). Feeds
+    /// genuinely multibyte, multi-line, over-length input so all three
+    /// properties are exercised at once.
+    #[test]
+    fn truncate_single_line_bounds_and_multibyte() {
+        // "café\tnaïve\n" is 11 chars incl. two 2-byte chars and two
+        // whitespace chars; 60 repeats ≈ 660 chars, well over the 200 cap.
+        let input = "café\tnaïve\n".repeat(60);
+        assert!(input.chars().count() > TOOL_EVENT_SUMMARY_MAX);
+        let out = summarize_tool_text(&input);
+
+        // Capped at exactly 200 kept chars + the ellipsis.
+        assert_eq!(
+            out.chars().count(),
+            TOOL_EVENT_SUMMARY_MAX + 1,
+            "output must be 200 kept chars + '…', got {out:?}"
+        );
+        assert!(out.ends_with('…'), "truncated output must end with '…'");
+
+        // Whitespace collapsed: no tabs, newlines, or double spaces survive.
+        assert!(!out.contains('\t') && !out.contains('\n'));
+        assert!(!out.contains("  "), "internal whitespace must be collapsed");
+
+        // Multibyte content flowed through intact (valid UTF-8, char-boundary
+        // safe — a byte-slice at 200 would have split 'é'/'ï' and panicked).
+        assert!(out.contains('é') || out.contains('ï'));
+    }
+
+    /// The categorization cache key must be order-independent (tools are sorted
+    /// by name before hashing) and description-sensitive (a description edit
+    /// with no name change must change the hash, or the cache would serve a
+    /// stale categorization for the edited manifest).
+    #[test]
+    fn tool_set_hash_order_independent_and_description_sensitive() {
+        let a = ToolDefinition::new("alpha", "reads things", json!({}));
+        let b = ToolDefinition::new("bravo", "writes things", json!({}));
+
+        let forward = vec![ToolNamespace::new("ns", "d", vec![a.clone(), b.clone()])];
+        let reversed = vec![ToolNamespace::new("ns", "d", vec![b.clone(), a.clone()])];
+        assert_eq!(
+            tool_set_hash(&forward),
+            tool_set_hash(&reversed),
+            "hash must not depend on tool input order"
+        );
+
+        // Same names, one description changed → hash must differ.
+        let b_edited = ToolDefinition::new("bravo", "writes things (edited)", json!({}));
+        let edited = vec![ToolNamespace::new("ns", "d", vec![a, b_edited])];
+        assert_ne!(
+            tool_set_hash(&forward),
+            tool_set_hash(&edited),
+            "a description change must change the hash"
+        );
+    }
+
+    /// A fake LLM whose categorization JSON drops a tool (assigns only 11 of 12
+    /// tool names to a bucket). `categorize_tool_namespaces` must detect the
+    /// lost tool and fall back to the *original* namespaces rather than serve a
+    /// categorization missing a tool.
+    #[tokio::test]
+    async fn categorize_falls_back_when_tools_dropped() {
+        use crate::ports::llm::{ChunkCallback, LlmResponse};
+
+        struct DroppingLlm {
+            payload: String,
+        }
+        #[async_trait::async_trait]
+        impl LlmClient for DroppingLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(self.payload.clone()))
+            }
+        }
+
+        // 12 tools in one namespace so categorization is not skipped (>10).
+        let tools: Vec<ToolDefinition> = (0..12)
+            .map(|i| ToolDefinition::new(format!("tool_{i}"), format!("desc {i}"), json!({})))
+            .collect();
+        let namespaces = vec![ToolNamespace::new("seed_ns", "seed", tools)];
+
+        // Fenced JSON that assigns only tool_0..tool_10 (drops tool_11).
+        let names: Vec<String> = (0..11).map(|i| format!("\"tool_{i}\"")).collect();
+        let payload = format!(
+            "```json\n[{{\"name\":\"all\",\"description\":\"everything\",\"tools\":[{}]}}]\n```",
+            names.join(",")
+        );
+        let llm = DroppingLlm { payload };
+
+        // budget=None so the small-listing fit shortcut is skipped and the
+        // categorization round-trip actually runs.
+        let result = categorize_tool_namespaces(namespaces.clone(), &llm, None).await;
+
+        assert_eq!(
+            result, namespaces,
+            "a dropped tool must trigger a fall back to the original namespaces"
+        );
+        // Concretely: it did NOT adopt the LLM's single "all" bucket.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "seed_ns");
+        assert_eq!(result[0].tools.len(), 12);
+    }
 }

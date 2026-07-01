@@ -143,6 +143,46 @@ mod tests {
         assert_eq!(msg, cloned);
     }
 
+    /// Equality deliberately excludes `id`: two *independently constructed*
+    /// messages with identical content must compare equal even though each
+    /// minted its own fresh id. The storage structural diff
+    /// (`ExistingMsgRow::matches`) and value-comparison tests depend on this.
+    #[test]
+    fn message_equality_ignores_id() {
+        let a = Message::new(Role::User, "hello");
+        let b = Message::new(Role::User, "hello");
+        assert_ne!(a.id, b.id, "each construction must mint a distinct id");
+        assert_eq!(
+            a, b,
+            "same content must compare equal despite differing ids"
+        );
+
+        // A content difference must still break equality (equality isn't a
+        // constant-true).
+        let c = Message::new(Role::User, "goodbye");
+        assert_ne!(a, c);
+    }
+
+    /// `new_message_id` mints monotonically increasing UUIDv7 strings on a
+    /// thread, so `max(id)` is the latest message and `id > since` is an exact
+    /// "everything after" cursor. Lexicographic string order matches mint order.
+    #[test]
+    fn message_ids_are_monotonic() {
+        let id_a = new_message_id();
+        let id_b = new_message_id();
+        assert!(id_b > id_a, "ids must increase: {id_a} !< {id_b}");
+
+        // The ids carried by successive Message constructions are ordered too.
+        let m1 = Message::new(Role::User, "one");
+        let m2 = Message::new(Role::Assistant, "two");
+        assert!(
+            m2.id > m1.id,
+            "message ids must increase: {} !< {}",
+            m1.id,
+            m2.id
+        );
+    }
+
     #[test]
     fn role_serialization_roundtrip() {
         let role = Role::User;

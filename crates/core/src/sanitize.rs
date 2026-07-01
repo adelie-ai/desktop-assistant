@@ -264,8 +264,60 @@ mod stream_sanitizer_tests {
 }
 
 #[cfg(test)]
+mod batch_sanitizer_tests {
+    use super::sanitize_assistant_text;
+
+    /// The production final-response sanitizer (not the `#[cfg(test)]` stream
+    /// oracle) must strip think blocks, trim outer whitespace, AND collapse any
+    /// run of 3+ newlines down to exactly two. The collapse is a `while` loop
+    /// because a single `replace("\n\n\n", "\n\n")` pass leaves an odd tail: a
+    /// run of 5 `\n` becomes `\n\n\n\n` (still a triple) after one pass. This
+    /// input exercises a 5-newline run, so a single-pass implementation would
+    /// leave `a\n\n\n\nb` and fail.
+    #[test]
+    fn sanitize_assistant_text_collapses_and_trims() {
+        let input = "  a<think>x</think>\n\n\n\n\nb  ";
+        assert_eq!(sanitize_assistant_text(input), "a\n\nb");
+    }
+}
+
+#[cfg(test)]
 mod redact_tests {
     use super::redact_secrets;
+
+    /// Boundary behaviour of the secret heuristic, driven through the public
+    /// `redact_secrets` entry point:
+    /// - a 19-char letters+digits run survives (under the length floor);
+    /// - a 20-char letters+digits run redacts (at the floor);
+    /// - a long all-digit run is NOT redacted (fails the `has_alpha` guard —
+    ///   e.g. overflow token counts);
+    /// - a long all-alpha run is NOT redacted (fails the `has_digit` guard —
+    ///   e.g. long English words);
+    /// - a short `sk-`-prefixed token redacts on the prefix alone, regardless
+    ///   of length.
+    #[test]
+    fn looks_like_secret_boundary_cases() {
+        // 19 chars, mixed letters+digits: below the 20-char length floor.
+        let survives_19 = "a1b2c3d4e5f6g7h8i9j"; // 19 chars
+        assert_eq!(survives_19.len(), 19);
+        assert_eq!(redact_secrets(survives_19), survives_19);
+
+        // 20 chars, mixed letters+digits: at the floor → redacted.
+        let redacts_20 = "a1b2c3d4e5f6g7h8i9j0"; // 20 chars
+        assert_eq!(redacts_20.len(), 20);
+        assert_eq!(redact_secrets(redacts_20), "[REDACTED]");
+
+        // Long all-digit: no letters → survives (guards overflow token counts).
+        let all_digits = "12345678901234567890"; // 20 digits
+        assert_eq!(redact_secrets(all_digits), all_digits);
+
+        // Long all-alpha: no digits → survives (guards long English words).
+        let all_alpha = "abcdefghijklmnopqrst"; // 20 letters
+        assert_eq!(redact_secrets(all_alpha), all_alpha);
+
+        // Short but prefixed: `sk-` matches even though it's only 4 chars.
+        assert_eq!(redact_secrets("sk-x"), "[REDACTED]");
+    }
 
     #[test]
     fn redacts_aws_key_and_long_token_keeps_prose() {

@@ -84,7 +84,11 @@ pub fn chunk_text(content: &str, max_chars: usize, overlap: usize) -> Vec<String
 /// Find a good split point at or before `max_pos` in `text`.
 /// Prefers sentence boundaries (`. `), then word boundaries (` `).
 fn find_split_point(text: &str, max_pos: usize) -> usize {
-    let search_end = max_pos.min(text.len());
+    // Snap to a char boundary BEFORE slicing: `max_pos` (the target chunk size
+    // in bytes) can land inside a multi-byte char, and `&text[..search_end]`
+    // below would panic on such an index. Multibyte content with no `\n\n`/`. `/
+    // ` ` boundary before the cap reaches exactly this path.
+    let search_end = text.floor_char_boundary(max_pos.min(text.len()));
     let region = &text[..search_end];
 
     // Try sentence boundary: look for ". " from the end.
@@ -187,5 +191,55 @@ mod tests {
         let text = "x".repeat(CHUNK_MAX_CHARS);
         let chunks = chunk_text(&text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
         assert_eq!(chunks.len(), 1);
+    }
+
+    /// A long run of multibyte characters with NO spaces or paragraph breaks
+    /// forces the hard-split path (`find_split_point` falls through to
+    /// `floor_char_boundary`) and the overlap tail (`ceil_char_boundary`). A
+    /// naive byte slice at `max_chars` would land mid-character and panic; the
+    /// char-boundary helpers must keep every chunk valid UTF-8.
+    #[test]
+    fn chunking_multibyte_safe() {
+        // 250 distinct CJK code points (3 bytes each = 750 bytes), no spaces.
+        let text: String = (0x4E00u32..0x4E00 + 250)
+            .filter_map(char::from_u32)
+            .collect();
+        assert!(text.len() > 300, "input must exceed max_chars to split");
+
+        let chunks = chunk_text(&text, 300, 60);
+        assert!(
+            chunks.len() > 1,
+            "long text must split into multiple chunks"
+        );
+        for chunk in &chunks {
+            assert!(!chunk.is_empty());
+            // Round-trips as valid UTF-8 — a mid-char cut would not.
+            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
+        }
+    }
+
+    /// Adjacent chunks must actually SHARE overlap text so context isn't lost
+    /// across a boundary. Uses distinct (non-repeating) multibyte characters so
+    /// a shared slice unambiguously proves overlap rather than coincidental
+    /// repetition.
+    #[test]
+    fn chunking_overlap_shares_text() {
+        let text: String = (0x4E00u32..0x4E00 + 250)
+            .filter_map(char::from_u32)
+            .collect();
+        let chunks = chunk_text(&text, 300, 60);
+        assert!(chunks.len() >= 2);
+
+        // The last 10 chars of chunk 0 fall inside chunk 1's leading overlap
+        // region (a 60-byte / 20-char tail), so they must reappear in chunk 1.
+        let tail: String = {
+            let n = chunks[0].chars().count();
+            chunks[0].chars().skip(n - 10).collect()
+        };
+        assert!(
+            chunks[1].contains(&tail),
+            "chunk 1 must carry chunk 0's tail as overlap; tail={tail:?}, chunk1 start={:?}",
+            chunks[1].chars().take(30).collect::<String>()
+        );
     }
 }
