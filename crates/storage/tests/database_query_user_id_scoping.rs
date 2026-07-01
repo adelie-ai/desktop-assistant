@@ -640,3 +640,77 @@ async fn personal_data_tables_cover_every_user_id_column() {
     )
     .await;
 }
+
+/// Explicitly-global tables: system-wide knowledge, NOT personal data, so they
+/// deliberately have no `user_id` column. Every OTHER base table must carry
+/// `user_id` (enforced by `every_table_is_user_scoped_or_explicitly_global`).
+/// Adding an entry here is a deliberate assertion that the table holds no
+/// per-user data — keep it small and justified.
+const GLOBAL_TABLES: &[&str] = &[
+    // System-wide MCP tool registry, keyed by tool `name` (#105).
+    "tool_definitions",
+    // Connector error-signature knowledge, keyed by (connector, signature) —
+    // how to read a provider's error, not personal data (migration 022, which
+    // documents the deliberate absence of user_id).
+    "error_classifications",
+    // Observed context-window ceilings, keyed by (connector, model) — model
+    // capacity knowledge, not personal data (migrations 025/028, likewise
+    // documented as deliberately global).
+    "context_window_observations",
+];
+
+/// Every base table is either user-scoped (has a `user_id` column) or
+/// explicitly global (listed in `GLOBAL_TABLES`). This is the inverse of
+/// `personal_data_tables_cover_every_user_id_column`: that guard ensures every
+/// `user_id` table is registered for db_query grafting; this one ensures no
+/// table silently holds per-user data *without* a `user_id` column. A new
+/// personal-data table that forgets `user_id` fails here; a new genuinely
+/// global table forces a deliberate, documented `GLOBAL_TABLES` entry rather
+/// than defaulting to "everyone can see it".
+#[tokio::test]
+async fn every_table_is_user_scoped_or_explicitly_global() {
+    with_fixture(
+        "every_table_is_user_scoped_or_explicitly_global",
+        |fx| async move {
+            let tables: Vec<(String,)> = sqlx::query_as(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = $1 AND table_type = 'BASE TABLE' \
+                 ORDER BY table_name",
+            )
+            .bind(&fx.schema)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("query information_schema for base tables");
+
+            let scoped: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
+                "SELECT table_name FROM information_schema.columns \
+                 WHERE table_schema = $1 AND column_name = 'user_id'",
+            )
+            .bind(&fx.schema)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("query information_schema for user_id columns")
+            .into_iter()
+            .map(|(t,)| t)
+            .collect();
+
+            let global: std::collections::HashSet<&str> = GLOBAL_TABLES.iter().copied().collect();
+
+            let unclassified: Vec<String> = tables
+                .into_iter()
+                .map(|(t,)| t)
+                .filter(|t| !scoped.contains(t) && !global.contains(t.as_str()))
+                .collect();
+
+            assert!(
+                unclassified.is_empty(),
+                "these base tables are neither user-scoped (no `user_id` column) \
+                 nor listed in GLOBAL_TABLES — either add `user_id` (if they hold \
+                 personal data) or add them to GLOBAL_TABLES with a rationale (if \
+                 they are genuinely system-wide): {unclassified:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
