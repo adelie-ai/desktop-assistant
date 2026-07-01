@@ -29,7 +29,7 @@ pub use background_tasks::PgBackgroundTaskStore;
 pub use context_window_observations::PgLearnedWindowStore;
 pub use conversation::PgConversationStore;
 pub use conversation_search::PgConversationSearchStore;
-pub use database::{execute_database_query, personal_data_tables};
+pub use database::{TOOL_QUERY_ROLE, execute_database_query, personal_data_tables};
 pub use error_classifications::PgErrorClassificationStore;
 pub use idempotency_keys::PgIdempotencyKeyStore;
 pub use knowledge::PgKnowledgeBaseStore;

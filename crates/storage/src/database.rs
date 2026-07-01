@@ -96,6 +96,13 @@ pub fn personal_data_tables() -> &'static [&'static str] {
     PERSONAL_DATA_TABLES
 }
 
+/// The un-privileged Postgres role the read path assumes (`SET LOCAL ROLE`)
+/// so RLS filters every personal-data table to the caller (#434). Created
+/// with neither table ownership nor BYPASSRLS by migration
+/// `029_rls_backstop.sql`; the literal in `execute_read`'s `SET LOCAL ROLE`
+/// must match this. Exposed for the RLS integration tests.
+pub const TOOL_QUERY_ROLE: &str = "adele_query";
+
 /// Output of `prepare_select_for_user` — the rewritten SELECT (with
 /// `user_id = '<user_id>'` predicates grafted onto every personal-data
 /// table reference). When no personal-data table was referenced (e.g.
@@ -616,7 +623,14 @@ pub async fn execute_database_query(
     if is_read {
         let user_id = current_user_id();
         let prepared = prepare_select_for_user(sql_trimmed, user_id.as_str())?;
-        execute_read(pool, &prepared.sql, prepared.has_limit, limit).await
+        execute_read(
+            pool,
+            &prepared.sql,
+            prepared.has_limit,
+            limit,
+            user_id.as_str(),
+        )
+        .await
     } else {
         validate_write_statement(sql_trimmed)?;
         let upper = sql_trimmed.to_uppercase();
@@ -690,19 +704,48 @@ fn strip_leading_sql_comments(sql: &str) -> &str {
 ///
 /// `sql` is the post-rewrite SQL produced by `prepare_select_for_user`;
 /// `has_limit` is that same call's AST-derived flag (DS-7) telling us
-/// whether the query already constrains its row count.
+/// whether the query already constrains its row count. `user_id` is the
+/// caller's task-local id, pinned into the `app.user_id` GUC so the #434
+/// RLS backstop can filter every personal-data table to this user.
 async fn execute_read(
     pool: &PgPool,
     sql: &str,
     has_limit: bool,
     limit: usize,
+    user_id: &str,
 ) -> Result<serde_json::Value, CoreError> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
+    // Must be the first statement in the transaction (Postgres rejects
+    // `SET TRANSACTION` once any query has run).
     sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+    // #434: engage the Postgres RLS backstop for the untrusted read. Pin
+    // the caller's id in `app.user_id`, then drop into the un-privileged
+    // `adele_query` role (no table ownership, no BYPASSRLS) so the
+    // per-table isolation policies from migration 029 filter every
+    // personal-data table to this user — regardless of what the grafted
+    // SQL text says. This is the hard backstop underneath #141's AST
+    // rewrite; if a future rewrite bug ever failed to graft a table, RLS
+    // still returns zero foreign rows. Both settings are transaction-local
+    // (`is_local`/`SET LOCAL`), so the always-taken rollback below restores
+    // the pooled connection's session role and GUCs cleanly.
+    //
+    // The role name is a compile-time constant (`TOOL_QUERY_ROLE`), never
+    // user input, so the literal below is safe; `SET ROLE` cannot be
+    // parameterised. `user_id` is bound as a parameter.
+    sqlx::query("SELECT set_config('app.user_id', $1, true)")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+    sqlx::query("SET LOCAL ROLE adele_query")
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

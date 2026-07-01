@@ -119,6 +119,13 @@ impl Fixture {
             .await
             .expect("run_migrations succeeds");
 
+        // #434: the read path now `SET LOCAL ROLE adele_query` and reads
+        // under RLS. Production tables live in `public` (granted by
+        // migration 029); this suite's tables live in a private schema, so
+        // grant the tool role access there too or every grafted SELECT
+        // would hit "permission denied for table".
+        support::grant_tool_role_on_schema(&pool, &schema).await;
+
         Some(Self {
             pool,
             schema,
