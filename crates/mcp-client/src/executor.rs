@@ -15,10 +15,30 @@ fn default_enabled() -> bool {
     true
 }
 
+/// HTTP transport settings for reaching a remote MCP server (streamable-HTTP).
+///
+/// The presence of this table on an [`McpServerConfig`] selects the HTTP
+/// transport instead of spawning `command` — so pointing Adele at Google's
+/// hosted Gmail/Calendar/Drive/Chat MCP endpoints is one `[servers.http]`
+/// table per service, and one server entry per account (with its own
+/// `namespace` + `auth_bearer_secret`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HttpTransportConfig {
+    /// Remote MCP endpoint URL, e.g. `https://gmailmcp.googleapis.com/mcp/v1`.
+    pub url: String,
+    /// Secret ID (looked up in secrets.toml) whose value is sent verbatim as an
+    /// `Authorization: Bearer` token. Acquiring/refreshing that token (e.g. via
+    /// Google OAuth) is out of scope; the resolved secret is used as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_bearer_secret: Option<String>,
+}
+
 /// Configuration for an MCP server.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
+    /// Command to spawn for a stdio server. Ignored when [`Self::http`] is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -36,6 +56,10 @@ pub struct McpServerConfig {
     /// Keys are env var names, values are secret IDs.
     #[serde(default)]
     pub env_secrets: HashMap<String, String>,
+    /// When set, reach this server over HTTP (streamable-HTTP) instead of
+    /// spawning `command`. See [`HttpTransportConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpTransportConfig>,
 }
 
 /// Status information for an MCP server.
@@ -113,6 +137,42 @@ impl McpExecutorState {
             env.insert(var_name.clone(), value.clone());
         }
         Ok(env)
+    }
+
+    /// Resolve the bearer token for an HTTP transport from secrets.toml, if the
+    /// config references one. A missing secret is an error (fail closed) rather
+    /// than silently connecting unauthenticated.
+    fn resolve_bearer(
+        &self,
+        http: &HttpTransportConfig,
+        server_name: &str,
+    ) -> Result<Option<String>, McpError> {
+        match &http.auth_bearer_secret {
+            None => Ok(None),
+            Some(secret_id) => {
+                let value = self.secrets.get(secret_id).ok_or_else(|| {
+                    McpError::UnexpectedResponse(format!(
+                        "secret '{secret_id}' (referenced by http.auth_bearer_secret in server '{server_name}') not found in secrets.toml"
+                    ))
+                })?;
+                Ok(Some(value.clone()))
+            }
+        }
+    }
+
+    /// Connect to a server using its configured transport: HTTP when
+    /// [`McpServerConfig::http`] is set, otherwise a stdio child process.
+    async fn connect_client(&self, config: &McpServerConfig) -> Result<McpClient, McpError> {
+        match &config.http {
+            Some(http) => {
+                let bearer = self.resolve_bearer(http, &config.name)?;
+                McpClient::connect_http(&http.url, bearer).await
+            }
+            None => {
+                let env = self.resolve_env(config)?;
+                McpClient::connect(&config.command, &config.args, &env).await
+            }
+        }
     }
 
     async fn maybe_refresh_metadata(&self) -> Result<(), McpError> {
@@ -283,11 +343,10 @@ impl McpExecutorState {
         tracing::info!(
             "connecting to MCP server '{}': {}",
             config.name,
-            config.command
+            connect_target(config)
         );
 
-        let env = self.resolve_env(config)?;
-        match McpClient::connect(&config.command, &config.args, &env).await {
+        match self.connect_client(config).await {
             Ok(client) => {
                 let mut clients = self.clients.write().await;
                 clients[idx] = Some(ClientHandle::new(client));
@@ -650,14 +709,10 @@ impl McpToolExecutor {
                 tracing::info!(
                     "connecting to MCP server '{}': {}",
                     config.name,
-                    config.command
+                    connect_target(config)
                 );
 
-                let env = self.state.resolve_env(config).unwrap_or_else(|e| {
-                    tracing::error!("failed to resolve secrets for '{}': {e}", config.name);
-                    config.env.clone()
-                });
-                match McpClient::connect(&config.command, &config.args, &env).await {
+                match self.state.connect_client(config).await {
                     Ok(client) => {
                         clients[idx] = Some(ClientHandle::new(client));
                     }
@@ -890,6 +945,15 @@ fn is_method_not_found(error: &McpError) -> bool {
     matches!(error, McpError::ServerError { code: -32601, .. })
 }
 
+/// Human-facing connection target for logs: the HTTP url when configured,
+/// otherwise the stdio command.
+fn connect_target(config: &McpServerConfig) -> &str {
+    match &config.http {
+        Some(http) => http.url.as_str(),
+        None => config.command.as_str(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +976,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         };
         assert_eq!(config.name, "fileio");
         assert_eq!(config.command, "fileio-mcp");
@@ -930,6 +995,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         };
         assert_eq!(config.namespace.as_deref(), Some("jira"));
     }
@@ -944,6 +1010,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         };
         assert_eq!(config.args.len(), 2);
     }
@@ -1020,6 +1087,7 @@ mod tests {
                 enabled: true,
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
+                http: None,
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -1029,6 +1097,7 @@ mod tests {
                 enabled: false,
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
+                http: None,
             },
         ];
         let executor = McpToolExecutor::new(configs);
@@ -1056,6 +1125,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();
@@ -1079,6 +1149,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();

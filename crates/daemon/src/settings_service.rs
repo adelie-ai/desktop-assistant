@@ -284,6 +284,7 @@ impl SettingsService for DaemonSettingsService {
             enabled,
             env: std::collections::HashMap::new(),
             env_secrets: std::collections::HashMap::new(),
+            http: None,
         };
         handle
             .add_server(config)

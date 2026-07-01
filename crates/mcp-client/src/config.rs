@@ -249,6 +249,7 @@ OTHER_VAR = "value"
                 enabled: true,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                http: None,
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -258,6 +259,7 @@ OTHER_VAR = "value"
                 enabled: false,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                http: None,
             },
         ];
 
@@ -354,5 +356,87 @@ other_key = "secret-value"
         let path = default_secrets_path();
         assert!(path.to_str().unwrap().contains("secrets.toml"));
         assert!(path.to_str().unwrap().contains("desktop-assistant"));
+    }
+
+    #[test]
+    fn parse_http_transport_server() {
+        // A remote (streamable-HTTP) server: no `command`, an `[servers.http]`
+        // table selects the HTTP transport. Mirrors pointing Adele at Google's
+        // hosted Gmail endpoint for one account.
+        let toml = r#"
+[[servers]]
+name = "gmail-personal"
+namespace = "gmail_personal"
+
+[servers.http]
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+auth_bearer_secret = "google_personal_token"
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        let server = &config.servers[0];
+        assert_eq!(server.name, "gmail-personal");
+        assert!(server.command.is_empty(), "http server needs no command");
+        assert_eq!(server.namespace.as_deref(), Some("gmail_personal"));
+        let http = server.http.as_ref().expect("http transport table");
+        assert_eq!(http.url, "https://gmailmcp.googleapis.com/mcp/v1");
+        assert_eq!(
+            http.auth_bearer_secret.as_deref(),
+            Some("google_personal_token")
+        );
+    }
+
+    #[test]
+    fn stdio_and_http_servers_roundtrip() {
+        // A stdio server and an HTTP server survive a save/load cycle with their
+        // transport intact.
+        let dir = std::env::temp_dir().join("mcp_config_http_roundtrip_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let configs = vec![
+            McpServerConfig {
+                name: "fileio".into(),
+                command: "fileio-mcp".into(),
+                args: vec![],
+                namespace: None,
+                enabled: true,
+                env: std::collections::HashMap::new(),
+                env_secrets: std::collections::HashMap::new(),
+                http: None,
+            },
+            McpServerConfig {
+                name: "calendar-work".into(),
+                command: String::new(),
+                args: vec![],
+                namespace: Some("calendar_work".into()),
+                enabled: true,
+                env: std::collections::HashMap::new(),
+                env_secrets: std::collections::HashMap::new(),
+                http: Some(crate::executor::HttpTransportConfig {
+                    url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
+                    auth_bearer_secret: Some("google_work_token".into()),
+                }),
+            },
+        ];
+
+        save_mcp_configs(&path, &configs).unwrap();
+        let loaded = load_mcp_configs(&path).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "fileio");
+        assert!(loaded[0].http.is_none());
+        assert_eq!(loaded[0].command, "fileio-mcp");
+
+        assert_eq!(loaded[1].name, "calendar-work");
+        assert!(loaded[1].command.is_empty());
+        let http = loaded[1].http.as_ref().expect("http survives roundtrip");
+        assert_eq!(http.url, "https://calendarmcp.googleapis.com/mcp/v1");
+        assert_eq!(
+            http.auth_bearer_secret.as_deref(),
+            Some("google_work_token")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

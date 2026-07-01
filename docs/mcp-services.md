@@ -91,9 +91,10 @@ Fields:
 | Field       | Required | Description                                                                          |
 |-------------|----------|--------------------------------------------------------------------------------------|
 | `name`      | yes      | Logical label for this server; used in logs and startup diagnostics                  |
-| `command`   | yes      | Executable to spawn — must be on `$PATH` or an absolute path                         |
+| `command`   | for stdio | Executable to spawn — must be on `$PATH` or an absolute path. Omit when using `[servers.http]` |
 | `args`      | no       | Command-line arguments passed to the process (default: empty list)                   |
 | `namespace` | no       | If set, all tools from this server are exposed as `{namespace}__{tool_name}`; if absent, tool names are passed through unchanged |
+| `[servers.http]` | no  | Reach the server over HTTP instead of spawning `command` — see [Remote (HTTP) MCP Servers](#remote-http-mcp-servers) |
 
 The daemon communicates with each server over stdio using the MCP JSON-RPC protocol.
 
@@ -180,6 +181,79 @@ name    = "calendar"
 command = "/opt/my-mcp-servers/calendar-mcp"
 args    = ["--profile", "work"]
 ```
+
+## Remote (HTTP) MCP Servers
+
+Besides spawning a local process over stdio, the daemon can reach a **remote** MCP server over HTTP (the MCP *streamable-HTTP* transport). Add a `[servers.http]` table instead of a `command`:
+
+```toml
+[[servers]]
+name      = "gmail-personal"
+namespace = "gmail_personal"
+
+[servers.http]
+url                = "https://gmailmcp.googleapis.com/mcp/v1"
+auth_bearer_secret = "google_personal_token"
+```
+
+Fields under `[servers.http]`:
+
+| Field                | Required | Description                                                                                |
+|----------------------|----------|--------------------------------------------------------------------------------------------|
+| `url`                | yes      | Remote MCP endpoint (`http://` or `https://`). Its presence selects the HTTP transport      |
+| `auth_bearer_secret` | no       | Secret **ID** (looked up in `secrets.toml`) whose value is sent as `Authorization: Bearer`  |
+
+The bearer token itself is never written in `mcp_servers.toml` — only the secret **ID** is. Put the real token in `secrets.toml` (also enforced `0600`):
+
+```toml
+# ~/.config/desktop-assistant/secrets.toml
+[secrets]
+google_personal_token = "ya29.a0Af..."
+```
+
+> **Token acquisition is out of scope for the daemon.** Whatever value you place in `secrets.toml` is sent verbatim as the bearer token; obtaining and refreshing it is currently your responsibility (e.g. an OAuth 2.0 access token from your own Google OAuth client).
+
+### Google Workspace (Gmail / Calendar / Drive / Chat)
+
+Google hosts a first-party MCP endpoint per Workspace service; each is one `[[servers]]` entry:
+
+```toml
+[[servers]]
+name = "gmail"
+namespace = "gmail"
+[servers.http]
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+auth_bearer_secret = "google_token"
+
+[[servers]]
+name = "calendar"
+namespace = "calendar"
+[servers.http]
+url = "https://calendarmcp.googleapis.com/mcp/v1"
+auth_bearer_secret = "google_token"
+```
+
+(Which tools — and whether writes like sending mail or RSVPing invites are permitted — depends on the OAuth scopes granted to your token.)
+
+**Multiple accounts.** Give each account its own entry with a distinct `namespace` and `auth_bearer_secret`, so the assistant can tell them apart ("create an invite on my *work* calendar" → the `calendar_work__` tools):
+
+```toml
+[[servers]]
+name = "calendar-personal"
+namespace = "calendar_personal"
+[servers.http]
+url = "https://calendarmcp.googleapis.com/mcp/v1"
+auth_bearer_secret = "google_personal_token"
+
+[[servers]]
+name = "calendar-work"
+namespace = "calendar_work"
+[servers.http]
+url = "https://calendarmcp.googleapis.com/mcp/v1"
+auth_bearer_secret = "google_work_token"
+```
+
+Within a single account, choosing between that account's calendars (primary vs. a shared "XYZ" calendar) is handled by the server's own `calendarId` tool argument, not by configuration.
 
 ## Startup Behaviour
 
