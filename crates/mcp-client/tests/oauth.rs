@@ -325,6 +325,93 @@ async fn provider_loads_valid_token_from_store_without_refreshing() {
 }
 
 #[tokio::test]
+async fn provider_adopts_cached_token_matching_bootstrap_refresh_token() {
+    // Daemon-restart case: bootstrapped from secrets.toml (rt-original) AND a
+    // store (keyring) that cached a still-valid access token minted from the
+    // same refresh token ⇒ adopt the cache, skip the startup refresh.
+    let server = MockServer::start_async().await;
+    let token_mock = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200)
+                .body(r#"{"access_token":"should-not-be-used"}"#);
+        })
+        .await;
+
+    let now = fixed_now();
+    let store = Arc::new(InMemoryTokenStore::default());
+    store
+        .save(
+            "acct@example.com",
+            &TokenSet {
+                access_token: "cached-and-valid".into(),
+                refresh_token: Some("rt-original".into()),
+                expires_at: Some(now + chrono::Duration::seconds(3600)),
+                token_type: "Bearer".into(),
+                scope: None,
+            },
+        )
+        .unwrap();
+
+    let provider = bootstrap_provider(&server, store);
+    assert_eq!(
+        provider.current_token_at(now).await.unwrap(),
+        "cached-and-valid"
+    );
+    token_mock.assert_calls_async(0).await;
+}
+
+#[tokio::test]
+async fn provider_ignores_stale_store_after_relogin() {
+    // Re-login case: secrets.toml now has rt-new, but the store still caches a
+    // (valid-looking) token for the OLD refresh token ⇒ ignore the stale cache
+    // and refresh with rt-new. The token endpoint asserts rt-new is used.
+    let server = MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/token")
+                .body_includes("refresh_token=rt-new");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"access_token":"fresh-from-rt-new","expires_in":3600,"token_type":"Bearer"}"#);
+        })
+        .await;
+
+    let now = fixed_now();
+    let store = Arc::new(InMemoryTokenStore::default());
+    store
+        .save(
+            "acct@example.com",
+            &TokenSet {
+                access_token: "stale-access".into(),
+                refresh_token: Some("rt-old".into()),
+                expires_at: Some(now + chrono::Duration::seconds(3600)),
+                token_type: "Bearer".into(),
+                scope: None,
+            },
+        )
+        .unwrap();
+
+    let provider = TokenProvider::bootstrap_from_refresh_token(
+        client_for(&server),
+        "acct@example.com",
+        store.clone(),
+        chrono::Duration::seconds(60),
+        "rt-new".to_string(),
+    );
+    assert_eq!(
+        provider.current_token_at(now).await.unwrap(),
+        "fresh-from-rt-new"
+    );
+    mock.assert_calls_async(1).await;
+    // The store is overwritten with the token for the current refresh token.
+    let persisted = store.load("acct@example.com").unwrap().unwrap();
+    assert_eq!(persisted.access_token, "fresh-from-rt-new");
+    assert_eq!(persisted.refresh_token.as_deref(), Some("rt-new"));
+}
+
+#[tokio::test]
 async fn force_refresh_bypasses_cache() {
     let server = MockServer::start_async().await;
     let mock = server

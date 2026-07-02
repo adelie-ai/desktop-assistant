@@ -19,6 +19,7 @@ mod config;
 mod connections;
 mod knowledge_service;
 mod maintenance_service;
+mod mcp_token_store;
 mod model_defaults;
 mod notifications;
 mod purposes;
@@ -1251,11 +1252,17 @@ async fn main() -> Result<()> {
         );
     }
 
-    let mut tool_executor = McpToolExecutor::with_builtin_tools_and_config_path(
+    // Persist remote-MCP OAuth tokens in the system Secret Service (#455). The
+    // store degrades to a no-op when there's no Secret Service (headless), so
+    // it's safe to always inject; the executor only touches it for OAuth
+    // servers. Kept behind the `TokenStore` trait so the backend is swappable.
+    let token_store = Arc::new(mcp_token_store::KeyringTokenStore::new());
+    let mut tool_executor = McpToolExecutor::with_builtin_tools_config_and_token_store(
         mcp_configs,
         builtin_tools,
         mcp_config_path,
         mcp_secrets,
+        token_store,
     );
     let mcp_handle = tool_executor.control_handle();
     tool_executor

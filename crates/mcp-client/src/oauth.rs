@@ -512,13 +512,23 @@ impl TokenProvider {
     async fn get(&self, now: DateTime<Utc>, force: bool) -> Result<String, OAuthError> {
         let mut state = self.state.lock().await;
 
-        // Lazily consult the store once — but a seed passed to `new` wins over
-        // the store, so only load when we have nothing yet.
+        // Lazily consult the store once. The store is a best-effort cache: a
+        // load failure is logged and ignored (we fall back to the seed), never
+        // fatal to the request. `reconcile_stored` decides whether the cached
+        // token is still authoritative for our bootstrap refresh token.
         if !state.loaded_from_store {
-            if state.tokens.is_none() {
-                state.tokens = self.store.load(&self.account_key)?;
-            }
             state.loaded_from_store = true;
+            match self.store.load(&self.account_key) {
+                Ok(Some(stored)) => {
+                    let seed = state.tokens.take();
+                    state.tokens = Some(reconcile_stored(seed, stored));
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    "token store load failed for account '{}': {error}; continuing without cache",
+                    self.account_key
+                ),
+            }
         }
 
         let needs_refresh = force
@@ -535,7 +545,14 @@ impl TokenProvider {
                 .ok_or(OAuthError::NoRefreshToken)?;
             let refreshed = self.client.refresh_at(&refresh_token, now).await?;
             let merged = merge_tokens(state.tokens.take(), refreshed);
-            self.store.save(&self.account_key, &merged)?;
+            // Persist is best-effort too: a store write failure keeps the token
+            // in memory (it just won't survive a restart), never fails the call.
+            if let Err(error) = self.store.save(&self.account_key, &merged) {
+                tracing::warn!(
+                    "token store save failed for account '{}': {error}; token kept in memory only",
+                    self.account_key
+                );
+            }
             state.tokens = Some(merged);
         }
 
@@ -555,6 +572,25 @@ fn merge_tokens(old: Option<TokenSet>, mut new: TokenSet) -> TokenSet {
         new.refresh_token = old.and_then(|t| t.refresh_token);
     }
     new
+}
+
+/// Reconcile a token loaded from the store with the bootstrap `seed`.
+///
+/// The store is authoritative when its cached token was minted from the *same*
+/// refresh token we were bootstrapped with — then its (possibly still-valid)
+/// access token lets the daemon skip a refresh across restarts, and any rotated
+/// refresh token it holds is preserved. If the refresh tokens differ, the cache
+/// is stale (e.g. the user re-ran the login, writing a new refresh token to
+/// secrets.toml) and we fall back to the seed. With no seed (a provider built
+/// purely from the store), the store is trusted.
+fn reconcile_stored(seed: Option<TokenSet>, stored: TokenSet) -> TokenSet {
+    let seed_refresh = seed.as_ref().and_then(|s| s.refresh_token.clone());
+    match (&seed_refresh, &stored.refresh_token) {
+        (Some(seed_rt), Some(stored_rt)) if seed_rt != stored_rt => {
+            seed.expect("seed is Some when its refresh token was read")
+        }
+        _ => merge_tokens(seed, stored),
+    }
 }
 
 /// Run the installed-app loopback + PKCE authorization flow and return the
@@ -851,5 +887,54 @@ mod tests {
             merge_tokens(old, rotated).refresh_token.as_deref(),
             Some("rt-new")
         );
+    }
+
+    fn token(access: &str, refresh: &str) -> TokenSet {
+        TokenSet {
+            access_token: access.into(),
+            refresh_token: Some(refresh.into()),
+            expires_at: None,
+            token_type: "Bearer".into(),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_adopts_store_when_refresh_token_matches() {
+        // Bootstrap seed (empty access) + a cached token minted from the same
+        // refresh token ⇒ adopt the cache (its access token skips a refresh).
+        let seed = TokenSet {
+            access_token: String::new(),
+            ..token("", "rt-1")
+        };
+        let stored = token("cached-access", "rt-1");
+        let result = reconcile_stored(Some(seed), stored);
+        assert_eq!(result.access_token, "cached-access");
+        assert_eq!(result.refresh_token.as_deref(), Some("rt-1"));
+    }
+
+    #[test]
+    fn reconcile_prefers_seed_when_refresh_token_differs() {
+        // A re-login wrote rt-2 to secrets.toml; the store still caches a token
+        // for rt-1 ⇒ ignore the stale cache and use the seed.
+        let seed = TokenSet {
+            access_token: String::new(),
+            ..token("", "rt-2")
+        };
+        let stored = token("stale-access", "rt-1");
+        let result = reconcile_stored(Some(seed), stored);
+        assert!(
+            result.access_token.is_empty(),
+            "must not adopt stale access token"
+        );
+        assert_eq!(result.refresh_token.as_deref(), Some("rt-2"));
+    }
+
+    #[test]
+    fn reconcile_trusts_store_when_no_seed() {
+        let stored = token("cached-access", "rt-1");
+        let result = reconcile_stored(None, stored);
+        assert_eq!(result.access_token, "cached-access");
+        assert_eq!(result.refresh_token.as_deref(), Some("rt-1"));
     }
 }

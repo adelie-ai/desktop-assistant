@@ -160,6 +160,13 @@ pub struct McpExecutorState {
     config_path: PathBuf,
     /// Secrets loaded from secrets.toml, keyed by secret ID.
     secrets: HashMap<String, String>,
+    /// Backend for persisting OAuth tokens across restarts (issue #455). The
+    /// executor is deliberately agnostic about *where* tokens live: it holds a
+    /// [`TokenStore`] trait object, defaulting to an in-memory store, so the
+    /// daemon can inject a keyring-backed one (or, later, a server-side store)
+    /// without any change here. Shared across all OAuth servers, keyed by
+    /// account, so services for one account can share a cached token.
+    token_store: Arc<dyn TokenStore>,
 }
 
 impl McpExecutorState {
@@ -237,11 +244,10 @@ impl McpExecutorState {
             .clone()
             .unwrap_or_else(|| server_name.to_string());
         let skew = chrono::Duration::seconds(oauth.refresh_skew_seconds.unwrap_or(60));
-        let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
         Ok(TokenProvider::bootstrap_from_refresh_token(
             client,
             account_key,
-            store,
+            Arc::clone(&self.token_store),
             skew,
             refresh_token,
         ))
@@ -747,6 +753,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
                 secrets: HashMap::new(),
+                token_store: Arc::new(InMemoryTokenStore::default()),
             }),
             builtin_tools,
         }
@@ -757,6 +764,28 @@ impl McpToolExecutor {
         builtin_tools: BuiltinToolService,
         config_path: PathBuf,
         secrets: HashMap<String, String>,
+    ) -> Self {
+        Self::with_builtin_tools_config_and_token_store(
+            configs,
+            builtin_tools,
+            config_path,
+            secrets,
+            Arc::new(InMemoryTokenStore::default()),
+        )
+    }
+
+    /// Like [`Self::with_builtin_tools_and_config_path`] but with an injected
+    /// [`TokenStore`] for persisting OAuth tokens (issue #455). The daemon
+    /// passes a keyring-backed store here; tests and the default path get an
+    /// in-memory one. Keeping this a trait object means the persistence backend
+    /// (keyring today, possibly a server-side store later) is swappable without
+    /// touching the transport or provider code.
+    pub fn with_builtin_tools_config_and_token_store(
+        configs: Vec<McpServerConfig>,
+        builtin_tools: BuiltinToolService,
+        config_path: PathBuf,
+        secrets: HashMap<String, String>,
+        token_store: Arc<dyn TokenStore>,
     ) -> Self {
         let clients: Vec<Option<ClientHandle>> = (0..configs.len()).map(|_| None).collect();
         Self {
@@ -769,6 +798,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
                 secrets,
+                token_store,
             }),
             builtin_tools,
         }

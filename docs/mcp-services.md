@@ -261,6 +261,8 @@ desktop-assistant --mcp-oauth-login gmail-work
 
 Then restart the daemon; it will keep the access token fresh from there on. Secret **values** (client secret, refresh token) live only in `secrets.toml` (`0600`) — never in `mcp_servers.toml`.
 
+At runtime the daemon caches the live token in the system secret store (best-effort) so a restart needn't re-fetch it; where that cache lives is an internal detail and needs no configuration — with no secret store available (headless) the daemon just keeps the token in memory. If you re-run the login (new refresh token), the daemon detects the change on next start and re-bootstraps automatically.
+
 > **Workspace domains skip the weekly re-auth.** If your `token_url` account is on a Google Workspace domain you control, set the OAuth **consent screen to "Internal"** — the refresh token then does not expire after 7 days and needs no Google verification, even for restricted scopes like `gmail.modify`. Personal/"Testing" consent screens expire the refresh token weekly; `--mcp-oauth-login` will need re-running when that happens (the daemon logs an `invalid_grant` error telling you so).
 
 ### Google Workspace (Gmail / Calendar / Drive / Chat)
