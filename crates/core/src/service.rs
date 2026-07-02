@@ -62,6 +62,20 @@ fn cancellation_token_or_default() -> CancellationToken {
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
 
+/// Transient instruction shown to the model for the #453 wind-down completion
+/// only (never persisted): the tool budget is spent, so it must close out in
+/// prose rather than request more tools.
+const WIND_DOWN_INSTRUCTION: &str = "You've reached this turn's limit on tool \
+    calls, so you can't run any more tools right now. Wrap up now in a brief, \
+    natural reply: what you accomplished, what's still left, and how we can \
+    continue from here.";
+
+/// Closing persisted when the #453 wind-down completion itself fails or comes
+/// back empty — so a round-budget-exhausted turn is never silently lost.
+const WIND_DOWN_FALLBACK: &str = "I reached the limit on tool calls for this \
+    turn before I could finish. I've kept the work so far — send another \
+    message and I'll pick up where I left off.";
+
 fn now_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -1597,10 +1611,119 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             }
         }
 
-        // If we exhausted all rounds, return what we have
-        Err(CoreError::Llm(format!(
-            "tool calling loop exceeded maximum of {MAX_TOOL_ROUNDS} rounds"
-        )))
+        // #453: the tool-round budget is spent. Rather than returning an error
+        // and dropping the entire turn (the user's prompt plus every tool
+        // round), do a bounded, tool-free wind-down: ask the model — in full
+        // context, with NO tools offered — for a fluent closing that says what
+        // it got done, what's left, and how to continue. Then persist the turn
+        // so it can be picked up later. A canned message is the fallback if
+        // that final call fails or returns nothing, so the turn is never lost.
+        tracing::warn!(
+            conversation_id = %conversation_id.0,
+            max_rounds = MAX_TOOL_ROUNDS,
+            "tool-round budget exhausted — winding down and persisting the turn"
+        );
+        bail_if_cancelled()?;
+
+        // Recompute the light task anchors so the wind-down prompt carries the
+        // same [Current task]/[Plan] context the loop rounds did.
+        let goal = match &self.scratchpad_goal_read {
+            Some(read) => read(
+                conversation_id.0.clone(),
+                vec![SCRATCHPAD_GOAL_KEY.to_string()],
+                1,
+            )
+            .await
+            .ok()
+            .and_then(|mut notes| notes.pop())
+            .map(|note| note.content)
+            .filter(|content| !content.trim().is_empty()),
+            None => None,
+        };
+        let wind_down_anchor = goal
+            .as_deref()
+            .or(conv.active_task.as_deref())
+            .map(str::to_string);
+        let wind_down_plan = self.render_current_plan(conversation_id, None).await;
+        let wind_down_index = self.render_current_scratchpad_index(conversation_id).await;
+
+        // Show the model a transient wrap-up instruction for THIS call only,
+        // then drop it so only its closing reply is persisted.
+        conv.messages
+            .push(Message::new(Role::User, WIND_DOWN_INSTRUCTION));
+        let wind_down_messages = {
+            let estimate = |text: &str| self.llm.estimate_tokens(text);
+            assemble_turn_within_budget(
+                &ConversationView {
+                    messages: &conv.messages,
+                    summaries: &conv.summaries,
+                    context_summary: &conv.context_summary,
+                },
+                &ToolContext {
+                    tool_defs: &[],
+                    deferred_namespaces: &[],
+                    locality: None,
+                },
+                &TurnAnchors {
+                    active_task: wind_down_anchor.as_deref(),
+                    plan: wind_down_plan.as_deref(),
+                    scratchpad_index: wind_down_index.as_deref(),
+                    tool_rounds_since_anchor: u32::MAX,
+                },
+                target_window,
+                current_context_budget(),
+                &estimate,
+            )
+        };
+        conv.messages.pop(); // the transient instruction is never persisted
+
+        // Stream the closing through the shared callback, sanitizing think
+        // blocks and honoring cancellation exactly like a normal round.
+        let mut wind_down_sanitizer = crate::sanitize::StreamSanitizer::new();
+        let wind_down_callback_slot = Arc::clone(&on_chunk);
+        let wind_down_token = cancellation_token_or_default();
+        let wind_down_stream: ChunkCallback = Box::new(move |chunk| {
+            if wind_down_token.is_cancelled() {
+                return false;
+            }
+            let visible = wind_down_sanitizer.push(&chunk);
+            if visible.is_empty() {
+                true
+            } else {
+                (wind_down_callback_slot.lock().unwrap())(visible)
+            }
+        });
+        let reasoning = crate::ports::llm::current_reasoning_config();
+        let closing = match self
+            .llm
+            .stream_completion(wind_down_messages, &[], reasoning, wind_down_stream)
+            .await
+        {
+            Ok(response) => {
+                let visible = sanitize_assistant_text(&response.text);
+                if visible.trim().is_empty() {
+                    WIND_DOWN_FALLBACK.to_string()
+                } else {
+                    visible
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "wind-down completion failed; using canned closing");
+                WIND_DOWN_FALLBACK.to_string()
+            }
+        };
+
+        // Persist the whole turn: prompt + tool transcript + closing.
+        conv.messages.push(Message::new(Role::Assistant, &closing));
+        if is_first_message {
+            let generated = generate_conversation_title(&prompt, self.task_llm()).await;
+            if !generated.is_empty() {
+                conv.title = generated;
+            }
+        }
+        conv.updated_at = now_timestamp();
+        self.store.update(conv).await?;
+        Ok(closing)
     }
 }
 
@@ -3520,15 +3643,19 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handler
+        // #453: the loop is still bounded — it stops at MAX_TOOL_ROUNDS rather
+        // than looping forever — but now winds down and persists a closing
+        // instead of returning an error, so the turn isn't lost.
+        let closing = handler
             .send_prompt(
                 &conv.id,
                 "Loop forever".into(),
                 noop_callback(),
                 noop_status(),
             )
-            .await;
-        assert!(matches!(result, Err(CoreError::Llm(_))));
+            .await
+            .expect("bounded loop winds down to Ok rather than erroring");
+        assert!(!closing.is_empty(), "a wind-down closing is produced");
     }
 
     // --- Context recovery test ---
@@ -6037,20 +6164,10 @@ mod tests {
         );
     }
 
-    /// PINS CURRENT BEHAVIOUR (possible data-loss defect — see PR #445 design
-    /// triage). When the tool loop exhausts `MAX_TOOL_ROUNDS`, it returns
-    /// `Err(Llm(..))` WITHOUT a `store.update`, so the user's prompt and all the
-    /// turn's tool churn are discarded — unlike the non-context-error path,
-    /// which persists a friendly assistant message. This test documents that
-    /// the persisted conversation is left EMPTY after exhaustion.
-    #[tokio::test]
-    async fn max_rounds_exhaustion_persistence() {
-        let tools = vec![ToolDefinition::new(
-            "loop_tool",
-            "Loops",
-            serde_json::json!({}),
-        )];
-        let responses: Vec<LlmResponse> = (0..MAX_TOOL_ROUNDS + 1)
+    /// Enough tool-call responses to burn the whole round budget, then one
+    /// trailing response the tool-free wind-down completion returns.
+    fn exhausting_responses(closing: LlmResponse) -> Vec<LlmResponse> {
+        let mut responses: Vec<LlmResponse> = (0..MAX_TOOL_ROUNDS)
             .map(|i| {
                 LlmResponse::with_tool_calls(
                     "",
@@ -6058,6 +6175,26 @@ mod tests {
                 )
             })
             .collect();
+        responses.push(closing);
+        responses
+    }
+
+    /// #453 FIX: exhausting `MAX_TOOL_ROUNDS` no longer drops the turn. The
+    /// daemon does a bounded, tool-free wind-down (one final completion with no
+    /// tools offered) and persists the whole turn — the user's prompt, the tool
+    /// transcript, and the model's closing summary — so the conversation can be
+    /// continued instead of silently vanishing.
+    #[tokio::test]
+    async fn max_rounds_exhaustion_winds_down_and_persists_turn() {
+        let tools = vec![ToolDefinition::new(
+            "loop_tool",
+            "Loops",
+            serde_json::json!({}),
+        )];
+        let responses = exhausting_responses(LlmResponse::text(
+            "I hit the tool-call limit before finishing. Done: read the files. \
+             Still to do: apply the edit. Say continue and I'll pick up.",
+        ));
         let mut tool_results = HashMap::new();
         tool_results.insert("loop_tool".to_string(), "ok".to_string());
 
@@ -6074,24 +6211,86 @@ mod tests {
                 noop_callback(),
                 noop_status(),
             )
-            .await;
-        assert!(matches!(result, Err(CoreError::Llm(_))));
+            .await
+            .expect("exhaustion now winds down to Ok, not Err");
+        assert!(
+            result.starts_with("I hit the tool-call limit"),
+            "the fluent wind-down closing is returned, got: {result}"
+        );
 
-        // The data-loss: nothing this turn was persisted. The user's prompt and
-        // every tool result are gone — the stored conversation is still empty.
+        // The turn is persisted, not lost: the user prompt is present, the
+        // closing is the last message, and the tool transcript survived.
         let persisted = handler.get_conversation(&conv.id).await.unwrap();
         assert!(
-            persisted.messages.is_empty(),
-            "PINNED: exhaustion discards the whole turn; expected 0 persisted \
-             messages (the user prompt itself is lost), got {}",
+            persisted
+                .messages
+                .iter()
+                .any(|m| m.content == "loop forever"),
+            "#453: the user's prompt MUST be persisted after exhaustion"
+        );
+        let last = persisted.messages.last().expect("non-empty history");
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(
+            last.content, result,
+            "closing summary is persisted verbatim"
+        );
+        assert!(
+            persisted.messages.len() > 2,
+            "the tool transcript must be preserved, got {} messages",
             persisted.messages.len()
         );
+        // The transient wind-down instruction must never leak into history.
         assert!(
             !persisted
                 .messages
                 .iter()
+                .any(|m| m.content.contains("Wrap up now")),
+            "the transient wind-down instruction must not be persisted"
+        );
+    }
+
+    /// #453: if the wind-down completion itself returns no usable text, a canned
+    /// closing is persisted rather than an empty assistant turn — the turn is
+    /// preserved either way.
+    #[tokio::test]
+    async fn max_rounds_exhaustion_falls_back_when_wind_down_is_empty() {
+        let tools = vec![ToolDefinition::new(
+            "loop_tool",
+            "Loops",
+            serde_json::json!({}),
+        )];
+        let responses = exhausting_responses(LlmResponse::text(""));
+        let mut tool_results = HashMap::new();
+        tool_results.insert("loop_tool".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let result = handler
+            .send_prompt(
+                &conv.id,
+                "loop forever".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("exhaustion winds down to Ok even when the closing is empty");
+        assert_eq!(result, WIND_DOWN_FALLBACK);
+
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            persisted
+                .messages
+                .iter()
                 .any(|m| m.content == "loop forever"),
-            "the user's prompt must be absent under the current (lossy) behaviour"
+            "#453: the user's prompt MUST be persisted even on the fallback path"
+        );
+        assert_eq!(
+            persisted.messages.last().unwrap().content,
+            WIND_DOWN_FALLBACK
         );
     }
 
