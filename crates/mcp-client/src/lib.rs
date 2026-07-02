@@ -4,6 +4,7 @@ mod builtin;
 pub mod config;
 pub mod executor;
 mod jsonrpc;
+pub mod oauth;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,6 +36,12 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Anything larger is a protocol violation (or a runaway tool result) and is
 /// surfaced as an error instead of buffering unbounded memory (DS-4).
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Cap on a remote (HTTP) response body — the streamable-HTTP analogue of
+/// [`MAX_LINE_BYTES`]. A remote server (or a hostile endpoint impersonating
+/// one) cannot make the daemon buffer unbounded memory; anything larger fails
+/// the request. Generous, because an SSE reply can carry a whole tool result.
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Error type for MCP client operations.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +78,9 @@ pub enum McpError {
 
     #[error("HTTP transport error: {0}")]
     Http(String),
+
+    #[error("OAuth error: {0}")]
+    OAuth(#[from] oauth::OAuthError),
 }
 
 /// Characters that could cause unintended behaviour if they appear in the
@@ -177,7 +187,35 @@ impl McpClient {
         bearer: Option<String>,
         request_timeout: Duration,
     ) -> Result<Self, McpError> {
-        let transport = Transport::Http(HttpTransport::new(url, bearer)?);
+        Self::connect_http_credential(url, Credential::from_bearer(bearer), request_timeout).await
+    }
+
+    /// Connect to a remote MCP server over streamable-HTTP, authenticating with
+    /// an OAuth 2.0 [`TokenProvider`](oauth::TokenProvider). The provider mints
+    /// and refreshes access tokens on demand, and the transport retries once
+    /// with a fresh token if the server answers `401`.
+    pub async fn connect_http_oauth(
+        url: &str,
+        provider: Arc<oauth::TokenProvider>,
+    ) -> Result<Self, McpError> {
+        Self::connect_http_oauth_with_request_timeout(url, provider, DEFAULT_REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::connect_http_oauth`] with an explicit per-request silence timeout.
+    pub async fn connect_http_oauth_with_request_timeout(
+        url: &str,
+        provider: Arc<oauth::TokenProvider>,
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        Self::connect_http_credential(url, Credential::OAuth(provider), request_timeout).await
+    }
+
+    async fn connect_http_credential(
+        url: &str,
+        credential: Credential,
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        let transport = Transport::Http(HttpTransport::new(url, credential)?);
         Self::from_transport(transport, request_timeout).await
     }
 
@@ -563,21 +601,64 @@ impl Drop for StdioTransport {
     }
 }
 
+/// How an [`HttpTransport`] authenticates each request.
+enum Credential {
+    /// No `Authorization` header (e.g. a single-user local endpoint).
+    None,
+    /// A verbatim bearer token from `secrets.toml` — used as-is, never refreshed.
+    Static(String),
+    /// An OAuth 2.0 provider that mints and refreshes access tokens on demand.
+    OAuth(Arc<oauth::TokenProvider>),
+}
+
+impl Credential {
+    fn from_bearer(bearer: Option<String>) -> Self {
+        match bearer {
+            Some(token) => Credential::Static(token),
+            None => Credential::None,
+        }
+    }
+
+    fn is_oauth(&self) -> bool {
+        matches!(self, Credential::OAuth(_))
+    }
+
+    /// The bearer token to attach right now — refreshing an OAuth token first
+    /// if it is missing or near expiry. `None` means send no `Authorization`.
+    async fn token(&self) -> Result<Option<String>, McpError> {
+        Ok(match self {
+            Credential::None => None,
+            Credential::Static(token) => Some(token.clone()),
+            Credential::OAuth(provider) => Some(provider.current_token().await?),
+        })
+    }
+
+    /// Force a fresh OAuth token (after a `401`); other credential kinds have
+    /// nothing to refresh and just return their current token.
+    async fn refreshed_token(&self) -> Result<Option<String>, McpError> {
+        match self {
+            Credential::OAuth(provider) => Ok(Some(provider.force_refresh().await?)),
+            other => other.token().await,
+        }
+    }
+}
+
 /// JSON-RPC over a remote streamable-HTTP MCP endpoint. Each request is a POST
 /// whose reply is either a single JSON body or a `text/event-stream` (SSE)
 /// sequence of JSON-RPC messages.
 struct HttpTransport {
     client: reqwest::Client,
     url: String,
-    /// Verbatim bearer token for `Authorization`, if the endpoint requires one.
-    bearer: Option<String>,
+    /// How to authenticate each request: none, a static bearer, or an OAuth
+    /// provider that mints/refreshes access tokens on demand.
+    credential: Credential,
     /// `Mcp-Session-Id` assigned by the server on initialize; echoed on
     /// subsequent requests when present.
     session_id: Option<String>,
 }
 
 impl HttpTransport {
-    fn new(url: &str, bearer: Option<String>) -> Result<Self, McpError> {
+    fn new(url: &str, credential: Credential) -> Result<Self, McpError> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(McpError::Http(format!(
                 "remote MCP url must be http(s): {url}"
@@ -589,21 +670,51 @@ impl HttpTransport {
         Ok(Self {
             client,
             url: url.to_string(),
-            bearer,
+            credential,
             session_id: None,
         })
     }
 
-    /// Attach the shared headers (accept + auth + session) to a request.
-    fn prepare(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut builder = builder.header(ACCEPT, "application/json, text/event-stream");
-        if let Some(bearer) = &self.bearer {
-            builder = builder.bearer_auth(bearer);
+    /// Send one POST and return `(status, content_type, body)`. Captures the
+    /// session id and caps the body size. `token`, when set, is attached as
+    /// `Authorization: Bearer`.
+    async fn send_once(
+        &mut self,
+        payload: &serde_json::Value,
+        method: &str,
+        token: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(reqwest::StatusCode, String, String), McpError> {
+        let mut builder = self
+            .client
+            .post(&self.url)
+            .header(ACCEPT, "application/json, text/event-stream")
+            .json(payload);
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
         }
         if let Some(session) = &self.session_id {
             builder = builder.header("Mcp-Session-Id", session);
         }
-        builder
+
+        let response = tokio::time::timeout(timeout, builder.send())
+            .await
+            .map_err(|_| McpError::Timeout {
+                method: method.to_string(),
+                after: timeout,
+            })?
+            .map_err(|e| McpError::Http(format!("request to {} failed: {e}", self.url)))?;
+
+        self.capture_session(&response);
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = read_body_capped(response, timeout, method, MAX_HTTP_BODY_BYTES).await?;
+        Ok((status, content_type, body))
     }
 
     /// Capture the `Mcp-Session-Id` header the first time the server assigns one.
@@ -624,32 +735,29 @@ impl HttpTransport {
         timeout: Duration,
         flags: &ListChangeFlags,
     ) -> Result<serde_json::Value, McpError> {
-        let builder = self.prepare(self.client.post(&self.url).json(request));
-        let response = tokio::time::timeout(timeout, builder.send())
-            .await
-            .map_err(|_| McpError::Timeout {
-                method: request.method.clone(),
-                after: timeout,
-            })?
-            .map_err(|e| McpError::Http(format!("request to {} failed: {e}", self.url)))?;
+        let payload = serde_json::to_value(request)?;
+        let method = request.method.as_str();
 
-        self.capture_session(&response);
+        let token = self.credential.token().await?;
+        let (status, content_type, body) = self
+            .send_once(&payload, method, token.as_deref(), timeout)
+            .await?;
 
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let body = tokio::time::timeout(timeout, response.text())
-            .await
-            .map_err(|_| McpError::Timeout {
-                method: request.method.clone(),
-                after: timeout,
-            })?
-            .map_err(|e| McpError::Http(format!("reading response body failed: {e}")))?;
+        // If the resource server rejects the (possibly stale) access token,
+        // mint a fresh one and retry once. Only OAuth credentials can refresh;
+        // a static bearer or no-auth request returns the 401 as-is.
+        let (status, content_type, body) =
+            if status == reqwest::StatusCode::UNAUTHORIZED && self.credential.is_oauth() {
+                tracing::info!(
+                    "MCP HTTP endpoint {} returned 401; refreshing OAuth token and retrying",
+                    self.url
+                );
+                let token = self.credential.refreshed_token().await?;
+                self.send_once(&payload, method, token.as_deref(), timeout)
+                    .await?
+            } else {
+                (status, content_type, body)
+            };
 
         if !status.is_success() {
             return Err(McpError::Http(format!(
@@ -701,7 +809,19 @@ impl HttpTransport {
         &mut self,
         notification: &serde_json::Value,
     ) -> Result<(), McpError> {
-        let builder = self.prepare(self.client.post(&self.url).json(notification));
+        // Resolve (and, for OAuth, proactively refresh) the token first.
+        let token = self.credential.token().await?;
+        let mut builder = self
+            .client
+            .post(&self.url)
+            .header(ACCEPT, "application/json, text/event-stream")
+            .json(notification);
+        if let Some(token) = &token {
+            builder = builder.bearer_auth(token);
+        }
+        if let Some(session) = &self.session_id {
+            builder = builder.header("Mcp-Session-Id", session);
+        }
         let response = builder
             .send()
             .await
@@ -711,6 +831,41 @@ impl HttpTransport {
         // any body is intentionally ignored.
         Ok(())
     }
+}
+
+/// Read an HTTP response body, bounding both total size ([`MAX_HTTP_BODY_BYTES`],
+/// the streamable-HTTP analogue of the stdio `MAX_LINE_BYTES` cap) and the
+/// overall read time, so a slow or oversized remote reply fails the request
+/// instead of hanging or exhausting memory.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    timeout: Duration,
+    method: &str,
+    max: usize,
+) -> Result<String, McpError> {
+    let read = async {
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| McpError::Http(format!("reading response body failed: {e}")))?
+        {
+            if buf.len() + chunk.len() > max {
+                return Err(McpError::Http(format!(
+                    "response body from remote MCP server exceeded {max} bytes"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        String::from_utf8(buf)
+            .map_err(|e| McpError::Http(format!("response body was not valid UTF-8: {e}")))
+    };
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| McpError::Timeout {
+            method: method.to_string(),
+            after: timeout,
+        })?
 }
 
 /// Parse an SSE (`text/event-stream`) body into the JSON values carried by its

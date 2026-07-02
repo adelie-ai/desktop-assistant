@@ -12,9 +12,16 @@ tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 toml = "1"
-chrono.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 uuid = { version = "1", features = ["v7"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
+# OAuth 2.0 token acquisition/refresh for remote (HTTP) MCP servers (#455).
+# PKCE (S256) needs SHA-256 + base64url; the authorize URL builder needs url;
+# code_verifier/state need a CSPRNG. All already in the workspace lock.
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+rand = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

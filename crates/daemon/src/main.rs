@@ -484,6 +484,108 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
 // erased to `Arc<dyn LlmClient>`, so the spawned future is a thin boxed
 // `Pin<Box<dyn Future>>` (guarded by the `spawned_send_prompt_future_stays_small`
 // tests). The workaround is therefore removed — we run on the default runtime.
+/// Run the interactive OAuth loopback login for a configured remote (HTTP) MCP
+/// server (#455). Reads the server's `[servers.http.oauth]` block, drives the
+/// browser + PKCE flow, and persists the resulting refresh token to
+/// secrets.toml under the configured `refresh_token_ref` (printing it as a
+/// fallback if the file can't be written).
+async fn run_mcp_oauth_login(server_name: &str) -> Result<()> {
+    use desktop_assistant_mcp_client::oauth::{OAuthClient, OAuthError, run_loopback_login};
+
+    let config_path = mcp_config::default_config_path();
+    let configs = mcp_config::load_mcp_configs(&config_path)
+        .map_err(|e| anyhow::anyhow!("failed to load MCP config: {e}"))?;
+    let server = configs
+        .iter()
+        .find(|c| c.name == server_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no MCP server named '{server_name}' in {}",
+                config_path.display()
+            )
+        })?;
+    let http = server.http.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("server '{server_name}' has no [servers.http] block (not a remote server)")
+    })?;
+    let oauth = http.oauth.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("server '{server_name}' has no [servers.http.oauth] block")
+    })?;
+    let authorize_url = oauth.authorize_url.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("server '{server_name}' oauth block needs an `authorize_url` for login")
+    })?;
+    if oauth.scopes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "server '{server_name}' oauth block needs at least one `scopes` entry"
+        ));
+    }
+
+    let secrets_path = mcp_config::default_secrets_path();
+    let mut secrets = mcp_config::load_secrets(&secrets_path)
+        .map_err(|e| anyhow::anyhow!("failed to load secrets: {e}"))?;
+    let client_secret = match &oauth.client_secret_ref {
+        Some(id) => Some(secrets.get(id).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "client_secret_ref '{id}' not found in {}",
+                secrets_path.display()
+            )
+        })?),
+        None => None,
+    };
+
+    let client = OAuthClient::new(&oauth.client_id, client_secret, &oauth.token_url)
+        .map_err(|e| anyhow::anyhow!("invalid oauth configuration: {e}"))?;
+
+    println!("Authorizing MCP server '{server_name}'…");
+    let open_browser = |url: &str| -> Result<(), OAuthError> {
+        println!("\nIf your browser does not open automatically, visit:\n\n  {url}\n");
+        // Best-effort launch; the URL is printed either way.
+        let _ = std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        Ok(())
+    };
+
+    let tokens = run_loopback_login(
+        &client,
+        authorize_url,
+        &oauth.scopes,
+        "127.0.0.1",
+        std::time::Duration::from_secs(300),
+        open_browser,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("OAuth login failed: {e}"))?;
+
+    let refresh = tokens.refresh_token.ok_or_else(|| {
+        anyhow::anyhow!(
+            "authorization returned no refresh token; ensure the consent screen grants offline access"
+        )
+    })?;
+
+    secrets.insert(oauth.refresh_token_ref.clone(), refresh.clone());
+    match mcp_config::save_secrets(&secrets_path, &secrets) {
+        Ok(()) => {
+            println!(
+                "\n✅ Saved refresh token for '{server_name}' to {} as '{}'.",
+                secrets_path.display(),
+                oauth.refresh_token_ref
+            );
+            println!("Restart the daemon to pick it up.");
+        }
+        Err(e) => {
+            println!(
+                "\n⚠️  Could not write {} automatically ({e}).",
+                secrets_path.display()
+            );
+            println!("Add this under [secrets] yourself, then restart the daemon:\n");
+            println!("  {} = \"{}\"", oauth.refresh_token_ref, refresh);
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -523,6 +625,22 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!(
             "failed to install rustls aws_lc_rs crypto provider"
         ));
+    }
+
+    // #455: `desktop-assistant --mcp-oauth-login <server>` runs the interactive
+    // OAuth loopback flow for a configured remote (HTTP) MCP server, mints its
+    // refresh token, persists it to secrets.toml, and exits without starting
+    // the daemon. Placed after the rustls provider install so the token/authz
+    // HTTPS calls have a crypto backend.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = args.iter().position(|a| a == "--mcp-oauth-login") {
+            let server_name = args.get(pos + 1).ok_or_else(|| {
+                anyhow::anyhow!("--mcp-oauth-login requires a server name argument")
+            })?;
+            run_mcp_oauth_login(server_name).await?;
+            return Ok(());
+        }
     }
 
     // Register the system Secret Service as keyring-core's default credential

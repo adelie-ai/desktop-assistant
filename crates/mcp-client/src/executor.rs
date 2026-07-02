@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub use crate::builtin::BuiltinToolService;
 use crate::config::save_mcp_configs;
+use crate::oauth::{InMemoryTokenStore, OAuthClient, TokenProvider, TokenStore};
 use crate::{ListChangeFlags, McpClient, McpError};
 
 fn default_enabled() -> bool {
@@ -27,10 +28,50 @@ pub struct HttpTransportConfig {
     /// Remote MCP endpoint URL, e.g. `https://gmailmcp.googleapis.com/mcp/v1`.
     pub url: String,
     /// Secret ID (looked up in secrets.toml) whose value is sent verbatim as an
-    /// `Authorization: Bearer` token. Acquiring/refreshing that token (e.g. via
-    /// Google OAuth) is out of scope; the resolved secret is used as-is.
+    /// `Authorization: Bearer` token — a static token the daemon never
+    /// refreshes. Prefer [`Self::oauth`] for tokens that expire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_bearer_secret: Option<String>,
+    /// When set, authenticate with OAuth 2.0: the daemon exchanges a stored
+    /// refresh token for short-lived access tokens and refreshes them on demand
+    /// (and on `401`). Takes precedence over [`Self::auth_bearer_secret`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthServerConfig>,
+}
+
+/// OAuth 2.0 settings for a remote MCP server (issue #455 follow-up).
+///
+/// Secret **references** (`*_ref`) name entries in `secrets.toml`; the secret
+/// values themselves never live in `mcp_servers.toml`. `client_id`, the URLs,
+/// and scopes are non-secret and stored inline. The interactive login
+/// (`desktop-assistant --mcp-oauth-login <server>`) uses `authorize_url` +
+/// `scopes` to mint the initial refresh token.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OAuthServerConfig {
+    /// OAuth client identifier (public; safe to store inline).
+    pub client_id: String,
+    /// Token endpoint, e.g. `https://oauth2.googleapis.com/token`.
+    pub token_url: String,
+    /// Secret ID (secrets.toml) holding the refresh token that bootstraps the
+    /// daemon's access-token refresh. Obtain it once via the interactive login.
+    pub refresh_token_ref: String,
+    /// Secret ID (secrets.toml) for the OAuth client secret. Omit for public
+    /// (PKCE) clients that have no client secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_ref: Option<String>,
+    /// Authorization endpoint (used only by the interactive login flow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize_url: Option<String>,
+    /// Scopes requested by the interactive login flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// Token-store key (defaults to the server `name`). Use the account email
+    /// so multiple servers for one account can share a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Seconds before hard expiry at which to refresh proactively (default 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_skew_seconds: Option<i64>,
 }
 
 /// Configuration for an MCP server.
@@ -139,6 +180,21 @@ impl McpExecutorState {
         Ok(env)
     }
 
+    /// Look up a required secret by ID, failing closed with a message that
+    /// names the field and server so a misconfiguration is easy to fix.
+    fn require_secret(
+        &self,
+        secret_id: &str,
+        server_name: &str,
+        field: &str,
+    ) -> Result<String, McpError> {
+        self.secrets.get(secret_id).cloned().ok_or_else(|| {
+            McpError::UnexpectedResponse(format!(
+                "secret '{secret_id}' (referenced by {field} in server '{server_name}') not found in secrets.toml"
+            ))
+        })
+    }
+
     /// Resolve the bearer token for an HTTP transport from secrets.toml, if the
     /// config references one. A missing secret is an error (fail closed) rather
     /// than silently connecting unauthenticated.
@@ -149,25 +205,64 @@ impl McpExecutorState {
     ) -> Result<Option<String>, McpError> {
         match &http.auth_bearer_secret {
             None => Ok(None),
-            Some(secret_id) => {
-                let value = self.secrets.get(secret_id).ok_or_else(|| {
-                    McpError::UnexpectedResponse(format!(
-                        "secret '{secret_id}' (referenced by http.auth_bearer_secret in server '{server_name}') not found in secrets.toml"
-                    ))
-                })?;
-                Ok(Some(value.clone()))
-            }
+            Some(secret_id) => Ok(Some(self.require_secret(
+                secret_id,
+                server_name,
+                "http.auth_bearer_secret",
+            )?)),
         }
     }
 
+    /// Build an OAuth [`TokenProvider`] for a server from its config + secrets.
+    /// Fails closed if the client secret or bootstrap refresh token is missing.
+    fn build_token_provider(
+        &self,
+        oauth: &OAuthServerConfig,
+        server_name: &str,
+    ) -> Result<TokenProvider, McpError> {
+        let client_secret = match &oauth.client_secret_ref {
+            Some(id) => {
+                Some(self.require_secret(id, server_name, "http.oauth.client_secret_ref")?)
+            }
+            None => None,
+        };
+        let client = OAuthClient::new(&oauth.client_id, client_secret, &oauth.token_url)?;
+        let refresh_token = self.require_secret(
+            &oauth.refresh_token_ref,
+            server_name,
+            "http.oauth.refresh_token_ref",
+        )?;
+        let account_key = oauth
+            .account
+            .clone()
+            .unwrap_or_else(|| server_name.to_string());
+        let skew = chrono::Duration::seconds(oauth.refresh_skew_seconds.unwrap_or(60));
+        let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
+        Ok(TokenProvider::bootstrap_from_refresh_token(
+            client,
+            account_key,
+            store,
+            skew,
+            refresh_token,
+        ))
+    }
+
     /// Connect to a server using its configured transport: HTTP when
-    /// [`McpServerConfig::http`] is set, otherwise a stdio child process.
+    /// [`McpServerConfig::http`] is set, otherwise a stdio child process. An
+    /// HTTP server authenticates via OAuth when `http.oauth` is present, else a
+    /// static bearer.
     async fn connect_client(&self, config: &McpServerConfig) -> Result<McpClient, McpError> {
         match &config.http {
-            Some(http) => {
-                let bearer = self.resolve_bearer(http, &config.name)?;
-                McpClient::connect_http(&http.url, bearer).await
-            }
+            Some(http) => match &http.oauth {
+                Some(oauth) => {
+                    let provider = self.build_token_provider(oauth, &config.name)?;
+                    McpClient::connect_http_oauth(&http.url, Arc::new(provider)).await
+                }
+                None => {
+                    let bearer = self.resolve_bearer(http, &config.name)?;
+                    McpClient::connect_http(&http.url, bearer).await
+                }
+            },
             None => {
                 let env = self.resolve_env(config)?;
                 McpClient::connect(&config.command, &config.args, &env).await

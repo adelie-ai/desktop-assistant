@@ -201,7 +201,8 @@ Fields under `[servers.http]`:
 | Field                | Required | Description                                                                                |
 |----------------------|----------|--------------------------------------------------------------------------------------------|
 | `url`                | yes      | Remote MCP endpoint (`http://` or `https://`). Its presence selects the HTTP transport      |
-| `auth_bearer_secret` | no       | Secret **ID** (looked up in `secrets.toml`) whose value is sent as `Authorization: Bearer`  |
+| `auth_bearer_secret` | no       | Secret **ID** (looked up in `secrets.toml`) whose value is sent as a **static** `Authorization: Bearer` token — never refreshed |
+| `[servers.http.oauth]` | no     | Authenticate with OAuth 2.0 instead: the daemon refreshes short-lived access tokens on its own — see [OAuth 2.0](#oauth-20-google) |
 
 The bearer token itself is never written in `mcp_servers.toml` — only the secret **ID** is. Put the real token in `secrets.toml` (also enforced `0600`):
 
@@ -211,7 +212,56 @@ The bearer token itself is never written in `mcp_servers.toml` — only the secr
 google_personal_token = "ya29.a0Af..."
 ```
 
-> **Token acquisition is out of scope for the daemon.** Whatever value you place in `secrets.toml` is sent verbatim as the bearer token; obtaining and refreshing it is currently your responsibility (e.g. an OAuth 2.0 access token from your own Google OAuth client).
+> **Static tokens don't refresh.** A value placed under `auth_bearer_secret` is sent verbatim; if it's a short-lived OAuth access token it will stop working when it expires. For anything that expires, use an [OAuth block](#oauth-20-google) so the daemon refreshes it automatically.
+
+### OAuth 2.0 (Google)
+
+For tokens that expire (Google's do, in ~1 hour), add a `[servers.http.oauth]` table. The daemon then holds a long-lived **refresh token** and exchanges it for fresh access tokens on demand — including an automatic retry when the server answers `401`.
+
+```toml
+[[servers]]
+name = "gmail-work"
+namespace = "gmail_work"
+
+[servers.http]
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+
+[servers.http.oauth]
+client_id         = "1234567890-abc.apps.googleusercontent.com"
+token_url         = "https://oauth2.googleapis.com/token"
+authorize_url     = "https://accounts.google.com/o/oauth2/v2/auth"
+refresh_token_ref = "gmail_work_refresh"     # secret ID in secrets.toml
+client_secret_ref = "google_client_secret"   # secret ID; omit for public/PKCE clients
+account           = "dave@spadea.tech"        # token-store key; share across services for one account
+scopes = [
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/calendar",
+]
+```
+
+Fields under `[servers.http.oauth]`:
+
+| Field                 | Required | Description                                                                       |
+|-----------------------|----------|-----------------------------------------------------------------------------------|
+| `client_id`           | yes      | OAuth client identifier (public; safe to store inline)                            |
+| `token_url`           | yes      | Token endpoint (HTTPS), e.g. `https://oauth2.googleapis.com/token`                 |
+| `refresh_token_ref`   | yes      | Secret **ID** holding the refresh token (minted by the login command below)       |
+| `client_secret_ref`   | no       | Secret **ID** for the client secret; omit for public (PKCE-only) clients          |
+| `authorize_url`       | for login | Authorization endpoint; only used by the interactive login                       |
+| `scopes`              | for login | Scopes requested during login (they determine which tools/writes are permitted)  |
+| `account`             | no       | Token-store key (defaults to the server `name`)                                   |
+| `refresh_skew_seconds`| no       | Refresh this many seconds before hard expiry (default `60`)                        |
+
+**One-time login.** Run the interactive flow once per account to mint the refresh token. It opens your browser (installed-app loopback + PKCE), captures the redirect on `127.0.0.1`, and writes the refresh token into `secrets.toml` under `refresh_token_ref`:
+
+```bash
+desktop-assistant --mcp-oauth-login gmail-work
+# → opens browser, then: "Saved refresh token for 'gmail-work' … Restart the daemon."
+```
+
+Then restart the daemon; it will keep the access token fresh from there on. Secret **values** (client secret, refresh token) live only in `secrets.toml` (`0600`) — never in `mcp_servers.toml`.
+
+> **Workspace domains skip the weekly re-auth.** If your `token_url` account is on a Google Workspace domain you control, set the OAuth **consent screen to "Internal"** — the refresh token then does not expire after 7 days and needs no Google verification, even for restricted scopes like `gmail.modify`. Personal/"Testing" consent screens expire the refresh token weekly; `--mcp-oauth-login` will need re-running when that happens (the daemon logs an `invalid_grant` error telling you so).
 
 ### Google Workspace (Gmail / Calendar / Drive / Chat)
 
@@ -252,6 +302,8 @@ namespace = "calendar_work"
 url = "https://calendarmcp.googleapis.com/mcp/v1"
 auth_bearer_secret = "google_work_token"
 ```
+
+The examples above use a static `auth_bearer_secret` for brevity; in practice each account entry should carry its own [`[servers.http.oauth]`](#oauth-20-google) block instead (with a distinct `refresh_token_ref` and `account`), so the daemon keeps every account's token fresh on its own. Two services for the *same* account (e.g. Gmail + Calendar) can share one `account` key so a single login covers both.
 
 Within a single account, choosing between that account's calendars (primary vs. a shared "XYZ" calendar) is handled by the server's own `calendarId` tool argument, not by configuration.
 
