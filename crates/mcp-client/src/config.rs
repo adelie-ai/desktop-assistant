@@ -159,6 +159,48 @@ pub fn load_secrets(path: &std::path::Path) -> Result<HashMap<String, String>, M
     Ok(config.secrets)
 }
 
+/// Save secrets to a TOML file, owner-only (0600). Used by the interactive
+/// OAuth login to persist a freshly minted refresh token. Any prior comments
+/// or formatting in the file are not preserved.
+pub fn save_secrets(
+    path: &std::path::Path,
+    secrets: &HashMap<String, String>,
+) -> Result<(), McpError> {
+    let config = SecretsConfig {
+        secrets: secrets.clone(),
+    };
+    let contents = toml::to_string_pretty(&config)
+        .map_err(|e| McpError::UnexpectedResponse(format!("failed to serialize secrets: {e}")))?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            McpError::UnexpectedResponse(format!("failed to create secrets directory: {e}"))
+        })?;
+    }
+
+    // Open 0600 before writing so the secrets never touch a world-readable file.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| {
+                McpError::UnexpectedResponse(format!("failed to open secrets file: {e}"))
+            })?;
+        file.write_all(contents.as_bytes()).map_err(|e| {
+            McpError::UnexpectedResponse(format!("failed to write secrets file: {e}"))
+        })?;
+    }
+
+    enforce_permissions(path)?;
+    tracing::info!("saved {} secret(s) to {}", secrets.len(), path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +291,7 @@ OTHER_VAR = "value"
                 enabled: true,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                http: None,
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -258,6 +301,7 @@ OTHER_VAR = "value"
                 enabled: false,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                http: None,
             },
         ];
 
@@ -350,9 +394,221 @@ other_key = "secret-value"
     }
 
     #[test]
+    fn save_secrets_roundtrip_and_upsert() {
+        let dir = std::env::temp_dir().join("mcp_secrets_roundtrip_test");
+        let path = dir.join("secrets.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut secrets = HashMap::new();
+        secrets.insert("existing_key".to_string(), "existing".to_string());
+        save_secrets(&path, &secrets).unwrap();
+
+        // Reload, add a new secret (as the OAuth login does), save again.
+        let mut loaded = load_secrets(&path).unwrap();
+        assert_eq!(loaded.get("existing_key").unwrap(), "existing");
+        loaded.insert("gmail_refresh".to_string(), "rt-value".to_string());
+        save_secrets(&path, &loaded).unwrap();
+
+        let reloaded = load_secrets(&path).unwrap();
+        assert_eq!(reloaded.get("existing_key").unwrap(), "existing");
+        assert_eq!(reloaded.get("gmail_refresh").unwrap(), "rt-value");
+
+        // File must be owner-only (it holds secrets).
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secrets file must be 0600");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn default_secrets_path_is_reasonable() {
         let path = default_secrets_path();
         assert!(path.to_str().unwrap().contains("secrets.toml"));
         assert!(path.to_str().unwrap().contains("desktop-assistant"));
+    }
+
+    #[test]
+    fn parse_http_transport_server() {
+        // A remote (streamable-HTTP) server: no `command`, an `[servers.http]`
+        // table selects the HTTP transport. Mirrors pointing Adele at Google's
+        // hosted Gmail endpoint for one account.
+        let toml = r#"
+[[servers]]
+name = "gmail-personal"
+namespace = "gmail_personal"
+
+[servers.http]
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+auth_bearer_secret = "google_personal_token"
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        let server = &config.servers[0];
+        assert_eq!(server.name, "gmail-personal");
+        assert!(server.command.is_empty(), "http server needs no command");
+        assert_eq!(server.namespace.as_deref(), Some("gmail_personal"));
+        let http = server.http.as_ref().expect("http transport table");
+        assert_eq!(http.url, "https://gmailmcp.googleapis.com/mcp/v1");
+        assert_eq!(
+            http.auth_bearer_secret.as_deref(),
+            Some("google_personal_token")
+        );
+    }
+
+    #[test]
+    fn parse_http_transport_with_oauth() {
+        // A remote server authenticating via OAuth: no static bearer, an
+        // `[servers.http.oauth]` table naming secret *references* (not values)
+        // plus the non-secret client id / URLs / scopes.
+        let toml = r#"
+[[servers]]
+name = "gmail-work"
+namespace = "gmail_work"
+
+[servers.http]
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+
+[servers.http.oauth]
+client_id = "1234.apps.googleusercontent.com"
+token_url = "https://oauth2.googleapis.com/token"
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+refresh_token_ref = "gmail_work_refresh"
+client_secret_ref = "google_client_secret"
+account = "dave@spadea.tech"
+scopes = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar",
+]
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        let server = &config.servers[0];
+        assert!(
+            server.command.is_empty(),
+            "oauth http server needs no command"
+        );
+        let http = server.http.as_ref().expect("http table");
+        assert!(
+            http.auth_bearer_secret.is_none(),
+            "oauth server has no static bearer"
+        );
+        let oauth = http.oauth.as_ref().expect("oauth table");
+        assert_eq!(oauth.client_id, "1234.apps.googleusercontent.com");
+        assert_eq!(oauth.token_url, "https://oauth2.googleapis.com/token");
+        assert_eq!(oauth.refresh_token_ref, "gmail_work_refresh");
+        assert_eq!(
+            oauth.client_secret_ref.as_deref(),
+            Some("google_client_secret")
+        );
+        assert_eq!(
+            oauth.authorize_url.as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth")
+        );
+        assert_eq!(oauth.account.as_deref(), Some("dave@spadea.tech"));
+        assert_eq!(oauth.scopes.len(), 2);
+        // Optional numeric knob defaults to absent (⇒ 60s skew at build time).
+        assert!(oauth.refresh_skew_seconds.is_none());
+    }
+
+    #[test]
+    fn oauth_config_survives_save_load_roundtrip() {
+        use crate::executor::{HttpTransportConfig, OAuthServerConfig};
+
+        let dir = std::env::temp_dir().join("mcp_config_oauth_roundtrip_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let configs = vec![McpServerConfig {
+            name: "calendar".into(),
+            command: String::new(),
+            args: vec![],
+            namespace: Some("calendar".into()),
+            enabled: true,
+            env: std::collections::HashMap::new(),
+            env_secrets: std::collections::HashMap::new(),
+            http: Some(HttpTransportConfig {
+                url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
+                auth_bearer_secret: None,
+                oauth: Some(OAuthServerConfig {
+                    client_id: "cid".into(),
+                    token_url: "https://oauth2.googleapis.com/token".into(),
+                    refresh_token_ref: "cal_refresh".into(),
+                    client_secret_ref: None,
+                    authorize_url: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
+                    scopes: vec!["https://www.googleapis.com/auth/calendar".into()],
+                    account: Some("dave@spadea.tech".into()),
+                    refresh_skew_seconds: Some(120),
+                }),
+            }),
+        }];
+
+        save_mcp_configs(&path, &configs).unwrap();
+        let loaded = load_mcp_configs(&path).unwrap();
+        let oauth = loaded[0]
+            .http
+            .as_ref()
+            .and_then(|h| h.oauth.as_ref())
+            .expect("oauth survives roundtrip");
+        assert_eq!(oauth.client_id, "cid");
+        assert_eq!(oauth.refresh_token_ref, "cal_refresh");
+        assert!(oauth.client_secret_ref.is_none());
+        assert_eq!(oauth.refresh_skew_seconds, Some(120));
+        assert_eq!(oauth.scopes.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stdio_and_http_servers_roundtrip() {
+        // A stdio server and an HTTP server survive a save/load cycle with their
+        // transport intact.
+        let dir = std::env::temp_dir().join("mcp_config_http_roundtrip_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let configs = vec![
+            McpServerConfig {
+                name: "fileio".into(),
+                command: "fileio-mcp".into(),
+                args: vec![],
+                namespace: None,
+                enabled: true,
+                env: std::collections::HashMap::new(),
+                env_secrets: std::collections::HashMap::new(),
+                http: None,
+            },
+            McpServerConfig {
+                name: "calendar-work".into(),
+                command: String::new(),
+                args: vec![],
+                namespace: Some("calendar_work".into()),
+                enabled: true,
+                env: std::collections::HashMap::new(),
+                env_secrets: std::collections::HashMap::new(),
+                http: Some(crate::executor::HttpTransportConfig {
+                    url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
+                    auth_bearer_secret: Some("google_work_token".into()),
+                    oauth: None,
+                }),
+            },
+        ];
+
+        save_mcp_configs(&path, &configs).unwrap();
+        let loaded = load_mcp_configs(&path).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "fileio");
+        assert!(loaded[0].http.is_none());
+        assert_eq!(loaded[0].command, "fileio-mcp");
+
+        assert_eq!(loaded[1].name, "calendar-work");
+        assert!(loaded[1].command.is_empty());
+        let http = loaded[1].http.as_ref().expect("http survives roundtrip");
+        assert_eq!(http.url, "https://calendarmcp.googleapis.com/mcp/v1");
+        assert_eq!(
+            http.auth_bearer_secret.as_deref(),
+            Some("google_work_token")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
