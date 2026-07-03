@@ -5,7 +5,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
     BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView,
     LlmSettingsView, McpServerView, PersistenceSettingsView, PersonalitySettingsView,
-    SettingsService, WsAuthSettingsView,
+    ServiceAccountView, SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
@@ -304,6 +304,7 @@ impl SettingsService for DaemonSettingsService {
                 auth_kind: s.auth_kind,
                 oauth_authorized: s.oauth_authorized,
                 oauth_account: s.oauth_account,
+                oauth_account_ref: s.oauth_account_ref,
                 oauth_scopes: s.oauth_scopes,
                 oauth_client_id: s.oauth_client_id,
                 oauth_token_url: s.oauth_token_url,
@@ -416,6 +417,7 @@ impl SettingsService for DaemonSettingsService {
                 auth_kind: s.auth_kind,
                 oauth_authorized: s.oauth_authorized,
                 oauth_account: s.oauth_account,
+                oauth_account_ref: s.oauth_account_ref,
                 oauth_scopes: s.oauth_scopes,
                 oauth_client_id: s.oauth_client_id,
                 oauth_token_url: s.oauth_token_url,
@@ -441,6 +443,21 @@ impl SettingsService for DaemonSettingsService {
                 "MCP server must set either a command (stdio) or an http transport".into(),
             ));
         }
+        // Type-safe reference check (epic #477): a server that references a
+        // service account must name an existing one, and must not also carry an
+        // inline oauth block. resolve_server_oauth returns those exact errors, so
+        // reuse it to reject a cross-wired / dangling config before persisting.
+        if let Some(http) = &config.http {
+            let path = desktop_assistant_mcp_client::config::default_config_path();
+            let accounts = desktop_assistant_mcp_client::config::load_service_accounts(&path)
+                .map_err(|e| CoreError::SystemService(e.to_string()))?;
+            desktop_assistant_mcp_client::executor::resolve_server_oauth(
+                http,
+                &accounts,
+                &config.name,
+            )
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        }
         handle
             .upsert_server(config)
             .await
@@ -461,6 +478,89 @@ impl SettingsService for DaemonSettingsService {
         let secrets = desktop_assistant_mcp_client::config::upsert_secret(&path, &id, &value)
             .map_err(|e| CoreError::SystemService(e.to_string()))?;
         handle.replace_secrets(secrets).await;
+        Ok(())
+    }
+
+    async fn list_service_accounts(&self) -> Result<Vec<ServiceAccountView>, CoreError> {
+        let config_path = desktop_assistant_mcp_client::config::default_config_path();
+        let accounts = desktop_assistant_mcp_client::config::load_service_accounts(&config_path)
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        // `authorized` = a refresh token for the account is present in secrets.
+        let secrets_path = desktop_assistant_mcp_client::config::default_secrets_path();
+        let secrets =
+            desktop_assistant_mcp_client::config::load_secrets(&secrets_path).unwrap_or_default();
+        // The client spawns this argv (detached) to sign an account in; the
+        // daemon reports it because only it knows its own binary path (mirrors
+        // the MCP-server Sign-in action). Falls back to the bare name on PATH.
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "desktop-assistant".to_string());
+        Ok(accounts
+            .into_iter()
+            .map(|a| {
+                let authorized = secrets.contains_key(&a.refresh_token_ref);
+                let configure_command =
+                    vec![exe.clone(), "--mcp-oauth-login".to_string(), a.id.clone()];
+                ServiceAccountView {
+                    id: a.id,
+                    display_name: a.display_name,
+                    client_id: a.client_id,
+                    client_secret_ref: a.client_secret_ref,
+                    authorize_url: a.authorize_url,
+                    token_url: a.token_url,
+                    account: a.account,
+                    refresh_token_ref: a.refresh_token_ref,
+                    granted_scopes: a.granted_scopes,
+                    authorized,
+                    configure_label: Some("Sign in".to_string()),
+                    configure_command,
+                }
+            })
+            .collect())
+    }
+
+    async fn upsert_service_account(&self, config_json: String) -> Result<(), CoreError> {
+        let handle = self.mcp_handle()?;
+        let account: desktop_assistant_mcp_client::executor::ServiceAccount =
+            serde_json::from_str(&config_json).map_err(|e| {
+                CoreError::SystemService(format!("invalid service account config: {e}"))
+            })?;
+        // Add-or-replace by id, then persist. save_service_accounts validates the
+        // whole set (unique/non-empty id, non-empty client_id, https urls) and
+        // fails closed, so a malformed account never lands on disk.
+        let config_path = desktop_assistant_mcp_client::config::default_config_path();
+        let mut accounts =
+            desktop_assistant_mcp_client::config::load_service_accounts(&config_path)
+                .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        match accounts.iter_mut().find(|a| a.id == account.id) {
+            Some(existing) => *existing = account,
+            None => accounts.push(account),
+        }
+        desktop_assistant_mcp_client::config::save_service_accounts(&config_path, &accounts)
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        // Push the fresh set into the live executor so a following server upsert
+        // that references it resolves without a restart.
+        handle.replace_service_accounts(accounts).await;
+        Ok(())
+    }
+
+    async fn remove_service_account(&self, id: String) -> Result<(), CoreError> {
+        let handle = self.mcp_handle()?;
+        let config_path = desktop_assistant_mcp_client::config::default_config_path();
+        let mut accounts =
+            desktop_assistant_mcp_client::config::load_service_accounts(&config_path)
+                .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        let before = accounts.len();
+        accounts.retain(|a| a.id != id);
+        if accounts.len() == before {
+            return Err(CoreError::SystemService(format!(
+                "service account '{id}' not found"
+            )));
+        }
+        desktop_assistant_mcp_client::config::save_service_accounts(&config_path, &accounts)
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        handle.replace_service_accounts(accounts).await;
         Ok(())
     }
 

@@ -280,6 +280,12 @@ pub struct McpServerStatusInfo {
     pub oauth_authorized: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth_account: Option<String>,
+    /// The id of the referenced [`ServiceAccount`], when this server resolved its
+    /// OAuth from one (epic #477). `None` for an inline oauth block. Distinct
+    /// from [`Self::oauth_account`] (the token-store key/email); this is the
+    /// config *reference* the editor round-trips.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_account_ref: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub oauth_scopes: Vec<String>,
     /// Non-secret OAuth request fields, echoed so the editor can prefill them on
@@ -789,6 +795,7 @@ impl McpControlHandle {
                 let mut auth_kind: Option<String> = None;
                 let mut oauth_authorized: Option<bool> = None;
                 let mut oauth_account: Option<String> = None;
+                let mut oauth_account_ref: Option<String> = None;
                 let mut oauth_scopes: Vec<String> = Vec::new();
                 let mut oauth_client_id: Option<String> = None;
                 let mut oauth_token_url: Option<String> = None;
@@ -846,6 +853,7 @@ impl McpControlHandle {
                         }
                         oauth_authorized = Some(authorized);
                         oauth_account = resolved.effective.account.clone();
+                        oauth_account_ref = resolved.account_id.clone();
                         oauth_scopes = resolved.required_scopes.clone();
                         oauth_client_id = Some(resolved.effective.client_id.clone());
                         oauth_token_url = Some(resolved.effective.token_url.clone());
@@ -905,6 +913,7 @@ impl McpControlHandle {
                     auth_kind,
                     oauth_authorized,
                     oauth_account,
+                    oauth_account_ref,
                     oauth_scopes,
                     oauth_client_id,
                     oauth_token_url,
@@ -2215,6 +2224,9 @@ mod tests {
         assert_eq!(s.status, "needs_auth");
         assert_eq!(s.auth_kind.as_deref(), Some("oauth"));
         assert_eq!(s.oauth_authorized, Some(false));
+        // The referenced account id is surfaced so the editor round-trips it into
+        // the account picker (distinct from the token-store `oauth_account`).
+        assert_eq!(s.oauth_account_ref.as_deref(), Some("work"));
         // Sign-in targets the *account id*, not the server name — one login
         // satisfies every server sharing it.
         assert!(s.configure_command.iter().any(|a| a == "--mcp-oauth-login"));

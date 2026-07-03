@@ -1738,6 +1738,7 @@ where
                             auth_kind: s.auth_kind,
                             oauth_authorized: s.oauth_authorized,
                             oauth_account: s.oauth_account,
+                            oauth_account_ref: s.oauth_account_ref,
                             oauth_scopes: s.oauth_scopes,
                             oauth_client_id: s.oauth_client_id,
                             oauth_token_url: s.oauth_token_url,
@@ -1802,6 +1803,7 @@ where
                             auth_kind: s.auth_kind,
                             oauth_authorized: s.oauth_authorized,
                             oauth_account: s.oauth_account,
+                            oauth_account_ref: s.oauth_account_ref,
                             oauth_scopes: s.oauth_scopes,
                             oauth_client_id: s.oauth_client_id,
                             oauth_token_url: s.oauth_token_url,
@@ -1822,6 +1824,49 @@ where
             api::Command::SetMcpSecret { id, value } => {
                 self.settings
                     .set_mcp_secret(id, value.into_inner())
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::ListServiceAccounts => {
+                let accounts = self
+                    .settings
+                    .list_service_accounts()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::ServiceAccounts(
+                    accounts
+                        .into_iter()
+                        .map(|a| api::ServiceAccountView {
+                            id: a.id,
+                            display_name: a.display_name,
+                            client_id: a.client_id,
+                            client_secret_ref: a.client_secret_ref,
+                            authorize_url: a.authorize_url,
+                            token_url: a.token_url,
+                            account: a.account,
+                            refresh_token_ref: a.refresh_token_ref,
+                            granted_scopes: a.granted_scopes,
+                            authorized: a.authorized,
+                            configure_label: a.configure_label,
+                            configure_command: a.configure_command,
+                        })
+                        .collect(),
+                ))
+            }
+
+            api::Command::UpsertServiceAccount { config_json } => {
+                self.settings
+                    .upsert_service_account(config_json)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::RemoveServiceAccount { id } => {
+                self.settings
+                    .remove_service_account(id)
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)
