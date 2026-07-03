@@ -14,6 +14,28 @@ pub mod client;
 pub mod signal;
 pub use signal::{SignalEvent, map_event_to_signal};
 
+/// A secret string that never reveals its value in `Debug` output, so it can't
+/// leak into logs when a [`Command`] carrying it is formatted (`{:?}`). Serde
+/// treats it transparently (it (de)serializes exactly like the inner `String`),
+/// so the wire form is unchanged. Used for `Command::SetMcpSecret`'s value.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl Secret {
+    /// Consume the wrapper, yielding the raw value. Call only at the point the
+    /// value is actually used (e.g. written to `secrets.toml`).
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -321,6 +343,21 @@ pub enum Command {
         action: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         server: Option<String>,
+    },
+    /// Add or replace an MCP server from a full JSON `McpServerConfig`
+    /// descriptor (transport-aware: stdio, or http with bearer/oauth). Only
+    /// secret *refs* travel in the JSON; secret *values* go via
+    /// [`Command::SetMcpSecret`]. (MCP-servers-UI epic)
+    UpsertMcpServer {
+        config_json: String,
+    },
+    /// Store one secret *value* (bearer token / OAuth client secret) into
+    /// `secrets.toml` under `id`, so a config can reference it by id without the
+    /// user hand-editing files. The value is [`Secret`]-wrapped so it can't leak
+    /// into a `Debug` log.
+    SetMcpSecret {
+        id: String,
+        value: Secret,
     },
 
     // --- Background tasks (issue #110) ------------------------------------
@@ -936,17 +973,55 @@ pub struct PersistenceSettingsView {
     pub push_on_update: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Wire form of a configured MCP server — the per-server *descriptor* the
+/// settings/KCM surface renders. Serialized to a JSON array by the D-Bus
+/// `ListMcpServersJson` method (MCP-servers-UI epic) so the config surface can
+/// grow without re-churning a typed D-Bus signature. Never carries secret
+/// *values* — only refs/kinds. `Default` lets test doubles fill only the fields
+/// they care about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerView {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub enabled: bool,
-    /// "running" | "stopped" | "disabled"
+    /// Coarse state: `disabled` | `running` | `stopped` | `needs_auth` |
+    /// `auth_expired` | `error`.
     pub status: String,
     pub tool_count: u32,
+    /// Transport: `"stdio"` or `"http"`.
+    pub transport: String,
+    /// Human-facing connection target: the command (stdio) or url (http).
+    pub target: String,
+    /// Last connection error, when the server failed to connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Label for a Configure/Sign-in button, if the server offers one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configure_label: Option<String>,
+    /// argv the client spawns (detached) to configure/sign in. Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configure_command: Vec<String>,
+    /// For http servers: `"none"` | `"bearer"` | `"oauth"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_kind: Option<String>,
+    /// For oauth servers: whether a refresh token is present in secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_authorized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oauth_scopes: Vec<String>,
+    /// Non-secret OAuth request fields, echoed so the editor can prefill them on
+    /// edit without blanking a working server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_token_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_authorize_url: Option<String>,
 }
 
 /// Wire form of the database settings (#314). Mirrors the core
@@ -2355,6 +2430,7 @@ mod tests {
             enabled: true,
             status: "running".into(),
             tool_count: 4,
+            ..Default::default()
         }]);
         let v: serde_json::Value = serde_json::to_value(&res).unwrap();
         let server = &v.get("mcp_servers").expect("mcp_servers key")[0];
@@ -2369,6 +2445,31 @@ mod tests {
         assert_eq!(server.get("namespace"), Some(&serde_json::json!("jira")));
         let back: CommandResult = serde_json::from_value(v).unwrap();
         assert_eq!(res, back);
+    }
+
+    #[test]
+    fn set_mcp_secret_redacts_value_in_debug_but_serializes_it() {
+        let cmd = Command::SetMcpSecret {
+            id: "gmail_work_token".into(),
+            value: Secret("super-secret-token".into()),
+        };
+        // Debug must never expose the value (it rides in logs/traces).
+        let dbg = format!("{cmd:?}");
+        assert!(dbg.contains("gmail_work_token"));
+        assert!(
+            !dbg.contains("super-secret-token"),
+            "debug leaked the secret: {dbg}"
+        );
+
+        // …but the wire form must carry it transparently (as a bare string) so
+        // the daemon can persist it.
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            v["set_mcp_secret"]["value"],
+            serde_json::json!("super-secret-token")
+        );
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
     }
 
     #[test]

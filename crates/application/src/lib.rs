@@ -1730,6 +1730,18 @@ where
                             enabled: s.enabled,
                             status: s.status,
                             tool_count: s.tool_count,
+                            transport: s.transport,
+                            target: s.target,
+                            detail: s.detail,
+                            configure_label: s.configure_label,
+                            configure_command: s.configure_command,
+                            auth_kind: s.auth_kind,
+                            oauth_authorized: s.oauth_authorized,
+                            oauth_account: s.oauth_account,
+                            oauth_scopes: s.oauth_scopes,
+                            oauth_client_id: s.oauth_client_id,
+                            oauth_token_url: s.oauth_token_url,
+                            oauth_authorize_url: s.oauth_authorize_url,
                         })
                         .collect(),
                 ))
@@ -1782,9 +1794,37 @@ where
                             enabled: s.enabled,
                             status: s.status,
                             tool_count: s.tool_count,
+                            transport: s.transport,
+                            target: s.target,
+                            detail: s.detail,
+                            configure_label: s.configure_label,
+                            configure_command: s.configure_command,
+                            auth_kind: s.auth_kind,
+                            oauth_authorized: s.oauth_authorized,
+                            oauth_account: s.oauth_account,
+                            oauth_scopes: s.oauth_scopes,
+                            oauth_client_id: s.oauth_client_id,
+                            oauth_token_url: s.oauth_token_url,
+                            oauth_authorize_url: s.oauth_authorize_url,
                         })
                         .collect(),
                 ))
+            }
+
+            api::Command::UpsertMcpServer { config_json } => {
+                self.settings
+                    .upsert_mcp_server(config_json)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::SetMcpSecret { id, value } => {
+                self.settings
+                    .set_mcp_secret(id, value.into_inner())
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
             }
 
             // Named connections (#11)
@@ -3740,6 +3780,7 @@ mod tests {
                     enabled,
                     status: if enabled { "running" } else { "disabled" }.to_string(),
                     tool_count: 0,
+                    ..Default::default()
                 });
             Ok(())
         }

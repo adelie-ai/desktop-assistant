@@ -57,16 +57,40 @@ pub struct DatabaseSettingsView {
 /// the same typed trait set the prompt assembler uses — no parallel schema.
 pub type PersonalitySettingsView = crate::prompts::Personality;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct McpServerView {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub namespace: Option<String>,
     pub enabled: bool,
-    /// "running" | "stopped" | "disabled"
+    /// Coarse state: `disabled` | `running` | `stopped` | `needs_auth` |
+    /// `auth_expired` | `error`. Richer than the old three-state string so the
+    /// settings UI can show an honest state and the one action that moves it
+    /// forward (MCP-servers-UI epic).
     pub status: String,
     pub tool_count: u32,
+    /// Transport: `"stdio"` or `"http"`.
+    pub transport: String,
+    /// Human-facing connection target: the command (stdio) or url (http).
+    pub target: String,
+    /// Last connection error, when the server failed to connect.
+    pub detail: Option<String>,
+    /// Label for a Configure/Sign-in button, if the server offers one.
+    pub configure_label: Option<String>,
+    /// argv the client spawns (detached) to configure/sign in. Empty = none.
+    pub configure_command: Vec<String>,
+    /// For http servers: `"none"` | `"bearer"` | `"oauth"`.
+    pub auth_kind: Option<String>,
+    /// For oauth servers: whether a refresh token is present in secrets.
+    pub oauth_authorized: Option<bool>,
+    pub oauth_account: Option<String>,
+    pub oauth_scopes: Vec<String>,
+    /// Non-secret OAuth request fields, echoed so the editor can prefill them on
+    /// edit without blanking a working server.
+    pub oauth_client_id: Option<String>,
+    pub oauth_token_url: Option<String>,
+    pub oauth_authorize_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -617,6 +641,37 @@ pub trait SettingsService: Send + Sync {
         action: String,
         server: Option<String>,
     ) -> impl std::future::Future<Output = Result<Vec<McpServerView>, CoreError>> + Send;
+
+    /// Add or replace an MCP server from a JSON `McpServerConfig`
+    /// (transport-aware). Default errors; the daemon overrides it
+    /// (MCP-servers-UI epic). Only secret *refs* are in the JSON — values are
+    /// written via [`Self::set_mcp_secret`].
+    fn upsert_mcp_server(
+        &self,
+        config_json: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        let _ = config_json;
+        async {
+            Err(CoreError::SystemService(
+                "upsert_mcp_server not supported".into(),
+            ))
+        }
+    }
+
+    /// Store one secret *value* into `secrets.toml` under `id`. Default errors;
+    /// the daemon overrides it (MCP-servers-UI epic).
+    fn set_mcp_secret(
+        &self,
+        id: String,
+        value: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        let _ = (id, value);
+        async {
+            Err(CoreError::SystemService(
+                "set_mcp_secret not supported".into(),
+            ))
+        }
+    }
 
     fn get_ws_auth_settings(
         &self,

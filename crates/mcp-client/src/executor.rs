@@ -103,7 +103,9 @@ pub struct McpServerConfig {
     pub http: Option<HttpTransportConfig>,
 }
 
-/// Status information for an MCP server.
+/// Status information for an MCP server — the per-server *descriptor* the
+/// settings/KCM surface renders. Richer than the old flat status string so the
+/// UI can show an honest state and the one action that moves it forward.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServerStatusInfo {
     pub name: String,
@@ -115,8 +117,53 @@ pub struct McpServerStatusInfo {
     /// round-trips through the settings surface (#314).
     pub namespace: Option<String>,
     pub enabled: bool,
+    /// Coarse state: `disabled` | `running` | `stopped` | `needs_auth` |
+    /// `auth_expired` | `error`. `stopped` = enabled but not connected with no
+    /// captured error; `error`/`auth_expired` = a connect attempt failed.
     pub status: String,
     pub tool_count: u32,
+    /// Transport: `"stdio"` or `"http"`.
+    pub transport: String,
+    /// Human-facing connection target: the command (stdio) or url (http).
+    pub target: String,
+    /// Last connection error, when the server failed to connect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Label for a Configure/Sign-in button, if the server offers one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configure_label: Option<String>,
+    /// argv the client spawns (detached) to configure/sign in. Empty = none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub configure_command: Vec<String>,
+    /// For http servers: `"none"` | `"bearer"` | `"oauth"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_kind: Option<String>,
+    /// For oauth servers: whether a refresh token is present in secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_authorized: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_account: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub oauth_scopes: Vec<String>,
+    /// Non-secret OAuth request fields, echoed so the editor can prefill them on
+    /// edit (otherwise a re-save would blank a working server). Secret *values*
+    /// are still never included — only these public config fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_token_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_authorize_url: Option<String>,
+}
+
+/// A captured connection failure, kept per server name so `status()` can report
+/// an honest `error`/`auth_expired` state with detail instead of a blank
+/// `stopped`. `auth_expired` distinguishes a revoked/expired OAuth refresh token
+/// (needs re-login) from a generic connect failure.
+#[derive(Debug, Clone)]
+struct ConnectError {
+    message: String,
+    auth_expired: bool,
 }
 
 /// A connected MCP server: the client behind its own lock plus a lock-free
@@ -158,8 +205,12 @@ pub struct McpExecutorState {
     cached_prompts: Mutex<Vec<serde_json::Value>>,
     /// Path to the MCP config file (for persisting changes).
     config_path: PathBuf,
-    /// Secrets loaded from secrets.toml, keyed by secret ID.
-    secrets: HashMap<String, String>,
+    /// Secrets loaded from secrets.toml, keyed by secret ID. Behind a
+    /// `std::sync::RwLock` (not the tokio one) so the sync resolve paths can
+    /// read it without `.await`, and the settings surface can swap in a fresh
+    /// snapshot via [`McpControlHandle::replace_secrets`] after a token is
+    /// minted out-of-band (the `--mcp-oauth-login` flow) or a secret is set.
+    secrets: std::sync::RwLock<HashMap<String, String>>,
     /// Backend for persisting OAuth tokens across restarts (issue #455). The
     /// executor is deliberately agnostic about *where* tokens live: it holds a
     /// [`TokenStore`] trait object, defaulting to an in-memory store, so the
@@ -167,6 +218,10 @@ pub struct McpExecutorState {
     /// without any change here. Shared across all OAuth servers, keyed by
     /// account, so services for one account can share a cached token.
     token_store: Arc<dyn TokenStore>,
+    /// Last connection failure per server *name* (stable across add/remove,
+    /// unlike the index). Set when a connect attempt fails, cleared on success;
+    /// read by `status()` to report `error`/`auth_expired` with detail.
+    last_errors: Mutex<HashMap<String, ConnectError>>,
 }
 
 impl McpExecutorState {
@@ -175,8 +230,9 @@ impl McpExecutorState {
     /// Secret references override plaintext if both set the same var.
     fn resolve_env(&self, config: &McpServerConfig) -> Result<HashMap<String, String>, McpError> {
         let mut env = config.env.clone();
+        let secrets = self.secrets.read().expect("secrets lock poisoned");
         for (var_name, secret_id) in &config.env_secrets {
-            let value = self.secrets.get(secret_id).ok_or_else(|| {
+            let value = secrets.get(secret_id).ok_or_else(|| {
                 McpError::UnexpectedResponse(format!(
                     "secret '{}' (referenced by env_secrets.{} in server '{}') not found in secrets.toml",
                     secret_id, var_name, config.name
@@ -195,11 +251,16 @@ impl McpExecutorState {
         server_name: &str,
         field: &str,
     ) -> Result<String, McpError> {
-        self.secrets.get(secret_id).cloned().ok_or_else(|| {
-            McpError::UnexpectedResponse(format!(
-                "secret '{secret_id}' (referenced by {field} in server '{server_name}') not found in secrets.toml"
-            ))
-        })
+        self.secrets
+            .read()
+            .expect("secrets lock poisoned")
+            .get(secret_id)
+            .cloned()
+            .ok_or_else(|| {
+                McpError::UnexpectedResponse(format!(
+                    "secret '{secret_id}' (referenced by {field} in server '{server_name}') not found in secrets.toml"
+                ))
+            })
     }
 
     /// Resolve the bearer token for an HTTP transport from secrets.toml, if the
@@ -435,6 +496,22 @@ impl McpExecutorState {
     }
 
     /// Connect a single server by index.
+    /// Record a connection failure for `name` so `status()` can report it.
+    async fn record_connect_error(&self, name: &str, err: &McpError) {
+        self.last_errors.lock().await.insert(
+            name.to_string(),
+            ConnectError {
+                message: err.to_string(),
+                auth_expired: is_auth_expired(err),
+            },
+        );
+    }
+
+    /// Clear any recorded connection failure for `name` (on a successful connect).
+    async fn clear_connect_error(&self, name: &str) {
+        self.last_errors.lock().await.remove(name);
+    }
+
     async fn connect_server(&self, idx: usize) -> Result<(), McpError> {
         let configs = self.configs.read().await;
         let config = configs.get(idx).ok_or_else(|| {
@@ -449,12 +526,16 @@ impl McpExecutorState {
 
         match self.connect_client(config).await {
             Ok(client) => {
-                let mut clients = self.clients.write().await;
-                clients[idx] = Some(ClientHandle::new(client));
+                {
+                    let mut clients = self.clients.write().await;
+                    clients[idx] = Some(ClientHandle::new(client));
+                }
+                self.clear_connect_error(&config.name).await;
                 Ok(())
             }
             Err(e) => {
                 tracing::error!("failed to connect to MCP server '{}': {e}", config.name);
+                self.record_connect_error(&config.name, &e).await;
                 Err(e)
             }
         }
@@ -493,6 +574,13 @@ impl McpControlHandle {
         let configs = self.state.configs.read().await;
         let clients = self.state.clients.read().await;
         let routing = self.state.tool_routing.lock().await;
+        let last_errors = self.state.last_errors.lock().await;
+        // Absolute path to this binary, for the OAuth "Sign in" launch command
+        // the client spawns; fall back to the bare name (assumed on PATH).
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "desktop-assistant".to_string());
 
         let indices: Vec<usize> = if let Some(name) = server {
             configs
@@ -514,12 +602,74 @@ impl McpControlHandle {
                     .filter(|(server_idx, _)| *server_idx == idx)
                     .count() as u32;
 
+                // Transport + auth summary — never includes secret *values*.
+                let (transport, target) = match &config.http {
+                    Some(http) => ("http", http.url.clone()),
+                    None => ("stdio", config.command.clone()),
+                };
+                let oauth = config.http.as_ref().and_then(|h| h.oauth.as_ref());
+                let (auth_kind, oauth_authorized, oauth_account, oauth_scopes) = match &config.http
+                {
+                    None => (None, None, None, Vec::new()),
+                    Some(http) => match &http.oauth {
+                        Some(o) => {
+                            let authorized = self
+                                .state
+                                .secrets
+                                .read()
+                                .expect("secrets lock poisoned")
+                                .contains_key(&o.refresh_token_ref);
+                            (
+                                Some("oauth".to_string()),
+                                Some(authorized),
+                                o.account.clone(),
+                                o.scopes.clone(),
+                            )
+                        }
+                        None => {
+                            let kind = if http.auth_bearer_secret.is_some() {
+                                "bearer"
+                            } else {
+                                "none"
+                            };
+                            (Some(kind.to_string()), None, None, Vec::new())
+                        }
+                    },
+                };
+
+                let needs_auth = oauth.is_some() && oauth_authorized == Some(false);
+                let recorded = last_errors.get(&config.name);
+
                 let status = if !config.enabled {
                     "disabled"
                 } else if connected {
                     "running"
+                } else if needs_auth {
+                    "needs_auth"
+                } else if let Some(err) = recorded {
+                    if err.auth_expired {
+                        "auth_expired"
+                    } else {
+                        "error"
+                    }
                 } else {
                     "stopped"
+                };
+
+                // OAuth servers get a "Sign in" action; the client spawns the
+                // daemon's own login command (detached). Phase 2 fills stdio
+                // `--config-ui` here.
+                let (configure_label, configure_command) = if oauth.is_some() {
+                    (
+                        Some("Sign in".to_string()),
+                        vec![
+                            exe.clone(),
+                            "--mcp-oauth-login".to_string(),
+                            config.name.clone(),
+                        ],
+                    )
+                } else {
+                    (None, Vec::new())
                 };
 
                 Some(McpServerStatusInfo {
@@ -530,6 +680,18 @@ impl McpControlHandle {
                     enabled: config.enabled,
                     status: status.to_string(),
                     tool_count,
+                    transport: transport.to_string(),
+                    target,
+                    detail: recorded.map(|e| e.message.clone()),
+                    configure_label,
+                    configure_command,
+                    auth_kind,
+                    oauth_authorized,
+                    oauth_account,
+                    oauth_scopes,
+                    oauth_client_id: oauth.map(|o| o.client_id.clone()),
+                    oauth_token_url: oauth.map(|o| o.token_url.clone()),
+                    oauth_authorize_url: oauth.and_then(|o| o.authorize_url.clone()),
                 })
             })
             .collect()
@@ -639,6 +801,60 @@ impl McpControlHandle {
         }
 
         Ok(())
+    }
+
+    /// Add a server, or replace an existing one with the same name. This is the
+    /// settings-UI write path (transport-aware: stdio or http+bearer/oauth).
+    /// Unlike [`Self::add_server`] (which errors on a duplicate), it disconnects
+    /// any live client for that name, swaps in the new config, persists, and
+    /// reconnects when the new config is enabled.
+    pub async fn upsert_server(&self, config: McpServerConfig) -> Result<(), McpError> {
+        match self.state.find_server_index(&config.name).await {
+            Some(idx) => {
+                // Replace in place: stop the old client, swap config, persist,
+                // then reconnect if enabled. The connect-error for this name is
+                // cleared so a fixed config doesn't keep showing a stale failure.
+                self.state.disconnect_server(idx).await;
+                self.state.clear_connect_error(&config.name).await;
+                let auto_start = config.enabled;
+                {
+                    let mut configs = self.state.configs.write().await;
+                    configs[idx] = config;
+                }
+                self.persist_configs().await?;
+                if auto_start {
+                    let _ = self.state.connect_server(idx).await;
+                }
+                let _ = self.state.refresh_all_metadata().await;
+                Ok(())
+            }
+            None => self.add_server(config).await,
+        }
+    }
+
+    /// Swap in a fresh secrets snapshot (e.g. after `set_mcp_secret` writes
+    /// `secrets.toml`, or a reload before a status read). Clears the stale
+    /// connect error for any OAuth server whose bootstrap refresh token *just
+    /// appeared*, so a freshly signed-in server reads as authorized/`stopped`
+    /// rather than a stale `auth_expired`/`error`.
+    pub async fn replace_secrets(&self, secrets: HashMap<String, String>) {
+        let newly_authorized: Vec<String> = {
+            let configs = self.state.configs.read().await;
+            let old = self.state.secrets.read().expect("secrets lock poisoned");
+            configs
+                .iter()
+                .filter_map(|c| {
+                    let o = c.http.as_ref()?.oauth.as_ref()?;
+                    (!old.contains_key(&o.refresh_token_ref)
+                        && secrets.contains_key(&o.refresh_token_ref))
+                    .then(|| c.name.clone())
+                })
+                .collect()
+        };
+        *self.state.secrets.write().expect("secrets lock poisoned") = secrets;
+        for name in &newly_authorized {
+            self.state.clear_connect_error(name).await;
+        }
     }
 
     /// Remove a server by name: auto-stop, remove config, persist.
@@ -752,8 +968,9 @@ impl McpToolExecutor {
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
-                secrets: HashMap::new(),
+                secrets: std::sync::RwLock::new(HashMap::new()),
                 token_store: Arc::new(InMemoryTokenStore::default()),
+                last_errors: Mutex::new(HashMap::new()),
             }),
             builtin_tools,
         }
@@ -797,8 +1014,9 @@ impl McpToolExecutor {
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
-                secrets,
+                secrets: std::sync::RwLock::new(secrets),
                 token_store,
+                last_errors: Mutex::new(HashMap::new()),
             }),
             builtin_tools,
         }
@@ -840,9 +1058,11 @@ impl McpToolExecutor {
                 match self.state.connect_client(config).await {
                     Ok(client) => {
                         clients[idx] = Some(ClientHandle::new(client));
+                        self.state.clear_connect_error(&config.name).await;
                     }
                     Err(e) => {
                         tracing::error!("failed to connect to MCP server '{}': {e}", config.name);
+                        self.state.record_connect_error(&config.name, &e).await;
                     }
                 }
             }
@@ -1070,6 +1290,17 @@ fn is_method_not_found(error: &McpError) -> bool {
     matches!(error, McpError::ServerError { code: -32601, .. })
 }
 
+/// True if a connect failure was an expired/revoked OAuth refresh token — the
+/// one failure that maps to `auth_expired` ("re-run the login") rather than a
+/// generic `error`. An OAuth server's initialize handshake makes a real token
+/// call, so `invalid_grant` surfaces here as a connect error.
+fn is_auth_expired(error: &McpError) -> bool {
+    matches!(
+        error,
+        McpError::OAuth(crate::oauth::OAuthError::InvalidGrant(_))
+    )
+}
+
 /// Human-facing connection target for logs: the HTTP url when configured,
 /// otherwise the stdio command.
 fn connect_target(config: &McpServerConfig) -> &str {
@@ -1237,6 +1468,133 @@ mod tests {
         assert!(!status[1].enabled);
     }
 
+    fn oauth_server(name: &str, refresh_ref: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: String::new(),
+            args: vec![],
+            namespace: None,
+            enabled: true,
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: Some(HttpTransportConfig {
+                url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
+                auth_bearer_secret: None,
+                oauth: Some(OAuthServerConfig {
+                    client_id: "cid".into(),
+                    token_url: "https://oauth2.googleapis.com/token".into(),
+                    refresh_token_ref: refresh_ref.into(),
+                    client_secret_ref: None,
+                    authorize_url: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
+                    scopes: vec!["https://www.googleapis.com/auth/calendar".into()],
+                    account: Some("dave@spadea.tech".into()),
+                    refresh_skew_seconds: None,
+                }),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_handle_status_reports_rich_states() {
+        let stdio = |name: &str, enabled: bool| McpServerConfig {
+            name: name.into(),
+            command: "some-mcp".into(),
+            args: vec![],
+            namespace: None,
+            enabled,
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: None,
+        };
+        let configs = vec![
+            oauth_server("authless", "missing_refresh"), // no secret -> needs_auth
+            oauth_server("expired", "present_refresh"), // secret present + invalid_grant -> auth_expired
+            stdio("broken", true),                      // recorded generic error -> error
+            stdio("idle", true),                        // stopped
+            stdio("off", false),                        // disabled
+        ];
+        let mut secrets = HashMap::new();
+        secrets.insert("present_refresh".to_string(), "rt".to_string());
+        let executor = McpToolExecutor::with_builtin_tools_config_and_token_store(
+            configs,
+            BuiltinToolService::new(),
+            std::path::PathBuf::new(),
+            secrets,
+            std::sync::Arc::new(crate::oauth::InMemoryTokenStore::default()),
+        );
+        executor
+            .state
+            .record_connect_error(
+                "expired",
+                &McpError::OAuth(crate::oauth::OAuthError::InvalidGrant("revoked".into())),
+            )
+            .await;
+        executor
+            .state
+            .record_connect_error("broken", &McpError::Http("connection refused".into()))
+            .await;
+
+        let status = executor.control_handle().status(None).await;
+        let by_name: HashMap<_, _> = status.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        // OAuth server, no refresh token yet -> needs_auth + a Sign in action.
+        let authless = by_name["authless"];
+        assert_eq!(authless.status, "needs_auth");
+        assert_eq!(authless.oauth_authorized, Some(false));
+        assert_eq!(authless.auth_kind.as_deref(), Some("oauth"));
+        assert_eq!(authless.transport, "http");
+        assert_eq!(authless.configure_label.as_deref(), Some("Sign in"));
+        assert!(
+            authless
+                .configure_command
+                .iter()
+                .any(|a| a == "--mcp-oauth-login")
+        );
+        assert!(authless.configure_command.iter().any(|a| a == "authless"));
+        // Non-secret OAuth request fields are echoed so an edit can prefill them.
+        assert_eq!(authless.oauth_client_id.as_deref(), Some("cid"));
+        assert_eq!(
+            authless.oauth_token_url.as_deref(),
+            Some("https://oauth2.googleapis.com/token")
+        );
+        assert_eq!(
+            authless.oauth_authorize_url.as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth")
+        );
+
+        // OAuth server, token present but the refresh was rejected -> auth_expired.
+        let expired = by_name["expired"];
+        assert_eq!(expired.status, "auth_expired");
+        assert_eq!(expired.oauth_authorized, Some(true));
+        assert!(
+            expired
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("refresh token is no longer valid"),
+            "detail: {:?}",
+            expired.detail
+        );
+
+        // stdio server with a recorded connect failure -> error, no action.
+        let broken = by_name["broken"];
+        assert_eq!(broken.status, "error");
+        assert_eq!(broken.transport, "stdio");
+        assert!(broken.configure_label.is_none());
+        assert!(broken.auth_kind.is_none());
+        assert!(
+            broken
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("connection refused")
+        );
+
+        assert_eq!(by_name["idle"].status, "stopped");
+        assert!(by_name["idle"].detail.is_none());
+        assert_eq!(by_name["off"].status, "disabled");
+    }
+
     #[tokio::test]
     async fn control_handle_status_carries_command_args_namespace() {
         // #314 MCP CRUD round-trip: `status()` must surface the full config
@@ -1284,6 +1642,91 @@ mod tests {
 
         let empty = handle.status(Some("nonexistent")).await;
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_server_adds_then_replaces_by_name() {
+        let dir = std::env::temp_dir().join("mcp_upsert_server_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let executor = McpToolExecutor::with_builtin_tools_and_config_path(
+            vec![],
+            BuiltinToolService::new(),
+            path.clone(),
+            HashMap::new(),
+        );
+        let handle = executor.control_handle();
+
+        let disabled_stdio = |command: &str| McpServerConfig {
+            name: "weather".into(),
+            command: command.into(),
+            args: vec!["--v1".into()],
+            namespace: None,
+            enabled: false, // disabled: no connect attempt, no child spawn
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: None,
+        };
+
+        // Absent -> added.
+        handle
+            .upsert_server(disabled_stdio("weather-mcp-v1"))
+            .await
+            .unwrap();
+        let status = handle.status(None).await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].command, "weather-mcp-v1");
+
+        // Same name -> replaced in place (not a second entry).
+        handle
+            .upsert_server(disabled_stdio("weather-mcp-v2"))
+            .await
+            .unwrap();
+        let status = handle.status(None).await;
+        assert_eq!(status.len(), 1, "upsert must replace, not duplicate");
+        assert_eq!(status[0].command, "weather-mcp-v2");
+
+        // Persisted to TOML so it survives a restart.
+        let on_disk = crate::config::load_mcp_configs(&path).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].command, "weather-mcp-v2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn replace_secrets_flips_authorized_and_clears_stale_error() {
+        let executor = McpToolExecutor::with_builtin_tools_config_and_token_store(
+            vec![oauth_server("cal", "cal_refresh")],
+            BuiltinToolService::new(),
+            std::path::PathBuf::new(),
+            HashMap::new(),
+            std::sync::Arc::new(crate::oauth::InMemoryTokenStore::default()),
+        );
+        // Simulate a prior failed connect (no token yet).
+        executor
+            .state
+            .record_connect_error("cal", &McpError::Http("connection refused".into()))
+            .await;
+        let handle = executor.control_handle();
+
+        // No token yet: needs_auth, unauthorized.
+        let before = handle.status(Some("cal")).await;
+        assert_eq!(before[0].status, "needs_auth");
+        assert_eq!(before[0].oauth_authorized, Some(false));
+
+        // Token appears out-of-band (the sign-in flow) -> reload the snapshot.
+        let mut secrets = HashMap::new();
+        secrets.insert("cal_refresh".to_string(), "rt-value".to_string());
+        handle.replace_secrets(secrets).await;
+
+        let after = handle.status(Some("cal")).await;
+        assert_eq!(after[0].oauth_authorized, Some(true));
+        // Stale error was cleared, so it reads as stopped (authorized, not yet
+        // connected) rather than a leftover `error`.
+        assert_eq!(after[0].status, "stopped");
+        assert!(after[0].detail.is_none());
     }
 
     #[tokio::test]
