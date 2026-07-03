@@ -693,6 +693,8 @@ scopes = [
                     account: Some("dave@example.com".into()),
                     refresh_skew_seconds: Some(120),
                 }),
+                oauth_account: None,
+                scopes: vec![],
             }),
         }];
 
@@ -743,6 +745,8 @@ scopes = [
                     url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
                     auth_bearer_secret: Some("google_work_token".into()),
                     oauth: None,
+                    oauth_account: None,
+                    scopes: vec![],
                 }),
             },
         ];

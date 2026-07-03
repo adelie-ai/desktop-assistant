@@ -38,6 +38,19 @@ pub struct HttpTransportConfig {
     /// (and on `401`). Takes precedence over [`Self::auth_bearer_secret`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthServerConfig>,
+    /// Reference to a reusable [`ServiceAccount`] by `id` (epic #477).
+    /// **Mutually exclusive** with the inline [`Self::oauth`] block — set one or
+    /// the other. When set, the account supplies the OAuth client identity +
+    /// refresh token, and this server contributes only `url`, [`Self::scopes`],
+    /// and the server-level `namespace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_account: Option<String>,
+    /// Required OAuth scopes for this server when it authenticates via
+    /// [`Self::oauth_account`]. Checked against the account's *granted* scopes
+    /// for coverage, and unioned across servers at sign-in. Ignored for inline
+    /// [`Self::oauth`] (which carries its own scopes) or bearer auth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
 }
 
 /// OAuth 2.0 settings for a remote MCP server (issue #455 follow-up).
@@ -118,6 +131,84 @@ pub struct ServiceAccount {
     /// server's *required* scopes are checked against these for coverage (#479).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub granted_scopes: Vec<String>,
+}
+
+/// A server's OAuth configuration after resolving any [`ServiceAccount`]
+/// reference — the single shape the connect/status paths consume regardless of
+/// whether the server carried an inline `oauth` block or pointed at an account.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedOAuth {
+    /// Effective config feeding the token provider / connect + login paths.
+    pub effective: OAuthServerConfig,
+    /// Scopes this server needs granted to function (for coverage checks).
+    pub required_scopes: Vec<String>,
+    /// Scopes currently granted. For an account, its `granted_scopes`; for an
+    /// inline block, its own `scopes` (requested == granted by construction, so
+    /// inline servers never regress into a coverage `needs_auth`).
+    pub granted_scopes: Vec<String>,
+    /// Id of the referenced service account, when resolved from one. Drives the
+    /// per-account "Sign in" command; `None` for an inline oauth block.
+    pub account_id: Option<String>,
+}
+
+/// Resolve a server's effective OAuth config from either its inline `oauth`
+/// block (back-compat) or a referenced [`ServiceAccount`]. Returns `Ok(None)`
+/// for a non-OAuth HTTP server (bearer or unauthenticated).
+///
+/// Fails closed with a clear [`McpError::InvalidConfig`] when the server both
+/// sets an inline block **and** references an account (ambiguous), or points at
+/// an account id that doesn't exist.
+pub fn resolve_server_oauth(
+    http: &HttpTransportConfig,
+    accounts: &[ServiceAccount],
+    server_name: &str,
+) -> Result<Option<ResolvedOAuth>, McpError> {
+    match (&http.oauth, &http.oauth_account) {
+        (Some(_), Some(account_id)) => Err(McpError::InvalidConfig(format!(
+            "server '{server_name}' sets both an inline [http.oauth] block and \
+             oauth_account = '{account_id}'; use exactly one"
+        ))),
+        (Some(inline), None) => Ok(Some(ResolvedOAuth {
+            effective: inline.clone(),
+            required_scopes: inline.scopes.clone(),
+            granted_scopes: inline.scopes.clone(),
+            account_id: None,
+        })),
+        (None, Some(account_id)) => {
+            let acct = accounts
+                .iter()
+                .find(|a| &a.id == account_id)
+                .ok_or_else(|| {
+                    McpError::InvalidConfig(format!(
+                        "server '{server_name}' references unknown service account '{account_id}'"
+                    ))
+                })?;
+            let effective = OAuthServerConfig {
+                client_id: acct.client_id.clone(),
+                token_url: acct.token_url.clone(),
+                refresh_token_ref: acct.refresh_token_ref.clone(),
+                client_secret_ref: acct.client_secret_ref.clone(),
+                authorize_url: Some(acct.authorize_url.clone()),
+                scopes: http.scopes.clone(),
+                // Share minted tokens across every server for this account:
+                // key by the account email when known, else the account id.
+                account: acct.account.clone().or_else(|| Some(acct.id.clone())),
+                refresh_skew_seconds: None,
+            };
+            Ok(Some(ResolvedOAuth {
+                effective,
+                required_scopes: http.scopes.clone(),
+                granted_scopes: acct.granted_scopes.clone(),
+                account_id: Some(acct.id.clone()),
+            }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// True when every `required` scope is present in `granted`.
+pub fn scopes_covered(required: &[String], granted: &[String]) -> bool {
+    required.iter().all(|s| granted.contains(s))
 }
 
 /// Configuration for an MCP server.
@@ -257,6 +348,12 @@ pub struct McpExecutorState {
     /// snapshot via [`McpControlHandle::replace_secrets`] after a token is
     /// minted out-of-band (the `--mcp-oauth-login` flow) or a secret is set.
     secrets: std::sync::RwLock<HashMap<String, String>>,
+    /// Reusable outbound OAuth **service accounts** (epic #477), the credentials
+    /// an HTTP server may reference by id via `http.oauth_account`. Behind a sync
+    /// `RwLock` like [`Self::secrets`] so the resolve paths read it without
+    /// `.await`, and the settings surface can swap in a fresh snapshot (e.g. when
+    /// a per-account sign-in records new `granted_scopes`) without a restart.
+    service_accounts: std::sync::RwLock<Vec<ServiceAccount>>,
     /// Backend for persisting OAuth tokens across restarts (issue #455). The
     /// executor is deliberately agnostic about *where* tokens live: it holds a
     /// [`TokenStore`] trait object, defaulting to an in-memory store, so the
@@ -372,16 +469,30 @@ impl McpExecutorState {
     async fn connect_client(&self, config: &McpServerConfig) -> Result<McpClient, McpError> {
         match &config.http {
             #[cfg(feature = "http")]
-            Some(http) => match &http.oauth {
-                Some(oauth) => {
-                    let provider = self.build_token_provider(oauth, &config.name)?;
-                    McpClient::connect_http_oauth(&http.url, Arc::new(provider)).await
+            Some(http) => {
+                // Resolve any service-account reference into an effective OAuth
+                // config. Clone the account snapshot and finish resolving before
+                // any `.await` so the std `RwLock` guard never crosses a suspend.
+                let resolved = {
+                    let accounts = self
+                        .service_accounts
+                        .read()
+                        .expect("service_accounts lock poisoned")
+                        .clone();
+                    resolve_server_oauth(http, &accounts, &config.name)?
+                };
+                match resolved {
+                    Some(resolved) => {
+                        let provider =
+                            self.build_token_provider(&resolved.effective, &config.name)?;
+                        McpClient::connect_http_oauth(&http.url, Arc::new(provider)).await
+                    }
+                    None => {
+                        let bearer = self.resolve_bearer(http, &config.name)?;
+                        McpClient::connect_http(&http.url, bearer).await
+                    }
                 }
-                None => {
-                    let bearer = self.resolve_bearer(http, &config.name)?;
-                    McpClient::connect_http(&http.url, bearer).await
-                }
-            },
+            }
             _ => {
                 let env = self.resolve_env(config)?;
                 McpClient::connect(&config.command, &config.args, &env).await
@@ -633,6 +744,14 @@ impl McpControlHandle {
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "desktop-assistant".to_string());
+        // Snapshot the service accounts once so each server's OAuth config can be
+        // resolved (inline block or account reference) inside the loop below.
+        let accounts = self
+            .state
+            .service_accounts
+            .read()
+            .expect("service_accounts lock poisoned")
+            .clone();
 
         let indices: Vec<usize> = if let Some(name) = server {
             configs
@@ -659,43 +778,99 @@ impl McpControlHandle {
                     Some(http) => ("http", http.url.clone()),
                     None => ("stdio", config.command.clone()),
                 };
-                let oauth = config.http.as_ref().and_then(|h| h.oauth.as_ref());
-                let (auth_kind, oauth_authorized, oauth_account, oauth_scopes) = match &config.http
-                {
-                    None => (None, None, None, Vec::new()),
-                    Some(http) => match &http.oauth {
-                        Some(o) => {
-                            let authorized = self
-                                .state
-                                .secrets
-                                .read()
-                                .expect("secrets lock poisoned")
-                                .contains_key(&o.refresh_token_ref);
-                            (
-                                Some("oauth".to_string()),
-                                Some(authorized),
-                                o.account.clone(),
-                                o.scopes.clone(),
-                            )
-                        }
-                        None => {
-                            let kind = if http.auth_bearer_secret.is_some() {
+                // Resolve the effective OAuth config (inline block or referenced
+                // service account). A *config* error (both set / missing account)
+                // is surfaced honestly as an `error` state rather than hidden.
+                let resolved = config
+                    .http
+                    .as_ref()
+                    .map(|http| resolve_server_oauth(http, &accounts, &config.name));
+
+                let mut auth_kind: Option<String> = None;
+                let mut oauth_authorized: Option<bool> = None;
+                let mut oauth_account: Option<String> = None;
+                let mut oauth_scopes: Vec<String> = Vec::new();
+                let mut oauth_client_id: Option<String> = None;
+                let mut oauth_token_url: Option<String> = None;
+                let mut oauth_authorize_url: Option<String> = None;
+                let mut configure_label: Option<String> = None;
+                let mut configure_command: Vec<String> = Vec::new();
+                let mut needs_auth = false;
+                let mut config_error: Option<String> = None;
+                let mut coverage_detail: Option<String> = None;
+
+                match resolved {
+                    None => {} // stdio
+                    Some(Err(e)) => {
+                        // Misconfigured OAuth server (both set / missing account);
+                        // no Sign-in button — signing in can't fix a bad config.
+                        auth_kind = Some("oauth".to_string());
+                        config_error = Some(e.to_string());
+                    }
+                    Some(Ok(None)) => {
+                        // HTTP without OAuth: static bearer or unauthenticated.
+                        let http = config.http.as_ref().expect("http present when resolve ran");
+                        auth_kind = Some(
+                            if http.auth_bearer_secret.is_some() {
                                 "bearer"
                             } else {
                                 "none"
-                            };
-                            (Some(kind.to_string()), None, None, Vec::new())
+                            }
+                            .to_string(),
+                        );
+                    }
+                    Some(Ok(Some(resolved))) => {
+                        auth_kind = Some("oauth".to_string());
+                        let authorized = self
+                            .state
+                            .secrets
+                            .read()
+                            .expect("secrets lock poisoned")
+                            .contains_key(&resolved.effective.refresh_token_ref);
+                        let covered =
+                            scopes_covered(&resolved.required_scopes, &resolved.granted_scopes);
+                        needs_auth = !authorized || !covered;
+                        // Authorized but the account hasn't been granted every
+                        // scope this server needs → prompt a re-authorize.
+                        if authorized && !covered {
+                            let missing: Vec<&str> = resolved
+                                .required_scopes
+                                .iter()
+                                .filter(|s| !resolved.granted_scopes.contains(s))
+                                .map(|s| s.as_str())
+                                .collect();
+                            coverage_detail = Some(format!(
+                                "service account not authorized for required scope(s): {}",
+                                missing.join(", ")
+                            ));
                         }
-                    },
-                };
+                        oauth_authorized = Some(authorized);
+                        oauth_account = resolved.effective.account.clone();
+                        oauth_scopes = resolved.required_scopes.clone();
+                        oauth_client_id = Some(resolved.effective.client_id.clone());
+                        oauth_token_url = Some(resolved.effective.token_url.clone());
+                        oauth_authorize_url = resolved.effective.authorize_url.clone();
+                        // Sign-in is per *account* when resolved from one (one
+                        // login satisfies every server sharing it), else per
+                        // server (inline oauth). Phase 2 fills stdio here.
+                        let login_target = resolved
+                            .account_id
+                            .clone()
+                            .unwrap_or_else(|| config.name.clone());
+                        configure_label = Some("Sign in".to_string());
+                        configure_command =
+                            vec![exe.clone(), "--mcp-oauth-login".to_string(), login_target];
+                    }
+                }
 
-                let needs_auth = oauth.is_some() && oauth_authorized == Some(false);
                 let recorded = last_errors.get(&config.name);
 
                 let status = if !config.enabled {
                     "disabled"
                 } else if connected {
                     "running"
+                } else if config_error.is_some() {
+                    "error"
                 } else if needs_auth {
                     "needs_auth"
                 } else if let Some(err) = recorded {
@@ -708,21 +883,11 @@ impl McpControlHandle {
                     "stopped"
                 };
 
-                // OAuth servers get a "Sign in" action; the client spawns the
-                // daemon's own login command (detached). Phase 2 fills stdio
-                // `--config-ui` here.
-                let (configure_label, configure_command) = if oauth.is_some() {
-                    (
-                        Some("Sign in".to_string()),
-                        vec![
-                            exe.clone(),
-                            "--mcp-oauth-login".to_string(),
-                            config.name.clone(),
-                        ],
-                    )
-                } else {
-                    (None, Vec::new())
-                };
+                // Detail precedence: a config error, then a recorded connect
+                // failure, then a scope-coverage gap.
+                let detail = config_error
+                    .or_else(|| recorded.map(|e| e.message.clone()))
+                    .or(coverage_detail);
 
                 Some(McpServerStatusInfo {
                     name: config.name.clone(),
@@ -734,16 +899,16 @@ impl McpControlHandle {
                     tool_count,
                     transport: transport.to_string(),
                     target,
-                    detail: recorded.map(|e| e.message.clone()),
+                    detail,
                     configure_label,
                     configure_command,
                     auth_kind,
                     oauth_authorized,
                     oauth_account,
                     oauth_scopes,
-                    oauth_client_id: oauth.map(|o| o.client_id.clone()),
-                    oauth_token_url: oauth.map(|o| o.token_url.clone()),
-                    oauth_authorize_url: oauth.and_then(|o| o.authorize_url.clone()),
+                    oauth_client_id,
+                    oauth_token_url,
+                    oauth_authorize_url,
                 })
             })
             .collect()
@@ -909,6 +1074,18 @@ impl McpControlHandle {
         }
     }
 
+    /// Swap in a fresh service-account snapshot (e.g. after a per-account sign-in
+    /// records new `granted_scopes` in `mcp_servers.toml`, or a reload before a
+    /// status read). Runs in a *separate* process, so the live daemon otherwise
+    /// wouldn't see the new grants until restart.
+    pub async fn replace_service_accounts(&self, accounts: Vec<ServiceAccount>) {
+        *self
+            .state
+            .service_accounts
+            .write()
+            .expect("service_accounts lock poisoned") = accounts;
+    }
+
     /// Remove a server by name: auto-stop, remove config, persist.
     pub async fn remove_server(&self, name: &str) -> Result<(), McpError> {
         let idx =
@@ -1021,6 +1198,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
                 secrets: std::sync::RwLock::new(HashMap::new()),
+                service_accounts: std::sync::RwLock::new(Vec::new()),
                 #[cfg(feature = "http")]
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
@@ -1046,6 +1224,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
                 secrets: std::sync::RwLock::new(secrets),
+                service_accounts: std::sync::RwLock::new(Vec::new()),
                 #[cfg(feature = "http")]
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
@@ -1079,6 +1258,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
                 secrets: std::sync::RwLock::new(secrets),
+                service_accounts: std::sync::RwLock::new(Vec::new()),
                 token_store,
                 last_errors: Mutex::new(HashMap::new()),
             }),
@@ -1564,6 +1744,8 @@ mod tests {
                     account: Some("dave@example.com".into()),
                     refresh_skew_seconds: None,
                 }),
+                oauth_account: None,
+                scopes: vec![],
             }),
         }
     }
@@ -1820,5 +2002,303 @@ mod tests {
         // Can still access after shutdown
         let tools = executor.core_tools().await;
         assert!(!tools.is_empty());
+    }
+
+    // --- Service-account resolution (issue #479) ------------------------------
+
+    fn service_account(id: &str, granted: &[&str]) -> ServiceAccount {
+        ServiceAccount {
+            id: id.into(),
+            display_name: "Work Google".into(),
+            client_id: "acct-client".into(),
+            client_secret_ref: Some("acct_secret".into()),
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            account: Some("user@example.com".into()),
+            refresh_token_ref: "acct_refresh".into(),
+            granted_scopes: granted.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_inline_oauth_is_passthrough() {
+        // Back-compat: an inline oauth block resolves to itself, required ==
+        // granted (so an inline server never regresses into coverage needs_auth).
+        let http = HttpTransportConfig {
+            url: "https://x/mcp".into(),
+            auth_bearer_secret: None,
+            oauth: Some(OAuthServerConfig {
+                client_id: "cid".into(),
+                token_url: "https://oauth2.googleapis.com/token".into(),
+                refresh_token_ref: "rt".into(),
+                client_secret_ref: None,
+                authorize_url: Some("https://auth".into()),
+                scopes: vec!["scope.a".into()],
+                account: Some("acc".into()),
+                refresh_skew_seconds: None,
+            }),
+            oauth_account: None,
+            scopes: vec![],
+        };
+        let resolved = resolve_server_oauth(&http, &[], "srv").unwrap().unwrap();
+        assert_eq!(resolved.account_id, None);
+        assert_eq!(resolved.effective.client_id, "cid");
+        assert_eq!(resolved.required_scopes, vec!["scope.a".to_string()]);
+        assert_eq!(resolved.granted_scopes, vec!["scope.a".to_string()]);
+    }
+
+    #[test]
+    fn resolve_account_reference_builds_effective_config() {
+        let http = HttpTransportConfig {
+            url: "https://gmail/mcp".into(),
+            auth_bearer_secret: None,
+            oauth: None,
+            oauth_account: Some("work".into()),
+            scopes: vec!["gmail.modify".into()],
+        };
+        let accounts = vec![service_account("work", &["gmail.modify", "calendar"])];
+        let resolved = resolve_server_oauth(&http, &accounts, "gmail")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.account_id.as_deref(), Some("work"));
+        assert_eq!(resolved.effective.client_id, "acct-client");
+        assert_eq!(resolved.effective.refresh_token_ref, "acct_refresh");
+        assert_eq!(
+            resolved.effective.client_secret_ref.as_deref(),
+            Some("acct_secret")
+        );
+        assert_eq!(
+            resolved.effective.authorize_url.as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth")
+        );
+        // Token-store key = the account email, so servers sharing the account
+        // share the minted token.
+        assert_eq!(
+            resolved.effective.account.as_deref(),
+            Some("user@example.com")
+        );
+        assert_eq!(resolved.required_scopes, vec!["gmail.modify".to_string()]);
+        assert_eq!(
+            resolved.granted_scopes,
+            vec!["gmail.modify".to_string(), "calendar".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_account_keys_by_id_when_no_email() {
+        let mut acct = service_account("work", &[]);
+        acct.account = None;
+        let http = HttpTransportConfig {
+            url: "https://gmail/mcp".into(),
+            auth_bearer_secret: None,
+            oauth: None,
+            oauth_account: Some("work".into()),
+            scopes: vec![],
+        };
+        let resolved = resolve_server_oauth(&http, &[acct], "gmail")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.effective.account.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn resolve_rejects_both_inline_and_account() {
+        let http = HttpTransportConfig {
+            url: "https://x/mcp".into(),
+            auth_bearer_secret: None,
+            oauth: Some(OAuthServerConfig {
+                client_id: "cid".into(),
+                token_url: "https://t".into(),
+                refresh_token_ref: "rt".into(),
+                client_secret_ref: None,
+                authorize_url: Some("https://a".into()),
+                scopes: vec![],
+                account: None,
+                refresh_skew_seconds: None,
+            }),
+            oauth_account: Some("work".into()),
+            scopes: vec![],
+        };
+        let err = resolve_server_oauth(&http, &[service_account("work", &[])], "srv").unwrap_err();
+        assert!(
+            matches!(err, McpError::InvalidConfig(ref m) if m.contains("both")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_missing_account() {
+        let http = HttpTransportConfig {
+            url: "https://x/mcp".into(),
+            auth_bearer_secret: None,
+            oauth: None,
+            oauth_account: Some("nope".into()),
+            scopes: vec![],
+        };
+        let err = resolve_server_oauth(&http, &[service_account("work", &[])], "srv").unwrap_err();
+        assert!(
+            matches!(err, McpError::InvalidConfig(ref m) if m.contains("nope")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_non_oauth_http_is_none() {
+        let http = HttpTransportConfig {
+            url: "https://x/mcp".into(),
+            auth_bearer_secret: Some("bearer".into()),
+            oauth: None,
+            oauth_account: None,
+            scopes: vec![],
+        };
+        assert!(resolve_server_oauth(&http, &[], "srv").unwrap().is_none());
+    }
+
+    #[test]
+    fn scopes_covered_is_subset_check() {
+        let granted = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(scopes_covered(&["a".into(), "c".into()], &granted));
+        assert!(scopes_covered(&[], &granted));
+        assert!(!scopes_covered(&["a".into(), "z".into()], &granted));
+    }
+
+    /// An HTTP server that references a service account by id, requiring
+    /// `required` scopes.
+    fn account_server(name: &str, account_id: &str, required: &[&str]) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: String::new(),
+            args: vec![],
+            namespace: Some(name.into()),
+            enabled: true,
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: Some(HttpTransportConfig {
+                url: format!("https://{name}/mcp"),
+                auth_bearer_secret: None,
+                oauth: None,
+                oauth_account: Some(account_id.into()),
+                scopes: required.iter().map(|s| s.to_string()).collect(),
+            }),
+        }
+    }
+
+    /// Build an executor seeded with configs, secrets, and service accounts.
+    async fn executor_with_accounts(
+        configs: Vec<McpServerConfig>,
+        secrets: HashMap<String, String>,
+        accounts: Vec<ServiceAccount>,
+    ) -> McpToolExecutor {
+        let executor = McpToolExecutor::with_builtin_tools_config_and_token_store(
+            configs,
+            BuiltinToolService::new(),
+            std::path::PathBuf::new(),
+            secrets,
+            std::sync::Arc::new(crate::oauth::InMemoryTokenStore::default()),
+        );
+        executor
+            .control_handle()
+            .replace_service_accounts(accounts)
+            .await;
+        executor
+    }
+
+    #[tokio::test]
+    async fn account_server_needs_auth_when_no_refresh_token() {
+        // Account exists, scopes covered, but no refresh token in secrets yet.
+        let configs = vec![account_server("gmail", "work", &["gmail.modify"])];
+        let accounts = vec![service_account("work", &["gmail.modify"])];
+        let executor = executor_with_accounts(configs, HashMap::new(), accounts).await;
+
+        let status = executor.control_handle().status(Some("gmail")).await;
+        let s = &status[0];
+        assert_eq!(s.status, "needs_auth");
+        assert_eq!(s.auth_kind.as_deref(), Some("oauth"));
+        assert_eq!(s.oauth_authorized, Some(false));
+        // Sign-in targets the *account id*, not the server name — one login
+        // satisfies every server sharing it.
+        assert!(s.configure_command.iter().any(|a| a == "--mcp-oauth-login"));
+        assert!(
+            s.configure_command.iter().any(|a| a == "work"),
+            "configure_command: {:?}",
+            s.configure_command
+        );
+        assert!(!s.configure_command.iter().any(|a| a == "gmail"));
+    }
+
+    #[tokio::test]
+    async fn account_server_covered_and_authorized_is_stopped() {
+        // Refresh token present + required scopes ⊆ granted → ready (stopped,
+        // since we don't actually connect in this unit test).
+        let mut secrets = HashMap::new();
+        secrets.insert("acct_refresh".to_string(), "rt".to_string());
+        let configs = vec![account_server("gmail", "work", &["gmail.modify"])];
+        let accounts = vec![service_account("work", &["gmail.modify", "calendar"])];
+        let executor = executor_with_accounts(configs, secrets, accounts).await;
+
+        let s = &executor.control_handle().status(Some("gmail")).await[0];
+        assert_eq!(s.status, "stopped");
+        assert_eq!(s.oauth_authorized, Some(true));
+        assert!(s.detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_server_needs_auth_on_scope_gap() {
+        // Authorized, but a required scope isn't granted → needs_auth + a
+        // coverage detail naming the missing scope.
+        let mut secrets = HashMap::new();
+        secrets.insert("acct_refresh".to_string(), "rt".to_string());
+        let configs = vec![account_server(
+            "gmail",
+            "work",
+            &["gmail.modify", "gmail.send"],
+        )];
+        let accounts = vec![service_account("work", &["gmail.modify"])];
+        let executor = executor_with_accounts(configs, secrets, accounts).await;
+
+        let s = &executor.control_handle().status(Some("gmail")).await[0];
+        assert_eq!(s.status, "needs_auth");
+        assert_eq!(s.oauth_authorized, Some(true));
+        assert!(
+            s.detail.as_deref().unwrap().contains("gmail.send"),
+            "detail should name the missing scope: {:?}",
+            s.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn misconfigured_account_reference_reports_error() {
+        // References an account that doesn't exist → honest `error` with detail,
+        // no Sign-in button (signing in can't fix a bad config).
+        let configs = vec![account_server("gmail", "ghost", &["gmail.modify"])];
+        let executor = executor_with_accounts(configs, HashMap::new(), vec![]).await;
+
+        let s = &executor.control_handle().status(Some("gmail")).await[0];
+        assert_eq!(s.status, "error");
+        assert!(s.detail.as_deref().unwrap().contains("ghost"));
+        assert!(s.configure_label.is_none());
+    }
+
+    #[tokio::test]
+    async fn two_servers_share_one_account_signin_target() {
+        // Gmail + Calendar both reference the same account → both point their
+        // Sign-in at that account id (shared login).
+        let configs = vec![
+            account_server("gmail", "work", &["gmail.modify"]),
+            account_server("calendar", "work", &["calendar"]),
+        ];
+        let accounts = vec![service_account("work", &[])];
+        let executor = executor_with_accounts(configs, HashMap::new(), accounts).await;
+
+        let status = executor.control_handle().status(None).await;
+        for s in &status {
+            assert_eq!(s.status, "needs_auth", "{}", s.name);
+            assert!(
+                s.configure_command.iter().any(|a| a == "work"),
+                "{} signs in via the account: {:?}",
+                s.name,
+                s.configure_command
+            );
+        }
     }
 }
