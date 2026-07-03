@@ -24,10 +24,11 @@ spec:
             - "until pg_isready -h postgres -U adele; do echo waiting for postgres; sleep 2; done"
       containers:
         - name: daemon
-          image: truenas.lab.spadea.tech:30095/adele/adele-daemon:prove-split
-          imagePullPolicy: Always # mutable tag on the TrueNAS registry; re-pull on rollout
-          # Nodes already trust the registry's LE cert and it allows anonymous
-          # pull, so no imagePullSecret is needed (same as the fstcore workloads).
+          # Replace with the image you built and pushed (see deploy/k8s/README.md).
+          image: registry.example.com:5000/adele/adele-daemon:prove-split
+          imagePullPolicy: Always # mutable tag; re-pull on rollout
+          # This example assumes a registry the nodes trust that allows anonymous
+          # pull, so no imagePullSecret is needed; adjust for your registry.
           ports:
             - containerPort: 11339
           env:

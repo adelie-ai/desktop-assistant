@@ -35,10 +35,10 @@ reproduce recipe) and [`docs/client-mcp-host.md`](./client-mcp-host.md) (the
 
 - A Kubernetes cluster with a default `StorageClass` and outbound network.
 - `kubectl` pointed at it; a namespace to work in (`adele-test` below).
-- A container registry the cluster can pull from. Anything works; on the lab
-  cluster we push to the TrueNAS registry (`truenas.lab.spadea.tech:30095`),
-  which serves a Let's Encrypt cert and allows anonymous pull — so no
-  `imagePullSecret` is needed. Adjust the image refs below for your registry.
+- A container registry the cluster can pull from. Anything works; the examples
+  below use `registry.example.com:5000` — a registry that serves a trusted cert
+  and allows anonymous pull, so no `imagePullSecret` is needed. Replace it with
+  your own registry throughout (and add an `imagePullSecret` if yours needs one).
 - `podman` (or `docker`) to build the image.
 
 Everything below assumes namespace `adele-test`; change to taste.
@@ -50,8 +50,8 @@ Everything below assumes namespace `adele-test`; change to taste.
 The `Dockerfile` builds a daemon-only image (non-root, `EXPOSE 11339`).
 
 ```sh
-podman build -t truenas.lab.spadea.tech:30095/adele/adele-daemon:latest -f Dockerfile .
-podman push  truenas.lab.spadea.tech:30095/adele/adele-daemon:latest
+podman build -t registry.example.com:5000/adele/adele-daemon:latest -f Dockerfile .
+podman push  registry.example.com:5000/adele/adele-daemon:latest
 ```
 
 > The daemon links `libpam`, so the builder installs `libpam0g-dev` and the
