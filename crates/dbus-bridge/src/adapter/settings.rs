@@ -1199,7 +1199,7 @@ mod tests {
             ],
             auth_kind: Some("oauth".into()),
             oauth_authorized: Some(false),
-            oauth_account: Some("dave@spadea.tech".into()),
+            oauth_account: Some("dave@example.com".into()),
             oauth_scopes: vec!["https://www.googleapis.com/auth/gmail.modify".into()],
             oauth_client_id: Some("1234.apps.googleusercontent.com".into()),
             oauth_token_url: Some("https://oauth2.googleapis.com/token".into()),
@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(s["status"], "needs_auth");
         assert_eq!(s["auth_kind"], "oauth");
         assert_eq!(s["oauth_authorized"], false);
-        assert_eq!(s["oauth_account"], "dave@spadea.tech");
+        assert_eq!(s["oauth_account"], "dave@example.com");
         assert_eq!(s["oauth_client_id"], "1234.apps.googleusercontent.com");
         assert_eq!(s["oauth_token_url"], "https://oauth2.googleapis.com/token");
         assert_eq!(s["configure_label"], "Sign in");

@@ -1516,7 +1516,7 @@ mod tests {
                     client_secret_ref: None,
                     authorize_url: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
                     scopes: vec!["https://www.googleapis.com/auth/calendar".into()],
-                    account: Some("dave@spadea.tech".into()),
+                    account: Some("dave@example.com".into()),
                     refresh_skew_seconds: None,
                 }),
             }),

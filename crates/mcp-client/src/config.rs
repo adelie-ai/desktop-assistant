@@ -529,7 +529,7 @@ token_url = "https://oauth2.googleapis.com/token"
 authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
 refresh_token_ref = "gmail_work_refresh"
 client_secret_ref = "google_client_secret"
-account = "dave@spadea.tech"
+account = "dave@example.com"
 scopes = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",
@@ -558,7 +558,7 @@ scopes = [
             oauth.authorize_url.as_deref(),
             Some("https://accounts.google.com/o/oauth2/v2/auth")
         );
-        assert_eq!(oauth.account.as_deref(), Some("dave@spadea.tech"));
+        assert_eq!(oauth.account.as_deref(), Some("dave@example.com"));
         assert_eq!(oauth.scopes.len(), 2);
         // Optional numeric knob defaults to absent (⇒ 60s skew at build time).
         assert!(oauth.refresh_skew_seconds.is_none());
@@ -590,7 +590,7 @@ scopes = [
                     client_secret_ref: None,
                     authorize_url: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
                     scopes: vec!["https://www.googleapis.com/auth/calendar".into()],
-                    account: Some("dave@spadea.tech".into()),
+                    account: Some("dave@example.com".into()),
                     refresh_skew_seconds: Some(120),
                 }),
             }),

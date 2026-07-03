@@ -232,7 +232,7 @@ token_url         = "https://oauth2.googleapis.com/token"
 authorize_url     = "https://accounts.google.com/o/oauth2/v2/auth"
 refresh_token_ref = "gmail_work_refresh"     # secret ID in secrets.toml
 client_secret_ref = "google_client_secret"   # secret ID; omit for public/PKCE clients
-account           = "dave@spadea.tech"        # token-store key; share across services for one account
+account           = "dave@example.com"        # token-store key; share across services for one account
 scopes = [
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/calendar",

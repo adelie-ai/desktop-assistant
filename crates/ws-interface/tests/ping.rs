@@ -1383,7 +1383,7 @@ async fn ws_allows_configured_origin() {
         Arc::new(FakeKnowledge),
     ));
 
-    let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];
+    let allowed = vec!["https://daystrom.example.com".to_string()];
     let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, allowed);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -1396,7 +1396,7 @@ async fn ws_allows_configured_origin() {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_request_with_origin(
         &url,
         Some("test-jwt"),
-        Some("https://daystrom.lab.spadea.tech"),
+        Some("https://daystrom.example.com"),
     ))
     .await
     .unwrap();
@@ -1428,7 +1428,7 @@ async fn ws_rejects_non_matching_origin() {
         Arc::new(FakeKnowledge),
     ));
 
-    let allowed = vec!["https://daystrom.lab.spadea.tech".to_string()];
+    let allowed = vec!["https://daystrom.example.com".to_string()];
     let app = router_full(handler, Arc::new(StaticJwtAuth), None, None, allowed);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
