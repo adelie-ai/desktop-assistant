@@ -936,17 +936,47 @@ pub struct PersistenceSettingsView {
     pub push_on_update: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Wire form of a configured MCP server — the per-server *descriptor* the
+/// settings/KCM surface renders. Serialized to a JSON array by the D-Bus
+/// `ListMcpServersJson` method (MCP-servers-UI epic) so the config surface can
+/// grow without re-churning a typed D-Bus signature. Never carries secret
+/// *values* — only refs/kinds. `Default` lets test doubles fill only the fields
+/// they care about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerView {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub enabled: bool,
-    /// "running" | "stopped" | "disabled"
+    /// Coarse state: `disabled` | `running` | `stopped` | `needs_auth` |
+    /// `auth_expired` | `error`.
     pub status: String,
     pub tool_count: u32,
+    /// Transport: `"stdio"` or `"http"`.
+    pub transport: String,
+    /// Human-facing connection target: the command (stdio) or url (http).
+    pub target: String,
+    /// Last connection error, when the server failed to connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Label for a Configure/Sign-in button, if the server offers one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configure_label: Option<String>,
+    /// argv the client spawns (detached) to configure/sign in. Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configure_command: Vec<String>,
+    /// For http servers: `"none"` | `"bearer"` | `"oauth"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_kind: Option<String>,
+    /// For oauth servers: whether a refresh token is present in secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_authorized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oauth_scopes: Vec<String>,
 }
 
 /// Wire form of the database settings (#314). Mirrors the core
@@ -2355,6 +2385,7 @@ mod tests {
             enabled: true,
             status: "running".into(),
             tool_count: 4,
+            ..Default::default()
         }]);
         let v: serde_json::Value = serde_json::to_value(&res).unwrap();
         let server = &v.get("mcp_servers").expect("mcp_servers key")[0];

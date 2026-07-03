@@ -134,6 +134,14 @@ const ADDITIONS: &[(&str, &str)] = &[
         "method StartMaintenance(in:s:op, out:s:)",
     ),
     ("org.desktopAssistant.Knowledge", "signal EntriesChanged()"),
+    // MCP-servers-UI epic — JSON-at-the-edge MCP read. Additive to the legacy
+    // tuple `ListMcpServers` (which stays for parity); new clients use this.
+    // The write methods (UpsertMcpServer/SetMcpSecret) are declared alongside
+    // their impls in the next step.
+    (
+        "org.desktopAssistant.Settings",
+        "method ListMcpServersJson(out:s:)",
+    ),
 ];
 
 // --- fake transport ---------------------------------------------------------

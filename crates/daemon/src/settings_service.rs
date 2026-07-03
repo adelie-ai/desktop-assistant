@@ -263,6 +263,15 @@ impl SettingsService for DaemonSettingsService {
                 enabled: s.enabled,
                 status: s.status,
                 tool_count: s.tool_count,
+                transport: s.transport,
+                target: s.target,
+                detail: s.detail,
+                configure_label: s.configure_label,
+                configure_command: s.configure_command,
+                auth_kind: s.auth_kind,
+                oauth_authorized: s.oauth_authorized,
+                oauth_account: s.oauth_account,
+                oauth_scopes: s.oauth_scopes,
             })
             .collect())
     }
@@ -361,6 +370,15 @@ impl SettingsService for DaemonSettingsService {
                 enabled: s.enabled,
                 status: s.status,
                 tool_count: s.tool_count,
+                transport: s.transport,
+                target: s.target,
+                detail: s.detail,
+                configure_label: s.configure_label,
+                configure_command: s.configure_command,
+                auth_kind: s.auth_kind,
+                oauth_authorized: s.oauth_authorized,
+                oauth_account: s.oauth_account,
+                oauth_scopes: s.oauth_scopes,
             })
             .collect())
     }

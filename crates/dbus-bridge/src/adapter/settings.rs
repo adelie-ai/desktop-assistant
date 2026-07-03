@@ -428,6 +428,10 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
 
     /// List configured MCP servers.
     /// Returns: `Vec<(name, command, enabled, status, tool_count)>`.
+    ///
+    /// Legacy five-tuple form, kept for D-Bus parity. New clients (the KCM MCP
+    /// Servers tab) use [`Self::list_mcp_servers_json`], which carries the full
+    /// per-server descriptor.
     async fn list_mcp_servers(&self) -> fdo::Result<Vec<(String, String, bool, String, u32)>> {
         let result = self.dispatch(api::Command::ListMcpServers).await?;
         match result {
@@ -435,6 +439,23 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
                 .into_iter()
                 .map(|s| (s.name, s.command, s.enabled, s.status, s.tool_count))
                 .collect()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected ListMcpServers result: {other:?}"
+            ))),
+        }
+    }
+
+    /// List configured MCP servers as a JSON array of full descriptors
+    /// (MCP-servers-UI epic). Each element is a serialized [`api::McpServerView`]
+    /// carrying transport/target/state/detail/configure/oauth fields (never any
+    /// secret *value*). Chosen over a widening D-Bus tuple so the config surface
+    /// can grow without re-churning the D-Bus signature + introspection gate; the
+    /// KCM `JSON.parse`s the reply. Reuses the `ListMcpServers` command.
+    async fn list_mcp_servers_json(&self) -> fdo::Result<String> {
+        let result = self.dispatch(api::Command::ListMcpServers).await?;
+        match result {
+            api::CommandResult::McpServers(servers) => serde_json::to_string(&servers)
+                .map_err(|e| fdo::Error::Failed(format!("failed to serialize MCP servers: {e}"))),
             other => Err(fdo::Error::Failed(format!(
                 "unexpected ListMcpServers result: {other:?}"
             ))),
@@ -856,6 +877,7 @@ mod tests {
             enabled: true,
             status: "running".into(),
             tool_count: 4,
+            ..Default::default()
         }]));
         let rows = settings(Arc::clone(&t))
             .mcp_server_action("restart", "")
@@ -1102,6 +1124,7 @@ mod tests {
             enabled: true,
             status: "running".into(),
             tool_count: 2,
+            ..Default::default()
         }]));
         let rows = settings(Arc::clone(&t)).list_mcp_servers().await.unwrap();
         assert_eq!(
@@ -1114,6 +1137,55 @@ mod tests {
                 2
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn list_mcp_servers_json_carries_the_full_descriptor() {
+        // MCP-servers-UI epic: the JSON read path must preserve the rich fields
+        // the five-tuple form drops (transport/target/state/detail/configure/
+        // oauth), so the KCM can render an honest state + Sign-in action.
+        let t = FakeTransport::replying(api::CommandResult::McpServers(vec![api::McpServerView {
+            name: "gmail-work".into(),
+            command: String::new(),
+            args: vec![],
+            namespace: Some("gmail".into()),
+            enabled: true,
+            status: "needs_auth".into(),
+            tool_count: 0,
+            transport: "http".into(),
+            target: "https://example.test/mcp".into(),
+            detail: None,
+            configure_label: Some("Sign in".into()),
+            configure_command: vec![
+                "/usr/bin/desktop-assistant".into(),
+                "--mcp-oauth-login".into(),
+                "gmail-work".into(),
+            ],
+            auth_kind: Some("oauth".into()),
+            oauth_authorized: Some(false),
+            oauth_account: Some("dave@spadea.tech".into()),
+            oauth_scopes: vec!["https://www.googleapis.com/auth/gmail.modify".into()],
+        }]));
+
+        let json = settings(Arc::clone(&t))
+            .list_mcp_servers_json()
+            .await
+            .unwrap();
+        assert!(matches!(t.last(), api::Command::ListMcpServers));
+
+        let arr: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let s = &arr[0];
+        assert_eq!(s["name"], "gmail-work");
+        assert_eq!(s["transport"], "http");
+        assert_eq!(s["target"], "https://example.test/mcp");
+        assert_eq!(s["status"], "needs_auth");
+        assert_eq!(s["auth_kind"], "oauth");
+        assert_eq!(s["oauth_authorized"], false);
+        assert_eq!(s["oauth_account"], "dave@spadea.tech");
+        assert_eq!(s["configure_label"], "Sign in");
+        assert_eq!(s["configure_command"][1], "--mcp-oauth-login");
+        // A secret value must never appear anywhere in the descriptor.
+        assert!(!json.contains("refresh_token"));
     }
 
     #[tokio::test]
