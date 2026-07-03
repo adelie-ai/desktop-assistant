@@ -70,6 +70,20 @@ impl DaemonSettingsService {
             handle.replace_secrets(secrets).await;
         }
     }
+
+    /// Refresh the executor's in-memory service accounts from `mcp_servers.toml`
+    /// so an account's `granted_scopes` (recorded by a separate `--mcp-oauth-login`
+    /// process) are reflected in a server's coverage state without a restart.
+    /// Best-effort, mirroring [`Self::reload_mcp_secrets`].
+    async fn reload_mcp_service_accounts(&self, handle: &McpControlHandle) {
+        let path = desktop_assistant_mcp_client::config::default_config_path();
+        if !path.exists() {
+            return;
+        }
+        if let Ok(accounts) = desktop_assistant_mcp_client::config::load_service_accounts(&path) {
+            handle.replace_service_accounts(accounts).await;
+        }
+    }
 }
 
 impl SettingsService for DaemonSettingsService {
@@ -270,6 +284,7 @@ impl SettingsService for DaemonSettingsService {
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerView>, CoreError> {
         let handle = self.mcp_handle()?;
         self.reload_mcp_secrets(handle).await;
+        self.reload_mcp_service_accounts(handle).await;
         let statuses = handle.status(None).await;
         Ok(statuses
             .into_iter()
@@ -352,6 +367,7 @@ impl SettingsService for DaemonSettingsService {
     ) -> Result<Vec<McpServerView>, CoreError> {
         let handle = self.mcp_handle()?;
         self.reload_mcp_secrets(handle).await;
+        self.reload_mcp_service_accounts(handle).await;
         let server_ref = server.as_deref();
 
         match action.as_str() {
