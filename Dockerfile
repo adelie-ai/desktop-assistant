@@ -1,13 +1,20 @@
 FROM rust:1-bookworm AS builder
 
 WORKDIR /workspace
+
+# The daemon links libpam (WS local-system-auth); the base rust image lacks the
+# dev headers, so the final link fails with `-lpam not found` without this.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpam0g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 RUN cargo build --release --locked -p desktop-assistant-daemon
 
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libpam0g \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 assistant

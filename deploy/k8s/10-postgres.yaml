@@ -1,0 +1,92 @@
+# pgvector Postgres for the prove-the-split test.
+# The stock `postgres` image lacks the `vector` extension and the daemon's
+# migrations do NOT run `CREATE EXTENSION vector` (they only use vector
+# columns), so we use the pgvector image and create the extension via an
+# initdb hook that runs once on first boot (empty PGDATA).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: adele-test
+data:
+  init.sql: |
+    CREATE EXTENSION IF NOT EXISTS vector;
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: adele-test
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # local-path (node-local), not nfs-ssd: NFS root_squash blocks the postgres
+  # entrypoint's chown of PGDATA ("Operation not permitted"). Node-local storage
+  # is fine for a single-replica test brain.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: adele-test
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single RWO volume; never run two pods against it at once
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: adele
+            - name: POSTGRES_DB
+              value: adele
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: adele-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata # subdir avoids NFS lost+found clash
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "adele", "-d", "adele"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: init
+          configMap:
+            name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: adele-test
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

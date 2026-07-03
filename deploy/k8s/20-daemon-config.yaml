@@ -1,0 +1,73 @@
+# Minimal daemon.toml for the prove-the-split smoke test.
+#
+# Structural blocks ([connections], [purposes], [personality], [ws_auth]) are
+# file-only (no env override), so they must ship via ConfigMap. Transport / DB /
+# secret / login knobs come from env in the Deployment.
+#
+# Inference is STAGED against Ollama-over-LAN (the desktop `daystrom`) purely so
+# the smoke test yields a real reply without cloud creds. This is a stand-in;
+# the production backend (Bedrock/OpenAI) is a one-line swap here + a secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adele-daemon-config
+  namespace: adele-test
+data:
+  daemon.toml: |
+    [llm]
+    connector = "ollama"
+    model = "qwen2.5:latest"
+    base_url = "http://192.168.1.7:11434"
+
+    [connections.default]
+    type = "ollama"
+    base_url = "http://192.168.1.7:11434"
+
+    [embeddings]
+
+    [database]
+    max_connections = 5
+
+    [backend_tasks]
+    # Off for the test so no surprise background LLM calls fire mid-smoke.
+    dreaming_enabled = false
+    dreaming_interval_secs = 3600
+    archive_after_days = 7
+    embedding_backfill_interval_secs = 300
+    consolidation_interval_secs = 86400
+
+    [purposes.interactive]
+    connection = "default"
+    model = "qwen2.5:latest"
+
+    [purposes.dreaming]
+    connection = "default"
+    model = "qwen2.5:latest"
+
+    [purposes.embedding]
+    connection = "default"
+    model = "qwen2.5:latest"
+
+    [purposes.titling]
+    connection = "default"
+    model = "qwen2.5:latest"
+
+    [profiling]
+    enabled = false
+    full_content = false
+
+    [ws_auth]
+    methods = ["password"]
+    allowed_origins = []
+
+    [tls]
+    enabled = false
+
+    [personality]
+    professionalism = "always"
+    warmth = "often"
+    directness = "often"
+    enthusiasm = "sometimes"
+    humor = "sometimes"
+    sarcasm = "rarely"
+    pretentiousness = "rarely"

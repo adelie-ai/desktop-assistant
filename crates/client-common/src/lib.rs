@@ -8,6 +8,8 @@ pub mod config;
 pub mod connector;
 #[cfg(feature = "dbus")]
 pub mod dbus_client;
+#[cfg(feature = "mcp-host")]
+pub mod mcp_host;
 pub mod signal;
 pub mod system_id;
 pub mod timeouts;
