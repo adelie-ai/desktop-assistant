@@ -14,10 +14,11 @@ tool fleet (all deliberately out of scope; separate projects).
   self-signed-cert CA distribution. Not for the public internet.
 - **Tools:** none. The image is daemon-only; the MCP fleet is a separate image
   (epic C-1). This proves conversation + persistence, not tool use.
-- **Inference:** staged against Ollama-over-LAN (`daystrom:11434`) so the smoke
-  test gets a real reply with no cloud creds. Swap to Bedrock/OpenAI by editing
-  `20-daemon-config.yaml` (`[connections]`/`[purposes]`) and adding the
-  credential to the `adele-secrets` Secret.
+- **Inference:** an in-cluster Ollama pod (`40-ollama.yaml`) with a small CPU
+  model (`llama3.2:1b`), so the smoke test gets a real reply with no external
+  host or cloud creds. Swap to Bedrock/OpenAI by editing `20-daemon-config.yaml`
+  (`[connections]`/`[purposes]`) and adding the credential to the
+  `adele-secrets` Secret.
 
 ## Deploy
 
@@ -25,20 +26,23 @@ tool fleet (all deliberately out of scope; separate projects).
 # 1. Build the daemon-only image (from the repo root)
 podman build -t localhost/adele-daemon:prove-split -f Dockerfile .
 
-# 2. Push to the TrueNAS registry. It serves a Let's Encrypt cert (nodes trust
-#    it out of the box) and allows anonymous pull, so no imagePullSecret is
-#    needed — same as the fstcore workloads.
+# 2. Push to a registry your cluster can pull from. This example uses one that
+#    serves a trusted cert and allows anonymous pull, so no imagePullSecret is
+#    needed; replace registry.example.com:5000 with your own.
 podman tag localhost/adele-daemon:prove-split \
-  truenas.lab.spadea.tech:30095/adele/adele-daemon:prove-split
-podman push truenas.lab.spadea.tech:30095/adele/adele-daemon:prove-split
+  registry.example.com:5000/adele/adele-daemon:prove-split
+podman push registry.example.com:5000/adele/adele-daemon:prove-split
 
 # 3. Create the Secret (random passwords; creds never committed)
 kubectl -n adele-test create secret generic adele-secrets \
   --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 16)" \
   --from-literal=WS_LOGIN_PASSWORD="$(openssl rand -hex 16)"
 
-# 4. Apply
+# 4. Apply (Ollama first so the daemon has a backend; pull the model once it's up)
 kubectl apply -f deploy/k8s/00-namespace.yaml
+kubectl apply -f deploy/k8s/40-ollama.yaml
+kubectl -n adele-test rollout status deploy/ollama
+kubectl -n adele-test exec deploy/ollama -- ollama pull llama3.2:1b
 kubectl apply -f deploy/k8s/10-postgres.yaml
 kubectl apply -f deploy/k8s/20-daemon-config.yaml
 kubectl apply -f deploy/k8s/30-daemon.yaml

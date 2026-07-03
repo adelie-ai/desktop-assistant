@@ -1,0 +1,66 @@
+# In-cluster Ollama for test inference, so the daemon has a reachable backend
+# without depending on an external host. CPU-only on these nodes (slow, but
+# fine for testing). Pull a small model after it's up, e.g.:
+#   kubectl -n adele-test exec deploy/ollama -- ollama pull llama3.2:1b
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: adele-test
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path # node-local; avoids the NFS root_squash chown issue
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: adele-test
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single RWO model volume
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: adele-test
+spec:
+  selector:
+    app: ollama
+  ports:
+    - port: 11434
+      targetPort: 11434

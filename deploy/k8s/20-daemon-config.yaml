@@ -4,9 +4,9 @@
 # file-only (no env override), so they must ship via ConfigMap. Transport / DB /
 # secret / login knobs come from env in the Deployment.
 #
-# Inference is STAGED against Ollama-over-LAN (the desktop `daystrom`) purely so
-# the smoke test yields a real reply without cloud creds. This is a stand-in;
-# the production backend (Bedrock/OpenAI) is a one-line swap here + a secret.
+# Inference points at the in-cluster `ollama` Service (40-ollama.yaml) with a
+# small CPU model — self-contained test inference, no external host needed. The
+# production backend (Bedrock/OpenAI) is a one-line swap here + a secret.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,12 +16,19 @@ data:
   daemon.toml: |
     [llm]
     connector = "ollama"
-    model = "qwen2.5:latest"
-    base_url = "http://192.168.1.7:11434"
+    model = "llama3.2:1b"
+    base_url = "http://ollama:11434"
 
     [connections.default]
     type = "ollama"
-    base_url = "http://192.168.1.7:11434"
+    base_url = "http://ollama:11434"
+    # Slow CPU nodes: tolerate long first-response + inter-chunk gaps, keep the
+    # interactive model resident (no cold load per turn), and clamp the context
+    # so prompt-eval stays cheap.
+    connect_timeout_secs = 600
+    stream_timeout_secs = 300
+    keep_warm = true
+    max_context_tokens = 4096
 
     [embeddings]
 
@@ -38,19 +45,19 @@ data:
 
     [purposes.interactive]
     connection = "default"
-    model = "qwen2.5:latest"
+    model = "llama3.2:1b"
 
     [purposes.dreaming]
     connection = "default"
-    model = "qwen2.5:latest"
+    model = "llama3.2:1b"
 
     [purposes.embedding]
     connection = "default"
-    model = "qwen2.5:latest"
+    model = "llama3.2:1b"
 
     [purposes.titling]
     connection = "default"
-    model = "qwen2.5:latest"
+    model = "llama3.2:1b"
 
     [profiling]
     enabled = false
