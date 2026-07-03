@@ -4,6 +4,7 @@ mod builtin;
 pub mod config;
 pub mod executor;
 mod jsonrpc;
+pub mod oauth;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use desktop_assistant_core::domain::ToolDefinition;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -34,6 +36,12 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Anything larger is a protocol violation (or a runaway tool result) and is
 /// surfaced as an error instead of buffering unbounded memory (DS-4).
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Cap on a remote (HTTP) response body — the streamable-HTTP analogue of
+/// [`MAX_LINE_BYTES`]. A remote server (or a hostile endpoint impersonating
+/// one) cannot make the daemon buffer unbounded memory; anything larger fails
+/// the request. Generous, because an SSE reply can carry a whole tool result.
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Error type for MCP client operations.
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +75,12 @@ pub enum McpError {
 
     #[error("MCP request '{method}' timed out after {after:?} of silence")]
     Timeout { method: String, after: Duration },
+
+    #[error("HTTP transport error: {0}")]
+    Http(String),
+
+    #[error("OAuth error: {0}")]
+    OAuth(#[from] oauth::OAuthError),
 }
 
 /// Characters that could cause unintended behaviour if they appear in the
@@ -120,14 +134,14 @@ impl ListChangeFlags {
     }
 }
 
-/// Client for a single MCP server process, communicating via JSON-RPC over stdio.
+/// Client for a single MCP server, speaking JSON-RPC over a pluggable
+/// [`Transport`] — either a spawned stdio child process or a remote
+/// streamable-HTTP endpoint.
 pub struct McpClient {
-    child: Child,
-    stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    transport: Transport,
     next_id: AtomicU64,
     flags: Arc<ListChangeFlags>,
-    /// Maximum silent gap while waiting for a response line; see
+    /// Maximum silent gap while waiting for a response; see
     /// [`DEFAULT_REQUEST_TIMEOUT`].
     request_timeout: Duration,
 }
@@ -153,39 +167,72 @@ impl McpClient {
         env: &HashMap<String, String>,
         request_timeout: Duration,
     ) -> Result<Self, McpError> {
-        validate_command(command, args)?;
+        let transport = Transport::Stdio(StdioTransport::spawn(command, args, env)?);
+        Self::from_transport(transport, request_timeout).await
+    }
 
-        let mut cmd = Command::new(command);
-        cmd.args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            // DS-2: make the kernel reap the server if this client is
-            // dropped without an explicit `shutdown` (panic, cancelled
-            // task, error mid-`connect`). Explicit `shutdown` still kills
-            // gracefully via `Child::kill`.
-            .kill_on_drop(true);
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        let mut child = cmd.spawn().map_err(McpError::SpawnFailed)?;
+    /// Connect to a remote MCP server over streamable-HTTP and perform the
+    /// initialize handshake.
+    ///
+    /// `bearer`, when set, is sent verbatim as an `Authorization: Bearer`
+    /// header on every request. Acquiring/refreshing that token (e.g. via
+    /// Google OAuth) is the caller's concern and out of scope here.
+    pub async fn connect_http(url: &str, bearer: Option<String>) -> Result<Self, McpError> {
+        Self::connect_http_with_request_timeout(url, bearer, DEFAULT_REQUEST_TIMEOUT).await
+    }
 
-        let stdin = child.stdin.take().ok_or(McpError::NoStdin)?;
-        let stdout = child.stdout.take().ok_or(McpError::NoStdout)?;
-        let reader = BufReader::new(stdout);
+    /// [`Self::connect_http`] with an explicit per-request silence timeout.
+    pub async fn connect_http_with_request_timeout(
+        url: &str,
+        bearer: Option<String>,
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        Self::connect_http_credential(url, Credential::from_bearer(bearer), request_timeout).await
+    }
 
+    /// Connect to a remote MCP server over streamable-HTTP, authenticating with
+    /// an OAuth 2.0 [`TokenProvider`](oauth::TokenProvider). The provider mints
+    /// and refreshes access tokens on demand, and the transport retries once
+    /// with a fresh token if the server answers `401`.
+    pub async fn connect_http_oauth(
+        url: &str,
+        provider: Arc<oauth::TokenProvider>,
+    ) -> Result<Self, McpError> {
+        Self::connect_http_oauth_with_request_timeout(url, provider, DEFAULT_REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::connect_http_oauth`] with an explicit per-request silence timeout.
+    pub async fn connect_http_oauth_with_request_timeout(
+        url: &str,
+        provider: Arc<oauth::TokenProvider>,
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        Self::connect_http_credential(url, Credential::OAuth(provider), request_timeout).await
+    }
+
+    async fn connect_http_credential(
+        url: &str,
+        credential: Credential,
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        let transport = Transport::Http(HttpTransport::new(url, credential)?);
+        Self::from_transport(transport, request_timeout).await
+    }
+
+    /// Wrap a ready transport and run the initialize handshake, bounded so a
+    /// wedged server fails startup instead of stalling it (DS-3). On error the
+    /// transport is dropped here, tearing down any child process (DS-2).
+    async fn from_transport(
+        transport: Transport,
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
         let mut client = Self {
-            child,
-            stdin,
-            reader,
+            transport,
             next_id: AtomicU64::new(1),
             flags: Arc::new(ListChangeFlags::default()),
             request_timeout,
         };
 
-        // Perform initialize handshake, bounded so a wedged server fails
-        // startup instead of stalling it (DS-3). On error `client` (and its
-        // `Child`) is dropped here, which kills the process (DS-2).
         let init_timeout = INIT_TIMEOUT.min(request_timeout);
         tokio::time::timeout(init_timeout, client.initialize())
             .await
@@ -214,15 +261,12 @@ impl McpClient {
 
         let _response = self.send_request("initialize", Some(params)).await?;
 
-        // Send initialized notification (no id, no response expected)
+        // Send initialized notification (no id, no response expected).
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        let mut line = serde_json::to_string(&notification)?;
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
+        self.transport.send_notification(&notification).await?;
 
         Ok(())
     }
@@ -322,10 +366,10 @@ impl McpClient {
         Ok(serde_json::to_string(&response)?)
     }
 
-    /// Shut down the MCP server process gracefully.
+    /// Shut down the MCP server gracefully (kills a stdio child; a no-op for
+    /// HTTP, which has no process to reap).
     pub async fn shutdown(&mut self) {
-        // Try to kill the child process
-        let _ = self.child.kill().await;
+        self.transport.shutdown().await;
     }
 
     fn next_id(&self) -> u64 {
@@ -345,22 +389,124 @@ impl McpClient {
             params,
         };
 
-        let mut line = serde_json::to_string(&request)?;
-        line.push('\n');
+        let result = self
+            .transport
+            .round_trip(&request, self.request_timeout, &self.flags)
+            .await?;
 
+        if result_has_list_changed(&result) {
+            mark_list_changed_for_method(&self.flags, method);
+        }
+
+        Ok(result)
+    }
+}
+
+/// Transport backing an [`McpClient`]: a spawned stdio child process, or a
+/// remote streamable-HTTP endpoint. The MCP request/response layer above is
+/// transport-agnostic — both variants expose the same round-trip surface.
+enum Transport {
+    Stdio(StdioTransport),
+    Http(HttpTransport),
+}
+
+impl Transport {
+    /// Send `request` and return its JSON-RPC `result`, marking `flags` for any
+    /// interleaved list-changed notifications observed along the way.
+    async fn round_trip(
+        &mut self,
+        request: &JsonRpcRequest,
+        timeout: Duration,
+        flags: &ListChangeFlags,
+    ) -> Result<serde_json::Value, McpError> {
+        match self {
+            Transport::Stdio(t) => t.round_trip(request, timeout, flags).await,
+            Transport::Http(t) => t.round_trip(request, timeout, flags).await,
+        }
+    }
+
+    async fn send_notification(
+        &mut self,
+        notification: &serde_json::Value,
+    ) -> Result<(), McpError> {
+        match self {
+            Transport::Stdio(t) => t.send_notification(notification).await,
+            Transport::Http(t) => t.send_notification(notification).await,
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        match self {
+            Transport::Stdio(t) => t.shutdown().await,
+            // HTTP has no process to reap.
+            Transport::Http(_) => {}
+        }
+    }
+}
+
+/// JSON-RPC over the stdio of a spawned MCP server child process.
+struct StdioTransport {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+}
+
+impl StdioTransport {
+    /// Spawn the server process with piped stdio. The command is validated
+    /// first: it must be a single program name or path with no shell
+    /// metacharacters (arguments go straight to `execve`, so they are not
+    /// checked).
+    fn spawn(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<Self, McpError> {
+        validate_command(command, args)?;
+
+        let mut cmd = Command::new(command);
+        cmd.args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            // DS-2: make the kernel reap the server if this transport is
+            // dropped without an explicit `shutdown` (panic, cancelled task,
+            // error mid-connect).
+            .kill_on_drop(true);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd.spawn().map_err(McpError::SpawnFailed)?;
+
+        let stdin = child.stdin.take().ok_or(McpError::NoStdin)?;
+        let stdout = child.stdout.take().ok_or(McpError::NoStdout)?;
+        let reader = BufReader::new(stdout);
+
+        Ok(Self {
+            child,
+            stdin,
+            reader,
+        })
+    }
+
+    async fn round_trip(
+        &mut self,
+        request: &JsonRpcRequest,
+        timeout: Duration,
+        flags: &ListChangeFlags,
+    ) -> Result<serde_json::Value, McpError> {
+        let mut line = serde_json::to_string(request)?;
+        line.push('\n');
         tracing::debug!("MCP request: {}", line.trim());
 
-        // Write the request and read the response *concurrently* (DS-4):
-        // a request larger than the pipe buffer sent to a server that is
-        // itself blocked writing a large message would otherwise deadlock —
-        // classic stdio pipe deadlock. `try_join!` also short-circuits when
-        // the read side times out, so a wedged exchange resolves into an
-        // error rather than blocking on the unfinished write.
-        let gap = self.request_timeout;
+        let id = request.id;
+        let method = request.method.as_str();
         let stdin = &mut self.stdin;
         let reader = &mut self.reader;
-        let flags = Arc::clone(&self.flags);
 
+        // Write and read concurrently (DS-4): a request larger than the pipe
+        // buffer sent to a server itself blocked writing a large message would
+        // otherwise deadlock. `try_join!` also short-circuits when the read
+        // side times out.
         let write_fut = async move {
             stdin.write_all(line.as_bytes()).await?;
             stdin.flush().await?;
@@ -368,15 +514,15 @@ impl McpClient {
         };
 
         let read_fut = async move {
-            // Read response lines until we get one with matching id. Each
-            // read is bounded by the request timeout (DS-3); any line from
-            // the server (including notifications) resets the window.
+            // Read response lines until we get one with a matching id. Each
+            // read is bounded by the request timeout (DS-3); any line from the
+            // server (including notifications) resets the window.
             loop {
-                let next = tokio::time::timeout(gap, read_line_bounded(reader, MAX_LINE_BYTES))
+                let next = tokio::time::timeout(timeout, read_line_bounded(reader, MAX_LINE_BYTES))
                     .await
                     .map_err(|_| McpError::Timeout {
                         method: method.to_string(),
-                        after: gap,
+                        after: timeout,
                     })??;
                 let Some(buf) = next else {
                     return Err(McpError::UnexpectedResponse(
@@ -388,7 +534,6 @@ impl McpClient {
                 if trimmed.is_empty() {
                     continue;
                 }
-
                 tracing::debug!("MCP response: {trimmed}");
 
                 let message: serde_json::Value = match serde_json::from_str(trimmed) {
@@ -401,60 +546,353 @@ impl McpClient {
 
                 if let Some(list_kind) = list_kind_from_notification(&message) {
                     tracing::debug!("received {list_kind} list changed notification");
-                    mark_list_changed_for_kind(&flags, list_kind);
+                    mark_list_changed_for_kind(flags, list_kind);
                     continue;
                 }
 
-                // Try to parse as JSON-RPC response
-                let response: JsonRpcResponse = match serde_json::from_value(message.clone()) {
+                let response: JsonRpcResponse = match serde_json::from_value(message) {
                     Ok(r) => r,
                     Err(_) => {
-                        // Could be a notification, skip it
                         tracing::debug!("skipping non-response line from MCP server");
                         continue;
                     }
                 };
-
-                // Check if this response matches our request id
                 if response.id != Some(serde_json::Value::Number(id.into())) {
-                    // Not our response, could be a notification or out-of-order
                     tracing::debug!("skipping response with non-matching id");
                     continue;
                 }
-
                 if let Some(error) = response.error {
                     return Err(McpError::ServerError {
                         code: error.code,
                         message: error.message,
                     });
                 }
-
-                let result = response.result.unwrap_or(serde_json::Value::Null);
-                if result_has_list_changed(&result) {
-                    mark_list_changed_for_method(&flags, method);
-                }
-
-                return Ok(result);
+                return Ok(response.result.unwrap_or(serde_json::Value::Null));
             }
         };
 
         let ((), result) = tokio::try_join!(write_fut, read_fut)?;
         Ok(result)
     }
+
+    async fn send_notification(
+        &mut self,
+        notification: &serde_json::Value,
+    ) -> Result<(), McpError> {
+        let mut line = serde_json::to_string(notification)?;
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) {
+        let _ = self.child.kill().await;
+    }
 }
 
-impl Drop for McpClient {
-    /// Belt-and-suspenders teardown (DS-2). `Command::kill_on_drop(true)`
-    /// already arranges for the runtime to reap the child when this struct
-    /// drops, but that relies on the tokio runtime still being alive to do
-    /// the reaping. Issuing a synchronous `start_kill()` here sends the kill
-    /// signal immediately and unconditionally, so a child is never leaked even
-    /// if the client is dropped on a panic, a cancelled task, or an error
-    /// during `connect`'s `initialize()`. It is harmless if the process has
-    /// already exited or `shutdown()` was called.
+impl Drop for StdioTransport {
+    /// Belt-and-suspenders teardown (DS-2): `kill_on_drop` already arranges for
+    /// the runtime to reap the child, but issuing `start_kill()` here sends the
+    /// signal immediately even if the runtime is shutting down. Harmless if the
+    /// process already exited or `shutdown()` was called.
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+/// How an [`HttpTransport`] authenticates each request.
+enum Credential {
+    /// No `Authorization` header (e.g. a single-user local endpoint).
+    None,
+    /// A verbatim bearer token from `secrets.toml` — used as-is, never refreshed.
+    Static(String),
+    /// An OAuth 2.0 provider that mints and refreshes access tokens on demand.
+    OAuth(Arc<oauth::TokenProvider>),
+}
+
+impl Credential {
+    fn from_bearer(bearer: Option<String>) -> Self {
+        match bearer {
+            Some(token) => Credential::Static(token),
+            None => Credential::None,
+        }
+    }
+
+    fn is_oauth(&self) -> bool {
+        matches!(self, Credential::OAuth(_))
+    }
+
+    /// The bearer token to attach right now — refreshing an OAuth token first
+    /// if it is missing or near expiry. `None` means send no `Authorization`.
+    async fn token(&self) -> Result<Option<String>, McpError> {
+        Ok(match self {
+            Credential::None => None,
+            Credential::Static(token) => Some(token.clone()),
+            Credential::OAuth(provider) => Some(provider.current_token().await?),
+        })
+    }
+
+    /// Force a fresh OAuth token (after a `401`); other credential kinds have
+    /// nothing to refresh and just return their current token.
+    async fn refreshed_token(&self) -> Result<Option<String>, McpError> {
+        match self {
+            Credential::OAuth(provider) => Ok(Some(provider.force_refresh().await?)),
+            other => other.token().await,
+        }
+    }
+}
+
+/// JSON-RPC over a remote streamable-HTTP MCP endpoint. Each request is a POST
+/// whose reply is either a single JSON body or a `text/event-stream` (SSE)
+/// sequence of JSON-RPC messages.
+struct HttpTransport {
+    client: reqwest::Client,
+    url: String,
+    /// How to authenticate each request: none, a static bearer, or an OAuth
+    /// provider that mints/refreshes access tokens on demand.
+    credential: Credential,
+    /// `Mcp-Session-Id` assigned by the server on initialize; echoed on
+    /// subsequent requests when present.
+    session_id: Option<String>,
+}
+
+impl HttpTransport {
+    fn new(url: &str, credential: Credential) -> Result<Self, McpError> {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(McpError::Http(format!(
+                "remote MCP url must be http(s): {url}"
+            )));
+        }
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| McpError::Http(format!("failed to build HTTP client: {e}")))?;
+        Ok(Self {
+            client,
+            url: url.to_string(),
+            credential,
+            session_id: None,
+        })
+    }
+
+    /// Send one POST and return `(status, content_type, body)`. Captures the
+    /// session id and caps the body size. `token`, when set, is attached as
+    /// `Authorization: Bearer`.
+    async fn send_once(
+        &mut self,
+        payload: &serde_json::Value,
+        method: &str,
+        token: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(reqwest::StatusCode, String, String), McpError> {
+        let mut builder = self
+            .client
+            .post(&self.url)
+            .header(ACCEPT, "application/json, text/event-stream")
+            .json(payload);
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+        if let Some(session) = &self.session_id {
+            builder = builder.header("Mcp-Session-Id", session);
+        }
+
+        let response = tokio::time::timeout(timeout, builder.send())
+            .await
+            .map_err(|_| McpError::Timeout {
+                method: method.to_string(),
+                after: timeout,
+            })?
+            .map_err(|e| McpError::Http(format!("request to {} failed: {e}", self.url)))?;
+
+        self.capture_session(&response);
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = read_body_capped(response, timeout, method, MAX_HTTP_BODY_BYTES).await?;
+        Ok((status, content_type, body))
+    }
+
+    /// Capture the `Mcp-Session-Id` header the first time the server assigns one.
+    fn capture_session(&mut self, response: &reqwest::Response) {
+        if self.session_id.is_none()
+            && let Some(session) = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+        {
+            self.session_id = Some(session.to_string());
+        }
+    }
+
+    async fn round_trip(
+        &mut self,
+        request: &JsonRpcRequest,
+        timeout: Duration,
+        flags: &ListChangeFlags,
+    ) -> Result<serde_json::Value, McpError> {
+        let payload = serde_json::to_value(request)?;
+        let method = request.method.as_str();
+
+        let token = self.credential.token().await?;
+        let (status, content_type, body) = self
+            .send_once(&payload, method, token.as_deref(), timeout)
+            .await?;
+
+        // If the resource server rejects the (possibly stale) access token,
+        // mint a fresh one and retry once. Only OAuth credentials can refresh;
+        // a static bearer or no-auth request returns the 401 as-is.
+        let (status, content_type, body) =
+            if status == reqwest::StatusCode::UNAUTHORIZED && self.credential.is_oauth() {
+                tracing::info!(
+                    "MCP HTTP endpoint {} returned 401; refreshing OAuth token and retrying",
+                    self.url
+                );
+                let token = self.credential.refreshed_token().await?;
+                self.send_once(&payload, method, token.as_deref(), timeout)
+                    .await?
+            } else {
+                (status, content_type, body)
+            };
+
+        if !status.is_success() {
+            return Err(McpError::Http(format!(
+                "{} returned HTTP {status}: {}",
+                self.url,
+                body.chars().take(500).collect::<String>()
+            )));
+        }
+
+        let messages = if content_type.contains("text/event-stream") {
+            parse_sse_messages(&body)
+        } else if body.trim().is_empty() {
+            Vec::new()
+        } else {
+            match serde_json::from_str::<serde_json::Value>(body.trim())? {
+                serde_json::Value::Array(items) => items,
+                other => vec![other],
+            }
+        };
+
+        for message in messages {
+            if let Some(list_kind) = list_kind_from_notification(&message) {
+                mark_list_changed_for_kind(flags, list_kind);
+                continue;
+            }
+            let response: JsonRpcResponse = match serde_json::from_value(message) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if response.id != Some(serde_json::Value::Number(request.id.into())) {
+                continue;
+            }
+            if let Some(error) = response.error {
+                return Err(McpError::ServerError {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+            return Ok(response.result.unwrap_or(serde_json::Value::Null));
+        }
+
+        Err(McpError::UnexpectedResponse(format!(
+            "no JSON-RPC response with id {} in HTTP reply from {}",
+            request.id, self.url
+        )))
+    }
+
+    async fn send_notification(
+        &mut self,
+        notification: &serde_json::Value,
+    ) -> Result<(), McpError> {
+        // Resolve (and, for OAuth, proactively refresh) the token first.
+        let token = self.credential.token().await?;
+        let mut builder = self
+            .client
+            .post(&self.url)
+            .header(ACCEPT, "application/json, text/event-stream")
+            .json(notification);
+        if let Some(token) = &token {
+            builder = builder.bearer_auth(token);
+        }
+        if let Some(session) = &self.session_id {
+            builder = builder.header("Mcp-Session-Id", session);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| McpError::Http(format!("notification to {} failed: {e}", self.url)))?;
+        self.capture_session(&response);
+        // A notification carries no response payload; 200/202 are both fine and
+        // any body is intentionally ignored.
+        Ok(())
+    }
+}
+
+/// Read an HTTP response body, bounding both total size ([`MAX_HTTP_BODY_BYTES`],
+/// the streamable-HTTP analogue of the stdio `MAX_LINE_BYTES` cap) and the
+/// overall read time, so a slow or oversized remote reply fails the request
+/// instead of hanging or exhausting memory.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    timeout: Duration,
+    method: &str,
+    max: usize,
+) -> Result<String, McpError> {
+    let read = async {
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| McpError::Http(format!("reading response body failed: {e}")))?
+        {
+            if buf.len() + chunk.len() > max {
+                return Err(McpError::Http(format!(
+                    "response body from remote MCP server exceeded {max} bytes"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        String::from_utf8(buf)
+            .map_err(|e| McpError::Http(format!("response body was not valid UTF-8: {e}")))
+    };
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| McpError::Timeout {
+            method: method.to_string(),
+            after: timeout,
+        })?
+}
+
+/// Parse an SSE (`text/event-stream`) body into the JSON values carried by its
+/// `data:` fields. Events are separated by blank lines; multiple `data:` lines
+/// within one event are joined with newlines (per the SSE spec).
+fn parse_sse_messages(body: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for block in body.split("\n\n") {
+        let mut data = String::new();
+        for raw in block.lines() {
+            let raw = raw.strip_suffix('\r').unwrap_or(raw);
+            if let Some(rest) = raw.strip_prefix("data:") {
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(rest);
+            }
+        }
+        let trimmed = data.trim();
+        if !trimmed.is_empty()
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            out.push(value);
+        }
+    }
+    out
 }
 
 /// Read one newline-terminated line from `reader`, capped at `max` bytes

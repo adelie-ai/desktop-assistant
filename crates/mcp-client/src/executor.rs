@@ -9,16 +9,77 @@ use tokio::sync::{Mutex, RwLock};
 
 pub use crate::builtin::BuiltinToolService;
 use crate::config::save_mcp_configs;
+use crate::oauth::{InMemoryTokenStore, OAuthClient, TokenProvider, TokenStore};
 use crate::{ListChangeFlags, McpClient, McpError};
 
 fn default_enabled() -> bool {
     true
 }
 
+/// HTTP transport settings for reaching a remote MCP server (streamable-HTTP).
+///
+/// The presence of this table on an [`McpServerConfig`] selects the HTTP
+/// transport instead of spawning `command` — so pointing Adele at Google's
+/// hosted Gmail/Calendar/Drive/Chat MCP endpoints is one `[servers.http]`
+/// table per service, and one server entry per account (with its own
+/// `namespace` + `auth_bearer_secret`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HttpTransportConfig {
+    /// Remote MCP endpoint URL, e.g. `https://gmailmcp.googleapis.com/mcp/v1`.
+    pub url: String,
+    /// Secret ID (looked up in secrets.toml) whose value is sent verbatim as an
+    /// `Authorization: Bearer` token — a static token the daemon never
+    /// refreshes. Prefer [`Self::oauth`] for tokens that expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_bearer_secret: Option<String>,
+    /// When set, authenticate with OAuth 2.0: the daemon exchanges a stored
+    /// refresh token for short-lived access tokens and refreshes them on demand
+    /// (and on `401`). Takes precedence over [`Self::auth_bearer_secret`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthServerConfig>,
+}
+
+/// OAuth 2.0 settings for a remote MCP server (issue #455 follow-up).
+///
+/// Secret **references** (`*_ref`) name entries in `secrets.toml`; the secret
+/// values themselves never live in `mcp_servers.toml`. `client_id`, the URLs,
+/// and scopes are non-secret and stored inline. The interactive login
+/// (`desktop-assistant --mcp-oauth-login <server>`) uses `authorize_url` +
+/// `scopes` to mint the initial refresh token.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OAuthServerConfig {
+    /// OAuth client identifier (public; safe to store inline).
+    pub client_id: String,
+    /// Token endpoint, e.g. `https://oauth2.googleapis.com/token`.
+    pub token_url: String,
+    /// Secret ID (secrets.toml) holding the refresh token that bootstraps the
+    /// daemon's access-token refresh. Obtain it once via the interactive login.
+    pub refresh_token_ref: String,
+    /// Secret ID (secrets.toml) for the OAuth client secret. Omit for public
+    /// (PKCE) clients that have no client secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_ref: Option<String>,
+    /// Authorization endpoint (used only by the interactive login flow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize_url: Option<String>,
+    /// Scopes requested by the interactive login flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// Token-store key (defaults to the server `name`). Use the account email
+    /// so multiple servers for one account can share a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Seconds before hard expiry at which to refresh proactively (default 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_skew_seconds: Option<i64>,
+}
+
 /// Configuration for an MCP server.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
+    /// Command to spawn for a stdio server. Ignored when [`Self::http`] is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -36,6 +97,10 @@ pub struct McpServerConfig {
     /// Keys are env var names, values are secret IDs.
     #[serde(default)]
     pub env_secrets: HashMap<String, String>,
+    /// When set, reach this server over HTTP (streamable-HTTP) instead of
+    /// spawning `command`. See [`HttpTransportConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpTransportConfig>,
 }
 
 /// Status information for an MCP server.
@@ -95,6 +160,13 @@ pub struct McpExecutorState {
     config_path: PathBuf,
     /// Secrets loaded from secrets.toml, keyed by secret ID.
     secrets: HashMap<String, String>,
+    /// Backend for persisting OAuth tokens across restarts (issue #455). The
+    /// executor is deliberately agnostic about *where* tokens live: it holds a
+    /// [`TokenStore`] trait object, defaulting to an in-memory store, so the
+    /// daemon can inject a keyring-backed one (or, later, a server-side store)
+    /// without any change here. Shared across all OAuth servers, keyed by
+    /// account, so services for one account can share a cached token.
+    token_store: Arc<dyn TokenStore>,
 }
 
 impl McpExecutorState {
@@ -113,6 +185,95 @@ impl McpExecutorState {
             env.insert(var_name.clone(), value.clone());
         }
         Ok(env)
+    }
+
+    /// Look up a required secret by ID, failing closed with a message that
+    /// names the field and server so a misconfiguration is easy to fix.
+    fn require_secret(
+        &self,
+        secret_id: &str,
+        server_name: &str,
+        field: &str,
+    ) -> Result<String, McpError> {
+        self.secrets.get(secret_id).cloned().ok_or_else(|| {
+            McpError::UnexpectedResponse(format!(
+                "secret '{secret_id}' (referenced by {field} in server '{server_name}') not found in secrets.toml"
+            ))
+        })
+    }
+
+    /// Resolve the bearer token for an HTTP transport from secrets.toml, if the
+    /// config references one. A missing secret is an error (fail closed) rather
+    /// than silently connecting unauthenticated.
+    fn resolve_bearer(
+        &self,
+        http: &HttpTransportConfig,
+        server_name: &str,
+    ) -> Result<Option<String>, McpError> {
+        match &http.auth_bearer_secret {
+            None => Ok(None),
+            Some(secret_id) => Ok(Some(self.require_secret(
+                secret_id,
+                server_name,
+                "http.auth_bearer_secret",
+            )?)),
+        }
+    }
+
+    /// Build an OAuth [`TokenProvider`] for a server from its config + secrets.
+    /// Fails closed if the client secret or bootstrap refresh token is missing.
+    fn build_token_provider(
+        &self,
+        oauth: &OAuthServerConfig,
+        server_name: &str,
+    ) -> Result<TokenProvider, McpError> {
+        let client_secret = match &oauth.client_secret_ref {
+            Some(id) => {
+                Some(self.require_secret(id, server_name, "http.oauth.client_secret_ref")?)
+            }
+            None => None,
+        };
+        let client = OAuthClient::new(&oauth.client_id, client_secret, &oauth.token_url)?;
+        let refresh_token = self.require_secret(
+            &oauth.refresh_token_ref,
+            server_name,
+            "http.oauth.refresh_token_ref",
+        )?;
+        let account_key = oauth
+            .account
+            .clone()
+            .unwrap_or_else(|| server_name.to_string());
+        let skew = chrono::Duration::seconds(oauth.refresh_skew_seconds.unwrap_or(60));
+        Ok(TokenProvider::bootstrap_from_refresh_token(
+            client,
+            account_key,
+            Arc::clone(&self.token_store),
+            skew,
+            refresh_token,
+        ))
+    }
+
+    /// Connect to a server using its configured transport: HTTP when
+    /// [`McpServerConfig::http`] is set, otherwise a stdio child process. An
+    /// HTTP server authenticates via OAuth when `http.oauth` is present, else a
+    /// static bearer.
+    async fn connect_client(&self, config: &McpServerConfig) -> Result<McpClient, McpError> {
+        match &config.http {
+            Some(http) => match &http.oauth {
+                Some(oauth) => {
+                    let provider = self.build_token_provider(oauth, &config.name)?;
+                    McpClient::connect_http_oauth(&http.url, Arc::new(provider)).await
+                }
+                None => {
+                    let bearer = self.resolve_bearer(http, &config.name)?;
+                    McpClient::connect_http(&http.url, bearer).await
+                }
+            },
+            None => {
+                let env = self.resolve_env(config)?;
+                McpClient::connect(&config.command, &config.args, &env).await
+            }
+        }
     }
 
     async fn maybe_refresh_metadata(&self) -> Result<(), McpError> {
@@ -283,11 +444,10 @@ impl McpExecutorState {
         tracing::info!(
             "connecting to MCP server '{}': {}",
             config.name,
-            config.command
+            connect_target(config)
         );
 
-        let env = self.resolve_env(config)?;
-        match McpClient::connect(&config.command, &config.args, &env).await {
+        match self.connect_client(config).await {
             Ok(client) => {
                 let mut clients = self.clients.write().await;
                 clients[idx] = Some(ClientHandle::new(client));
@@ -593,6 +753,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
                 secrets: HashMap::new(),
+                token_store: Arc::new(InMemoryTokenStore::default()),
             }),
             builtin_tools,
         }
@@ -603,6 +764,28 @@ impl McpToolExecutor {
         builtin_tools: BuiltinToolService,
         config_path: PathBuf,
         secrets: HashMap<String, String>,
+    ) -> Self {
+        Self::with_builtin_tools_config_and_token_store(
+            configs,
+            builtin_tools,
+            config_path,
+            secrets,
+            Arc::new(InMemoryTokenStore::default()),
+        )
+    }
+
+    /// Like [`Self::with_builtin_tools_and_config_path`] but with an injected
+    /// [`TokenStore`] for persisting OAuth tokens (issue #455). The daemon
+    /// passes a keyring-backed store here; tests and the default path get an
+    /// in-memory one. Keeping this a trait object means the persistence backend
+    /// (keyring today, possibly a server-side store later) is swappable without
+    /// touching the transport or provider code.
+    pub fn with_builtin_tools_config_and_token_store(
+        configs: Vec<McpServerConfig>,
+        builtin_tools: BuiltinToolService,
+        config_path: PathBuf,
+        secrets: HashMap<String, String>,
+        token_store: Arc<dyn TokenStore>,
     ) -> Self {
         let clients: Vec<Option<ClientHandle>> = (0..configs.len()).map(|_| None).collect();
         Self {
@@ -615,6 +798,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
                 secrets,
+                token_store,
             }),
             builtin_tools,
         }
@@ -650,14 +834,10 @@ impl McpToolExecutor {
                 tracing::info!(
                     "connecting to MCP server '{}': {}",
                     config.name,
-                    config.command
+                    connect_target(config)
                 );
 
-                let env = self.state.resolve_env(config).unwrap_or_else(|e| {
-                    tracing::error!("failed to resolve secrets for '{}': {e}", config.name);
-                    config.env.clone()
-                });
-                match McpClient::connect(&config.command, &config.args, &env).await {
+                match self.state.connect_client(config).await {
                     Ok(client) => {
                         clients[idx] = Some(ClientHandle::new(client));
                     }
@@ -890,6 +1070,15 @@ fn is_method_not_found(error: &McpError) -> bool {
     matches!(error, McpError::ServerError { code: -32601, .. })
 }
 
+/// Human-facing connection target for logs: the HTTP url when configured,
+/// otherwise the stdio command.
+fn connect_target(config: &McpServerConfig) -> &str {
+    match &config.http {
+        Some(http) => http.url.as_str(),
+        None => config.command.as_str(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +1101,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         };
         assert_eq!(config.name, "fileio");
         assert_eq!(config.command, "fileio-mcp");
@@ -930,6 +1120,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         };
         assert_eq!(config.namespace.as_deref(), Some("jira"));
     }
@@ -944,6 +1135,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         };
         assert_eq!(config.args.len(), 2);
     }
@@ -1020,6 +1212,7 @@ mod tests {
                 enabled: true,
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
+                http: None,
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -1029,6 +1222,7 @@ mod tests {
                 enabled: false,
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
+                http: None,
             },
         ];
         let executor = McpToolExecutor::new(configs);
@@ -1056,6 +1250,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();
@@ -1079,6 +1274,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();

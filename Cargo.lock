@@ -977,6 +977,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -1468,14 +1469,20 @@ dependencies = [
 name = "desktop-assistant-mcp-client"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "desktop-assistant-core",
+ "httpmock",
+ "rand 0.9.4",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
+ "url",
  "uuid",
 ]
 
