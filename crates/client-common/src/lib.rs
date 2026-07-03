@@ -25,5 +25,5 @@ pub use config::{ConnectionConfig, TransportMode, default_desktop_socket_path};
 pub use connector::Connector;
 pub use signal::SignalEvent;
 pub use transport::{AssistantClient, DropNotifier, TransportClient, connect_transport};
-pub use types::{ChatMessage, ConversationDetail, ConversationSummary};
+pub use types::{ChatMessage, ConversationDetail, ConversationSummary, MessageKind};
 pub use uds_client::UdsClient;

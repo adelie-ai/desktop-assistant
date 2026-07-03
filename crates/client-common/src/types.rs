@@ -8,5 +8,5 @@
 //! paths are unchanged.
 
 pub use desktop_assistant_api_model::client::{
-    ChatMessage, ConversationDetail, ConversationSummary,
+    ChatMessage, ConversationDetail, ConversationSummary, MessageKind,
 };

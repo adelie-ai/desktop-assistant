@@ -20,6 +20,22 @@ pub struct ConversationSummary {
     pub archived: bool,
 }
 
+/// Presentation metadata for a [`ChatMessage`] — explicit so a UI never has to
+/// parse `content` to know what a bubble is (voice#126). Daemon-sourced messages
+/// are always `Normal`; clients tag the lines they generate locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageKind {
+    /// An ordinary user / assistant / system / tool message.
+    #[default]
+    Normal,
+    /// A line Adele spoke aloud via the `say_this` voice tool (on-demand mode).
+    /// A real transcript entry, rendered with a "Spoken" marker.
+    Spoken,
+    /// A `say_this` the client did not speak because voice output is off — shown
+    /// as an inline "(speech mode disabled)" note.
+    SpeechDisabled,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     /// Stable monotonic UUIDv7 id (#1) — the message's identity, ordering key,
@@ -28,6 +44,8 @@ pub struct ChatMessage {
     pub id: String,
     pub role: String,
     pub content: String,
+    /// Presentation metadata (voice#126); `Normal` for daemon-sourced messages.
+    pub kind: MessageKind,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +76,9 @@ impl From<api::MessageView> for ChatMessage {
             id: value.id,
             role: value.role,
             content: value.content,
+            // Daemon-sourced messages are always ordinary; clients tag the lines
+            // they generate locally (voice#126).
+            kind: MessageKind::Normal,
         }
     }
 }
@@ -71,5 +92,28 @@ impl From<api::ConversationView> for ConversationDetail {
             model_selection: value.model_selection,
             conversation_personality: value.conversation_personality,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_kind_defaults_to_normal() {
+        assert_eq!(MessageKind::default(), MessageKind::Normal);
+    }
+
+    #[test]
+    fn daemon_messages_convert_as_normal_kind() {
+        // A wire MessageView -> client ChatMessage is always Normal; only clients
+        // tag Spoken / SpeechDisabled locally (voice#126).
+        let m = ChatMessage::from(api::MessageView {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: "hi".into(),
+        });
+        assert_eq!(m.kind, MessageKind::Normal);
+        assert_eq!(m.content, "hi");
     }
 }
