@@ -9,8 +9,10 @@
 //! Phase 1 (this module) provides the config layer; the host orchestrator and
 //! the `Connector` registration bridge land in follow-up phases.
 
+pub mod bridge;
 pub mod config;
 pub mod host;
 
+pub use bridge::{ClientToolResultSink, dispatch_client_tool_call, merge_registrations};
 pub use config::{ClientMcpConfig, McpServerConfig, SurfaceConfig, default_client_mcp_path};
 pub use host::McpHost;
