@@ -545,6 +545,10 @@ impl ConnectionsService for DaemonConnectionsService {
                 .purposes
                 .get(PurposeKind::Titling)
                 .map(purpose_to_payload),
+            voice: config
+                .purposes
+                .get(PurposeKind::Voice)
+                .map(purpose_to_payload),
         })
     }
 
@@ -611,6 +615,18 @@ pub trait ConversationSelectionStore: Send + Sync {
         id: &ConversationId,
         personality: Option<&PersonalityOverride>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// Read the conversation's tags (e.g. `"voice"`, set by the voice daemon),
+    /// or an empty list when the backend doesn't track them. Used to route
+    /// voice-originated turns to the Voice purpose (voice#126). Defaults to
+    /// empty so stores that don't provide tags (tests, the JSON backend) simply
+    /// opt out of tag-based routing.
+    fn get_tags(
+        &self,
+        _id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, CoreError>> + Send {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// The complete per-turn LLM dispatch decision, resolved ONCE at the turn
@@ -705,6 +721,43 @@ where
                 effort: p.effort,
             })
         })
+    }
+
+    /// Resolve the Voice purpose from the current config, mirroring
+    /// [`Self::interactive_selection`] (voice#126). Returns `None` when
+    /// `[purposes.voice]` is absent or set to inherit (`connection`/`model =
+    /// primary`) — so voice turns then fall through to the interactive purpose,
+    /// i.e. adding the purpose is a no-op until an operator points it at a
+    /// concrete model.
+    fn voice_selection(&self) -> Option<ConversationModelSelection> {
+        let cfg = self.registry.snapshot_config();
+        cfg.purposes.get(PurposeKind::Voice).and_then(|p| {
+            let connection_id = match &p.connection {
+                ConnectionRef::Named(id) => id.as_str().to_string(),
+                ConnectionRef::Primary => return None,
+            };
+            let model_id = match &p.model {
+                ModelRef::Named(m) => m.clone(),
+                ModelRef::Primary => return None,
+            };
+            Some(ConversationModelSelection {
+                connection_id,
+                model_id,
+                effort: p.effort,
+            })
+        })
+    }
+
+    /// True when the conversation carries the `"voice"` tag the voice daemon
+    /// sets on its conversations — the signal that a turn is voice-originated
+    /// and should prefer the Voice purpose (voice#126).
+    async fn conversation_is_voice(&self, id: &ConversationId) -> Result<bool, CoreError> {
+        Ok(self
+            .selection_store
+            .get_tags(id)
+            .await?
+            .iter()
+            .any(|t| t == "voice"))
     }
 
     /// Resolve the effective personality for a send (#227, Phase 2):
@@ -1075,6 +1128,8 @@ where
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<PromptDispatchOutcome, CoreError> {
         let mut warnings: Vec<DispatchWarning> = Vec::new();
+        // Set when tier-3 routing sends this turn to the Voice purpose (voice#126).
+        let mut routed_via_voice = false;
 
         // Resolve the effective selection following priority:
         //   1. override (validate first; hard error if invalid)
@@ -1142,6 +1197,21 @@ where
                 }
                 None
             }
+        } else if let Some(voice_sel) = self.voice_selection() {
+            // Tier 3a (voice#126): no override and no stored selection. When a
+            // Voice purpose is configured with a concrete model AND this is a
+            // voice-originated conversation (tagged "voice" by the voice
+            // daemon), route the turn there — as a *user-driven* selection so
+            // the chosen model actually dispatches (the interactive fallback
+            // routes through the static primary and would drop the model id).
+            // Gating the tag lookup on a configured Voice purpose keeps this a
+            // zero-cost no-op for the common case where none is set.
+            if self.conversation_is_voice(conversation_id).await? {
+                routed_via_voice = true;
+                Some(voice_sel)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1167,7 +1237,7 @@ where
             .await?;
 
         tracing::info!(
-            purpose = ?PurposeKind::Interactive,
+            purpose = ?if routed_via_voice { PurposeKind::Voice } else { PurposeKind::Interactive },
             connection = ?chosen.as_ref().map(|(c, _)| c.as_str()),
             model = ?chosen.as_ref().map(|(_, m)| m.as_str()),
             source = ?budget.source,
@@ -1463,6 +1533,7 @@ mod tests {
     pub struct InMemoryConversationSelectionStore {
         inner: Mutex<std::collections::HashMap<String, ConversationModelSelection>>,
         personality: Mutex<std::collections::HashMap<String, PersonalityOverride>>,
+        tags: Mutex<std::collections::HashMap<String, Vec<String>>>,
     }
 
     impl Default for InMemoryConversationSelectionStore {
@@ -1470,7 +1541,18 @@ mod tests {
             Self {
                 inner: Mutex::new(std::collections::HashMap::new()),
                 personality: Mutex::new(std::collections::HashMap::new()),
+                tags: Mutex::new(std::collections::HashMap::new()),
             }
+        }
+    }
+
+    impl InMemoryConversationSelectionStore {
+        /// Test helper: pin a conversation's tags (e.g. `["voice"]`).
+        fn set_tags(&self, id: &str, tags: Vec<String>) {
+            self.tags
+                .lock()
+                .expect("tags store poisoned")
+                .insert(id.to_string(), tags);
         }
     }
 
@@ -1531,6 +1613,16 @@ mod tests {
                 }
             }
             Ok(())
+        }
+
+        async fn get_tags(&self, id: &ConversationId) -> Result<Vec<String>, CoreError> {
+            Ok(self
+                .tags
+                .lock()
+                .expect("tags store poisoned")
+                .get(&id.0)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
@@ -2822,6 +2914,146 @@ api_key_env = "{unused}"
                 captured[0],
                 Some("llama3".to_string()),
                 "interactive purpose must pin its model so dispatch matches the budget"
+            );
+        }
+
+        // ─── voice#126: Voice purpose routing by the "voice" tag ──────────
+
+        /// Build a handler whose config adds a concrete `[purposes.voice]`
+        /// (`local`/`qwen3`) on top of the interactive `local`/`llama3`.
+        fn make_handler_with_voice_purpose() -> (
+            Arc<RoutingConversationHandler<InMemoryConversationSelectionStore, CapturingInner>>,
+            Arc<CapturingInner>,
+            Arc<InMemoryConversationSelectionStore>,
+        ) {
+            let mut cfg = local_ollama_cfg();
+            cfg.purposes.set(
+                PurposeKind::Voice,
+                Some(PurposeConfig {
+                    connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    model: ModelRef::Named("qwen3".into()),
+                    effort: None,
+                    max_context_tokens: None,
+                }),
+            );
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(InMemoryConversationSelectionStore::default());
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+            (routing, inner, store)
+        }
+
+        #[tokio::test]
+        async fn voice_selection_none_unless_concrete() {
+            // Absent → None (inherit interactive).
+            let (routing, ..) = make_handler();
+            assert!(
+                routing.voice_selection().is_none(),
+                "an absent Voice purpose must inherit interactive (None)"
+            );
+            // Concrete connection+model → Some.
+            let (routing, ..) = make_handler_with_voice_purpose();
+            let sel = routing
+                .voice_selection()
+                .expect("a concrete Voice purpose must resolve");
+            assert_eq!(sel.connection_id, "local");
+            assert_eq!(sel.model_id, "qwen3");
+        }
+
+        #[tokio::test]
+        async fn conversation_is_voice_reads_the_voice_tag() {
+            let (routing, _inner, store) = make_handler_with_voice_purpose();
+            store.set_tags("v", vec!["voice".into()]);
+            store.set_tags("t", vec!["something-else".into()]);
+            assert!(
+                routing
+                    .conversation_is_voice(&ConversationId::from("v"))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !routing
+                    .conversation_is_voice(&ConversationId::from("t"))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !routing
+                    .conversation_is_voice(&ConversationId::from("unknown"))
+                    .await
+                    .unwrap(),
+                "an unknown conversation has no tags → not voice"
+            );
+        }
+
+        #[tokio::test]
+        async fn voice_tagged_conversation_dispatches_the_voice_model() {
+            // A "voice"-tagged conversation dispatches the Voice purpose's model
+            // (qwen3); an untagged one still uses interactive (llama3). voice#126.
+            let (routing, inner, store) = make_handler_with_voice_purpose();
+            store.set_tags("voice-conv", vec!["voice".into()]);
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("voice-conv"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("voice-tagged send should succeed");
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("text-conv"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("untagged send should succeed");
+
+            let captured = inner.captured_model_override.lock().unwrap();
+            assert_eq!(captured.len(), 2);
+            assert_eq!(
+                captured[0],
+                Some("qwen3".to_string()),
+                "a voice-tagged turn must dispatch the Voice purpose's model"
+            );
+            assert_eq!(
+                captured[1],
+                Some("llama3".to_string()),
+                "an untagged turn must keep dispatching the interactive model"
+            );
+        }
+
+        #[tokio::test]
+        async fn voice_purpose_absent_is_a_noop_for_voice_tagged_conversation() {
+            // Without [purposes.voice], a voice-tagged conversation still uses
+            // the interactive model — adding the variant is a no-op until
+            // an operator points it at a concrete model (voice#126).
+            let (routing, inner, _reg, store) = make_handler();
+            store.set_tags("voice-conv", vec!["voice".into()]);
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("voice-conv"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("send should succeed");
+            let captured = inner.captured_model_override.lock().unwrap();
+            assert_eq!(
+                captured[0],
+                Some("llama3".to_string()),
+                "no Voice purpose → the interactive model, even for a voice-tagged conversation"
             );
         }
 

@@ -1931,13 +1931,14 @@ where
                     .get_purposes()
                     .await
                     .map_err(Self::map_core_err)?;
-                Ok(api::CommandResult::Purposes(api::PurposesView {
+                Ok(api::CommandResult::Purposes(Box::new(api::PurposesView {
                     interactive: p.interactive.map(core_purpose_to_api),
                     dreaming: p.dreaming.map(core_purpose_to_api),
                     consolidation: p.consolidation.map(core_purpose_to_api),
                     embedding: p.embedding.map(core_purpose_to_api),
                     titling: p.titling.map(core_purpose_to_api),
-                }))
+                    voice: p.voice.map(core_purpose_to_api),
+                })))
             }
 
             api::Command::SetPurpose { purpose, config } => {

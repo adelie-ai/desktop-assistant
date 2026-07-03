@@ -252,7 +252,7 @@ mod purposes_serde {
                             return Err(M::Error::custom(format!(
                                 "unknown purpose `{key}`; expected one of \
                                  `interactive`, `dreaming`, `consolidation`, \
-                                 `embedding`, `titling`"
+                                 `embedding`, `titling`, `voice`"
                             )));
                         };
                         if out.get(kind).is_some() {
