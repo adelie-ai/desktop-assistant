@@ -86,6 +86,11 @@ pub struct McpServerView {
     pub oauth_authorized: Option<bool>,
     pub oauth_account: Option<String>,
     pub oauth_scopes: Vec<String>,
+    /// Non-secret OAuth request fields, echoed so the editor can prefill them on
+    /// edit without blanking a working server.
+    pub oauth_client_id: Option<String>,
+    pub oauth_token_url: Option<String>,
+    pub oauth_authorize_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]

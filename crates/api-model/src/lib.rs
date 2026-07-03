@@ -1014,6 +1014,14 @@ pub struct McpServerView {
     pub oauth_account: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oauth_scopes: Vec<String>,
+    /// Non-secret OAuth request fields, echoed so the editor can prefill them on
+    /// edit without blanking a working server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_token_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_authorize_url: Option<String>,
 }
 
 /// Wire form of the database settings (#314). Mirrors the core

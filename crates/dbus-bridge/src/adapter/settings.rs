@@ -1201,6 +1201,9 @@ mod tests {
             oauth_authorized: Some(false),
             oauth_account: Some("dave@spadea.tech".into()),
             oauth_scopes: vec!["https://www.googleapis.com/auth/gmail.modify".into()],
+            oauth_client_id: Some("1234.apps.googleusercontent.com".into()),
+            oauth_token_url: Some("https://oauth2.googleapis.com/token".into()),
+            oauth_authorize_url: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
         }]));
 
         let json = settings(Arc::clone(&t))
@@ -1218,6 +1221,8 @@ mod tests {
         assert_eq!(s["auth_kind"], "oauth");
         assert_eq!(s["oauth_authorized"], false);
         assert_eq!(s["oauth_account"], "dave@spadea.tech");
+        assert_eq!(s["oauth_client_id"], "1234.apps.googleusercontent.com");
+        assert_eq!(s["oauth_token_url"], "https://oauth2.googleapis.com/token");
         assert_eq!(s["configure_label"], "Sign in");
         assert_eq!(s["configure_command"][1], "--mcp-oauth-login");
         // A secret value must never appear anywhere in the descriptor.

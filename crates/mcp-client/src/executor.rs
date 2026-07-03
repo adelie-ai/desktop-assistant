@@ -145,6 +145,15 @@ pub struct McpServerStatusInfo {
     pub oauth_account: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub oauth_scopes: Vec<String>,
+    /// Non-secret OAuth request fields, echoed so the editor can prefill them on
+    /// edit (otherwise a re-save would blank a working server). Secret *values*
+    /// are still never included — only these public config fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_token_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_authorize_url: Option<String>,
 }
 
 /// A captured connection failure, kept per server name so `status()` can report
@@ -680,6 +689,9 @@ impl McpControlHandle {
                     oauth_authorized,
                     oauth_account,
                     oauth_scopes,
+                    oauth_client_id: oauth.map(|o| o.client_id.clone()),
+                    oauth_token_url: oauth.map(|o| o.token_url.clone()),
+                    oauth_authorize_url: oauth.and_then(|o| o.authorize_url.clone()),
                 })
             })
             .collect()
@@ -1539,6 +1551,16 @@ mod tests {
                 .any(|a| a == "--mcp-oauth-login")
         );
         assert!(authless.configure_command.iter().any(|a| a == "authless"));
+        // Non-secret OAuth request fields are echoed so an edit can prefill them.
+        assert_eq!(authless.oauth_client_id.as_deref(), Some("cid"));
+        assert_eq!(
+            authless.oauth_token_url.as_deref(),
+            Some("https://oauth2.googleapis.com/token")
+        );
+        assert_eq!(
+            authless.oauth_authorize_url.as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth")
+        );
 
         // OAuth server, token present but the refresh was rejected -> auth_expired.
         let expired = by_name["expired"];

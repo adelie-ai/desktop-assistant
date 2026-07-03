@@ -290,6 +290,9 @@ impl SettingsService for DaemonSettingsService {
                 oauth_authorized: s.oauth_authorized,
                 oauth_account: s.oauth_account,
                 oauth_scopes: s.oauth_scopes,
+                oauth_client_id: s.oauth_client_id,
+                oauth_token_url: s.oauth_token_url,
+                oauth_authorize_url: s.oauth_authorize_url,
             })
             .collect())
     }
@@ -398,6 +401,9 @@ impl SettingsService for DaemonSettingsService {
                 oauth_authorized: s.oauth_authorized,
                 oauth_account: s.oauth_account,
                 oauth_scopes: s.oauth_scopes,
+                oauth_client_id: s.oauth_client_id,
+                oauth_token_url: s.oauth_token_url,
+                oauth_authorize_url: s.oauth_authorize_url,
             })
             .collect())
     }
