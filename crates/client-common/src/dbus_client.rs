@@ -495,6 +495,7 @@ impl DbusClient {
                     id: String::new(),
                     role,
                     content,
+                    kind: crate::MessageKind::Normal,
                 })
                 .collect(),
             model_selection: None,
