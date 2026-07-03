@@ -575,14 +575,15 @@ impl Connector {
     /// call — send the full list, not deltas — so re-register on every connect.
     /// Returns the count of tools the daemon accepted.
     ///
-    /// The Connector **remembers** the last registration and replays it
-    /// automatically after an auto-reconnect (#246), so a daemon restart doesn't
-    /// silently drop this client's tools — callers don't have to re-register on
-    /// every reconnect.
+    /// Works over **every** transport — UDS, WS, and D-Bus: client tools ride
+    /// the shared command channel that `as_commands()` exposes for all three
+    /// (#213/#320).
     ///
-    /// Client tools ride the socket command channel, so this is supported only
-    /// over the UDS/WS transports; the D-Bus transport has no command channel
-    /// for it and returns an error.
+    /// The Connector **remembers** the last registration. On UDS/WS it replays
+    /// it automatically after an auto-reconnect (#246), so a daemon restart
+    /// doesn't silently drop this client's tools. The D-Bus transport doesn't
+    /// auto-reconnect, so a D-Bus client re-registers when its own service
+    /// watcher re-drives the connect — remembered, just not auto-replayed.
     pub async fn register_client_tools(
         &self,
         tools: Vec<api::ClientToolRegistration>,
@@ -596,8 +597,7 @@ impl Connector {
                 Ok(count)
             }
             None => Err(anyhow::anyhow!(
-                "register_client_tools requires a socket transport (UDS or WS); \
-                 the D-Bus transport does not support client tools"
+                "register_client_tools: this transport has no command channel"
             )),
         }
     }
@@ -608,7 +608,7 @@ impl Connector {
     /// `task_id` and `tool_call_id` from the event and exactly one of
     /// `result` / `error` (encoded as `Ok` / `Err`).
     ///
-    /// Supported only over the socket transports (UDS/WS), like
+    /// Works over every transport (UDS/WS/D-Bus), like
     /// [`register_client_tools`](Self::register_client_tools).
     pub async fn submit_client_tool_result(
         &self,
@@ -623,8 +623,7 @@ impl Connector {
                     .await
             }
             None => Err(anyhow::anyhow!(
-                "submit_client_tool_result requires a socket transport (UDS or WS); \
-                 the D-Bus transport does not support client tools"
+                "submit_client_tool_result: this transport has no command channel"
             )),
         }
     }
