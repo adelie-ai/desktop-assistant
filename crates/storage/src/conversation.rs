@@ -148,6 +148,25 @@ impl PgConversationStore {
         })?;
         Ok(Some(ovr))
     }
+
+    /// Read the conversation's tags (e.g. `"voice"`). Empty when the id is
+    /// unknown or belongs to another user — fail-closed: an unroutable turn
+    /// simply doesn't get tag-based routing rather than erroring. Mirrors
+    /// [`Self::get_conversation_personality`] (voice#126).
+    pub async fn get_conversation_tags(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Vec<String>, CoreError> {
+        let user_id = current_user_id();
+        let row: Option<(Vec<String>,)> =
+            sqlx::query_as("SELECT tags FROM conversations WHERE user_id = $1 AND id = $2")
+                .bind(user_id.as_str())
+                .bind(&conversation_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(row.map(|(tags,)| tags).unwrap_or_default())
+    }
 }
 
 fn role_to_str(role: &Role) -> &'static str {

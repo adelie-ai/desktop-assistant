@@ -385,8 +385,9 @@ mod tests {
             consolidation: None,
             embedding: None,
             titling: None,
+            voice: None,
         };
-        let t = FakeTransport::replying(api::CommandResult::Purposes(purposes));
+        let t = FakeTransport::replying(api::CommandResult::Purposes(Box::new(purposes)));
         let json = adapter(Arc::clone(&t)).get_purposes().await.unwrap();
         assert!(matches!(t.last(), api::Command::GetPurposes));
         let back: api::CommandResult = serde_json::from_str(&json).unwrap();

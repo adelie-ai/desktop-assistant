@@ -411,6 +411,14 @@ impl api_surface::ConversationSelectionStore for SharedConversationStore {
         )
         .await
     }
+
+    async fn get_tags(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<Vec<String>, CoreError> {
+        <AnyConversationStore as api_surface::ConversationSelectionStore>::get_tags(&self.0, id)
+            .await
+    }
 }
 
 // Per-conversation model selection. Only the Postgres backend persists
@@ -471,6 +479,17 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
                 let _ = personality;
                 Ok(())
             }
+        }
+    }
+
+    async fn get_tags(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<Vec<String>, CoreError> {
+        match self {
+            Self::Postgres(s) => s.get_conversation_tags(id).await,
+            // No durable storage — no tags, so no tag-based voice routing.
+            Self::Json(_) => Ok(Vec::new()),
         }
     }
 }

@@ -50,6 +50,11 @@ pub enum PurposeKind {
     Embedding,
     /// Short-title generation for conversations.
     Titling,
+    /// The voice assistant's interactive turns (routed by the `"voice"`
+    /// conversation tag the voice daemon sets). Inherits interactive by default;
+    /// point it at a stronger tool-calling model when voice's on-demand speech
+    /// mode needs one (voice#126).
+    Voice,
 }
 
 impl PurposeKind {
@@ -61,6 +66,7 @@ impl PurposeKind {
             Self::Consolidation => "consolidation",
             Self::Embedding => "embedding",
             Self::Titling => "titling",
+            Self::Voice => "voice",
         }
     }
 
@@ -73,6 +79,7 @@ impl PurposeKind {
             "consolidation" => Some(Self::Consolidation),
             "embedding" => Some(Self::Embedding),
             "titling" => Some(Self::Titling),
+            "voice" => Some(Self::Voice),
             _ => None,
         }
     }
@@ -81,13 +88,14 @@ impl PurposeKind {
     /// tests and serialization round-trips. Order matches the schema
     /// migration order (interactive first because every other purpose
     /// can inherit from it).
-    pub fn all() -> [Self; 5] {
+    pub fn all() -> [Self; 6] {
         [
             Self::Interactive,
             Self::Dreaming,
             Self::Consolidation,
             Self::Embedding,
             Self::Titling,
+            Self::Voice,
         ]
     }
 }

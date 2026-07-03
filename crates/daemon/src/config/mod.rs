@@ -2627,6 +2627,10 @@ y = 2
             [purposes.titling]
             connection = "bedrock"
             model = "anthropic.claude-haiku-4-5"
+
+            [purposes.voice]
+            connection = "bedrock"
+            model = "us.anthropic.claude-sonnet-4-6"
         "#;
 
         let config: DaemonConfig = toml::from_str(toml_str).expect("parses cleanly");

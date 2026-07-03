@@ -421,6 +421,7 @@ pub struct PurposesView {
     pub consolidation: Option<PurposeConfigPayload>,
     pub embedding: Option<PurposeConfigPayload>,
     pub titling: Option<PurposeConfigPayload>,
+    pub voice: Option<PurposeConfigPayload>,
 }
 
 /// Inbound port for connection + purpose management (issue #11).

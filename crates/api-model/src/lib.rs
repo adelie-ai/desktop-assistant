@@ -505,7 +505,10 @@ pub enum CommandResult {
 
     Connections(Vec<ConnectionView>),
     Models(Vec<ModelListing>),
-    Purposes(PurposesView),
+    // Boxed to keep `CommandResult`/`WsFrame` variant sizes balanced
+    // (large_enum_variant): `PurposesView` is a wide struct and this variant is
+    // rare. `Box<T>` serializes transparently, so the wire format is unchanged.
+    Purposes(Box<PurposesView>),
 
     KnowledgeEntries(Vec<KnowledgeEntryView>),
     KnowledgeEntry(Option<KnowledgeEntryView>),
@@ -1207,6 +1210,8 @@ pub struct PurposesView {
     pub embedding: Option<PurposeConfigView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub titling: Option<PurposeConfigView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<PurposeConfigView>,
 }
 
 impl PurposesView {
@@ -1228,6 +1233,9 @@ impl PurposesView {
         }
         if let Some(v) = &self.titling {
             map.insert("titling".to_string(), v.clone());
+        }
+        if let Some(v) = &self.voice {
+            map.insert("voice".to_string(), v.clone());
         }
         map
     }
