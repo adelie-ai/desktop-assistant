@@ -490,24 +490,192 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
 /// browser + PKCE flow, and persists the resulting refresh token to
 /// secrets.toml under the configured `refresh_token_ref` (printing it as a
 /// fallback if the file can't be written).
-async fn run_mcp_oauth_login(server_name: &str) -> Result<()> {
-    use desktop_assistant_mcp_client::oauth::{OAuthClient, OAuthError, run_loopback_login};
-
+/// Interactive OAuth sign-in for a remote MCP credential. `identifier` is
+/// matched first against a reusable **service account** id (per-account
+/// sign-in, epic #477) and then, for back-compat, against a server name with an
+/// inline `[http.oauth]` block.
+async fn run_mcp_oauth_login(identifier: &str) -> Result<()> {
     let config_path = mcp_config::default_config_path();
     let configs = mcp_config::load_mcp_configs(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load MCP config: {e}"))?;
+    let accounts = mcp_config::load_service_accounts(&config_path)
+        .map_err(|e| anyhow::anyhow!("failed to load service accounts: {e}"))?;
+    let secrets_path = mcp_config::default_secrets_path();
+
+    // Prefer a named service account (one sign-in serves every server that
+    // references it). Fall back to a server's own inline oauth block.
+    if let Some(account) = accounts.iter().find(|a| a.id == identifier) {
+        run_account_login(account, &configs, &config_path, &secrets_path).await
+    } else {
+        run_inline_server_login(identifier, &configs, &config_path, &secrets_path).await
+    }
+}
+
+/// Run the loopback + PKCE flow and return the acquired token set. The browser
+/// is best-effort-launched; the URL is always printed as a fallback.
+async fn acquire_tokens(
+    client: &desktop_assistant_mcp_client::oauth::OAuthClient,
+    authorize_url: &str,
+    scopes: &[String],
+) -> Result<desktop_assistant_mcp_client::oauth::TokenSet> {
+    use desktop_assistant_mcp_client::oauth::{OAuthError, run_loopback_login};
+    let open_browser = |url: &str| -> Result<(), OAuthError> {
+        println!("\nIf your browser does not open automatically, visit:\n\n  {url}\n");
+        let _ = std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        Ok(())
+    };
+    run_loopback_login(
+        client,
+        authorize_url,
+        scopes,
+        "127.0.0.1",
+        std::time::Duration::from_secs(300),
+        open_browser,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("OAuth login failed: {e}"))
+}
+
+/// The scopes to request when signing in an account: what it already holds
+/// plus every referencing server's required scopes, deduped and deterministic.
+/// Signing in this union means one authorization covers every server and a
+/// re-sign never drops a previously-granted scope.
+fn union_scopes_for_account(
+    account: &desktop_assistant_mcp_client::executor::ServiceAccount,
+    configs: &[desktop_assistant_mcp_client::executor::McpServerConfig],
+) -> Vec<String> {
+    let mut scope_set: std::collections::BTreeSet<String> =
+        account.granted_scopes.iter().cloned().collect();
+    for c in configs {
+        if let Some(http) = &c.http
+            && http.oauth_account.as_deref() == Some(account.id.as_str())
+        {
+            scope_set.extend(http.scopes.iter().cloned());
+        }
+    }
+    scope_set.into_iter().collect()
+}
+
+/// Per-account sign-in: authorize the **union** of scopes needed across every
+/// server referencing the account (plus what it was already granted), persist
+/// the refresh token to `secrets.toml` under the account's `refresh_token_ref`,
+/// and record the granted scopes back on the account in `mcp_servers.toml`.
+async fn run_account_login(
+    account: &desktop_assistant_mcp_client::executor::ServiceAccount,
+    configs: &[desktop_assistant_mcp_client::executor::McpServerConfig],
+    config_path: &std::path::Path,
+    secrets_path: &std::path::Path,
+) -> Result<()> {
+    use desktop_assistant_mcp_client::oauth::OAuthClient;
+
+    let scopes = union_scopes_for_account(account, configs);
+    if scopes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "service account '{}' has no scopes to authorize; add a server that references it \
+             (oauth_account = \"{}\") with `scopes`",
+            account.id,
+            account.id
+        ));
+    }
+
+    let mut secrets = mcp_config::load_secrets(secrets_path)
+        .map_err(|e| anyhow::anyhow!("failed to load secrets: {e}"))?;
+    let client_secret = match &account.client_secret_ref {
+        Some(id) => Some(secrets.get(id).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "client_secret_ref '{id}' not found in {}",
+                secrets_path.display()
+            )
+        })?),
+        None => None,
+    };
+    let client = OAuthClient::new(&account.client_id, client_secret, &account.token_url)
+        .map_err(|e| anyhow::anyhow!("invalid service account configuration: {e}"))?;
+
+    println!("Authorizing service account '{}'…", account.id);
+    let tokens = acquire_tokens(&client, &account.authorize_url, &scopes).await?;
+    let refresh = tokens.refresh_token.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "authorization returned no refresh token; ensure the consent screen grants offline access"
+        )
+    })?;
+
+    // Persist the refresh token (secrets.toml).
+    secrets.insert(account.refresh_token_ref.clone(), refresh.clone());
+    match mcp_config::save_secrets(secrets_path, &secrets) {
+        Ok(()) => println!(
+            "\n✅ Saved refresh token for account '{}' to {} as '{}'.",
+            account.id,
+            secrets_path.display(),
+            account.refresh_token_ref
+        ),
+        Err(e) => {
+            println!(
+                "\n⚠️  Could not write {} automatically ({e}).",
+                secrets_path.display()
+            );
+            println!("Add this under [secrets] yourself, then restart the daemon:\n");
+            println!("  {} = \"{}\"", account.refresh_token_ref, refresh);
+        }
+    }
+
+    // Record the granted scopes on the account (mcp_servers.toml) so coverage
+    // checks pass. The provider reports them via `scope`; fall back to the
+    // requested union. Best-effort: a signed-in token still works if this write
+    // fails (coverage just reads stale until the file is fixed).
+    let granted: Vec<String> = tokens
+        .scope
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or(scopes);
+    match mcp_config::load_service_accounts(config_path) {
+        Ok(mut accts) => {
+            if let Some(a) = accts.iter_mut().find(|a| a.id == account.id) {
+                a.granted_scopes = granted;
+            }
+            if let Err(e) = mcp_config::save_service_accounts(config_path, &accts) {
+                println!("⚠️  Signed in, but could not record granted scopes: {e}");
+            }
+        }
+        Err(e) => println!("⚠️  Signed in, but could not reload service accounts: {e}"),
+    }
+
+    println!("The daemon will pick up the new sign-in on its next status check.");
+    Ok(())
+}
+
+/// Back-compat sign-in for a server carrying its own inline `[http.oauth]`
+/// block (no service-account reference).
+async fn run_inline_server_login(
+    server_name: &str,
+    configs: &[desktop_assistant_mcp_client::executor::McpServerConfig],
+    config_path: &std::path::Path,
+    secrets_path: &std::path::Path,
+) -> Result<()> {
+    use desktop_assistant_mcp_client::oauth::OAuthClient;
+
     let server = configs
         .iter()
         .find(|c| c.name == server_name)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no MCP server named '{server_name}' in {}",
+                "no service account or MCP server named '{server_name}' in {}",
                 config_path.display()
             )
         })?;
     let http = server.http.as_ref().ok_or_else(|| {
         anyhow::anyhow!("server '{server_name}' has no [servers.http] block (not a remote server)")
     })?;
+    if http.oauth_account.is_some() {
+        // Shouldn't happen (the dispatcher matches accounts first) but guard it.
+        return Err(anyhow::anyhow!(
+            "server '{server_name}' references a service account; sign in with that account id instead"
+        ));
+    }
     let oauth = http.oauth.as_ref().ok_or_else(|| {
         anyhow::anyhow!("server '{server_name}' has no [servers.http.oauth] block")
     })?;
@@ -520,8 +688,7 @@ async fn run_mcp_oauth_login(server_name: &str) -> Result<()> {
         ));
     }
 
-    let secrets_path = mcp_config::default_secrets_path();
-    let mut secrets = mcp_config::load_secrets(&secrets_path)
+    let mut secrets = mcp_config::load_secrets(secrets_path)
         .map_err(|e| anyhow::anyhow!("failed to load secrets: {e}"))?;
     let client_secret = match &oauth.client_secret_ref {
         Some(id) => Some(secrets.get(id).cloned().ok_or_else(|| {
@@ -532,33 +699,11 @@ async fn run_mcp_oauth_login(server_name: &str) -> Result<()> {
         })?),
         None => None,
     };
-
     let client = OAuthClient::new(&oauth.client_id, client_secret, &oauth.token_url)
         .map_err(|e| anyhow::anyhow!("invalid oauth configuration: {e}"))?;
 
     println!("Authorizing MCP server '{server_name}'…");
-    let open_browser = |url: &str| -> Result<(), OAuthError> {
-        println!("\nIf your browser does not open automatically, visit:\n\n  {url}\n");
-        // Best-effort launch; the URL is printed either way.
-        let _ = std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        Ok(())
-    };
-
-    let tokens = run_loopback_login(
-        &client,
-        authorize_url,
-        &oauth.scopes,
-        "127.0.0.1",
-        std::time::Duration::from_secs(300),
-        open_browser,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("OAuth login failed: {e}"))?;
-
+    let tokens = acquire_tokens(&client, authorize_url, &oauth.scopes).await?;
     let refresh = tokens.refresh_token.ok_or_else(|| {
         anyhow::anyhow!(
             "authorization returned no refresh token; ensure the consent screen grants offline access"
@@ -566,7 +711,7 @@ async fn run_mcp_oauth_login(server_name: &str) -> Result<()> {
     })?;
 
     secrets.insert(oauth.refresh_token_ref.clone(), refresh.clone());
-    match mcp_config::save_secrets(&secrets_path, &secrets) {
+    match mcp_config::save_secrets(secrets_path, &secrets) {
         Ok(()) => {
             println!(
                 "\n✅ Saved refresh token for '{server_name}' to {} as '{}'.",
@@ -636,10 +781,12 @@ async fn main() -> Result<()> {
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(pos) = args.iter().position(|a| a == "--mcp-oauth-login") {
-            let server_name = args.get(pos + 1).ok_or_else(|| {
-                anyhow::anyhow!("--mcp-oauth-login requires a server name argument")
+            let identifier = args.get(pos + 1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--mcp-oauth-login requires a service account id or server name argument"
+                )
             })?;
-            run_mcp_oauth_login(server_name).await?;
+            run_mcp_oauth_login(identifier).await?;
             return Ok(());
         }
     }
@@ -994,6 +1141,14 @@ async fn main() -> Result<()> {
         tracing::warn!("failed to load secrets: {e}");
         std::collections::HashMap::new()
     });
+    // Reusable outbound OAuth service accounts (#477) that HTTP servers may
+    // reference. Injected into the executor below before it starts, so
+    // account-referencing servers resolve their credential at connect time.
+    let mcp_service_accounts =
+        mcp_config::load_service_accounts(&mcp_config_path).unwrap_or_else(|e| {
+            tracing::warn!("failed to load MCP service accounts: {e}");
+            Vec::new()
+        });
 
     // Build the MCP tool executor with builtin tools
     let mut builtin_tools = BuiltinToolService::new();
@@ -1268,6 +1423,11 @@ async fn main() -> Result<()> {
     tool_executor
         .builtin_tools_mut()
         .set_mcp_control(mcp_handle.clone());
+    // Seed the service accounts before starting, so servers referencing one
+    // resolve their OAuth credential on the initial connect.
+    mcp_handle
+        .replace_service_accounts(mcp_service_accounts)
+        .await;
     if let Err(e) = tool_executor.start().await {
         tracing::warn!("failed to start MCP servers: {e}");
     }
@@ -2274,4 +2434,73 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use desktop_assistant_mcp_client::executor::{
+        HttpTransportConfig, McpServerConfig, ServiceAccount,
+    };
+
+    fn account(id: &str, granted: &[&str]) -> ServiceAccount {
+        ServiceAccount {
+            id: id.into(),
+            display_name: String::new(),
+            client_id: "cid".into(),
+            client_secret_ref: None,
+            authorize_url: "https://a".into(),
+            token_url: "https://t".into(),
+            account: Some("u@example.com".into()),
+            refresh_token_ref: "rt".into(),
+            granted_scopes: granted.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn account_server(name: &str, account_id: Option<&str>, scopes: &[&str]) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: String::new(),
+            args: vec![],
+            namespace: None,
+            enabled: true,
+            env: Default::default(),
+            env_secrets: Default::default(),
+            http: Some(HttpTransportConfig {
+                url: "https://x/mcp".into(),
+                auth_bearer_secret: None,
+                oauth: None,
+                oauth_account: account_id.map(String::from),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            }),
+        }
+    }
+
+    #[test]
+    fn union_scopes_merges_referencing_servers_and_prior_grants() {
+        let acct = account("work", &["prior.scope"]);
+        let configs = vec![
+            account_server("gmail", Some("work"), &["gmail.modify", "prior.scope"]),
+            account_server("calendar", Some("work"), &["calendar"]),
+            account_server("other", Some("personal"), &["ignored"]), // different account
+            account_server("bearerish", None, &["ignored"]),         // no account ref
+        ];
+        let scopes = union_scopes_for_account(&acct, &configs);
+        // Deduped + sorted (BTreeSet), only the two referencing servers + prior.
+        assert_eq!(
+            scopes,
+            vec![
+                "calendar".to_string(),
+                "gmail.modify".to_string(),
+                "prior.scope".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn union_scopes_empty_when_nothing_references_and_no_prior() {
+        let acct = account("work", &[]);
+        let configs = vec![account_server("gmail", Some("personal"), &["x"])];
+        assert!(union_scopes_for_account(&acct, &configs).is_empty());
+    }
 }
