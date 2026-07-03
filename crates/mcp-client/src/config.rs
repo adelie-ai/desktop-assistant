@@ -41,15 +41,17 @@ fn enforce_permissions(path: &std::path::Path) -> Result<(), McpError> {
     })
 }
 
-/// Load MCP server configurations from a TOML file.
-/// Returns an empty vec if the file doesn't exist.
-pub fn load_mcp_configs(path: &std::path::Path) -> Result<Vec<McpServerConfig>, McpError> {
+/// Read and parse the whole MCP config document (servers + service accounts).
+/// Returns a default (empty) config if the file doesn't exist. This is the one
+/// read path both the server and service-account helpers go through, so each
+/// save can preserve the sibling array (read-modify-write).
+fn load_full_config(path: &std::path::Path) -> Result<McpConfig, McpError> {
     if !path.exists() {
         tracing::debug!(
             "MCP config file not found at {}, no servers configured",
             path.display()
         );
-        return Ok(Vec::new());
+        return Ok(McpConfig::default());
     }
 
     enforce_permissions(path)?;
@@ -58,29 +60,13 @@ pub fn load_mcp_configs(path: &std::path::Path) -> Result<Vec<McpServerConfig>, 
         McpError::UnexpectedResponse(format!("failed to read MCP config file: {e}"))
     })?;
 
-    let config: McpConfig = toml::from_str(&contents).map_err(|e| {
-        McpError::UnexpectedResponse(format!("failed to parse MCP config file: {e}"))
-    })?;
-
-    tracing::info!(
-        "loaded {} MCP server config(s) from {}",
-        config.servers.len(),
-        path.display()
-    );
-    Ok(config.servers)
+    toml::from_str(&contents)
+        .map_err(|e| McpError::UnexpectedResponse(format!("failed to parse MCP config file: {e}")))
 }
 
-/// Save MCP server configurations to a TOML file.
-pub fn save_mcp_configs(
-    path: &std::path::Path,
-    configs: &[McpServerConfig],
-) -> Result<(), McpError> {
-    let config = McpConfig {
-        servers: configs.to_vec(),
-        ..Default::default()
-    };
-
-    let contents = toml::to_string_pretty(&config).map_err(|e| {
+/// Serialize and write the whole MCP config document at 0600.
+fn save_full_config(path: &std::path::Path, config: &McpConfig) -> Result<(), McpError> {
+    let contents = toml::to_string_pretty(config).map_err(|e| {
         McpError::UnexpectedResponse(format!("failed to serialize MCP config: {e}"))
     })?;
 
@@ -111,6 +97,30 @@ pub fn save_mcp_configs(
     }
 
     enforce_permissions(path)?;
+    Ok(())
+}
+
+/// Load MCP server configurations from a TOML file.
+/// Returns an empty vec if the file doesn't exist.
+pub fn load_mcp_configs(path: &std::path::Path) -> Result<Vec<McpServerConfig>, McpError> {
+    let config = load_full_config(path)?;
+    tracing::info!(
+        "loaded {} MCP server config(s) from {}",
+        config.servers.len(),
+        path.display()
+    );
+    Ok(config.servers)
+}
+
+/// Save MCP server configurations to a TOML file, preserving any service
+/// accounts already present (read-modify-write over the whole document).
+pub fn save_mcp_configs(
+    path: &std::path::Path,
+    configs: &[McpServerConfig],
+) -> Result<(), McpError> {
+    let mut config = load_full_config(path)?;
+    config.servers = configs.to_vec();
+    save_full_config(path, &config)?;
 
     tracing::info!(
         "saved {} MCP server config(s) to {}",
@@ -242,27 +252,81 @@ pub fn upsert_secret(
 /// Load the reusable service accounts from the MCP config file. Returns an
 /// empty vec if the file doesn't exist.
 pub fn load_service_accounts(path: &std::path::Path) -> Result<Vec<ServiceAccount>, McpError> {
-    let _ = path;
-    unimplemented!("load_service_accounts implemented in the follow-up commit")
+    Ok(load_full_config(path)?.service_accounts)
 }
 
 /// Persist the given service accounts into the MCP config file, preserving the
-/// server entries already there (read-modify-write). Validates the set first
-/// and fails closed — an invalid set is never written.
+/// server entries already there (read-modify-write over the whole document).
+/// Validates the set first and fails closed — an invalid set is never written,
+/// so a prior valid state on disk is left intact.
 pub fn save_service_accounts(
     path: &std::path::Path,
     accounts: &[ServiceAccount],
 ) -> Result<(), McpError> {
-    let _ = (path, accounts);
-    unimplemented!("save_service_accounts implemented in the follow-up commit")
+    validate_service_accounts(accounts)?;
+    let mut config = load_full_config(path)?;
+    config.service_accounts = accounts.to_vec();
+    save_full_config(path, &config)?;
+
+    tracing::info!(
+        "saved {} service account(s) to {}",
+        accounts.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// True for a syntactically well-formed `https://` URL with a non-empty host
+/// part. Deliberately conservative: outbound OAuth endpoints must be TLS.
+fn is_https_url(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Validate a single service account's fields (uniqueness is checked across the
+/// set by [`validate_service_accounts`]).
+fn validate_service_account(acct: &ServiceAccount) -> Result<(), McpError> {
+    if acct.id.trim().is_empty() {
+        return Err(McpError::InvalidConfig(
+            "service account id must not be empty".into(),
+        ));
+    }
+    if acct.client_id.trim().is_empty() {
+        return Err(McpError::InvalidConfig(format!(
+            "service account '{}': client_id must not be empty",
+            acct.id
+        )));
+    }
+    if !is_https_url(&acct.authorize_url) {
+        return Err(McpError::InvalidConfig(format!(
+            "service account '{}': authorize_url must be an https URL, got '{}'",
+            acct.id, acct.authorize_url
+        )));
+    }
+    if !is_https_url(&acct.token_url) {
+        return Err(McpError::InvalidConfig(format!(
+            "service account '{}': token_url must be an https URL, got '{}'",
+            acct.id, acct.token_url
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a set of service accounts: each individually valid (non-empty
 /// `id`/`client_id`, https `authorize_url`/`token_url`) and `id`s unique across
 /// the set. Returns a clear [`McpError::InvalidConfig`] on the first problem.
 pub fn validate_service_accounts(accounts: &[ServiceAccount]) -> Result<(), McpError> {
-    let _ = accounts;
-    unimplemented!("validate_service_accounts implemented in the follow-up commit")
+    let mut seen = std::collections::HashSet::new();
+    for acct in accounts {
+        validate_service_account(acct)?;
+        if !seen.insert(acct.id.as_str()) {
+            return Err(McpError::InvalidConfig(format!(
+                "duplicate service account id '{}'",
+                acct.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -752,7 +816,10 @@ granted_scopes = [
         let acct = &config.service_accounts[0];
         assert_eq!(acct.id, "work-google");
         assert_eq!(acct.client_id, "1234.apps.googleusercontent.com");
-        assert_eq!(acct.client_secret_ref.as_deref(), Some("google_client_secret"));
+        assert_eq!(
+            acct.client_secret_ref.as_deref(),
+            Some("google_client_secret")
+        );
         assert_eq!(acct.refresh_token_ref, "work_google_refresh");
         assert_eq!(acct.account.as_deref(), Some("user@example.com"));
         assert_eq!(acct.granted_scopes.len(), 2);
@@ -848,7 +915,11 @@ command = "fileio-mcp"
 
         // Adding accounts keeps the server.
         save_service_accounts(&path, &[sample_account("work-google")]).unwrap();
-        assert_eq!(load_mcp_configs(&path).unwrap().len(), 1, "server preserved");
+        assert_eq!(
+            load_mcp_configs(&path).unwrap().len(),
+            1,
+            "server preserved"
+        );
         assert_eq!(load_service_accounts(&path).unwrap().len(), 1);
 
         // Re-saving servers keeps the account.
