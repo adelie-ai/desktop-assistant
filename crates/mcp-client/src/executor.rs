@@ -75,6 +75,51 @@ pub struct OAuthServerConfig {
     pub refresh_skew_seconds: Option<i64>,
 }
 
+/// A named, reusable **outbound** OAuth credential — a *service account*.
+///
+/// This is the shared OAuth *client identity* that MCP servers reference by
+/// [`id`](Self::id) instead of duplicating an inline `[servers.http.oauth]`
+/// block per server (epic #477). Gmail/Calendar/Drive all sit behind one Google
+/// Cloud OAuth client, so their servers point at one account and sign in once.
+///
+/// Direction matters: here Adele is the OAuth *client* — it **holds** a refresh
+/// token, mints access tokens, and presents them **to** a remote service. That
+/// is the opposite of the inbound WebSocket API-auth config, where Adele is the
+/// relying party *validating* tokens clients present to it. The two are never
+/// interchangeable (see #480 for the type-safe validation).
+///
+/// Secret **references** (`*_ref`) name entries in `secrets.toml`; secret values
+/// never live in this struct nor in `mcp_servers.toml`. `client_id`, the URLs,
+/// `account`, and `granted_scopes` are non-secret and stored inline.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceAccount {
+    /// Stable, unique identifier a server references (e.g. `oauth_account = "<id>"`).
+    pub id: String,
+    /// Human-facing name shown in the settings UI (e.g. "Work Google Workspace").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// OAuth client identifier (public; safe to store inline).
+    pub client_id: String,
+    /// Secret ID (secrets.toml) for the OAuth client secret. Omit for public
+    /// (PKCE) clients that have no client secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_ref: Option<String>,
+    /// Authorization endpoint used by the interactive sign-in flow.
+    pub authorize_url: String,
+    /// Token endpoint, e.g. `https://oauth2.googleapis.com/token`.
+    pub token_url: String,
+    /// Token-store key — typically the account email. Every server referencing
+    /// this account shares the tokens minted under this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Secret ID (secrets.toml) holding the refresh token minted by sign-in.
+    pub refresh_token_ref: String,
+    /// Scopes actually granted by the last successful sign-in. A referencing
+    /// server's *required* scopes are checked against these for coverage (#479).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_scopes: Vec<String>,
+}
+
 /// Configuration for an MCP server.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
