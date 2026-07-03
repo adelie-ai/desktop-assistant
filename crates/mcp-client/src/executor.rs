@@ -196,8 +196,12 @@ pub struct McpExecutorState {
     cached_prompts: Mutex<Vec<serde_json::Value>>,
     /// Path to the MCP config file (for persisting changes).
     config_path: PathBuf,
-    /// Secrets loaded from secrets.toml, keyed by secret ID.
-    secrets: HashMap<String, String>,
+    /// Secrets loaded from secrets.toml, keyed by secret ID. Behind a
+    /// `std::sync::RwLock` (not the tokio one) so the sync resolve paths can
+    /// read it without `.await`, and the settings surface can swap in a fresh
+    /// snapshot via [`McpControlHandle::replace_secrets`] after a token is
+    /// minted out-of-band (the `--mcp-oauth-login` flow) or a secret is set.
+    secrets: std::sync::RwLock<HashMap<String, String>>,
     /// Backend for persisting OAuth tokens across restarts (issue #455). The
     /// executor is deliberately agnostic about *where* tokens live: it holds a
     /// [`TokenStore`] trait object, defaulting to an in-memory store, so the
@@ -217,8 +221,9 @@ impl McpExecutorState {
     /// Secret references override plaintext if both set the same var.
     fn resolve_env(&self, config: &McpServerConfig) -> Result<HashMap<String, String>, McpError> {
         let mut env = config.env.clone();
+        let secrets = self.secrets.read().expect("secrets lock poisoned");
         for (var_name, secret_id) in &config.env_secrets {
-            let value = self.secrets.get(secret_id).ok_or_else(|| {
+            let value = secrets.get(secret_id).ok_or_else(|| {
                 McpError::UnexpectedResponse(format!(
                     "secret '{}' (referenced by env_secrets.{} in server '{}') not found in secrets.toml",
                     secret_id, var_name, config.name
@@ -237,11 +242,16 @@ impl McpExecutorState {
         server_name: &str,
         field: &str,
     ) -> Result<String, McpError> {
-        self.secrets.get(secret_id).cloned().ok_or_else(|| {
-            McpError::UnexpectedResponse(format!(
-                "secret '{secret_id}' (referenced by {field} in server '{server_name}') not found in secrets.toml"
-            ))
-        })
+        self.secrets
+            .read()
+            .expect("secrets lock poisoned")
+            .get(secret_id)
+            .cloned()
+            .ok_or_else(|| {
+                McpError::UnexpectedResponse(format!(
+                    "secret '{secret_id}' (referenced by {field} in server '{server_name}') not found in secrets.toml"
+                ))
+            })
     }
 
     /// Resolve the bearer token for an HTTP transport from secrets.toml, if the
@@ -594,7 +604,12 @@ impl McpControlHandle {
                     None => (None, None, None, Vec::new()),
                     Some(http) => match &http.oauth {
                         Some(o) => {
-                            let authorized = self.state.secrets.contains_key(&o.refresh_token_ref);
+                            let authorized = self
+                                .state
+                                .secrets
+                                .read()
+                                .expect("secrets lock poisoned")
+                                .contains_key(&o.refresh_token_ref);
                             (
                                 Some("oauth".to_string()),
                                 Some(authorized),
@@ -776,6 +791,60 @@ impl McpControlHandle {
         Ok(())
     }
 
+    /// Add a server, or replace an existing one with the same name. This is the
+    /// settings-UI write path (transport-aware: stdio or http+bearer/oauth).
+    /// Unlike [`Self::add_server`] (which errors on a duplicate), it disconnects
+    /// any live client for that name, swaps in the new config, persists, and
+    /// reconnects when the new config is enabled.
+    pub async fn upsert_server(&self, config: McpServerConfig) -> Result<(), McpError> {
+        match self.state.find_server_index(&config.name).await {
+            Some(idx) => {
+                // Replace in place: stop the old client, swap config, persist,
+                // then reconnect if enabled. The connect-error for this name is
+                // cleared so a fixed config doesn't keep showing a stale failure.
+                self.state.disconnect_server(idx).await;
+                self.state.clear_connect_error(&config.name).await;
+                let auto_start = config.enabled;
+                {
+                    let mut configs = self.state.configs.write().await;
+                    configs[idx] = config;
+                }
+                self.persist_configs().await?;
+                if auto_start {
+                    let _ = self.state.connect_server(idx).await;
+                }
+                let _ = self.state.refresh_all_metadata().await;
+                Ok(())
+            }
+            None => self.add_server(config).await,
+        }
+    }
+
+    /// Swap in a fresh secrets snapshot (e.g. after `set_mcp_secret` writes
+    /// `secrets.toml`, or a reload before a status read). Clears the stale
+    /// connect error for any OAuth server whose bootstrap refresh token *just
+    /// appeared*, so a freshly signed-in server reads as authorized/`stopped`
+    /// rather than a stale `auth_expired`/`error`.
+    pub async fn replace_secrets(&self, secrets: HashMap<String, String>) {
+        let newly_authorized: Vec<String> = {
+            let configs = self.state.configs.read().await;
+            let old = self.state.secrets.read().expect("secrets lock poisoned");
+            configs
+                .iter()
+                .filter_map(|c| {
+                    let o = c.http.as_ref()?.oauth.as_ref()?;
+                    (!old.contains_key(&o.refresh_token_ref)
+                        && secrets.contains_key(&o.refresh_token_ref))
+                    .then(|| c.name.clone())
+                })
+                .collect()
+        };
+        *self.state.secrets.write().expect("secrets lock poisoned") = secrets;
+        for name in &newly_authorized {
+            self.state.clear_connect_error(name).await;
+        }
+    }
+
     /// Remove a server by name: auto-stop, remove config, persist.
     pub async fn remove_server(&self, name: &str) -> Result<(), McpError> {
         let idx =
@@ -887,7 +956,7 @@ impl McpToolExecutor {
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
-                secrets: HashMap::new(),
+                secrets: std::sync::RwLock::new(HashMap::new()),
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
             }),
@@ -933,7 +1002,7 @@ impl McpToolExecutor {
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
-                secrets,
+                secrets: std::sync::RwLock::new(secrets),
                 token_store,
                 last_errors: Mutex::new(HashMap::new()),
             }),
@@ -1551,6 +1620,91 @@ mod tests {
 
         let empty = handle.status(Some("nonexistent")).await;
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_server_adds_then_replaces_by_name() {
+        let dir = std::env::temp_dir().join("mcp_upsert_server_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let executor = McpToolExecutor::with_builtin_tools_and_config_path(
+            vec![],
+            BuiltinToolService::new(),
+            path.clone(),
+            HashMap::new(),
+        );
+        let handle = executor.control_handle();
+
+        let disabled_stdio = |command: &str| McpServerConfig {
+            name: "weather".into(),
+            command: command.into(),
+            args: vec!["--v1".into()],
+            namespace: None,
+            enabled: false, // disabled: no connect attempt, no child spawn
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: None,
+        };
+
+        // Absent -> added.
+        handle
+            .upsert_server(disabled_stdio("weather-mcp-v1"))
+            .await
+            .unwrap();
+        let status = handle.status(None).await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].command, "weather-mcp-v1");
+
+        // Same name -> replaced in place (not a second entry).
+        handle
+            .upsert_server(disabled_stdio("weather-mcp-v2"))
+            .await
+            .unwrap();
+        let status = handle.status(None).await;
+        assert_eq!(status.len(), 1, "upsert must replace, not duplicate");
+        assert_eq!(status[0].command, "weather-mcp-v2");
+
+        // Persisted to TOML so it survives a restart.
+        let on_disk = crate::config::load_mcp_configs(&path).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].command, "weather-mcp-v2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn replace_secrets_flips_authorized_and_clears_stale_error() {
+        let executor = McpToolExecutor::with_builtin_tools_config_and_token_store(
+            vec![oauth_server("cal", "cal_refresh")],
+            BuiltinToolService::new(),
+            std::path::PathBuf::new(),
+            HashMap::new(),
+            std::sync::Arc::new(crate::oauth::InMemoryTokenStore::default()),
+        );
+        // Simulate a prior failed connect (no token yet).
+        executor
+            .state
+            .record_connect_error("cal", &McpError::Http("connection refused".into()))
+            .await;
+        let handle = executor.control_handle();
+
+        // No token yet: needs_auth, unauthorized.
+        let before = handle.status(Some("cal")).await;
+        assert_eq!(before[0].status, "needs_auth");
+        assert_eq!(before[0].oauth_authorized, Some(false));
+
+        // Token appears out-of-band (the sign-in flow) -> reload the snapshot.
+        let mut secrets = HashMap::new();
+        secrets.insert("cal_refresh".to_string(), "rt-value".to_string());
+        handle.replace_secrets(secrets).await;
+
+        let after = handle.status(Some("cal")).await;
+        assert_eq!(after[0].oauth_authorized, Some(true));
+        // Stale error was cleared, so it reads as stopped (authorized, not yet
+        // connected) rather than a leftover `error`.
+        assert_eq!(after[0].status, "stopped");
+        assert!(after[0].detail.is_none());
     }
 
     #[tokio::test]

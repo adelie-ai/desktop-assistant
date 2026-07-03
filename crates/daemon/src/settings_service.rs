@@ -53,6 +53,23 @@ impl DaemonSettingsService {
             .as_ref()
             .ok_or_else(|| CoreError::SystemService("MCP control not configured".to_string()))
     }
+
+    /// Refresh the executor's in-memory secrets from `secrets.toml` so an OAuth
+    /// server's `authorized` state reflects a refresh token minted out-of-band
+    /// (the `--mcp-oauth-login` flow runs in a *separate* process, so the live
+    /// daemon otherwise never sees the new token until restart). Best-effort: a
+    /// missing/unreadable file leaves the current snapshot in place. Called
+    /// before every MCP status read so the settings UI reports the truth.
+    async fn reload_mcp_secrets(&self, handle: &McpControlHandle) {
+        let path = desktop_assistant_mcp_client::config::default_secrets_path();
+        // A missing file must not wipe the snapshot the daemon started with.
+        if !path.exists() {
+            return;
+        }
+        if let Ok(secrets) = desktop_assistant_mcp_client::config::load_secrets(&path) {
+            handle.replace_secrets(secrets).await;
+        }
+    }
 }
 
 impl SettingsService for DaemonSettingsService {
@@ -252,6 +269,7 @@ impl SettingsService for DaemonSettingsService {
 
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerView>, CoreError> {
         let handle = self.mcp_handle()?;
+        self.reload_mcp_secrets(handle).await;
         let statuses = handle.status(None).await;
         Ok(statuses
             .into_iter()
@@ -330,6 +348,7 @@ impl SettingsService for DaemonSettingsService {
         server: Option<String>,
     ) -> Result<Vec<McpServerView>, CoreError> {
         let handle = self.mcp_handle()?;
+        self.reload_mcp_secrets(handle).await;
         let server_ref = server.as_deref();
 
         match action.as_str() {
@@ -381,6 +400,46 @@ impl SettingsService for DaemonSettingsService {
                 oauth_scopes: s.oauth_scopes,
             })
             .collect())
+    }
+
+    async fn upsert_mcp_server(&self, config_json: String) -> Result<(), CoreError> {
+        let handle = self.mcp_handle()?;
+        let config: desktop_assistant_mcp_client::executor::McpServerConfig =
+            serde_json::from_str(&config_json)
+                .map_err(|e| CoreError::SystemService(format!("invalid MCP server config: {e}")))?;
+        if config.name.trim().is_empty() {
+            return Err(CoreError::SystemService(
+                "MCP server name must not be empty".into(),
+            ));
+        }
+        // A server is either stdio (a command) or remote (an http transport);
+        // reject a config that is neither so we never persist an unusable entry.
+        if config.command.trim().is_empty() && config.http.is_none() {
+            return Err(CoreError::SystemService(
+                "MCP server must set either a command (stdio) or an http transport".into(),
+            ));
+        }
+        handle
+            .upsert_server(config)
+            .await
+            .map_err(|e| CoreError::SystemService(e.to_string()))
+    }
+
+    async fn set_mcp_secret(&self, id: String, value: String) -> Result<(), CoreError> {
+        let handle = self.mcp_handle()?;
+        if id.trim().is_empty() {
+            return Err(CoreError::SystemService(
+                "secret id must not be empty".into(),
+            ));
+        }
+        // Read-modify-write secrets.toml (preserving other entries), then push
+        // the fresh snapshot into the live executor so a following upsert that
+        // references this id resolves without a restart.
+        let path = desktop_assistant_mcp_client::config::default_secrets_path();
+        let secrets = desktop_assistant_mcp_client::config::upsert_secret(&path, &id, &value)
+            .map_err(|e| CoreError::SystemService(e.to_string()))?;
+        handle.replace_secrets(secrets).await;
+        Ok(())
     }
 
     async fn get_ws_auth_settings(&self) -> Result<WsAuthSettingsView, CoreError> {

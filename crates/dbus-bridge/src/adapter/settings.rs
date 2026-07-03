@@ -611,6 +611,42 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         }
     }
 
+    /// Add or replace an MCP server from a full JSON `McpServerConfig`
+    /// descriptor (transport-aware: stdio, or http with bearer/oauth). Only
+    /// secret *refs* travel in the JSON; secret *values* go via
+    /// [`Self::set_mcp_secret`]. (MCP-servers-UI epic)
+    async fn upsert_mcp_server(&self, config_json: &str) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::UpsertMcpServer {
+                config_json: config_json.to_string(),
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected UpsertMcpServer result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Store one secret *value* (bearer token / OAuth client secret) into
+    /// `secrets.toml` (0600) under `id`, so an MCP config can reference it by id
+    /// without the user hand-editing files. (MCP-servers-UI epic)
+    async fn set_mcp_secret(&self, id: &str, value: &str) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::SetMcpSecret {
+                id: id.to_string(),
+                value: api::Secret(value.to_string()),
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetMcpSecret result: {other:?}"
+            ))),
+        }
+    }
+
     /// Perform an action (status/start/stop/restart) on MCP server(s). An empty
     /// `server` targets all of them. Returns the resulting server list as
     /// `Vec<(name, command, enabled, status, tool_count)>`.
@@ -1186,6 +1222,36 @@ mod tests {
         assert_eq!(s["configure_command"][1], "--mcp-oauth-login");
         // A secret value must never appear anywhere in the descriptor.
         assert!(!json.contains("refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn upsert_and_set_mcp_secret_build_their_commands() {
+        // Upsert forwards the JSON config verbatim.
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .upsert_mcp_server(r#"{"name":"gmail","http":{"url":"https://x/mcp"}}"#)
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::UpsertMcpServer { config_json } => {
+                assert!(config_json.contains("\"name\":\"gmail\""));
+            }
+            other => panic!("expected UpsertMcpServer, got {other:?}"),
+        }
+
+        // Set-secret forwards id + value (value wrapped so it can't leak in Debug).
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .set_mcp_secret("gmail_token", "tok-xyz")
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::SetMcpSecret { id, value } => {
+                assert_eq!(id, "gmail_token");
+                assert_eq!(value.into_inner(), "tok-xyz");
+            }
+            other => panic!("expected SetMcpSecret, got {other:?}"),
+        }
     }
 
     #[tokio::test]

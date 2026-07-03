@@ -637,6 +637,37 @@ pub trait SettingsService: Send + Sync {
         server: Option<String>,
     ) -> impl std::future::Future<Output = Result<Vec<McpServerView>, CoreError>> + Send;
 
+    /// Add or replace an MCP server from a JSON `McpServerConfig`
+    /// (transport-aware). Default errors; the daemon overrides it
+    /// (MCP-servers-UI epic). Only secret *refs* are in the JSON — values are
+    /// written via [`Self::set_mcp_secret`].
+    fn upsert_mcp_server(
+        &self,
+        config_json: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        let _ = config_json;
+        async {
+            Err(CoreError::SystemService(
+                "upsert_mcp_server not supported".into(),
+            ))
+        }
+    }
+
+    /// Store one secret *value* into `secrets.toml` under `id`. Default errors;
+    /// the daemon overrides it (MCP-servers-UI epic).
+    fn set_mcp_secret(
+        &self,
+        id: String,
+        value: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        let _ = (id, value);
+        async {
+            Err(CoreError::SystemService(
+                "set_mcp_secret not supported".into(),
+            ))
+        }
+    }
+
     fn get_ws_auth_settings(
         &self,
     ) -> impl std::future::Future<Output = Result<WsAuthSettingsView, CoreError>> + Send;

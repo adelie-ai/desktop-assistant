@@ -14,6 +14,28 @@ pub mod client;
 pub mod signal;
 pub use signal::{SignalEvent, map_event_to_signal};
 
+/// A secret string that never reveals its value in `Debug` output, so it can't
+/// leak into logs when a [`Command`] carrying it is formatted (`{:?}`). Serde
+/// treats it transparently (it (de)serializes exactly like the inner `String`),
+/// so the wire form is unchanged. Used for `Command::SetMcpSecret`'s value.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl Secret {
+    /// Consume the wrapper, yielding the raw value. Call only at the point the
+    /// value is actually used (e.g. written to `secrets.toml`).
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -321,6 +343,21 @@ pub enum Command {
         action: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         server: Option<String>,
+    },
+    /// Add or replace an MCP server from a full JSON `McpServerConfig`
+    /// descriptor (transport-aware: stdio, or http with bearer/oauth). Only
+    /// secret *refs* travel in the JSON; secret *values* go via
+    /// [`Command::SetMcpSecret`]. (MCP-servers-UI epic)
+    UpsertMcpServer {
+        config_json: String,
+    },
+    /// Store one secret *value* (bearer token / OAuth client secret) into
+    /// `secrets.toml` under `id`, so a config can reference it by id without the
+    /// user hand-editing files. The value is [`Secret`]-wrapped so it can't leak
+    /// into a `Debug` log.
+    SetMcpSecret {
+        id: String,
+        value: Secret,
     },
 
     // --- Background tasks (issue #110) ------------------------------------
@@ -2400,6 +2437,31 @@ mod tests {
         assert_eq!(server.get("namespace"), Some(&serde_json::json!("jira")));
         let back: CommandResult = serde_json::from_value(v).unwrap();
         assert_eq!(res, back);
+    }
+
+    #[test]
+    fn set_mcp_secret_redacts_value_in_debug_but_serializes_it() {
+        let cmd = Command::SetMcpSecret {
+            id: "gmail_work_token".into(),
+            value: Secret("super-secret-token".into()),
+        };
+        // Debug must never expose the value (it rides in logs/traces).
+        let dbg = format!("{cmd:?}");
+        assert!(dbg.contains("gmail_work_token"));
+        assert!(
+            !dbg.contains("super-secret-token"),
+            "debug leaked the secret: {dbg}"
+        );
+
+        // …but the wire form must carry it transparently (as a bare string) so
+        // the daemon can persist it.
+        let v: serde_json::Value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            v["set_mcp_secret"]["value"],
+            serde_json::json!("super-secret-token")
+        );
+        let back: Command = serde_json::from_value(v).unwrap();
+        assert_eq!(cmd, back);
     }
 
     #[test]

@@ -1805,6 +1805,22 @@ where
                 ))
             }
 
+            api::Command::UpsertMcpServer { config_json } => {
+                self.settings
+                    .upsert_mcp_server(config_json)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
+            api::Command::SetMcpSecret { id, value } => {
+                self.settings
+                    .set_mcp_secret(id, value.into_inner())
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
             // Named connections (#11)
             api::Command::ListConnections => {
                 let views = self

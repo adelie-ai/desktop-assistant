@@ -201,6 +201,34 @@ pub fn save_secrets(
     Ok(())
 }
 
+/// Set one secret value in `secrets.toml`, preserving every other entry
+/// (read-modify-write), and return the resulting map. Used by the settings-UI
+/// `set_mcp_secret` so the user can store a bearer token / OAuth client secret
+/// without hand-editing files.
+///
+/// Fails closed on a *parse* error of an existing file rather than clobbering
+/// it — silently overwriting with just the new key would drop every other
+/// secret. A missing file is fine (starts from empty).
+pub fn upsert_secret(
+    path: &std::path::Path,
+    id: &str,
+    value: &str,
+) -> Result<HashMap<String, String>, McpError> {
+    let mut secrets = if path.exists() {
+        load_secrets(path).map_err(|e| {
+            McpError::UnexpectedResponse(format!(
+                "refusing to overwrite secrets: cannot read existing {}: {e}",
+                path.display()
+            ))
+        })?
+    } else {
+        HashMap::new()
+    };
+    secrets.insert(id.to_string(), value.to_string());
+    save_secrets(path, &secrets)?;
+    Ok(secrets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +444,33 @@ other_key = "secret-value"
         // File must be owner-only (it holds secrets).
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secrets file must be 0600");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_secret_preserves_other_entries_and_starts_from_missing() {
+        let dir = std::env::temp_dir().join("mcp_upsert_secret_test");
+        let path = dir.join("secrets.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Missing file: starts from empty, writes the one key at 0600.
+        let map = upsert_secret(&path, "gmail_work_token", "tok-1").unwrap();
+        assert_eq!(map.get("gmail_work_token").unwrap(), "tok-1");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // Second upsert must NOT clobber the first (read-modify-write).
+        let map = upsert_secret(&path, "cal_refresh", "rt-2").unwrap();
+        assert_eq!(map.get("gmail_work_token").unwrap(), "tok-1");
+        assert_eq!(map.get("cal_refresh").unwrap(), "rt-2");
+        let on_disk = load_secrets(&path).unwrap();
+        assert_eq!(on_disk.len(), 2);
+
+        // Overwriting an existing id updates just that value.
+        let map = upsert_secret(&path, "gmail_work_token", "tok-3").unwrap();
+        assert_eq!(map.get("gmail_work_token").unwrap(), "tok-3");
+        assert_eq!(map.get("cal_refresh").unwrap(), "rt-2");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
