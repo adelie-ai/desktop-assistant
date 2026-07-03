@@ -4,6 +4,7 @@ mod builtin;
 pub mod config;
 pub mod executor;
 mod jsonrpc;
+#[cfg(feature = "http")]
 pub mod oauth;
 
 use std::collections::HashMap;
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use desktop_assistant_core::domain::ToolDefinition;
+#[cfg(feature = "http")]
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -41,6 +43,7 @@ const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 /// [`MAX_LINE_BYTES`]. A remote server (or a hostile endpoint impersonating
 /// one) cannot make the daemon buffer unbounded memory; anything larger fails
 /// the request. Generous, because an SSE reply can carry a whole tool result.
+#[cfg(feature = "http")]
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Error type for MCP client operations.
@@ -76,9 +79,11 @@ pub enum McpError {
     #[error("MCP request '{method}' timed out after {after:?} of silence")]
     Timeout { method: String, after: Duration },
 
+    #[cfg(feature = "http")]
     #[error("HTTP transport error: {0}")]
     Http(String),
 
+    #[cfg(feature = "http")]
     #[error("OAuth error: {0}")]
     OAuth(#[from] oauth::OAuthError),
 }
@@ -177,11 +182,13 @@ impl McpClient {
     /// `bearer`, when set, is sent verbatim as an `Authorization: Bearer`
     /// header on every request. Acquiring/refreshing that token (e.g. via
     /// Google OAuth) is the caller's concern and out of scope here.
+    #[cfg(feature = "http")]
     pub async fn connect_http(url: &str, bearer: Option<String>) -> Result<Self, McpError> {
         Self::connect_http_with_request_timeout(url, bearer, DEFAULT_REQUEST_TIMEOUT).await
     }
 
     /// [`Self::connect_http`] with an explicit per-request silence timeout.
+    #[cfg(feature = "http")]
     pub async fn connect_http_with_request_timeout(
         url: &str,
         bearer: Option<String>,
@@ -194,6 +201,7 @@ impl McpClient {
     /// an OAuth 2.0 [`TokenProvider`](oauth::TokenProvider). The provider mints
     /// and refreshes access tokens on demand, and the transport retries once
     /// with a fresh token if the server answers `401`.
+    #[cfg(feature = "http")]
     pub async fn connect_http_oauth(
         url: &str,
         provider: Arc<oauth::TokenProvider>,
@@ -202,6 +210,7 @@ impl McpClient {
     }
 
     /// [`Self::connect_http_oauth`] with an explicit per-request silence timeout.
+    #[cfg(feature = "http")]
     pub async fn connect_http_oauth_with_request_timeout(
         url: &str,
         provider: Arc<oauth::TokenProvider>,
@@ -210,6 +219,7 @@ impl McpClient {
         Self::connect_http_credential(url, Credential::OAuth(provider), request_timeout).await
     }
 
+    #[cfg(feature = "http")]
     async fn connect_http_credential(
         url: &str,
         credential: Credential,
@@ -407,6 +417,7 @@ impl McpClient {
 /// transport-agnostic — both variants expose the same round-trip surface.
 enum Transport {
     Stdio(StdioTransport),
+    #[cfg(feature = "http")]
     Http(HttpTransport),
 }
 
@@ -421,6 +432,7 @@ impl Transport {
     ) -> Result<serde_json::Value, McpError> {
         match self {
             Transport::Stdio(t) => t.round_trip(request, timeout, flags).await,
+            #[cfg(feature = "http")]
             Transport::Http(t) => t.round_trip(request, timeout, flags).await,
         }
     }
@@ -431,6 +443,7 @@ impl Transport {
     ) -> Result<(), McpError> {
         match self {
             Transport::Stdio(t) => t.send_notification(notification).await,
+            #[cfg(feature = "http")]
             Transport::Http(t) => t.send_notification(notification).await,
         }
     }
@@ -439,6 +452,7 @@ impl Transport {
         match self {
             Transport::Stdio(t) => t.shutdown().await,
             // HTTP has no process to reap.
+            #[cfg(feature = "http")]
             Transport::Http(_) => {}
         }
     }
@@ -602,6 +616,7 @@ impl Drop for StdioTransport {
 }
 
 /// How an [`HttpTransport`] authenticates each request.
+#[cfg(feature = "http")]
 enum Credential {
     /// No `Authorization` header (e.g. a single-user local endpoint).
     None,
@@ -611,6 +626,7 @@ enum Credential {
     OAuth(Arc<oauth::TokenProvider>),
 }
 
+#[cfg(feature = "http")]
 impl Credential {
     fn from_bearer(bearer: Option<String>) -> Self {
         match bearer {
@@ -646,6 +662,7 @@ impl Credential {
 /// JSON-RPC over a remote streamable-HTTP MCP endpoint. Each request is a POST
 /// whose reply is either a single JSON body or a `text/event-stream` (SSE)
 /// sequence of JSON-RPC messages.
+#[cfg(feature = "http")]
 struct HttpTransport {
     client: reqwest::Client,
     url: String,
@@ -657,6 +674,7 @@ struct HttpTransport {
     session_id: Option<String>,
 }
 
+#[cfg(feature = "http")]
 impl HttpTransport {
     fn new(url: &str, credential: Credential) -> Result<Self, McpError> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
@@ -837,6 +855,7 @@ impl HttpTransport {
 /// the streamable-HTTP analogue of the stdio `MAX_LINE_BYTES` cap) and the
 /// overall read time, so a slow or oversized remote reply fails the request
 /// instead of hanging or exhausting memory.
+#[cfg(feature = "http")]
 async fn read_body_capped(
     mut response: reqwest::Response,
     timeout: Duration,
@@ -871,6 +890,7 @@ async fn read_body_capped(
 /// Parse an SSE (`text/event-stream`) body into the JSON values carried by its
 /// `data:` fields. Events are separated by blank lines; multiple `data:` lines
 /// within one event are joined with newlines (per the SSE spec).
+#[cfg(feature = "http")]
 fn parse_sse_messages(body: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for block in body.split("\n\n") {

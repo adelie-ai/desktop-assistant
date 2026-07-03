@@ -144,7 +144,11 @@ impl McpHost {
     /// tool-level error (`isError`) comes back from `McpClient` as its text in
     /// `Ok` — the LLM sees the error content as the result, which is the
     /// intended behavior. Results are capped to the daemon's client-tool limit.
-    pub async fn call(&self, tool_name: &str, arguments: serde_json::Value) -> Result<String, String> {
+    pub async fn call(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String, String> {
         let Some((index, original)) = self.routes.get(tool_name) else {
             return Err(format!("unknown client MCP tool: {tool_name}"));
         };
@@ -244,6 +248,7 @@ done
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         }
     }
 
@@ -257,6 +262,7 @@ done
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         }
     }
 
@@ -311,8 +317,15 @@ done
 
         let host = McpHost::start(&[sh_config("srv", &script, Some("ns"))]).await;
         assert!(host.handles("ns__echo"));
-        assert_eq!(host.call("ns__echo", serde_json::json!({})).await.unwrap(), "done");
-        assert!(host.call("ns__missing", serde_json::json!({})).await.is_err());
+        assert_eq!(
+            host.call("ns__echo", serde_json::json!({})).await.unwrap(),
+            "done"
+        );
+        assert!(
+            host.call("ns__missing", serde_json::json!({}))
+                .await
+                .is_err()
+        );
         host.shutdown().await;
     }
 
@@ -322,12 +335,16 @@ done
         let good = dir.path().join("good.sh");
         std::fs::write(&good, fake_script("echo", CallMode::Ok, None)).unwrap();
 
-        let host = McpHost::start(&[broken_config("broken"), sh_config("good", &good, Some("g"))]).await;
+        let host =
+            McpHost::start(&[broken_config("broken"), sh_config("good", &good, Some("g"))]).await;
 
         // The broken server is skipped; the healthy one still works.
         let names: Vec<String> = host.registrations().into_iter().map(|r| r.name).collect();
         assert_eq!(names, vec!["g__echo".to_string()]);
-        assert_eq!(host.call("g__echo", serde_json::json!({})).await.unwrap(), "done");
+        assert_eq!(
+            host.call("g__echo", serde_json::json!({})).await.unwrap(),
+            "done"
+        );
         host.shutdown().await;
     }
 
@@ -351,7 +368,11 @@ done
 
         let host = McpHost::start(&[sh_config("srv", &script, Some("ns"))]).await;
         let result = host.call("ns__echo", serde_json::json!({})).await.unwrap();
-        assert!(result.len() <= MAX_RESULT_BYTES, "result was {} bytes", result.len());
+        assert!(
+            result.len() <= MAX_RESULT_BYTES,
+            "result was {} bytes",
+            result.len()
+        );
         host.shutdown().await;
     }
 
@@ -363,7 +384,11 @@ done
         std::fs::write(&script, fake_script("echo", CallMode::Ok, Some(&pid_file))).unwrap();
 
         let host = McpHost::start(&[sh_config("srv", &script, Some("ns"))]).await;
-        let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert!(pid_running(pid), "server should be alive before shutdown");
 
         host.shutdown().await;
@@ -375,6 +400,9 @@ done
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(!pid_running(pid), "server process should be dead after shutdown");
+        assert!(
+            !pid_running(pid),
+            "server process should be dead after shutdown"
+        );
     }
 }

@@ -40,13 +40,26 @@ pub fn merge_registrations(
 /// daemon connection.
 #[async_trait]
 pub trait ClientToolResultSink {
-    async fn submit_result(&self, task_id: &str, tool_call_id: &str, result: Result<String, String>);
+    async fn submit_result(
+        &self,
+        task_id: &str,
+        tool_call_id: &str,
+        result: Result<String, String>,
+    );
 }
 
 #[async_trait]
 impl ClientToolResultSink for Connector {
-    async fn submit_result(&self, task_id: &str, tool_call_id: &str, result: Result<String, String>) {
-        if let Err(err) = self.submit_client_tool_result(task_id, tool_call_id, result).await {
+    async fn submit_result(
+        &self,
+        task_id: &str,
+        tool_call_id: &str,
+        result: Result<String, String>,
+    ) {
+        if let Err(err) = self
+            .submit_client_tool_result(task_id, tool_call_id, result)
+            .await
+        {
             tracing::warn!("failed to submit client tool result (task {task_id}): {err}");
         }
     }
@@ -76,8 +89,8 @@ pub async fn dispatch_client_tool_call(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::McpServerConfig;
+    use super::*;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex;
@@ -119,6 +132,7 @@ done
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            http: None,
         }
     }
 
@@ -129,8 +143,16 @@ done
 
     #[async_trait]
     impl ClientToolResultSink for FakeSink {
-        async fn submit_result(&self, _task_id: &str, tool_call_id: &str, result: Result<String, String>) {
-            self.calls.lock().unwrap().push((tool_call_id.into(), result));
+        async fn submit_result(
+            &self,
+            _task_id: &str,
+            tool_call_id: &str,
+            result: Result<String, String>,
+        ) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((tool_call_id.into(), result));
         }
     }
 
@@ -155,7 +177,9 @@ done
     async fn dispatch_ignores_foreign_tool() {
         let host = McpHost::start(&[]).await; // empty host serves nothing
         let sink = FakeSink::default();
-        let handled = dispatch_client_tool_call(&host, &sink, "t", "c", "say_this", serde_json::json!({})).await;
+        let handled =
+            dispatch_client_tool_call(&host, &sink, "t", "c", "say_this", serde_json::json!({}))
+                .await;
         assert!(!handled);
         assert!(sink.calls.lock().unwrap().is_empty());
     }
@@ -165,7 +189,15 @@ done
         let dir = tempfile::tempdir().unwrap();
         let host = McpHost::start(&[fake_server(dir.path(), false)]).await;
         let sink = FakeSink::default();
-        let handled = dispatch_client_tool_call(&host, &sink, "t", "call-1", "ns__echo", serde_json::json!({})).await;
+        let handled = dispatch_client_tool_call(
+            &host,
+            &sink,
+            "t",
+            "call-1",
+            "ns__echo",
+            serde_json::json!({}),
+        )
+        .await;
         host.shutdown().await;
         assert!(handled);
         // Lock only after all awaits so no guard is held across one.
@@ -180,7 +212,15 @@ done
         let dir = tempfile::tempdir().unwrap();
         let host = McpHost::start(&[fake_server(dir.path(), true)]).await;
         let sink = FakeSink::default();
-        let handled = dispatch_client_tool_call(&host, &sink, "t", "call-2", "ns__echo", serde_json::json!({})).await;
+        let handled = dispatch_client_tool_call(
+            &host,
+            &sink,
+            "t",
+            "call-2",
+            "ns__echo",
+            serde_json::json!({}),
+        )
+        .await;
         host.shutdown().await;
         assert!(handled, "a host tool is always handled, even on error");
         let calls = sink.calls.lock().unwrap();

@@ -12,6 +12,9 @@ clap = ["dep:clap"]
 # Opt-in client-side MCP host: run local MCP servers on the edge and expose
 # their tools to the daemon as client-side tools. Pulls the stdio MCP client
 # (and `core` transitively); clients that never host MCPs don't compile it.
+# The MCP client is taken WITHOUT default features, so its remote-HTTP transport
+# (and `reqwest`) is never compiled into edge clients — the host only ever
+# spawns local stdio servers.
 mcp-host = ["dep:desktop-assistant-mcp-client", "dep:serde", "dep:toml"]
 
 [dependencies]
@@ -19,7 +22,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 clap = { version = "4", features = ["derive"], optional = true }
 desktop-assistant-api-model = { path = "../api-model" }
-desktop-assistant-mcp-client = { path = "../mcp-client", optional = true }
+desktop-assistant-mcp-client = { path = "../mcp-client", optional = true, default-features = false }
 desktop-assistant-frame-codec = { workspace = true }
 futures = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
