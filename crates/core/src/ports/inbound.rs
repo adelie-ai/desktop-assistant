@@ -85,12 +85,37 @@ pub struct McpServerView {
     /// For oauth servers: whether a refresh token is present in secrets.
     pub oauth_authorized: Option<bool>,
     pub oauth_account: Option<String>,
+    /// Id of the referenced service account (epic #477); `None` for inline oauth.
+    pub oauth_account_ref: Option<String>,
     pub oauth_scopes: Vec<String>,
     /// Non-secret OAuth request fields, echoed so the editor can prefill them on
     /// edit without blanking a working server.
     pub oauth_client_id: Option<String>,
     pub oauth_token_url: Option<String>,
     pub oauth_authorize_url: Option<String>,
+}
+
+/// A reusable outbound OAuth **service account** (epic #477) as the settings
+/// surface sees it. Refs + a derived `authorized` flag only — never secret
+/// values.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceAccountView {
+    pub id: String,
+    pub display_name: String,
+    pub client_id: String,
+    pub client_secret_ref: Option<String>,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub account: Option<String>,
+    pub refresh_token_ref: String,
+    pub granted_scopes: Vec<String>,
+    /// Whether a refresh token is present in secrets for this account.
+    pub authorized: bool,
+    /// Label for the Sign-in button (always "Sign in").
+    pub configure_label: Option<String>,
+    /// argv the client spawns to sign this account in:
+    /// `[daemon_exe, "--mcp-oauth-login", <id>]`.
+    pub configure_command: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -669,6 +694,43 @@ pub trait SettingsService: Send + Sync {
         async {
             Err(CoreError::SystemService(
                 "set_mcp_secret not supported".into(),
+            ))
+        }
+    }
+
+    // Service accounts (reusable outbound OAuth credentials, epic #477).
+
+    /// List the reusable service accounts. Defaults to empty so unrelated test
+    /// doubles need not implement it; the daemon overrides it.
+    fn list_service_accounts(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ServiceAccountView>, CoreError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Add or replace a service account from a JSON `ServiceAccount` descriptor
+    /// (secret *refs* only). Default errors; the daemon overrides it.
+    fn upsert_service_account(
+        &self,
+        config_json: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        let _ = config_json;
+        async {
+            Err(CoreError::SystemService(
+                "upsert_service_account not supported".into(),
+            ))
+        }
+    }
+
+    /// Remove a service account by id. Default errors; the daemon overrides it.
+    fn remove_service_account(
+        &self,
+        id: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        let _ = id;
+        async {
+            Err(CoreError::SystemService(
+                "remove_service_account not supported".into(),
             ))
         }
     }

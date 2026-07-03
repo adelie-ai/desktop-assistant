@@ -360,6 +360,22 @@ pub enum Command {
         value: Secret,
     },
 
+    /// List reusable outbound OAuth service accounts (epic #477). Mirrors
+    /// `ListMcpServers`; the bridge serializes the result to JSON for the
+    /// `ListServiceAccountsJson` D-Bus method. Only refs/state travel — no
+    /// secret values.
+    ListServiceAccounts,
+    /// Add or replace a service account from a full JSON `ServiceAccount`
+    /// descriptor (secret *refs* only; the client-secret value goes via
+    /// [`Command::SetMcpSecret`]).
+    UpsertServiceAccount {
+        config_json: String,
+    },
+    /// Remove a service account by id.
+    RemoveServiceAccount {
+        id: String,
+    },
+
     // --- Background tasks (issue #110) ------------------------------------
     //
     // Protocol shape only; the registry that backs these commands is the
@@ -539,6 +555,9 @@ pub enum CommandResult {
     WsAuthSettings(WsAuthSettingsView),
 
     McpServers(Vec<McpServerView>),
+
+    /// Response to `ListServiceAccounts` (epic #477).
+    ServiceAccounts(Vec<ServiceAccountView>),
 
     Connections(Vec<ConnectionView>),
     Models(Vec<ModelListing>),
@@ -1012,6 +1031,11 @@ pub struct McpServerView {
     pub oauth_authorized: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_account: Option<String>,
+    /// Id of the referenced service account (epic #477); `None` for inline oauth.
+    /// Distinct from `oauth_account` (the token-store key) — this is the config
+    /// reference the editor round-trips into a type-constrained account picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_account_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oauth_scopes: Vec<String>,
     /// Non-secret OAuth request fields, echoed so the editor can prefill them on
@@ -1022,6 +1046,42 @@ pub struct McpServerView {
     pub oauth_token_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_authorize_url: Option<String>,
+}
+
+/// Wire form of a reusable **service account** — a named outbound OAuth
+/// credential (epic #477) that MCP servers reference by `id`. Serialized to a
+/// JSON array by the D-Bus `ListServiceAccountsJson` method, mirroring
+/// [`McpServerView`]. Never carries secret *values* — only refs and a derived
+/// `authorized` flag. `Default` lets test doubles fill only what they need.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceAccountView {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+    pub client_id: String,
+    /// Secret *ref* (id in secrets.toml) for the client secret, if any — never
+    /// the value. Absent for public (PKCE) clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_ref: Option<String>,
+    pub authorize_url: String,
+    pub token_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Secret *ref* holding the refresh token minted by sign-in — never the value.
+    pub refresh_token_ref: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_scopes: Vec<String>,
+    /// Derived: whether a refresh token is present in secrets for this account
+    /// (i.e. it has been signed in). Never exposes the token itself.
+    pub authorized: bool,
+    /// Label for the account's Sign-in button (always "Sign in").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configure_label: Option<String>,
+    /// argv the client spawns (detached) to sign this account in:
+    /// `[daemon_exe, "--mcp-oauth-login", <id>]`. The daemon reports it because
+    /// only it knows its own binary path (mirrors `McpServerView`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configure_command: Vec<String>,
 }
 
 /// Wire form of the database settings (#314). Mirrors the core

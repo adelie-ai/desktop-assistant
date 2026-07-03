@@ -149,6 +149,20 @@ const ADDITIONS: &[(&str, &str)] = &[
         "org.desktopAssistant.Settings",
         "method SetMcpSecret(in:s:id, in:s:value)",
     ),
+    // Service accounts (epic #477): reusable outbound OAuth credentials MCP
+    // servers reference by id. JSON-at-the-edge CRUD, mirroring the MCP methods.
+    (
+        "org.desktopAssistant.Settings",
+        "method ListServiceAccountsJson(out:s:)",
+    ),
+    (
+        "org.desktopAssistant.Settings",
+        "method UpsertServiceAccount(in:s:config_json)",
+    ),
+    (
+        "org.desktopAssistant.Settings",
+        "method RemoveServiceAccount(in:s:id)",
+    ),
 ];
 
 // --- fake transport ---------------------------------------------------------

@@ -647,6 +647,54 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         }
     }
 
+    /// List reusable outbound OAuth **service accounts** (epic #477) as a JSON
+    /// array of `api::ServiceAccountView`. Only refs + a derived `authorized`
+    /// flag travel — never a secret value. JSON-at-the-edge, mirroring
+    /// [`Self::list_mcp_servers_json`], so the account surface can grow without
+    /// re-churning a typed D-Bus signature.
+    async fn list_service_accounts_json(&self) -> fdo::Result<String> {
+        let result = self.dispatch(api::Command::ListServiceAccounts).await?;
+        match result {
+            api::CommandResult::ServiceAccounts(accounts) => serde_json::to_string(&accounts)
+                .map_err(|e| {
+                    fdo::Error::Failed(format!("failed to serialize service accounts: {e}"))
+                }),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected ListServiceAccounts result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Add or replace a service account from a full JSON `ServiceAccount`
+    /// descriptor. Only secret *refs* travel; the client-secret value goes via
+    /// [`Self::set_mcp_secret`]. (epic #477)
+    async fn upsert_service_account(&self, config_json: &str) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::UpsertServiceAccount {
+                config_json: config_json.to_string(),
+            })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected UpsertServiceAccount result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Remove a service account by id. (epic #477)
+    async fn remove_service_account(&self, id: &str) -> fdo::Result<()> {
+        let result = self
+            .dispatch(api::Command::RemoveServiceAccount { id: id.to_string() })
+            .await?;
+        match result {
+            api::CommandResult::Ack => Ok(()),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected RemoveServiceAccount result: {other:?}"
+            ))),
+        }
+    }
+
     /// Perform an action (status/start/stop/restart) on MCP server(s). An empty
     /// `server` targets all of them. Returns the resulting server list as
     /// `Vec<(name, command, enabled, status, tool_count)>`.
@@ -1200,6 +1248,7 @@ mod tests {
             auth_kind: Some("oauth".into()),
             oauth_authorized: Some(false),
             oauth_account: Some("dave@example.com".into()),
+            oauth_account_ref: Some("work-google".into()),
             oauth_scopes: vec!["https://www.googleapis.com/auth/gmail.modify".into()],
             oauth_client_id: Some("1234.apps.googleusercontent.com".into()),
             oauth_token_url: Some("https://oauth2.googleapis.com/token".into()),
@@ -1257,6 +1306,74 @@ mod tests {
             }
             other => panic!("expected SetMcpSecret, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn list_service_accounts_json_carries_refs_and_state_no_secret_values() {
+        // epic #477: the JSON read path carries the account's refs + derived
+        // `authorized` state — never a secret value.
+        let t = FakeTransport::replying(api::CommandResult::ServiceAccounts(vec![
+            api::ServiceAccountView {
+                id: "work-google".into(),
+                display_name: "Work Google".into(),
+                client_id: "1234.apps.googleusercontent.com".into(),
+                client_secret_ref: Some("google_client_secret".into()),
+                authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+                token_url: "https://oauth2.googleapis.com/token".into(),
+                account: Some("user@example.com".into()),
+                refresh_token_ref: "work_google_refresh".into(),
+                granted_scopes: vec!["https://www.googleapis.com/auth/gmail.modify".into()],
+                authorized: true,
+                configure_label: Some("Sign in".into()),
+                configure_command: vec![
+                    "/usr/bin/desktop-assistant".into(),
+                    "--mcp-oauth-login".into(),
+                    "work-google".into(),
+                ],
+            },
+        ]));
+
+        let json = settings(Arc::clone(&t))
+            .list_service_accounts_json()
+            .await
+            .unwrap();
+        assert!(matches!(t.last(), api::Command::ListServiceAccounts));
+
+        let arr: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let a = &arr[0];
+        assert_eq!(a["id"], "work-google");
+        assert_eq!(a["client_secret_ref"], "google_client_secret");
+        assert_eq!(a["refresh_token_ref"], "work_google_refresh");
+        assert_eq!(a["authorized"], true);
+        assert_eq!(a["configure_label"], "Sign in");
+        assert_eq!(a["configure_command"][1], "--mcp-oauth-login");
+        assert_eq!(a["configure_command"][2], "work-google");
+        // Only refs (ids) travel — the JSON must carry no `*_secret`/token *value*
+        // keys, just the `*_ref` names.
+        assert!(!json.contains("client_secret\":"));
+        assert!(!json.contains("refresh_token\":"));
+    }
+
+    #[tokio::test]
+    async fn upsert_and_remove_service_account_build_their_commands() {
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .upsert_service_account(r#"{"id":"work","client_id":"c","authorize_url":"https://a","token_url":"https://t","refresh_token_ref":"r"}"#)
+            .await
+            .unwrap();
+        match t.last() {
+            api::Command::UpsertServiceAccount { config_json } => {
+                assert!(config_json.contains("\"id\":\"work\""));
+            }
+            other => panic!("expected UpsertServiceAccount, got {other:?}"),
+        }
+
+        let t = FakeTransport::replying(api::CommandResult::Ack);
+        settings(Arc::clone(&t))
+            .remove_service_account("work")
+            .await
+            .unwrap();
+        assert!(matches!(t.last(), api::Command::RemoveServiceAccount { id } if id == "work"));
     }
 
     #[tokio::test]
