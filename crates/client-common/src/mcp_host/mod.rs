@@ -10,5 +10,7 @@
 //! the `Connector` registration bridge land in follow-up phases.
 
 pub mod config;
+pub mod host;
 
 pub use config::{ClientMcpConfig, McpServerConfig, SurfaceConfig, default_client_mcp_path};
+pub use host::McpHost;
