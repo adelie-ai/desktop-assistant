@@ -195,7 +195,10 @@ enabled = ["filesystem", "disabled-one", "ghost"]
     #[test]
     fn resolved_servers_uses_surface_list() {
         let cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
-        assert_eq!(names(&cfg.resolved_servers("gtk")), vec!["filesystem", "git"]);
+        assert_eq!(
+            names(&cfg.resolved_servers("gtk")),
+            vec!["filesystem", "git"]
+        );
     }
 
     #[test]

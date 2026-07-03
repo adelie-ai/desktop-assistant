@@ -14,14 +14,27 @@ thiserror.workspace = true
 toml = "1"
 chrono = { workspace = true, features = ["serde"] }
 uuid = { version = "1", features = ["v7"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
+# Remote streamable-HTTP transport + OAuth — behind the default `http` feature.
+# Stdio-only consumers (the client-side MCP host in `client-common`) build with
+# `default-features = false` and never compile any of these, so they don't pull
+# `reqwest` at all (see the `[features]` note below).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"], optional = true }
 # OAuth 2.0 token acquisition/refresh for remote (HTTP) MCP servers (#455).
 # PKCE (S256) needs SHA-256 + base64url; the authorize URL builder needs url;
-# code_verifier/state need a CSPRNG. All already in the workspace lock.
-sha2 = "0.10"
-base64 = "0.22"
-url = "2"
-rand = "0.9"
+# code_verifier/state need a CSPRNG. Used only by the HTTP transport (oauth.rs).
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+url = { version = "2", optional = true }
+rand = { version = "0.9", optional = true }
+
+[features]
+default = ["http"]
+# The remote streamable-HTTP MCP transport (`connect_http*`, `HttpTransport`)
+# and its OAuth 2.0 support (`oauth`). The daemon needs it (remote MCP servers,
+# #455) so it's on by default. Stdio-only consumers turn it off with
+# `default-features = false`, which drops `reqwest` (and the webpki-roots
+# feature churn that comes with it) from their dependency tree entirely.
+http = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:url", "dep:rand"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

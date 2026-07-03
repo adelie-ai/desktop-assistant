@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub use crate::builtin::BuiltinToolService;
 use crate::config::save_mcp_configs;
+#[cfg(feature = "http")]
 use crate::oauth::{InMemoryTokenStore, OAuthClient, TokenProvider, TokenStore};
 use crate::{ListChangeFlags, McpClient, McpError};
 
@@ -217,6 +218,7 @@ pub struct McpExecutorState {
     /// daemon can inject a keyring-backed one (or, later, a server-side store)
     /// without any change here. Shared across all OAuth servers, keyed by
     /// account, so services for one account can share a cached token.
+    #[cfg(feature = "http")]
     token_store: Arc<dyn TokenStore>,
     /// Last connection failure per server *name* (stable across add/remove,
     /// unlike the index). Set when a connect attempt fails, cleared on success;
@@ -245,6 +247,8 @@ impl McpExecutorState {
 
     /// Look up a required secret by ID, failing closed with a message that
     /// names the field and server so a misconfiguration is easy to fix.
+    /// Used only by the HTTP transport's bearer/OAuth secret resolution.
+    #[cfg(feature = "http")]
     fn require_secret(
         &self,
         secret_id: &str,
@@ -266,6 +270,7 @@ impl McpExecutorState {
     /// Resolve the bearer token for an HTTP transport from secrets.toml, if the
     /// config references one. A missing secret is an error (fail closed) rather
     /// than silently connecting unauthenticated.
+    #[cfg(feature = "http")]
     fn resolve_bearer(
         &self,
         http: &HttpTransportConfig,
@@ -283,6 +288,7 @@ impl McpExecutorState {
 
     /// Build an OAuth [`TokenProvider`] for a server from its config + secrets.
     /// Fails closed if the client secret or bootstrap refresh token is missing.
+    #[cfg(feature = "http")]
     fn build_token_provider(
         &self,
         oauth: &OAuthServerConfig,
@@ -320,6 +326,7 @@ impl McpExecutorState {
     /// static bearer.
     async fn connect_client(&self, config: &McpServerConfig) -> Result<McpClient, McpError> {
         match &config.http {
+            #[cfg(feature = "http")]
             Some(http) => match &http.oauth {
                 Some(oauth) => {
                     let provider = self.build_token_provider(oauth, &config.name)?;
@@ -330,7 +337,7 @@ impl McpExecutorState {
                     McpClient::connect_http(&http.url, bearer).await
                 }
             },
-            None => {
+            _ => {
                 let env = self.resolve_env(config)?;
                 McpClient::connect(&config.command, &config.args, &env).await
             }
@@ -969,6 +976,7 @@ impl McpToolExecutor {
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
                 secrets: std::sync::RwLock::new(HashMap::new()),
+                #[cfg(feature = "http")]
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
             }),
@@ -982,13 +990,23 @@ impl McpToolExecutor {
         config_path: PathBuf,
         secrets: HashMap<String, String>,
     ) -> Self {
-        Self::with_builtin_tools_config_and_token_store(
-            configs,
+        let clients: Vec<Option<ClientHandle>> = (0..configs.len()).map(|_| None).collect();
+        Self {
+            state: Arc::new(McpExecutorState {
+                configs: RwLock::new(configs),
+                clients: RwLock::new(clients),
+                tool_routing: Mutex::new(HashMap::new()),
+                cached_tools: Mutex::new(Vec::new()),
+                cached_resources: Mutex::new(Vec::new()),
+                cached_prompts: Mutex::new(Vec::new()),
+                config_path,
+                secrets: std::sync::RwLock::new(secrets),
+                #[cfg(feature = "http")]
+                token_store: Arc::new(InMemoryTokenStore::default()),
+                last_errors: Mutex::new(HashMap::new()),
+            }),
             builtin_tools,
-            config_path,
-            secrets,
-            Arc::new(InMemoryTokenStore::default()),
-        )
+        }
     }
 
     /// Like [`Self::with_builtin_tools_and_config_path`] but with an injected
@@ -997,6 +1015,7 @@ impl McpToolExecutor {
     /// in-memory one. Keeping this a trait object means the persistence backend
     /// (keyring today, possibly a server-side store later) is swappable without
     /// touching the transport or provider code.
+    #[cfg(feature = "http")]
     pub fn with_builtin_tools_config_and_token_store(
         configs: Vec<McpServerConfig>,
         builtin_tools: BuiltinToolService,
@@ -1295,10 +1314,20 @@ fn is_method_not_found(error: &McpError) -> bool {
 /// generic `error`. An OAuth server's initialize handshake makes a real token
 /// call, so `invalid_grant` surfaces here as a connect error.
 fn is_auth_expired(error: &McpError) -> bool {
-    matches!(
-        error,
-        McpError::OAuth(crate::oauth::OAuthError::InvalidGrant(_))
-    )
+    #[cfg(feature = "http")]
+    {
+        matches!(
+            error,
+            McpError::OAuth(crate::oauth::OAuthError::InvalidGrant(_))
+        )
+    }
+    // Without the HTTP transport there are no OAuth connects, so no failure can
+    // be an expired-token failure.
+    #[cfg(not(feature = "http"))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 /// Human-facing connection target for logs: the HTTP url when configured,
