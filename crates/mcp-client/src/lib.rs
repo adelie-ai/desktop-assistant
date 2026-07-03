@@ -73,6 +73,9 @@ pub enum McpError {
     #[error("unexpected response from MCP server: {0}")]
     UnexpectedResponse(String),
 
+    #[error("invalid MCP configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("MCP client is not connected")]
     NotConnected,
 

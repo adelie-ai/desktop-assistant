@@ -3,13 +3,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use crate::McpError;
-use crate::executor::McpServerConfig;
+use crate::executor::{McpServerConfig, ServiceAccount};
 
 /// Top-level MCP configuration file structure.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+///
+/// Servers and the reusable [`ServiceAccount`]s they reference live in one file
+/// (`mcp_servers.toml`) so there is a single source of truth. Each save path is
+/// read-modify-write over the whole document, so persisting servers never wipes
+/// service accounts and vice-versa.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct McpConfig {
     #[serde(default)]
     servers: Vec<McpServerConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    service_accounts: Vec<ServiceAccount>,
 }
 
 /// Returns the default path for the MCP servers config file.
@@ -70,6 +77,7 @@ pub fn save_mcp_configs(
 ) -> Result<(), McpError> {
     let config = McpConfig {
         servers: configs.to_vec(),
+        ..Default::default()
     };
 
     let contents = toml::to_string_pretty(&config).map_err(|e| {
@@ -227,6 +235,34 @@ pub fn upsert_secret(
     secrets.insert(id.to_string(), value.to_string());
     save_secrets(path, &secrets)?;
     Ok(secrets)
+}
+
+// --- Service accounts (reusable outbound OAuth credentials, epic #477) --------
+
+/// Load the reusable service accounts from the MCP config file. Returns an
+/// empty vec if the file doesn't exist.
+pub fn load_service_accounts(path: &std::path::Path) -> Result<Vec<ServiceAccount>, McpError> {
+    let _ = path;
+    unimplemented!("load_service_accounts implemented in the follow-up commit")
+}
+
+/// Persist the given service accounts into the MCP config file, preserving the
+/// server entries already there (read-modify-write). Validates the set first
+/// and fails closed — an invalid set is never written.
+pub fn save_service_accounts(
+    path: &std::path::Path,
+    accounts: &[ServiceAccount],
+) -> Result<(), McpError> {
+    let _ = (path, accounts);
+    unimplemented!("save_service_accounts implemented in the follow-up commit")
+}
+
+/// Validate a set of service accounts: each individually valid (non-empty
+/// `id`/`client_id`, https `authorize_url`/`token_url`) and `id`s unique across
+/// the set. Returns a clear [`McpError::InvalidConfig`] on the first problem.
+pub fn validate_service_accounts(accounts: &[ServiceAccount]) -> Result<(), McpError> {
+    let _ = accounts;
+    unimplemented!("validate_service_accounts implemented in the follow-up commit")
 }
 
 #[cfg(test)]
@@ -663,6 +699,261 @@ scopes = [
             http.auth_bearer_secret.as_deref(),
             Some("google_work_token")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Service accounts (epic #477 / issue #478) ----------------------------
+
+    /// A fully-populated, valid service account for reuse across tests.
+    fn sample_account(id: &str) -> ServiceAccount {
+        ServiceAccount {
+            id: id.into(),
+            display_name: "Work Google Workspace".into(),
+            client_id: "1234.apps.googleusercontent.com".into(),
+            client_secret_ref: Some("google_client_secret".into()),
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            account: Some("user@example.com".into()),
+            refresh_token_ref: "work_google_refresh".into(),
+            granted_scopes: vec![
+                "https://www.googleapis.com/auth/gmail.modify".into(),
+                "https://www.googleapis.com/auth/calendar".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn parse_service_accounts_toml() {
+        // A `[[service_accounts]]` array sits alongside `[[servers]]` in one
+        // file; the two are independent.
+        let toml = r#"
+[[servers]]
+name = "fileio"
+command = "fileio-mcp"
+
+[[service_accounts]]
+id = "work-google"
+display_name = "Work Google Workspace"
+client_id = "1234.apps.googleusercontent.com"
+client_secret_ref = "google_client_secret"
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+account = "user@example.com"
+refresh_token_ref = "work_google_refresh"
+granted_scopes = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar",
+]
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.service_accounts.len(), 1);
+        let acct = &config.service_accounts[0];
+        assert_eq!(acct.id, "work-google");
+        assert_eq!(acct.client_id, "1234.apps.googleusercontent.com");
+        assert_eq!(acct.client_secret_ref.as_deref(), Some("google_client_secret"));
+        assert_eq!(acct.refresh_token_ref, "work_google_refresh");
+        assert_eq!(acct.account.as_deref(), Some("user@example.com"));
+        assert_eq!(acct.granted_scopes.len(), 2);
+    }
+
+    #[test]
+    fn parse_config_without_service_accounts_defaults_empty() {
+        // Back-compat: an existing file with no `[[service_accounts]]` loads
+        // with an empty list, not an error.
+        let toml = r#"
+[[servers]]
+name = "fileio"
+command = "fileio-mcp"
+"#;
+        let config: McpConfig = toml::from_str(toml).unwrap();
+        assert!(config.service_accounts.is_empty());
+    }
+
+    #[test]
+    fn service_account_roundtrip_unchanged() {
+        // Acceptance: a `[[service_accounts]]` entry round-trips save → load
+        // unchanged. Covers a public (PKCE, no client secret) account too.
+        let dir = std::env::temp_dir().join("mcp_service_account_roundtrip_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let accounts = vec![
+            sample_account("work-google"),
+            ServiceAccount {
+                id: "personal-pkce".into(),
+                display_name: String::new(),
+                client_id: "public-client".into(),
+                client_secret_ref: None, // public PKCE client
+                authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+                token_url: "https://oauth2.googleapis.com/token".into(),
+                account: None,
+                refresh_token_ref: "personal_refresh".into(),
+                granted_scopes: vec![],
+            },
+        ];
+
+        save_service_accounts(&path, &accounts).unwrap();
+        let loaded = load_service_accounts(&path).unwrap();
+
+        assert_eq!(loaded, accounts, "service accounts round-trip unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn service_account_serialization_omits_secret_values() {
+        // Acceptance: serializing a ServiceAccount emits only secret *refs*,
+        // never secret material. The struct cannot even hold a value — this
+        // pins that invariant against a future field slip.
+        let serialized = toml::to_string(&sample_account("work-google")).unwrap();
+        assert!(
+            serialized.contains("client_secret_ref"),
+            "client secret is stored as a ref"
+        );
+        assert!(
+            serialized.contains("refresh_token_ref"),
+            "refresh token is stored as a ref"
+        );
+        // No bare (value-carrying) secret keys.
+        assert!(
+            !serialized.contains("client_secret ="),
+            "no inline client secret value"
+        );
+        assert!(
+            !serialized.contains("refresh_token ="),
+            "no inline refresh token value"
+        );
+    }
+
+    #[test]
+    fn saving_service_accounts_preserves_servers_and_vice_versa() {
+        // One file, two independent arrays: writing one must never wipe the
+        // other (read-modify-write over the whole document).
+        let dir = std::env::temp_dir().join("mcp_service_account_preserve_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let servers = vec![McpServerConfig {
+            name: "fileio".into(),
+            command: "fileio-mcp".into(),
+            args: vec![],
+            namespace: None,
+            enabled: true,
+            env: std::collections::HashMap::new(),
+            env_secrets: std::collections::HashMap::new(),
+            http: None,
+        }];
+        save_mcp_configs(&path, &servers).unwrap();
+
+        // Adding accounts keeps the server.
+        save_service_accounts(&path, &[sample_account("work-google")]).unwrap();
+        assert_eq!(load_mcp_configs(&path).unwrap().len(), 1, "server preserved");
+        assert_eq!(load_service_accounts(&path).unwrap().len(), 1);
+
+        // Re-saving servers keeps the account.
+        save_mcp_configs(&path, &servers).unwrap();
+        assert_eq!(
+            load_service_accounts(&path).unwrap().len(),
+            1,
+            "account preserved across a server save"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_service_accounts_is_owner_only() {
+        let dir = std::env::temp_dir().join("mcp_service_account_perms_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        save_service_accounts(&path, &[sample_account("work-google")]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config file must be 0600");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_service_accounts_missing_file_returns_empty() {
+        let result =
+            load_service_accounts(std::path::Path::new("/nonexistent/mcp_servers.toml")).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn duplicate_service_account_id_rejected() {
+        let err = validate_service_accounts(&[
+            sample_account("work-google"),
+            sample_account("work-google"),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, McpError::InvalidConfig(ref m) if m.contains("work-google")),
+            "duplicate id rejected with a clear error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn blank_service_account_id_rejected() {
+        let mut acct = sample_account("");
+        acct.id = "   ".into(); // whitespace-only is still blank
+        let err = validate_service_accounts(std::slice::from_ref(&acct)).unwrap_err();
+        assert!(matches!(err, McpError::InvalidConfig(_)), "got: {err}");
+    }
+
+    #[test]
+    fn empty_client_id_rejected() {
+        let mut acct = sample_account("work-google");
+        acct.client_id = String::new();
+        let err = validate_service_accounts(std::slice::from_ref(&acct)).unwrap_err();
+        assert!(
+            matches!(err, McpError::InvalidConfig(ref m) if m.contains("client_id")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn non_https_urls_rejected() {
+        // authorize_url
+        let mut acct = sample_account("work-google");
+        acct.authorize_url = "http://accounts.google.com/o/oauth2/v2/auth".into();
+        let err = validate_service_accounts(std::slice::from_ref(&acct)).unwrap_err();
+        assert!(
+            matches!(err, McpError::InvalidConfig(ref m) if m.contains("authorize_url")),
+            "http authorize_url rejected, got: {err}"
+        );
+
+        // token_url
+        let mut acct = sample_account("work-google");
+        acct.token_url = "ftp://oauth2.googleapis.com/token".into();
+        let err = validate_service_accounts(std::slice::from_ref(&acct)).unwrap_err();
+        assert!(
+            matches!(err, McpError::InvalidConfig(ref m) if m.contains("token_url")),
+            "non-https token_url rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn save_service_accounts_fails_closed_on_invalid() {
+        // An invalid set is validated *before* touching disk, so a following
+        // load still sees the previously-saved (valid) state.
+        let dir = std::env::temp_dir().join("mcp_service_account_failclosed_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        save_service_accounts(&path, &[sample_account("good")]).unwrap();
+
+        let mut bad = sample_account("bad");
+        bad.token_url = "http://insecure".into();
+        let err = save_service_accounts(&path, &[bad]).unwrap_err();
+        assert!(matches!(err, McpError::InvalidConfig(_)), "got: {err}");
+
+        // Prior valid state is intact.
+        let loaded = load_service_accounts(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "good");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
