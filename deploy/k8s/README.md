@@ -19,6 +19,15 @@ tool fleet (all deliberately out of scope; separate projects).
   host or cloud creds. Swap to Bedrock/OpenAI by editing `20-daemon-config.yaml`
   (`[connections]`/`[purposes]`) and adding the credential to the
   `adele-secrets` Secret.
+- **Config persistence:** a `local-path` PVC (`adele-daemon-state` in
+  `30-daemon.yaml`) is mounted at `/state`, and `XDG_CONFIG_HOME`/`XDG_DATA_HOME`
+  point under it, so everything the daemon persists — `daemon.toml`,
+  `mcp_servers.toml`, service accounts, the per-connection secret files set from
+  a client (`SetConnectionSecret`, #484), and the system-id — survives restarts.
+  `20-daemon-config.yaml` is now a **seed**: an init container copies its
+  `daemon.toml` onto a *fresh* volume (non-clobbering) and chowns the volume to
+  the daemon uid. After the first boot the on-volume config wins — see "Changing
+  the baseline config" below.
 
 ## Deploy
 
@@ -64,4 +73,27 @@ adele-tui --transport ws --service ws://127.0.0.1:11339/ws \
 ```
 
 Expected: a real reply. Then `kubectl -n adele-test rollout restart deploy/adele-daemon`
-and reconnect — conversation history persists (it's in Postgres, not the pod).
+and reconnect — conversation history persists (it's in Postgres, not the pod),
+and so does anything you changed via the settings API (it's on the state PVC).
+
+## Changing the baseline config
+
+Because `20-daemon-config.yaml` only *seeds* a fresh volume, editing the
+ConfigMap and re-applying does **not** change a daemon that already has a
+`daemon.toml` on its PVC. To reset the baseline, either edit the live file in
+place:
+
+```sh
+kubectl -n adele-test exec deploy/adele-daemon -- \
+  sh -c 'cat > /state/config/desktop-assistant/daemon.toml' < my-daemon.toml
+kubectl -n adele-test rollout restart deploy/adele-daemon
+```
+
+or wipe the volume to re-seed from the (edited) ConfigMap — this also drops any
+client-set credentials on the PVC:
+
+```sh
+kubectl -n adele-test scale deploy/adele-daemon --replicas=0
+kubectl -n adele-test delete pvc adele-daemon-state   # recreated on next apply
+kubectl apply -f deploy/k8s/30-daemon.yaml
+```
