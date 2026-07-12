@@ -757,6 +757,63 @@ fn common_secret_file_path(account: &str) -> PathBuf {
     default_secret_store_dir().join(account)
 }
 
+/// Secret-store account name for a named connection's credential.
+///
+/// Keyed by the connection **id** (not the connector type) so two connections
+/// of the same connector never share — or clobber — each other's secret file.
+/// The id is already validated (`ConnectionId`) to `[a-z0-9][a-z0-9_-]*`, so it
+/// is safe as a bare filename fragment.
+fn connection_secret_account(connection_id: &str) -> String {
+    format!("connection_{connection_id}")
+}
+
+/// Store (or clear) the raw credential for a named connection and return the
+/// [`SecretConfig`] coordinate to persist on the connection.
+///
+/// * Non-empty `value` ⇒ write it to the secret backend (the default `"auto"`
+///   backend writes a 0600 file under [`default_secret_store_dir`]) keyed by the
+///   connection id, and return `Some(secret)` for the caller to store on the
+///   connection's `secret` field.
+/// * Empty/whitespace `value` ⇒ best-effort remove the file-store entry and
+///   return `None` (clear).
+///
+/// The raw credential is written **only** to the secret backend — never to
+/// daemon.toml. `connector` is passed through to the backend for its
+/// account-fallback logic but is not used to key the account (the id is), so
+/// two connections of the same connector stay isolated.
+pub fn store_connection_secret(
+    connection_id: &str,
+    connector: &str,
+    value: &str,
+) -> anyhow::Result<Option<SecretConfig>> {
+    let account = connection_secret_account(connection_id);
+    let secret = SecretConfig {
+        account: Some(account.clone()),
+        ..SecretConfig::default()
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        // Clear: best-effort removal of the file-store entry. A missing file is
+        // already "cleared", so treat NotFound as success.
+        let path = common_secret_file_path(&account);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    "failed to remove connection secret file {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        return Ok(None);
+    }
+
+    write_secret_to_backend(&secret, trimmed, connector)?;
+    Ok(Some(secret))
+}
+
 pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     if !path.exists() {
         return Ok(None);
@@ -905,14 +962,26 @@ pub fn authenticate_os_user_password(username: &str, password: &str) -> anyhow::
     }
 }
 
+/// Process-wide lock serialising every test in the daemon binary that mutates
+/// the global `XDG_DATA_HOME` env var. Both the JWT store and the secret store
+/// resolve their directory from it, so tests in different modules (config's JWT
+/// / `set_api_key` tests and api_surface's `set_connection_secret` tests) must
+/// share one lock — separate per-module locks would race on the same global.
+#[cfg(test)]
+pub(crate) fn xdg_data_home_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
     fn ws_jwt_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        super::xdg_data_home_test_lock()
     }
 
     #[test]

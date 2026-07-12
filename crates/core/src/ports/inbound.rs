@@ -501,6 +501,28 @@ pub trait ConnectionsService: Send + Sync {
         force: bool,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
+    /// Store (or clear) the raw credential for a named connection in the
+    /// daemon's secret store (file/keyring — never the config file). An empty
+    /// `credential` clears it. Write-only: the value is never returned by any
+    /// read/list command.
+    ///
+    /// The default impl rejects the call so test doubles opt out without
+    /// boilerplate; only the daemon service implements real secret storage.
+    fn set_connection_secret(
+        &self,
+        id: String,
+        credential: String,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send {
+        // Drop the credential immediately — the default is a hard rejection and
+        // must not retain the raw secret in the returned future.
+        drop(credential);
+        async move {
+            Err(CoreError::Llm(format!(
+                "set_connection_secret is not supported by this service (connection {id:?})"
+            )))
+        }
+    }
+
     fn list_available_models(
         &self,
         connection_id: Option<String>,

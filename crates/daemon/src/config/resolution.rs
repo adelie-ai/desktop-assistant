@@ -540,6 +540,7 @@ pub fn resolve_connection_llm_config(
             aws_profile,
             region,
             base_url,
+            secret,
             ..
         }) => {
             // Bedrock historically used `base_url` to encode the region when
@@ -549,7 +550,9 @@ pub fn resolve_connection_llm_config(
                 .clone()
                 .or_else(|| region.clone())
                 .filter(|v| !v.trim().is_empty());
-            (effective_base, None, None, aws_profile.clone())
+            // A stored secret (`ACCESS:SECRET[:SESSION]`) resolves into `api_key`,
+            // which the Bedrock client parses into static AWS credentials.
+            (effective_base, None, secret.clone(), aws_profile.clone())
         }
     };
 

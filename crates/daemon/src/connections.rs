@@ -145,6 +145,21 @@ impl ConnectionConfig {
             Self::Ollama(_) => Connector::Ollama,
         }
     }
+
+    /// Set (or clear, with `None`) this connection's secret-store coordinate.
+    ///
+    /// Only credential-bearing connectors carry a `secret` field. Ollama talks
+    /// to a local/self-hosted endpoint with no API key, so setting a credential
+    /// on it is a caller error rather than a silent no-op.
+    pub fn set_secret(&mut self, secret: Option<SecretConfig>) -> Result<(), &'static str> {
+        match self {
+            Self::Anthropic(c) => c.secret = secret,
+            Self::OpenAi(c) => c.secret = secret,
+            Self::Bedrock(c) => c.secret = secret,
+            Self::Ollama(_) => return Err("ollama connections do not use a stored credential"),
+        }
+        Ok(())
+    }
 }
 
 /// Typed connector identity. The wire/config layer continues to round-trip
@@ -362,6 +377,13 @@ pub struct BedrockConnection {
     /// endpoint. The AWS SDK default is usually correct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Secret-store coordinate for a raw static-credential string
+    /// (`ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`). Set via the
+    /// `SetConnectionSecret` command; the raw value lives only in the secret
+    /// backend, never in daemon.toml. When absent, the daemon falls back to the
+    /// AWS credential chain / `aws_profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretConfig>,
     /// Seconds to wait for the first streaming response before treating the
     /// request as stalled. Overrides the shared 30s default. See
     /// [`AnthropicConnection::connect_timeout_secs`].

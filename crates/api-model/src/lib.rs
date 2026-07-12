@@ -257,6 +257,17 @@ pub enum Command {
         #[serde(default)]
         force: bool,
     },
+    /// Store (or clear) the raw credential for a named connection in the daemon's
+    /// secret store (file/keyring — never in daemon.toml). Empty `credential`
+    /// clears it. For Bedrock the value is
+    /// `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`; for api-key connectors
+    /// it is the raw key. Write-only — never echoed back.
+    ///
+    /// `credential` is a [`Secret`]: it (de)serializes transparently (the wire
+    /// form is a plain string, `{"set_connection_secret":{"id":…,"credential":…}}`)
+    /// but redacts itself in `Debug`, so it can't leak if a `Command` carrying it
+    /// is ever formatted into a log line.
+    SetConnectionSecret { id: String, credential: Secret },
     /// Enumerate models across one or all configured connections. When
     /// `connection_id` is `None`, aggregates models from every healthy
     /// connection. `refresh=true` bypasses connector caches (e.g. Bedrock).
@@ -1756,6 +1767,50 @@ mod tests {
                 force: false,
             }
         );
+    }
+
+    #[test]
+    fn set_connection_secret_wire_shape() {
+        let cmd = Command::SetConnectionSecret {
+            id: "work".into(),
+            credential: Secret("AKIAEXAMPLE:secretkey:sessiontoken".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        // Externally-tagged snake_case wire shape; `Secret` is transparent so
+        // the credential is a plain string on the wire.
+        assert_eq!(
+            json,
+            r#"{"set_connection_secret":{"id":"work","credential":"AKIAEXAMPLE:secretkey:sessiontoken"}}"#
+        );
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn set_connection_secret_credential_redacted_in_debug() {
+        // The credential must never surface in `{:?}` (log-leak guard).
+        let cmd = Command::SetConnectionSecret {
+            id: "work".into(),
+            credential: Secret("AKIAEXAMPLE:secretkey".into()),
+        };
+        let dump = format!("{cmd:?}");
+        assert!(
+            !dump.contains("secretkey") && !dump.contains("AKIAEXAMPLE"),
+            "credential leaked into Debug output: {dump}"
+        );
+    }
+
+    #[test]
+    fn set_connection_secret_empty_credential_roundtrips() {
+        // An empty credential is the documented "clear" signal and must survive
+        // the round-trip verbatim (not be dropped or defaulted).
+        let cmd = Command::SetConnectionSecret {
+            id: "work".into(),
+            credential: Secret(String::new()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
     }
 
     #[test]
