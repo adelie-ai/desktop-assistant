@@ -1,3 +1,27 @@
+# Persistent state for the daemon. A single PVC is mounted at /state and the
+# XDG config/data homes are pointed under it, so everything the daemon persists —
+# daemon.toml, mcp_servers.toml, service accounts (XDG_CONFIG_HOME) and the
+# per-connection secret files + system-id (XDG_DATA_HOME) — lives on the volume
+# and survives pod restarts and rollouts. Mounting one dir (not deep XDG
+# subpaths) keeps every write a child of a dir the daemon uid owns: kubelet
+# creates a mount's parents as root, which would otherwise block the daemon
+# (uid 10001) from creating sibling dirs like ~/.local/share/adelie.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: adele-daemon-state
+  namespace: adele-test
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # local-path (node-local), not nfs-ssd: an init container chowns the volume to
+  # the non-root daemon uid, and NFS root_squash would block that chown. A
+  # single-replica brain doesn't need shared storage. Two storageclasses are
+  # flagged default, so name it explicitly.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5,6 +29,8 @@ metadata:
   namespace: adele-test
 spec:
   replicas: 1
+  strategy:
+    type: Recreate # single RWO state volume; never run two pods against it at once
   selector:
     matchLabels:
       app: adele-daemon
@@ -14,6 +40,37 @@ spec:
         app: adele-daemon
     spec:
       initContainers:
+        # Seed + own the persistent state volume. The daemon self-bootstraps a
+        # default daemon.toml when none exists (#484); we instead seed the
+        # *tuned* config from the ConfigMap on a fresh volume, so the in-cluster
+        # Ollama timeouts/purposes/personality are correct out of the box. The
+        # copy is non-clobbering: once the volume holds a daemon.toml, runtime
+        # edits made through the settings API win and persist (edit the ConfigMap
+        # AND re-seed — see README — to change the baseline afterwards). Runs as
+        # root to chown the hostPath-backed local-path volume to the daemon uid;
+        # kubelet does not apply fsGroup to hostPath volumes.
+        - name: init-state
+          image: busybox:1.37
+          securityContext:
+            runAsUser: 0
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mkdir -p /state/config/desktop-assistant /state/data
+              if [ ! -f /state/config/desktop-assistant/daemon.toml ]; then
+                cp /seed/daemon.toml /state/config/desktop-assistant/daemon.toml
+                echo "seeded daemon.toml from ConfigMap"
+              else
+                echo "daemon.toml already present on volume; leaving as-is"
+              fi
+              chown -R 10001:10001 /state
+          volumeMounts:
+            - name: config-seed
+              mountPath: /seed
+            - name: state
+              mountPath: /state
         # Migrations auto-run on boot and need the DB (+ vector extension)
         # ready, so gate daemon start on Postgres accepting connections.
         - name: wait-for-postgres
@@ -34,6 +91,13 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            # Point the XDG config/data homes at the persistent volume (see the
+            # PVC above). State/cache stay on the (ephemeral) container fs under
+            # the assistant home, which is writable and needs no persistence.
+            - name: XDG_CONFIG_HOME
+              value: /state/config
+            - name: XDG_DATA_HOME
+              value: /state/data
             - name: DESKTOP_ASSISTANT_WS_ENABLED
               value: "true"
             - name: DESKTOP_ASSISTANT_WS_BIND
@@ -62,16 +126,19 @@ spec:
             - name: DESKTOP_ASSISTANT_DATABASE_URL
               value: "postgres://adele:$(POSTGRES_PASSWORD)@postgres:5432/adele"
           volumeMounts:
-            - name: config
-              mountPath: /home/assistant/.config/desktop-assistant/daemon.toml
-              subPath: daemon.toml
+            - name: state
+              mountPath: /state
           readinessProbe:
             tcpSocket:
               port: 11339
             initialDelaySeconds: 10
             periodSeconds: 5
       volumes:
-        - name: config
+        - name: state
+          persistentVolumeClaim:
+            claimName: adele-daemon-state
+        # Read-only ConfigMap, used only to seed a fresh state volume (above).
+        - name: config-seed
           configMap:
             name: adele-daemon-config
 ---
