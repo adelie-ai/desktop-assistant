@@ -439,6 +439,40 @@ impl ConnectionsService for DaemonConnectionsService {
         })
     }
 
+    async fn set_connection_secret(
+        &self,
+        id: String,
+        credential: String,
+    ) -> Result<(), CoreError> {
+        let id_valid = ConnectionId::new(id.clone())
+            .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
+        self.registry.mutate_config(|cfg| {
+            // Unhappy path: the connection must already exist. We store the
+            // credential against a specific connection's coordinate, so there is
+            // nothing to attach it to otherwise.
+            let Some(conn) = cfg.connections.get(id_valid.as_str()) else {
+                return Err(format!("connection id {id_valid:?} does not exist"));
+            };
+            let connector = conn.connector_type().to_string();
+
+            // Write (or clear) the raw value in the secret backend and get back
+            // the coordinate to persist. The raw credential never enters the
+            // config; only this non-secret coordinate does. Error messages here
+            // carry the store path/connector — never the credential value.
+            let secret =
+                crate::config::store_connection_secret(id_valid.as_str(), &connector, &credential)
+                    .map_err(|e| format!("failed to store secret for {id_valid:?}: {e}"))?;
+
+            let conn = cfg
+                .connections
+                .get_mut(id_valid.as_str())
+                .expect("connection existence checked above");
+            conn.set_secret(secret)
+                .map_err(|e| format!("connection {id_valid:?}: {e}"))?;
+            Ok(())
+        })
+    }
+
     async fn list_available_models(
         &self,
         connection_id: Option<String>,
@@ -1401,6 +1435,10 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
             aws_profile,
             region,
             base_url,
+            // Secrets never cross the non-secret payload boundary; they are set
+            // out-of-band via `set_connection_secret`. A create/update via
+            // payload therefore leaves the secret coordinate cleared.
+            secret: None,
             connect_timeout_secs,
             stream_timeout_secs,
             max_context_tokens,
@@ -1748,6 +1786,223 @@ mod tests {
             !dump.contains("super-secret-account") && !dump.contains("super-secret-entry"),
             "echoed ConnectionView leaked secret coordinates: {dump}"
         );
+    }
+
+    // --- set_connection_secret (#11 credential storage) ---------------------
+
+    /// Run `body` with `XDG_DATA_HOME` pointed at a fresh unique temp dir so the
+    /// 0600 secret files live in isolation and never touch the real
+    /// `~/.local/share`. Serialised via the crate-wide
+    /// [`crate::config::xdg_data_home_test_lock`] so it can't race the config
+    /// module's JWT / `set_api_key` tests, which repoint the same env var.
+    fn with_isolated_secret_store<T>(body: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = crate::config::xdg_data_home_test_lock();
+        let test_dir =
+            std::env::temp_dir().join(format!("da-test-connsecret-{}", uuid::Uuid::new_v4()));
+        let data_home = test_dir.join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        // SAFETY: serialised against other secret tests via the lock above; the
+        // temp dir is unique per run (UUID-suffixed).
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+        let out = body(&data_home);
+        // SAFETY: same scope as the matching `set_var` above.
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(&test_dir).ok();
+        out
+    }
+
+    /// Drive an async future to completion on a fresh current-thread runtime.
+    /// Kept sync (vs `#[tokio::test]`) so the env guard from
+    /// [`with_isolated_secret_store`] is never held across an `.await`.
+    fn run_async<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn make_handle_at(cfg: DaemonConfig, path: std::path::PathBuf) -> Arc<RegistryHandle> {
+        let registry = build_registry(&cfg);
+        Arc::new(RegistryHandle::new(cfg, registry).with_config_path(path))
+    }
+
+    /// Resolve a connection's live API key from the current config, reading any
+    /// stored secret back through the backend — the property downstream
+    /// connectors depend on.
+    fn resolved_api_key(handle: &RegistryHandle, id: &str) -> String {
+        let cfg = handle.snapshot_config();
+        let conn = cfg
+            .connections
+            .get(id)
+            .expect("connection should exist in config");
+        crate::config::resolve_connection_llm_config(conn, None).api_key
+    }
+
+    // Realistic AWS static-credential string; contains none of the
+    // placeholder markers `sanitize_secret_value` filters out.
+    const BEDROCK_CRED: &str = "AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY";
+
+    #[test]
+    fn set_connection_secret_round_trips_to_resolved_api_key() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(
+                config_with_connections(&[("aws", bedrock_work())]),
+                tmp_config_path(),
+            );
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            run_async(svc.set_connection_secret("aws".into(), BEDROCK_CRED.into())).unwrap();
+
+            // Resolution reads the file secret back as the Bedrock api_key, which
+            // `static_credentials_from_api_key` parses into AWS credentials.
+            assert_eq!(resolved_api_key(&handle, "aws"), BEDROCK_CRED);
+        });
+    }
+
+    #[test]
+    fn set_connection_secret_empty_credential_clears_it() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(
+                config_with_connections(&[("aws", bedrock_work())]),
+                tmp_config_path(),
+            );
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            run_async(svc.set_connection_secret("aws".into(), BEDROCK_CRED.into())).unwrap();
+            assert_eq!(resolved_api_key(&handle, "aws"), BEDROCK_CRED);
+
+            // Empty credential clears the stored secret; resolution then sees no
+            // key (no env fallback set in this isolated store).
+            run_async(svc.set_connection_secret("aws".into(), String::new())).unwrap();
+            assert_eq!(resolved_api_key(&handle, "aws"), "");
+
+            // The connection's `secret` coordinate is dropped from config too.
+            let cfg = handle.snapshot_config();
+            match cfg.connections.get("aws").unwrap() {
+                ConnectionConfig::Bedrock(c) => assert!(c.secret.is_none()),
+                other => panic!("expected Bedrock, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn set_connection_secret_whitespace_credential_clears_it() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(
+                config_with_connections(&[("aws", bedrock_work())]),
+                tmp_config_path(),
+            );
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            run_async(svc.set_connection_secret("aws".into(), BEDROCK_CRED.into())).unwrap();
+            // Whitespace-only is treated as "clear", same as empty.
+            run_async(svc.set_connection_secret("aws".into(), "   \n\t ".into())).unwrap();
+            assert_eq!(resolved_api_key(&handle, "aws"), "");
+        });
+    }
+
+    #[test]
+    fn set_connection_secret_is_isolated_per_connection() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(
+                config_with_connections(&[("aws1", bedrock_work()), ("aws2", bedrock_work())]),
+                tmp_config_path(),
+            );
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            // Setting aws1 must not populate aws2 (distinct account files keyed
+            // by connection id).
+            run_async(svc.set_connection_secret("aws1".into(), BEDROCK_CRED.into())).unwrap();
+            assert_eq!(resolved_api_key(&handle, "aws1"), BEDROCK_CRED);
+            assert_eq!(resolved_api_key(&handle, "aws2"), "");
+
+            // Two connections of the same connector keep independent values.
+            let other = "AKIAI44QH8DHBEXAMPLE:je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY";
+            run_async(svc.set_connection_secret("aws2".into(), other.into())).unwrap();
+            assert_eq!(resolved_api_key(&handle, "aws1"), BEDROCK_CRED);
+            assert_eq!(resolved_api_key(&handle, "aws2"), other);
+        });
+    }
+
+    #[test]
+    fn set_connection_secret_rejects_unknown_connection() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(
+                config_with_connections(&[("aws", bedrock_work())]),
+                tmp_config_path(),
+            );
+            let svc = DaemonConnectionsService::new(handle);
+            let err = run_async(svc.set_connection_secret("nope".into(), BEDROCK_CRED.into()))
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_connection_secret_rejects_bad_slug() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(DaemonConfig::default(), tmp_config_path());
+            let svc = DaemonConnectionsService::new(handle);
+            let err = run_async(svc.set_connection_secret("Bad Id!".into(), BEDROCK_CRED.into()))
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("invalid connection id"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_connection_secret_rejects_ollama() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(
+                config_with_connections(&[("local", ollama_local())]),
+                tmp_config_path(),
+            );
+            let svc = DaemonConnectionsService::new(handle);
+            // Ollama has no API key; setting a credential is a caller error.
+            let err = run_async(svc.set_connection_secret("local".into(), "whatever".into()))
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("do not use a stored credential"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_connection_secret_never_writes_credential_to_daemon_toml() {
+        with_isolated_secret_store(|_| {
+            let config_path = tmp_config_path();
+            let handle = make_handle_at(
+                config_with_connections(&[("aws", bedrock_work())]),
+                config_path.clone(),
+            );
+            let svc = DaemonConnectionsService::new(handle);
+
+            run_async(svc.set_connection_secret("aws".into(), BEDROCK_CRED.into())).unwrap();
+
+            let toml = std::fs::read_to_string(&config_path)
+                .expect("mutate_config should have persisted daemon.toml");
+            assert!(
+                !toml.contains(BEDROCK_CRED),
+                "raw credential leaked into daemon.toml:\n{toml}"
+            );
+            // The non-secret coordinate (keyed by connection id) is what persists.
+            assert!(
+                toml.contains("connection_aws"),
+                "expected the secret coordinate account in daemon.toml:\n{toml}"
+            );
+            std::fs::remove_file(&config_path).ok();
+        });
     }
 
     #[tokio::test]
