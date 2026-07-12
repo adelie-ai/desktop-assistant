@@ -825,6 +825,22 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
 /// it here, because that would force the user to manage two copies of the same
 /// credentials when the common case is "backend tasks share the primary
 /// connector".
+/// Ensure a daemon config file exists at `path`, writing a default
+/// [`DaemonConfig`] when it is absent (first run, or a fresh writable mount that
+/// replaced a baked-in config). Returns `true` when a default was written.
+///
+/// Idempotent and non-clobbering: an existing file — even empty or unparsable —
+/// is left untouched (`Ok(false)`). Best-effort at the call site: a read-only
+/// location (e.g. a Kubernetes ConfigMap mount) surfaces as an `Err` the caller
+/// logs before falling back to in-memory defaults, so this never blocks startup.
+pub fn ensure_daemon_config_exists(path: &Path) -> anyhow::Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    save_daemon_config(path, &DaemonConfig::default())?;
+    Ok(true)
+}
+
 pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -883,7 +899,7 @@ pub fn authenticate_os_user_password(username: &str, password: &str) -> anyhow::
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (username, password);
-        Err(anyhow!(
+        Err(anyhow::anyhow!(
             "OS password authentication is only supported on Linux"
         ))
     }
@@ -1413,6 +1429,43 @@ uds_socket = "/tmp/adelie.sock"
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn ensure_config_writes_default_when_missing() {
+        let dir = unique_test_dir("da-ensure-missing");
+        // A nested, not-yet-created parent dir — save_daemon_config must create it.
+        let path = dir.join("nested").join("daemon.toml");
+        assert!(!path.exists());
+
+        let wrote = ensure_daemon_config_exists(&path).unwrap();
+        assert!(wrote, "should report it wrote a default");
+        assert!(path.exists(), "the default config file should now exist");
+
+        // The written file parses back cleanly as a valid config (the daemon can
+        // load what it just bootstrapped, and settings writes will round-trip).
+        let loaded = load_daemon_config(&path).unwrap();
+        assert!(loaded.is_some(), "the written default must load back as valid config");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_config_is_idempotent_and_never_clobbers() {
+        let dir = unique_test_dir("da-ensure-existing");
+        let path = dir.join("daemon.toml");
+        let hand_written = "[connections.mine]\ntype = \"ollama\"\nbase_url = \"http://x:11434\"\n";
+        std::fs::write(&path, hand_written).unwrap();
+
+        let wrote = ensure_daemon_config_exists(&path).unwrap();
+        assert!(!wrote, "an existing file must not be overwritten");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            hand_written,
+            "the existing config must be left byte-for-byte untouched"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

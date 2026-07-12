@@ -836,6 +836,24 @@ async fn main() -> Result<()> {
 
     // Build the LLM client from daemon.toml + KWallet (fallback to env)
     let config_path = config::default_daemon_config_path();
+
+    // Self-bootstrap: on a fresh install (or a writable mount that replaced a
+    // baked-in config), write a default daemon.toml so the file exists and is
+    // editable via the settings API. Best-effort — a read-only mount (e.g. a
+    // Kubernetes ConfigMap) fails here; we log and fall back to in-memory
+    // defaults, exactly as before. Never clobbers an existing config.
+    match config::ensure_daemon_config_exists(&config_path) {
+        Ok(true) => tracing::info!(
+            "wrote a default daemon config at {} (none existed)",
+            config_path.display()
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            "could not write a default daemon config at {} (using in-memory defaults): {error}",
+            config_path.display()
+        ),
+    }
+
     let daemon_config = match config::load_daemon_config(&config_path) {
         Ok(config) => config,
         Err(error) => {
