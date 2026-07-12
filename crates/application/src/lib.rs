@@ -1908,6 +1908,16 @@ where
                 Ok(api::CommandResult::Ack)
             }
 
+            api::Command::SetConnectionSecret { id, credential } => {
+                // Unwrap the `Secret` only here, at the point the raw value is
+                // handed to the daemon's write-only secret store.
+                self.connections
+                    .set_connection_secret(id, credential.into_inner())
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Ack)
+            }
+
             api::Command::ListAvailableModels {
                 connection_id,
                 refresh,
