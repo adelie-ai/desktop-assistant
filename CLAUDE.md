@@ -1,5 +1,7 @@
 # Adele — project instructions
 
+@AGENTS.md
+
 Adele is a personal AI assistant: the `desktop-assistant` daemon plus its clients
 (GTK, TUI, KDE, voice, web). These are the guiding principles behind how Adele should
 *behave* and how we *build* it. Architecture is in `docs/architecture.md`; day-to-day
