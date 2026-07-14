@@ -345,4 +345,99 @@ mod tests {
             "after disconnect, no delivery"
         );
     }
+
+    // --- Change observer (adele-web-ui#35) ------------------------------------
+    //
+    // The BFF forwards the union of its browser sessions' subscriptions onto its
+    // single upstream daemon connection. It cannot see the dispatcher's
+    // per-session `set_subscriptions` / `unregister` calls, so the registry
+    // notifies an installed observer of each change. The daemon installs none, so
+    // the feature is zero-cost by default.
+
+    /// Records `(session_id, conversation_ids)` from each observer notification.
+    #[derive(Default)]
+    struct RecordingObserver(StdMutex<Vec<(String, Vec<String>)>>);
+
+    impl RecordingObserver {
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn install_recording_observer(subs: &ConversationSubscriptions) -> Arc<RecordingObserver> {
+        let rec = Arc::new(RecordingObserver::default());
+        let sink = Arc::clone(&rec);
+        subs.set_change_observer(Arc::new(move |session: &str, convs: &[String]| {
+            sink.0
+                .lock()
+                .unwrap()
+                .push((session.to_string(), convs.to_vec()));
+        }));
+        rec
+    }
+
+    #[test]
+    fn change_observer_fires_with_the_new_set_on_set_subscriptions() {
+        let subs = ConversationSubscriptions::new();
+        let rec = install_recording_observer(&subs);
+
+        subs.set_subscriptions("s1", vec!["c1".into(), "c2".into()]);
+
+        assert_eq!(
+            rec.calls(),
+            vec![("s1".to_string(), vec!["c1".to_string(), "c2".to_string()])],
+            "observer must be notified of the session's new subscribed set"
+        );
+    }
+
+    #[test]
+    fn change_observer_fires_empty_set_on_unregister() {
+        let subs = ConversationSubscriptions::new();
+        subs.register("s1", "alice", Arc::new(RecordingSink::default()));
+        subs.set_subscriptions("s1", vec!["c1".into()]);
+        let rec = install_recording_observer(&subs);
+
+        subs.unregister("s1");
+
+        assert_eq!(
+            rec.calls(),
+            vec![("s1".to_string(), Vec::<String>::new())],
+            "a disconnect must be reported as the session viewing nothing"
+        );
+    }
+
+    #[test]
+    fn register_alone_does_not_fire_the_change_observer() {
+        // Registering a connection's sink does not change what anyone is viewing
+        // (its subscribed set is still empty), so the union is unchanged and the
+        // observer must not fire until a `SubscribeConversations` arrives.
+        let subs = ConversationSubscriptions::new();
+        let rec = install_recording_observer(&subs);
+
+        subs.register("s1", "alice", Arc::new(RecordingSink::default()));
+
+        assert!(
+            rec.calls().is_empty(),
+            "register must not notify the change observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_change_observer_mutations_and_routing_still_work() {
+        // Degradation: the daemon installs no observer. Every mutation must be a
+        // no-op notification-wise and routing must be unaffected.
+        let subs = ConversationSubscriptions::new();
+        let viewer = Arc::new(RecordingSink::default());
+        subs.register("viewer", "alice", viewer.clone());
+        subs.set_subscriptions("viewer", vec!["c1".into()]);
+
+        subs.route("c1", &delta("c1"), "origin", "alice").await;
+
+        assert_eq!(
+            viewer.0.lock().unwrap().len(),
+            1,
+            "routing must work with no observer installed"
+        );
+        subs.unregister("viewer"); // must not panic without an observer
+    }
 }
