@@ -24,6 +24,18 @@ use desktop_assistant_api_model as api;
 
 use crate::EventSink;
 
+/// Observer notified whenever a session's subscribed set changes, with the
+/// session id and its new set of conversation ids (empty when the session
+/// disconnects). Installed via [`ConversationSubscriptions::set_change_observer`].
+///
+/// The daemon installs none; it exists for the web-UI BFF, which reaches the
+/// daemon over one shared connection and must forward the *union* of its browser
+/// sessions' subscriptions upstream so the daemon fans other clients' turns to
+/// it (adele-web-ui#35). The observer runs synchronously and MUST NOT block or
+/// re-enter the registry — the BFF's observer only recomputes a union and pushes
+/// it onto a channel.
+pub type SubscriptionChangeObserver = Arc<dyn Fn(&str, &[String]) + Send + Sync>;
+
 /// Shared registry of which connections are viewing which conversations, plus
 /// each connection's sink, so turn events can be fanned to viewers.
 #[derive(Default)]
@@ -45,6 +57,9 @@ struct Inner {
     /// another user's conversation UUID and receive its `AssistantDelta` /
     /// `AssistantCompleted` (full message content).
     users: HashMap<String, String>,
+    /// Optional change observer (adele-web-ui#35). `None` in the daemon — the
+    /// feature is zero-cost until a consumer (the BFF) installs one.
+    observer: Option<SubscriptionChangeObserver>,
 }
 
 impl ConversationSubscriptions {
@@ -63,25 +78,48 @@ impl ConversationSubscriptions {
             .insert(session_id.to_string(), user_id.to_string());
     }
 
+    /// Install a [`SubscriptionChangeObserver`] (adele-web-ui#35). Install it
+    /// before any connection registers so no change is missed; the daemon
+    /// installs none. Replaces any previous observer.
+    pub fn set_change_observer(&self, observer: SubscriptionChangeObserver) {
+        self.lock().observer = Some(observer);
+    }
+
     /// Drop a connection on disconnect: forget its sink, subscriptions, and
     /// user mapping so the maps stay bounded by live connections and no dead
-    /// sink is routed to.
+    /// sink is routed to. Notifies the change observer (if any) that the session
+    /// now views nothing, so a consumer can drop its contribution to the union.
     pub fn unregister(&self, session_id: &str) {
-        let mut inner = self.lock();
-        inner.sinks.remove(session_id);
-        inner.subscribed.remove(session_id);
-        inner.users.remove(session_id);
+        let observer = {
+            let mut inner = self.lock();
+            inner.sinks.remove(session_id);
+            inner.subscribed.remove(session_id);
+            inner.users.remove(session_id);
+            inner.observer.clone()
+        };
+        // Fire after releasing the lock: the observer must never re-enter the
+        // registry, and holding the lock across it would risk a deadlock.
+        if let Some(observer) = observer {
+            observer(session_id, &[]);
+        }
     }
 
     /// Set-replace the conversations a connection is viewing. An empty list
     /// unsubscribes it from all (it still gets turns it initiates via its own
-    /// request stream).
+    /// request stream). Notifies the change observer (if any) with the new set.
     pub fn set_subscriptions(&self, session_id: &str, conversation_ids: Vec<String>) {
-        let mut inner = self.lock();
-        inner.subscribed.insert(
-            session_id.to_string(),
-            conversation_ids.into_iter().collect(),
-        );
+        let observer = {
+            let mut inner = self.lock();
+            inner.subscribed.insert(
+                session_id.to_string(),
+                conversation_ids.iter().cloned().collect(),
+            );
+            inner.observer.clone()
+        };
+        // Fire after releasing the lock (see `unregister`).
+        if let Some(observer) = observer {
+            observer(session_id, &conversation_ids);
+        }
     }
 
     /// Fan `event` (belonging to `conversation_id`) to every OTHER connection
