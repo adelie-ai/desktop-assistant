@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
-use desktop_assistant_core::ports::inbound::KnowledgeMaintenanceService;
+use desktop_assistant_core::ports::inbound::{EmbeddingHealth, KnowledgeMaintenanceService};
 use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tokio_util::sync::CancellationToken;
@@ -1030,7 +1030,7 @@ async fn main() -> Result<()> {
         resolved_emb.is_default
     );
 
-    let embedding_client: Option<Arc<dyn EmbeddingClient>> = if !resolved_emb.available {
+    let mut embedding_client: Option<Arc<dyn EmbeddingClient>> = if !resolved_emb.available {
         tracing::info!(
             "embeddings unavailable (connector={})",
             resolved_emb.connector
@@ -1086,6 +1086,51 @@ async fn main() -> Result<()> {
     } else {
         resolved_emb.model.clone()
     };
+
+    // --- Startup embedding health probe (#499) ---
+    // `resolved_emb.available` is a shallow connector-string check; it does not
+    // prove the configured model can actually embed. A generation model
+    // configured as the embedder answers every embed with HTTP 501 and would
+    // otherwise silently disable all vector search behind a green status. Probe
+    // once here with a tiny embed so a broken backend is caught at startup,
+    // surfaced as degraded health via `GetConfig`, and search takes the honest
+    // "vector search disabled -> FTS" path instead of FTS-degrading per call.
+    let embed_configured = embedding_client.is_some();
+    let embed_probe: Option<EmbeddingHealth> = if let Some(client) = embedding_client.as_ref() {
+        if let Err(reason) = config::reject_generation_model_embedder(&resolved_emb.model) {
+            // Secondary early-UX guard: a clearly text-generation model can
+            // never embed. The probe below would catch it too, but this gives a
+            // clearer reason than a raw HTTP 501.
+            tracing::error!(model = %resolved_emb.model, "embedding backend rejected: {reason}");
+            Some(EmbeddingHealth::Unavailable { reason })
+        } else {
+            let health = embedding_probe::probe_embedding_backend(client.as_ref()).await;
+            match &health {
+                EmbeddingHealth::Ok => {
+                    tracing::info!("embedding backend probe succeeded; vector search live")
+                }
+                EmbeddingHealth::Unavailable { reason } => tracing::error!(
+                    "embedding backend probe failed; vector search degraded to full-text search: {reason}"
+                ),
+                EmbeddingHealth::Disabled => {}
+            }
+            Some(health)
+        }
+    } else {
+        // No embedding backend configured at all (for example Anthropic).
+        None
+    };
+    let embed_health = embedding_probe::embedding_view_health(embed_configured, embed_probe);
+
+    // On anything but a healthy probe, drop the embedding client so every
+    // downstream vector path (query embedding, stale-embedding invalidation,
+    // background backfill) takes the disabled path uniformly rather than
+    // churning against a backend that cannot embed. The health handle below
+    // still reports *why* (Disabled vs Unavailable) via `GetConfig`.
+    if !matches!(embed_health, EmbeddingHealth::Ok) {
+        embedding_client = None;
+    }
+    let embed_health_handle = Arc::new(embed_health);
 
     let embedding_fn: Option<EmbedFn> = embedding_client.as_ref().map(|client| {
         let client = Arc::clone(client);
@@ -2123,7 +2168,10 @@ async fn main() -> Result<()> {
             .with_mcp_control(mcp_handle)
             // Personality (#226) reads/writes through the shared registry handle
             // so settings changes hit the in-memory config the dispatch reads.
-            .with_registry(Arc::clone(&registry_handle)),
+            .with_registry(Arc::clone(&registry_handle))
+            // Startup embedding-probe result (#499) so `GetConfig` reports the
+            // backend's real degraded/disabled/ok health.
+            .with_embedding_health(Arc::clone(&embed_health_handle)),
     );
 
     // Knowledge management service (#73). Client-authored entries are

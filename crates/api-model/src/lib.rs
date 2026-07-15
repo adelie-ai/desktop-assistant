@@ -984,6 +984,38 @@ pub struct EmbeddingsSettingsView {
     pub has_api_key: bool,
     pub available: bool,
     pub is_default: bool,
+    /// Capability-detected runtime health of the embedding backend (#499).
+    ///
+    /// `available` remains a shallow connector check (true whenever a backend
+    /// is configured); `health` carries the real state from the daemon's
+    /// startup probe so clients can tell "off by design" from "configured but
+    /// broken -> vector search degraded to full-text".
+    ///
+    /// Additive and backward-compatible: `#[serde(default)]` means a payload
+    /// from an older daemon that omits the field still deserializes (as
+    /// [`EmbeddingHealth::Disabled`]), and older clients ignore the extra
+    /// field.
+    #[serde(default)]
+    pub health: EmbeddingHealth,
+}
+
+/// Capability-detected health of the embedding backend, surfaced over the wire
+/// via [`EmbeddingsSettingsView`] (#499).
+///
+/// Mirrors the core `EmbeddingHealth` and the [`ConnectionAvailability`] shape:
+/// `disabled` = no backend configured (absent by design), `ok` = the startup
+/// probe produced a real embedding, `unavailable` = a backend is configured but
+/// the probe failed (or the model was rejected as a non-embedding model), so
+/// vector search has degraded to full-text search.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EmbeddingHealth {
+    #[default]
+    Disabled,
+    Ok,
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2843,6 +2875,7 @@ mod tests {
                 has_api_key: true,
                 available: true,
                 is_default: true,
+                health: EmbeddingHealth::Ok,
             },
             persistence: PersistenceSettingsView {
                 enabled: false,
@@ -2857,6 +2890,42 @@ mod tests {
         assert_eq!(cfg, back);
         assert_eq!(back.personality.professionalism, PersonalityLevel::Always);
         assert_eq!(back.personality.humor, PersonalityLevel::Sometimes);
+    }
+
+    #[test]
+    fn embeddings_view_health_is_additive_and_backward_compatible() {
+        // A payload from an older daemon that predates the `health` field (#499)
+        // must still deserialize; the missing field defaults to `Disabled`.
+        let legacy = r#"{
+            "connector": "ollama",
+            "model": "nomic-embed-text",
+            "base_url": "http://localhost:11434",
+            "has_api_key": false,
+            "available": true,
+            "is_default": true
+        }"#;
+        let view: EmbeddingsSettingsView = serde_json::from_str(legacy).unwrap();
+        assert_eq!(view.health, EmbeddingHealth::Disabled);
+
+        // A degraded health round-trips with its reason as a tagged enum.
+        let degraded = EmbeddingsSettingsView {
+            connector: "ollama".into(),
+            model: "gpt-oss:120b".into(),
+            base_url: "http://localhost:11434".into(),
+            has_api_key: false,
+            available: true,
+            is_default: false,
+            health: EmbeddingHealth::Unavailable {
+                reason: "HTTP 501".into(),
+            },
+        };
+        let json = serde_json::to_string(&degraded).unwrap();
+        assert!(
+            json.contains("\"status\":\"unavailable\""),
+            "health serializes with a snake_case status tag: {json}"
+        );
+        let back: EmbeddingsSettingsView = serde_json::from_str(&json).unwrap();
+        assert_eq!(degraded, back);
     }
 
     #[test]

@@ -123,6 +123,15 @@ Current command variants:
 - `set_llm_settings { connector, model?, base_url? }`
 - `set_api_key { api_key }`
 - `get_embeddings_settings`
+  - The embeddings view (also carried in `get_config`) includes a `health`
+    field with a capability-detected runtime state from the daemon's startup
+    probe: `{ "status": "disabled" }` (no embedding backend configured, vector
+    search off by design), `{ "status": "ok" }` (probe produced a real
+    embedding), or `{ "status": "unavailable", "reason": "..." }` (a backend is
+    configured but the probe failed, so vector search has degraded to full-text
+    search). The legacy `available` boolean remains a shallow connector check;
+    `health` is the honest signal. Additive and backward-compatible: an older
+    daemon that omits the field deserializes as `disabled`.
 - `set_embeddings_settings { connector?, model?, base_url? }`
 - `get_connector_defaults { connector }`
 - `get_persistence_settings`

@@ -23,6 +23,13 @@ pub struct EmbeddingsSettingsView {
     pub has_api_key: bool,
     pub available: bool,
     pub is_default: bool,
+    /// Runtime health of the embedding backend, determined by the daemon's
+    /// startup probe (#499). `available` is a shallow connector check that
+    /// cannot tell a working embedder from a misconfigured one; `health`
+    /// carries the real, capability-detected state so clients can distinguish
+    /// "off by design" from "configured but broken -> degraded to full-text
+    /// search".
+    pub health: EmbeddingHealth,
 }
 
 /// Capability-detected health of the embedding backend (#499).

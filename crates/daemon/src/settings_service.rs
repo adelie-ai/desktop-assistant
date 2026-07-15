@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
-    BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView,
-    LlmSettingsView, McpServerView, PersistenceSettingsView, PersonalitySettingsView,
-    ServiceAccountView, SettingsService, WsAuthSettingsView,
+    BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingHealth,
+    EmbeddingsSettingsView, LlmSettingsView, McpServerView, PersistenceSettingsView,
+    PersonalitySettingsView, ServiceAccountView, SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
@@ -21,6 +21,12 @@ pub struct DaemonSettingsService {
     /// all share the registry's in-memory config — making personality changes
     /// take effect on the next turn without a separate reload.
     registry: Option<Arc<RegistryHandle>>,
+    /// Result of the daemon's startup embedding probe (#499). Set once at
+    /// start-up; `get_embeddings_settings` reports it so `GetConfig` surfaces a
+    /// real degraded/disabled state instead of a bare `available = true`. A
+    /// config change after start-up does not re-probe, so this reflects the
+    /// backend as it was at boot (re-probe on reload is a follow-up).
+    embedding_health: Option<Arc<EmbeddingHealth>>,
 }
 
 impl DaemonSettingsService {
@@ -29,6 +35,7 @@ impl DaemonSettingsService {
             config_path,
             mcp_handle: None,
             registry: None,
+            embedding_health: None,
         }
     }
 
@@ -39,6 +46,13 @@ impl DaemonSettingsService {
 
     pub fn with_registry(mut self, registry: Arc<RegistryHandle>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Inject the startup embedding-probe result (#499) so `GetConfig` reports
+    /// the backend's real health.
+    pub fn with_embedding_health(mut self, health: Arc<EmbeddingHealth>) -> Self {
+        self.embedding_health = Some(health);
         self
     }
 
@@ -144,6 +158,22 @@ impl SettingsService for DaemonSettingsService {
         let view = config::get_embeddings_settings_view(&self.config_path)
             .map_err(|error| CoreError::SystemService(error.to_string()))?;
 
+        // Prefer the startup probe result (#499) when it was injected; it knows
+        // whether the configured backend can actually embed. Without a probe
+        // handle (only in tests / degraded wiring), fall back to deriving from
+        // the shallow `available` connector check.
+        let health = self
+            .embedding_health
+            .as_ref()
+            .map(|health| (**health).clone())
+            .unwrap_or_else(|| {
+                if view.available {
+                    EmbeddingHealth::Ok
+                } else {
+                    EmbeddingHealth::Disabled
+                }
+            });
+
         Ok(EmbeddingsSettingsView {
             connector: view.connector,
             model: view.model,
@@ -151,6 +181,7 @@ impl SettingsService for DaemonSettingsService {
             has_api_key: view.has_api_key,
             available: view.available,
             is_default: view.is_default,
+            health,
         })
     }
 

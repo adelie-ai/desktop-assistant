@@ -1053,6 +1053,7 @@ mod tests {
                 has_api_key: true,
                 available: true,
                 is_default: false,
+                health: Default::default(),
             },
             persistence: api::PersistenceSettingsView {
                 enabled: true,
@@ -1095,6 +1096,7 @@ mod tests {
                 has_api_key: true,
                 available: true,
                 is_default: false,
+                health: Default::default(),
             },
         ));
         let (connector, model, _url, has_key, available, is_default) = settings(Arc::clone(&t))
@@ -1184,6 +1186,7 @@ mod tests {
                 has_api_key: false,
                 available: true,
                 is_default: true,
+                health: Default::default(),
             },
             persistence: api::PersistenceSettingsView {
                 enabled: false,

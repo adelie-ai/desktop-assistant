@@ -12,8 +12,19 @@
 //! name-based generation-model denylist in [`crate::config`] is only a faster,
 //! clearer secondary guard for the common misconfiguration.
 
+use std::time::Duration;
+
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::inbound::EmbeddingHealth;
+
+/// The text embedded by the startup probe. Deliberately tiny — one short word
+/// is enough to confirm the backend produces a vector.
+const PROBE_TEXT: &str = "health";
+
+/// Upper bound on the startup probe so a wedged backend cannot hang daemon
+/// start-up indefinitely. Mirrors the per-call embed timeout used by the
+/// built-in vector search.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Perform one tiny embed to verify the backend actually produces vectors, and
 /// classify the outcome into an [`EmbeddingHealth`]. Success (a non-empty
@@ -21,8 +32,23 @@ use desktop_assistant_core::ports::inbound::EmbeddingHealth;
 /// yields [`EmbeddingHealth::Unavailable`] carrying the reason. This never
 /// returns [`EmbeddingHealth::Disabled`] — the caller sets that when no backend
 /// is configured, before probing.
-pub async fn probe_embedding_backend(_client: &dyn EmbeddingClient) -> EmbeddingHealth {
-    unimplemented!("probe_embedding_backend pending implementation (#499)")
+///
+/// Model-agnostic by construction: it exercises the real embed path, so a
+/// generation model that answers with HTTP 501, a wrong endpoint, or any other
+/// non-embedding backend is caught here regardless of the model's name.
+pub async fn probe_embedding_backend(client: &dyn EmbeddingClient) -> EmbeddingHealth {
+    match tokio::time::timeout(PROBE_TIMEOUT, client.embed(vec![PROBE_TEXT.to_string()])).await {
+        Ok(Ok(vectors)) if vectors.iter().any(|v| !v.is_empty()) => EmbeddingHealth::Ok,
+        Ok(Ok(_)) => EmbeddingHealth::Unavailable {
+            reason: "embedding backend returned no vectors".to_string(),
+        },
+        Ok(Err(err)) => EmbeddingHealth::Unavailable {
+            reason: err.to_string(),
+        },
+        Err(_) => EmbeddingHealth::Unavailable {
+            reason: format!("embedding probe timed out after {PROBE_TIMEOUT:?}"),
+        },
+    }
 }
 
 /// Assemble the health surfaced in the embeddings settings view from whether a
@@ -33,11 +59,12 @@ pub async fn probe_embedding_backend(_client: &dyn EmbeddingClient) -> Embedding
 /// - configured + probe result -> that result ([`Ok`](EmbeddingHealth::Ok) or
 ///   [`Unavailable`](EmbeddingHealth::Unavailable))
 /// - configured but never probed -> [`EmbeddingHealth::Disabled`] (defensive)
-pub fn embedding_view_health(
-    _configured: bool,
-    _probe: Option<EmbeddingHealth>,
-) -> EmbeddingHealth {
-    unimplemented!("embedding_view_health pending implementation (#499)")
+pub fn embedding_view_health(configured: bool, probe: Option<EmbeddingHealth>) -> EmbeddingHealth {
+    match (configured, probe) {
+        (false, _) => EmbeddingHealth::Disabled,
+        (true, Some(health)) => health,
+        (true, None) => EmbeddingHealth::Disabled,
+    }
 }
 
 #[cfg(test)]

@@ -325,6 +325,7 @@ impl SettingsService for FakeSettings {
             has_api_key: false,
             available: false,
             is_default: true,
+            health: Default::default(),
         })
     }
     async fn set_embeddings_settings(
@@ -485,6 +486,7 @@ impl StatefulSettings {
                     has_api_key: false,
                     available: true,
                     is_default: true,
+                    health: Default::default(),
                 },
                 persistence: PersistenceSettingsView {
                     enabled: false,
