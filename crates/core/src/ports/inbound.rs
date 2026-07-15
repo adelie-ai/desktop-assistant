@@ -25,6 +25,32 @@ pub struct EmbeddingsSettingsView {
     pub is_default: bool,
 }
 
+/// Capability-detected health of the embedding backend (#499).
+///
+/// Three states, mirroring the codebase's capability-degradation model
+/// ("absent -> disable; present-and-known -> use; present-but-anomalous ->
+/// warn") and the [`ConnectionAvailability`] shape used for LLM connections:
+///
+/// - [`Disabled`](Self::Disabled): no embedding backend is configured at all
+///   (for example Anthropic). Vector search is off by design; search uses
+///   full-text only. This is the *absent* state.
+/// - [`Ok`](Self::Ok): the startup probe produced a real embedding; vector
+///   search is live.
+/// - [`Unavailable`](Self::Unavailable): a backend is configured but the
+///   startup probe failed (or the model was rejected as a non-embedding
+///   model). Vector search has degraded to full-text search until the
+///   embedder is fixed. This is the *present-but-broken* state, deliberately
+///   distinct from `Disabled`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EmbeddingHealth {
+    #[default]
+    Disabled,
+    Ok,
+    Unavailable {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectorDefaultsView {
     pub llm_model: String,

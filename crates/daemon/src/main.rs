@@ -17,6 +17,7 @@ mod backend_reasoning;
 mod classifying_llm;
 mod config;
 mod connections;
+mod embedding_probe;
 mod knowledge_service;
 mod maintenance_service;
 mod mcp_token_store;

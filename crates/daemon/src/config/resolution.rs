@@ -26,6 +26,19 @@ use super::{
     default_push_on_update,
 };
 
+/// Secondary early-UX guard (#499): reject a model that is clearly a
+/// text-generation model configured as the embedder.
+///
+/// Returns `Err(reason)` to reject. This is deliberately conservative and
+/// name-based — the startup embed probe (see [`crate::embedding_probe`]) is the
+/// general, model-agnostic mechanism that catches *any* non-embedding backend
+/// regardless of name. This guard only gives a faster, clearer signal for the
+/// common misconfiguration, so it must never false-reject an unusual-but-valid
+/// embedding model.
+pub(crate) fn reject_generation_model_embedder(_model: &str) -> Result<(), String> {
+    unimplemented!("reject_generation_model_embedder pending implementation (#499)")
+}
+
 pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSettingsView {
     // Purpose-driven path: when `[purposes.embedding]` is configured, it wins
     // over the legacy `[embeddings]` block. The daemon API surface
@@ -647,5 +660,51 @@ pub fn resolve_connection_llm_config(
         stream_timeout_secs,
         keep_warm,
         max_context_tokens,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_model_as_embedder_is_rejected_at_config_resolve() {
+        // Clearly text-generation models configured as the embedder are
+        // rejected loudly at resolve time (secondary early-UX guard; the
+        // startup probe is the general mechanism).
+        for gen_model in [
+            "gpt-oss:120b",
+            "llama3.1:8b",
+            "qwen2.5:7b",
+            "mistral:7b",
+            "gemma2:9b",
+            "phi3:mini",
+            "deepseek-r1:14b",
+        ] {
+            assert!(
+                reject_generation_model_embedder(gen_model).is_err(),
+                "{gen_model} is a generation model and must be rejected as an embedder"
+            );
+        }
+
+        // Real embedding models (including ones that share a family name with a
+        // generation model, e.g. qwen/mistral) must NOT be false-rejected — the
+        // probe is the general safety net, so this guard stays conservative.
+        for emb in [
+            "nomic-embed-text",
+            "mxbai-embed-large",
+            "text-embedding-3-small",
+            "text-embedding-3-large",
+            "snowflake-arctic-embed",
+            "all-minilm",
+            "bge-large-en-v1.5",
+            "qwen3-embedding",
+            "mistral-embed",
+        ] {
+            assert!(
+                reject_generation_model_embedder(emb).is_ok(),
+                "{emb} is a valid embedding model and must not be rejected"
+            );
+        }
     }
 }
