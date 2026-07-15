@@ -169,6 +169,38 @@ impl ConversationSubscriptions {
             .collect()
     }
 
+    /// Fan `event` to EVERY connection owned by `user`, irrespective of what
+    /// each is viewing. Unlike [`route`](Self::route), this ignores the
+    /// per-session subscribed set — it is for **user-scoped** events that carry
+    /// no conversation to route on (e.g. `KnowledgeChanged`: the user's
+    /// long-term knowledge base changed, not any one conversation). Best-effort:
+    /// a sink whose connection has gone simply fails its emit and is cleaned up
+    /// on disconnect.
+    ///
+    /// The `user` filter is the same authorization boundary [`route`](Self::route)
+    /// enforces (#432): delivery is scoped to that user's own connections, so a
+    /// different user's session is never delivered another user's event. There
+    /// is no origin-session to exclude here — a user-scoped background event has
+    /// no originating browser turn to suppress.
+    pub async fn broadcast_to_user(&self, event: &api::Event, user: &str) {
+        // Snapshot the target sinks under the lock, then release it before the
+        // async emits so a slow/contended emit never holds the registry lock.
+        let targets = self.sinks_for_user(user);
+        for sink in targets {
+            let _ = sink.emit(event.clone()).await;
+        }
+    }
+
+    fn sinks_for_user(&self, user: &str) -> Vec<Arc<dyn EventSink>> {
+        let inner = self.lock();
+        inner
+            .users
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == user)
+            .filter_map(|(session, _)| inner.sinks.get(session).cloned())
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
