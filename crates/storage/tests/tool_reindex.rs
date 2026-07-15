@@ -94,7 +94,9 @@ async fn fixture(prefix: &str) -> Option<DbFixture> {
 #[tokio::test]
 async fn reindex_source_inserts_newly_enabled_server_tools() {
     let Some(fx) = fixture("reindex_insert").await else {
-        eprintln!("skip: TEST_DATABASE_URL not set; reindex_source_inserts_newly_enabled_server_tools");
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; reindex_source_inserts_newly_enabled_server_tools"
+        );
         return;
     };
     let store = PgToolRegistryStore::new(fx.pool.clone());

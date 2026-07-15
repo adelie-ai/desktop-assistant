@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{ToolDefinition, ToolNamespace};
+use desktop_assistant_core::ports::tool_registry::ToolReindexFn;
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::{Mutex, RwLock};
 
@@ -372,6 +373,16 @@ pub struct McpExecutorState {
     /// unlike the index). Set when a connect attempt fails, cleared on success;
     /// read by `status()` to report `error`/`auth_expired` with detail.
     last_errors: Mutex<HashMap<String, ConnectError>>,
+    /// Injected reindex closure (#498): re-writes the persistent
+    /// `tool_definitions` search index with the current connected-tool set
+    /// after an enable/disable. `OnceLock` because it is wired once at startup
+    /// (via [`McpControlHandle::set_tool_reindex`]) and never reset; unset means
+    /// no persistent index to maintain (headless / no-Postgres), so
+    /// [`McpControlHandle::fire_tool_reindex`] is a clean no-op. Held as a
+    /// boxed closure rather than a store handle so this crate never depends on
+    /// `storage`; the "mcp"-source delete-then-reinsert policy lives in the
+    /// daemon's closure.
+    tool_reindex: OnceLock<ToolReindexFn>,
 }
 
 impl McpExecutorState {
@@ -1095,6 +1106,42 @@ impl McpControlHandle {
             .expect("service_accounts lock poisoned") = accounts;
     }
 
+    /// Wire the tool-registry reindex closure (#498), called once at startup by
+    /// the daemon when a persistent tool index exists. `OnceLock::set` succeeds
+    /// only the first time; a second call is silently ignored, which is fine -
+    /// the closure is startup-immutable. Left unwired (headless / no-Postgres),
+    /// [`Self::fire_tool_reindex`] is a no-op and toggling behaves exactly as
+    /// before this change.
+    pub fn set_tool_reindex(&self, reindex: ToolReindexFn) {
+        let _ = self.state.tool_reindex.set(reindex);
+    }
+
+    /// Re-write the persistent tool-search index with the current connected-tool
+    /// set (#498). Called at the end of [`Self::enable_server`] /
+    /// [`Self::disable_server`] so a hot-toggled server's tools become (or stop
+    /// being) discoverable without a daemon restart.
+    ///
+    /// No-op when no reindex closure is wired. Any error the closure returns is
+    /// logged and swallowed: a persistence hiccup must never fail the toggle
+    /// (the server has already connected/disconnected in memory), and the next
+    /// toggle - or a restart - re-converges the index.
+    ///
+    /// Concurrency: the `cached_tools` snapshot is cloned out and the guard
+    /// dropped *before* awaiting the closure, so no lock is held across the
+    /// `.await` (`clippy::await_holding_lock`).
+    pub(crate) async fn fire_tool_reindex(&self) {
+        let Some(reindex) = self.state.tool_reindex.get() else {
+            return;
+        };
+        let tools = {
+            let cached = self.state.cached_tools.lock().await;
+            cached.clone()
+        };
+        if let Err(e) = reindex(tools).await {
+            tracing::warn!("tool_definitions reindex after MCP enable/disable failed: {e}");
+        }
+    }
+
     /// Remove a server by name: auto-stop, remove config, persist.
     pub async fn remove_server(&self, name: &str) -> Result<(), McpError> {
         let idx =
@@ -1136,6 +1183,9 @@ impl McpControlHandle {
         self.persist_configs().await?;
         let _ = self.state.connect_server(idx).await;
         let _ = self.state.refresh_all_metadata().await;
+        // Re-write the persistent tool index so the newly-enabled server's tools
+        // are discoverable by tool-search without a daemon restart (#498).
+        self.fire_tool_reindex().await;
 
         Ok(())
     }
@@ -1156,6 +1206,9 @@ impl McpControlHandle {
 
         let _ = self.state.refresh_all_metadata().await;
         self.persist_configs().await?;
+        // Prune the disabled server's now-dead rows from the persistent tool
+        // index so they stop being advertised to tool-search (#498).
+        self.fire_tool_reindex().await;
 
         Ok(())
     }
@@ -1211,6 +1264,7 @@ impl McpToolExecutor {
                 #[cfg(feature = "http")]
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
+                tool_reindex: OnceLock::new(),
             }),
             builtin_tools,
         }
@@ -1237,6 +1291,7 @@ impl McpToolExecutor {
                 #[cfg(feature = "http")]
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
+                tool_reindex: OnceLock::new(),
             }),
             builtin_tools,
         }
@@ -1270,6 +1325,7 @@ impl McpToolExecutor {
                 service_accounts: std::sync::RwLock::new(Vec::new()),
                 token_store,
                 last_errors: Mutex::new(HashMap::new()),
+                tool_reindex: OnceLock::new(),
             }),
             builtin_tools,
         }
