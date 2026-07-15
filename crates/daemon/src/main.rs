@@ -854,6 +854,34 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Self-bootstrap the MCP server config the same way (#491). The
+    // containerized fleet ships a curated default at an image-specific path
+    // (absolute MCP binary locations), pointed to by
+    // `DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG`; on first boot we copy it into
+    // place so the daemon starts with the standard servers. Non-clobbering, and
+    // a no-op when the env var is unset (every non-container install) or a
+    // config already exists. Best-effort — a read-only or malformed source is
+    // logged and never blocks startup.
+    {
+        let mcp_dest = mcp_config::default_config_path();
+        let mcp_source = mcp_config::parse_default_config_source(
+            std::env::var("DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG")
+                .ok()
+                .as_deref(),
+        );
+        match mcp_config::ensure_mcp_config_exists(&mcp_dest, mcp_source.as_deref()) {
+            Ok(true) => tracing::info!(
+                "seeded default mcp_servers.toml at {} (none existed)",
+                mcp_dest.display()
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                "could not seed a default mcp_servers.toml at {}: {error}",
+                mcp_dest.display()
+            ),
+        }
+    }
+
     let daemon_config = match config::load_daemon_config(&config_path) {
         Ok(config) => config,
         Err(error) => {

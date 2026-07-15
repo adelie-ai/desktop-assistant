@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::McpError;
 use crate::executor::{McpServerConfig, ServiceAccount};
@@ -128,6 +128,62 @@ pub fn save_mcp_configs(
         path.display()
     );
     Ok(())
+}
+
+/// Seed a curated default `mcp_servers.toml` at `dest` on first boot, mirroring
+/// the daemon-config self-bootstrap (`config::ensure_daemon_config_exists`).
+/// Returns `Ok(true)` only when a default was written.
+///
+/// Non-clobbering, and a no-op for installs without a bundled default (every
+/// non-container desktop install):
+/// - `dest` already present (even empty or unparsable) -> left untouched,
+///   `Ok(false)`. Existence is checked *before* any read, so an existing file is
+///   never parsed or replaced.
+/// - `source` is `None`, or points at a path that doesn't exist -> nothing to
+///   seed, `Ok(false)`.
+/// - otherwise the source is parsed through the normal [`load_mcp_configs`]
+///   loader and written to `dest` via [`save_mcp_configs`] (0600, parent dir
+///   created).
+///
+/// Why parse-then-write rather than a byte copy: a corrupt bundled default must
+/// fail loudly at boot (a real error, not a silent copy of garbage), and the
+/// write path enforces owner-only perms on the freshly created file. `source`
+/// content is image-specific (absolute MCP binary paths), so it is a shipped
+/// file the daemon is pointed at, never a Rust constant (#490).
+pub fn ensure_mcp_config_exists(dest: &Path, source: Option<&Path>) -> Result<bool, McpError> {
+    if dest.exists() {
+        return Ok(false);
+    }
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    if !source.exists() {
+        return Ok(false);
+    }
+
+    let servers = load_mcp_configs(source)?;
+    save_mcp_configs(dest, &servers)?;
+    tracing::info!(
+        "seeded {} MCP server config(s) into {} from {}",
+        servers.len(),
+        dest.display(),
+        source.display()
+    );
+    Ok(true)
+}
+
+/// Resolve the optional path to a bundled default MCP config from the raw value
+/// of the `DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG` env var (`None` when unset).
+/// Unset or blank/whitespace-only -> `None` (no seeding; a non-container install
+/// with the var unset is a no-op). A real value is trimmed and returned.
+///
+/// Split out as a pure function so the blank-is-none semantics are unit-testable
+/// without touching the process environment (mirrors `transports::parse_env_bool`).
+pub fn parse_default_config_source(value: Option<&str>) -> Option<PathBuf> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Top-level secrets file structure.
