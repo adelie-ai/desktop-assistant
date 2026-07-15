@@ -1,0 +1,105 @@
+# Composable adele-daemon BASE image: the daemon PLUS the full MCP-server fleet
+# (issue #492). This is the image to deploy AND to derive from. A downstream
+# image adds or swaps servers with one COPY + a config line, no base rebuild:
+#
+#   FROM ghcr.io/adelie-ai/adele-daemon:base
+#   COPY my-new-mcp        /opt/adele/mcp/my-new-mcp
+#   COPY mcp_servers.toml  /opt/adele/mcp_servers.default.toml
+#
+# On-disk layout (stable contract):
+#   /usr/local/bin/desktop-assistant-daemon   the daemon (on PATH)
+#   /opt/adele/mcp/<name>-mcp                  bundled fleet binaries (absolute
+#                                              paths; the daemon spawns via
+#                                              Command::new with no PATH aug)
+#   /opt/adele/mcp_servers.default.toml        curated default, seeded on first
+#                                              boot (#491) via
+#                                              DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG
+#
+# BUILD CONTEXT: a staged dir with `desktop-assistant/` + the 13 `*-mcp` fleet
+# repos as SIBLINGS (each builds from its own source). See deploy/mcp/README.md.
+
+# ---- Builder ----------------------------------------------------------------
+FROM rust:1-bookworm AS builder
+
+# libpam0g-dev is only needed by the daemon (WS local-system auth), but a single
+# builder keeps the toolchain + cargo registry/git cache shared across the fleet.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpam0g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Fleet sources first: they change less often than the daemon, so a daemon edit
+# doesn't bust these (heavier) layers. Each is an independent cargo project.
+COPY command-mcp/          ./command-mcp/
+COPY cve-mcp/              ./cve-mcp/
+COPY fileio-mcp/           ./fileio-mcp/
+COPY geocode-mcp/          ./geocode-mcp/
+COPY homeassistant-mcp/    ./homeassistant-mcp/
+COPY internet-radio-mcp/   ./internet-radio-mcp/
+COPY openstreetmap-mcp/    ./openstreetmap-mcp/
+COPY skills-mcp/           ./skills-mcp/
+COPY tasks-mcp/            ./tasks-mcp/
+COPY terminal-mcp/         ./terminal-mcp/
+COPY timeclock-mcp/        ./timeclock-mcp/
+COPY weather-forecast-mcp/ ./weather-forecast-mcp/
+COPY web-mcp/              ./web-mcp/
+
+# Build every fleet server (shared cargo cache; binary name == crate/dir name).
+RUN set -eux; \
+    for d in command-mcp cve-mcp fileio-mcp geocode-mcp homeassistant-mcp \
+             internet-radio-mcp openstreetmap-mcp skills-mcp tasks-mcp \
+             terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do \
+      ( cd "$d" && cargo build --release ); \
+    done
+
+# Daemon last so a daemon source edit doesn't rebuild the fleet layers above.
+COPY desktop-assistant/ ./desktop-assistant/
+RUN cd desktop-assistant && cargo build --release --locked -p desktop-assistant-daemon
+
+# Collect + strip binaries into a clean staging tree.
+RUN set -eux; \
+    mkdir -p /out/mcp; \
+    for d in command-mcp cve-mcp fileio-mcp geocode-mcp homeassistant-mcp \
+             internet-radio-mcp openstreetmap-mcp skills-mcp tasks-mcp \
+             terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do \
+      cp "$d/target/release/$d" "/out/mcp/$d"; \
+      strip "/out/mcp/$d" || true; \
+    done; \
+    cp desktop-assistant/target/release/desktop-assistant-daemon /out/desktop-assistant-daemon; \
+    strip /out/desktop-assistant-daemon || true
+
+# ---- Runtime ----------------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libpam0g \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 assistant
+WORKDIR /home/assistant
+
+# Daemon on PATH; fleet binaries in the well-known composable dir.
+COPY --from=builder /out/desktop-assistant-daemon /usr/local/bin/desktop-assistant-daemon
+COPY --from=builder /out/mcp/ /opt/adele/mcp/
+
+# Curated default fleet config. Owned by the daemon user (uid 10001) because the
+# loader enforces 0600 on the file it reads (set_permissions requires ownership);
+# a root-owned copy would fail the chmod and the seed would silently skip.
+COPY --chown=10001:10001 desktop-assistant/deploy/mcp/mcp_servers.default.toml /opt/adele/mcp_servers.default.toml
+RUN chmod 600 /opt/adele/mcp_servers.default.toml
+
+ENV RUST_LOG=info
+ENV DESKTOP_ASSISTANT_WS_BIND=0.0.0.0:11339
+ENV DESKTOP_ASSISTANT_DBUS_REQUIRED=false
+ENV XDG_CONFIG_HOME=/home/assistant/.config
+ENV XDG_DATA_HOME=/home/assistant/.local/share
+ENV XDG_STATE_HOME=/home/assistant/.local/state
+ENV XDG_CACHE_HOME=/home/assistant/.cache
+# Seed the bundled fleet config on first boot (non-clobbering) when no config exists.
+ENV DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG=/opt/adele/mcp_servers.default.toml
+
+EXPOSE 11339
+USER assistant
+
+ENTRYPOINT ["desktop-assistant-daemon"]

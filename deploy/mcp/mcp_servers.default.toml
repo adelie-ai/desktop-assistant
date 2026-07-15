@@ -1,0 +1,115 @@
+# Curated default MCP server fleet for the adele-daemon composable base image.
+#
+# Every server binary is bundled at /opt/adele/mcp/<name>-mcp and speaks stdio
+# via `<name>-mcp serve`. On first boot the daemon seeds THIS file into its
+# config (via DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG, issue #491) ONLY when no
+# mcp_servers.toml exists yet - runtime edits from the settings UI win and
+# persist. Downstream images can replace this file, or COPY extra binaries into
+# /opt/adele/mcp, to change the shipped fleet (see deploy/mcp/README.md).
+#
+# Tiering (danger x usefulness): safe, zero-config servers ship ENABLED.
+# Powerful/dangerous servers, and servers that need a runtime dependency or
+# secret the headless base lacks, ship configured-but-DISABLED - flip
+# `enabled = true`, provide the dependency, or derive an image.
+
+# --- Enabled: safe, useful, start with zero configuration --------------------
+
+[[servers]]
+name = "weather-forecast"
+command = "/opt/adele/mcp/weather-forecast-mcp"
+args = ["serve"]
+enabled = true
+
+[[servers]]
+name = "geocode"
+command = "/opt/adele/mcp/geocode-mcp"
+args = ["serve"]
+enabled = true
+
+[[servers]]
+name = "openstreetmap"
+command = "/opt/adele/mcp/openstreetmap-mcp"
+args = ["serve"]
+enabled = true
+
+[[servers]]
+name = "cve"
+command = "/opt/adele/mcp/cve-mcp"
+args = ["serve"]
+enabled = true
+
+[[servers]]
+name = "tasks"
+command = "/opt/adele/mcp/tasks-mcp"
+args = ["serve"]
+enabled = true
+
+[[servers]]
+name = "timeclock"
+command = "/opt/adele/mcp/timeclock-mcp"
+args = ["serve"]
+enabled = true
+
+[[servers]]
+name = "skills"
+command = "/opt/adele/mcp/skills-mcp"
+args = ["serve"]
+enabled = true
+
+# --- Disabled: powerful/dangerous or needs a runtime dep/secret (opt-in) ------
+
+# Arbitrary shell execution. Enable only on a host you trust the assistant to
+# run shell commands on.
+[[servers]]
+name = "terminal"
+command = "/opt/adele/mcp/terminal-mcp"
+args = ["serve"]
+enabled = false
+
+# Executes configured commands. `serve` REQUIRES a --config file (bare serve
+# errors out), so before enabling, generate one - `command-mcp config example` -
+# and set e.g. args = ["serve", "--config", "/opt/adele/command-mcp.toml"].
+[[servers]]
+name = "command"
+command = "/opt/adele/mcp/command-mcp"
+args = ["serve"]
+enabled = false
+
+# Full filesystem read/write/remove/chown/move. Enable only with intent (its
+# PathGuard deny-defaults still apply).
+[[servers]]
+name = "fileio"
+command = "/opt/adele/mcp/fileio-mcp"
+args = ["serve"]
+enabled = false
+
+# Home Assistant control. Needs HOMEASSISTANT_URL + HOMEASSISTANT_TOKEN in the
+# environment to be useful (it starts, but tool calls fail until configured).
+# Prefer env_secrets for the token (seed a secret, then reference it here).
+[[servers]]
+name = "homeassistant"
+command = "/opt/adele/mcp/homeassistant-mcp"
+args = ["serve"]
+enabled = false
+# [servers.env]
+# HOMEASSISTANT_URL = "http://homeassistant.local:8123"
+
+# Headless web browsing/scraping. Needs Chromium in the image. To use it, derive:
+#   FROM <this-image>
+#   RUN apt-get update && apt-get install -y --no-install-recommends chromium \
+#       && rm -rf /var/lib/apt/lists/*
+# then set enabled = true and args = ["serve", "--chrome-arg=--no-sandbox"].
+# The SSRF guard (WEB_ALLOW_PRIVATE_HOSTS=false) stays on by default.
+[[servers]]
+name = "web"
+command = "/opt/adele/mcp/web-mcp"
+args = ["serve"]
+enabled = false
+
+# Internet radio playback. Needs the `mpv` binary plus an audio sink routed into
+# the container. On a headless brain image it starts but cannot play.
+[[servers]]
+name = "internet-radio"
+command = "/opt/adele/mcp/internet-radio-mcp"
+args = ["serve"]
+enabled = false
