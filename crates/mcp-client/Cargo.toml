@@ -39,6 +39,7 @@ http = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:url", "dep:rand"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 httpmock = "0.8"
+tempfile = "3"
 
 [lints]
 workspace = true
