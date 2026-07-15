@@ -1032,4 +1032,148 @@ command = "fileio-mcp"
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- First-boot seed of a curated default mcp_servers.toml (#491) ---------
+
+    /// A servers-only bundled default, using image-style absolute binary paths
+    /// like the containerized fleet ships (#492).
+    const BUNDLED_DEFAULT_TOML: &str = r#"
+[[servers]]
+name = "fileio"
+command = "/opt/adele/mcp/fileio-mcp"
+
+[[servers]]
+name = "weather"
+command = "/opt/adele/mcp/weather-forecast-mcp"
+args = ["--units", "metric"]
+"#;
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn seeds_default_when_dest_absent() {
+        // dest missing + valid source => dest is written to match the source and
+        // the call returns Ok(true), at owner-only perms.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("bundled_default.toml");
+        let dest = tmp.path().join("nested").join("mcp_servers.toml");
+        std::fs::write(&source, BUNDLED_DEFAULT_TOML).unwrap();
+
+        let wrote = ensure_mcp_config_exists(&dest, Some(&source)).unwrap();
+        assert!(wrote, "a fresh dest with a valid source is seeded");
+        assert!(dest.exists(), "parent dir is created and dest written");
+
+        let servers = load_mcp_configs(&dest).unwrap();
+        assert_eq!(servers.len(), 2, "both bundled servers land in dest");
+        assert_eq!(servers[0].name, "fileio");
+        assert_eq!(servers[0].command, "/opt/adele/mcp/fileio-mcp");
+        assert_eq!(servers[1].name, "weather");
+        assert_eq!(servers[1].command, "/opt/adele/mcp/weather-forecast-mcp");
+        assert_eq!(servers[1].args, vec!["--units", "metric"]);
+        assert_eq!(mode_of(&dest), 0o600, "seeded config must be 0600");
+    }
+
+    #[test]
+    fn never_clobbers_existing_dest() {
+        // dest present (distinct content) + source present => dest is left
+        // exactly as it was and the call returns Ok(false).
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("bundled_default.toml");
+        let dest = tmp.path().join("mcp_servers.toml");
+        std::fs::write(&source, BUNDLED_DEFAULT_TOML).unwrap();
+
+        let existing = "[[servers]]\nname = \"user-added\"\ncommand = \"my-mcp\"\n";
+        std::fs::write(&dest, existing).unwrap();
+
+        let wrote = ensure_mcp_config_exists(&dest, Some(&source)).unwrap();
+        assert!(!wrote, "an existing dest is never overwritten");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            existing,
+            "dest content is untouched"
+        );
+    }
+
+    #[test]
+    fn never_clobbers_even_empty_or_unparsable_dest() {
+        // A present-but-garbage dest is left as-is: existence is checked before
+        // any parse, so an unparsable file is never read, never replaced.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("bundled_default.toml");
+        std::fs::write(&source, BUNDLED_DEFAULT_TOML).unwrap();
+
+        // Empty file.
+        let empty = tmp.path().join("empty.toml");
+        std::fs::write(&empty, "").unwrap();
+        assert!(!ensure_mcp_config_exists(&empty, Some(&source)).unwrap());
+        assert_eq!(std::fs::read_to_string(&empty).unwrap(), "");
+
+        // Garbage (unparsable) file.
+        let garbage = tmp.path().join("garbage.toml");
+        std::fs::write(&garbage, "this is not = valid toml [[[").unwrap();
+        assert!(!ensure_mcp_config_exists(&garbage, Some(&source)).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&garbage).unwrap(),
+            "this is not = valid toml [[[",
+            "garbage dest is left byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn no_op_when_source_unset() {
+        // source None => nothing to seed; dest stays absent, Ok(false). This is
+        // the non-container path (DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG unset).
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mcp_servers.toml");
+
+        let wrote = ensure_mcp_config_exists(&dest, None).unwrap();
+        assert!(!wrote);
+        assert!(!dest.exists(), "no source => dest is not created");
+    }
+
+    #[test]
+    fn no_op_when_source_file_missing() {
+        // source Some(path) but the file does not exist => Ok(false), dest absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mcp_servers.toml");
+        let source = tmp.path().join("does-not-exist.toml");
+
+        let wrote = ensure_mcp_config_exists(&dest, Some(&source)).unwrap();
+        assert!(!wrote);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn malformed_source_is_an_error() {
+        // A corrupt bundled default fails loudly (parsed through the real loader)
+        // rather than being silently copied, and dest is not partially written.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("bad.toml");
+        let dest = tmp.path().join("mcp_servers.toml");
+        std::fs::write(&source, "this is not = valid toml [[[").unwrap();
+
+        let err = ensure_mcp_config_exists(&dest, Some(&source)).unwrap_err();
+        assert!(
+            matches!(err, McpError::UnexpectedResponse(_)),
+            "malformed source surfaces as a parse error, got: {err}"
+        );
+        assert!(!dest.exists(), "a malformed source never writes dest");
+    }
+
+    #[test]
+    fn default_config_source_blank_or_unset_is_none() {
+        // The env-value parser: unset (None) or blank/whitespace-only => None
+        // (so a non-container install with the var unset is a no-op); a real
+        // value => Some(path).
+        assert_eq!(parse_default_config_source(None), None);
+        assert_eq!(parse_default_config_source(Some("")), None);
+        assert_eq!(parse_default_config_source(Some("   ")), None);
+        assert_eq!(
+            parse_default_config_source(Some("  /opt/adele/mcp_servers.toml  ")),
+            Some(PathBuf::from("/opt/adele/mcp_servers.toml")),
+            "a real value is trimmed and returned"
+        );
+    }
 }
