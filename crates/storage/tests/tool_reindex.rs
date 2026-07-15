@@ -21,6 +21,9 @@
 //!   reduced set, the disabled server's rows are gone and the rest remain.
 //! - `reindex_source_is_idempotent` — repeating the same reindex yields the same
 //!   row set.
+//! - `reindex_source_empty_set_clears_all_mcp_rows` — disabling the last MCP
+//!   server (or a zero-tool server) reindexes with an empty set: the delete runs,
+//!   the INSERT batch is empty, and no `"mcp"` row survives or stays searchable.
 //!
 //! Gated on `TEST_DATABASE_URL`; pass-skips when unset (see `support`).
 
@@ -228,6 +231,46 @@ async fn reindex_source_is_idempotent() {
     assert_eq!(
         first, second,
         "a repeated reindex must yield the same row set (idempotent)"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn reindex_source_empty_set_clears_all_mcp_rows() {
+    let Some(fx) = fixture("reindex_empty").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set; reindex_source_empty_set_clears_all_mcp_rows");
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // Populate: both servers enabled.
+    let mut superset = server_a_tools();
+    superset.push(server_b_tool());
+    reindex_mcp(&store, superset).await;
+    assert!(
+        !mcp_source_names(&fx).await.is_empty(),
+        "precondition: mcp rows present before the empty reindex"
+    );
+
+    // Disable the last MCP server (or a zero-tool server): reindex with an empty
+    // set -> the delete runs, the INSERT batch is empty, no mcp rows survive.
+    reindex_mcp(&store, vec![]).await;
+
+    assert!(
+        mcp_source_names(&fx).await.is_empty(),
+        "an empty reindex must clear every mcp row"
+    );
+    // Nothing is left to surface: the FTS token that singled out server B before
+    // now matches no row.
+    let results = store
+        .search_tools("telemetry", vec![], 10)
+        .await
+        .expect("fts search after empty reindex");
+    assert!(
+        results.is_empty(),
+        "no tool may remain searchable after an empty reindex; got {:?}",
+        results.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
     fx.cleanup().await;
