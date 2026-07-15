@@ -384,6 +384,112 @@ mod tests {
         );
     }
 
+    // --- User-scoped broadcast (adele-web-ui#39) ------------------------------
+    //
+    // Some events belong to the *user*, not a conversation — `KnowledgeChanged`
+    // is the first: the user's long-term KB changed, so an open KB browser
+    // should refresh whatever it is looking at. Such an event carries no
+    // conversation id to `route` on; `broadcast_to_user` fans it to every one of
+    // that user's connections, ignoring their subscribed sets, while preserving
+    // the same #432 user boundary.
+
+    fn knowledge_changed() -> api::Event {
+        api::Event::KnowledgeChanged
+    }
+
+    #[tokio::test]
+    async fn broadcast_reaches_every_session_of_the_user() {
+        // Two connections of the one user, viewing DIFFERENT conversations —
+        // both must receive a user-scoped broadcast, because it is not routed by
+        // conversation at all.
+        let subs = ConversationSubscriptions::new();
+        let a = Arc::new(RecordingSink::default());
+        let b = Arc::new(RecordingSink::default());
+        subs.register("a", "alice", a.clone());
+        subs.set_subscriptions("a", vec!["c1".into()]);
+        subs.register("b", "alice", b.clone());
+        subs.set_subscriptions("b", vec!["c2".into()]);
+
+        subs.broadcast_to_user(&knowledge_changed(), "alice").await;
+
+        for (name, sink) in [("a", &a), ("b", &b)] {
+            let got = sink.0.lock().unwrap();
+            assert!(
+                matches!(got.as_slice(), [api::Event::KnowledgeChanged]),
+                "session {name} must receive the user-scoped event, got {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_reaches_a_session_subscribed_to_nothing() {
+        // A connection that has declared no subscriptions (e.g. it only ever
+        // reads the KB) still belongs to the user and must receive the event —
+        // proving delivery is by ownership, not subscription.
+        let subs = ConversationSubscriptions::new();
+        let reader = Arc::new(RecordingSink::default());
+        subs.register("reader", "alice", reader.clone());
+        // No `set_subscriptions` call at all.
+
+        subs.broadcast_to_user(&knowledge_changed(), "alice").await;
+
+        assert_eq!(
+            reader.0.lock().unwrap().len(),
+            1,
+            "a session with no subscriptions must still receive the user event"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_does_not_cross_the_user_boundary() {
+        // #432: bob's connection — even subscribed to alice's conversation id —
+        // must never receive alice's user-scoped broadcast.
+        let subs = ConversationSubscriptions::new();
+        let bob = Arc::new(RecordingSink::default());
+        subs.register("bob", "bob", bob.clone());
+        subs.set_subscriptions("bob", vec!["alice-conv".into()]);
+
+        subs.broadcast_to_user(&knowledge_changed(), "alice").await;
+
+        assert!(
+            bob.0.lock().unwrap().is_empty(),
+            "a different user's connection must not receive the broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_after_unregister_stops_delivery() {
+        // A disconnected connection is dropped from the registry and must no
+        // longer be delivered to.
+        let subs = ConversationSubscriptions::new();
+        let gone = Arc::new(RecordingSink::default());
+        subs.register("gone", "alice", gone.clone());
+        subs.unregister("gone");
+
+        subs.broadcast_to_user(&knowledge_changed(), "alice").await;
+
+        assert!(
+            gone.0.lock().unwrap().is_empty(),
+            "an unregistered connection must not receive the broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_to_a_user_with_no_sessions_is_a_noop() {
+        // Nothing registered for the user: the broadcast simply reaches no one
+        // (and must not panic).
+        let subs = ConversationSubscriptions::new();
+        let other = Arc::new(RecordingSink::default());
+        subs.register("other", "bob", other.clone());
+
+        subs.broadcast_to_user(&knowledge_changed(), "alice").await;
+
+        assert!(
+            other.0.lock().unwrap().is_empty(),
+            "an unrelated user's session must receive nothing"
+        );
+    }
+
     // --- Change observer (adele-web-ui#35) ------------------------------------
     //
     // The BFF forwards the union of its browser sessions' subscriptions onto its
