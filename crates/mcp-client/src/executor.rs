@@ -2313,4 +2313,117 @@ mod tests {
             );
         }
     }
+
+    // --- runtime enable/disable tool-search reindex (#498) -----------------
+    //
+    // The injected `ToolReindexFn` is the seam that lets `enable_server` /
+    // `disable_server` re-write the persistent `tool_definitions` index without
+    // `mcp-client` depending on `storage`. These pin the executor half of the
+    // contract: it fires the closure with the current connected-tool set, is a
+    // clean no-op when no closure is wired (headless / no-Postgres), and never
+    // lets a reindex error fail the toggle.
+
+    use desktop_assistant_core::ports::tool_registry::ToolReindexFn;
+
+    /// Recording reindex closure: captures each call's tool set so a test can
+    /// assert exactly what the executor handed over.
+    fn recording_reindex() -> (ToolReindexFn, Arc<Mutex<Vec<Vec<ToolDefinition>>>>) {
+        let calls: Arc<Mutex<Vec<Vec<ToolDefinition>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&calls);
+        let f: ToolReindexFn = Arc::new(move |tools| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().await.push(tools);
+                Ok(())
+            })
+        });
+        (f, calls)
+    }
+
+    #[tokio::test]
+    async fn fire_tool_reindex_calls_injected_fn_with_cached_tools() {
+        let executor = McpToolExecutor::new(vec![]);
+        // Seed the connected-tool cache directly (no live servers needed).
+        {
+            let mut cached = executor.state.cached_tools.lock().await;
+            cached.push(ToolDefinition::new(
+                "servera__alpha",
+                "alpha tool",
+                serde_json::json!({"type": "object"}),
+            ));
+            cached.push(ToolDefinition::new(
+                "serverb__beta",
+                "beta tool",
+                serde_json::json!({"type": "object"}),
+            ));
+        }
+
+        let handle = executor.control_handle();
+        let (reindex, calls) = recording_reindex();
+        handle.set_tool_reindex(reindex);
+
+        handle.fire_tool_reindex().await;
+
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1, "reindex closure must fire exactly once");
+        let names: Vec<&str> = calls[0].iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["servera__alpha", "serverb__beta"],
+            "reindex must receive the current connected-tool set"
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_tool_reindex_is_noop_when_reindex_fn_unset() {
+        let executor = McpToolExecutor::new(vec![]);
+        {
+            let mut cached = executor.state.cached_tools.lock().await;
+            cached.push(ToolDefinition::new(
+                "servera__alpha",
+                "alpha tool",
+                serde_json::json!({"type": "object"}),
+            ));
+        }
+
+        // No `set_tool_reindex` call: the headless / no-Postgres path. This must
+        // complete without panicking and without invoking any closure.
+        let handle = executor.control_handle();
+        handle.fire_tool_reindex().await;
+    }
+
+    #[tokio::test]
+    async fn fire_tool_reindex_error_does_not_fail_the_toggle() {
+        let executor = McpToolExecutor::new(vec![]);
+        {
+            let mut cached = executor.state.cached_tools.lock().await;
+            cached.push(ToolDefinition::new(
+                "servera__alpha",
+                "alpha tool",
+                serde_json::json!({"type": "object"}),
+            ));
+        }
+
+        let invoked: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&invoked);
+        let failing: ToolReindexFn = Arc::new(move |_tools| {
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                *flag.lock().await = true;
+                Err(CoreError::Storage("simulated reindex failure".to_string()))
+            })
+        });
+
+        let handle = executor.control_handle();
+        handle.set_tool_reindex(failing);
+
+        // `fire_tool_reindex` returns `()` — the error is logged and swallowed,
+        // so `enable_server` / `disable_server` stay `Ok`. Reaching the line
+        // after the await is the assertion that the error did not propagate.
+        handle.fire_tool_reindex().await;
+        assert!(
+            *invoked.lock().await,
+            "the failing closure must actually have run"
+        );
+    }
 }
