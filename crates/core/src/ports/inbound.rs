@@ -34,9 +34,9 @@ pub struct EmbeddingsSettingsView {
 
 /// Capability-detected health of the embedding backend (#499).
 ///
-/// Three states, mirroring the codebase's capability-degradation model
-/// ("absent -> disable; present-and-known -> use; present-but-anomalous ->
-/// warn") and the [`ConnectionAvailability`] shape used for LLM connections:
+/// Mirrors the codebase's capability-degradation model ("absent -> disable;
+/// present-and-known -> use; present-but-anomalous -> warn") and the
+/// [`ConnectionAvailability`] shape used for LLM connections:
 ///
 /// - [`Disabled`](Self::Disabled): no embedding backend is configured at all
 ///   (for example Anthropic). Vector search is off by design; search uses
@@ -48,14 +48,20 @@ pub struct EmbeddingsSettingsView {
 ///   model). Vector search has degraded to full-text search until the
 ///   embedder is fixed. This is the *present-but-broken* state, deliberately
 ///   distinct from `Disabled`.
+/// - [`Unknown`](Self::Unknown): the backend's health was not determined — it is
+///   configured but has not been probed (for example a config change after
+///   start-up, or degraded wiring with no probe handle). Honest "not yet known",
+///   distinct from both `Disabled` (off by design) and a false-green `Ok`. This
+///   is the default.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EmbeddingHealth {
-    #[default]
     Disabled,
     Ok,
     Unavailable {
         reason: String,
     },
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone)]

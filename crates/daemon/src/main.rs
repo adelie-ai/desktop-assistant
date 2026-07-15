@@ -1112,7 +1112,9 @@ async fn main() -> Result<()> {
                 EmbeddingHealth::Unavailable { reason } => tracing::error!(
                     "embedding backend probe failed; vector search degraded to full-text search: {reason}"
                 ),
-                EmbeddingHealth::Disabled => {}
+                // The probe only ever returns Ok/Unavailable; Disabled/Unknown are
+                // set by the caller when there is no backend to probe.
+                EmbeddingHealth::Disabled | EmbeddingHealth::Unknown => {}
             }
             Some(health)
         }
@@ -1126,8 +1128,9 @@ async fn main() -> Result<()> {
     // downstream vector path (query embedding, stale-embedding invalidation,
     // background backfill) takes the disabled path uniformly rather than
     // churning against a backend that cannot embed. The health handle below
-    // still reports *why* (Disabled vs Unavailable) via `GetConfig`.
-    if !matches!(embed_health, EmbeddingHealth::Ok) {
+    // still reports *why* (Disabled vs Unavailable vs Unknown) via `GetConfig`.
+    // The keep-or-drop decision is unit-pinned in `embedding_probe`.
+    if !embedding_probe::keep_embedding_client(&embed_health) {
         embedding_client = None;
     }
     let embed_health_handle = Arc::new(embed_health);

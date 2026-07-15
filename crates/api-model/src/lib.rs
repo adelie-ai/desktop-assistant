@@ -267,7 +267,10 @@ pub enum Command {
     /// form is a plain string, `{"set_connection_secret":{"id":…,"credential":…}}`)
     /// but redacts itself in `Debug`, so it can't leak if a `Command` carrying it
     /// is ever formatted into a log line.
-    SetConnectionSecret { id: String, credential: Secret },
+    SetConnectionSecret {
+        id: String,
+        credential: Secret,
+    },
     /// Enumerate models across one or all configured connections. When
     /// `connection_id` is `None`, aggregates models from every healthy
     /// connection. `refresh=true` bypasses connector caches (e.g. Bedrock).
@@ -993,8 +996,8 @@ pub struct EmbeddingsSettingsView {
     ///
     /// Additive and backward-compatible: `#[serde(default)]` means a payload
     /// from an older daemon that omits the field still deserializes (as
-    /// [`EmbeddingHealth::Disabled`]), and older clients ignore the extra
-    /// field.
+    /// [`EmbeddingHealth::Unknown`] — health was not reported, which is distinct
+    /// from "off by design"), and older clients ignore the extra field.
     #[serde(default)]
     pub health: EmbeddingHealth,
 }
@@ -1003,19 +1006,35 @@ pub struct EmbeddingsSettingsView {
 /// via [`EmbeddingsSettingsView`] (#499).
 ///
 /// Mirrors the core `EmbeddingHealth` and the [`ConnectionAvailability`] shape:
-/// `disabled` = no backend configured (absent by design), `ok` = the startup
-/// probe produced a real embedding, `unavailable` = a backend is configured but
-/// the probe failed (or the model was rejected as a non-embedding model), so
-/// vector search has degraded to full-text search.
+///
+/// - `disabled` = no embedding backend is configured (absent by design); vector
+///   search is off and search uses full-text only.
+/// - `ok` = the startup probe produced a real embedding; vector search is live.
+/// - `unavailable` = a backend is configured but the probe failed (or the model
+///   was rejected as a non-embedding model), so vector search has degraded to
+///   full-text search.
+/// - `unknown` = the backend's health was not determined: the field was absent
+///   (an older daemon that predates `health`), the backend is configured but was
+///   not probed, or the payload carried a status tag this client does not know.
+///   Deliberately distinct from `disabled` so a working-but-unreported backend
+///   is never misreported as off.
+///
+/// Wire-compatibility: `Unknown` is both the serde **default** (a missing
+/// `health` field from an older daemon deserializes as `Unknown`, not
+/// `Disabled`) and the `#[serde(other)]` **catch-all** (a future status tag an
+/// older client does not recognize deserializes as `Unknown` rather than failing
+/// the whole payload).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum EmbeddingHealth {
-    #[default]
     Disabled,
     Ok,
     Unavailable {
         reason: String,
     },
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

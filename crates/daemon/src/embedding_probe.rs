@@ -21,50 +21,123 @@ use desktop_assistant_core::ports::inbound::EmbeddingHealth;
 /// is enough to confirm the backend produces a vector.
 const PROBE_TEXT: &str = "health";
 
-/// Upper bound on the startup probe so a wedged backend cannot hang daemon
-/// start-up indefinitely. Mirrors the per-call embed timeout used by the
-/// built-in vector search.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-attempt timeout for the startup probe. Sized generously for a **cold**
+/// backend: on the target hardware (a slow Intel NUC) Ollama loads the embed
+/// model into memory on the first call, so the first embed can be many seconds.
+/// A too-tight bound (the old 10s) misclassifies a healthy-but-cold backend as
+/// broken and permanently disables vector search until restart — the regression
+/// this value plus [`PROBE_ATTEMPTS`] fixes.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many times the probe attempts the embed before giving up. Only *timeouts*
+/// consume attempts (a slow cold load); a hard error is classified immediately
+/// (see [`probe_embedding_backend_with`]). Worst case is bounded at roughly
+/// `PROBE_ATTEMPTS * PROBE_TIMEOUT` plus backoff.
+const PROBE_ATTEMPTS: u32 = 2;
+
+/// Short pause between timed-out attempts, giving a cold backend a moment to
+/// finish loading the model before the next embed.
+const PROBE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Perform one tiny embed to verify the backend actually produces vectors, and
-/// classify the outcome into an [`EmbeddingHealth`]. Success (a non-empty
-/// vector) yields [`EmbeddingHealth::Ok`]; any error, timeout, or empty result
-/// yields [`EmbeddingHealth::Unavailable`] carrying the reason. This never
-/// returns [`EmbeddingHealth::Disabled`] — the caller sets that when no backend
-/// is configured, before probing.
+/// classify the outcome into an [`EmbeddingHealth`]. Uses generous, cold-load
+/// tolerant defaults ([`PROBE_TIMEOUT`], [`PROBE_ATTEMPTS`]); see
+/// [`probe_embedding_backend_with`] for the injectable inner form (tests pass a
+/// tiny timeout).
 ///
 /// Model-agnostic by construction: it exercises the real embed path, so a
 /// generation model that answers with HTTP 501, a wrong endpoint, or any other
 /// non-embedding backend is caught here regardless of the model's name.
 pub async fn probe_embedding_backend(client: &dyn EmbeddingClient) -> EmbeddingHealth {
-    match tokio::time::timeout(PROBE_TIMEOUT, client.embed(vec![PROBE_TEXT.to_string()])).await {
-        Ok(Ok(vectors)) if vectors.iter().any(|v| !v.is_empty()) => EmbeddingHealth::Ok,
-        Ok(Ok(_)) => EmbeddingHealth::Unavailable {
-            reason: "embedding backend returned no vectors".to_string(),
-        },
-        Ok(Err(err)) => EmbeddingHealth::Unavailable {
-            reason: err.to_string(),
-        },
-        Err(_) => EmbeddingHealth::Unavailable {
-            reason: format!("embedding probe timed out after {PROBE_TIMEOUT:?}"),
-        },
+    probe_embedding_backend_with(client, PROBE_TIMEOUT, PROBE_ATTEMPTS).await
+}
+
+/// Inner probe with an injectable per-attempt `timeout` and `attempts` budget so
+/// the retry/timeout policy is testable without real multi-second sleeps.
+///
+/// Classification:
+/// - a non-empty vector -> [`EmbeddingHealth::Ok`];
+/// - HTTP 200 but no usable vector -> [`EmbeddingHealth::Unavailable`] (the
+///   backend answered but is not an embedder — a hard failure, not retried);
+/// - a definitive backend error (HTTP 501, connection refused, ...) ->
+///   [`EmbeddingHealth::Unavailable`] on the FIRST attempt (not retried, so a
+///   genuinely-down backend fails fast without burning the budget);
+/// - a **timeout** -> retried up to `attempts` times with a short backoff,
+///   because on a cold backend the first embed can be slow while the model loads
+///   into memory; only if every attempt times out is it
+///   [`EmbeddingHealth::Unavailable`].
+///
+/// Never returns [`EmbeddingHealth::Disabled`]/[`EmbeddingHealth::Unknown`] — the
+/// caller sets those when there is no backend to probe.
+pub async fn probe_embedding_backend_with(
+    client: &dyn EmbeddingClient,
+    timeout: Duration,
+    attempts: u32,
+) -> EmbeddingHealth {
+    let attempts = attempts.max(1);
+    let mut timeout_reason = format!("embedding probe timed out after {timeout:?}");
+    for attempt in 1..=attempts {
+        match tokio::time::timeout(timeout, client.embed(vec![PROBE_TEXT.to_string()])).await {
+            Ok(Ok(vectors)) if vectors.iter().any(|v| !v.is_empty()) => return EmbeddingHealth::Ok,
+            Ok(Ok(_)) => {
+                // The backend answered but produced no usable vector; retrying a
+                // definitively-wrong backend will not help.
+                return EmbeddingHealth::Unavailable {
+                    reason: "embedding backend returned no vectors".to_string(),
+                };
+            }
+            Ok(Err(err)) => {
+                // A definitive error (e.g. HTTP 501, connection refused): classify
+                // now rather than spending the remaining attempts on it.
+                return EmbeddingHealth::Unavailable {
+                    reason: err.to_string(),
+                };
+            }
+            Err(_) => {
+                // Timed out: likely a cold model load on the first embed. Retry a
+                // bounded number of times before declaring the backend broken.
+                timeout_reason =
+                    format!("embedding probe timed out after {timeout:?} on {attempt} attempt(s)");
+                if attempt < attempts {
+                    tokio::time::sleep(PROBE_BACKOFF).await;
+                }
+            }
+        }
+    }
+    EmbeddingHealth::Unavailable {
+        reason: timeout_reason,
     }
 }
 
 /// Assemble the health surfaced in the embeddings settings view from whether a
 /// backend is configured at all (`configured`) and the startup probe result
-/// (`probe`, `None` when no backend was configured):
+/// (`probe`, `None` when no backend was configured or it was not probed):
 ///
 /// - not configured -> [`EmbeddingHealth::Disabled`] (absent by design)
 /// - configured + probe result -> that result ([`Ok`](EmbeddingHealth::Ok) or
 ///   [`Unavailable`](EmbeddingHealth::Unavailable))
-/// - configured but never probed -> [`EmbeddingHealth::Disabled`] (defensive)
+/// - configured but never probed -> [`EmbeddingHealth::Unknown`] (honest "not
+///   determined", never a false-green `Ok` or a misleading `Disabled`)
 pub fn embedding_view_health(configured: bool, probe: Option<EmbeddingHealth>) -> EmbeddingHealth {
     match (configured, probe) {
         (false, _) => EmbeddingHealth::Disabled,
         (true, Some(health)) => health,
-        (true, None) => EmbeddingHealth::Disabled,
+        (true, None) => EmbeddingHealth::Unknown,
     }
+}
+
+/// Whether to keep the embedding client wired given the resolved startup health.
+///
+/// Only a healthy ([`Ok`](EmbeddingHealth::Ok)) probe keeps it; every other
+/// state ([`Disabled`](EmbeddingHealth::Disabled),
+/// [`Unavailable`](EmbeddingHealth::Unavailable),
+/// [`Unknown`](EmbeddingHealth::Unknown)) drops it, so every downstream vector
+/// path (query embedding, stale-embedding invalidation, background backfill)
+/// takes the disabled -> full-text-search route uniformly instead of churning
+/// against a backend that cannot embed. Extracted so this honest-fallback
+/// guarantee is unit-pinned rather than buried in `main`.
+pub(crate) fn keep_embedding_client(health: &EmbeddingHealth) -> bool {
+    matches!(health, EmbeddingHealth::Ok)
 }
 
 #[cfg(test)]

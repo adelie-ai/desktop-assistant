@@ -787,6 +787,7 @@ where
                     EmbeddingHealth::Unavailable { reason } => {
                         api::EmbeddingHealth::Unavailable { reason }
                     }
+                    EmbeddingHealth::Unknown => api::EmbeddingHealth::Unknown,
                 },
             },
             persistence: api::PersistenceSettingsView {
@@ -1409,6 +1410,7 @@ where
                             EmbeddingHealth::Unavailable { reason } => {
                                 api::EmbeddingHealth::Unavailable { reason }
                             }
+                            EmbeddingHealth::Unknown => api::EmbeddingHealth::Unknown,
                         },
                     },
                 ))

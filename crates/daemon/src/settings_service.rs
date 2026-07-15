@@ -160,19 +160,15 @@ impl SettingsService for DaemonSettingsService {
 
         // Prefer the startup probe result (#499) when it was injected; it knows
         // whether the configured backend can actually embed. Without a probe
-        // handle (only in tests / degraded wiring), fall back to deriving from
-        // the shallow `available` connector check.
+        // handle (only in tests / degraded wiring) the honest answer is
+        // `Unknown` — health was never determined. Deriving `Ok` from the shallow
+        // `available` connector check would be exactly the false-green #499
+        // exists to kill.
         let health = self
             .embedding_health
             .as_ref()
             .map(|health| (**health).clone())
-            .unwrap_or_else(|| {
-                if view.available {
-                    EmbeddingHealth::Ok
-                } else {
-                    EmbeddingHealth::Disabled
-                }
-            });
+            .unwrap_or(EmbeddingHealth::Unknown);
 
         Ok(EmbeddingsSettingsView {
             connector: view.connector,
@@ -672,15 +668,19 @@ mod tests {
         // #499: `available` is a shallow connector check and is `true` here, but
         // the startup probe found the backend broken. The reported health MUST be
         // the probe's `Unavailable`, never a false-green derived from `available`.
-        let service = DaemonSettingsService::new(available_config_path())
-            .with_embedding_health(Arc::new(EmbeddingHealth::Unavailable {
+        let service = DaemonSettingsService::new(available_config_path()).with_embedding_health(
+            Arc::new(EmbeddingHealth::Unavailable {
                 reason: "HTTP 501 Not Implemented".to_string(),
-            }));
+            }),
+        );
         let view = service
             .get_embeddings_settings()
             .await
             .expect("resolving default embeddings settings should succeed");
-        assert!(view.available, "default connector is available (not anthropic)");
+        assert!(
+            view.available,
+            "default connector is available (not anthropic)"
+        );
         match view.health {
             EmbeddingHealth::Unavailable { reason } => assert!(
                 reason.contains("501"),
@@ -700,7 +700,10 @@ mod tests {
             .get_embeddings_settings()
             .await
             .expect("resolving default embeddings settings should succeed");
-        assert!(view.available, "default connector is available (not anthropic)");
+        assert!(
+            view.available,
+            "default connector is available (not anthropic)"
+        );
         assert_eq!(
             view.health,
             EmbeddingHealth::Unknown,
