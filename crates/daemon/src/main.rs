@@ -1504,6 +1504,12 @@ async fn main() -> Result<()> {
         let reindex: ToolReindexFn = Arc::new(move |tools| {
             let store = Arc::clone(&store);
             Box::pin(async move {
+                // unregister_source + register_tools run as two separate
+                // transactions, so a concurrent tool_search landing in the gap
+                // can transiently see zero "mcp" tools. That transient-empty
+                // window is accepted for #498 (it self-heals the instant the
+                // reinsert commits); making the delete+reinsert a single atomic
+                // replace is deferred and tracked under epic #497.
                 store.unregister_source("mcp").await?;
                 let embeddings = vec![None; tools.len()];
                 store
