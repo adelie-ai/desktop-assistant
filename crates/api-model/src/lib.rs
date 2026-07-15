@@ -2895,7 +2895,10 @@ mod tests {
     #[test]
     fn embeddings_view_health_is_additive_and_backward_compatible() {
         // A payload from an older daemon that predates the `health` field (#499)
-        // must still deserialize; the missing field defaults to `Disabled`.
+        // must still deserialize. The missing field defaults to `Unknown` — the
+        // daemon did not report a health, which is NOT the same as "off": an OLD
+        // daemon whose embeddings actually work must not be misreported as
+        // Disabled.
         let legacy = r#"{
             "connector": "ollama",
             "model": "nomic-embed-text",
@@ -2905,7 +2908,7 @@ mod tests {
             "is_default": true
         }"#;
         let view: EmbeddingsSettingsView = serde_json::from_str(legacy).unwrap();
-        assert_eq!(view.health, EmbeddingHealth::Disabled);
+        assert_eq!(view.health, EmbeddingHealth::Unknown);
 
         // A degraded health round-trips with its reason as a tagged enum.
         let degraded = EmbeddingsSettingsView {
@@ -2926,6 +2929,31 @@ mod tests {
         );
         let back: EmbeddingsSettingsView = serde_json::from_str(&json).unwrap();
         assert_eq!(degraded, back);
+    }
+
+    #[test]
+    fn embeddings_view_health_unknown_is_forward_compatible_catch_all() {
+        // A FUTURE daemon may report a health status this client does not know.
+        // The `#[serde(other)]` catch-all must map any unrecognized tag to
+        // `Unknown` so deserializing the whole `GetConfig` payload never fails on
+        // an older client that predates the new variant.
+        let future = r#"{
+            "connector": "ollama",
+            "model": "nomic-embed-text",
+            "base_url": "http://localhost:11434",
+            "has_api_key": false,
+            "available": true,
+            "is_default": true,
+            "health": { "status": "reindexing", "progress": 42 }
+        }"#;
+        let view: EmbeddingsSettingsView = serde_json::from_str(future).unwrap();
+        assert_eq!(view.health, EmbeddingHealth::Unknown);
+
+        // `Unknown` itself round-trips as `{"status":"unknown"}`.
+        let json = serde_json::to_string(&EmbeddingHealth::Unknown).unwrap();
+        assert_eq!(json, r#"{"status":"unknown"}"#);
+        let back: EmbeddingHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, EmbeddingHealth::Unknown);
     }
 
     #[test]

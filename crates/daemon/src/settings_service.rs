@@ -658,4 +658,53 @@ mod tests {
         let service = DaemonSettingsService::new(PathBuf::from("/tmp/desktop-assistant-test.toml"));
         assert!(service.config_path.ends_with("desktop-assistant-test.toml"));
     }
+
+    /// A path that does not exist resolves to the daemon's default config, whose
+    /// default connector (`openai`) is not Anthropic, so `available` is `true`.
+    /// That lets these tests exercise the health-vs-`available` mapping without
+    /// touching the filesystem.
+    fn available_config_path() -> PathBuf {
+        PathBuf::from("/nonexistent/desktop-assistant-embed-health-499.toml")
+    }
+
+    #[tokio::test]
+    async fn get_embeddings_reports_injected_unavailable_over_available_true() {
+        // #499: `available` is a shallow connector check and is `true` here, but
+        // the startup probe found the backend broken. The reported health MUST be
+        // the probe's `Unavailable`, never a false-green derived from `available`.
+        let service = DaemonSettingsService::new(available_config_path())
+            .with_embedding_health(Arc::new(EmbeddingHealth::Unavailable {
+                reason: "HTTP 501 Not Implemented".to_string(),
+            }));
+        let view = service
+            .get_embeddings_settings()
+            .await
+            .expect("resolving default embeddings settings should succeed");
+        assert!(view.available, "default connector is available (not anthropic)");
+        match view.health {
+            EmbeddingHealth::Unavailable { reason } => assert!(
+                reason.contains("501"),
+                "the probe's degraded reason must be surfaced, got: {reason}"
+            ),
+            other => panic!("expected Unavailable despite available=true, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_embeddings_without_probe_handle_reports_unknown_not_false_green() {
+        // Without a probe handle (only in tests / degraded wiring), the honest
+        // answer is `Unknown` — health was never determined — NOT the shallow
+        // `available -> Ok` false-green that #499 exists to kill.
+        let service = DaemonSettingsService::new(available_config_path());
+        let view = service
+            .get_embeddings_settings()
+            .await
+            .expect("resolving default embeddings settings should succeed");
+        assert!(view.available, "default connector is available (not anthropic)");
+        assert_eq!(
+            view.health,
+            EmbeddingHealth::Unknown,
+            "no probe handle must report Unknown, never a false-green Ok"
+        );
+    }
 }

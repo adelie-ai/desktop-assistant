@@ -71,19 +71,37 @@ pub fn embedding_view_health(configured: bool, probe: Option<EmbeddingHealth>) -
 mod tests {
     use super::*;
     use desktop_assistant_core::CoreError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Minimal [`EmbeddingClient`] that returns a preset embed outcome so the
     /// probe's classification can be exercised without a live backend.
+    ///
+    /// It can also simulate a *cold* backend: the first `slow_calls` calls sleep
+    /// for `cold_delay` (mimicking a model loading into memory on the first
+    /// embed) before returning. That lets the retry/timeout path be tested
+    /// deterministically with tiny durations, so no test ever waits real
+    /// seconds.
+    #[derive(Default)]
     struct MockEmbedder {
         /// `Some(reason)` makes `embed` fail (mirroring a real HTTP-error
         /// path); `None` makes it succeed with `vectors`.
         fail_reason: Option<String>,
         vectors: Vec<Vec<f32>>,
+        /// Sleep this long on each of the first `slow_calls` calls.
+        cold_delay: Duration,
+        /// Number of leading calls that "cold-load" (sleep `cold_delay`).
+        slow_calls: usize,
+        /// Total calls observed, so a test can assert a retry actually re-called.
+        calls: AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl EmbeddingClient for MockEmbedder {
         async fn embed(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.slow_calls {
+                tokio::time::sleep(self.cold_delay).await;
+            }
             match &self.fail_reason {
                 Some(reason) => Err(CoreError::Llm(reason.clone())),
                 None => Ok(self.vectors.clone()),
@@ -107,6 +125,7 @@ mod tests {
                     .to_string(),
             ),
             vectors: Vec::new(),
+            ..Default::default()
         };
         let health = probe_embedding_backend(&client).await;
         match health {
@@ -125,12 +144,105 @@ mod tests {
         let client = MockEmbedder {
             fail_reason: None,
             vectors: vec![vec![0.1, 0.2, 0.3]],
+            ..Default::default()
         };
         let health = probe_embedding_backend(&client).await;
         assert_eq!(
             health,
             EmbeddingHealth::Ok,
             "a real embedding must probe healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_embed_probe_marks_backend_unavailable_on_empty_vectors() {
+        // #499's core failure mode: the backend answers HTTP 200 but produces no
+        // usable embedding. Both an empty outer vec and a vec-of-empty-vec must
+        // classify Unavailable (not a false-green Ok) — there is no vector to
+        // search with either way.
+        for vectors in [Vec::new(), vec![Vec::new()]] {
+            let client = MockEmbedder {
+                fail_reason: None,
+                vectors,
+                ..Default::default()
+            };
+            let health = probe_embedding_backend(&client).await;
+            match health {
+                EmbeddingHealth::Unavailable { reason } => assert!(
+                    reason.contains("no vectors"),
+                    "empty embedding must classify Unavailable, got reason: {reason}"
+                ),
+                other => panic!("expected Unavailable on empty vectors, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_embed_probe_times_out_to_unavailable() {
+        // A backend that never answers within the per-attempt timeout must
+        // classify Unavailable carrying a timeout reason — not hang startup, not
+        // read as healthy. Uses a TINY injected timeout and a single attempt so
+        // the test is fast: no real multi-second sleeps.
+        let client = MockEmbedder {
+            fail_reason: None,
+            vectors: vec![vec![0.1_f32]],
+            cold_delay: Duration::from_secs(3600),
+            slow_calls: usize::MAX,
+            ..Default::default()
+        };
+        let health = probe_embedding_backend_with(&client, Duration::from_millis(10), 1).await;
+        match health {
+            EmbeddingHealth::Unavailable { reason } => assert!(
+                reason.contains("timed out"),
+                "timeout must classify Unavailable with a timeout reason, got: {reason}"
+            ),
+            other => panic!("expected Unavailable on timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_embed_probe_tolerates_cold_first_embed() {
+        // Regression guard for the cold-start bug: on a slow/cold backend (e.g.
+        // Ollama loading the embed model into memory on the NUC) the FIRST embed
+        // can exceed the per-attempt timeout. The probe must RETRY rather than
+        // permanently disabling a healthy-but-cold backend. Here the first call
+        // "cold loads" past a tiny timeout; the second returns a real vector -> Ok.
+        let client = MockEmbedder {
+            fail_reason: None,
+            vectors: vec![vec![0.1, 0.2, 0.3]],
+            cold_delay: Duration::from_millis(200),
+            slow_calls: 1,
+            ..Default::default()
+        };
+        let health = probe_embedding_backend_with(&client, Duration::from_millis(20), 3).await;
+        assert_eq!(
+            health,
+            EmbeddingHealth::Ok,
+            "a healthy-but-cold backend must survive the first slow embed via retry"
+        );
+        assert!(
+            client.calls.load(Ordering::SeqCst) >= 2,
+            "the probe must have retried after the cold first embed"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_embed_probe_does_not_retry_hard_error() {
+        // A definitively-down backend (immediate error — HTTP 501, connection
+        // refused) must be classified Unavailable on the FIRST attempt without
+        // burning the retry budget on repeated calls, so a genuinely broken
+        // backend fails fast.
+        let client = MockEmbedder {
+            fail_reason: Some("HTTP 501 Not Implemented".to_string()),
+            vectors: Vec::new(),
+            ..Default::default()
+        };
+        let health = probe_embedding_backend_with(&client, Duration::from_secs(30), 5).await;
+        assert!(matches!(health, EmbeddingHealth::Unavailable { .. }));
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            1,
+            "a hard error must not be retried"
         );
     }
 
@@ -157,6 +269,17 @@ mod tests {
     }
 
     #[test]
+    fn embedding_view_health_configured_but_unprobed_is_unknown() {
+        // A backend is configured but no probe result is available (probing was
+        // skipped, or the probe handle was not wired). The honest state is
+        // Unknown — health was not determined — NOT Disabled, which would
+        // misreport a configured backend as off by design.
+        let health = embedding_view_health(true, None);
+        assert_eq!(health, EmbeddingHealth::Unknown);
+        assert_ne!(health, EmbeddingHealth::Disabled);
+    }
+
+    #[test]
     fn embed_backend_absent_reports_disabled_not_degraded() {
         // Anthropic has no embedding backend: the capability is absent, not
         // broken. It must report Disabled, distinct from present-but-broken
@@ -167,5 +290,18 @@ mod tests {
             !matches!(health, EmbeddingHealth::Unavailable { .. }),
             "absent backend must report Disabled, not degraded/Unavailable"
         );
+    }
+
+    #[test]
+    fn keep_embedding_client_only_on_ok() {
+        // Pin the honest-FTS wiring: only a healthy probe keeps the embedding
+        // client. Every other state drops it so downstream vector paths take the
+        // disabled -> full-text-search route uniformly.
+        assert!(keep_embedding_client(&EmbeddingHealth::Ok));
+        assert!(!keep_embedding_client(&EmbeddingHealth::Disabled));
+        assert!(!keep_embedding_client(&EmbeddingHealth::Unknown));
+        assert!(!keep_embedding_client(&EmbeddingHealth::Unavailable {
+            reason: "HTTP 501".to_string(),
+        }));
     }
 }
