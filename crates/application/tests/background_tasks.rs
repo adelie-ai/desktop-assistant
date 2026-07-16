@@ -631,6 +631,7 @@ mod foreground_send {
                 has_api_key: false,
                 available: false,
                 is_default: true,
+                health: Default::default(),
             })
         }
         async fn set_embeddings_settings(

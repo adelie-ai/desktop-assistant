@@ -23,6 +23,45 @@ pub struct EmbeddingsSettingsView {
     pub has_api_key: bool,
     pub available: bool,
     pub is_default: bool,
+    /// Runtime health of the embedding backend, determined by the daemon's
+    /// startup probe (#499). `available` is a shallow connector check that
+    /// cannot tell a working embedder from a misconfigured one; `health`
+    /// carries the real, capability-detected state so clients can distinguish
+    /// "off by design" from "configured but broken -> degraded to full-text
+    /// search".
+    pub health: EmbeddingHealth,
+}
+
+/// Capability-detected health of the embedding backend (#499).
+///
+/// Mirrors the codebase's capability-degradation model ("absent -> disable;
+/// present-and-known -> use; present-but-anomalous -> warn") and the
+/// [`ConnectionAvailability`] shape used for LLM connections:
+///
+/// - [`Disabled`](Self::Disabled): no embedding backend is configured at all
+///   (for example Anthropic). Vector search is off by design; search uses
+///   full-text only. This is the *absent* state.
+/// - [`Ok`](Self::Ok): the startup probe produced a real embedding; vector
+///   search is live.
+/// - [`Unavailable`](Self::Unavailable): a backend is configured but the
+///   startup probe failed (or the model was rejected as a non-embedding
+///   model). Vector search has degraded to full-text search until the
+///   embedder is fixed. This is the *present-but-broken* state, deliberately
+///   distinct from `Disabled`.
+/// - [`Unknown`](Self::Unknown): the backend's health was not determined — it is
+///   configured but has not been probed (for example a config change after
+///   start-up, or degraded wiring with no probe handle). Honest "not yet known",
+///   distinct from both `Disabled` (off by design) and a false-green `Ok`. This
+///   is the default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EmbeddingHealth {
+    Disabled,
+    Ok,
+    Unavailable {
+        reason: String,
+    },
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone)]

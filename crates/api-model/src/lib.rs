@@ -267,7 +267,10 @@ pub enum Command {
     /// form is a plain string, `{"set_connection_secret":{"id":…,"credential":…}}`)
     /// but redacts itself in `Debug`, so it can't leak if a `Command` carrying it
     /// is ever formatted into a log line.
-    SetConnectionSecret { id: String, credential: Secret },
+    SetConnectionSecret {
+        id: String,
+        credential: Secret,
+    },
     /// Enumerate models across one or all configured connections. When
     /// `connection_id` is `None`, aggregates models from every healthy
     /// connection. `refresh=true` bypasses connector caches (e.g. Bedrock).
@@ -984,6 +987,54 @@ pub struct EmbeddingsSettingsView {
     pub has_api_key: bool,
     pub available: bool,
     pub is_default: bool,
+    /// Capability-detected runtime health of the embedding backend (#499).
+    ///
+    /// `available` remains a shallow connector check (true whenever a backend
+    /// is configured); `health` carries the real state from the daemon's
+    /// startup probe so clients can tell "off by design" from "configured but
+    /// broken -> vector search degraded to full-text".
+    ///
+    /// Additive and backward-compatible: `#[serde(default)]` means a payload
+    /// from an older daemon that omits the field still deserializes (as
+    /// [`EmbeddingHealth::Unknown`] — health was not reported, which is distinct
+    /// from "off by design"), and older clients ignore the extra field.
+    #[serde(default)]
+    pub health: EmbeddingHealth,
+}
+
+/// Capability-detected health of the embedding backend, surfaced over the wire
+/// via [`EmbeddingsSettingsView`] (#499).
+///
+/// Mirrors the core `EmbeddingHealth` and the [`ConnectionAvailability`] shape:
+///
+/// - `disabled` = no embedding backend is configured (absent by design); vector
+///   search is off and search uses full-text only.
+/// - `ok` = the startup probe produced a real embedding; vector search is live.
+/// - `unavailable` = a backend is configured but the probe failed (or the model
+///   was rejected as a non-embedding model), so vector search has degraded to
+///   full-text search.
+/// - `unknown` = the backend's health was not determined: the field was absent
+///   (an older daemon that predates `health`), the backend is configured but was
+///   not probed, or the payload carried a status tag this client does not know.
+///   Deliberately distinct from `disabled` so a working-but-unreported backend
+///   is never misreported as off.
+///
+/// Wire-compatibility: `Unknown` is both the serde **default** (a missing
+/// `health` field from an older daemon deserializes as `Unknown`, not
+/// `Disabled`) and the `#[serde(other)]` **catch-all** (a future status tag an
+/// older client does not recognize deserializes as `Unknown` rather than failing
+/// the whole payload).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EmbeddingHealth {
+    Disabled,
+    Ok,
+    Unavailable {
+        reason: String,
+    },
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2843,6 +2894,7 @@ mod tests {
                 has_api_key: true,
                 available: true,
                 is_default: true,
+                health: EmbeddingHealth::Ok,
             },
             persistence: PersistenceSettingsView {
                 enabled: false,
@@ -2857,6 +2909,70 @@ mod tests {
         assert_eq!(cfg, back);
         assert_eq!(back.personality.professionalism, PersonalityLevel::Always);
         assert_eq!(back.personality.humor, PersonalityLevel::Sometimes);
+    }
+
+    #[test]
+    fn embeddings_view_health_is_additive_and_backward_compatible() {
+        // A payload from an older daemon that predates the `health` field (#499)
+        // must still deserialize. The missing field defaults to `Unknown` — the
+        // daemon did not report a health, which is NOT the same as "off": an OLD
+        // daemon whose embeddings actually work must not be misreported as
+        // Disabled.
+        let legacy = r#"{
+            "connector": "ollama",
+            "model": "nomic-embed-text",
+            "base_url": "http://localhost:11434",
+            "has_api_key": false,
+            "available": true,
+            "is_default": true
+        }"#;
+        let view: EmbeddingsSettingsView = serde_json::from_str(legacy).unwrap();
+        assert_eq!(view.health, EmbeddingHealth::Unknown);
+
+        // A degraded health round-trips with its reason as a tagged enum.
+        let degraded = EmbeddingsSettingsView {
+            connector: "ollama".into(),
+            model: "gpt-oss:120b".into(),
+            base_url: "http://localhost:11434".into(),
+            has_api_key: false,
+            available: true,
+            is_default: false,
+            health: EmbeddingHealth::Unavailable {
+                reason: "HTTP 501".into(),
+            },
+        };
+        let json = serde_json::to_string(&degraded).unwrap();
+        assert!(
+            json.contains("\"status\":\"unavailable\""),
+            "health serializes with a snake_case status tag: {json}"
+        );
+        let back: EmbeddingsSettingsView = serde_json::from_str(&json).unwrap();
+        assert_eq!(degraded, back);
+    }
+
+    #[test]
+    fn embeddings_view_health_unknown_is_forward_compatible_catch_all() {
+        // A FUTURE daemon may report a health status this client does not know.
+        // The `#[serde(other)]` catch-all must map any unrecognized tag to
+        // `Unknown` so deserializing the whole `GetConfig` payload never fails on
+        // an older client that predates the new variant.
+        let future = r#"{
+            "connector": "ollama",
+            "model": "nomic-embed-text",
+            "base_url": "http://localhost:11434",
+            "has_api_key": false,
+            "available": true,
+            "is_default": true,
+            "health": { "status": "reindexing", "progress": 42 }
+        }"#;
+        let view: EmbeddingsSettingsView = serde_json::from_str(future).unwrap();
+        assert_eq!(view.health, EmbeddingHealth::Unknown);
+
+        // `Unknown` itself round-trips as `{"status":"unknown"}`.
+        let json = serde_json::to_string(&EmbeddingHealth::Unknown).unwrap();
+        assert_eq!(json, r#"{"status":"unknown"}"#);
+        let back: EmbeddingHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, EmbeddingHealth::Unknown);
     }
 
     #[test]

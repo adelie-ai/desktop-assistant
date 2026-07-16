@@ -52,6 +52,7 @@ pub use oidc::OidcValidator;
 // at `config::` for external visibility.
 #[allow(unused_imports)]
 pub use resolution::DEFAULT_PURPOSE_MAX_CONTEXT_TOKENS;
+pub(crate) use resolution::reject_generation_model_embedder;
 pub use resolution::{
     apply_learned_cap, purpose_max_context_override, resolve_backend_tasks_llm_config,
     resolve_connection_llm_config, resolve_consolidation_llm_config, resolve_context_budget,

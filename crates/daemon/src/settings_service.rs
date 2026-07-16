@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
-    BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingsSettingsView,
-    LlmSettingsView, McpServerView, PersistenceSettingsView, PersonalitySettingsView,
-    ServiceAccountView, SettingsService, WsAuthSettingsView,
+    BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingHealth,
+    EmbeddingsSettingsView, LlmSettingsView, McpServerView, PersistenceSettingsView,
+    PersonalitySettingsView, ServiceAccountView, SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
@@ -21,6 +21,12 @@ pub struct DaemonSettingsService {
     /// all share the registry's in-memory config — making personality changes
     /// take effect on the next turn without a separate reload.
     registry: Option<Arc<RegistryHandle>>,
+    /// Result of the daemon's startup embedding probe (#499). Set once at
+    /// start-up; `get_embeddings_settings` reports it so `GetConfig` surfaces a
+    /// real degraded/disabled state instead of a bare `available = true`. A
+    /// config change after start-up does not re-probe, so this reflects the
+    /// backend as it was at boot (re-probe on reload is a follow-up).
+    embedding_health: Option<Arc<EmbeddingHealth>>,
 }
 
 impl DaemonSettingsService {
@@ -29,6 +35,7 @@ impl DaemonSettingsService {
             config_path,
             mcp_handle: None,
             registry: None,
+            embedding_health: None,
         }
     }
 
@@ -39,6 +46,13 @@ impl DaemonSettingsService {
 
     pub fn with_registry(mut self, registry: Arc<RegistryHandle>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Inject the startup embedding-probe result (#499) so `GetConfig` reports
+    /// the backend's real health.
+    pub fn with_embedding_health(mut self, health: Arc<EmbeddingHealth>) -> Self {
+        self.embedding_health = Some(health);
         self
     }
 
@@ -144,6 +158,18 @@ impl SettingsService for DaemonSettingsService {
         let view = config::get_embeddings_settings_view(&self.config_path)
             .map_err(|error| CoreError::SystemService(error.to_string()))?;
 
+        // Prefer the startup probe result (#499) when it was injected; it knows
+        // whether the configured backend can actually embed. Without a probe
+        // handle (only in tests / degraded wiring) the honest answer is
+        // `Unknown` — health was never determined. Deriving `Ok` from the shallow
+        // `available` connector check would be exactly the false-green #499
+        // exists to kill.
+        let health = self
+            .embedding_health
+            .as_ref()
+            .map(|health| (**health).clone())
+            .unwrap_or(EmbeddingHealth::Unknown);
+
         Ok(EmbeddingsSettingsView {
             connector: view.connector,
             model: view.model,
@@ -151,6 +177,7 @@ impl SettingsService for DaemonSettingsService {
             has_api_key: view.has_api_key,
             available: view.available,
             is_default: view.is_default,
+            health,
         })
     }
 
@@ -626,5 +653,61 @@ mod tests {
     fn settings_service_constructs() {
         let service = DaemonSettingsService::new(PathBuf::from("/tmp/desktop-assistant-test.toml"));
         assert!(service.config_path.ends_with("desktop-assistant-test.toml"));
+    }
+
+    /// A path that does not exist resolves to the daemon's default config, whose
+    /// default connector (`openai`) is not Anthropic, so `available` is `true`.
+    /// That lets these tests exercise the health-vs-`available` mapping without
+    /// touching the filesystem.
+    fn available_config_path() -> PathBuf {
+        PathBuf::from("/nonexistent/desktop-assistant-embed-health-499.toml")
+    }
+
+    #[tokio::test]
+    async fn get_embeddings_reports_injected_unavailable_over_available_true() {
+        // #499: `available` is a shallow connector check and is `true` here, but
+        // the startup probe found the backend broken. The reported health MUST be
+        // the probe's `Unavailable`, never a false-green derived from `available`.
+        let service = DaemonSettingsService::new(available_config_path()).with_embedding_health(
+            Arc::new(EmbeddingHealth::Unavailable {
+                reason: "HTTP 501 Not Implemented".to_string(),
+            }),
+        );
+        let view = service
+            .get_embeddings_settings()
+            .await
+            .expect("resolving default embeddings settings should succeed");
+        assert!(
+            view.available,
+            "default connector is available (not anthropic)"
+        );
+        match view.health {
+            EmbeddingHealth::Unavailable { reason } => assert!(
+                reason.contains("501"),
+                "the probe's degraded reason must be surfaced, got: {reason}"
+            ),
+            other => panic!("expected Unavailable despite available=true, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_embeddings_without_probe_handle_reports_unknown_not_false_green() {
+        // Without a probe handle (only in tests / degraded wiring), the honest
+        // answer is `Unknown` — health was never determined — NOT the shallow
+        // `available -> Ok` false-green that #499 exists to kill.
+        let service = DaemonSettingsService::new(available_config_path());
+        let view = service
+            .get_embeddings_settings()
+            .await
+            .expect("resolving default embeddings settings should succeed");
+        assert!(
+            view.available,
+            "default connector is available (not anthropic)"
+        );
+        assert_eq!(
+            view.health,
+            EmbeddingHealth::Unknown,
+            "no probe handle must report Unknown, never a false-green Ok"
+        );
     }
 }

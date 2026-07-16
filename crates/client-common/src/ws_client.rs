@@ -602,6 +602,7 @@ mod tests {
                     has_api_key: true,
                     available: true,
                     is_default: true,
+                    health: Default::default(),
                 },
                 persistence: api::PersistenceSettingsView {
                     enabled: false,

@@ -18,8 +18,9 @@ use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::client_tools::with_client_tools;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
-    ConversationModelSelection, ConversationService, DispatchWarning, KnowledgeMaintenanceService,
-    KnowledgeService, PromptSelectionOverride, PurposeConfigPayload, SettingsService,
+    ConversationModelSelection, ConversationService, DispatchWarning, EmbeddingHealth,
+    KnowledgeMaintenanceService, KnowledgeService, PromptSelectionOverride, PurposeConfigPayload,
+    SettingsService,
 };
 use desktop_assistant_core::ports::request_scope::RequestScope;
 use desktop_assistant_core::ports::scratchpad::{
@@ -780,6 +781,14 @@ where
                 has_api_key: embeddings.has_api_key,
                 available: embeddings.available,
                 is_default: embeddings.is_default,
+                health: match embeddings.health {
+                    EmbeddingHealth::Disabled => api::EmbeddingHealth::Disabled,
+                    EmbeddingHealth::Ok => api::EmbeddingHealth::Ok,
+                    EmbeddingHealth::Unavailable { reason } => {
+                        api::EmbeddingHealth::Unavailable { reason }
+                    }
+                    EmbeddingHealth::Unknown => api::EmbeddingHealth::Unknown,
+                },
             },
             persistence: api::PersistenceSettingsView {
                 enabled: persistence.enabled,
@@ -1395,6 +1404,14 @@ where
                         has_api_key: s.has_api_key,
                         available: s.available,
                         is_default: s.is_default,
+                        health: match s.health {
+                            EmbeddingHealth::Disabled => api::EmbeddingHealth::Disabled,
+                            EmbeddingHealth::Ok => api::EmbeddingHealth::Ok,
+                            EmbeddingHealth::Unavailable { reason } => {
+                                api::EmbeddingHealth::Unavailable { reason }
+                            }
+                            EmbeddingHealth::Unknown => api::EmbeddingHealth::Unknown,
+                        },
                     },
                 ))
             }
@@ -3425,6 +3442,7 @@ mod tests {
                 has_api_key: false,
                 available: false,
                 is_default: true,
+                health: EmbeddingHealth::Disabled,
             })
         }
         async fn set_embeddings_settings(
@@ -3597,6 +3615,7 @@ mod tests {
                         has_api_key: false,
                         available: true,
                         is_default: true,
+                        health: EmbeddingHealth::Ok,
                     },
                     persistence: PersistenceSettingsView {
                         enabled: false,
