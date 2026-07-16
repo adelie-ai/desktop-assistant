@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{ToolDefinition, ToolNamespace};
+use desktop_assistant_core::ports::tool_registry::ToolReindexFn;
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::{Mutex, RwLock};
 
@@ -372,6 +373,27 @@ pub struct McpExecutorState {
     /// unlike the index). Set when a connect attempt fails, cleared on success;
     /// read by `status()` to report `error`/`auth_expired` with detail.
     last_errors: Mutex<HashMap<String, ConnectError>>,
+    /// Serializes each enable/disable reindex (#498 review). Overlapping toggles
+    /// otherwise race: two [`McpControlHandle::fire_tool_reindex`] calls could
+    /// interleave their `cached_tools` snapshot and `reindex(..)` write so an
+    /// earlier toggle's slower reindex lands *after* a later one and commits a
+    /// stale snapshot as the final index (and it does not self-heal). This mutex
+    /// is held across BOTH the snapshot and the closure await, making per-toggle
+    /// snapshot+reindex mutually exclusive; the last toggle to serialize
+    /// deterministically writes the current tool set. A `tokio::sync::Mutex`
+    /// guard held across `.await` is correct and does not trip
+    /// `clippy::await_holding_lock` (that lint targets std / parking_lot guards).
+    reindex_lock: Mutex<()>,
+    /// Injected reindex closure (#498): re-writes the persistent
+    /// `tool_definitions` search index with the current connected-tool set
+    /// after an enable/disable. `OnceLock` because it is wired once at startup
+    /// (via [`McpControlHandle::set_tool_reindex`]) and never reset; unset means
+    /// no persistent index to maintain (headless / no-Postgres), so
+    /// [`McpControlHandle::fire_tool_reindex`] is a clean no-op. Held as a
+    /// boxed closure rather than a store handle so this crate never depends on
+    /// `storage`; the "mcp"-source delete-then-reinsert policy lives in the
+    /// daemon's closure.
+    tool_reindex: OnceLock<ToolReindexFn>,
 }
 
 impl McpExecutorState {
@@ -1095,6 +1117,50 @@ impl McpControlHandle {
             .expect("service_accounts lock poisoned") = accounts;
     }
 
+    /// Wire the tool-registry reindex closure (#498), called once at startup by
+    /// the daemon when a persistent tool index exists. `OnceLock::set` succeeds
+    /// only the first time; a second call is silently ignored, which is fine -
+    /// the closure is startup-immutable. Left unwired (headless / no-Postgres),
+    /// [`Self::fire_tool_reindex`] is a no-op and toggling behaves exactly as
+    /// before this change.
+    pub fn set_tool_reindex(&self, reindex: ToolReindexFn) {
+        let _ = self.state.tool_reindex.set(reindex);
+    }
+
+    /// Re-write the persistent tool-search index with the current connected-tool
+    /// set (#498). Called at the end of [`Self::enable_server`] /
+    /// [`Self::disable_server`] so a hot-toggled server's tools become (or stop
+    /// being) discoverable without a daemon restart.
+    ///
+    /// No-op when no reindex closure is wired. Any error the closure returns is
+    /// logged and swallowed: a persistence hiccup must never fail the toggle
+    /// (the server has already connected/disconnected in memory), and the next
+    /// toggle - or a restart - re-converges the index.
+    ///
+    /// Concurrency: `reindex_lock` is held across BOTH the `cached_tools`
+    /// snapshot and the `reindex(..)` await, so overlapping enable/disable
+    /// toggles serialize instead of interleaving. Without it, an earlier
+    /// toggle's slower reindex could land *after* a later one and commit a stale
+    /// snapshot as the final index; with it, the last toggle to acquire the lock
+    /// snapshots the *current* tool set and writes it last (last-writer-wins).
+    /// Holding a `tokio::sync::Mutex` guard across `.await` is correct and does
+    /// not trip `clippy::await_holding_lock` (that lint targets std /
+    /// parking_lot guards).
+    pub(crate) async fn fire_tool_reindex(&self) {
+        let Some(reindex) = self.state.tool_reindex.get() else {
+            return;
+        };
+        // Snapshot + reindex must be atomic per toggle (see `reindex_lock`).
+        let _serialize = self.state.reindex_lock.lock().await;
+        let tools = {
+            let cached = self.state.cached_tools.lock().await;
+            cached.clone()
+        };
+        if let Err(e) = reindex(tools).await {
+            tracing::warn!("tool_definitions reindex after MCP enable/disable failed: {e}");
+        }
+    }
+
     /// Remove a server by name: auto-stop, remove config, persist.
     pub async fn remove_server(&self, name: &str) -> Result<(), McpError> {
         let idx =
@@ -1136,6 +1202,9 @@ impl McpControlHandle {
         self.persist_configs().await?;
         let _ = self.state.connect_server(idx).await;
         let _ = self.state.refresh_all_metadata().await;
+        // Re-write the persistent tool index so the newly-enabled server's tools
+        // are discoverable by tool-search without a daemon restart (#498).
+        self.fire_tool_reindex().await;
 
         Ok(())
     }
@@ -1156,6 +1225,9 @@ impl McpControlHandle {
 
         let _ = self.state.refresh_all_metadata().await;
         self.persist_configs().await?;
+        // Prune the disabled server's now-dead rows from the persistent tool
+        // index so they stop being advertised to tool-search (#498).
+        self.fire_tool_reindex().await;
 
         Ok(())
     }
@@ -1211,6 +1283,8 @@ impl McpToolExecutor {
                 #[cfg(feature = "http")]
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
+                reindex_lock: Mutex::new(()),
+                tool_reindex: OnceLock::new(),
             }),
             builtin_tools,
         }
@@ -1237,6 +1311,8 @@ impl McpToolExecutor {
                 #[cfg(feature = "http")]
                 token_store: Arc::new(InMemoryTokenStore::default()),
                 last_errors: Mutex::new(HashMap::new()),
+                reindex_lock: Mutex::new(()),
+                tool_reindex: OnceLock::new(),
             }),
             builtin_tools,
         }
@@ -1270,6 +1346,8 @@ impl McpToolExecutor {
                 service_accounts: std::sync::RwLock::new(Vec::new()),
                 token_store,
                 last_errors: Mutex::new(HashMap::new()),
+                reindex_lock: Mutex::new(()),
+                tool_reindex: OnceLock::new(),
             }),
             builtin_tools,
         }
@@ -2312,5 +2390,277 @@ mod tests {
                 s.configure_command
             );
         }
+    }
+
+    // --- runtime enable/disable tool-search reindex (#498) -----------------
+    //
+    // The injected `ToolReindexFn` is the seam that lets `enable_server` /
+    // `disable_server` re-write the persistent `tool_definitions` index without
+    // `mcp-client` depending on `storage`. These pin the executor half of the
+    // contract: it fires the closure with the current connected-tool set, is a
+    // clean no-op when no closure is wired (headless / no-Postgres), and never
+    // lets a reindex error fail the toggle.
+
+    use desktop_assistant_core::ports::tool_registry::ToolReindexFn;
+
+    /// Recording reindex closure: captures each call's tool set so a test can
+    /// assert exactly what the executor handed over.
+    fn recording_reindex() -> (ToolReindexFn, Arc<Mutex<Vec<Vec<ToolDefinition>>>>) {
+        let calls: Arc<Mutex<Vec<Vec<ToolDefinition>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&calls);
+        let f: ToolReindexFn = Arc::new(move |tools| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().await.push(tools);
+                Ok(())
+            })
+        });
+        (f, calls)
+    }
+
+    #[tokio::test]
+    async fn fire_tool_reindex_calls_injected_fn_with_cached_tools() {
+        let executor = McpToolExecutor::new(vec![]);
+        // Seed the connected-tool cache directly (no live servers needed).
+        {
+            let mut cached = executor.state.cached_tools.lock().await;
+            cached.push(ToolDefinition::new(
+                "servera__alpha",
+                "alpha tool",
+                serde_json::json!({"type": "object"}),
+            ));
+            cached.push(ToolDefinition::new(
+                "serverb__beta",
+                "beta tool",
+                serde_json::json!({"type": "object"}),
+            ));
+        }
+
+        let handle = executor.control_handle();
+        let (reindex, calls) = recording_reindex();
+        handle.set_tool_reindex(reindex);
+
+        handle.fire_tool_reindex().await;
+
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1, "reindex closure must fire exactly once");
+        let names: Vec<&str> = calls[0].iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["servera__alpha", "serverb__beta"],
+            "reindex must receive the current connected-tool set"
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_tool_reindex_is_noop_when_reindex_fn_unset() {
+        // Headless / no-Postgres path: no reindex closure is ever wired. Both a
+        // bare `fire_tool_reindex` and a real enable/disable toggle must stay
+        // fine - the no-op fire can never fail or panic the toggle.
+        let dir = std::env::temp_dir().join("mcp_noop_reindex_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let config = McpServerConfig {
+            name: "noopserver".into(),
+            command: "definitely-not-a-real-mcp-binary".into(),
+            args: vec![],
+            namespace: None,
+            enabled: false,
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: None,
+        };
+        let executor = McpToolExecutor::with_builtin_tools_and_config_path(
+            vec![config],
+            BuiltinToolService::new(),
+            path.clone(),
+            HashMap::new(),
+        );
+        let handle = executor.control_handle();
+
+        // A bare fire with no closure wired is a clean no-op (nothing to invoke).
+        handle.fire_tool_reindex().await;
+
+        // ...and driving a real toggle stays Ok despite the unwired reindex.
+        handle
+            .enable_server("noopserver")
+            .await
+            .expect("enable stays Ok with no reindex wired");
+        handle
+            .disable_server("noopserver")
+            .await
+            .expect("disable stays Ok with no reindex wired");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fire_tool_reindex_error_does_not_fail_the_toggle() {
+        let executor = McpToolExecutor::new(vec![]);
+        {
+            let mut cached = executor.state.cached_tools.lock().await;
+            cached.push(ToolDefinition::new(
+                "servera__alpha",
+                "alpha tool",
+                serde_json::json!({"type": "object"}),
+            ));
+        }
+
+        let invoked: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&invoked);
+        let failing: ToolReindexFn = Arc::new(move |_tools| {
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                *flag.lock().await = true;
+                Err(CoreError::Storage("simulated reindex failure".to_string()))
+            })
+        });
+
+        let handle = executor.control_handle();
+        handle.set_tool_reindex(failing);
+
+        // `fire_tool_reindex` returns `()` — the error is logged and swallowed,
+        // so `enable_server` / `disable_server` stay `Ok`. Reaching the line
+        // after the await is the assertion that the error did not propagate.
+        handle.fire_tool_reindex().await;
+        assert!(
+            *invoked.lock().await,
+            "the failing closure must actually have run"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_and_disable_server_fire_reindex_with_current_tools() {
+        // Pins the ACTUAL fix: the `fire_tool_reindex().await` calls at the end
+        // of `enable_server` and `disable_server`. The other #498 unit tests
+        // drive `fire_tool_reindex` directly, so deleting those two call sites
+        // would leave them green; this test drives the toggles themselves and so
+        // goes red if either call is removed. (A temp config path is required
+        // because both toggles `persist_configs` to TOML.)
+        let dir = std::env::temp_dir().join("mcp_toggle_reindex_test");
+        let path = dir.join("mcp_servers.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A disabled stdio server whose command does not exist: enabling it
+        // attempts a connect that fails and is swallowed, leaving an empty
+        // connected-tool set — exactly the current set the reindex must receive.
+        let config = McpServerConfig {
+            name: "toggleme".into(),
+            command: "definitely-not-a-real-mcp-binary".into(),
+            args: vec![],
+            namespace: None,
+            enabled: false,
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: None,
+        };
+        let executor = McpToolExecutor::with_builtin_tools_and_config_path(
+            vec![config],
+            BuiltinToolService::new(),
+            path.clone(),
+            HashMap::new(),
+        );
+        let handle = executor.control_handle();
+        let (reindex, calls) = recording_reindex();
+        handle.set_tool_reindex(reindex);
+
+        // Enabling drives connect + refresh + the reindex fire at the end.
+        handle
+            .enable_server("toggleme")
+            .await
+            .expect("enable_server");
+        {
+            let calls = calls.lock().await;
+            assert_eq!(
+                calls.len(),
+                1,
+                "enable_server must fire the reindex exactly once"
+            );
+            assert_eq!(
+                calls[0],
+                executor.all_mcp_tools().await,
+                "enable must reindex the current connected-tool set"
+            );
+        }
+
+        // Disabling drives disconnect + refresh + the reindex fire at the end.
+        handle
+            .disable_server("toggleme")
+            .await
+            .expect("disable_server");
+        {
+            let calls = calls.lock().await;
+            assert_eq!(
+                calls.len(),
+                2,
+                "disable_server must fire the reindex exactly once more"
+            );
+            assert_eq!(
+                calls[1],
+                executor.all_mcp_tools().await,
+                "disable must reindex the current connected-tool set"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overlapping_toggles_leave_index_consistent() {
+        // Two reindexes fired concurrently through the handle must serialize:
+        // the final committed index equals the final connected-tool set, never a
+        // stale snapshot torn across the interleave (#498 review, FIX 2).
+        let executor = McpToolExecutor::new(vec![]);
+        let handle = executor.control_handle();
+
+        // Models the persistent index: snapshot the handed-over names, yield (so
+        // a concurrent toggle can interleave), then OVERWRITE a shared committed
+        // cell — mirroring the daemon's delete-then-reinsert of the "mcp" source.
+        let committed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&committed);
+        let reindex: ToolReindexFn = Arc::new(move |tools| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                tokio::task::yield_now().await;
+                *sink.lock().await = names;
+                Ok(())
+            })
+        });
+        handle.set_tool_reindex(reindex);
+
+        let tool = |n: &str| ToolDefinition::new(n, "", serde_json::json!({"type": "object"}));
+
+        // Toggle 1 may snapshot the pre-change set...
+        *executor.state.cached_tools.lock().await = vec![tool("servera__alpha")];
+        let h1 = handle.clone();
+        let t1 = tokio::spawn(async move { h1.fire_tool_reindex().await });
+
+        // ...then the connected-tool set changes to its final value before
+        // toggle 2. Because snapshot+reindex is serialized, whichever toggle
+        // acquires the lock last snapshots this current set and writes it last.
+        *executor.state.cached_tools.lock().await =
+            vec![tool("servera__alpha"), tool("serverb__beta")];
+        let h2 = handle.clone();
+        let t2 = tokio::spawn(async move { h2.fire_tool_reindex().await });
+
+        t1.await.expect("toggle 1 task");
+        t2.await.expect("toggle 2 task");
+
+        let final_names: Vec<String> = executor
+            .state
+            .cached_tools
+            .lock()
+            .await
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(
+            *committed.lock().await,
+            final_names,
+            "the final committed index must equal the current connected-tool set \
+             (serialized last-writer-wins, not a torn stale snapshot)"
+        );
     }
 }

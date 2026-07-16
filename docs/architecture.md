@@ -53,6 +53,13 @@ The project follows a ports-and-adapters (hexagonal) layout:
 - Discovers tools and routes tool calls per server
 - Handles `list_changed` notifications and `listChanged` flags
 - Maintains cached tools/resources/prompts metadata
+- Runtime enable/disable re-writes the persistent tool-search index
+  (`tool_definitions`), not just in-memory state: a `ToolReindexFn` closure
+  injected by the daemon (kept storage-free — `mcp-client` never depends on
+  `storage`) delete-then-reinserts the `"mcp"` source after each toggle, so a
+  hot-enabled server's tools become discoverable — and a hot-disabled server's
+  rows are pruned — without a daemon restart. Unwired when there is no Postgres,
+  leaving the headless path unchanged.
 
 ## `tui`
 

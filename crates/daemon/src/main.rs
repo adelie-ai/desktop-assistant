@@ -1488,6 +1488,38 @@ async fn main() -> Result<()> {
     tool_executor
         .builtin_tools_mut()
         .set_mcp_control(mcp_handle.clone());
+
+    // Reindex the persistent tool-search index whenever an MCP server is
+    // enabled/disabled at runtime (#498). Without this, `tool_definitions` is
+    // written only once at startup (below), so a hot-enabled server's tools stay
+    // undiscoverable - and a hot-disabled server's rows linger as dead entries -
+    // until the daemon restarts. The executor hands over the current
+    // connected-tool set; the storage-touching policy (delete-then-reinsert the
+    // whole "mcp" source with NULL embeddings for the background backfill to
+    // fill) lives here so `mcp-client` never depends on `storage`. Left unwired
+    // when there is no Postgres, preserving the headless path unchanged.
+    if let Some(tr) = &tool_registry_store {
+        use desktop_assistant_core::ports::tool_registry::{ToolRegistryStore, ToolReindexFn};
+        let store = Arc::clone(tr);
+        let reindex: ToolReindexFn = Arc::new(move |tools| {
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                // unregister_source + register_tools run as two separate
+                // transactions, so a concurrent tool_search landing in the gap
+                // can transiently see zero "mcp" tools. That transient-empty
+                // window is accepted for #498 (it self-heals the instant the
+                // reinsert commits); making the delete+reinsert a single atomic
+                // replace is deferred and tracked under epic #497.
+                store.unregister_source("mcp").await?;
+                let embeddings = vec![None; tools.len()];
+                store
+                    .register_tools(tools, "mcp", false, embeddings, None)
+                    .await
+            })
+        });
+        mcp_handle.set_tool_reindex(reindex);
+    }
+
     // Seed the service accounts before starting, so servers referencing one
     // resolve their OAuth credential on the initial connect.
     mcp_handle

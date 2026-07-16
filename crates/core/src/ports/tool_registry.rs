@@ -62,6 +62,24 @@ pub type ToolDefinitionFn = Arc<
         + Sync,
 >;
 
+/// Boxed async closure for re-writing the persistent tool-search index with a
+/// fresh set of tool definitions.
+///
+/// Why: runtime MCP enable/disable changes the connected-tool set, but
+/// `crates/mcp-client` must not depend on `crates/storage` (its only workspace
+/// dep is `desktop-assistant-core`) and `ToolRegistryStore` is not
+/// dyn-compatible (RPIT in trait position), so a boxed closure - not
+/// `Arc<dyn ToolRegistryStore>` - is the boundary. The daemon injects a closure
+/// that owns the storage-touching policy (delete-then-reinsert the `"mcp"`
+/// source with NULL embeddings for the background backfill to fill); the
+/// executor only hands over the current `Vec<ToolDefinition>`. Mirrors
+/// [`ToolSearchFn`] / [`ToolDefinitionFn`].
+pub type ToolReindexFn = Arc<
+    dyn Fn(Vec<ToolDefinition>) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
