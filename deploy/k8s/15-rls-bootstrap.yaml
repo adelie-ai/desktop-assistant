@@ -1,0 +1,76 @@
+# RLS-role bootstrap (#500). Provisions the privileged `adele_query` role that
+# the db_query read path assumes via `SET LOCAL ROLE` (crates/storage/src/database.rs).
+# It is deliberately NOT part of the daemon's auto-run migrations: the daemon
+# connects as a least-privilege role that cannot CREATE ROLE / GRANT. Without
+# this, a fresh DB ships a dead db_query (fault #3 of the 2026-07-15 outage).
+#
+# This Job runs the CANONICAL crates/storage/bootstrap/rls_role.sql. To avoid
+# drift, the SQL is NOT copied here: the `deploy-rls-bootstrap` justfile recipe
+# generates the `rls-bootstrap-sql` ConfigMap from that file at deploy time and
+# this Job mounts it at /bootstrap. Apply via `just deploy-rls-bootstrap`, not a
+# bare `kubectl apply -f` (which would leave the ConfigMap absent).
+#
+# NOT folded into the postgres-init hook (10-postgres.yaml): that runs once on
+# empty PGDATA before any app tables exist, so `GRANT SELECT ON ALL TABLES`
+# would grant on nothing. A postgres-ready-gated, re-runnable Job avoids that.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rls-bootstrap
+  namespace: adele-test
+  labels:
+    app: rls-bootstrap
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: rls-bootstrap
+    spec:
+      # OnFailure: retry the whole (idempotent) SQL on a transient failure such
+      # as Postgres not yet accepting connections. Safe because rls_role.sql
+      # swallows a duplicate role and its grants self-heal on every run.
+      restartPolicy: OnFailure
+      initContainers:
+        # Gate the bootstrap on Postgres accepting connections, mirroring the
+        # daemon's wait-for-postgres initContainer (30-daemon.yaml).
+        - name: wait-for-postgres
+          image: pgvector/pgvector:pg16
+          command:
+            - sh
+            - -c
+            - "until pg_isready -h postgres -U adele; do echo waiting for postgres; sleep 2; done"
+      containers:
+        - name: rls-bootstrap
+          image: pgvector/pgvector:pg16
+          env:
+            # Reuse the same POSTGRES_PASSWORD secret wired into postgres + the
+            # daemon. Bound to PGPASSWORD so the secret stays out of the psql
+            # argv (visible via /proc/<pid>/cmdline) and only lives in the env.
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: adele-secrets
+                  key: POSTGRES_PASSWORD
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # app_role=adele matches the daemon's connect role (POSTGRES_USER
+              # in 10-postgres.yaml, DATABASE_URL in 30-daemon.yaml). ON_ERROR_STOP
+              # makes a real SQL error fail the Job instead of exiting 0.
+              psql "postgres://adele@postgres:5432/adele" \
+                -v ON_ERROR_STOP=1 \
+                -v app_role=adele \
+                -f /bootstrap/rls_role.sql
+          volumeMounts:
+            - name: rls-sql
+              mountPath: /bootstrap
+              readOnly: true
+      volumes:
+        # Generated at deploy time from the canonical rls_role.sql by the
+        # `just deploy-rls-bootstrap` recipe (single source of truth, no drift).
+        - name: rls-sql
+          configMap:
+            name: rls-bootstrap-sql

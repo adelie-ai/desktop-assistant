@@ -55,7 +55,58 @@ kubectl -n adele-test exec deploy/ollama -- ollama pull llama3.2:1b
 kubectl apply -f deploy/k8s/10-postgres.yaml
 kubectl apply -f deploy/k8s/20-daemon-config.yaml
 kubectl apply -f deploy/k8s/30-daemon.yaml
+
+# 5. Provision the RLS `adele_query` role the db_query tool runs as (#500).
+#    Postgres-gated + idempotent; run it once the daemon is up so the grant
+#    lands on the migrated tables (see "RLS role bootstrap" below).
+just deploy-rls-bootstrap
 ```
+
+Validate every manifest offline first (client-side schema check + the RLS
+shape/anti-drift assertions, never contacts a cluster):
+
+```sh
+just check-deploy
+```
+
+## RLS role bootstrap
+
+The `db_query` read tool runs as a restricted `adele_query` role (`SET LOCAL
+ROLE`) so Postgres row-level security applies to it. That role, and its grants,
+are the privileged half of the RLS backstop in
+`crates/storage/bootstrap/rls_role.sql`. It is deliberately **not** part of the
+daemon's auto-run migrations (the daemon connects as a least-privilege role
+that cannot `CREATE ROLE`/`GRANT`), so nothing in the pod provisions it. Without
+this step a fresh DB ships a **dead `db_query`** that fails closed on every call.
+
+`15-rls-bootstrap.yaml` is a Job that runs that SQL as the app role `adele`,
+gated on `pg_isready` via a `wait-for-postgres` initContainer (mirroring the
+daemon). `just deploy-rls-bootstrap` drives it:
+
+- **No SQL duplication / drift.** The SQL is never hand-copied into a manifest.
+  The recipe generates the `rls-bootstrap-sql` ConfigMap straight from the
+  canonical `crates/storage/bootstrap/rls_role.sql` (`kubectl create configmap
+  --from-file=... --dry-run=client -o yaml | kubectl apply -f -`), and the Job
+  mounts it at `/bootstrap`. The running SQL is always byte-for-byte the source.
+- **Idempotent / re-runnable.** The SQL swallows a duplicate role and its grants
+  self-heal (`WITH ADMIN OPTION` + `ALTER DEFAULT PRIVILEGES`); the recipe
+  clears any prior Job first (a Job's pod template is immutable, so a bare
+  re-apply would error). Re-run it freely.
+- **Not folded into `postgres-init`.** That initdb hook (`10-postgres.yaml`)
+  runs once on empty PGDATA before any app tables exist, so `GRANT SELECT ON ALL
+  TABLES` would grant on nothing. A ready-gated, re-runnable Job avoids that.
+
+Run it after the daemon has migrated so the explicit `GRANT SELECT ON ALL
+TABLES` lands on the real tables; the `ALTER DEFAULT PRIVILEGES` clause also
+covers tables added by later migrations, so ordering is not critical and a
+re-run is always safe.
+
+`just check-deploy` validates every manifest with `kubectl apply
+--dry-run=client` and runs the named shape/anti-drift assertions in
+`check-rls-bootstrap.sh` (`rls_bootstrap_manifest_runs_rls_role_sql`,
+`rls_bootstrap_passes_app_role_adele`, `rls_bootstrap_gated_on_postgres_ready`,
+`rls_bootstrap_is_rerunnable`, `rls_bootstrap_configmap_from_canonical_sql`),
+all offline and safe in CI.
 
 ## Smoke test
 
