@@ -72,8 +72,14 @@ RUN set -eux; \
 # ---- Runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim
 
+# ca-certificates + libpam0g for the daemon; chromium (+ base fonts) for
+# web-mcp's headless-Chrome browsing (#57-web). The `chromium` package pulls the
+# shared libs headless Chrome needs (libnss3, libgbm1, libasound2, ...); the
+# binary lands at /usr/bin/chromium. In a container it must run with
+# --no-sandbox (see the fleet config), and WEB_CHROME_PATH points web-mcp at it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libpam0g \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates libpam0g chromium fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 assistant
@@ -98,6 +104,10 @@ ENV XDG_STATE_HOME=/home/assistant/.local/state
 ENV XDG_CACHE_HOME=/home/assistant/.cache
 # Seed the bundled fleet config on first boot (non-clobbering) when no config exists.
 ENV DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG=/opt/adele/mcp_servers.default.toml
+# Point web-mcp's headless Chrome at the bundled binary (chromiumoxide also
+# auto-detects `chromium` on PATH; this is the explicit, belt-and-suspenders path
+# the launched subprocess inherits).
+ENV WEB_CHROME_PATH=/usr/bin/chromium
 
 EXPOSE 11339
 USER assistant
