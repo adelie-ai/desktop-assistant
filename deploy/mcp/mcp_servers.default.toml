@@ -94,17 +94,16 @@ enabled = false
 # [servers.env]
 # HOMEASSISTANT_URL = "http://homeassistant.local:8123"
 
-# Headless web browsing/scraping. Needs Chromium in the image. To use it, derive:
-#   FROM <this-image>
-#   RUN apt-get update && apt-get install -y --no-install-recommends chromium \
-#       && rm -rf /var/lib/apt/lists/*
-# then set enabled = true and args = ["serve", "--chrome-arg=--no-sandbox"].
-# The SSRF guard (WEB_ALLOW_PRIVATE_HOSTS=false) stays on by default.
+# Headless web browsing/scraping. Chromium is bundled in the base runtime image
+# (see Dockerfile.fleet) with WEB_CHROME_PATH pointing web-mcp at it, so this is
+# enabled by default. In a container Chrome must run with --no-sandbox, and
+# --disable-dev-shm-usage avoids crashes on the small default /dev/shm. The SSRF
+# guard (WEB_ALLOW_PRIVATE_HOSTS=false) stays on by default.
 [[servers]]
 name = "web"
 command = "/opt/adele/mcp/web-mcp"
-args = ["serve"]
-enabled = false
+args = ["serve", "--chrome-arg=--no-sandbox", "--chrome-arg=--disable-dev-shm-usage"]
+enabled = true
 
 # Internet radio playback. Needs the `mpv` binary plus an audio sink routed into
 # the container. On a headless brain image it starts but cannot play.
