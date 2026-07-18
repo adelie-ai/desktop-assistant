@@ -1656,6 +1656,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mcp_server_config_description_deserializes_from_toml() {
+        let toml = r#"
+            name = "weather"
+            command = "weather-mcp"
+            description = "Live weather and forecasts."
+        "#;
+        let config: McpServerConfig = toml::from_str(toml).expect("parse config");
+        assert_eq!(
+            config.description.as_deref(),
+            Some("Live weather and forecasts."),
+            "the description field must round-trip from TOML"
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_description_absent_defaults_none() {
+        // TOML back-compat: an existing config with no `description` still parses.
+        let toml = r#"
+            name = "weather"
+            command = "weather-mcp"
+        "#;
+        let config: McpServerConfig = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.description, None, "an absent description defaults to None");
+    }
+
+    #[test]
+    fn resolved_description_prefers_instructions() {
+        // instructions ?? config.description ?? boilerplate.
+        assert_eq!(
+            resolve_provider_description(Some("live instructions"), Some("cfg desc"), "weather"),
+            "live instructions"
+        );
+    }
+
+    #[test]
+    fn resolved_description_falls_back_to_config() {
+        assert_eq!(
+            resolve_provider_description(None, Some("cfg desc"), "weather"),
+            "cfg desc"
+        );
+    }
+
+    #[test]
+    fn resolved_description_falls_back_to_boilerplate() {
+        assert_eq!(
+            resolve_provider_description(None, None, "weather"),
+            "Tools from the weather MCP server"
+        );
+    }
+
+    #[test]
     fn executor_creation_with_empty_configs() {
         let executor = McpToolExecutor::new(vec![]);
         let rt = tokio::runtime::Runtime::new().unwrap();

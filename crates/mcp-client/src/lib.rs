@@ -1207,6 +1207,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_server_instructions_captures() {
+        // The `instructions` field of an initialize result becomes the server's
+        // description seed, trimmed of surrounding whitespace.
+        let result = serde_json::json!({
+            "serverInfo": {"name": "weather"},
+            "instructions": "  Query live weather and forecasts.  "
+        });
+        assert_eq!(
+            parse_server_instructions(&result).as_deref(),
+            Some("Query live weather and forecasts.")
+        );
+    }
+
+    #[test]
+    fn parse_server_instructions_absent_is_none() {
+        let result = serde_json::json!({"serverInfo": {"name": "weather"}});
+        assert_eq!(parse_server_instructions(&result), None);
+    }
+
+    #[test]
+    fn parse_server_instructions_blank_is_none() {
+        // A whitespace-only instructions string carries no signal — treat it as
+        // absent so description resolution falls through to the config/boilerplate.
+        let result = serde_json::json!({"instructions": "   \n\t "});
+        assert_eq!(parse_server_instructions(&result), None);
+    }
+
+    #[test]
     fn extract_list_field_requires_existing_array_field() {
         let missing = serde_json::json!({"other": []});
         let err = extract_list_field(&missing, "prompts").unwrap_err();
