@@ -21,6 +21,12 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
     async fn write(&self, entry: KnowledgeEntry) -> Result<KnowledgeEntry, CoreError> {
         let user_id = current_user_id();
 
+        // Normalize tags on the way in so case/whitespace drift
+        // (`Preference` / `preference ` / `preference`) can't fragment the
+        // exact-match filters reads run (`tags && $2`). Facet tags keep their
+        // `facet:value` colon — see `crate::tag_normalize`.
+        let tags = crate::tag_normalize::normalize_tags(&entry.tags);
+
         // Embedding generation is decoupled from content writes: this query
         // never touches the `embedding`/`embedding_model`/`embeddings_updated_at`
         // columns. New rows insert with a NULL embedding; on update the existing
@@ -54,7 +60,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(&entry.id)
         .bind(user_id.as_str())
         .bind(&entry.content)
-        .bind(&entry.tags)
+        .bind(&tags)
         .bind(&entry.metadata)
         .bind(&entry.source)
         .fetch_one(&self.pool)

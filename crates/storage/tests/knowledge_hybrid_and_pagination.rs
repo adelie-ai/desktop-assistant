@@ -721,10 +721,12 @@ async fn knowledge_write_normalizes_tags_case_whitespace_and_preserves_facets() 
             })
             .await;
 
-            let row = with_user_id(UserId::new("alice"), async { store.get("kb-tag-norm").await })
-                .await
-                .expect("get")
-                .expect("row exists");
+            let row = with_user_id(UserId::new("alice"), async {
+                store.get("kb-tag-norm").await
+            })
+            .await
+            .expect("get")
+            .expect("row exists");
 
             // Case/whitespace collapsed, the duplicate "preference" dropped, and
             // the facet colon preserved (NOT mangled to `project-adelie-ai`).

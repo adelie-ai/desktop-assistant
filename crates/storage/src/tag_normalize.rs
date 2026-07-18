@@ -13,12 +13,31 @@
 //! meaning in that shape (`project:<name>`, `topic:<subject>`); losing the
 //! separator would break the whole facet scheme.
 
-// STUB (red commit): identity passthrough so the spec tests compile and fail
-// for the real reason before the implementation lands.
+use std::collections::HashSet;
 
 /// Normalize a single knowledge-base tag, preserving a `facet:value` colon.
+///
+/// Lowercases, trims, and collapses internal whitespace runs to a single `-`.
+/// A tag in `facet:value` shape (a non-empty facet name, then the first colon)
+/// keeps its separator: the facet and value halves are normalized
+/// independently and rejoined with `:`. A leading colon (empty facet) is not a
+/// facet and is normalized as a plain token.
 pub fn normalize_tag(raw: &str) -> String {
-    raw.to_string()
+    match raw.split_once(':') {
+        Some((facet, value)) if !facet.trim().is_empty() => {
+            format!("{}:{}", normalize_token(facet), normalize_token(value))
+        }
+        _ => normalize_token(raw),
+    }
+}
+
+/// Lowercase, trim, and collapse internal whitespace runs to single dashes.
+/// Existing dashes are preserved; an all-whitespace/empty input yields `""`.
+fn normalize_token(raw: &str) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase()
 }
 
 /// Normalize a list of tags, dropping empties and duplicates that collapse
@@ -28,7 +47,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    tags.into_iter().map(|t| t.as_ref().to_string()).collect()
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for tag in tags {
+        let norm = normalize_tag(tag.as_ref());
+        if norm.is_empty() {
+            continue;
+        }
+        if seen.insert(norm.clone()) {
+            out.push(norm);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -59,10 +89,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_facet_is_not_treated_as_a_facet() {
-        // A leading colon has no facet name; fall back to whole-token
-        // normalization rather than emitting a `:value` tag.
-        assert_eq!(normalize_tag(":Deploy"), "deploy");
+    fn splits_on_first_colon_only() {
+        // Only the first colon is the facet separator; any further colons ride
+        // along in the value untouched, so a value may itself contain a colon.
+        assert_eq!(normalize_tag("Topic:Release:2026"), "topic:release:2026");
+    }
+
+    #[test]
+    fn leading_colon_is_not_split_into_an_empty_facet() {
+        // A leading colon has no facet name, so it is normalized as a plain
+        // token (the stray colon is kept literally) rather than producing a
+        // `:value`-shaped facet with an empty key.
+        assert_eq!(normalize_tag(":deploy"), ":deploy");
     }
 
     #[test]
@@ -80,9 +118,6 @@ mod tests {
 
     #[test]
     fn normalize_tags_drops_empty() {
-        assert_eq!(
-            normalize_tags(["", "   ", "ok"]),
-            vec!["ok".to_string()]
-        );
+        assert_eq!(normalize_tags(["", "   ", "ok"]), vec!["ok".to_string()]);
     }
 }

@@ -240,7 +240,7 @@ impl BuiltinToolService {
                         "tags": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Tags for categorization (e.g. 'preference', 'memory', 'instruction', 'project:myapp')"
+                            "description": "Two-level tags. Give a coarse KIND ('preference', 'memory', or 'instruction') PLUS at least one SPECIFIC facet: 'project:<name>', 'tool:<name>', 'topic:<subject>', or 'person:<name>'. Prefer specific over generic. Good: ['instruction', 'project:adelie-ai', 'topic:deploy']. Too generic: ['instruction']."
                         },
                         "id": {
                             "type": "string",
@@ -253,7 +253,11 @@ impl BuiltinToolService {
                                 "type": "object",
                                 "properties": {
                                     "content": {"type": "string"},
-                                    "tags": {"type": "array", "items": {"type": "string"}},
+                                    "tags": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Two-level tags: a coarse KIND ('preference'/'memory'/'instruction') PLUS at least one SPECIFIC facet ('project:<name>', 'tool:<name>', 'topic:<subject>', 'person:<name>'). Prefer specific over generic."
+                                    },
                                     "id": {"type": "string"}
                                 }
                             }
