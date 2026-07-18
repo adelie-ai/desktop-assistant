@@ -12,6 +12,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::tool_registry::{ReindexProvider, ToolRegistryStore};
 use desktop_assistant_mcp_client::executor::BuiltinToolService;
+use desktop_assistant_storage::ToolRegisterBatch;
 
 /// Generic provider group + blurb for any builtin the map somehow missed, so a
 /// new builtin is never dropped from registration. `provider_group` classifies
@@ -97,8 +98,35 @@ pub(crate) fn build_builtin_batches(defs: Vec<ToolDefinition>) -> Vec<RegisterBa
     batches
 }
 
+/// Map the pure [`RegisterBatch`] groups to storage [`ToolRegisterBatch`]es for
+/// an atomic [`PgToolRegistryStore::reindex_source`](desktop_assistant_storage::PgToolRegistryStore::reindex_source),
+/// giving every row a NULL embedding (the background backfill fills vectors
+/// later). Pure so the mapping is unit-testable without a database; the source
+/// is carried by the reindex call (every batch is swept + rewritten under it),
+/// so it is dropped here.
+pub(crate) fn into_storage_batches(batches: Vec<RegisterBatch>) -> Vec<ToolRegisterBatch> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let embeddings = vec![None; batch.tools.len()];
+            ToolRegisterBatch {
+                tools: batch.tools,
+                is_core: batch.is_core,
+                provider: Some(batch.provider),
+                embeddings,
+                embedding_model: None,
+            }
+        })
+        .collect()
+}
+
 /// Register a set of batches with NULL embeddings (the background backfill fills
 /// vectors later). Batches are applied in order; the first error stops the run.
+///
+/// Used for the startup registration paths, which are additive (no delete-first)
+/// and best-effort. The runtime hot-reindex instead goes through
+/// [`into_storage_batches`] + `reindex_source` so its sweep + re-register is
+/// atomic (#519).
 pub(crate) async fn apply_batches<S: ToolRegistryStore>(
     store: &S,
     batches: Vec<RegisterBatch>,

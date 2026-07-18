@@ -19,9 +19,160 @@ pub struct PgToolRegistryStore {
 /// it stays tunable.
 pub const PROVIDER_BOOST_WEIGHT: f64 = 0.5;
 
+/// One provider batch for [`PgToolRegistryStore::reindex_source`]: the same
+/// shape as a single `register_tools` call, minus `source` (a reindex writes
+/// every batch under the one swept source). Grouped so the sweep and all of the
+/// provider inserts commit in a single transaction — a mid-loop failure then
+/// rolls the whole reindex back instead of stranding the providers that had not
+/// re-registered yet (#519).
+pub struct ToolRegisterBatch {
+    /// The provider's tool rows. May include the provider's own synthetic
+    /// `provider:<provider>` row; any *other* `provider:*` row is rejected.
+    pub tools: Vec<ToolDefinition>,
+    /// Whether these rows are core (always sent to the LLM).
+    pub is_core: bool,
+    /// The batch-constant provider identity written to every row, or `None` to
+    /// leave the `provider` column unclassified.
+    pub provider: Option<String>,
+    /// Per-tool chunk embeddings; `None` leaves a row's vector NULL for the
+    /// background backfill to fill later.
+    pub embeddings: Vec<Option<Vec<Vec<f32>>>>,
+    /// The embedding model id stamped on the rows, if any.
+    pub embedding_model: Option<String>,
+}
+
 impl PgToolRegistryStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Guard #4 (defense in depth): reject any tool that squats the reserved
+    /// `provider:*` name space, EXCEPT the batch's own synthetic
+    /// `provider:<provider>` row. A real, dispatchable tool must never be able to
+    /// masquerade as a synthetic provider row.
+    ///
+    /// Pure (no DB), so the caller validates every batch *before* opening a
+    /// transaction — a rejected batch writes nothing, and [`Self::reindex_source`]
+    /// rejects a bad batch set without even running the sweep.
+    fn validate_reserved_names(
+        tools: &[ToolDefinition],
+        provider: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let own_synthetic = provider.map(|p| format!("provider:{p}"));
+        for tool in tools {
+            if tool.name.starts_with("provider:") && Some(&tool.name) != own_synthetic.as_ref() {
+                return Err(CoreError::Storage(format!(
+                    "refusing to register reserved tool name '{}': the 'provider:' \
+                     prefix is reserved for synthetic provider rows",
+                    tool.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert one provider batch's rows on an existing connection/transaction.
+    /// The caller owns the transaction boundary (begin / commit / rollback) and
+    /// MUST have already run [`Self::validate_reserved_names`] on the batch; this
+    /// only issues the per-tool upserts, so several batches can share one
+    /// transaction (see [`Self::reindex_source`]).
+    async fn insert_batch(
+        conn: &mut sqlx::PgConnection,
+        tools: &[ToolDefinition],
+        source: &str,
+        is_core: bool,
+        provider: Option<&str>,
+        embeddings: &[Option<Vec<Vec<f32>>>],
+        embedding_model: Option<&str>,
+    ) -> Result<(), CoreError> {
+        for (i, tool) in tools.iter().enumerate() {
+            let embedding_vecs: Option<Vec<Vector>> = embeddings
+                .get(i)
+                .and_then(|e| e.clone())
+                .map(|chunks| chunks.into_iter().map(Vector::from).collect());
+
+            sqlx::query(
+                "INSERT INTO tool_definitions (name, description, parameters, source, is_core, provider, embedding, embedding_model)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::vector[], $8)
+                 ON CONFLICT (name) DO UPDATE
+                    SET description = EXCLUDED.description,
+                        parameters = EXCLUDED.parameters,
+                        source = EXCLUDED.source,
+                        is_core = EXCLUDED.is_core,
+                        provider = EXCLUDED.provider,
+                        embedding = EXCLUDED.embedding,
+                        embedding_model = EXCLUDED.embedding_model,
+                        registered_at = NOW()"
+            )
+            .bind(&tool.name)
+            .bind(&tool.description)
+            .bind(&tool.parameters)
+            .bind(source)
+            .bind(is_core)
+            .bind(provider)
+            .bind(&embedding_vecs)
+            .bind(embedding_model)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Atomically replace every row of `source`: delete them and register all
+    /// `batches` in ONE transaction, so a failure anywhere rolls the whole
+    /// reindex back and the index is never left in a partial state (#519).
+    ///
+    /// Contrast with composing `unregister_source` + N× `register_tools`: there
+    /// each call is its own transaction, so a mid-loop failure leaves the source
+    /// swept but only partially re-registered — every provider after the fault is
+    /// silently dropped until the next toggle or restart. Here the single commit
+    /// also closes the transient-empty window (a concurrent `search_tools` never
+    /// observes the sweep without the reinsert), which #497/#498 had deferred for
+    /// the hot path.
+    ///
+    /// Every batch is written under `source`; per-batch `is_core`, `provider`,
+    /// and embeddings still vary. All batches are validated up front (before the
+    /// delete), so a reserved-name violation rejects the reindex without touching
+    /// the table.
+    pub async fn reindex_source(
+        &self,
+        source: &str,
+        batches: Vec<ToolRegisterBatch>,
+    ) -> Result<(), CoreError> {
+        for batch in &batches {
+            Self::validate_reserved_names(&batch.tools, batch.provider.as_deref())?;
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        sqlx::query("DELETE FROM tool_definitions WHERE source = $1")
+            .bind(source)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        for batch in &batches {
+            Self::insert_batch(
+                &mut tx,
+                &batch.tools,
+                source,
+                batch.is_core,
+                batch.provider.as_deref(),
+                &batch.embeddings,
+                batch.embedding_model.as_deref(),
+            )
+            .await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     /// Like [`ToolRegistryStore::search_tools`], but also returns each result's
@@ -183,21 +334,9 @@ impl ToolRegistryStore for PgToolRegistryStore {
         embedding_model: Option<String>,
     ) -> Result<(), CoreError> {
         // Guard #4 (defense in depth): the `provider:*` name space is reserved
-        // for the synthetic, non-routable provider rows. A batch may carry its
-        // own provider's synthetic row (`provider:<provider>`); any other tool
-        // literally named `provider:*` is refused so a real, dispatchable tool
-        // can never masquerade as a provider row. Checked before opening the tx
-        // so a rejected batch writes nothing.
-        let own_synthetic = provider.map(|p| format!("provider:{p}"));
-        for tool in &tools {
-            if tool.name.starts_with("provider:") && Some(&tool.name) != own_synthetic.as_ref() {
-                return Err(CoreError::Storage(format!(
-                    "refusing to register reserved tool name '{}': the 'provider:' \
-                     prefix is reserved for synthetic provider rows",
-                    tool.name
-                )));
-            }
-        }
+        // for the synthetic, non-routable provider rows. Checked before opening
+        // the tx so a rejected batch writes nothing.
+        Self::validate_reserved_names(&tools, provider)?;
 
         let mut tx = self
             .pool
@@ -205,37 +344,16 @@ impl ToolRegistryStore for PgToolRegistryStore {
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        for (i, tool) in tools.iter().enumerate() {
-            let embedding_vecs: Option<Vec<Vector>> = embeddings
-                .get(i)
-                .and_then(|e| e.clone())
-                .map(|chunks| chunks.into_iter().map(Vector::from).collect());
-
-            sqlx::query(
-                "INSERT INTO tool_definitions (name, description, parameters, source, is_core, provider, embedding, embedding_model)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::vector[], $8)
-                 ON CONFLICT (name) DO UPDATE
-                    SET description = EXCLUDED.description,
-                        parameters = EXCLUDED.parameters,
-                        source = EXCLUDED.source,
-                        is_core = EXCLUDED.is_core,
-                        provider = EXCLUDED.provider,
-                        embedding = EXCLUDED.embedding,
-                        embedding_model = EXCLUDED.embedding_model,
-                        registered_at = NOW()"
-            )
-            .bind(&tool.name)
-            .bind(&tool.description)
-            .bind(&tool.parameters)
-            .bind(source)
-            .bind(is_core)
-            .bind(provider)
-            .bind(&embedding_vecs)
-            .bind(&embedding_model)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        }
+        Self::insert_batch(
+            &mut tx,
+            &tools,
+            source,
+            is_core,
+            provider,
+            &embeddings,
+            embedding_model.as_deref(),
+        )
+        .await?;
 
         tx.commit()
             .await
