@@ -687,3 +687,58 @@ async fn delete_many_ignores_foreign_ids() {
     })
     .await;
 }
+
+// -- write path: tags are normalized (case/whitespace/facet, dedup) ----------
+
+#[tokio::test]
+async fn knowledge_write_normalizes_tags_case_whitespace_and_preserves_facets() {
+    // Exact-match tag filters (`tags && $2`) fragment when the same intent is
+    // written as `Preference`/`preference `/`preference`. The write path must
+    // collapse that drift AND preserve a `facet:value` colon, then dedup — so a
+    // round-trip through the store returns canonical, deduped tags.
+    //
+    // MUTATION: dropping the `normalize_tags(...)` call in `knowledge::write`
+    // persists the raw tags verbatim → this test goes RED.
+    with_fixture(
+        "knowledge_write_normalizes_tags_case_whitespace_and_preserves_facets",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-tag-norm",
+                        "deploy notes for the adelie stack",
+                        vec![
+                            "Preference".into(),
+                            " Memory ".into(),
+                            "project:Adelie-AI".into(),
+                            "preference".into(),
+                        ],
+                    ))
+                    .await
+                    .expect("write with drifty tags");
+            })
+            .await;
+
+            let row = with_user_id(UserId::new("alice"), async { store.get("kb-tag-norm").await })
+                .await
+                .expect("get")
+                .expect("row exists");
+
+            // Case/whitespace collapsed, the duplicate "preference" dropped, and
+            // the facet colon preserved (NOT mangled to `project-adelie-ai`).
+            assert_eq!(
+                row.tags,
+                vec![
+                    "preference".to_string(),
+                    "memory".to_string(),
+                    "project:adelie-ai".to_string(),
+                ],
+                "write must normalize + dedup tags and keep the facet colon"
+            );
+            fx
+        },
+    )
+    .await;
+}

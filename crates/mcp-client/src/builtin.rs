@@ -1652,6 +1652,41 @@ mod tests {
         assert!(names.contains(&TOOL_SCRATCHPAD_DELETE.to_string()));
     }
 
+    #[test]
+    fn kb_write_tags_description_urges_specific_facets() {
+        // Generic tags ("instruction", "memory") make KB entries fragment and
+        // over-surface. Both the single-write and the batch `tags` schema
+        // descriptions must push the two-level rule (a specific facet, not just
+        // a bare kind) so the in-schema hint matches the system-prompt guidance.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+        let props = &def.parameters["properties"];
+
+        let single = props["tags"]["description"]
+            .as_str()
+            .expect("single-write tags has a description");
+        assert!(
+            single.to_lowercase().contains("specific"),
+            "single-write tags description must urge a specific facet: {single}"
+        );
+        assert!(
+            single.contains("topic:") && single.contains("tool:"),
+            "single-write tags description must list facet examples: {single}"
+        );
+
+        let batch = props["entries"]["items"]["properties"]["tags"]["description"]
+            .as_str()
+            .expect("batch tags must carry a description too");
+        assert!(
+            batch.to_lowercase().contains("specific"),
+            "batch tags description must urge a specific facet: {batch}"
+        );
+    }
+
     // --- Scratchpad tools (#184) ---
 
     use std::sync::Arc;
