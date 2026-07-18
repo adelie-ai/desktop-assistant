@@ -30,14 +30,24 @@ pub fn derive_login_url_from_ws_url(ws_url: &str) -> Result<String> {
 
 /// Loads the extra trust anchors for the `/login` request, layered on top of
 /// reqwest's built-in roots.
+///
+/// Mirrors `ws_client::build_root_store` deliberately: both halves of the
+/// connect flow must trust the same anchors, or login succeeds and the socket
+/// that follows it fails (#521). `from_pem_bundle` rather than `from_pem`
+/// because the latter stops after the first certificate in a concatenated file.
 fn load_login_root_certs(tls_ca_cert: Option<&Path>) -> Result<Vec<reqwest::tls::Certificate>> {
-    let Some(ca_path) = tls_ca_cert else {
+    let Some(pem_bytes) = crate::config::read_optional_ca_pem(tls_ca_cert)? else {
         return Ok(Vec::new());
     };
-    let pem_bytes = std::fs::read(ca_path)
-        .map_err(|e| anyhow::anyhow!("reading CA cert {}: {e}", ca_path.display()))?;
-    let cert = reqwest::tls::Certificate::from_pem(&pem_bytes)?;
-    Ok(vec![cert])
+    let certs = reqwest::tls::Certificate::from_pem_bundle(&pem_bytes)?;
+    if certs.is_empty() {
+        let path = tls_ca_cert.map(Path::display);
+        return Err(anyhow::anyhow!(
+            "CA cert {} contains no certificates",
+            path.expect("a bundle was read, so a path was configured")
+        ));
+    }
+    Ok(certs)
 }
 
 pub async fn request_ws_login_token(
@@ -193,7 +203,11 @@ mod tests {
         let certs =
             load_login_root_certs(Some(missing)).expect("missing CA file must not be fatal");
 
-        assert!(certs.is_empty(), "expected no extra roots, got {}", certs.len());
+        assert!(
+            certs.is_empty(),
+            "expected no extra roots, got {}",
+            certs.len()
+        );
     }
 
     #[test]
@@ -215,7 +229,11 @@ mod tests {
 
         let certs = load_login_root_certs(Some(bundle.path())).expect("load CA bundle");
 
-        assert_eq!(certs.len(), 2, "both certificates in the bundle should load");
+        assert_eq!(
+            certs.len(),
+            2,
+            "both certificates in the bundle should load"
+        );
     }
 
     #[test]

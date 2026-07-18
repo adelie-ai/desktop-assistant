@@ -131,4 +131,36 @@ mod tests {
             Some(PathBuf::from("/run/user/4242/adelie/sock"))
         );
     }
+
+    /// Only *absence* is benign. A path that exists but cannot be read is a
+    /// real fault (wrong permissions, a directory) and must surface rather than
+    /// silently downgrading the connection's trust anchors.
+    #[test]
+    fn unreadable_ca_path_is_an_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let err = read_optional_ca_pem(Some(dir.path()))
+            .expect_err("an unreadable CA path must not be treated as absent");
+
+        assert!(
+            err.to_string().contains("reading CA cert"),
+            "error should name the read failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn absent_ca_path_yields_none() {
+        let missing = Path::new("/nonexistent/desktop-assistant/tls/ca.pem");
+
+        let pem = read_optional_ca_pem(Some(missing)).expect("absent CA file must not be fatal");
+
+        assert!(pem.is_none());
+    }
+
+    #[test]
+    fn unconfigured_ca_path_yields_none() {
+        let pem = read_optional_ca_pem(None).expect("no configured CA is not an error");
+
+        assert!(pem.is_none());
+    }
 }

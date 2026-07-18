@@ -387,20 +387,11 @@ pub(crate) fn build_root_store(ca_cert_path: Option<&Path>) -> Result<rustls::Ro
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
 
-    let Some(ca_path) = ca_cert_path else {
+    let (Some(ca_path), Some(pem_bytes)) = (
+        ca_cert_path,
+        crate::config::read_optional_ca_pem(ca_cert_path)?,
+    ) else {
         return Ok(root_store);
-    };
-
-    let pem_bytes = match std::fs::read(ca_path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::debug!(
-                path = %ca_path.display(),
-                "no local CA certificate; trusting the public roots only"
-            );
-            return Ok(root_store);
-        }
-        Err(e) => return Err(anyhow!("reading CA cert {}: {e}", ca_path.display())),
     };
 
     use rustls::pki_types::pem::PemObject;
