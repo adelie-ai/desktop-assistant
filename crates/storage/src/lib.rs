@@ -43,5 +43,5 @@ pub use scratchpad::PgScratchpadStore;
 /// Re-exported so daemon-side consumers can name the pool type (e.g. the
 /// knowledge-maintenance service) without taking a direct `sqlx` dependency.
 pub use sqlx::PgPool;
-pub use tool_registry::{PROVIDER_BOOST_WEIGHT, PgToolRegistryStore};
+pub use tool_registry::{PROVIDER_BOOST_WEIGHT, PgToolRegistryStore, ToolRegisterBatch};
 pub use turn_state::PgTurnStateStore;

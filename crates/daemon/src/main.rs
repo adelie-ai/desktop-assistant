@@ -1549,24 +1549,30 @@ async fn main() -> Result<()> {
     // fill) lives here so `mcp-client` never depends on `storage`. Left unwired
     // when there is no Postgres, preserving the headless path unchanged.
     if let Some(tr) = &tool_registry_store {
-        use desktop_assistant_core::ports::tool_registry::{ToolRegistryStore, ToolReindexFn};
+        use desktop_assistant_core::ports::tool_registry::ToolReindexFn;
         let store = Arc::clone(tr);
         let reindex: ToolReindexFn = Arc::new(move |providers| {
             let store = Arc::clone(&store);
             Box::pin(async move {
-                // unregister_source + register_tools run as two separate
-                // transactions, so a concurrent tool_search landing in the gap
-                // can transiently see zero "mcp" tools. That transient-empty
-                // window is accepted for #498 (it self-heals the instant the
-                // reinsert commits); making the delete+reinsert a single atomic
-                // replace is deferred and tracked under epic #497.
+                // The whole reindex - the "mcp" sweep plus every provider's
+                // re-registration - runs in ONE transaction (`reindex_source`),
+                // so a mid-loop failure rolls the whole thing back and the index
+                // stays at its prior good state rather than a partial one where
+                // the sweep dropped providers the failed loop never re-registered
+                // (#519). This also closes the transient-empty window that
+                // #497/#498 had deferred for the hot path: a concurrent
+                // tool_search never observes the sweep without the reinsert,
+                // because neither is visible until the single commit.
                 //
                 // Each provider group registers its member tools plus one
                 // synthetic `provider:<name>` row (non-routable) so tool-search
                 // can boost a whole server's tools when the provider matches.
-                store.unregister_source("mcp").await?;
-                let batches = crate::provider_reindex::build_mcp_batches(providers);
-                crate::provider_reindex::apply_batches(store.as_ref(), batches).await
+                // Serialization across overlapping toggles and error-swallowing
+                // stay at the mcp-client boundary (`fire_tool_reindex`).
+                let batches = crate::provider_reindex::into_storage_batches(
+                    crate::provider_reindex::build_mcp_batches(providers),
+                );
+                store.reindex_source("mcp", batches).await
             })
         });
         mcp_handle.set_tool_reindex(reindex);
