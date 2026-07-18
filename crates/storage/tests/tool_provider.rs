@@ -308,3 +308,384 @@ async fn core_tools_excludes_provider_rows() {
 
     fx.cleanup().await;
 }
+
+/// One 2-D embedding chunk, wrapped for the `Vec<Option<Vec<Vec<f32>>>>` shape.
+fn embed(x: f32, y: f32) -> Option<Vec<Vec<f32>>> {
+    Some(vec![vec![x, y]])
+}
+
+/// Delete a single row by name (used to remove a provider row for the
+/// counterfactual "would-not-without-the-boost" half of a test).
+async fn delete_row(fx: &DbFixture, name: &str) {
+    sqlx::query("DELETE FROM tool_definitions WHERE name = $1")
+        .bind(name)
+        .execute(&fx.pool)
+        .await
+        .expect("delete row");
+}
+
+#[tokio::test]
+async fn search_provider_match_boosts_member_tools_into_top_n() {
+    let Some(fx) = fixture("provider_boost_topn").await else {
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; search_provider_match_boosts_member_tools_into_top_n"
+        );
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // Ten filler tools whose embeddings sit progressively farther from the query
+    // vector [1,0] (cosine distance grows with the y-tilt), so their vector ranks
+    // are a stable 1..10. None match the text query. Provider = None (unboosted).
+    let fillers: Vec<ToolDefinition> = (1..=10)
+        .map(|k| tool(&format!("filler__{k:02}"), "generic filler capability"))
+        .collect();
+    let filler_embeddings: Vec<Option<Vec<Vec<f32>>>> =
+        (1..=10).map(|k| embed(1.0, 0.01 * k as f32)).collect();
+    store
+        .register_tools(fillers, "mcp", false, None, filler_embeddings, None)
+        .await
+        .expect("register fillers");
+
+    // The target member: vector rank 11 (just past filler_10 at y=0.10), no text
+    // match — so on its own it sits ONE below a top-10 cutoff. Its provider = boostme.
+    store
+        .register_tools(
+            vec![tool("boostme__member", "an unrelated gizmo")],
+            "mcp",
+            false,
+            Some("boostme"),
+            vec![embed(1.0, 0.11)],
+            None,
+        )
+        .await
+        .expect("register member");
+
+    // The provider row matches the text query strongly (text-only; NULL embedding).
+    store
+        .register_tools(
+            vec![provider_row(
+                "boostme",
+                "Frobnication service. Tools: boostme__member.",
+            )],
+            "mcp",
+            false,
+            Some("boostme"),
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register provider row");
+
+    // Query: text hits ONLY the provider row ("frobnication"); embedding [1,0].
+    let names_with_boost: Vec<String> = store
+        .search_tools("frobnication", vec![1.0, 0.0], 10)
+        .await
+        .expect("search with boost")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        names_with_boost.contains(&"boostme__member".to_string()),
+        "the provider match must lift its member into the top-10; got {names_with_boost:?}"
+    );
+    assert!(
+        !names_with_boost.iter().any(|n| n.starts_with("provider:")),
+        "the provider row itself must never be returned; got {names_with_boost:?}"
+    );
+
+    // Counterfactual: remove the provider row and re-run the identical query. With
+    // no provider match the member falls back to its raw rank-11 and drops out of
+    // the top-10 — proving the boost (not the raw rank) put it there.
+    delete_row(&fx, "provider:boostme").await;
+    let names_without_boost: Vec<String> = store
+        .search_tools("frobnication", vec![1.0, 0.0], 10)
+        .await
+        .expect("search without boost")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        !names_without_boost.contains(&"boostme__member".to_string()),
+        "without the provider row the member must NOT be in the top-10; got {names_without_boost:?}"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_provider_row_never_returned() {
+    let Some(fx) = fixture("provider_never_returned").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set; search_provider_row_never_returned");
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    store
+        .register_tools(
+            vec![tool("svc__do_thing", "handle a special widget request")],
+            "mcp",
+            false,
+            Some("svc"),
+            vec![embed(1.0, 0.0)],
+            None,
+        )
+        .await
+        .expect("register member");
+    // A provider row whose text matches the query even harder than the member.
+    store
+        .register_tools(
+            vec![provider_row(
+                "svc",
+                "Special widget service tools. Tools: svc__do_thing.",
+            )],
+            "mcp",
+            false,
+            Some("svc"),
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register provider row");
+
+    // Query strongly matches the provider row (and the member).
+    let results = store
+        .search_tools("special widget service tools", vec![1.0, 0.0], 10)
+        .await
+        .expect("search");
+    assert!(
+        results.iter().any(|t| t.name == "svc__do_thing"),
+        "the real member tool must be returned; got {:?}",
+        results.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !results.iter().any(|t| t.name.starts_with("provider:")),
+        "no `provider:*` row may ever be returned as a tool; got {:?}",
+        results.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_no_provider_match_ranking_unchanged() {
+    let Some(fx) = fixture("provider_no_match").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set; search_no_provider_match_ranking_unchanged");
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // No provider rows at all -> matched_providers is empty -> the boost is
+    // additive-zero -> ordering is the plain-RRF baseline. Construct a case that
+    // genuinely exercises vector+text fusion with distinct, integer-rank scores:
+    //   toolB: vector rank 2 + text rank 1  -> 1/62 + 1/61  (highest)
+    //   toolA: vector rank 1, no text       -> 1/61
+    //   toolC: no vector, text rank 2        -> 1/62         (lowest)
+    // Expected order: [B, A, C].
+    store
+        .register_tools(
+            vec![tool("tool_a", "beta gamma capability")],
+            "mcp",
+            false,
+            None,
+            vec![embed(1.0, 0.0)], // closest to query -> vector rank 1
+            None,
+        )
+        .await
+        .expect("register A");
+    store
+        .register_tools(
+            vec![tool("tool_b", "alpha alpha alpha alpha task")],
+            "mcp",
+            false,
+            None,
+            vec![embed(0.9, 0.1)], // second closest -> vector rank 2
+            None,
+        )
+        .await
+        .expect("register B");
+    store
+        .register_tools(
+            vec![tool("tool_c", "alpha task")], // fewer 'alpha' -> weaker text rank
+            "mcp",
+            false,
+            None,
+            vec![None], // no embedding -> text branch only
+            None,
+        )
+        .await
+        .expect("register C");
+
+    let order: Vec<String> = store
+        .search_tools("alpha", vec![1.0, 0.0], 10)
+        .await
+        .expect("search")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        order,
+        vec!["tool_b".to_string(), "tool_a".to_string(), "tool_c".to_string()],
+        "with no provider row the boost is additive-zero, so ordering must equal \
+         the plain-RRF baseline [B, A, C]"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_boost_no_double_count() {
+    let Some(fx) = fixture("provider_no_double").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set; search_boost_no_double_count");
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // The member matches BOTH branches: vector rank 1 (it IS the query vector) and
+    // text rank 2 (the provider row, with more term repetition, takes text rank 1).
+    //   member raw fused = 1/61 (vector) + 1/62 (text)
+    //   provider_score   = 1/61 (provider row text rank 1)
+    //   correct boosted  = (1/61 + 1/62) + 1/61   [provider score added ONCE]
+    //   double-count bug = (1/61 + 1/62) + 2/61
+    store
+        .register_tools(
+            vec![tool("dup__tool", "special dup gadget")],
+            "mcp",
+            false,
+            Some("dup"),
+            vec![embed(1.0, 0.0)],
+            None,
+        )
+        .await
+        .expect("register member");
+    store
+        .register_tools(
+            vec![provider_row(
+                "dup",
+                "special special special dup dup dup gadget gadget gadget tools",
+            )],
+            "mcp",
+            false,
+            Some("dup"),
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register provider row");
+
+    let scored = store
+        .search_tools_scored("special dup gadget", vec![1.0, 0.0], 10)
+        .await
+        .expect("scored search");
+    let member = scored
+        .iter()
+        .find(|(t, _)| t.name == "dup__tool")
+        .map(|(_, s)| *s)
+        .expect("member present in results");
+
+    let one = 1.0_f64 / 61.0;
+    let two = 1.0_f64 / 62.0;
+    let expected = (one + two) + one; // provider score added exactly once
+    let double = (one + two) + 2.0 * one;
+    assert!(
+        (member - expected).abs() < 1e-9,
+        "provider score must be added exactly once: got {member}, expected {expected} \
+         (double-count would be {double})"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_fts_fallback_excludes_provider_rows_and_boosts() {
+    let Some(fx) = fixture("provider_fts_fallback").await else {
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; search_fts_fallback_excludes_provider_rows_and_boosts"
+        );
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // Empty query embedding -> the FTS-only fallback path. `other` out-ranks the
+    // `member` on raw ts_rank (more term repetition), but the member's provider
+    // row matches strongest of all, so the boost lifts the member above `other`.
+    store
+        .register_tools(
+            vec![tool("fb__member", "widget")], // 1 occurrence -> weakest raw rank
+            "mcp",
+            false,
+            Some("fb"),
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register member");
+    store
+        .register_tools(
+            vec![tool("other__tool", "widget widget widget widget")], // stronger raw
+            "mcp",
+            false,
+            None,
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register other");
+    store
+        .register_tools(
+            vec![provider_row(
+                "fb",
+                "widget widget widget widget widget widget widget widget widget widget widget widget",
+            )],
+            "mcp",
+            false,
+            Some("fb"),
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register provider row");
+
+    // Empty embedding forces the FTS fallback.
+    let names: Vec<String> = store
+        .search_tools("widget", vec![], 10)
+        .await
+        .expect("fts fallback search")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.starts_with("provider:")),
+        "the FTS fallback MUST exclude provider rows; got {names:?}"
+    );
+    let pos = |n: &str| names.iter().position(|x| x == n);
+    assert!(
+        pos("fb__member") < pos("other__tool"),
+        "the provider boost must lift the member above the higher-raw-rank tool \
+         in the FTS fallback; got {names:?}"
+    );
+
+    // Counterfactual: drop the provider row; the raw ts_rank order reasserts
+    // itself (other above member), proving the reordering came from the boost.
+    delete_row(&fx, "provider:fb").await;
+    let baseline: Vec<String> = store
+        .search_tools("widget", vec![], 10)
+        .await
+        .expect("fts fallback baseline")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        pos_in(&baseline, "other__tool") < pos_in(&baseline, "fb__member"),
+        "without the provider row the raw ts_rank order must put other above member; \
+         got {baseline:?}"
+    );
+
+    fx.cleanup().await;
+}
+
+/// Position of `name` in `names`, or `usize::MAX` when absent (so a missing name
+/// sorts last in the counterfactual comparison).
+fn pos_in(names: &[String], name: &str) -> usize {
+    names.iter().position(|x| x == name).unwrap_or(usize::MAX)
+}
