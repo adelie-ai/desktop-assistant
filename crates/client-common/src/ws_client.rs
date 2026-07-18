@@ -364,22 +364,68 @@ impl AssistantCommands for WsClient {
     }
 }
 
-fn build_tls_connector(ca_cert_path: Option<&Path>) -> Result<tokio_tungstenite::Connector> {
-    let mut root_store = rustls::RootCertStore::empty();
+/// Builds the trust anchors for an outbound `wss://` connection: the public
+/// webpki roots, plus any certificate in `ca_cert_path`.
+///
+/// Why the public roots are the floor: a remote brain normally sits behind an
+/// ingress that terminates TLS with a publicly-signed certificate, while
+/// `ca_cert_path` defaults to the *daemon's* self-signed local CA. Treating the
+/// configured CA as a replacement rather than an addition left clients trusting
+/// exactly one private CA and unable to verify any public endpoint (#521). This
+/// also matches the reqwest path in `auth::request_ws_login_token`, whose
+/// `add_root_certificate` has always layered onto the built-in roots — the two
+/// halves of the connect flow previously disagreed.
+///
+/// A `ca_cert_path` that does not exist is logged and skipped, not an error:
+/// clients populate the default path unconditionally, so a machine that has
+/// never run a local daemon has no file there and still needs to reach public
+/// endpoints. A file that exists but yields no certificate *is* an error — the
+/// operator pointed at it deliberately, and silently ignoring it would downgrade
+/// trust without saying so.
+pub(crate) fn build_root_store(ca_cert_path: Option<&Path>) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
 
-    if let Some(ca_path) = ca_cert_path {
-        let pem_bytes = std::fs::read(ca_path)
-            .map_err(|e| anyhow!("reading CA cert {}: {e}", ca_path.display()))?;
-        use rustls::pki_types::pem::PemObject;
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls::pki_types::CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(
-                pem_bytes.as_slice(),
-            ))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for cert in certs {
-            root_store.add(cert)?;
-        }
+    let Some(ca_path) = ca_cert_path else {
+        return Ok(root_store);
+    };
+    let Some(pem_bytes) = crate::config::read_optional_ca_pem(Some(ca_path))? else {
+        return Ok(root_store);
+    };
+
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(
+            pem_bytes.as_slice(),
+        ))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!("parsing CA cert {}: {e}", ca_path.display()))?;
+
+    if certs.is_empty() {
+        return Err(anyhow!(
+            "CA cert {} contains no certificates",
+            ca_path.display()
+        ));
     }
+
+    let added = certs.len();
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|e| anyhow!("trusting CA cert {}: {e}", ca_path.display()))?;
+    }
+    tracing::debug!(
+        path = %ca_path.display(),
+        added,
+        "trusting local CA certificate(s) alongside the public roots"
+    );
+
+    Ok(root_store)
+}
+
+fn build_tls_connector(ca_cert_path: Option<&Path>) -> Result<tokio_tungstenite::Connector> {
+    let root_store = build_root_store(ca_cert_path)?;
 
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -397,6 +443,100 @@ pub use desktop_assistant_api_model::signal::map_event_to_signal;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `pem` to a scratch file and returns the handle. Kept alive by the
+    /// caller so the path stays valid for the duration of the assertion.
+    fn ca_file(pem: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("create temp CA file");
+        f.write_all(pem.as_bytes()).expect("write temp CA file");
+        f.flush().expect("flush temp CA file");
+        f
+    }
+
+    /// A freshly minted self-signed certificate, PEM-encoded.
+    fn self_signed_pem() -> String {
+        rcgen::generate_simple_self_signed(vec!["ca.test".to_string()])
+            .expect("generate self-signed cert")
+            .cert
+            .pem()
+    }
+
+    /// The public trust anchors are the floor: a client with no extra CA
+    /// configured must still be able to verify a publicly-signed endpoint.
+    #[test]
+    fn root_store_without_custom_ca_trusts_public_roots() {
+        let store = build_root_store(None).expect("build root store with no custom CA");
+        assert!(
+            !store.is_empty(),
+            "expected the public webpki roots to be trusted by default, got an empty store"
+        );
+    }
+
+    /// The regression this issue is about: a configured CA must be *additional*
+    /// trust, never a replacement for the public roots.
+    #[test]
+    fn root_store_with_custom_ca_keeps_public_roots() {
+        let baseline = build_root_store(None).expect("baseline root store").len();
+        let ca = ca_file(&self_signed_pem());
+
+        let store = build_root_store(Some(ca.path())).expect("build root store with custom CA");
+
+        assert_eq!(
+            store.len(),
+            baseline + 1,
+            "custom CA should be added to the public roots, not replace them"
+        );
+    }
+
+    /// The default CA path is populated unconditionally, so a machine that has
+    /// never run a local daemon points at a file that does not exist. That must
+    /// degrade to "public roots only", not fail the connection.
+    #[test]
+    fn missing_ca_file_warns_and_keeps_public_roots() {
+        let baseline = build_root_store(None).expect("baseline root store").len();
+        let missing = std::path::Path::new("/nonexistent/desktop-assistant/tls/ca.pem");
+
+        let store = build_root_store(Some(missing)).expect("missing CA file must not be fatal");
+
+        assert_eq!(
+            store.len(),
+            baseline,
+            "a missing CA file should leave the public roots intact"
+        );
+    }
+
+    /// An explicitly configured path that holds no certificate is operator
+    /// error and must be loud — unlike the absent-file case above.
+    #[test]
+    fn ca_file_without_certificates_is_an_error() {
+        let junk = ca_file("this is not a certificate\n");
+
+        let err = build_root_store(Some(junk.path()))
+            .expect_err("a CA file with no certificates must be rejected");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no certificates"),
+            "error should name the empty-bundle cause, got: {msg}"
+        );
+    }
+
+    /// Concatenated bundles are the normal way to trust an internal CA and a
+    /// public root at once; every certificate in the file must land.
+    #[test]
+    fn multi_certificate_ca_bundle_adds_every_certificate() {
+        let baseline = build_root_store(None).expect("baseline root store").len();
+        let bundle = ca_file(&format!("{}{}", self_signed_pem(), self_signed_pem()));
+
+        let store = build_root_store(Some(bundle.path())).expect("build root store from bundle");
+
+        assert_eq!(
+            store.len(),
+            baseline + 2,
+            "both certificates in the bundle should be trusted"
+        );
+    }
 
     #[test]
     fn maps_stream_events_to_signal_events() {

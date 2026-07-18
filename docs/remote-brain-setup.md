@@ -138,6 +138,23 @@ already provides transport encryption and it avoids shipping a self-signed CA.
 **Do not** expose this to the public internet as-is — put it behind Tailscale or
 an ingress that terminates TLS.
 
+### What a client trusts
+
+For `wss://` endpoints a client trusts the **public CA roots**, plus any
+certificate in its configured `--tls-ca-cert` file (default
+`$XDG_DATA_HOME/desktop-assistant/tls/ca.pem`). So both shapes work without
+configuration:
+
+- an ingress serving a publicly-signed certificate — nothing to set up;
+- the daemon's own TLS listener with its self-signed local CA — the generated
+  `ca.pem` is picked up from the default path.
+
+To trust a private CA *and* the public roots, either leave the public endpoint
+alone (the roots are always present) or concatenate certificates into one PEM —
+every certificate in the file becomes a trust anchor. A missing CA file is not an
+error; a file that contains no certificate is, since it was configured
+deliberately.
+
 ---
 
 ## 5. Deploy

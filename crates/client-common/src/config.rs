@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_WS_URL: &str = "wss://127.0.0.1:11339/ws";
 pub const DEFAULT_WS_SUBJECT: &str = "desktop-tui";
@@ -16,6 +16,31 @@ pub fn default_ca_cert_path() -> PathBuf {
         .join("desktop-assistant")
         .join("tls")
         .join("ca.pem")
+}
+
+/// Reads an optional CA-certificate bundle from disk.
+///
+/// `Ok(None)` means "no extra CA to trust": either none was configured, or the
+/// configured path does not exist. The latter is deliberately not an error —
+/// clients populate the default path unconditionally, so a machine that has
+/// never run a local daemon has no file there and must still be able to reach
+/// endpoints that need no private CA at all (#521). Any other read failure
+/// (permissions, a directory, I/O) is a real error and propagates.
+pub fn read_optional_ca_pem(ca_cert_path: Option<&Path>) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(path) = ca_cert_path else {
+        return Ok(None);
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                path = %path.display(),
+                "no local CA certificate; trusting the public roots only"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("reading CA cert {}: {e}", path.display())),
+    }
 }
 
 /// Default path to the daemon's local Unix domain socket, or `None` when
@@ -105,5 +130,37 @@ mod tests {
             default_desktop_socket_path(),
             Some(PathBuf::from("/run/user/4242/adelie/sock"))
         );
+    }
+
+    /// Only *absence* is benign. A path that exists but cannot be read is a
+    /// real fault (wrong permissions, a directory) and must surface rather than
+    /// silently downgrading the connection's trust anchors.
+    #[test]
+    fn unreadable_ca_path_is_an_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let err = read_optional_ca_pem(Some(dir.path()))
+            .expect_err("an unreadable CA path must not be treated as absent");
+
+        assert!(
+            err.to_string().contains("reading CA cert"),
+            "error should name the read failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn absent_ca_path_yields_none() {
+        let missing = Path::new("/nonexistent/desktop-assistant/tls/ca.pem");
+
+        let pem = read_optional_ca_pem(Some(missing)).expect("absent CA file must not be fatal");
+
+        assert!(pem.is_none());
+    }
+
+    #[test]
+    fn unconfigured_ca_path_yields_none() {
+        let pem = read_optional_ca_pem(None).expect("no configured CA is not an error");
+
+        assert!(pem.is_none());
     }
 }

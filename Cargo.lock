@@ -1271,6 +1271,7 @@ dependencies = [
  "desktop-assistant-mcp-client",
  "desktop-assistant-uds",
  "futures",
+ "rcgen",
  "reqwest",
  "rustls 0.23.40",
  "rustls-pki-types",
@@ -1282,6 +1283,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "webpki-roots 1.0.7",
  "zbus",
 ]
 

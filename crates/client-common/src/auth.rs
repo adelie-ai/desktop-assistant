@@ -28,6 +28,31 @@ pub fn derive_login_url_from_ws_url(ws_url: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Loads the extra trust anchors for the `/login` request, layered on top of
+/// reqwest's built-in roots.
+///
+/// Mirrors `ws_client::build_root_store` deliberately: both halves of the
+/// connect flow must trust the same anchors, or login succeeds and the socket
+/// that follows it fails (#521). `from_pem_bundle` rather than `from_pem`
+/// because the latter stops after the first certificate in a concatenated file.
+fn load_login_root_certs(tls_ca_cert: Option<&Path>) -> Result<Vec<reqwest::tls::Certificate>> {
+    let Some(ca_path) = tls_ca_cert else {
+        return Ok(Vec::new());
+    };
+    let Some(pem_bytes) = crate::config::read_optional_ca_pem(Some(ca_path))? else {
+        return Ok(Vec::new());
+    };
+    let certs = reqwest::tls::Certificate::from_pem_bundle(&pem_bytes)
+        .map_err(|e| anyhow::anyhow!("parsing CA cert {}: {e}", ca_path.display()))?;
+    if certs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "CA cert {} contains no certificates",
+            ca_path.display()
+        ));
+    }
+    Ok(certs)
+}
+
 pub async fn request_ws_login_token(
     ws_url: &str,
     username: &str,
@@ -36,10 +61,7 @@ pub async fn request_ws_login_token(
 ) -> Result<String> {
     let login_url = derive_login_url_from_ws_url(ws_url)?;
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
-    if let Some(ca_path) = tls_ca_cert {
-        let pem_bytes = std::fs::read(ca_path)
-            .map_err(|e| anyhow::anyhow!("reading CA cert {}: {e}", ca_path.display()))?;
-        let cert = reqwest::tls::Certificate::from_pem(&pem_bytes)?;
+    for cert in load_login_root_certs(tls_ca_cert)? {
         builder = builder.add_root_certificate(cert);
     }
     let client = builder.build()?;
@@ -157,5 +179,76 @@ mod tests {
         let error = derive_login_url_from_ws_url("http://example.com/ws")
             .expect_err("non-ws scheme should fail");
         assert!(error.to_string().contains("ws:// or wss://"));
+    }
+
+    fn ca_file(pem: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("create temp CA file");
+        f.write_all(pem.as_bytes()).expect("write temp CA file");
+        f.flush().expect("flush temp CA file");
+        f
+    }
+
+    fn self_signed_pem() -> String {
+        rcgen::generate_simple_self_signed(vec!["ca.test".to_string()])
+            .expect("generate self-signed cert")
+            .cert
+            .pem()
+    }
+
+    /// The login half of the connect flow must tolerate an absent local CA for
+    /// the same reason the socket half does — otherwise a fresh machine cannot
+    /// authenticate against a publicly-signed endpoint.
+    #[test]
+    fn missing_ca_file_yields_no_extra_login_roots() {
+        let missing = std::path::Path::new("/nonexistent/desktop-assistant/tls/ca.pem");
+
+        let certs =
+            load_login_root_certs(Some(missing)).expect("missing CA file must not be fatal");
+
+        assert!(
+            certs.is_empty(),
+            "expected no extra roots, got {}",
+            certs.len()
+        );
+    }
+
+    #[test]
+    fn single_ca_file_yields_one_login_root() {
+        let ca = ca_file(&self_signed_pem());
+
+        let certs = load_login_root_certs(Some(ca.path())).expect("load single CA");
+
+        assert_eq!(certs.len(), 1);
+    }
+
+    /// A concatenated bundle must contribute every certificate, matching the
+    /// WebSocket trust store. `Certificate::from_pem` silently reads only the
+    /// first, which would leave the two halves of the flow trusting different
+    /// sets of anchors.
+    #[test]
+    fn ca_bundle_yields_every_login_root() {
+        let bundle = ca_file(&format!("{}{}", self_signed_pem(), self_signed_pem()));
+
+        let certs = load_login_root_certs(Some(bundle.path())).expect("load CA bundle");
+
+        assert_eq!(
+            certs.len(),
+            2,
+            "both certificates in the bundle should load"
+        );
+    }
+
+    #[test]
+    fn ca_file_without_certificates_fails_login_root_load() {
+        let junk = ca_file("this is not a certificate\n");
+
+        let err = load_login_root_certs(Some(junk.path()))
+            .expect_err("a CA file with no certificates must be rejected");
+
+        assert!(
+            err.to_string().contains("no certificates"),
+            "error should name the empty-bundle cause, got: {err}"
+        );
     }
 }

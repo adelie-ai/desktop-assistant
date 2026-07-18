@@ -33,6 +33,10 @@ tokio = { workspace = true, features = ["sync", "net", "io-util", "time"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+# Public trust anchors for outbound `wss://`. Already in the tree via
+# tokio-tungstenite's `rustls-tls-webpki-roots`; named directly because the
+# client layers its own CA on top of these roots rather than replacing them.
+webpki-roots = "1"
 tracing.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
@@ -48,6 +52,10 @@ desktop-assistant-uds = { path = "../uds-interface" }
 desktop-assistant-application = { path = "../application" }
 desktop-assistant-core.workspace = true
 desktop-assistant-auth-jwt.workspace = true
+# Mint throwaway CA certificates so the trust-store tests assert against real
+# DER, not hand-pasted fixtures. Already in the tree — `daemon` uses it to
+# generate the local CA these tests stand in for.
+rcgen = "0.14"
 tempfile = "3"
 tokio = { workspace = true, features = [
     "macros",
