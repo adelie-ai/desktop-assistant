@@ -163,6 +163,7 @@ fn sh_config(name: &str, script: &Path, namespace: &str) -> McpServerConfig {
         env: HashMap::new(),
         env_secrets: HashMap::new(),
         http: None,
+        description: None,
     }
 }
 

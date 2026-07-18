@@ -111,6 +111,7 @@ async fn executor_with_real_mcp_server() {
         env: std::collections::HashMap::new(),
         env_secrets: std::collections::HashMap::new(),
         http: None,
+        description: None,
     }];
 
     let executor = McpToolExecutor::new(configs);

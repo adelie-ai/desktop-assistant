@@ -152,6 +152,23 @@ pub struct McpClient {
     /// Maximum silent gap while waiting for a response; see
     /// [`DEFAULT_REQUEST_TIMEOUT`].
     request_timeout: Duration,
+    /// The `instructions` string the server returned from `initialize`, if any
+    /// (trimmed, non-empty). Captured once at connect and used as the primary
+    /// seed for the server's provider description in tool-search surfacing.
+    server_instructions: Option<String>,
+}
+
+/// Extract the trimmed, non-empty `instructions` string from an MCP
+/// `initialize` result, or `None` when absent or blank. Servers may include
+/// human-facing usage instructions here (MCP spec); Adele seeds a server's
+/// provider description from it.
+pub fn parse_server_instructions(result: &serde_json::Value) -> Option<String> {
+    result
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 impl McpClient {
@@ -244,6 +261,7 @@ impl McpClient {
             next_id: AtomicU64::new(1),
             flags: Arc::new(ListChangeFlags::default()),
             request_timeout,
+            server_instructions: None,
         };
 
         let init_timeout = INIT_TIMEOUT.min(request_timeout);
@@ -262,6 +280,12 @@ impl McpClient {
         Arc::clone(&self.flags)
     }
 
+    /// The server's `initialize` instructions (trimmed, non-empty), if it sent
+    /// any. Seeds this server's provider description for tool-search surfacing.
+    pub fn server_instructions(&self) -> Option<&str> {
+        self.server_instructions.as_deref()
+    }
+
     async fn initialize(&mut self) -> Result<(), McpError> {
         let params = serde_json::json!({
             "protocolVersion": "2024-11-05",
@@ -272,7 +296,8 @@ impl McpClient {
             }
         });
 
-        let _response = self.send_request("initialize", Some(params)).await?;
+        let response = self.send_request("initialize", Some(params)).await?;
+        self.server_instructions = parse_server_instructions(&response);
 
         // Send initialized notification (no id, no response expected).
         let notification = serde_json::json!({

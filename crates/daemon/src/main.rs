@@ -23,6 +23,7 @@ mod maintenance_service;
 mod mcp_token_store;
 mod model_defaults;
 mod notifications;
+mod provider_reindex;
 mod purposes;
 mod registry;
 mod routing_llm;
@@ -1550,7 +1551,7 @@ async fn main() -> Result<()> {
     if let Some(tr) = &tool_registry_store {
         use desktop_assistant_core::ports::tool_registry::{ToolRegistryStore, ToolReindexFn};
         let store = Arc::clone(tr);
-        let reindex: ToolReindexFn = Arc::new(move |tools| {
+        let reindex: ToolReindexFn = Arc::new(move |providers| {
             let store = Arc::clone(&store);
             Box::pin(async move {
                 // unregister_source + register_tools run as two separate
@@ -1559,11 +1560,13 @@ async fn main() -> Result<()> {
                 // window is accepted for #498 (it self-heals the instant the
                 // reinsert commits); making the delete+reinsert a single atomic
                 // replace is deferred and tracked under epic #497.
+                //
+                // Each provider group registers its member tools plus one
+                // synthetic `provider:<name>` row (non-routable) so tool-search
+                // can boost a whole server's tools when the provider matches.
                 store.unregister_source("mcp").await?;
-                let embeddings = vec![None; tools.len()];
-                store
-                    .register_tools(tools, "mcp", false, None, embeddings, None)
-                    .await
+                let batches = crate::provider_reindex::build_mcp_batches(providers);
+                crate::provider_reindex::apply_batches(store.as_ref(), batches).await
             })
         });
         mcp_handle.set_tool_reindex(reindex);
@@ -2622,6 +2625,7 @@ mod tests {
                 oauth_account: account_id.map(String::from),
                 scopes: scopes.iter().map(|s| s.to_string()).collect(),
             }),
+            description: None,
         }
     }
 

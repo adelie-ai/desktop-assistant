@@ -91,6 +91,7 @@ fn account_server(name: &str, url: String, scopes: &[&str]) -> McpServerConfig {
             oauth_account: Some("work".into()),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
         }),
+        description: None,
     }
 }
 
@@ -217,6 +218,7 @@ async fn inline_oauth_server_still_connects() {
             oauth_account: None,
             scopes: vec![],
         }),
+        description: None,
     };
     let executor = McpToolExecutor::new(vec![config]);
     let handle = executor.control_handle();

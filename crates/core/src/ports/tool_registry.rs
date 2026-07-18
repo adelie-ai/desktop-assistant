@@ -70,8 +70,50 @@ pub type ToolDefinitionFn = Arc<
         + Sync,
 >;
 
+/// A provider (an MCP server or a builtin group) and its member tools, handed
+/// across the reindex boundary so the daemon can register each provider's tools
+/// *and* a synthetic, searchable `provider:<name>` row (see [`Self::synthetic_row`]).
+///
+/// Widening the reindex payload from a flat `Vec<ToolDefinition>` to per-provider
+/// groups is what lets tool-search surface a whole server's/group's tools when
+/// its provider row matches — the unifying concept across external MCP servers
+/// and Adele's own builtins.
+pub struct ReindexProvider {
+    /// Stable provider identity — an MCP server's namespace/name, or a builtin
+    /// group. Becomes the `provider` column value and the `provider:<name>` row.
+    pub name: String,
+    /// Row source for the persistence sweep: `"mcp"` or `"builtin"`.
+    pub source: &'static str,
+    /// Resolved provider description (server instructions, config description, or
+    /// an authored builtin blurb) seeding the synthetic row's searchable text.
+    pub description: String,
+    /// The provider's member tools.
+    pub tools: Vec<ToolDefinition>,
+}
+
+impl ReindexProvider {
+    /// The synthetic, searchable `provider:<name>` row for this provider: the
+    /// description followed by the member tool names, so a tool-search query that
+    /// hits the description or any member name matches the provider and boosts
+    /// its members. Non-routable (registered `is_core = FALSE`, excluded from
+    /// search results, and never dispatched — see the guards in `crates/storage`).
+    pub fn synthetic_row(&self) -> ToolDefinition {
+        let members = self
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ToolDefinition::new(
+            format!("provider:{}", self.name),
+            format!("{} Tools: {members}.", self.description),
+            serde_json::json!({}),
+        )
+    }
+}
+
 /// Boxed async closure for re-writing the persistent tool-search index with a
-/// fresh set of tool definitions.
+/// fresh set of provider groups.
 ///
 /// Why: runtime MCP enable/disable changes the connected-tool set, but
 /// `crates/mcp-client` must not depend on `crates/storage` (its only workspace
@@ -79,11 +121,12 @@ pub type ToolDefinitionFn = Arc<
 /// dyn-compatible (RPIT in trait position), so a boxed closure - not
 /// `Arc<dyn ToolRegistryStore>` - is the boundary. The daemon injects a closure
 /// that owns the storage-touching policy (delete-then-reinsert the `"mcp"`
-/// source with NULL embeddings for the background backfill to fill); the
-/// executor only hands over the current `Vec<ToolDefinition>`. Mirrors
-/// [`ToolSearchFn`] / [`ToolDefinitionFn`].
+/// source, registering each provider's tools plus its synthetic row, with NULL
+/// embeddings for the background backfill to fill); the executor only hands over
+/// the current [`ReindexProvider`] groups. Mirrors [`ToolSearchFn`] /
+/// [`ToolDefinitionFn`].
 pub type ToolReindexFn = Arc<
-    dyn Fn(Vec<ToolDefinition>) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
+    dyn Fn(Vec<ReindexProvider>) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
         + Send
         + Sync,
 >;
@@ -141,6 +184,30 @@ mod tests {
         let registry = MockToolRegistry;
         let tools = registry.search_tools("test", vec![0.0], 10).await.unwrap();
         assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn provider_row_description_includes_member_tool_names() {
+        // The synthetic row's searchable text is the provider description plus
+        // every member tool name, so a query for a member name matches the
+        // provider (and boosts all its members).
+        let provider = ReindexProvider {
+            name: "weather".to_string(),
+            source: "mcp",
+            description: "Live weather and forecasts.".to_string(),
+            tools: vec![
+                ToolDefinition::new("weather__forecast", "d", serde_json::json!({})),
+                ToolDefinition::new("weather__alerts", "d", serde_json::json!({})),
+            ],
+        };
+        let row = provider.synthetic_row();
+        assert_eq!(row.name, "provider:weather", "synthetic name is provider:<name>");
+        assert_eq!(
+            row.description,
+            "Live weather and forecasts. Tools: weather__forecast, weather__alerts.",
+            "the row text carries the description AND the member tool names"
+        );
+        assert_eq!(row.parameters, serde_json::json!({}), "no callable parameters");
     }
 
     fn _assert_tool_registry<T: ToolRegistryStore>() {}
