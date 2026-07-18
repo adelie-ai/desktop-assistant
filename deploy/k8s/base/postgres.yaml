@@ -7,7 +7,6 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: postgres-init
-  namespace: adele-test
 data:
   init.sql: |
     CREATE EXTENSION IF NOT EXISTS vector;
@@ -16,7 +15,6 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: postgres-data
-  namespace: adele-test
 spec:
   accessModes: ["ReadWriteOnce"]
   # local-path (node-local), not nfs-ssd: NFS root_squash blocks the postgres
@@ -31,7 +29,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: postgres
-  namespace: adele-test
 spec:
   replicas: 1
   strategy:
@@ -83,7 +80,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: postgres
-  namespace: adele-test
 spec:
   selector:
     app: postgres

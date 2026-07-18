@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Named-check assertions for the #500 RLS-bootstrap deploy (deploy/k8s/15-rls-bootstrap.yaml
+# Named-check assertions for the #500 RLS-bootstrap deploy (deploy/k8s/base/rls-bootstrap.yaml
 # + the `deploy-rls-bootstrap` justfile recipe). These are manifest-shape tests,
 # not a live-cluster run: they read the manifest, the justfile recipe, and the
 # canonical rls_role.sql and assert the deploy provisions the `adele_query` role
@@ -18,7 +18,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 
-manifest="${repo_root}/deploy/k8s/15-rls-bootstrap.yaml"
+manifest="${repo_root}/deploy/k8s/base/rls-bootstrap.yaml"
 justfile="${repo_root}/justfile"
 sql="${repo_root}/crates/storage/bootstrap/rls_role.sql"
 
