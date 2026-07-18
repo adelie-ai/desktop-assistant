@@ -240,6 +240,31 @@ mod tests {
     }
 
     #[test]
+    fn assembled_prompt_urges_web_browsing_and_resourcefulness() {
+        // Adele kept forgetting she can browse for live info and waited to be
+        // told; the tool-use guidance must push proactive web use for current
+        // information and creative combination of general tools when no
+        // purpose-built tool exists.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("== Live & external info (web) =="),
+            "the always-present prompt must advertise web browsing"
+        );
+        assert!(
+            assembled.contains("browse the web"),
+            "and tell her she can browse the web"
+        );
+        assert!(
+            assembled.to_lowercase().contains("news"),
+            "naming current-info uses like news"
+        );
+        assert!(
+            assembled.contains("resourceful"),
+            "and urge resourcefulness when no purpose-built tool exists"
+        );
+    }
+
+    #[test]
     fn assembled_prompt_advertises_scratchpad_tools() {
         // The scratchpad must be advertised in the always-present system prompt
         // so the model knows the tools exist (#184).
