@@ -2850,4 +2850,60 @@ mod tests {
              (serialized last-writer-wins, not a torn stale snapshot)"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_grouping_and_diagnostics_never_deadlock() {
+        // Regression for the `cached_tools` <-> `tool_routing` lock-order
+        // inversion (#520). `tools_by_service` acquired the two mutexes in the
+        // opposite order from `tool_namespaces` / `mcp_providers_with_tools`, so
+        // two callers racing on a multi-thread runtime could wedge AB-BA (one
+        // holds `cached_tools` waiting on `tool_routing`, the other the reverse).
+        // With a single canonical order they always make progress; this test
+        // times out (fails) if the inversion is ever reintroduced.
+        let configs: Vec<McpServerConfig> = (0..8).map(|i| stdio_cfg(&format!("srv{i}"))).collect();
+        let executor = Arc::new(McpToolExecutor::new(configs));
+        {
+            let mut cached = executor.state.cached_tools.lock().await;
+            let mut routing = executor.state.tool_routing.lock().await;
+            for s in 0..8usize {
+                for t in 0..8usize {
+                    let name = format!("srv{s}__tool{t}");
+                    cached.push(ToolDefinition::new(
+                        name.clone(),
+                        "d",
+                        serde_json::json!({"type": "object"}),
+                    ));
+                    routing.insert(name, (s, format!("tool{t}")));
+                }
+            }
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let e = Arc::clone(&executor);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..200 {
+                    let _ = e.tools_by_service().await;
+                }
+            }));
+            let e = Arc::clone(&executor);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..200 {
+                    let _ = e.tool_namespaces().await;
+                }
+            }));
+        }
+
+        let join_all = async {
+            for h in handles {
+                h.await.expect("stress task panicked");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), join_all)
+            .await
+            .expect(
+                "tools_by_service and tool_namespaces deadlocked — \
+                 cached_tools/tool_routing lock-order inversion (#520)",
+            );
+    }
 }
