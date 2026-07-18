@@ -608,6 +608,7 @@ async fn tool_registry_upsert_and_search() {
                 ],
                 "srcA",
                 false,
+                None,
                 vec![
                     Some(vec![vec![1.0, 0.0, 0.0]]),
                     Some(vec![vec![0.0, 1.0, 0.0]]),
@@ -635,6 +636,7 @@ async fn tool_registry_upsert_and_search() {
                 vec![tool("get_weather", "Weather now updated description")],
                 "srcA",
                 false,
+                None,
                 vec![Some(vec![vec![1.0, 0.0, 0.0]])],
                 Some("test-model".to_string()),
             )
@@ -671,6 +673,7 @@ async fn unregister_source_removes_only_that_source() {
                     vec![tool("a_tool", "tool from source A")],
                     "srcA",
                     false,
+                    None,
                     vec![None],
                     None,
                 )
@@ -681,6 +684,7 @@ async fn unregister_source_removes_only_that_source() {
                     vec![tool("b_tool", "tool from source B")],
                     "srcB",
                     false,
+                    None,
                     vec![None],
                     None,
                 )

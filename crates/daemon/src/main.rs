@@ -1562,7 +1562,7 @@ async fn main() -> Result<()> {
                 store.unregister_source("mcp").await?;
                 let embeddings = vec![None; tools.len()];
                 store
-                    .register_tools(tools, "mcp", false, embeddings, None)
+                    .register_tools(tools, "mcp", false, None, embeddings, None)
                     .await
             })
         });
@@ -1605,7 +1605,7 @@ async fn main() -> Result<()> {
             .collect();
         let builtin_embeddings = vec![None; builtin_defs.len()];
         if let Err(e) = tr
-            .register_tools(builtin_defs, "builtin", true, builtin_embeddings, None)
+            .register_tools(builtin_defs, "builtin", true, None, builtin_embeddings, None)
             .await
         {
             tracing::warn!("failed to register builtin tools in registry: {e}");
@@ -1616,7 +1616,7 @@ async fn main() -> Result<()> {
         let mcp_embeddings = vec![None; mcp_defs.len()];
         if !mcp_defs.is_empty()
             && let Err(e) = tr
-                .register_tools(mcp_defs, "mcp", false, mcp_embeddings, None)
+                .register_tools(mcp_defs, "mcp", false, None, mcp_embeddings, None)
                 .await
         {
             tracing::warn!("failed to register MCP tools in registry: {e}");

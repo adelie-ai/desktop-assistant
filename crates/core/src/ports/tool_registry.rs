@@ -10,11 +10,19 @@ use crate::domain::ToolDefinition;
 pub trait ToolRegistryStore: Send + Sync {
     /// Register (upsert) tool definitions from a source (e.g. an MCP server name or "builtin").
     /// Embeddings are chunk arrays (one Vec<f32> per chunk) to match the vector[] column.
+    ///
+    /// `provider` is the batch-constant provider identity (an MCP server's
+    /// namespace/name, or a builtin group) written to every row in the batch —
+    /// we register once per provider, so a single value per call is correct
+    /// (mirrors `source`). `None` leaves the column unclassified. A batch may
+    /// carry the provider's own synthetic `provider:<provider>` row; any *other*
+    /// row literally named `provider:*` is rejected (it must never be dispatchable).
     fn register_tools(
         &self,
         tools: Vec<ToolDefinition>,
         source: &str,
         is_core: bool,
+        provider: Option<&str>,
         embeddings: Vec<Option<Vec<Vec<f32>>>>,
         embedding_model: Option<String>,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
@@ -92,6 +100,7 @@ mod tests {
             _tools: Vec<ToolDefinition>,
             _source: &str,
             _is_core: bool,
+            _provider: Option<&str>,
             _embeddings: Vec<Option<Vec<Vec<f32>>>>,
             _embedding_model: Option<String>,
         ) -> Result<(), CoreError> {

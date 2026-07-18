@@ -20,9 +20,27 @@ impl ToolRegistryStore for PgToolRegistryStore {
         tools: Vec<ToolDefinition>,
         source: &str,
         is_core: bool,
+        provider: Option<&str>,
         embeddings: Vec<Option<Vec<Vec<f32>>>>,
         embedding_model: Option<String>,
     ) -> Result<(), CoreError> {
+        // Guard #4 (defense in depth): the `provider:*` name space is reserved
+        // for the synthetic, non-routable provider rows. A batch may carry its
+        // own provider's synthetic row (`provider:<provider>`); any other tool
+        // literally named `provider:*` is refused so a real, dispatchable tool
+        // can never masquerade as a provider row. Checked before opening the tx
+        // so a rejected batch writes nothing.
+        let own_synthetic = provider.map(|p| format!("provider:{p}"));
+        for tool in &tools {
+            if tool.name.starts_with("provider:") && Some(&tool.name) != own_synthetic.as_ref() {
+                return Err(CoreError::Storage(format!(
+                    "refusing to register reserved tool name '{}': the 'provider:' \
+                     prefix is reserved for synthetic provider rows",
+                    tool.name
+                )));
+            }
+        }
+
         let mut tx = self
             .pool
             .begin()
@@ -36,13 +54,14 @@ impl ToolRegistryStore for PgToolRegistryStore {
                 .map(|chunks| chunks.into_iter().map(Vector::from).collect());
 
             sqlx::query(
-                "INSERT INTO tool_definitions (name, description, parameters, source, is_core, embedding, embedding_model)
-                 VALUES ($1, $2, $3, $4, $5, $6::vector[], $7)
+                "INSERT INTO tool_definitions (name, description, parameters, source, is_core, provider, embedding, embedding_model)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::vector[], $8)
                  ON CONFLICT (name) DO UPDATE
                     SET description = EXCLUDED.description,
                         parameters = EXCLUDED.parameters,
                         source = EXCLUDED.source,
                         is_core = EXCLUDED.is_core,
+                        provider = EXCLUDED.provider,
                         embedding = EXCLUDED.embedding,
                         embedding_model = EXCLUDED.embedding_model,
                         registered_at = NOW()"
@@ -52,6 +71,7 @@ impl ToolRegistryStore for PgToolRegistryStore {
             .bind(&tool.parameters)
             .bind(source)
             .bind(is_core)
+            .bind(provider)
             .bind(&embedding_vecs)
             .bind(&embedding_model)
             .execute(&mut *tx)
