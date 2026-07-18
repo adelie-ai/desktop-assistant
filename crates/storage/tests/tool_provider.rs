@@ -36,7 +36,7 @@ mod support;
 
 use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
-use desktop_assistant_storage::PgToolRegistryStore;
+use desktop_assistant_storage::{PROVIDER_BOOST_WEIGHT, PgToolRegistryStore};
 use sqlx::Row;
 
 use support::DbFixture;
@@ -555,12 +555,13 @@ async fn search_boost_no_double_count() {
     };
     let store = PgToolRegistryStore::new(fx.pool.clone());
 
-    // The member matches BOTH branches: vector rank 1 (it IS the query vector) and
-    // text rank 2 (the provider row, with more term repetition, takes text rank 1).
-    //   member raw fused = 1/61 (vector) + 1/62 (text)
-    //   provider_score   = 1/61 (provider row text rank 1)
-    //   correct boosted  = (1/61 + 1/62) + 1/61   [provider score added ONCE]
-    //   double-count bug = (1/61 + 1/62) + 2/61
+    // Real tools and provider rows are ranked in SEPARATE candidate sets, so the
+    // member is text rank 1 among real tools and vector rank 1; the provider row
+    // is text rank 1 among provider rows.
+    //   member raw fused = 1/61 (vector) + 1/61 (text)
+    //   provider_score   = 1/61 (provider row text rank 1, provider-only ranking)
+    //   correct boosted  = 2/61 + w*(1/61)   [provider score added ONCE]
+    //   double-count bug = 2/61 + 2*w*(1/61)
     store
         .register_tools(
             vec![tool("dup__tool", "special dup gadget")],
@@ -598,9 +599,9 @@ async fn search_boost_no_double_count() {
         .expect("member present in results");
 
     let one = 1.0_f64 / 61.0;
-    let two = 1.0_f64 / 62.0;
-    let expected = (one + two) + one; // provider score added exactly once
-    let double = (one + two) + 2.0 * one;
+    let w = PROVIDER_BOOST_WEIGHT;
+    let expected = 2.0 * one + w * one; // provider score added exactly once
+    let double = 2.0 * one + 2.0 * w * one;
     assert!(
         (member - expected).abs() < 1e-9,
         "provider score must be added exactly once: got {member}, expected {expected} \
@@ -702,4 +703,165 @@ async fn search_fts_fallback_excludes_provider_rows_and_boosts() {
 /// sorts last in the counterfactual comparison).
 fn pos_in(names: &[String], name: &str) -> usize {
     names.iter().position(|x| x == name).unwrap_or(usize::MAX)
+}
+
+#[tokio::test]
+async fn search_provider_rows_do_not_crowd_out_real_tools() {
+    // Recall guard (FIX 1): synthetic provider rows must NOT consume slots in the
+    // candidate window at the expense of real tools. With 15 real tools that
+    // weakly match and 12 provider rows that match strongly, a `limit = 10` query
+    // must still return 10 REAL tools — not fewer because provider rows filled the
+    // limit*2 candidate window and pushed real tools out before the final filter.
+    let Some(fx) = fixture("provider_recall").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set; search_provider_rows_do_not_crowd_out_real_tools");
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // 15 real tools, each a weak single-token match. No embeddings, so the hybrid
+    // query's vector branch is empty and this exercises the text candidate window.
+    let reals: Vec<ToolDefinition> = (0..15)
+        .map(|k| tool(&format!("real__{k:02}"), "widget helper"))
+        .collect();
+    store
+        .register_tools(reals, "mcp", false, None, vec![None; 15], None)
+        .await
+        .expect("register real tools");
+
+    // Baseline (no provider rows): the full window of 10 real tools is returned.
+    let baseline = store
+        .search_tools("widget", vec![1.0], 10)
+        .await
+        .expect("baseline search");
+    let baseline_real = baseline
+        .iter()
+        .filter(|t| !t.name.starts_with("provider:"))
+        .count();
+    assert_eq!(baseline_real, 10, "baseline must return the full 10 real tools");
+
+    // 12 provider rows that match the query far more strongly than the real tools.
+    for k in 0..12 {
+        let name = format!("crowd{k:02}");
+        store
+            .register_tools(
+                vec![provider_row(
+                    &name,
+                    "widget widget widget widget widget widget widget widget widget widget",
+                )],
+                "mcp",
+                false,
+                Some(&name),
+                vec![None],
+                None,
+            )
+            .await
+            .expect("register provider row");
+    }
+
+    let results = store
+        .search_tools("widget", vec![1.0], 10)
+        .await
+        .expect("search with provider rows");
+    assert!(
+        !results.iter().any(|t| t.name.starts_with("provider:")),
+        "no provider row may be returned; got {:?}",
+        results.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    let real_count = results
+        .iter()
+        .filter(|t| !t.name.starts_with("provider:"))
+        .count();
+    assert_eq!(
+        real_count, 10,
+        "provider rows must not crowd real tools out of the result window (recall); \
+         got {real_count} real tools"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn weak_member_of_matched_provider_does_not_outrank_strong_standalone() {
+    // Weight guard (FIX 2): a provider match lifts a member but must not let a
+    // WEAK member leapfrog a tool that matched STRONGLY on its own.
+    //   strong standalone S: vector rank 1 + text rank 1  -> 2/61  (no provider)
+    //   weak member M:       vector rank 3 only            -> 1/63  (provider = pp)
+    //   provider row P:      vector rank 1 + text rank 1 (provider-only) -> 2/61
+    //   M boosted = 1/63 + w * (2/61)
+    // At w = 1.0 this exceeds S (0.0487 > 0.0328). The fractional weight must keep
+    // M below S.
+    let Some(fx) = fixture("provider_weight").await else {
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; weak_member_of_matched_provider_does_not_outrank_strong_standalone"
+        );
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // Strong standalone: closest embedding + strongest text, no provider.
+    store
+        .register_tools(
+            vec![tool("strong__standalone", "gizmo gizmo gizmo gizmo")],
+            "mcp",
+            false,
+            None,
+            vec![embed(1.0, 0.0)],
+            None,
+        )
+        .await
+        .expect("register strong standalone");
+    // Weak member: far embedding (vector rank 3), no text match; provider = pp.
+    store
+        .register_tools(
+            vec![tool("pp__weakmember", "unrelated doohickey")],
+            "mcp",
+            false,
+            Some("pp"),
+            vec![embed(1.0, 0.30)],
+            None,
+        )
+        .await
+        .expect("register weak member");
+    // Two filler tools between so the weak member is vector rank 3.
+    store
+        .register_tools(
+            vec![
+                tool("filler__a", "nothing to see"),
+                tool("filler__b", "nothing to see"),
+            ],
+            "mcp",
+            false,
+            None,
+            vec![embed(1.0, 0.05), embed(1.0, 0.10)],
+            None,
+        )
+        .await
+        .expect("register fillers");
+    // Provider row for pp: matches the query strongly on BOTH branches.
+    store
+        .register_tools(
+            vec![provider_row("pp", "gizmo gizmo gizmo gizmo doohickey service")],
+            "mcp",
+            false,
+            Some("pp"),
+            vec![embed(1.0, 0.0)],
+            None,
+        )
+        .await
+        .expect("register provider row");
+
+    let order: Vec<String> = store
+        .search_tools("gizmo", vec![1.0, 0.0], 10)
+        .await
+        .expect("search")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        pos_in(&order, "strong__standalone") < pos_in(&order, "pp__weakmember"),
+        "a boosted weak member must NOT outrank a strongly-matching standalone tool \
+         (weight={PROVIDER_BOOST_WEIGHT}); got {order:?}"
+    );
+
+    fx.cleanup().await;
 }

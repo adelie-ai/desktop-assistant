@@ -13,7 +13,7 @@ pub struct PgToolRegistryStore {
 /// (a rank-1 provider match contributes ~`1/61` to every member), enough to lift
 /// a member sitting just below the top-N cutoff into it without swamping a tool
 /// that matched the query strongly on its own. Named so it stays tunable.
-const PROVIDER_BOOST_WEIGHT: f64 = 1.0;
+pub const PROVIDER_BOOST_WEIGHT: f64 = 1.0;
 
 impl PgToolRegistryStore {
     pub fn new(pool: PgPool) -> Self {
