@@ -88,6 +88,12 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                 .await;
         }
 
+        // Normalize the include/exclude filters the same way writes normalize
+        // stored tags, so a differently-cased filter still matches (write/read
+        // symmetry). The FTS fallback above normalizes inside
+        // `search_text_filtered`, so this covers only the vector-branch path.
+        let tags = normalize_tag_filter(tags);
+        let exclude_tags = normalize_tag_filter(exclude_tags);
         let user_id = current_user_id();
         let embedding_vec = Vector::from(query_embedding);
         let fetch_limit = (limit * 2) as i64;
@@ -166,6 +172,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         offset: usize,
         tag_filter: Option<Vec<String>>,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let tag_filter = normalize_tag_filter(tag_filter);
         let user_id = current_user_id();
         let limit_i64 = limit as i64;
         let offset_i64 = offset as i64;
@@ -229,6 +236,8 @@ impl PgKnowledgeBaseStore {
         exclude_tags: Option<Vec<String>>,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let tags = normalize_tag_filter(tags);
+        let exclude_tags = normalize_tag_filter(exclude_tags);
         let user_id = current_user_id();
         let result_limit = limit as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
@@ -315,10 +324,12 @@ impl PgKnowledgeBaseStore {
             }
         };
 
+        let tags = normalize_tag_filter(q.tags);
+        let exclude_tags = normalize_tag_filter(q.exclude_tags);
         let rows: Vec<KbRow> = sqlx::query_as(sql)
             .bind(user_id.as_str())
-            .bind(&q.tags)
-            .bind(&q.exclude_tags)
+            .bind(&tags)
+            .bind(&exclude_tags)
             .bind(&q.source)
             .bind(cur_ts)
             .bind(&cur_id)
@@ -341,6 +352,22 @@ impl PgKnowledgeBaseStore {
             next_cursor,
         })
     }
+}
+
+/// Normalize an optional tag filter the same way [`PgKnowledgeBaseStore::write`]
+/// normalizes stored tags, so a read matches regardless of the caller's casing
+/// or whitespace (`Project:MyApp` finds a row stored as `project:myapp`).
+///
+/// Contract: `None` (no filter) stays `None`. A present filter is normalized and
+/// de-duplicated; if every entry normalizes away it collapses to an empty vec —
+/// still `Some(vec![])`, never `None`. That empty-vec case is unchanged from
+/// before: each read query guards with `$N::text[] IS NULL OR ...`, and
+/// `tags && '{}'` is always false, so an empty include matches no rows and an
+/// empty exclude drops none.
+pub(crate) fn normalize_tag_filter(filter: Option<Vec<String>>) -> Option<Vec<String>> {
+    // STUB (red commit): identity passthrough. The spec tests fail until this
+    // actually normalizes.
+    filter
 }
 
 /// Encode a keyset cursor as `<created_at_micros>:<id>`.
@@ -409,5 +436,53 @@ impl KbSearchRow {
             // Search does not select provenance; the audit/list path does.
             source: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_filter_none_stays_none() {
+        // No filter must stay "no filter" — never coerced to an empty vec.
+        assert_eq!(normalize_tag_filter(None), None);
+    }
+
+    #[test]
+    fn tag_filter_empty_vec_stays_empty_some() {
+        // An explicit empty filter must NOT become None or match/exclude
+        // everything: `tags && '{}'` is false, so an empty include matches no
+        // rows and an empty exclude drops none — identical to pre-normalization.
+        assert_eq!(normalize_tag_filter(Some(vec![])), Some(vec![]));
+    }
+
+    #[test]
+    fn tag_filter_normalizes_case_and_preserves_facet_colon() {
+        assert_eq!(
+            normalize_tag_filter(Some(vec!["Project:MyApp".to_string()])),
+            Some(vec!["project:myapp".to_string()])
+        );
+    }
+
+    #[test]
+    fn tag_filter_dedups_after_normalization() {
+        assert_eq!(
+            normalize_tag_filter(Some(vec![
+                "Instruction".to_string(),
+                "instruction".to_string(),
+            ])),
+            Some(vec!["instruction".to_string()])
+        );
+    }
+
+    #[test]
+    fn tag_filter_all_empty_collapses_to_empty_some() {
+        // A whitespace-only filter normalizes away to an empty vec — still
+        // `Some`, so it behaves like an explicit empty filter, not "no filter".
+        assert_eq!(
+            normalize_tag_filter(Some(vec!["   ".to_string(), String::new()])),
+            Some(vec![])
+        );
     }
 }
