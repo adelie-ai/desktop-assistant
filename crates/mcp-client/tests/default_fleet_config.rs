@@ -64,9 +64,11 @@ fn shipped_default_seeds_and_parses_to_the_expected_fleet() {
             "cve",
             "tasks",
             "timeclock",
-            "skills"
+            "skills",
+            "web"
         ],
-        "the safe, zero-config servers ship enabled"
+        "the safe, zero-config servers ship enabled; `web` joined once Chromium \
+         was bundled into the base image (#508) with the SSRF guard on"
     );
     assert_eq!(
         disabled,
@@ -75,7 +77,6 @@ fn shipped_default_seeds_and_parses_to_the_expected_fleet() {
             "command",
             "fileio",
             "homeassistant",
-            "web",
             "internet-radio"
         ],
         "the dangerous / dependency-needing servers ship disabled"
@@ -98,8 +99,8 @@ fn every_shipped_server_is_a_bundled_stdio_binary() {
             s.command
         );
         assert_eq!(
-            s.args,
-            vec!["serve".to_string()],
+            s.args.first().map(String::as_str),
+            Some("serve"),
             "{}: fleet servers launch via `<bin> serve`",
             s.name
         );
@@ -109,6 +110,22 @@ fn every_shipped_server_is_a_bundled_stdio_binary() {
             s.name
         );
     }
+
+    // `web` carries the container Chrome flags on top of `serve` (Chromium is
+    // bundled in the base image; #508). Pin them so the contract is explicit.
+    let web = servers
+        .iter()
+        .find(|s| s.name == "web")
+        .expect("web server present in the fleet");
+    assert_eq!(
+        web.args,
+        vec![
+            "serve".to_string(),
+            "--chrome-arg=--no-sandbox".to_string(),
+            "--chrome-arg=--disable-dev-shm-usage".to_string(),
+        ],
+        "web launches headless Chrome with the container-required flags"
+    );
 }
 
 #[test]
