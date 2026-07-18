@@ -183,6 +183,19 @@ enabled = ["filesystem", "disabled-one", "ghost"]
         servers.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// Build a minimal `McpServerConfig` by name, going through the parser so
+    /// the test doesn't depend on the (cross-crate) struct's full field set.
+    fn server(name: &str) -> McpServerConfig {
+        ClientMcpConfig::from_toml(&format!(
+            "[[servers]]\nname = \"{name}\"\ncommand = \"cmd\"\n"
+        ))
+        .expect("valid single-server toml")
+        .servers
+        .into_iter()
+        .next()
+        .expect("one server")
+    }
+
     #[test]
     fn parses_servers_and_surfaces() {
         let cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
@@ -297,5 +310,198 @@ command = "b"
         let shown = path.to_str().unwrap();
         assert!(shown.contains("adele"), "got: {shown}");
         assert!(shown.ends_with("client-mcp.toml"), "got: {shown}");
+    }
+
+    // ----- Phase-1 edit operations (#532) -----
+
+    #[test]
+    fn client_surfaces_helper_recognizes_known() {
+        assert_eq!(CLIENT_SURFACES.len(), 4);
+        assert!(is_client_surface("gtk"));
+        assert!(is_client_surface("tui"));
+        assert!(is_client_surface("kde"));
+        assert!(is_client_surface("voice"));
+        // `default` is the inheritance fallback, not a client surface.
+        assert!(!is_client_surface(DEFAULT_SURFACE));
+        assert!(!is_client_surface("bogus"));
+    }
+
+    #[test]
+    fn save_roundtrips_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        // A nested path exercises parent-dir creation.
+        let path = dir.path().join("nested").join("client-mcp.toml");
+        let cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        cfg.save(&path).expect("save");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
+        }
+
+        // load-modify-save-load preserves data.
+        let reloaded = ClientMcpConfig::load(&path);
+        assert_eq!(reloaded.servers.len(), cfg.servers.len());
+        assert_eq!(reloaded.servers[0].name, "filesystem");
+        assert_eq!(reloaded.servers[0].namespace.as_deref(), Some("fs"));
+        assert_eq!(reloaded.servers[0].args, vec!["serve", "--root", "/home/dave"]);
+        assert_eq!(
+            names(&reloaded.resolved_servers("gtk")),
+            vec!["filesystem", "git"]
+        );
+        // A disabled definition and the raw per-surface lists survive the trip.
+        assert!(
+            reloaded
+                .list_defined_servers()
+                .iter()
+                .any(|s| s.name == "disabled-one" && !s.enabled)
+        );
+        assert_eq!(
+            reloaded.surface_enabled_names("locked"),
+            &["filesystem", "disabled-one", "ghost"]
+        );
+    }
+
+    #[test]
+    fn save_rejects_duplicate_names() {
+        // Force a duplicate past the parser (which would have rejected it) and
+        // confirm save re-validates and fails closed without writing a file.
+        let mut cfg = ClientMcpConfig::default();
+        cfg.servers.push(server("dup"));
+        cfg.servers.push(server("dup"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client-mcp.toml");
+        let err = cfg.save(&path).unwrap_err();
+        assert!(err.contains("duplicate"), "got: {err}");
+        assert!(!path.exists(), "no file should be written on validation failure");
+    }
+
+    #[test]
+    fn add_rejects_empty_and_duplicate() {
+        let mut cfg = ClientMcpConfig::default();
+        cfg.add_server(server("a")).expect("first add");
+
+        let dup = cfg.add_server(server("a")).unwrap_err();
+        assert!(dup.contains("duplicate"), "got: {dup}");
+
+        let empty = cfg.add_server(server("")).unwrap_err();
+        assert!(empty.contains("empty"), "got: {empty}");
+
+        // Neither rejected add mutated the definition list.
+        assert_eq!(cfg.list_defined_servers().len(), 1);
+    }
+
+    #[test]
+    fn upsert_replaces_or_appends() {
+        let mut cfg = ClientMcpConfig::default();
+        cfg.upsert_server(server("a"));
+        cfg.upsert_server(server("b"));
+        assert_eq!(cfg.list_defined_servers().len(), 2);
+
+        // Same name replaces in place (no new entry), carrying new fields.
+        let mut updated = server("a");
+        updated.command = "newcmd".to_string();
+        cfg.upsert_server(updated);
+        assert_eq!(cfg.list_defined_servers().len(), 2);
+        let a = cfg
+            .list_defined_servers()
+            .iter()
+            .find(|s| s.name == "a")
+            .unwrap();
+        assert_eq!(a.command, "newcmd");
+    }
+
+    #[test]
+    fn remove_prunes_from_all_surfaces_and_errors_if_absent() {
+        let mut cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        // "filesystem" appears in default, gtk, and locked.
+        cfg.remove_server("filesystem").expect("remove existing");
+        assert!(
+            !cfg.list_defined_servers()
+                .iter()
+                .any(|s| s.name == "filesystem")
+        );
+        for surface in ["default", "gtk", "locked"] {
+            assert!(
+                !cfg.surface_enabled_names(surface)
+                    .iter()
+                    .any(|n| n == "filesystem"),
+                "surface '{surface}' still lists filesystem"
+            );
+        }
+        // Sibling names in those surfaces are untouched.
+        assert_eq!(cfg.surface_enabled_names("gtk"), &["git"]);
+
+        let err = cfg.remove_server("filesystem").unwrap_err();
+        assert!(err.contains("filesystem"), "got: {err}");
+    }
+
+    #[test]
+    fn set_surface_enabled_materializes_and_never_touches_default() {
+        let mut cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        // "voice" has no entry of its own -> it inherits default.
+        assert!(cfg.surface_enabled_names("voice").is_empty());
+
+        cfg.set_surface_enabled("voice", "git", true);
+        assert_eq!(cfg.surface_enabled_names("voice"), &["git"]);
+        // default's own list must be untouched by editing another surface.
+        assert_eq!(cfg.surface_enabled_names("default"), &["filesystem"]);
+
+        // Adding is idempotent (no duplicate entry).
+        cfg.set_surface_enabled("voice", "git", true);
+        assert_eq!(cfg.surface_enabled_names("voice"), &["git"]);
+
+        // Removing operates on the named surface only.
+        cfg.set_surface_enabled("voice", "git", false);
+        assert!(cfg.surface_enabled_names("voice").is_empty());
+        assert_eq!(cfg.surface_enabled_names("default"), &["filesystem"]);
+    }
+
+    #[test]
+    fn set_server_enabled_flips_definition() {
+        let mut cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        cfg.set_server_enabled("filesystem", false).expect("disable");
+        assert!(
+            !cfg.list_defined_servers()
+                .iter()
+                .find(|s| s.name == "filesystem")
+                .unwrap()
+                .enabled
+        );
+        // A disabled definition drops out of resolution everywhere.
+        assert!(
+            cfg.resolved_servers("gtk")
+                .iter()
+                .all(|s| s.name != "filesystem")
+        );
+
+        cfg.set_server_enabled("filesystem", true).expect("re-enable");
+        assert!(
+            cfg.list_defined_servers()
+                .iter()
+                .find(|s| s.name == "filesystem")
+                .unwrap()
+                .enabled
+        );
+
+        let err = cfg.set_server_enabled("ghost", true).unwrap_err();
+        assert!(err.contains("ghost"), "got: {err}");
+    }
+
+    #[test]
+    fn surface_enabled_names_is_raw_unfiltered() {
+        let cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        // Raw list keeps the disabled and undefined names that resolution drops.
+        assert_eq!(
+            cfg.surface_enabled_names("locked"),
+            &["filesystem", "disabled-one", "ghost"]
+        );
+        assert_eq!(names(&cfg.resolved_servers("locked")), vec!["filesystem"]);
+
+        // A surface with no entry yields an empty slice, with NO default fallback
+        // (unlike `resolved_servers`).
+        assert!(cfg.surface_enabled_names("voice").is_empty());
     }
 }
