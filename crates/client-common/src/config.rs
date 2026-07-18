@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_WS_URL: &str = "wss://127.0.0.1:11339/ws";
 pub const DEFAULT_WS_SUBJECT: &str = "desktop-tui";
@@ -16,6 +16,31 @@ pub fn default_ca_cert_path() -> PathBuf {
         .join("desktop-assistant")
         .join("tls")
         .join("ca.pem")
+}
+
+/// Reads an optional CA-certificate bundle from disk.
+///
+/// `Ok(None)` means "no extra CA to trust": either none was configured, or the
+/// configured path does not exist. The latter is deliberately not an error —
+/// clients populate the default path unconditionally, so a machine that has
+/// never run a local daemon has no file there and must still be able to reach
+/// endpoints that need no private CA at all (#521). Any other read failure
+/// (permissions, a directory, I/O) is a real error and propagates.
+pub fn read_optional_ca_pem(ca_cert_path: Option<&Path>) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(path) = ca_cert_path else {
+        return Ok(None);
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                path = %path.display(),
+                "no local CA certificate; trusting the public roots only"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("reading CA cert {}: {e}", path.display())),
+    }
 }
 
 /// Default path to the daemon's local Unix domain socket, or `None` when

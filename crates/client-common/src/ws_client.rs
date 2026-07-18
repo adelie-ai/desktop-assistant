@@ -364,23 +364,71 @@ impl AssistantCommands for WsClient {
     }
 }
 
-/// Builds the trust anchors for an outbound `wss://` connection.
+/// Builds the trust anchors for an outbound `wss://` connection: the public
+/// webpki roots, plus any certificate in `ca_cert_path`.
+///
+/// Why the public roots are the floor: a remote brain normally sits behind an
+/// ingress that terminates TLS with a publicly-signed certificate, while
+/// `ca_cert_path` defaults to the *daemon's* self-signed local CA. Treating the
+/// configured CA as a replacement rather than an addition left clients trusting
+/// exactly one private CA and unable to verify any public endpoint (#521). This
+/// also matches the reqwest path in `auth::request_ws_login_token`, whose
+/// `add_root_certificate` has always layered onto the built-in roots — the two
+/// halves of the connect flow previously disagreed.
+///
+/// A `ca_cert_path` that does not exist is a warning, not an error: clients
+/// populate the default path unconditionally, so a machine that has never run a
+/// local daemon has no file there and still needs to reach public endpoints. A
+/// file that exists but yields no certificate *is* an error — the operator
+/// pointed at it deliberately, and silently ignoring it would downgrade trust
+/// without saying so.
 pub(crate) fn build_root_store(ca_cert_path: Option<&Path>) -> Result<rustls::RootCertStore> {
-    let mut root_store = rustls::RootCertStore::empty();
+    let mut root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
 
-    if let Some(ca_path) = ca_cert_path {
-        let pem_bytes = std::fs::read(ca_path)
-            .map_err(|e| anyhow!("reading CA cert {}: {e}", ca_path.display()))?;
-        use rustls::pki_types::pem::PemObject;
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls::pki_types::CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(
-                pem_bytes.as_slice(),
-            ))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for cert in certs {
-            root_store.add(cert)?;
+    let Some(ca_path) = ca_cert_path else {
+        return Ok(root_store);
+    };
+
+    let pem_bytes = match std::fs::read(ca_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                path = %ca_path.display(),
+                "no local CA certificate; trusting the public roots only"
+            );
+            return Ok(root_store);
         }
+        Err(e) => return Err(anyhow!("reading CA cert {}: {e}", ca_path.display())),
+    };
+
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(
+            pem_bytes.as_slice(),
+        ))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!("parsing CA cert {}: {e}", ca_path.display()))?;
+
+    if certs.is_empty() {
+        return Err(anyhow!(
+            "CA cert {} contains no certificates",
+            ca_path.display()
+        ));
     }
+
+    let added = certs.len();
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|e| anyhow!("trusting CA cert {}: {e}", ca_path.display()))?;
+    }
+    tracing::debug!(
+        path = %ca_path.display(),
+        added,
+        "trusting local CA certificate(s) alongside the public roots"
+    );
 
     Ok(root_store)
 }

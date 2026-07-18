@@ -1283,6 +1283,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "webpki-roots 1.0.7",
  "zbus",
 ]
 
