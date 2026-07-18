@@ -201,13 +201,20 @@ mod tests {
             ],
         };
         let row = provider.synthetic_row();
-        assert_eq!(row.name, "provider:weather", "synthetic name is provider:<name>");
+        assert_eq!(
+            row.name, "provider:weather",
+            "synthetic name is provider:<name>"
+        );
         assert_eq!(
             row.description,
             "Live weather and forecasts. Tools: weather__forecast, weather__alerts.",
             "the row text carries the description AND the member tool names"
         );
-        assert_eq!(row.parameters, serde_json::json!({}), "no callable parameters");
+        assert_eq!(
+            row.parameters,
+            serde_json::json!({}),
+            "no callable parameters"
+        );
     }
 
     fn _assert_tool_registry<T: ToolRegistryStore>() {}

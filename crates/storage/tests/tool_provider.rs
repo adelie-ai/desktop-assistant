@@ -131,7 +131,9 @@ async fn register_tools_persists_provider_column() {
 #[tokio::test]
 async fn unregister_source_sweeps_provider_and_tool_rows() {
     let Some(fx) = fixture("provider_sweep").await else {
-        eprintln!("skip: TEST_DATABASE_URL not set; unregister_source_sweeps_provider_and_tool_rows");
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; unregister_source_sweeps_provider_and_tool_rows"
+        );
         return;
     };
     let store = PgToolRegistryStore::new(fx.pool.clone());
@@ -142,7 +144,10 @@ async fn unregister_source_sweeps_provider_and_tool_rows() {
             vec![
                 tool("weather__forecast", "Forecast"),
                 tool("weather__alerts", "Alerts"),
-                provider_row("weather", "Weather tools. Tools: weather__forecast, weather__alerts."),
+                provider_row(
+                    "weather",
+                    "Weather tools. Tools: weather__forecast, weather__alerts.",
+                ),
             ],
             "mcp",
             false,
@@ -168,7 +173,10 @@ async fn unregister_source_sweeps_provider_and_tool_rows() {
         .expect("register builtin members");
     store
         .register_tools(
-            vec![provider_row("database", "Database tools. Tools: builtin_db_query.")],
+            vec![provider_row(
+                "database",
+                "Database tools. Tools: builtin_db_query.",
+            )],
             "builtin",
             false,
             Some("database"),
@@ -210,7 +218,9 @@ async fn unregister_source_sweeps_provider_and_tool_rows() {
 #[tokio::test]
 async fn register_tools_rejects_non_synthetic_provider_name() {
     let Some(fx) = fixture("provider_guard").await else {
-        eprintln!("skip: TEST_DATABASE_URL not set; register_tools_rejects_non_synthetic_provider_name");
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; register_tools_rejects_non_synthetic_provider_name"
+        );
         return;
     };
     let store = PgToolRegistryStore::new(fx.pool.clone());
@@ -525,7 +535,11 @@ async fn search_no_provider_match_ranking_unchanged() {
         .collect();
     assert_eq!(
         order,
-        vec!["tool_b".to_string(), "tool_a".to_string(), "tool_c".to_string()],
+        vec![
+            "tool_b".to_string(),
+            "tool_a".to_string(),
+            "tool_c".to_string()
+        ],
         "with no provider row the boost is additive-zero, so ordering must equal \
          the plain-RRF baseline [B, A, C]"
     );

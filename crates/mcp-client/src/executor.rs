@@ -702,8 +702,11 @@ impl McpExecutorState {
                 .get(idx)
                 .and_then(|slot| slot.as_ref())
                 .and_then(|handle| handle.instructions.as_deref());
-            let description =
-                resolve_provider_description(instructions, config.description.as_deref(), &config.name);
+            let description = resolve_provider_description(
+                instructions,
+                config.description.as_deref(),
+                &config.name,
+            );
             providers.push(ReindexProvider {
                 name,
                 source: "mcp",
@@ -1760,7 +1763,10 @@ mod tests {
             command = "weather-mcp"
         "#;
         let config: McpServerConfig = toml::from_str(toml).expect("parse config");
-        assert_eq!(config.description, None, "an absent description defaults to None");
+        assert_eq!(
+            config.description, None,
+            "an absent description defaults to None"
+        );
     }
 
     #[test]
