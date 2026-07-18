@@ -128,6 +128,46 @@ mod tests {
     }
 
     #[test]
+    fn into_storage_batches_maps_with_null_embeddings() {
+        // The hot-reindex mapping to `reindex_source` batches: provider identity
+        // and is_core carried through, one NULL embedding slot per row (the
+        // background backfill fills vectors later), no embedding model.
+        let mcp = build_mcp_batches(vec![ReindexProvider {
+            name: "weather".into(),
+            source: "mcp",
+            description: "Weather and forecasts.".into(),
+            tools: vec![td("weather__forecast"), td("weather__alerts")],
+        }]);
+        let storage = into_storage_batches(mcp);
+        assert_eq!(storage.len(), 1, "one storage batch per provider group");
+        let b = &storage[0];
+        assert!(!b.is_core, "MCP provider batches are non-core");
+        assert_eq!(
+            b.provider.as_deref(),
+            Some("mcp:weather"),
+            "the source-qualified provider identity is carried through"
+        );
+        assert_eq!(
+            b.tools.len(),
+            3,
+            "the batch carries its 2 member tools plus 1 synthetic provider row"
+        );
+        assert_eq!(
+            b.embeddings.len(),
+            b.tools.len(),
+            "exactly one embedding slot per row (so a bind never misaligns)"
+        );
+        assert!(
+            b.embeddings.iter().all(|e| e.is_none()),
+            "the hot reindex writes NULL embeddings for the background backfill"
+        );
+        assert!(
+            b.embedding_model.is_none(),
+            "no embedding model is stamped on a NULL-embedding reindex"
+        );
+    }
+
+    #[test]
     fn reindex_emits_one_provider_row_per_mcp_provider() {
         let providers = vec![
             ReindexProvider {

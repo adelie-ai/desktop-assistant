@@ -322,3 +322,42 @@ impl ToolSearchRow {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn td(name: &str) -> ToolDefinition {
+        ToolDefinition::new(name, "does things", serde_json::json!({}))
+    }
+
+    #[test]
+    fn validate_reserved_names_rejects_foreign_provider_row() {
+        // A batch registered under `mcp:weather` may carry its OWN synthetic row,
+        // but a *different* `provider:*` row must be refused (guard #4). This is
+        // the pure check `reindex_source` runs over every batch before opening a
+        // transaction, so a rejected batch never runs the sweep.
+        let tools = vec![td("weather__forecast"), td("provider:mcp:other")];
+        let err = PgToolRegistryStore::validate_reserved_names(&tools, Some("mcp:weather"))
+            .expect_err("a foreign provider row must be rejected");
+        assert!(
+            matches!(err, CoreError::Storage(_)),
+            "reserved-name violations surface as CoreError::Storage"
+        );
+    }
+
+    #[test]
+    fn validate_reserved_names_accepts_own_synthetic_row() {
+        let tools = vec![td("weather__forecast"), td("provider:mcp:weather")];
+        PgToolRegistryStore::validate_reserved_names(&tools, Some("mcp:weather"))
+            .expect("a batch may carry its own synthetic provider row");
+    }
+
+    #[test]
+    fn validate_reserved_names_rejects_provider_row_when_unclassified() {
+        // With no owning provider identity, ANY `provider:*` row is foreign.
+        let tools = vec![td("provider:mcp:weather")];
+        PgToolRegistryStore::validate_reserved_names(&tools, None)
+            .expect_err("a provider row with no owning provider must be rejected");
+    }
+}

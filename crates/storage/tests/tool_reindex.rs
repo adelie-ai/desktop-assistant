@@ -24,6 +24,11 @@
 //! - `reindex_source_empty_set_clears_all_mcp_rows` — disabling the last MCP
 //!   server (or a zero-tool server) reindexes with an empty set: the delete runs,
 //!   the INSERT batch is empty, and no `"mcp"` row survives or stays searchable.
+//! - `reindex_source_rolls_back_on_mid_batch_failure` — the atomic
+//!   `reindex_source` (#519): when a provider batch *after* the first fails
+//!   mid-loop, the whole reindex rolls back to the prior good state — no provider
+//!   swept-but-not-restored (dropped), and none of the partial new state leaked
+//!   in.
 //!
 //! Gated on `TEST_DATABASE_URL`; pass-skips when unset (see `support`).
 
@@ -31,7 +36,7 @@ mod support;
 
 use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
-use desktop_assistant_storage::PgToolRegistryStore;
+use desktop_assistant_storage::{PgToolRegistryStore, ToolRegisterBatch};
 use sqlx::Row;
 
 use support::DbFixture;
@@ -271,6 +276,120 @@ async fn reindex_source_empty_set_clears_all_mcp_rows() {
         results.is_empty(),
         "no tool may remain searchable after an empty reindex; got {:?}",
         results.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    fx.cleanup().await;
+}
+
+/// One provider batch with NULL embeddings — the same mapping the daemon's
+/// hot-reindex closure feeds to `reindex_source`.
+fn batch(provider: &str, tools: Vec<ToolDefinition>) -> ToolRegisterBatch {
+    let embeddings = vec![None; tools.len()];
+    ToolRegisterBatch {
+        tools,
+        is_core: false,
+        provider: Some(provider.to_string()),
+        embeddings,
+        embedding_model: None,
+    }
+}
+
+/// A tool whose description carries an embedded NUL byte. Postgres rejects NUL
+/// in `text` (`invalid byte sequence for encoding "UTF8": 0x00`), so INSERTing
+/// this row fails *inside* the reindex transaction — a faithful stand-in for a
+/// transient mid-loop DB error striking the Nth provider, after the sweep and
+/// the earlier batches have already been applied within the transaction.
+fn poison_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        "serverpoison__boom",
+        "bad\u{0}description",
+        serde_json::json!({"type": "object"}),
+    )
+}
+
+#[tokio::test]
+async fn reindex_source_rolls_back_on_mid_batch_failure() {
+    let Some(fx) = fixture("reindex_rollback").await else {
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; reindex_source_rolls_back_on_mid_batch_failure"
+        );
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // Prior good state: two providers, registered atomically.
+    store
+        .reindex_source(
+            "mcp",
+            vec![
+                batch("mcp:servera", server_a_tools()),
+                batch("mcp:serverb", vec![server_b_tool()]),
+            ],
+        )
+        .await
+        .expect("seed prior good state");
+    let before = mcp_source_names(&fx).await;
+    assert_eq!(
+        before,
+        vec![
+            "servera__alpha".to_string(),
+            "servera__beta".to_string(),
+            "serverb__frobnicate".to_string(),
+        ],
+        "precondition: the prior good state has all three rows"
+    );
+
+    // Attempt a NEW reindex in which a provider *after* the first fails mid-loop.
+    // Ordering matters: a good new provider (serverc) is applied first, then the
+    // poison provider fails. With a non-atomic loop the sweep + the serverc
+    // insert would already be committed, so serverc would survive while serverb
+    // (swept, never re-registered) would vanish — a partial index. The atomic
+    // `reindex_source` must instead roll the whole thing back.
+    let serverc = ToolDefinition::new(
+        "serverc__gamma",
+        "A newly enabled provider tool",
+        serde_json::json!({"type": "object"}),
+    );
+    let err = store
+        .reindex_source(
+            "mcp",
+            vec![
+                batch("mcp:serverc", vec![serverc]),
+                batch("mcp:serverpoison", vec![poison_tool()]),
+            ],
+        )
+        .await
+        .expect_err("a mid-loop INSERT failure must surface as an error, not be swallowed");
+    // The failure is surfaced to the caller (the mcp-client boundary swallows it,
+    // not the store) — assert it is a storage error, not a silent Ok.
+    assert!(
+        matches!(err, desktop_assistant_core::CoreError::Storage(_)),
+        "a mid-loop DB failure surfaces as CoreError::Storage; got {err:?}"
+    );
+
+    // Invariant (atomic / all-or-nothing): the index is byte-for-byte the prior
+    // good state. No provider was silently dropped, and none of the partial new
+    // state leaked in.
+    let after = mcp_source_names(&fx).await;
+    assert_eq!(
+        after, before,
+        "a mid-loop failure must roll the reindex back to the prior good state"
+    );
+    assert!(
+        store
+            .tool_definition("serverc__gamma")
+            .await
+            .expect("lookup serverc after rollback")
+            .is_none(),
+        "the partially-applied new provider must NOT survive a rolled-back reindex"
+    );
+    assert!(
+        store
+            .tool_definition("serverb__frobnicate")
+            .await
+            .expect("lookup serverb after rollback")
+            .is_some(),
+        "a provider present before the failed reindex must NOT be dropped by it"
     );
 
     fx.cleanup().await;
