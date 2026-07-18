@@ -623,6 +623,92 @@ impl BuiltinToolService {
         )
     }
 
+    /// The builtin provider groups (Phase 1): a stable group id plus the authored
+    /// blurb that seeds the group's synthetic `provider:<id>` row. Built-ins are
+    /// surfaced to tool-search by the SAME provider mechanism as external MCP
+    /// servers — this classification is what unifies them.
+    pub const PROVIDER_GROUPS: &'static [(&'static str, &'static str)] = &[
+        (
+            "knowledge",
+            "Long-term memory: store and recall the user's preferences, facts, \
+             instructions, and project context as durable tagged entries, via hybrid \
+             vector + full-text search.",
+        ),
+        (
+            "scratchpad",
+            "Ephemeral per-conversation working notes: hold a plan, findings, and \
+             intermediate results across a multi-step task; discarded when the \
+             conversation ends.",
+        ),
+        (
+            "database",
+            "Run SQL against the assistant's own PostgreSQL database to inspect or \
+             modify its conversations, messages, knowledge, and tool data, and to \
+             build your own schemas/views.",
+        ),
+        (
+            "recall",
+            "Search past conversations by full-text query to recall what was \
+             discussed or decided.",
+        ),
+        (
+            "system",
+            "System and desktop touchpoints: read runtime/system context and raise \
+             desktop notifications for things that need attention now.",
+        ),
+        (
+            "tool-meta",
+            "Discover additional tools by description and manage the MCP servers that \
+             provide them (status/start/stop/restart).",
+        ),
+    ];
+
+    /// Every builtin tool name, including the capability-gated `builtin_notify`
+    /// (absent at runtime when no notifier is wired). The exhaustiveness guard
+    /// walks this so a NEW builtin without a provider mapping fails the build.
+    pub const ALL_TOOL_NAMES: &'static [&'static str] = &[
+        TOOL_KB_WRITE,
+        TOOL_KB_SEARCH,
+        TOOL_KB_DELETE,
+        TOOL_KB_LIST,
+        TOOL_SEARCH,
+        TOOL_NOTIFY,
+        TOOL_SYS_PROPS,
+        TOOL_DB_QUERY,
+        TOOL_MCP_CONTROL,
+        TOOL_CONV_SEARCH,
+        TOOL_SCRATCHPAD_WRITE,
+        TOOL_SCRATCHPAD_SEARCH,
+        TOOL_SCRATCHPAD_DELETE,
+    ];
+
+    /// Classify a builtin tool name into its provider group, or `None` when the
+    /// name is not a known builtin. Callers that must register every builtin
+    /// (never drop one) fall back to a generic group on `None`; the
+    /// `builtin_provider_map_is_exhaustive` test ensures no known builtin relies
+    /// on that fallback.
+    pub fn provider_group(tool_name: &str) -> Option<&'static str> {
+        match tool_name {
+            TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST => Some("knowledge"),
+            TOOL_SCRATCHPAD_WRITE | TOOL_SCRATCHPAD_SEARCH | TOOL_SCRATCHPAD_DELETE => {
+                Some("scratchpad")
+            }
+            TOOL_DB_QUERY => Some("database"),
+            TOOL_CONV_SEARCH => Some("recall"),
+            TOOL_SYS_PROPS | TOOL_NOTIFY => Some("system"),
+            TOOL_SEARCH | TOOL_MCP_CONTROL => Some("tool-meta"),
+            _ => None,
+        }
+    }
+
+    /// The authored blurb for a provider group id, or `None` if unknown.
+    pub fn provider_blurb(provider: &str) -> Option<&'static str> {
+        Self::PROVIDER_GROUPS
+            .iter()
+            .find(|(id, _)| *id == provider)
+            .map(|(_, blurb)| *blurb)
+    }
+
     pub async fn execute_tool(
         &self,
         name: &str,
@@ -1565,6 +1651,43 @@ fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_provider_map_is_exhaustive() {
+        // Every known builtin tool must classify into one of the authored
+        // PROVIDER_GROUPS — so a NEW builtin added without a mapping fails here
+        // instead of silently registering unclassified (spec requirement).
+        let group_ids: Vec<&str> = BuiltinToolService::PROVIDER_GROUPS
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        for name in BuiltinToolService::ALL_TOOL_NAMES {
+            let group = BuiltinToolService::provider_group(name).unwrap_or_else(|| {
+                panic!("builtin '{name}' has no provider group — classify it in provider_group()")
+            });
+            assert!(
+                group_ids.contains(&group),
+                "builtin '{name}' maps to '{group}', which is not an authored PROVIDER_GROUP"
+            );
+        }
+        // ALL_TOOL_NAMES must also cover everything supports_tool accepts and
+        // everything the default service actually emits (notify aside) — a
+        // classified name that is not a real builtin, or a real builtin missing
+        // from the list, is a drift bug.
+        for name in BuiltinToolService::ALL_TOOL_NAMES {
+            assert!(
+                BuiltinToolService::supports_tool(name),
+                "ALL_TOOL_NAMES lists '{name}', which supports_tool rejects"
+            );
+        }
+        for def in BuiltinToolService::new().tool_definitions() {
+            assert!(
+                BuiltinToolService::provider_group(&def.name).is_some(),
+                "runtime builtin '{}' is unclassified",
+                def.name
+            );
+        }
+    }
 
     /// The pre-#141 docstring on `with_database` claimed "read-only SQL
     /// access" — which the implementation did not enforce. Comment-vs-

@@ -242,6 +242,16 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Provider identity + index for provider-level tool surfacing (Phase 1):
+    // real tools carry their MCP server / builtin-group provider, and the
+    // daemon registers one synthetic `provider:<provider>` row per provider that
+    // boosts its members' search scores when it matches a query.
+    sqlx::raw_sql(include_str!(
+        "../migrations/030_tool_definitions_provider.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

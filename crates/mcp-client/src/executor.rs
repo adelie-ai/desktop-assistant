@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{ToolDefinition, ToolNamespace};
-use desktop_assistant_core::ports::tool_registry::ToolReindexFn;
+use desktop_assistant_core::ports::tool_registry::{ReindexProvider, ToolReindexFn};
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::{Mutex, RwLock};
 
@@ -239,6 +239,27 @@ pub struct McpServerConfig {
     /// spawning `command`. See [`HttpTransportConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpTransportConfig>,
+    /// Human-facing description of what this server offers, used as the fallback
+    /// seed for its provider description in tool-search surfacing when the server
+    /// sends no `initialize` instructions. Phase-1 stopgap until every server
+    /// emits its own instructions. Optional for TOML back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Resolve a provider's description for tool-search surfacing:
+/// server `initialize` instructions, else the configured `description`, else a
+/// generic boilerplate naming the server. Trimmed inputs are the caller's job
+/// (instructions arrive trimmed from [`crate::parse_server_instructions`]).
+pub(crate) fn resolve_provider_description(
+    instructions: Option<&str>,
+    config_description: Option<&str>,
+    server_name: &str,
+) -> String {
+    instructions
+        .or(config_description)
+        .map(String::from)
+        .unwrap_or_else(|| format!("Tools from the {server_name} MCP server"))
 }
 
 /// Status information for an MCP server — the per-server *descriptor* the
@@ -320,14 +341,20 @@ struct ConnectError {
 struct ClientHandle {
     client: Arc<Mutex<McpClient>>,
     flags: Arc<ListChangeFlags>,
+    /// The server's captured `initialize` instructions, cached here (read from
+    /// the already-initialized client at construction) so provider grouping for
+    /// reindexing can read it without taking the per-client lock.
+    instructions: Option<String>,
 }
 
 impl ClientHandle {
     fn new(client: McpClient) -> Self {
         let flags = client.list_change_flags();
+        let instructions = client.server_instructions().map(String::from);
         Self {
             client: Arc::new(Mutex::new(client)),
             flags,
+            instructions,
         }
     }
 }
@@ -638,6 +665,56 @@ impl McpExecutorState {
         *self.cached_tools.lock().await = all_tools;
 
         Ok(())
+    }
+
+    /// Group the current connected MCP tools by provider for reindexing. Modeled
+    /// on `tool_namespaces` (keyed on `config.namespace.unwrap_or(config.name)`),
+    /// but returns [`ReindexProvider`] with a resolved description
+    /// (`initialize` instructions ?? config `description` ?? boilerplate) read
+    /// from the per-server [`ClientHandle::instructions`] cache — no per-client
+    /// lock needed. Servers contributing zero connected tools are skipped.
+    async fn mcp_providers_with_tools(&self) -> Vec<ReindexProvider> {
+        let configs = self.configs.read().await;
+        let clients = self.clients.read().await;
+        let cached = self.cached_tools.lock().await;
+        let routing = self.tool_routing.lock().await;
+
+        let mut providers = Vec::new();
+        for (idx, config) in configs.iter().enumerate() {
+            let server_tools: Vec<ToolDefinition> = cached
+                .iter()
+                .filter(|tool| {
+                    routing
+                        .get(&tool.name)
+                        .is_some_and(|(server_idx, _)| *server_idx == idx)
+                })
+                .cloned()
+                .collect();
+            if server_tools.is_empty() {
+                continue;
+            }
+            let name = config
+                .namespace
+                .as_deref()
+                .unwrap_or(&config.name)
+                .to_string();
+            let instructions = clients
+                .get(idx)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|handle| handle.instructions.as_deref());
+            let description = resolve_provider_description(
+                instructions,
+                config.description.as_deref(),
+                &config.name,
+            );
+            providers.push(ReindexProvider {
+                name,
+                source: "mcp",
+                description,
+                tools: server_tools,
+            });
+        }
+        providers
     }
 
     async fn refresh_resources_cache(&self) -> Result<(), McpError> {
@@ -1152,11 +1229,8 @@ impl McpControlHandle {
         };
         // Snapshot + reindex must be atomic per toggle (see `reindex_lock`).
         let _serialize = self.state.reindex_lock.lock().await;
-        let tools = {
-            let cached = self.state.cached_tools.lock().await;
-            cached.clone()
-        };
-        if let Err(e) = reindex(tools).await {
+        let providers = self.state.mcp_providers_with_tools().await;
+        if let Err(e) = reindex(providers).await {
             tracing::warn!("tool_definitions reindex after MCP enable/disable failed: {e}");
         }
     }
@@ -1454,6 +1528,17 @@ impl McpToolExecutor {
         self.state.cached_tools.lock().await.clone()
     }
 
+    /// The connected MCP tools grouped by provider (server), each with its
+    /// resolved description. The startup analogue of what the reindex closure
+    /// receives, so a fresh boot registers provider rows immediately (not only
+    /// after the first enable/disable toggle).
+    pub async fn mcp_providers(&self) -> Vec<ReindexProvider> {
+        if let Err(e) = self.state.maybe_refresh_metadata().await {
+            tracing::warn!("failed to refresh MCP tools cache: {e}");
+        }
+        self.state.mcp_providers_with_tools().await
+    }
+
     /// Shut down all connected MCP servers.
     pub async fn shutdown(&self) {
         let handles: Vec<ClientHandle> = {
@@ -1656,6 +1741,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mcp_server_config_description_deserializes_from_toml() {
+        let toml = r#"
+            name = "weather"
+            command = "weather-mcp"
+            description = "Live weather and forecasts."
+        "#;
+        let config: McpServerConfig = toml::from_str(toml).expect("parse config");
+        assert_eq!(
+            config.description.as_deref(),
+            Some("Live weather and forecasts."),
+            "the description field must round-trip from TOML"
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_description_absent_defaults_none() {
+        // TOML back-compat: an existing config with no `description` still parses.
+        let toml = r#"
+            name = "weather"
+            command = "weather-mcp"
+        "#;
+        let config: McpServerConfig = toml::from_str(toml).expect("parse config");
+        assert_eq!(
+            config.description, None,
+            "an absent description defaults to None"
+        );
+    }
+
+    #[test]
+    fn resolved_description_prefers_instructions() {
+        // instructions ?? config.description ?? boilerplate.
+        assert_eq!(
+            resolve_provider_description(Some("live instructions"), Some("cfg desc"), "weather"),
+            "live instructions"
+        );
+    }
+
+    #[test]
+    fn resolved_description_falls_back_to_config() {
+        assert_eq!(
+            resolve_provider_description(None, Some("cfg desc"), "weather"),
+            "cfg desc"
+        );
+    }
+
+    #[test]
+    fn resolved_description_falls_back_to_boilerplate() {
+        assert_eq!(
+            resolve_provider_description(None, None, "weather"),
+            "Tools from the weather MCP server"
+        );
+    }
+
+    #[test]
     fn executor_creation_with_empty_configs() {
         let executor = McpToolExecutor::new(vec![]);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1674,6 +1813,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         };
         assert_eq!(config.name, "fileio");
         assert_eq!(config.command, "fileio-mcp");
@@ -1693,6 +1833,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         };
         assert_eq!(config.namespace.as_deref(), Some("jira"));
     }
@@ -1708,6 +1849,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         };
         assert_eq!(config.args.len(), 2);
     }
@@ -1785,6 +1927,7 @@ mod tests {
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
                 http: None,
+                description: None,
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -1795,6 +1938,7 @@ mod tests {
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
                 http: None,
+                description: None,
             },
         ];
         let executor = McpToolExecutor::new(configs);
@@ -1834,6 +1978,7 @@ mod tests {
                 oauth_account: None,
                 scopes: vec![],
             }),
+            description: None,
         }
     }
 
@@ -1848,6 +1993,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         };
         let configs = vec![
             oauth_server("authless", "missing_refresh"), // no secret -> needs_auth
@@ -1952,6 +2098,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();
@@ -1976,6 +2123,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         }];
         let executor = McpToolExecutor::new(configs);
         let handle = executor.control_handle();
@@ -2010,6 +2158,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         };
 
         // Absent -> added.
@@ -2267,6 +2416,7 @@ mod tests {
                 oauth_account: Some(account_id.into()),
                 scopes: required.iter().map(|s| s.to_string()).collect(),
             }),
+            description: None,
         }
     }
 
@@ -2403,15 +2553,46 @@ mod tests {
 
     use desktop_assistant_core::ports::tool_registry::ToolReindexFn;
 
-    /// Recording reindex closure: captures each call's tool set so a test can
-    /// assert exactly what the executor handed over.
-    fn recording_reindex() -> (ToolReindexFn, Arc<Mutex<Vec<Vec<ToolDefinition>>>>) {
-        let calls: Arc<Mutex<Vec<Vec<ToolDefinition>>>> = Arc::new(Mutex::new(Vec::new()));
+    /// A minimal enabled stdio config (never actually connected in these tests).
+    fn stdio_cfg(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: "x".into(),
+            args: vec![],
+            namespace: None,
+            enabled: true,
+            env: HashMap::new(),
+            env_secrets: HashMap::new(),
+            http: None,
+            description: None,
+        }
+    }
+
+    /// Seed the connected state so `mcp_providers_with_tools` produces providers:
+    /// each `(server_idx, exposed_name)` adds a cached tool routed to the config
+    /// at `server_idx`. The executor must already hold matching configs.
+    async fn seed_routed_tools(executor: &McpToolExecutor, tools: &[(usize, &str)]) {
+        let mut cached = executor.state.cached_tools.lock().await;
+        let mut routing = executor.state.tool_routing.lock().await;
+        for (idx, name) in tools {
+            cached.push(ToolDefinition::new(
+                *name,
+                format!("{name} description"),
+                serde_json::json!({"type": "object"}),
+            ));
+            routing.insert((*name).to_string(), (*idx, (*name).to_string()));
+        }
+    }
+
+    /// Recording reindex closure: captures each call's provider groups so a test
+    /// can assert exactly what the executor handed over.
+    fn recording_reindex() -> (ToolReindexFn, Arc<Mutex<Vec<Vec<ReindexProvider>>>>) {
+        let calls: Arc<Mutex<Vec<Vec<ReindexProvider>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&calls);
-        let f: ToolReindexFn = Arc::new(move |tools| {
+        let f: ToolReindexFn = Arc::new(move |providers| {
             let sink = Arc::clone(&sink);
             Box::pin(async move {
-                sink.lock().await.push(tools);
+                sink.lock().await.push(providers);
                 Ok(())
             })
         });
@@ -2419,22 +2600,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fire_tool_reindex_calls_injected_fn_with_cached_tools() {
-        let executor = McpToolExecutor::new(vec![]);
-        // Seed the connected-tool cache directly (no live servers needed).
-        {
-            let mut cached = executor.state.cached_tools.lock().await;
-            cached.push(ToolDefinition::new(
-                "servera__alpha",
-                "alpha tool",
-                serde_json::json!({"type": "object"}),
-            ));
-            cached.push(ToolDefinition::new(
-                "serverb__beta",
-                "beta tool",
-                serde_json::json!({"type": "object"}),
-            ));
-        }
+    async fn fire_tool_reindex_hands_over_provider_groups() {
+        // Two servers each contributing one tool -> the reindex receives one
+        // provider group per server, keyed on its name, carrying its member tool.
+        let executor = McpToolExecutor::new(vec![stdio_cfg("servera"), stdio_cfg("serverb")]);
+        seed_routed_tools(&executor, &[(0, "servera__alpha"), (1, "serverb__beta")]).await;
 
         let handle = executor.control_handle();
         let (reindex, calls) = recording_reindex();
@@ -2444,11 +2614,23 @@ mod tests {
 
         let calls = calls.lock().await;
         assert_eq!(calls.len(), 1, "reindex closure must fire exactly once");
-        let names: Vec<&str> = calls[0].iter().map(|t| t.name.as_str()).collect();
+        let providers = &calls[0];
+        let mut names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
         assert_eq!(
             names,
-            vec!["servera__alpha", "serverb__beta"],
-            "reindex must receive the current connected-tool set"
+            vec!["servera", "serverb"],
+            "reindex must receive one provider group per connected server"
+        );
+        let a = providers
+            .iter()
+            .find(|p| p.name == "servera")
+            .expect("servera group present");
+        assert_eq!(a.source, "mcp", "MCP providers carry the mcp source");
+        assert_eq!(
+            a.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["servera__alpha"],
+            "each provider group carries only its own member tools"
         );
     }
 
@@ -2470,6 +2652,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         };
         let executor = McpToolExecutor::with_builtin_tools_and_config_path(
             vec![config],
@@ -2497,19 +2680,12 @@ mod tests {
 
     #[tokio::test]
     async fn fire_tool_reindex_error_does_not_fail_the_toggle() {
-        let executor = McpToolExecutor::new(vec![]);
-        {
-            let mut cached = executor.state.cached_tools.lock().await;
-            cached.push(ToolDefinition::new(
-                "servera__alpha",
-                "alpha tool",
-                serde_json::json!({"type": "object"}),
-            ));
-        }
+        let executor = McpToolExecutor::new(vec![stdio_cfg("servera")]);
+        seed_routed_tools(&executor, &[(0, "servera__alpha")]).await;
 
         let invoked: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&invoked);
-        let failing: ToolReindexFn = Arc::new(move |_tools| {
+        let failing: ToolReindexFn = Arc::new(move |_providers| {
             let flag = Arc::clone(&flag);
             Box::pin(async move {
                 *flag.lock().await = true;
@@ -2554,6 +2730,7 @@ mod tests {
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         };
         let executor = McpToolExecutor::with_builtin_tools_and_config_path(
             vec![config],
@@ -2565,7 +2742,9 @@ mod tests {
         let (reindex, calls) = recording_reindex();
         handle.set_tool_reindex(reindex);
 
-        // Enabling drives connect + refresh + the reindex fire at the end.
+        // Enabling drives connect + refresh + the reindex fire at the end. The
+        // fake server never connects, so it contributes zero tools and thus no
+        // provider group — but the reindex still fires (the pinned behavior).
         handle
             .enable_server("toggleme")
             .await
@@ -2577,10 +2756,9 @@ mod tests {
                 1,
                 "enable_server must fire the reindex exactly once"
             );
-            assert_eq!(
-                calls[0],
-                executor.all_mcp_tools().await,
-                "enable must reindex the current connected-tool set"
+            assert!(
+                calls[0].is_empty(),
+                "a server that connected zero tools yields no provider group"
             );
         }
 
@@ -2596,10 +2774,9 @@ mod tests {
                 2,
                 "disable_server must fire the reindex exactly once more"
             );
-            assert_eq!(
-                calls[1],
-                executor.all_mcp_tools().await,
-                "disable must reindex the current connected-tool set"
+            assert!(
+                calls[1].is_empty(),
+                "still no provider group after the disable reindex"
             );
         }
 
@@ -2611,18 +2788,28 @@ mod tests {
         // Two reindexes fired concurrently through the handle must serialize:
         // the final committed index equals the final connected-tool set, never a
         // stale snapshot torn across the interleave (#498 review, FIX 2).
-        let executor = McpToolExecutor::new(vec![]);
+        let executor = McpToolExecutor::new(vec![stdio_cfg("servera")]);
         let handle = executor.control_handle();
+        // Both tools route to the single server so the provider grouping picks up
+        // whatever cached set is current when a toggle serializes.
+        {
+            let mut routing = executor.state.tool_routing.lock().await;
+            routing.insert("servera__alpha".into(), (0, "alpha".into()));
+            routing.insert("serverb__beta".into(), (0, "beta".into()));
+        }
 
-        // Models the persistent index: snapshot the handed-over names, yield (so
-        // a concurrent toggle can interleave), then OVERWRITE a shared committed
-        // cell — mirroring the daemon's delete-then-reinsert of the "mcp" source.
+        // Models the persistent index: snapshot the handed-over member names,
+        // yield (so a concurrent toggle can interleave), then OVERWRITE a shared
+        // committed cell — mirroring the daemon's delete-then-reinsert of "mcp".
         let committed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&committed);
-        let reindex: ToolReindexFn = Arc::new(move |tools| {
+        let reindex: ToolReindexFn = Arc::new(move |providers| {
             let sink = Arc::clone(&sink);
             Box::pin(async move {
-                let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                let names: Vec<String> = providers
+                    .iter()
+                    .flat_map(|p| p.tools.iter().map(|t| t.name.clone()))
+                    .collect();
                 tokio::task::yield_now().await;
                 *sink.lock().await = names;
                 Ok(())

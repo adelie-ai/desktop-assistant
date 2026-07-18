@@ -10,11 +10,19 @@ use crate::domain::ToolDefinition;
 pub trait ToolRegistryStore: Send + Sync {
     /// Register (upsert) tool definitions from a source (e.g. an MCP server name or "builtin").
     /// Embeddings are chunk arrays (one Vec<f32> per chunk) to match the vector[] column.
+    ///
+    /// `provider` is the batch-constant provider identity (an MCP server's
+    /// namespace/name, or a builtin group) written to every row in the batch —
+    /// we register once per provider, so a single value per call is correct
+    /// (mirrors `source`). `None` leaves the column unclassified. A batch may
+    /// carry the provider's own synthetic `provider:<provider>` row; any *other*
+    /// row literally named `provider:*` is rejected (it must never be dispatchable).
     fn register_tools(
         &self,
         tools: Vec<ToolDefinition>,
         source: &str,
         is_core: bool,
+        provider: Option<&str>,
         embeddings: Vec<Option<Vec<Vec<f32>>>>,
         embedding_model: Option<String>,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
@@ -62,8 +70,61 @@ pub type ToolDefinitionFn = Arc<
         + Sync,
 >;
 
+/// A provider (an MCP server or a builtin group) and its member tools, handed
+/// across the reindex boundary so the daemon can register each provider's tools
+/// *and* a synthetic, searchable `provider:<name>` row (see [`Self::synthetic_row`]).
+///
+/// Widening the reindex payload from a flat `Vec<ToolDefinition>` to per-provider
+/// groups is what lets tool-search surface a whole server's/group's tools when
+/// its provider row matches — the unifying concept across external MCP servers
+/// and Adele's own builtins.
+pub struct ReindexProvider {
+    /// Stable provider identity — an MCP server's namespace/name, or a builtin
+    /// group. Becomes the `provider` column value and the `provider:<name>` row.
+    pub name: String,
+    /// Row source for the persistence sweep: `"mcp"` or `"builtin"`.
+    pub source: &'static str,
+    /// Resolved provider description (server instructions, config description, or
+    /// an authored builtin blurb) seeding the synthetic row's searchable text.
+    pub description: String,
+    /// The provider's member tools.
+    pub tools: Vec<ToolDefinition>,
+}
+
+impl ReindexProvider {
+    /// The **source-qualified** provider identity, `<source>:<name>` (e.g.
+    /// `mcp:weather`, `builtin:database`). This is the value written to the
+    /// `provider` column and embedded in the synthetic row name, so an MCP server
+    /// and a builtin group that happen to share a bare name (e.g. `database`)
+    /// never collide on one PK row or cross-boost each other's members.
+    pub fn qualified_provider(&self) -> String {
+        format!("{}:{}", self.source, self.name)
+    }
+
+    /// The synthetic, searchable `provider:<source>:<name>` row for this provider:
+    /// the description followed by the member tool names, so a tool-search query
+    /// that hits the description or any member name matches the provider and
+    /// boosts its members. Non-routable (registered `is_core = FALSE`, excluded
+    /// from search results, and never dispatched — see the guards in
+    /// `crates/storage`). Its name matches on the boost via the shared
+    /// [`Self::qualified_provider`] value in the `provider` column.
+    pub fn synthetic_row(&self) -> ToolDefinition {
+        let members = self
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ToolDefinition::new(
+            format!("provider:{}", self.qualified_provider()),
+            format!("{} Tools: {members}.", self.description),
+            serde_json::json!({}),
+        )
+    }
+}
+
 /// Boxed async closure for re-writing the persistent tool-search index with a
-/// fresh set of tool definitions.
+/// fresh set of provider groups.
 ///
 /// Why: runtime MCP enable/disable changes the connected-tool set, but
 /// `crates/mcp-client` must not depend on `crates/storage` (its only workspace
@@ -71,11 +132,12 @@ pub type ToolDefinitionFn = Arc<
 /// dyn-compatible (RPIT in trait position), so a boxed closure - not
 /// `Arc<dyn ToolRegistryStore>` - is the boundary. The daemon injects a closure
 /// that owns the storage-touching policy (delete-then-reinsert the `"mcp"`
-/// source with NULL embeddings for the background backfill to fill); the
-/// executor only hands over the current `Vec<ToolDefinition>`. Mirrors
-/// [`ToolSearchFn`] / [`ToolDefinitionFn`].
+/// source, registering each provider's tools plus its synthetic row, with NULL
+/// embeddings for the background backfill to fill); the executor only hands over
+/// the current [`ReindexProvider`] groups. Mirrors [`ToolSearchFn`] /
+/// [`ToolDefinitionFn`].
 pub type ToolReindexFn = Arc<
-    dyn Fn(Vec<ToolDefinition>) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
+    dyn Fn(Vec<ReindexProvider>) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
         + Send
         + Sync,
 >;
@@ -92,6 +154,7 @@ mod tests {
             _tools: Vec<ToolDefinition>,
             _source: &str,
             _is_core: bool,
+            _provider: Option<&str>,
             _embeddings: Vec<Option<Vec<Vec<f32>>>>,
             _embedding_model: Option<String>,
         ) -> Result<(), CoreError> {
@@ -132,6 +195,73 @@ mod tests {
         let registry = MockToolRegistry;
         let tools = registry.search_tools("test", vec![0.0], 10).await.unwrap();
         assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn provider_row_description_includes_member_tool_names() {
+        // The synthetic row's searchable text is the provider description plus
+        // every member tool name, so a query for a member name matches the
+        // provider (and boosts all its members).
+        let provider = ReindexProvider {
+            name: "weather".to_string(),
+            source: "mcp",
+            description: "Live weather and forecasts.".to_string(),
+            tools: vec![
+                ToolDefinition::new("weather__forecast", "d", serde_json::json!({})),
+                ToolDefinition::new("weather__alerts", "d", serde_json::json!({})),
+            ],
+        };
+        let row = provider.synthetic_row();
+        assert_eq!(
+            row.name, "provider:mcp:weather",
+            "synthetic name is provider:<source>:<name>"
+        );
+        assert_eq!(
+            row.description,
+            "Live weather and forecasts. Tools: weather__forecast, weather__alerts.",
+            "the row text carries the description AND the member tool names"
+        );
+        assert_eq!(
+            row.parameters,
+            serde_json::json!({}),
+            "no callable parameters"
+        );
+    }
+
+    #[test]
+    fn synthetic_row_source_qualifies_provider_identity() {
+        // An MCP server and a builtin group that share a bare name must not
+        // collide on one PK row: the provider identity carries the source, so the
+        // provider column value and synthetic row name are distinct per source.
+        let mcp = ReindexProvider {
+            name: "database".to_string(),
+            source: "mcp",
+            description: "External DB.".to_string(),
+            tools: vec![ToolDefinition::new(
+                "database__query",
+                "d",
+                serde_json::json!({}),
+            )],
+        };
+        let builtin = ReindexProvider {
+            name: "database".to_string(),
+            source: "builtin",
+            description: "Adele's DB.".to_string(),
+            tools: vec![ToolDefinition::new(
+                "builtin_db_query",
+                "d",
+                serde_json::json!({}),
+            )],
+        };
+        assert_eq!(mcp.qualified_provider(), "mcp:database");
+        assert_eq!(builtin.qualified_provider(), "builtin:database");
+        assert_eq!(mcp.synthetic_row().name, "provider:mcp:database");
+        assert_eq!(builtin.synthetic_row().name, "provider:builtin:database");
+        assert_ne!(
+            mcp.synthetic_row().name,
+            builtin.synthetic_row().name,
+            "same bare name under different sources must yield distinct provider rows"
+        );
     }
 
     fn _assert_tool_registry<T: ToolRegistryStore>() {}

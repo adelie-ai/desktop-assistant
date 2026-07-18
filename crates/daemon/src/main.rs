@@ -23,6 +23,7 @@ mod maintenance_service;
 mod mcp_token_store;
 mod model_defaults;
 mod notifications;
+mod provider_reindex;
 mod purposes;
 mod registry;
 mod routing_llm;
@@ -1550,7 +1551,7 @@ async fn main() -> Result<()> {
     if let Some(tr) = &tool_registry_store {
         use desktop_assistant_core::ports::tool_registry::{ToolRegistryStore, ToolReindexFn};
         let store = Arc::clone(tr);
-        let reindex: ToolReindexFn = Arc::new(move |tools| {
+        let reindex: ToolReindexFn = Arc::new(move |providers| {
             let store = Arc::clone(&store);
             Box::pin(async move {
                 // unregister_source + register_tools run as two separate
@@ -1559,11 +1560,13 @@ async fn main() -> Result<()> {
                 // window is accepted for #498 (it self-heals the instant the
                 // reinsert commits); making the delete+reinsert a single atomic
                 // replace is deferred and tracked under epic #497.
+                //
+                // Each provider group registers its member tools plus one
+                // synthetic `provider:<name>` row (non-routable) so tool-search
+                // can boost a whole server's tools when the provider matches.
                 store.unregister_source("mcp").await?;
-                let embeddings = vec![None; tools.len()];
-                store
-                    .register_tools(tools, "mcp", false, embeddings, None)
-                    .await
+                let batches = crate::provider_reindex::build_mcp_batches(providers);
+                crate::provider_reindex::apply_batches(store.as_ref(), batches).await
             })
         });
         mcp_handle.set_tool_reindex(reindex);
@@ -1593,32 +1596,29 @@ async fn main() -> Result<()> {
     }
 
     if let Some(tr) = &tool_registry_store {
-        use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
         use desktop_assistant_core::ports::tools::ToolExecutor;
 
-        // Register builtin tools as core (always sent to LLM)
+        // Register builtin tools grouped by provider: each group's members
+        // (core, always sent to the LLM) plus a synthetic `provider:<group>` row
+        // (non-core, searchable). Built-ins surface to tool-search through the
+        // SAME provider mechanism as external MCP servers.
         let builtin_defs: Vec<_> = tool_executor
             .core_tools()
             .await
             .into_iter()
             .filter(|t| t.name.starts_with("builtin_"))
             .collect();
-        let builtin_embeddings = vec![None; builtin_defs.len()];
-        if let Err(e) = tr
-            .register_tools(builtin_defs, "builtin", true, builtin_embeddings, None)
-            .await
-        {
+        let builtin_batches = crate::provider_reindex::build_builtin_batches(builtin_defs);
+        if let Err(e) = crate::provider_reindex::apply_batches(tr.as_ref(), builtin_batches).await {
             tracing::warn!("failed to register builtin tools in registry: {e}");
         }
 
-        // Register MCP tools as non-core (discoverable via tool_search)
-        let mcp_defs: Vec<_> = tool_executor.all_mcp_tools().await;
-        let mcp_embeddings = vec![None; mcp_defs.len()];
-        if !mcp_defs.is_empty()
-            && let Err(e) = tr
-                .register_tools(mcp_defs, "mcp", false, mcp_embeddings, None)
-                .await
-        {
+        // Register MCP tools grouped by provider (non-core, discoverable via
+        // tool_search): each server's members plus its synthetic provider row,
+        // so provider rows exist from boot rather than only after a hot toggle.
+        let providers = tool_executor.mcp_providers().await;
+        let mcp_batches = crate::provider_reindex::build_mcp_batches(providers);
+        if let Err(e) = crate::provider_reindex::apply_batches(tr.as_ref(), mcp_batches).await {
             tracing::warn!("failed to register MCP tools in registry: {e}");
         }
     }
@@ -2622,6 +2622,7 @@ mod tests {
                 oauth_account: account_id.map(String::from),
                 scopes: scopes.iter().map(|s| s.to_string()).collect(),
             }),
+            description: None,
         }
     }
 

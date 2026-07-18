@@ -476,6 +476,7 @@ OTHER_VAR = "value"
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
                 http: None,
+                description: None,
             },
             McpServerConfig {
                 name: "jira".into(),
@@ -486,6 +487,7 @@ OTHER_VAR = "value"
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
                 http: None,
+                description: None,
             },
         ];
 
@@ -752,6 +754,7 @@ scopes = [
                 oauth_account: None,
                 scopes: vec![],
             }),
+            description: None,
         }];
 
         save_mcp_configs(&path, &configs).unwrap();
@@ -788,6 +791,7 @@ scopes = [
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
                 http: None,
+                description: None,
             },
             McpServerConfig {
                 name: "calendar-work".into(),
@@ -804,6 +808,7 @@ scopes = [
                     oauth_account: None,
                     scopes: vec![],
                 }),
+                description: None,
             },
         ];
 
@@ -970,6 +975,7 @@ command = "fileio-mcp"
             env: std::collections::HashMap::new(),
             env_secrets: std::collections::HashMap::new(),
             http: None,
+            description: None,
         }];
         save_mcp_configs(&path, &servers).unwrap();
 

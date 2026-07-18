@@ -71,7 +71,7 @@ async fn reindex_mcp(store: &PgToolRegistryStore, tools: Vec<ToolDefinition>) {
         .expect("unregister mcp source");
     let embeddings = vec![None; tools.len()];
     store
-        .register_tools(tools, "mcp", false, embeddings, None)
+        .register_tools(tools, "mcp", false, None, embeddings, None)
         .await
         .expect("register mcp tools");
 }
