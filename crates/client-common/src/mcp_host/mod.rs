@@ -14,5 +14,8 @@ pub mod config;
 pub mod host;
 
 pub use bridge::{ClientToolResultSink, dispatch_client_tool_call, merge_registrations};
-pub use config::{ClientMcpConfig, McpServerConfig, SurfaceConfig, default_client_mcp_path};
+pub use config::{
+    CLIENT_SURFACES, ClientMcpConfig, DEFAULT_SURFACE, McpServerConfig, SurfaceConfig,
+    default_client_mcp_path, is_client_surface,
+};
 pub use host::McpHost;

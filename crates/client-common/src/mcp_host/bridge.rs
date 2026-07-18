@@ -133,6 +133,7 @@ done
             env: HashMap::new(),
             env_secrets: HashMap::new(),
             http: None,
+            description: None,
         }
     }
 
