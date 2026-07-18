@@ -9,11 +9,15 @@ pub struct PgToolRegistryStore {
 }
 
 /// Weight applied to a matched provider row's fused score when boosting its
-/// member tools. `1.0` gives a provider match the pull of a full extra RRF hit
-/// (a rank-1 provider match contributes ~`1/61` to every member), enough to lift
-/// a member sitting just below the top-N cutoff into it without swamping a tool
-/// that matched the query strongly on its own. Named so it stays tunable.
-pub const PROVIDER_BOOST_WEIGHT: f64 = 1.0;
+/// member tools. A provider match contributes at most `0.5 x` a *maximal*
+/// (rank-1 in both branches) RRF hit to each member, so a provider match can
+/// lift a member several ranks - enough to pull one just below the top-N cutoff
+/// into it - but cannot, on its own, carry a weakly-matching member past a tool
+/// that matched the query maximally on its own. (At `1.0` a single provider
+/// match added a whole standalone hit and could leapfrog strong direct matches;
+/// see the `weak_member_..._does_not_outrank_strong_standalone` test.) Named so
+/// it stays tunable.
+pub const PROVIDER_BOOST_WEIGHT: f64 = 0.5;
 
 impl PgToolRegistryStore {
     pub fn new(pool: PgPool) -> Self {
@@ -41,21 +45,27 @@ impl PgToolRegistryStore {
         // full-text search only. The FTS fallback carries the SAME provider
         // boost + `provider:%` exclusion as the hybrid path.
         if query_embedding.is_empty() {
+            // Real tools and provider rows are scored in SEPARATE candidate sets
+            // (FIX 1): `real_ranked` excludes `provider:%` so synthetic rows never
+            // consume a real-tool result slot, while `matched_providers` still
+            // scores the provider rows so the boost works. The final
+            // `WHERE name NOT LIKE 'provider:%'` remains as guard #2.
             let rows: Vec<ToolSearchRow> = sqlx::query_as(
-                "WITH ranked AS (
+                "WITH real_ranked AS (
                     SELECT name, description, parameters, provider,
                            ts_rank_cd(tsv, query)::FLOAT8 AS score
                     FROM tool_definitions, plainto_tsquery('english', $1) query
-                    WHERE tsv @@ query
+                    WHERE tsv @@ query AND name NOT LIKE 'provider:%'
                 ),
                 matched_providers AS (
-                    SELECT provider, score AS provider_score
-                    FROM ranked WHERE name LIKE 'provider:%'
+                    SELECT provider, ts_rank_cd(tsv, query)::FLOAT8 AS provider_score
+                    FROM tool_definitions, plainto_tsquery('english', $1) query
+                    WHERE tsv @@ query AND name LIKE 'provider:%'
                 ),
                 boosted AS (
                     SELECT r.name, r.description, r.parameters,
                            (r.score + COALESCE(m.provider_score, 0) * $2)::FLOAT8 AS boosted_score
-                    FROM ranked r
+                    FROM real_ranked r
                     LEFT JOIN matched_providers m ON r.provider = m.provider
                 )
                 SELECT name, description, parameters, boosted_score AS rrf_score
@@ -76,25 +86,31 @@ impl PgToolRegistryStore {
         let fetch_limit = (limit * 2) as i64;
         let result_limit = limit as i64;
 
+        // Real tools and provider rows are ranked in SEPARATE candidate sets
+        // (FIX 1): the real-tool `vector_ranked` / `text_ranked` windows exclude
+        // `provider:%`, so synthetic rows never consume a real-tool slot and a
+        // plain query returns the full requested count of real tools. The
+        // provider rows are ranked among THEMSELVES (a small set) with the same
+        // RRF formula to compute a comparable `provider_score` for the boost.
         let rows: Vec<ToolSearchRow> = sqlx::query_as(
-            "WITH chunk_distances AS (
+            "WITH real_chunk_distances AS (
                 SELECT name, description, parameters, provider,
                        MIN(chunk <=> $1) AS min_distance
                 FROM tool_definitions, unnest(embedding) AS chunk
-                WHERE embedding IS NOT NULL
+                WHERE embedding IS NOT NULL AND name NOT LIKE 'provider:%'
                 GROUP BY name, description, parameters, provider
             ),
             vector_ranked AS (
                 SELECT name, description, parameters, provider,
                        ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
-                FROM chunk_distances
+                FROM real_chunk_distances
                 LIMIT $2
             ),
             text_ranked AS (
                 SELECT name, description, parameters, provider,
                        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
                 FROM tool_definitions, plainto_tsquery('english', $3) query
-                WHERE tsv @@ query
+                WHERE tsv @@ query AND name NOT LIKE 'provider:%'
                 ORDER BY ts_rank_cd(tsv, query) DESC
                 LIMIT $2
             ),
@@ -108,9 +124,29 @@ impl PgToolRegistryStore {
                 FROM vector_ranked v
                 FULL OUTER JOIN text_ranked t ON v.name = t.name
             ),
+            provider_vector AS (
+                SELECT name, provider, MIN(chunk <=> $1) AS min_distance
+                FROM tool_definitions, unnest(embedding) AS chunk
+                WHERE embedding IS NOT NULL AND name LIKE 'provider:%'
+                GROUP BY name, provider
+            ),
+            provider_vector_ranked AS (
+                SELECT name, provider,
+                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
+                FROM provider_vector
+            ),
+            provider_text_ranked AS (
+                SELECT name, provider,
+                       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
+                FROM tool_definitions, plainto_tsquery('english', $3) query
+                WHERE tsv @@ query AND name LIKE 'provider:%'
+            ),
             matched_providers AS (
-                SELECT provider, rrf_score AS provider_score
-                FROM fused WHERE name LIKE 'provider:%'
+                SELECT COALESCE(v.provider, t.provider) AS provider,
+                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
+                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS provider_score
+                FROM provider_vector_ranked v
+                FULL OUTER JOIN provider_text_ranked t ON v.name = t.name
             ),
             boosted AS (
                 SELECT f.name, f.description, f.parameters,
