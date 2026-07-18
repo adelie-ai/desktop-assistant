@@ -1,0 +1,37 @@
+# Namespace-agnostic base for the Adele daemon "brain": pgvector Postgres, an
+# in-cluster Ollama, the RLS-role bootstrap Job, and the daemon itself.
+#
+# Nothing here names an environment. No namespace, no real hostname, no real
+# registry, no credentials. An overlay supplies all of that (see
+# ../overlays/example) so the same base can render more than one instance -
+# e.g. a test and a production stack - into different namespaces.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - postgres.yaml
+  - ollama.yaml
+  - rls-bootstrap.yaml
+  - daemon.yaml
+
+# The daemon image is a placeholder. Every overlay MUST override it via its own
+# `images:` entry, pinning a real registry and an immutable tag.
+images:
+  - name: registry.example.com:5000/adele/adele-daemon
+    newTag: replace-me
+
+configMapGenerator:
+  # Seed daemon.toml. The daemon's init container copies this onto a *fresh*
+  # state volume only (non-clobbering) - see daemon.yaml. An overlay replaces it
+  # wholesale with `behavior: replace` and its own daemon.toml.
+  - name: adele-daemon-config
+    files:
+      - daemon.toml
+
+generatorOptions:
+  # Keep generated names stable (no content-hash suffix). The ConfigMap is only
+  # ever a seed for a fresh volume, so hash-rotating it would churn the daemon
+  # Deployment on every config edit without changing what the running pod uses.
+  # It also keeps the documented manual re-seed flow (README) addressable by a
+  # fixed name.
+  disableNameSuffixHash: true

@@ -1,7 +1,7 @@
 # Persistent state for the daemon. A single PVC is mounted at /state and the
-# XDG config/data homes are pointed under it, so everything the daemon persists —
+# XDG config/data homes are pointed under it, so everything the daemon persists -
 # daemon.toml, mcp_servers.toml, service accounts (XDG_CONFIG_HOME) and the
-# per-connection secret files + system-id (XDG_DATA_HOME) — lives on the volume
+# per-connection secret files + system-id (XDG_DATA_HOME) - lives on the volume
 # and survives pod restarts and rollouts. Mounting one dir (not deep XDG
 # subpaths) keeps every write a child of a dir the daemon uid owns: kubelet
 # creates a mount's parents as root, which would otherwise block the daemon
@@ -10,7 +10,6 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: adele-daemon-state
-  namespace: adele-test
 spec:
   accessModes: ["ReadWriteOnce"]
   # local-path (node-local), not nfs-ssd: an init container chowns the volume to
@@ -26,7 +25,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: adele-daemon
-  namespace: adele-test
 spec:
   replicas: 1
   strategy:
@@ -46,7 +44,7 @@ spec:
         # Ollama timeouts/purposes/personality are correct out of the box. The
         # copy is non-clobbering: once the volume holds a daemon.toml, runtime
         # edits made through the settings API win and persist (edit the ConfigMap
-        # AND re-seed — see README — to change the baseline afterwards). Runs as
+        # AND re-seed - see README - to change the baseline afterwards). Runs as
         # root to chown the hostPath-backed local-path volume to the daemon uid;
         # kubelet does not apply fsGroup to hostPath volumes.
         - name: init-state
@@ -146,7 +144,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: adele-daemon
-  namespace: adele-test
 spec:
   selector:
     app: adele-daemon

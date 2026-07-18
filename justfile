@@ -152,46 +152,59 @@ premerge:
     git rebase origin/main
     just check
 
-# --- Prove-the-split k8s deploy (deploy/k8s/) --------------------------------
-# The reference deployment is applied with plain `kubectl apply -f`. The one
-# step that can't be a static manifest is provisioning the privileged
+# --- k8s deploy (deploy/k8s/) ------------------------------------------------
+# The deployment is a kustomize base (deploy/k8s/base) plus a per-environment
+# overlay that supplies the namespace, image tag, and seed daemon.toml. This
+# repo is public, so it ships only deploy/k8s/overlays/example; real overlays
+# live outside the repo and point at the base by relative path (see
+# deploy/k8s/README.md).
+#
+# The one step that can't be a static manifest is provisioning the privileged
 # `adele_query` RLS role (#500): it must run the canonical
 # crates/storage/bootstrap/rls_role.sql WITHOUT hand-copying the SQL into a
 # manifest (which would rot). `deploy-rls-bootstrap` generates the ConfigMap
 # from that file at deploy time, so the running SQL is always byte-for-byte the
-# source. `check-deploy` validates every manifest offline (never contacts the
-# cluster).
+# source. `check-deploy` validates the rendered manifests offline (never
+# contacts the cluster).
 
-# Provision the RLS `adele_query` role (#500) in the adele-test namespace.
+# Which environment the deploy recipes target. Defaults are the in-repo example;
+# point them at your private overlay, e.g.
+#   ADELE_K8S_NAMESPACE=my-ns ADELE_K8S_OVERLAY=../my-overlays/prod just deploy-rls-bootstrap
+k8s_namespace := env_var_or_default("ADELE_K8S_NAMESPACE", "adele-example")
+k8s_overlay := env_var_or_default("ADELE_K8S_OVERLAY", "deploy/k8s/overlays/example")
+
+# Provision the RLS `adele_query` role (#500) in the target namespace.
 # Generates the rls-bootstrap-sql ConfigMap from the canonical rls_role.sql
 # (single source of truth), then runs the postgres-gated Job that applies it as
 # the app role `adele`. Idempotent: the SQL swallows a duplicate role and its
 # grants self-heal, and any prior Job is cleared first (a Job's pod template is
-# immutable, so a bare re-apply would error). Run after `10-postgres.yaml`.
+# immutable, so a bare re-apply would error). Run after Postgres is up.
 deploy-rls-bootstrap:
     kubectl create configmap rls-bootstrap-sql \
-        --namespace adele-test \
+        --namespace {{k8s_namespace}} \
         --from-file=rls_role.sql=crates/storage/bootstrap/rls_role.sql \
         --dry-run=client -o yaml | kubectl apply -f -
-    kubectl delete job rls-bootstrap --namespace adele-test --ignore-not-found
-    kubectl apply -f deploy/k8s/15-rls-bootstrap.yaml
-    kubectl wait --namespace adele-test --for=condition=complete --timeout=120s job/rls-bootstrap
+    kubectl delete job rls-bootstrap --namespace {{k8s_namespace}} --ignore-not-found
+    kubectl apply --namespace {{k8s_namespace}} -f deploy/k8s/base/rls-bootstrap.yaml
+    kubectl wait --namespace {{k8s_namespace}} --for=condition=complete --timeout=120s job/rls-bootstrap
 
-# Validate the deploy manifests without touching a live cluster: client-side
-# schema validation of every manifest under deploy/k8s/, a dry-run of the
-# generated rls-bootstrap-sql ConfigMap (proves the canonical SQL path resolves
-# and the generation pipeline is well-formed), and the #500 RLS-bootstrap
-# shape/anti-drift assertions. Safe in CI; never contacts the API server.
+# Validate the deploy manifests without touching a live cluster: the base and
+# the example overlay must both render, the rendered output is schema-validated
+# client-side, a dry-run of the generated rls-bootstrap-sql ConfigMap proves the
+# canonical SQL path resolves, and the #500 RLS-bootstrap shape/anti-drift
+# assertions run. Safe in CI; never contacts the API server.
 check-deploy:
     #!/usr/bin/env bash
     set -euo pipefail
-    for f in deploy/k8s/*.yaml; do
-      echo "dry-run validate: $f"
-      kubectl apply --dry-run=client -f "$f" >/dev/null
+    for target in deploy/k8s/base deploy/k8s/overlays/example; do
+      echo "kustomize render + dry-run validate: $target"
+      kubectl kustomize "$target" | kubectl apply --dry-run=client -f - >/dev/null
     done
+    echo "dry-run validate: standalone manifests"
+    kubectl apply --dry-run=client -f deploy/k8s/secret.example.yaml >/dev/null
     echo "dry-run validate: generated rls-bootstrap-sql ConfigMap"
     kubectl create configmap rls-bootstrap-sql \
-        --namespace adele-test \
+        --namespace {{k8s_namespace}} \
         --from-file=rls_role.sql=crates/storage/bootstrap/rls_role.sql \
         --dry-run=client -o yaml | kubectl apply --dry-run=client -f - >/dev/null
     ./deploy/k8s/check-rls-bootstrap.sh

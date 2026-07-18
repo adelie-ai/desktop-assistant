@@ -1,0 +1,48 @@
+# Example overlay - the shape a real environment takes, with placeholder values.
+#
+# Copy this directory to render an instance (test, production, ...). Everything
+# environment-specific lives HERE, never in ../../base:
+#
+#   * the namespace (and the Namespace object itself)
+#   * the daemon image registry + immutable tag
+#   * the seed daemon.toml (connections, purposes, models)
+#
+# This repo is PUBLIC. Real overlays - with real namespaces, registries, image
+# tags, hostnames, and model choices - MUST NOT be committed here. Keep them in
+# a private location and point `resources:` at this repo's base by relative
+# path. See ../../README.md ("Private overlays").
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Applies to every resource pulled from the base, so the base itself stays
+# namespace-free.
+namespace: adele-example
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+# Pin the image your cluster actually pulls. Prefer an immutable tag (a digest
+# or a content-addressed tag) over a moving one so a rollout is reproducible;
+# the base sets imagePullPolicy: Always for the mutable-tag case.
+images:
+  - name: registry.example.com:5000/adele/adele-daemon
+    newName: registry.example.com:5000/adele/adele-daemon
+    newTag: replace-me
+
+configMapGenerator:
+  # Replace the base's seed daemon.toml wholesale. `behavior: replace` targets
+  # the generator of the same name in the base - the overlay's file is the only
+  # one that ends up in the rendered ConfigMap.
+  #
+  # Remember this is only a SEED: the daemon's init container copies it onto a
+  # *fresh* state volume and never clobbers an existing one. Changing it does
+  # not reconfigure a running instance - see ../../README.md ("Changing the
+  # baseline config").
+  - name: adele-daemon-config
+    behavior: replace
+    files:
+      - daemon.toml
+
+generatorOptions:
+  disableNameSuffixHash: true

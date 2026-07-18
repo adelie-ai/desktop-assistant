@@ -1,0 +1,101 @@
+# Example seed daemon.toml for one environment.
+#
+# Structural blocks ([connections], [purposes], [personality], [ws_auth]) are
+# file-only (no env override), so they must ship via this ConfigMap. Transport /
+# DB / secret / login knobs come from env in the daemon Deployment.
+#
+# This shows the common production shape: a cloud connection for the expensive
+# reasoning purposes, and the in-cluster Ollama for cheap local embeddings, so
+# nothing leaves the cluster to turn text into vectors.
+#
+# PLACEHOLDER model and region names. Substitute your own in a private overlay.
+
+[llm]
+connector = "ollama"
+model = "llama3.2:1b"
+base_url = "http://ollama:11434"
+
+# In-cluster Ollama (../../base/ollama.yaml). Slow CPU nodes: tolerate long
+# first-response + inter-chunk gaps, keep the model resident, clamp context.
+[connections.default]
+type = "ollama"
+base_url = "http://ollama:11434"
+connect_timeout_secs = 600
+stream_timeout_secs = 300
+keep_warm = true
+max_context_tokens = 4096
+
+# A cloud connection for the reasoning purposes. The credential is NOT in this
+# file and NOT in a k8s Secret: the daemon keeps per-connection secrets in its
+# own store under XDG_DATA_HOME on the state PVC. Set it once per environment
+# from a client (SetConnectionSecret) - see ../../README.md ("Connection
+# secrets"). `backend = "auto"` resolves to a file-backed store in a pod, where
+# no desktop keyring exists.
+[connections.cloud]
+type = "bedrock"
+region = "us-east-1"
+
+[connections.cloud.secret]
+backend = "auto"
+service = "org.desktopAssistant"
+account = "connection_cloud"
+
+[embeddings]
+
+[database]
+max_connections = 5
+
+[backend_tasks]
+# Background LLM work. Enable dreaming/consolidation on a long-lived instance;
+# leave it off where surprise background inference would muddy a test.
+dreaming_enabled = false
+dreaming_interval_secs = 3600
+archive_after_days = 7
+embedding_backfill_interval_secs = 300
+consolidation_interval_secs = 86400
+
+[purposes.interactive]
+connection = "cloud"
+model = "replace-me"
+
+[purposes.dreaming]
+connection = "cloud"
+model = "replace-me"
+
+[purposes.consolidation]
+connection = "cloud"
+model = "replace-me"
+
+[purposes.titling]
+connection = "cloud"
+model = "replace-me"
+
+[purposes.voice]
+connection = "cloud"
+model = "replace-me"
+
+# Embeddings stay local on the in-cluster Ollama. Pull the model once the pod is
+# up: kubectl -n <namespace> exec deploy/ollama -- ollama pull nomic-embed-text
+[purposes.embedding]
+connection = "default"
+model = "nomic-embed-text"
+
+[profiling]
+enabled = false
+full_content = false
+
+[ws_auth]
+methods = ["password"]
+allowed_origins = []
+
+[tls]
+enabled = false
+
+[personality]
+professionalism = "always"
+warmth = "often"
+directness = "often"
+enthusiasm = "sometimes"
+humor = "sometimes"
+sarcasm = "rarely"
+pretentiousness = "rarely"
