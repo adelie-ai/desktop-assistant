@@ -92,11 +92,22 @@ pub struct ReindexProvider {
 }
 
 impl ReindexProvider {
-    /// The synthetic, searchable `provider:<name>` row for this provider: the
-    /// description followed by the member tool names, so a tool-search query that
-    /// hits the description or any member name matches the provider and boosts
-    /// its members. Non-routable (registered `is_core = FALSE`, excluded from
-    /// search results, and never dispatched — see the guards in `crates/storage`).
+    /// The **source-qualified** provider identity, `<source>:<name>` (e.g.
+    /// `mcp:weather`, `builtin:database`). This is the value written to the
+    /// `provider` column and embedded in the synthetic row name, so an MCP server
+    /// and a builtin group that happen to share a bare name (e.g. `database`)
+    /// never collide on one PK row or cross-boost each other's members.
+    pub fn qualified_provider(&self) -> String {
+        format!("{}:{}", self.source, self.name)
+    }
+
+    /// The synthetic, searchable `provider:<source>:<name>` row for this provider:
+    /// the description followed by the member tool names, so a tool-search query
+    /// that hits the description or any member name matches the provider and
+    /// boosts its members. Non-routable (registered `is_core = FALSE`, excluded
+    /// from search results, and never dispatched — see the guards in
+    /// `crates/storage`). Its name matches on the boost via the shared
+    /// [`Self::qualified_provider`] value in the `provider` column.
     pub fn synthetic_row(&self) -> ToolDefinition {
         let members = self
             .tools
@@ -105,7 +116,7 @@ impl ReindexProvider {
             .collect::<Vec<_>>()
             .join(", ");
         ToolDefinition::new(
-            format!("provider:{}", self.name),
+            format!("provider:{}", self.qualified_provider()),
             format!("{} Tools: {members}.", self.description),
             serde_json::json!({}),
         )
@@ -202,8 +213,8 @@ mod tests {
         };
         let row = provider.synthetic_row();
         assert_eq!(
-            row.name, "provider:weather",
-            "synthetic name is provider:<name>"
+            row.name, "provider:mcp:weather",
+            "synthetic name is provider:<source>:<name>"
         );
         assert_eq!(
             row.description,
@@ -214,6 +225,42 @@ mod tests {
             row.parameters,
             serde_json::json!({}),
             "no callable parameters"
+        );
+    }
+
+    #[test]
+    fn synthetic_row_source_qualifies_provider_identity() {
+        // An MCP server and a builtin group that share a bare name must not
+        // collide on one PK row: the provider identity carries the source, so the
+        // provider column value and synthetic row name are distinct per source.
+        let mcp = ReindexProvider {
+            name: "database".to_string(),
+            source: "mcp",
+            description: "External DB.".to_string(),
+            tools: vec![ToolDefinition::new(
+                "database__query",
+                "d",
+                serde_json::json!({}),
+            )],
+        };
+        let builtin = ReindexProvider {
+            name: "database".to_string(),
+            source: "builtin",
+            description: "Adele's DB.".to_string(),
+            tools: vec![ToolDefinition::new(
+                "builtin_db_query",
+                "d",
+                serde_json::json!({}),
+            )],
+        };
+        assert_eq!(mcp.qualified_provider(), "mcp:database");
+        assert_eq!(builtin.qualified_provider(), "builtin:database");
+        assert_eq!(mcp.synthetic_row().name, "provider:mcp:database");
+        assert_eq!(builtin.synthetic_row().name, "provider:builtin:database");
+        assert_ne!(
+            mcp.synthetic_row().name,
+            builtin.synthetic_row().name,
+            "same bare name under different sources must yield distinct provider rows"
         );
     }
 

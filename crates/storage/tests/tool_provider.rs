@@ -706,6 +706,121 @@ fn pos_in(names: &[String], name: &str) -> usize {
 }
 
 #[tokio::test]
+async fn source_qualified_providers_do_not_cross_boost() {
+    // FIX 3 (keyspace collision): an MCP server "database" and a builtin group
+    // "database" carry DISTINCT source-qualified provider identities
+    // (mcp:database vs builtin:database). A match on the mcp provider row must
+    // boost only the mcp member, never the builtin member, and an mcp source
+    // sweep must leave the builtin rows untouched.
+    let Some(fx) = fixture("provider_collision").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set; source_qualified_providers_do_not_cross_boost");
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    // Builtin member: CLOSER embedding (vector rank 1) -> raw-ranks ABOVE the mcp
+    // member. Its provider (builtin:database) has no matching provider row.
+    store
+        .register_tools(
+            vec![tool("builtin_db_query", "alpha")],
+            "builtin",
+            true,
+            Some("builtin:database"),
+            vec![embed(1.0, 0.0)],
+            None,
+        )
+        .await
+        .expect("register builtin member");
+    // MCP member: farther embedding (vector rank 2) -> raw-ranks BELOW the builtin
+    // member. Its provider (mcp:database) DOES have a matching provider row.
+    store
+        .register_tools(
+            vec![tool("database__query", "alpha")],
+            "mcp",
+            false,
+            Some("mcp:database"),
+            vec![embed(1.0, 0.1)],
+            None,
+        )
+        .await
+        .expect("register mcp member");
+    // The mcp provider row matches the query token "widget"; the builtin group has
+    // no such row. Only mcp:database should be boosted.
+    store
+        .register_tools(
+            vec![ToolDefinition::new(
+                "provider:mcp:database",
+                "widget database service tools",
+                serde_json::json!({}),
+            )],
+            "mcp",
+            false,
+            Some("mcp:database"),
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register mcp provider row");
+
+    // Query text hits only the provider row; members are pulled in by the vector
+    // branch. The boost must lift the mcp member above the builtin member DESPITE
+    // the builtin member's raw (vector) advantage — proving (a) the boost applies
+    // and (b) it does NOT cross-boost the builtin member.
+    let order: Vec<String> = store
+        .search_tools("widget", vec![1.0, 0.0], 10)
+        .await
+        .expect("search")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        !order.iter().any(|n| n.starts_with("provider:")),
+        "no provider row may be returned; got {order:?}"
+    );
+    assert!(
+        order.contains(&"database__query".to_string())
+            && order.contains(&"builtin_db_query".to_string()),
+        "both members must be present; got {order:?}"
+    );
+    assert!(
+        pos_in(&order, "database__query") < pos_in(&order, "builtin_db_query"),
+        "only the mcp member's provider matched, so it must outrank the builtin \
+         member despite the builtin member's raw advantage (no cross-boost); got {order:?}"
+    );
+
+    // Source sweep isolation: unregistering "mcp" removes the mcp member AND the
+    // mcp provider row, but the builtin member (a distinct qualified identity)
+    // survives — the collision defect would have deleted a shared row.
+    store.unregister_source("mcp").await.expect("sweep mcp");
+    assert!(
+        store
+            .tool_definition("database__query")
+            .await
+            .expect("lookup mcp member")
+            .is_none(),
+        "the mcp member is swept"
+    );
+    assert!(
+        store
+            .tool_definition("provider:mcp:database")
+            .await
+            .expect("lookup mcp provider row")
+            .is_none(),
+        "the mcp provider row is swept"
+    );
+    assert!(
+        store
+            .tool_definition("builtin_db_query")
+            .await
+            .expect("lookup builtin member")
+            .is_some(),
+        "the builtin member (builtin:database) must survive an mcp source sweep"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn search_provider_rows_do_not_crowd_out_real_tools() {
     // Recall guard (FIX 1): synthetic provider rows must NOT consume slots in the
     // candidate window at the expense of real tools. With 15 real tools that
@@ -713,7 +828,9 @@ async fn search_provider_rows_do_not_crowd_out_real_tools() {
     // must still return 10 REAL tools — not fewer because provider rows filled the
     // limit*2 candidate window and pushed real tools out before the final filter.
     let Some(fx) = fixture("provider_recall").await else {
-        eprintln!("skip: TEST_DATABASE_URL not set; search_provider_rows_do_not_crowd_out_real_tools");
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; search_provider_rows_do_not_crowd_out_real_tools"
+        );
         return;
     };
     let store = PgToolRegistryStore::new(fx.pool.clone());
@@ -737,7 +854,10 @@ async fn search_provider_rows_do_not_crowd_out_real_tools() {
         .iter()
         .filter(|t| !t.name.starts_with("provider:"))
         .count();
-    assert_eq!(baseline_real, 10, "baseline must return the full 10 real tools");
+    assert_eq!(
+        baseline_real, 10,
+        "baseline must return the full 10 real tools"
+    );
 
     // 12 provider rows that match the query far more strongly than the real tools.
     for k in 0..12 {
@@ -840,7 +960,10 @@ async fn weak_member_of_matched_provider_does_not_outrank_strong_standalone() {
     // Provider row for pp: matches the query strongly on BOTH branches.
     store
         .register_tools(
-            vec![provider_row("pp", "gizmo gizmo gizmo gizmo doohickey service")],
+            vec![provider_row(
+                "pp",
+                "gizmo gizmo gizmo gizmo doohickey service",
+            )],
             "mcp",
             false,
             Some("pp"),

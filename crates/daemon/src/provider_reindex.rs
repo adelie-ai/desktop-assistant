@@ -37,13 +37,14 @@ pub(crate) fn build_mcp_batches(providers: Vec<ReindexProvider>) -> Vec<Register
         .into_iter()
         .map(|p| {
             let synthetic = p.synthetic_row();
+            let provider = p.qualified_provider();
             let mut tools = p.tools;
             tools.push(synthetic);
             RegisterBatch {
                 tools,
                 source: p.source,
                 is_core: false,
-                provider: p.name,
+                provider,
             }
         })
         .collect()
@@ -78,18 +79,19 @@ pub(crate) fn build_builtin_batches(defs: Vec<ToolDefinition>) -> Vec<RegisterBa
             tools: members,
         };
         let synthetic = group.synthetic_row();
+        let qualified = group.qualified_provider();
         // Members are core; the synthetic provider row is non-core.
         batches.push(RegisterBatch {
             tools: group.tools,
             source: "builtin",
             is_core: true,
-            provider: provider.to_string(),
+            provider: qualified.clone(),
         });
         batches.push(RegisterBatch {
             tools: vec![synthetic],
             source: "builtin",
             is_core: false,
-            provider: provider.to_string(),
+            provider: qualified,
         });
     }
     batches
@@ -172,8 +174,8 @@ mod tests {
 
         let weather = batches
             .iter()
-            .find(|b| b.provider == "weather")
-            .expect("weather batch");
+            .find(|b| b.provider == "mcp:weather")
+            .expect("weather batch (source-qualified provider)");
         assert_eq!(
             weather.tools.len(),
             3,
@@ -190,14 +192,15 @@ mod tests {
 
         // Every batch is under the builtin source; every member is classified
         // (no batch lands in the generic fallback group for the default set).
-        let expected_groups: Vec<&str> = BuiltinToolService::PROVIDER_GROUPS
+        // Provider identities are source-qualified (`builtin:<group>`).
+        let expected_groups: Vec<String> = BuiltinToolService::PROVIDER_GROUPS
             .iter()
-            .map(|(id, _)| *id)
+            .map(|(id, _)| format!("builtin:{id}"))
             .collect();
         for b in &batches {
             assert_eq!(b.source, "builtin");
             assert!(
-                expected_groups.contains(&b.provider.as_str()),
+                expected_groups.contains(&b.provider),
                 "unexpected builtin group '{}' (fell back?)",
                 b.provider
             );
@@ -221,17 +224,72 @@ mod tests {
         }
 
         // One synthetic provider row per group present, and every default group
-        // (knowledge/scratchpad/database/recall/system/tool-meta) is represented.
-        let synthetic_providers: std::collections::BTreeSet<&str> = batches
+        // (knowledge/scratchpad/database/recall/system/tool-meta) is represented,
+        // each source-qualified as builtin:<group>.
+        let synthetic_providers: std::collections::BTreeSet<String> = batches
             .iter()
             .flat_map(|b| b.tools.iter())
             .filter(|t| t.name.starts_with("provider:"))
-            .map(|t| t.name.strip_prefix("provider:").unwrap())
+            .map(|t| t.name.strip_prefix("provider:").unwrap().to_string())
             .collect();
         assert_eq!(
             synthetic_providers,
             expected_groups.into_iter().collect(),
             "every builtin group must get exactly one synthetic provider row"
         );
+    }
+
+    #[test]
+    fn mcp_and_builtin_same_bare_name_get_distinct_providers() {
+        // FIX 3 (keyspace collision): an MCP server literally named "database"
+        // must not collide with the builtin "database" group. Their provider
+        // identities and synthetic row names must be source-qualified and distinct.
+        let mcp = build_mcp_batches(vec![ReindexProvider {
+            name: "database".into(),
+            source: "mcp",
+            description: "External DB server.".into(),
+            tools: vec![td("database__query")],
+        }]);
+        let builtin = build_builtin_batches(vec![ToolDefinition::new(
+            "builtin_db_query",
+            "Run SQL",
+            serde_json::json!({}),
+        )]);
+
+        let synthetic = |batches: &[RegisterBatch]| -> Vec<String> {
+            batches
+                .iter()
+                .flat_map(|b| b.tools.iter())
+                .filter(|t| t.name.starts_with("provider:"))
+                .map(|t| t.name.clone())
+                .collect()
+        };
+        let mcp_rows = synthetic(&mcp);
+        let builtin_rows = synthetic(&builtin);
+
+        assert!(
+            mcp_rows.contains(&"provider:mcp:database".to_string()),
+            "mcp server 'database' -> provider:mcp:database; got {mcp_rows:?}"
+        );
+        assert!(
+            builtin_rows.contains(&"provider:builtin:database".to_string()),
+            "builtin group 'database' -> provider:builtin:database; got {builtin_rows:?}"
+        );
+        // The provider *column* values are distinct too, so the boost join never
+        // cross-matches an mcp member to a builtin provider row or vice versa.
+        assert_eq!(mcp[0].provider, "mcp:database");
+        for b in &builtin {
+            assert_ne!(
+                b.provider, "mcp:database",
+                "no builtin batch may share the mcp provider identity"
+            );
+        }
+        // No synthetic row name is shared between the two sources.
+        for r in &mcp_rows {
+            assert!(
+                !builtin_rows.contains(r),
+                "row '{r}' must not appear under both sources"
+            );
+        }
     }
 }
