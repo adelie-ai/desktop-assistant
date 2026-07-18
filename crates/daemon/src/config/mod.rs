@@ -1515,7 +1515,10 @@ uds_socket = "/tmp/adelie.sock"
         // The written file parses back cleanly as a valid config (the daemon can
         // load what it just bootstrapped, and settings writes will round-trip).
         let loaded = load_daemon_config(&path).unwrap();
-        assert!(loaded.is_some(), "the written default must load back as valid config");
+        assert!(
+            loaded.is_some(),
+            "the written default must load back as valid config"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
