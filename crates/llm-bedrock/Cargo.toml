@@ -8,8 +8,20 @@ license = "AGPL-3.0-or-later"
 async-trait.workspace = true
 aws-config = "1"
 aws-credential-types = "1"
-aws-sdk-bedrock = "1"
-aws-sdk-bedrockruntime = "1"
+# The SDK default feature set enables BOTH `rustls` and `default-https-client`.
+# They select different TLS backends: `rustls` is a legacy alias resolving to
+# rustls 0.21 (and rustls-webpki 0.101, which carries RUSTSEC-2026-0098/0099/0104),
+# while `default-https-client` selects the maintained rustls 0.23 stack that the
+# client actually uses. Opting out of the default set drops the vulnerable
+# duplicate without changing which backend serves requests (#523).
+aws-sdk-bedrock = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-smithy-types = "1"
 desktop-assistant-core.workspace = true
 desktop-assistant-llm-http.workspace = true
