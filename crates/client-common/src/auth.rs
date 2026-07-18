@@ -36,15 +36,18 @@ pub fn derive_login_url_from_ws_url(ws_url: &str) -> Result<String> {
 /// that follows it fails (#521). `from_pem_bundle` rather than `from_pem`
 /// because the latter stops after the first certificate in a concatenated file.
 fn load_login_root_certs(tls_ca_cert: Option<&Path>) -> Result<Vec<reqwest::tls::Certificate>> {
-    let Some(pem_bytes) = crate::config::read_optional_ca_pem(tls_ca_cert)? else {
+    let Some(ca_path) = tls_ca_cert else {
         return Ok(Vec::new());
     };
-    let certs = reqwest::tls::Certificate::from_pem_bundle(&pem_bytes)?;
+    let Some(pem_bytes) = crate::config::read_optional_ca_pem(Some(ca_path))? else {
+        return Ok(Vec::new());
+    };
+    let certs = reqwest::tls::Certificate::from_pem_bundle(&pem_bytes)
+        .map_err(|e| anyhow::anyhow!("parsing CA cert {}: {e}", ca_path.display()))?;
     if certs.is_empty() {
-        let path = tls_ca_cert.map(Path::display);
         return Err(anyhow::anyhow!(
             "CA cert {} contains no certificates",
-            path.expect("a bundle was read, so a path was configured")
+            ca_path.display()
         ));
     }
     Ok(certs)

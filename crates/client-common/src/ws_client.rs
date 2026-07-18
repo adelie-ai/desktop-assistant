@@ -376,21 +376,21 @@ impl AssistantCommands for WsClient {
 /// `add_root_certificate` has always layered onto the built-in roots — the two
 /// halves of the connect flow previously disagreed.
 ///
-/// A `ca_cert_path` that does not exist is a warning, not an error: clients
-/// populate the default path unconditionally, so a machine that has never run a
-/// local daemon has no file there and still needs to reach public endpoints. A
-/// file that exists but yields no certificate *is* an error — the operator
-/// pointed at it deliberately, and silently ignoring it would downgrade trust
-/// without saying so.
+/// A `ca_cert_path` that does not exist is logged and skipped, not an error:
+/// clients populate the default path unconditionally, so a machine that has
+/// never run a local daemon has no file there and still needs to reach public
+/// endpoints. A file that exists but yields no certificate *is* an error — the
+/// operator pointed at it deliberately, and silently ignoring it would downgrade
+/// trust without saying so.
 pub(crate) fn build_root_store(ca_cert_path: Option<&Path>) -> Result<rustls::RootCertStore> {
     let mut root_store = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
 
-    let (Some(ca_path), Some(pem_bytes)) = (
-        ca_cert_path,
-        crate::config::read_optional_ca_pem(ca_cert_path)?,
-    ) else {
+    let Some(ca_path) = ca_cert_path else {
+        return Ok(root_store);
+    };
+    let Some(pem_bytes) = crate::config::read_optional_ca_pem(Some(ca_path))? else {
         return Ok(root_store);
     };
 
