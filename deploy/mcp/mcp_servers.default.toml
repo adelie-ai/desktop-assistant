@@ -16,42 +16,49 @@
 
 [[servers]]
 name = "weather-forecast"
+description = "Live weather conditions and multi-day forecasts for any location."
 command = "/opt/adele/mcp/weather-forecast-mcp"
 args = ["serve"]
 enabled = true
 
 [[servers]]
 name = "geocode"
+description = "Convert between place names or addresses and geographic coordinates."
 command = "/opt/adele/mcp/geocode-mcp"
 args = ["serve"]
 enabled = true
 
 [[servers]]
 name = "openstreetmap"
+description = "Look up places, addresses, routes, and points of interest from OpenStreetMap."
 command = "/opt/adele/mcp/openstreetmap-mcp"
 args = ["serve"]
 enabled = true
 
 [[servers]]
 name = "cve"
+description = "Look up CVE vulnerability details and scan package lists for known advisories."
 command = "/opt/adele/mcp/cve-mcp"
 args = ["serve"]
 enabled = true
 
 [[servers]]
 name = "tasks"
+description = "Create, organize, and track to-do tasks and projects."
 command = "/opt/adele/mcp/tasks-mcp"
 args = ["serve"]
 enabled = true
 
 [[servers]]
 name = "timeclock"
+description = "Track work time: clock in and out, log hours, and report on time entries."
 command = "/opt/adele/mcp/timeclock-mcp"
 args = ["serve"]
 enabled = true
 
 [[servers]]
 name = "skills"
+description = "Discover and read reusable skill playbooks for how to perform specific tasks."
 command = "/opt/adele/mcp/skills-mcp"
 args = ["serve"]
 enabled = true
@@ -62,6 +69,7 @@ enabled = true
 # run shell commands on.
 [[servers]]
 name = "terminal"
+description = "Run arbitrary shell commands on the host (powerful and dangerous)."
 command = "/opt/adele/mcp/terminal-mcp"
 args = ["serve"]
 enabled = false
@@ -71,6 +79,7 @@ enabled = false
 # and set e.g. args = ["serve", "--config", "/opt/adele/command-mcp.toml"].
 [[servers]]
 name = "command"
+description = "Run a curated allowlist of preconfigured commands."
 command = "/opt/adele/mcp/command-mcp"
 args = ["serve"]
 enabled = false
@@ -79,6 +88,7 @@ enabled = false
 # PathGuard deny-defaults still apply).
 [[servers]]
 name = "fileio"
+description = "Read, write, move, and remove files on the local filesystem."
 command = "/opt/adele/mcp/fileio-mcp"
 args = ["serve"]
 enabled = false
@@ -88,6 +98,7 @@ enabled = false
 # Prefer env_secrets for the token (seed a secret, then reference it here).
 [[servers]]
 name = "homeassistant"
+description = "Read and control Home Assistant devices, entities, scenes, and automations."
 command = "/opt/adele/mcp/homeassistant-mcp"
 args = ["serve"]
 enabled = false
@@ -101,6 +112,7 @@ enabled = false
 # guard (WEB_ALLOW_PRIVATE_HOSTS=false) stays on by default.
 [[servers]]
 name = "web"
+description = "Browse and scrape web pages, following links and extracting page content."
 command = "/opt/adele/mcp/web-mcp"
 args = ["serve", "--chrome-arg=--no-sandbox", "--chrome-arg=--disable-dev-shm-usage"]
 enabled = true
@@ -109,6 +121,7 @@ enabled = true
 # the container. On a headless brain image it starts but cannot play.
 [[servers]]
 name = "internet-radio"
+description = "Search internet radio stations and play them."
 command = "/opt/adele/mcp/internet-radio-mcp"
 args = ["serve"]
 enabled = false
