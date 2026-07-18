@@ -48,6 +48,10 @@ desktop-assistant-uds = { path = "../uds-interface" }
 desktop-assistant-application = { path = "../application" }
 desktop-assistant-core.workspace = true
 desktop-assistant-auth-jwt.workspace = true
+# Mint throwaway CA certificates so the trust-store tests assert against real
+# DER, not hand-pasted fixtures. Already in the tree — `daemon` uses it to
+# generate the local CA these tests stand in for.
+rcgen = "0.14"
 tempfile = "3"
 tokio = { workspace = true, features = [
     "macros",
