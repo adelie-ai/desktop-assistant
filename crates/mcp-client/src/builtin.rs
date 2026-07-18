@@ -240,7 +240,7 @@ impl BuiltinToolService {
                         "tags": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Tags for categorization (e.g. 'preference', 'memory', 'instruction', 'project:myapp')"
+                            "description": "Two-level tags. Give a coarse KIND ('preference', 'memory', or 'instruction') PLUS at least one SPECIFIC facet: 'project:<name>', 'tool:<name>', 'topic:<subject>', or 'person:<name>'. Prefer specific over generic. Good: ['instruction', 'project:adelie-ai', 'topic:deploy']. Too generic: ['instruction']."
                         },
                         "id": {
                             "type": "string",
@@ -253,7 +253,11 @@ impl BuiltinToolService {
                                 "type": "object",
                                 "properties": {
                                     "content": {"type": "string"},
-                                    "tags": {"type": "array", "items": {"type": "string"}},
+                                    "tags": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Two-level tags: a coarse KIND ('preference'/'memory'/'instruction') PLUS at least one SPECIFIC facet ('project:<name>', 'tool:<name>', 'topic:<subject>', 'person:<name>'). Prefer specific over generic."
+                                    },
                                     "id": {"type": "string"}
                                 }
                             }
@@ -1650,6 +1654,41 @@ mod tests {
         assert!(names.contains(&TOOL_SCRATCHPAD_WRITE.to_string()));
         assert!(names.contains(&TOOL_SCRATCHPAD_SEARCH.to_string()));
         assert!(names.contains(&TOOL_SCRATCHPAD_DELETE.to_string()));
+    }
+
+    #[test]
+    fn kb_write_tags_description_urges_specific_facets() {
+        // Generic tags ("instruction", "memory") make KB entries fragment and
+        // over-surface. Both the single-write and the batch `tags` schema
+        // descriptions must push the two-level rule (a specific facet, not just
+        // a bare kind) so the in-schema hint matches the system-prompt guidance.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+        let props = &def.parameters["properties"];
+
+        let single = props["tags"]["description"]
+            .as_str()
+            .expect("single-write tags has a description");
+        assert!(
+            single.to_lowercase().contains("specific"),
+            "single-write tags description must urge a specific facet: {single}"
+        );
+        assert!(
+            single.contains("topic:") && single.contains("tool:"),
+            "single-write tags description must list facet examples: {single}"
+        );
+
+        let batch = props["entries"]["items"]["properties"]["tags"]["description"]
+            .as_str()
+            .expect("batch tags must carry a description too");
+        assert!(
+            batch.to_lowercase().contains("specific"),
+            "batch tags description must urge a specific facet: {batch}"
+        );
     }
 
     // --- Scratchpad tools (#184) ---

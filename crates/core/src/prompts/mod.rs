@@ -265,6 +265,27 @@ mod tests {
     }
 
     #[test]
+    fn assembled_prompt_urges_specific_facet_tags() {
+        // Generic-only tags (just "instruction"/"memory") fragment and
+        // over-surface. The KB guidance must push a two-level scheme: a coarse
+        // KIND plus at least one SPECIFIC facet drawn from
+        // project:/tool:/topic:/person:.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("SPECIFIC facet"),
+            "KB guidance must name a SPECIFIC facet, not just a coarse kind"
+        );
+        assert!(
+            assembled.contains("topic:"),
+            "the facet vocabulary must include topic:"
+        );
+        assert!(
+            assembled.contains("project:adelie-ai"),
+            "a concrete good-vs-generic example must anchor the rule"
+        );
+    }
+
+    #[test]
     fn assembled_prompt_advertises_scratchpad_tools() {
         // The scratchpad must be advertised in the always-present system prompt
         // so the model knows the tools exist (#184).

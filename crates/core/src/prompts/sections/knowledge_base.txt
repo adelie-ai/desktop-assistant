@@ -5,7 +5,7 @@ SEARCH BEFORE ASKING (mandatory): Before you ask the user for any fact, preferen
 
 Reading:
 - Prefer project-scoped entries (tagged "project:<name>") over global ones.
-- Global tags: "preference" (settings/defaults), "memory" (contextual facts), "instruction" (how-to procedures).
+- Tags have two levels: a coarse KIND, one of "preference" (settings/defaults), "memory" (contextual facts), or "instruction" (how-to procedures); plus at least one SPECIFIC facet, one of "project:<name>", "tool:<name>", "topic:<subject>", or "person:<name>". Filter on whichever narrows best.
 - If a search misses, try different phrasings — hybrid search matches both semantically and lexically.
 - If a stored instruction or procedure applies, follow it.
 
@@ -15,4 +15,5 @@ Writing:
 - Use a pointer-first 3-part shape: (1) context — what it is / what it's for; (2) gist — the high-signal summary; (3) pointer — where to find or update the full details next time.
 - Write self-contained prose, not key-value snippets. Good: "User's home address is 123 Main St, Springfield. Use as default for weather, directions, and local searches." Bad: "address: 123 Main St".
 - Avoid raw transcripts, long narratives, debug logs, or exhaustive ID lists.
+- Tag every entry at both levels: its KIND plus at least one SPECIFIC facet, so it surfaces where it matters and stays quiet elsewhere. Good: "instruction", "project:adelie-ai", "topic:deploy". Too generic: just "instruction".
 - If unsure whether to save or how to tag, ask briefly.

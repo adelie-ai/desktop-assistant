@@ -687,3 +687,210 @@ async fn delete_many_ignores_foreign_ids() {
     })
     .await;
 }
+
+// -- write path: tags are normalized (case/whitespace/facet, dedup) ----------
+
+#[tokio::test]
+async fn knowledge_write_normalizes_tags_case_whitespace_and_preserves_facets() {
+    // Exact-match tag filters (`tags && $2`) fragment when the same intent is
+    // written as `Preference`/`preference `/`preference`. The write path must
+    // collapse that drift AND preserve a `facet:value` colon, then dedup — so a
+    // round-trip through the store returns canonical, deduped tags.
+    //
+    // MUTATION: dropping the `normalize_tags(...)` call in `knowledge::write`
+    // persists the raw tags verbatim → this test goes RED.
+    with_fixture(
+        "knowledge_write_normalizes_tags_case_whitespace_and_preserves_facets",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-tag-norm",
+                        "deploy notes for the adelie stack",
+                        vec![
+                            "Preference".into(),
+                            " Memory ".into(),
+                            "project:Adelie-AI".into(),
+                            "preference".into(),
+                        ],
+                    ))
+                    .await
+                    .expect("write with drifty tags");
+            })
+            .await;
+
+            let row = with_user_id(UserId::new("alice"), async {
+                store.get("kb-tag-norm").await
+            })
+            .await
+            .expect("get")
+            .expect("row exists");
+
+            // Case/whitespace collapsed, the duplicate "preference" dropped, and
+            // the facet colon preserved (NOT mangled to `project-adelie-ai`).
+            assert_eq!(
+                row.tags,
+                vec![
+                    "preference".to_string(),
+                    "memory".to_string(),
+                    "project:adelie-ai".to_string(),
+                ],
+                "write must normalize + dedup tags and keep the facet colon"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- read path: tag filters are case/facet-insensitive (write/read symmetry) --
+
+#[tokio::test]
+async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
+    // Writes normalize stored tags; reads must normalize the filter too, or a
+    // differently-cased filter silently misses. Two docs share the FTS term
+    // "deploy", so only the tag filter discriminates. Every read binding site is
+    // exercised: the FTS include ($2) / exclude ($5), the vector-branch include
+    // ($2), `list` ($1), and `list_page` include ($2) / exclude ($3).
+    //
+    // MUTATION: dropping `normalize_tag_filter(...)` on any read path makes the
+    // differently-cased filter miss/keep the wrong rows → RED.
+    with_fixture(
+        "knowledge_read_filters_are_case_insensitive_and_symmetric",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-instr",
+                        "deploy runbook for the stack",
+                        vec!["Instruction".into(), "project:Adelie-AI".into()],
+                    ))
+                    .await
+                    .expect("write kb-instr");
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-other",
+                        "deploy runbook for something else",
+                        vec!["memory".into(), "project:other".into()],
+                    ))
+                    .await
+                    .expect("write kb-other");
+            })
+            .await;
+
+            // INCLUDE via search_text (FTS $2): a differently-cased facet filter
+            // still finds the matching row and only that row.
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search_text("deploy", Some(vec!["Project:adelie-ai".into()]), 10)
+                    .await
+            })
+            .await
+            .expect("search_text include");
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                ids.contains(&"kb-instr") && !ids.contains(&"kb-other"),
+                "case-varied include filter must find only kb-instr; got {ids:?}"
+            );
+
+            // EXCLUDE via the search FTS-fallback (empty embedding, $5): a
+            // differently-cased exclude filter drops the matching row, keeps rest.
+            let kept = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "deploy",
+                        vec![],
+                        None,
+                        Some(vec!["PROJECT:Adelie-AI".into()]),
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search exclude");
+            let kept_ids: Vec<&str> = kept.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                kept_ids.contains(&"kb-other") && !kept_ids.contains(&"kb-instr"),
+                "case-varied exclude filter must drop kb-instr, keep kb-other; got {kept_ids:?}"
+            );
+
+            // INCLUDE on the hybrid VECTOR branch ($2): stamp embeddings so the
+            // vector branch actually runs, then filter with a case-varied facet.
+            set_embedding(&fx.pool, "kb-instr", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_embedding(&fx.pool, "kb-other", vec![vec![0.0, 1.0, 0.0]]).await;
+            let vec_hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "deploy",
+                        vec![1.0, 0.0, 0.0],
+                        Some(vec!["Project:Adelie-AI".into()]),
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("vector search include");
+            let vec_ids: Vec<&str> = vec_hits.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                vec_ids.contains(&"kb-instr") && !vec_ids.contains(&"kb-other"),
+                "hybrid vector-branch include filter must find only kb-instr; got {vec_ids:?}"
+            );
+
+            // INCLUDE via list ($1).
+            let via_list = with_user_id(UserId::new("alice"), async {
+                store
+                    .list(50, 0, Some(vec!["Project:Adelie-AI".into()]))
+                    .await
+            })
+            .await
+            .expect("list include");
+            let list_ids: Vec<&str> = via_list.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                list_ids.contains(&"kb-instr") && !list_ids.contains(&"kb-other"),
+                "list include filter must find only kb-instr; got {list_ids:?}"
+            );
+
+            // INCLUDE + EXCLUDE via list_page ($2 / $3), no FTS path.
+            let inc = with_user_id(UserId::new("alice"), async {
+                store
+                    .list_page(KnowledgeListQuery {
+                        limit: 50,
+                        tags: Some(vec!["PROJECT:Adelie-AI".into()]),
+                        ..Default::default()
+                    })
+                    .await
+            })
+            .await
+            .expect("list_page include");
+            let inc_ids: Vec<&str> = inc.entries.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                inc_ids.contains(&"kb-instr") && !inc_ids.contains(&"kb-other"),
+                "list_page include filter must find only kb-instr; got {inc_ids:?}"
+            );
+
+            let exc = with_user_id(UserId::new("alice"), async {
+                store
+                    .list_page(KnowledgeListQuery {
+                        limit: 50,
+                        exclude_tags: Some(vec!["project:ADELIE-ai".into()]),
+                        ..Default::default()
+                    })
+                    .await
+            })
+            .await
+            .expect("list_page exclude");
+            let exc_ids: Vec<&str> = exc.entries.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                exc_ids.contains(&"kb-other") && !exc_ids.contains(&"kb-instr"),
+                "list_page exclude filter must drop kb-instr, keep kb-other; got {exc_ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}

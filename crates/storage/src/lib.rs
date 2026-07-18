@@ -14,6 +14,7 @@ pub mod knowledge;
 pub mod migrate_json;
 pub mod pool;
 pub mod scratchpad;
+pub mod tag_normalize;
 pub mod tag_registry;
 pub mod tool_registry;
 pub mod turn_state;
