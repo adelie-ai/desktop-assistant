@@ -1525,6 +1525,17 @@ impl McpToolExecutor {
         self.state.cached_tools.lock().await.clone()
     }
 
+    /// The connected MCP tools grouped by provider (server), each with its
+    /// resolved description. The startup analogue of what the reindex closure
+    /// receives, so a fresh boot registers provider rows immediately (not only
+    /// after the first enable/disable toggle).
+    pub async fn mcp_providers(&self) -> Vec<ReindexProvider> {
+        if let Err(e) = self.state.maybe_refresh_metadata().await {
+            tracing::warn!("failed to refresh MCP tools cache: {e}");
+        }
+        self.state.mcp_providers_with_tools().await
+    }
+
     /// Shut down all connected MCP servers.
     pub async fn shutdown(&self) {
         let handles: Vec<ClientHandle> = {
