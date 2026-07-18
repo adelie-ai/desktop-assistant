@@ -439,11 +439,7 @@ impl ConnectionsService for DaemonConnectionsService {
         })
     }
 
-    async fn set_connection_secret(
-        &self,
-        id: String,
-        credential: String,
-    ) -> Result<(), CoreError> {
+    async fn set_connection_secret(&self, id: String, credential: String) -> Result<(), CoreError> {
         let id_valid = ConnectionId::new(id.clone())
             .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
         self.registry.mutate_config(|cfg| {

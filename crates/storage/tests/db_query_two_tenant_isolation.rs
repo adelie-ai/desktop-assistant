@@ -92,17 +92,13 @@ async fn db_query_rows_as(pool: &PgPool, user: &str, query: &str) -> Vec<serde_j
     // tool-call dispatch in production; do the same here.
     let response = with_user_id(UserId::new(user), async {
         service
-            .execute_tool(
-                "builtin_db_query",
-                serde_json::json!({ "query": query }),
-            )
+            .execute_tool("builtin_db_query", serde_json::json!({ "query": query }))
             .await
     })
     .await
     .unwrap_or_else(|e| panic!("db_query tool failed for {user}: {e:?}"));
 
-    let json: serde_json::Value =
-        serde_json::from_str(&response).expect("tool response is JSON");
+    let json: serde_json::Value = serde_json::from_str(&response).expect("tool response is JSON");
     assert_eq!(
         json["ok"],
         serde_json::json!(true),
@@ -174,7 +170,10 @@ async fn db_query_user_b_cannot_read_user_a_personal_rows() {
     .await;
 
     let ids = first_col(&rows);
-    let alice_leak: Vec<&String> = ids.iter().filter(|id| id.starts_with("conv-alice")).collect();
+    let alice_leak: Vec<&String> = ids
+        .iter()
+        .filter(|id| id.starts_with("conv-alice"))
+        .collect();
     assert!(
         alice_leak.is_empty(),
         "bob must NEVER read alice's rows; leaked: {alice_leak:?} (full set {ids:?})"
