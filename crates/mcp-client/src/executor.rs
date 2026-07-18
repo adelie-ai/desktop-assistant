@@ -6,7 +6,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::tool_registry::{ReindexProvider, ToolReindexFn};
 use desktop_assistant_core::ports::tools::ToolExecutor;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 
 pub use crate::builtin::BuiltinToolService;
 use crate::config::save_mcp_configs;
@@ -360,16 +360,37 @@ impl ClientHandle {
 }
 
 /// Shared mutable state for MCP servers, accessible via `McpControlHandle`.
+///
+/// ## Lock ordering (issue #520)
+///
+/// Several methods hold more than one of these locks at once. To rule out an
+/// AB-BA deadlock, every such method acquires them in this **single canonical
+/// order**, which matches the field-declaration order below:
+///
+/// ```text
+/// configs -> clients -> cached_tools -> tool_routing -> last_errors
+/// ```
+///
+/// (`cached_resources` and `cached_prompts` are only ever taken singly, so they
+/// impose no ordering constraint.) The `cached_tools` + `tool_routing` pair is
+/// the one most easily inverted, so it is acquired *exclusively* through the
+/// `lock_tools_then_routing` helper, which encodes the order in one place. Any
+/// new site that needs both must call that helper; any new multi-lock site that
+/// adds `configs`/`clients`/`last_errors` must keep to the order above.
 pub struct McpExecutorState {
     configs: RwLock<Vec<McpServerConfig>>,
     /// Connected MCP client instances, indexed by config position. RwLock
     /// because most accesses only need to clone an `Arc` out of a slot;
     /// only connect/disconnect/add/remove take the write lock.
     clients: RwLock<Vec<Option<ClientHandle>>>,
-    /// Map from namespaced tool name (`server__original`) to (server index, original tool name).
-    tool_routing: Mutex<HashMap<String, (usize, String)>>,
-    /// Cached list of all available tools.
+    /// Cached list of all available tools. Per the lock-ordering note above this
+    /// is acquired **before** [`Self::tool_routing`]; when both are needed, take
+    /// them via [`Self::lock_tools_then_routing`] rather than by hand.
     cached_tools: Mutex<Vec<ToolDefinition>>,
+    /// Map from namespaced tool name (`server__original`) to (server index,
+    /// original tool name). Acquired **after** [`Self::cached_tools`] (see the
+    /// lock-ordering note on this struct).
+    tool_routing: Mutex<HashMap<String, (usize, String)>>,
     /// Cached metadata for MCP resources across all connected servers.
     cached_resources: Mutex<Vec<serde_json::Value>>,
     /// Cached metadata for MCP prompts across all connected servers.
@@ -661,10 +682,32 @@ impl McpExecutorState {
             }
         }
 
-        *self.tool_routing.lock().await = new_routing;
-        *self.cached_tools.lock().await = all_tools;
+        // Swap both maps through the canonical helper (cached before routing) so
+        // the acquisition order stays uniform with every reader and a reader that
+        // holds both never observes a torn cached/routing pair (#520).
+        let (mut cached, mut routing) = self.lock_tools_then_routing().await;
+        *cached = all_tools;
+        *routing = new_routing;
 
         Ok(())
+    }
+
+    /// Acquire the tool cache and routing mutexes together in the one canonical
+    /// order — [`Self::cached_tools`] **before** [`Self::tool_routing`] (issue
+    /// #520). Every site that holds both at once MUST go through this helper so
+    /// the acquisition order is uniform across the executor and the AB-BA
+    /// inversion (one caller taking `cached_tools` then `tool_routing`, another
+    /// the reverse, wedging forever) is structurally impossible. See the
+    /// lock-ordering note on [`McpExecutorState`].
+    async fn lock_tools_then_routing(
+        &self,
+    ) -> (
+        MutexGuard<'_, Vec<ToolDefinition>>,
+        MutexGuard<'_, HashMap<String, (usize, String)>>,
+    ) {
+        let cached = self.cached_tools.lock().await;
+        let routing = self.tool_routing.lock().await;
+        (cached, routing)
     }
 
     /// Group the current connected MCP tools by provider for reindexing. Modeled
@@ -676,8 +719,8 @@ impl McpExecutorState {
     async fn mcp_providers_with_tools(&self) -> Vec<ReindexProvider> {
         let configs = self.configs.read().await;
         let clients = self.clients.read().await;
-        let cached = self.cached_tools.lock().await;
-        let routing = self.tool_routing.lock().await;
+        // `cached_tools` before `tool_routing` via the canonical helper (#520).
+        let (cached, routing) = self.lock_tools_then_routing().await;
 
         let mut providers = Vec::new();
         for (idx, config) in configs.iter().enumerate() {
@@ -1347,8 +1390,8 @@ impl McpToolExecutor {
             state: Arc::new(McpExecutorState {
                 configs: RwLock::new(configs),
                 clients: RwLock::new(clients),
-                tool_routing: Mutex::new(HashMap::new()),
                 cached_tools: Mutex::new(Vec::new()),
+                tool_routing: Mutex::new(HashMap::new()),
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path: PathBuf::new(),
@@ -1375,8 +1418,8 @@ impl McpToolExecutor {
             state: Arc::new(McpExecutorState {
                 configs: RwLock::new(configs),
                 clients: RwLock::new(clients),
-                tool_routing: Mutex::new(HashMap::new()),
                 cached_tools: Mutex::new(Vec::new()),
+                tool_routing: Mutex::new(HashMap::new()),
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
@@ -1411,8 +1454,8 @@ impl McpToolExecutor {
             state: Arc::new(McpExecutorState {
                 configs: RwLock::new(configs),
                 clients: RwLock::new(clients),
-                tool_routing: Mutex::new(HashMap::new()),
                 cached_tools: Mutex::new(Vec::new()),
+                tool_routing: Mutex::new(HashMap::new()),
                 cached_resources: Mutex::new(Vec::new()),
                 cached_prompts: Mutex::new(Vec::new()),
                 config_path,
@@ -1498,8 +1541,9 @@ impl McpToolExecutor {
     /// Intended for startup diagnostics.
     pub async fn tools_by_service(&self) -> Vec<(String, String)> {
         let configs = self.state.configs.read().await;
-        let routing = self.state.tool_routing.lock().await;
-        let cached = self.state.cached_tools.lock().await;
+        // `cached_tools` before `tool_routing` via the canonical helper (#520);
+        // this site historically took them in the reverse order.
+        let (cached, routing) = self.state.lock_tools_then_routing().await;
 
         let mut entries: Vec<(String, String)> = cached
             .iter()
@@ -1571,8 +1615,8 @@ impl ToolExecutor for McpToolExecutor {
 
         // MCP server tool namespaces — grouped by server
         let configs = self.state.configs.read().await;
-        let cached = self.state.cached_tools.lock().await;
-        let routing = self.state.tool_routing.lock().await;
+        // `cached_tools` before `tool_routing` via the canonical helper (#520).
+        let (cached, routing) = self.state.lock_tools_then_routing().await;
 
         for (idx, config) in configs.iter().enumerate() {
             let server_tools: Vec<ToolDefinition> = cached
@@ -2849,5 +2893,61 @@ mod tests {
             "the final committed index must equal the current connected-tool set \
              (serialized last-writer-wins, not a torn stale snapshot)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_grouping_and_diagnostics_never_deadlock() {
+        // Regression for the `cached_tools` <-> `tool_routing` lock-order
+        // inversion (#520). `tools_by_service` acquired the two mutexes in the
+        // opposite order from `tool_namespaces` / `mcp_providers_with_tools`, so
+        // two callers racing on a multi-thread runtime could wedge AB-BA (one
+        // holds `cached_tools` waiting on `tool_routing`, the other the reverse).
+        // With a single canonical order they always make progress; this test
+        // times out (fails) if the inversion is ever reintroduced.
+        let configs: Vec<McpServerConfig> = (0..8).map(|i| stdio_cfg(&format!("srv{i}"))).collect();
+        let executor = Arc::new(McpToolExecutor::new(configs));
+        {
+            let mut cached = executor.state.cached_tools.lock().await;
+            let mut routing = executor.state.tool_routing.lock().await;
+            for s in 0..8usize {
+                for t in 0..8usize {
+                    let name = format!("srv{s}__tool{t}");
+                    cached.push(ToolDefinition::new(
+                        name.clone(),
+                        "d",
+                        serde_json::json!({"type": "object"}),
+                    ));
+                    routing.insert(name, (s, format!("tool{t}")));
+                }
+            }
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let e = Arc::clone(&executor);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..200 {
+                    let _ = e.tools_by_service().await;
+                }
+            }));
+            let e = Arc::clone(&executor);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..200 {
+                    let _ = e.tool_namespaces().await;
+                }
+            }));
+        }
+
+        let join_all = async {
+            for h in handles {
+                h.await.expect("stress task panicked");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), join_all)
+            .await
+            .expect(
+                "tools_by_service and tool_namespaces deadlocked — \
+                 cached_tools/tool_routing lock-order inversion (#520)",
+            );
     }
 }
