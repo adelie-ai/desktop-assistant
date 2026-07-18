@@ -365,9 +365,7 @@ impl PgKnowledgeBaseStore {
 /// `tags && '{}'` is always false, so an empty include matches no rows and an
 /// empty exclude drops none.
 pub(crate) fn normalize_tag_filter(filter: Option<Vec<String>>) -> Option<Vec<String>> {
-    // STUB (red commit): identity passthrough. The spec tests fail until this
-    // actually normalizes.
-    filter
+    filter.map(crate::tag_normalize::normalize_tags)
 }
 
 /// Encode a keyset cursor as `<created_at_micros>:<id>`.
