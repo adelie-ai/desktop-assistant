@@ -18,4 +18,4 @@ pub use config::{
     CLIENT_SURFACES, ClientMcpConfig, DEFAULT_SURFACE, McpServerConfig, SurfaceConfig,
     default_client_mcp_path, is_client_surface,
 };
-pub use host::{BuiltinServer, McpHost};
+pub use host::{BuiltinServer, BuiltinStatus, McpHost};
