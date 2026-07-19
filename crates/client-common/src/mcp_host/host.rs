@@ -933,4 +933,102 @@ done
         );
         host.shutdown().await;
     }
+
+    // ----- Centralized built-in override + status (da#538 Phase D slice 2) -----
+
+    #[tokio::test]
+    async fn builtin_overridden_by_same_name_config_is_not_hosted() {
+        // A configured client-mcp server named "fileio" shadows a built-in of the
+        // same NAME: `start_with` hosts the configured one and leaves the built-in
+        // dormant. Distinct namespaces ("cfg" vs "bi") ensure this exercises the
+        // name-based override, not the namespaced-tool dedup — without the override
+        // both tools would register.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fileio.sh");
+        std::fs::write(&script, fake_script("read", CallMode::Ok, None)).unwrap();
+        let (b, _f) = builtin(
+            "fileio",
+            "bi",
+            "write",
+            BuiltinBehavior::Text("built-in-should-not-run".into()),
+        );
+
+        let host = McpHost::start_with(&[sh_config("fileio", &script, Some("cfg"))], vec![b]).await;
+
+        // Only the configured server's tool is hosted; the built-in's is not.
+        let names: Vec<String> = host.registrations().into_iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            vec!["cfg__read".to_string()],
+            "the configured server wins; the built-in's tool must be absent"
+        );
+        assert!(
+            !host.handles("bi__write"),
+            "the overridden built-in's tool must not be routed"
+        );
+
+        // The built-in is still reported, flagged as overridden by name.
+        let status = host.builtin_status();
+        let entry = status
+            .iter()
+            .find(|s| s.name == "fileio")
+            .expect("built-in 'fileio' must appear in builtin_status");
+        assert_eq!(entry.overridden_by, Some("fileio".to_string()));
+        assert_eq!(entry.namespace, "bi");
+        assert_eq!(
+            entry.tool_count, 1,
+            "reports the built-in's own advertised tool count"
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builtin_not_overridden_is_hosted_and_status_clean() {
+        // No configured server named "tasks", so the built-in is hosted normally
+        // and its status carries no override.
+        let (b, _f) = builtin("tasks", "tasks", "list", BuiltinBehavior::Text("ok".into()));
+        let host = McpHost::start_with(&[], vec![b]).await;
+
+        assert!(host.handles("tasks__list"), "built-in must be hosted");
+
+        let status = host.builtin_status();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].name, "tasks");
+        assert_eq!(status[0].namespace, "tasks");
+        assert_eq!(status[0].tool_count, 1, "one registered tool");
+        assert_eq!(status[0].overridden_by, None);
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builtin_status_reports_all_passed_builtins() {
+        // One overridden built-in + one active built-in: both appear in the
+        // status, each with the correct override flag.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fileio.sh");
+        std::fs::write(&script, fake_script("read", CallMode::Ok, None)).unwrap();
+        let (overridden, _f1) = builtin("fileio", "bi", "write", BuiltinBehavior::Text("nope".into()));
+        let (active, _f2) = builtin("tasks", "tasks", "list", BuiltinBehavior::Text("ok".into()));
+
+        let host = McpHost::start_with(
+            &[sh_config("fileio", &script, Some("cfg"))],
+            vec![overridden, active],
+        )
+        .await;
+
+        let status = host.builtin_status();
+        assert_eq!(status.len(), 2, "both built-ins reported");
+        let fileio = status
+            .iter()
+            .find(|s| s.name == "fileio")
+            .expect("overridden built-in present");
+        let tasks = status
+            .iter()
+            .find(|s| s.name == "tasks")
+            .expect("active built-in present");
+        assert_eq!(fileio.overridden_by, Some("fileio".to_string()));
+        assert_eq!(tasks.overridden_by, None);
+        assert_eq!(tasks.tool_count, 1);
+        host.shutdown().await;
+    }
 }
