@@ -29,6 +29,10 @@ const NAMESPACE_SEP: &str = "__";
 struct HostedServer {
     /// Config name, for diagnostics.
     name: String,
+    /// Tool-namespace prefix this server's tools are advertised under
+    /// (`cfg.namespace`, or the name when unset) — the key [`McpHost::tool_counts`]
+    /// reports per-server totals against.
+    namespace: String,
     client: Mutex<McpClient>,
 }
 
@@ -109,6 +113,7 @@ impl McpHost {
 
             hosted.push(HostedServer {
                 name: cfg.name.clone(),
+                namespace: namespace.clone(),
                 client: Mutex::new(client),
             });
             tracing::info!(
@@ -140,8 +145,19 @@ impl McpHost {
     /// Client UIs surface this as each client-hosted server's live tool count
     /// (adele-gtk#125), matching the per-server totals daemon rows already show.
     pub fn tool_counts(&self) -> HashMap<String, usize> {
-        // Stub: real per-server counts computed from the routing table below.
-        HashMap::new()
+        // Each route points at its owning server by index; tally per index (so a
+        // hosted-but-toolless server stays at 0), then key by that server's
+        // namespace. Servers that never started aren't in `self.servers`, so they
+        // are naturally absent.
+        let mut per_index = vec![0usize; self.servers.len()];
+        for &(index, _) in self.routes.values() {
+            per_index[index] += 1;
+        }
+        self.servers
+            .iter()
+            .zip(per_index)
+            .map(|(server, count)| (server.namespace.clone(), count))
+            .collect()
     }
 
     /// Whether `tool_name` is one this host serves (used to decide whether a
