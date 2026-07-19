@@ -15,7 +15,11 @@ clap = ["dep:clap"]
 # The MCP client is taken WITHOUT default features, so its remote-HTTP transport
 # (and `reqwest`) is never compiled into edge clients — the host only ever
 # spawns local stdio servers.
-mcp-host = ["dep:desktop-assistant-mcp-client", "dep:serde", "dep:toml"]
+#
+# `dep:mcp-core` brings the `McpService` trait + value types so the host can run
+# a built-in server in-process (no subprocess). It is taken WITHOUT default
+# features because only the trait and value types are needed, never a transport.
+mcp-host = ["dep:desktop-assistant-mcp-client", "dep:mcp-core", "dep:serde", "dep:toml"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,6 +28,9 @@ clap = { version = "4", features = ["derive"], optional = true }
 desktop-assistant-api-model = { path = "../api-model" }
 desktop-assistant-mcp-client = { path = "../mcp-client", optional = true, default-features = false }
 desktop-assistant-frame-codec = { workspace = true }
+# First-party (adelie-ai) MCP core: only the `McpService` trait + value types
+# for in-process built-in servers. No default features -> no transport crates.
+mcp-core = { git = "https://github.com/adelie-ai/mcp-core", rev = "448b0e4a3e4dbfb04d56423d41077f0b114e6143", default-features = false, optional = true }
 futures = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
 serde = { workspace = true, optional = true }
