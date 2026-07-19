@@ -67,6 +67,27 @@ enum ServerBackend {
     InProcess(Arc<dyn McpService>),
 }
 
+/// The panel-facing status of one built-in MCP server passed to
+/// [`McpHost::start_with`]: whether it is hosted in-process, or shadowed by a
+/// configured client-mcp server of the same name.
+///
+/// Panels render an overridden built-in as a disabled row (the configured
+/// server of the same name is the one actually hosting those tools), and an
+/// active built-in with its live `tool_count`. da#538 Phase D.
+#[derive(Debug, Clone)]
+pub struct BuiltinStatus {
+    /// The built-in's diagnostic name (`BuiltinServer::name`).
+    pub name: String,
+    /// The tool-namespace prefix the built-in advertises under.
+    pub namespace: String,
+    /// When hosted, the number of tools actually registered; when overridden,
+    /// the number the built-in would have advertised (`service.tools().len()`).
+    pub tool_count: usize,
+    /// `Some(name)` when a configured client-mcp server of the same name shadows
+    /// this built-in (so the built-in is not hosted); `None` when it is hosted.
+    pub overridden_by: Option<String>,
+}
+
 /// A running local MCP server, whether spawned as a subprocess or hosted
 /// in-process.
 struct HostedServer {
@@ -88,6 +109,9 @@ pub struct McpHost {
     /// Namespaced tool name -> (server index, original tool name).
     routes: HashMap<String, (usize, String)>,
     registrations: Vec<ClientToolRegistration>,
+    /// Per-built-in status for the panels: one entry per built-in passed to
+    /// [`start_with`](Self::start_with), whether hosted or overridden.
+    builtin_status: Vec<BuiltinStatus>,
 }
 
 impl McpHost {
@@ -107,10 +131,21 @@ impl McpHost {
     /// tools; a built-in never "fails to start". Subprocess servers are set up
     /// first, so on a namespaced-name collision the built-in tool is the one
     /// skipped.
+    ///
+    /// **Override (shadowing).** A built-in whose `name` matches a configured
+    /// server's `name` is treated as *overridden*: it is not hosted (the
+    /// configured server of the same name serves those tools instead), the
+    /// decision is logged, and the built-in is still reported by
+    /// [`builtin_status`](Self::builtin_status) with `overridden_by` set so the
+    /// panels can render it as a disabled row. This centralizes a decision the
+    /// clients previously made by pre-filtering the built-in list; a client that
+    /// still pre-filters simply passes an already-shadowed list, and the check
+    /// here is a harmless no-op (da#538 Phase D).
     pub async fn start_with(servers: &[McpServerConfig], builtins: Vec<BuiltinServer>) -> Self {
         let mut hosted: Vec<HostedServer> = Vec::new();
         let mut routes: HashMap<String, (usize, String)> = HashMap::new();
         let mut registrations: Vec<ClientToolRegistration> = Vec::new();
+        let mut builtin_status: Vec<BuiltinStatus> = Vec::new();
 
         for cfg in servers {
             if !cfg.env_secrets.is_empty() {
@@ -180,11 +215,34 @@ impl McpHost {
 
         // In-process built-ins use the same namespacing / dedup / routing /
         // registration path as subprocess servers; only the backend differs. A
-        // built-in never fails to start.
+        // built-in never fails to start. The shadow decision (below) is owned
+        // here, centrally, rather than by each client pre-filtering the list.
+        let configured_names: std::collections::HashSet<&str> =
+            servers.iter().map(|s| s.name.as_str()).collect();
+
         for builtin in builtins {
             let namespace = builtin.namespace.clone();
+
+            // Override: a configured client-mcp server of the same name shadows
+            // this built-in. Don't host it — the configured one serves those
+            // tools — but still report it so panels can show the overridden row.
+            if configured_names.contains(builtin.name.as_str()) {
+                tracing::info!(
+                    "built-in MCP server '{}' is overridden by a configured client-mcp \
+                     server of the same name; hosting the configured one instead",
+                    builtin.name
+                );
+                builtin_status.push(BuiltinStatus {
+                    name: builtin.name.clone(),
+                    namespace,
+                    tool_count: builtin.service.tools().len(),
+                    overridden_by: Some(builtin.name.clone()),
+                });
+                continue;
+            }
+
             let index = hosted.len();
-            let mut hosted_any = false;
+            let mut registered_count = 0usize;
             for tool in builtin.service.tools() {
                 let namespaced = format!("{namespace}{NAMESPACE_SEP}{}", tool.name);
                 if routes.contains_key(&namespaced) {
@@ -201,7 +259,7 @@ impl McpHost {
                     description: tool.description,
                     input_schema: tool.input_schema,
                 });
-                hosted_any = true;
+                registered_count += 1;
             }
 
             hosted.push(HostedServer {
@@ -213,14 +271,25 @@ impl McpHost {
                 "hosting built-in client MCP server '{}' as namespace '{}'{}",
                 builtin.name,
                 namespace,
-                if hosted_any { "" } else { " (no tools)" }
+                if registered_count > 0 {
+                    ""
+                } else {
+                    " (no tools)"
+                }
             );
+            builtin_status.push(BuiltinStatus {
+                name: builtin.name.clone(),
+                namespace,
+                tool_count: registered_count,
+                overridden_by: None,
+            });
         }
 
         Self {
             servers: hosted,
             routes,
             registrations,
+            builtin_status,
         }
     }
 
@@ -251,6 +320,16 @@ impl McpHost {
             .zip(per_index)
             .map(|(server, count)| (server.namespace.clone(), count))
             .collect()
+    }
+
+    /// The status of every built-in passed to
+    /// [`start_with`](Self::start_with): one [`BuiltinStatus`] per built-in,
+    /// whether it is hosted in-process or overridden by a configured client-mcp
+    /// server of the same name. Panels use this to render an overridden built-in
+    /// as a disabled row and an active one with its live tool count (da#538
+    /// Phase D). Order follows the order the built-ins were passed.
+    pub fn builtin_status(&self) -> Vec<BuiltinStatus> {
+        self.builtin_status.clone()
     }
 
     /// Whether `tool_name` is one this host serves (used to decide whether a
@@ -1007,7 +1086,12 @@ done
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fileio.sh");
         std::fs::write(&script, fake_script("read", CallMode::Ok, None)).unwrap();
-        let (overridden, _f1) = builtin("fileio", "bi", "write", BuiltinBehavior::Text("nope".into()));
+        let (overridden, _f1) = builtin(
+            "fileio",
+            "bi",
+            "write",
+            BuiltinBehavior::Text("nope".into()),
+        );
         let (active, _f2) = builtin("tasks", "tasks", "list", BuiltinBehavior::Text("ok".into()));
 
         let host = McpHost::start_with(
