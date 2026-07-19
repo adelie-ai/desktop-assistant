@@ -29,6 +29,10 @@ const NAMESPACE_SEP: &str = "__";
 struct HostedServer {
     /// Config name, for diagnostics.
     name: String,
+    /// Tool-namespace prefix this server's tools are advertised under
+    /// (`cfg.namespace`, or the name when unset) — the key [`McpHost::tool_counts`]
+    /// reports per-server totals against.
+    namespace: String,
     client: Mutex<McpClient>,
 }
 
@@ -109,6 +113,7 @@ impl McpHost {
 
             hosted.push(HostedServer {
                 name: cfg.name.clone(),
+                namespace: namespace.clone(),
                 client: Mutex::new(client),
             });
             tracing::info!(
@@ -129,6 +134,30 @@ impl McpHost {
     /// The client-side tool registrations for every hosted server.
     pub fn registrations(&self) -> Vec<ClientToolRegistration> {
         self.registrations.clone()
+    }
+
+    /// The number of tools each hosted server currently exposes, keyed by the
+    /// server's **namespace** (`cfg.namespace`, or the server name when it has
+    /// none) — the same key the host uses to namespace that server's tools. A
+    /// server that started but advertised no tools maps to `0`; a server that
+    /// failed to start is absent (it hosts nothing).
+    ///
+    /// Client UIs surface this as each client-hosted server's live tool count
+    /// (adele-gtk#125), matching the per-server totals daemon rows already show.
+    pub fn tool_counts(&self) -> HashMap<String, usize> {
+        // Each route points at its owning server by index; tally per index (so a
+        // hosted-but-toolless server stays at 0), then key by that server's
+        // namespace. Servers that never started aren't in `self.servers`, so they
+        // are naturally absent.
+        let mut per_index = vec![0usize; self.servers.len()];
+        for &(index, _) in self.routes.values() {
+            per_index[index] += 1;
+        }
+        self.servers
+            .iter()
+            .zip(per_index)
+            .map(|(server, count)| (server.namespace.clone(), count))
+            .collect()
     }
 
     /// Whether `tool_name` is one this host serves (used to decide whether a
@@ -308,6 +337,56 @@ done
         let mut names: Vec<String> = host.registrations().into_iter().map(|r| r.name).collect();
         names.sort();
         assert_eq!(names, vec!["a__echo".to_string(), "b__echo".to_string()]);
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tool_counts_keyed_by_namespace_with_name_fallback() {
+        // Two healthy servers, each advertising one tool. One declares a
+        // namespace ("a"); the other has none, so it keys by its config name
+        // ("plain") — the SAME key the host uses when namespacing that server's
+        // tools. adele-gtk#125.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.sh");
+        let b = dir.path().join("b.sh");
+        std::fs::write(&a, fake_script("echo", CallMode::Ok, None)).unwrap();
+        std::fs::write(&b, fake_script("echo", CallMode::Ok, None)).unwrap();
+
+        let host = McpHost::start(&[
+            sh_config("srv-a", &a, Some("a")),
+            sh_config("plain", &b, None),
+        ])
+        .await;
+
+        let counts = host.tool_counts();
+        assert_eq!(counts.get("a").copied(), Some(1), "namespace-keyed count");
+        assert_eq!(
+            counts.get("plain").copied(),
+            Some(1),
+            "name-keyed count when no namespace"
+        );
+        assert_eq!(counts.len(), 2, "exactly the two hosted namespaces");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tool_counts_excludes_server_that_failed_to_start() {
+        // A broken server hosts nothing, so it never appears in the counts; the
+        // healthy one is still reported with its tool total.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.sh");
+        std::fs::write(&good, fake_script("echo", CallMode::Ok, None)).unwrap();
+
+        let host =
+            McpHost::start(&[broken_config("broken"), sh_config("good", &good, Some("g"))]).await;
+
+        let counts = host.tool_counts();
+        assert_eq!(counts.get("g").copied(), Some(1));
+        assert!(
+            !counts.contains_key("x"),
+            "the broken server's namespace must not appear"
+        );
+        assert_eq!(counts.len(), 1);
         host.shutdown().await;
     }
 
