@@ -1265,6 +1265,7 @@ dependencies = [
  "desktop-assistant-mcp-client",
  "desktop-assistant-uds",
  "futures",
+ "mcp-core",
  "rcgen",
  "reqwest",
  "rustls",
@@ -2680,6 +2681,19 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "mcp-core"
+version = "0.1.0"
+source = "git+https://github.com/adelie-ai/mcp-core?rev=448b0e4a3e4dbfb04d56423d41077f0b114e6143#448b0e4a3e4dbfb04d56423d41077f0b114e6143"
+dependencies = [
+ "async-trait",
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
 
 [[package]]
 name = "md-5"
