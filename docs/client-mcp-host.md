@@ -29,6 +29,11 @@ depending on which edge is connected.
 - `[surfaces.<name>].enabled` — which defined servers that surface hosts. A
   surface with **no** entry inherits `[surfaces.default]`; an **explicit empty**
   list means "nothing".
+- `[surfaces.<name>].disabled_builtins` — built-in (compiled-in) server names this
+  surface has turned **off** (see [Built-in servers](#built-in-in-process-servers)).
+  Unlike `enabled`, this list is per-surface with **no** `default` fallback and is
+  omitted when empty, so a file written before this key existed leaves every
+  built-in on.
 
 Definitions say what exists; surfaces say who gets what.
 
@@ -55,13 +60,47 @@ namespace = "web"
 [surfaces.default]
 enabled = ["filesystem", "git"]
 
-# Voice keeps a lean set.
+# Voice keeps a lean set, and turns the built-in 'web' server off.
 [surfaces.voice]
 enabled = ["filesystem"]
+disabled_builtins = ["web"]
 
 [surfaces.gtk]
 enabled = ["filesystem", "git", "browser"]
 ```
+
+## Built-in (in-process) servers
+
+Desktop clients ship with a small set of MCP servers **compiled into the binary**
+and hosted **in-process** — no subprocess, no `[[servers]]` entry, useful out of
+the box on a fresh install. The default desktop set is `fileio`, `terminal`,
+`tasks`, and `web`; each client chooses its own compiled-in set at build time
+(voice, for example, compiles them in but defaults them all off). A built-in's
+tools are namespaced, registered, and routed exactly like a subprocess server's —
+the brain cannot tell the two apart.
+
+Each built-in is in one of three states, in precedence order:
+
+1. **Overridden** — a `[[servers]]` entry with the **same name** shadows the
+   built-in. The configured (external) server hosts those tools instead; the
+   built-in is not run. Use this to swap in a newer or patched external binary
+   without losing the tool. The panel shows the built-in as a disabled row
+   ("overridden by the external ...").
+2. **Disabled** — the built-in's name is listed in this surface's
+   `disabled_builtins`. It is not hosted at all, for that surface only. This is
+   the explicit off-switch; it takes display precedence over an override. Toggle
+   it from a client's MCP panel, or from the CLI:
+
+   ```sh
+   adele config mcp disable web        # turn the built-in 'web' off for this surface
+   adele config mcp enable web         # turn it back on
+   ```
+3. **Active** (default) — compiled in, not overridden, not disabled: hosted
+   in-process.
+
+Disable is **per-surface**: a hands-free surface (voice) can silence a built-in
+the desktop keeps. Because the in-process host is set up at client start, a
+disable/enable change takes effect on the client's next launch.
 
 ## Not to be confused with `mcp_servers.toml`
 
