@@ -90,9 +90,9 @@ async fn lookup_is_scoped_per_user() {
     .await;
 
     with_user_id(UserId::new("bob"), async {
-        // Bob owns his own conversation with the same id + key; he must not see
-        // alice's stored reply.
-        convs.create(make_conversation("c1")).await.unwrap();
+        // Bob presents the same conversation id + key; the lookup is scoped to
+        // his user_id, so alice's stored reply is invisible (a lookup is a read,
+        // so no conversation row of bob's is required).
         assert_eq!(
             store.lookup_completed("c1", "k1").await.unwrap(),
             None,
