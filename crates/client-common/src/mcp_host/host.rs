@@ -86,6 +86,11 @@ pub struct BuiltinStatus {
     /// `Some(name)` when a configured client-mcp server of the same name shadows
     /// this built-in (so the built-in is not hosted); `None` when it is hosted.
     pub overridden_by: Option<String>,
+    /// `true` when this built-in was explicitly disabled for the surface via client
+    /// config (`[surfaces.<name>].disabled_builtins`), so it is not hosted even with
+    /// no external override. Orthogonal to [`overridden_by`](Self::overridden_by):
+    /// both can be set at once. da#538 slice 4.
+    pub disabled_by_config: bool,
 }
 
 /// A running local MCP server, whether spawned as a subprocess or hosted
@@ -142,6 +147,24 @@ impl McpHost {
     /// still pre-filters simply passes an already-shadowed list, and the check
     /// here is a harmless no-op (da#538 Phase D).
     pub async fn start_with(servers: &[McpServerConfig], builtins: Vec<BuiltinServer>) -> Self {
+        Self::start_with_disabled(servers, builtins, &[]).await
+    }
+
+    /// Like [`start_with`](Self::start_with), but additionally honors a per-surface
+    /// **disabled** set: any built-in whose `name` appears in `disabled` is not
+    /// hosted (the user turned it off in client config via
+    /// `[surfaces.<name>].disabled_builtins`), the decision is logged, and it is
+    /// still reported by [`builtin_status`](Self::builtin_status) with
+    /// `disabled_by_config` set so panels render it as a disabled row.
+    ///
+    /// Disable and override are orthogonal: a built-in that is both disabled and
+    /// shadowed by a same-name configured server is skipped once, with both flags
+    /// recorded. da#538 slice 4.
+    pub async fn start_with_disabled(
+        servers: &[McpServerConfig],
+        builtins: Vec<BuiltinServer>,
+        disabled: &[String],
+    ) -> Self {
         let mut hosted: Vec<HostedServer> = Vec::new();
         let mut routes: HashMap<String, (usize, String)> = HashMap::new();
         let mut registrations: Vec<ClientToolRegistration> = Vec::new();
@@ -219,24 +242,39 @@ impl McpHost {
         // here, centrally, rather than by each client pre-filtering the list.
         let configured_names: std::collections::HashSet<&str> =
             servers.iter().map(|s| s.name.as_str()).collect();
+        let disabled_names: std::collections::HashSet<&str> =
+            disabled.iter().map(String::as_str).collect();
 
         for builtin in builtins {
             let namespace = builtin.namespace.clone();
+            let overridden = configured_names.contains(builtin.name.as_str());
+            let is_disabled = disabled_names.contains(builtin.name.as_str());
 
-            // Override: a configured client-mcp server of the same name shadows
-            // this built-in. Don't host it — the configured one serves those
-            // tools — but still report it so panels can show the overridden row.
-            if configured_names.contains(builtin.name.as_str()) {
-                tracing::info!(
-                    "built-in MCP server '{}' is overridden by a configured client-mcp \
-                     server of the same name; hosting the configured one instead",
-                    builtin.name
-                );
+            // Skip hosting when the built-in was turned off for this surface, or when
+            // a configured client-mcp server of the same name overrides it. In either
+            // case still report it (with the reason flags) so panels can render the
+            // disabled row. Disable is checked first: it is the user's explicit
+            // off-switch, so it wins the log line when both apply.
+            if is_disabled || overridden {
+                if is_disabled {
+                    tracing::info!(
+                        "built-in MCP server '{}' is disabled for this surface by client \
+                         config; not hosting it",
+                        builtin.name
+                    );
+                } else {
+                    tracing::info!(
+                        "built-in MCP server '{}' is overridden by a configured client-mcp \
+                         server of the same name; hosting the configured one instead",
+                        builtin.name
+                    );
+                }
                 builtin_status.push(BuiltinStatus {
                     name: builtin.name.clone(),
                     namespace,
                     tool_count: builtin.service.tools().len(),
-                    overridden_by: Some(builtin.name.clone()),
+                    overridden_by: overridden.then(|| builtin.name.clone()),
+                    disabled_by_config: is_disabled,
                 });
                 continue;
             }
@@ -282,6 +320,7 @@ impl McpHost {
                 namespace,
                 tool_count: registered_count,
                 overridden_by: None,
+                disabled_by_config: false,
             });
         }
 
@@ -1113,6 +1152,102 @@ done
         assert_eq!(fileio.overridden_by, Some("fileio".to_string()));
         assert_eq!(tasks.overridden_by, None);
         assert_eq!(tasks.tool_count, 1);
+        // Neither is disabled-by-config in this scenario.
+        assert!(!fileio.disabled_by_config);
+        assert!(!tasks.disabled_by_config);
+        host.shutdown().await;
+    }
+
+    // ----- Built-in disable (da#538 slice 4) -----
+
+    #[tokio::test]
+    async fn builtin_disabled_by_config_is_not_hosted() {
+        // Naming a built-in in the disabled set turns it off: its tools are not
+        // registered, but it is still reported so panels can show the disabled row.
+        let (b, _f) = builtin("web", "web", "browse", BuiltinBehavior::Text("nope".into()));
+        let host = McpHost::start_with_disabled(&[], vec![b], &["web".to_string()]).await;
+
+        assert!(
+            !host.handles("web__browse"),
+            "a disabled built-in's tools must not be routed"
+        );
+        assert!(host.registrations().is_empty());
+
+        let status = host.builtin_status();
+        assert_eq!(status.len(), 1, "the disabled built-in is still reported");
+        assert!(status[0].disabled_by_config, "flagged disabled-by-config");
+        assert_eq!(status[0].overridden_by, None, "disabled, not overridden");
+        assert_eq!(
+            status[0].tool_count, 1,
+            "reports the built-in's own advertised tool count"
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builtin_not_in_disabled_set_is_hosted() {
+        // A non-empty disabled set that doesn't name this built-in leaves it hosted.
+        let (b, _f) = builtin("tasks", "tasks", "list", BuiltinBehavior::Text("ok".into()));
+        let host = McpHost::start_with_disabled(&[], vec![b], &["web".to_string()]).await;
+
+        assert!(
+            host.handles("tasks__list"),
+            "unrelated disable must not affect it"
+        );
+        let status = host.builtin_status();
+        assert_eq!(status.len(), 1);
+        assert!(!status[0].disabled_by_config);
+        assert_eq!(status[0].overridden_by, None);
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builtin_disabled_and_overridden_records_both_flags() {
+        // A built-in that is BOTH disabled for the surface AND shadowed by a
+        // same-name configured server is skipped once, with both reasons recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fileio.sh");
+        std::fs::write(&script, fake_script("read", CallMode::Ok, None)).unwrap();
+        let (b, _f) = builtin(
+            "fileio",
+            "bi",
+            "write",
+            BuiltinBehavior::Text("nope".into()),
+        );
+
+        let host = McpHost::start_with_disabled(
+            &[sh_config("fileio", &script, Some("cfg"))],
+            vec![b],
+            &["fileio".to_string()],
+        )
+        .await;
+
+        // Only the configured server's tool is hosted; the built-in's is not.
+        assert!(host.handles("cfg__read"));
+        assert!(!host.handles("bi__write"));
+
+        let status = host.builtin_status();
+        let entry = status
+            .iter()
+            .find(|s| s.name == "fileio")
+            .expect("reported");
+        assert!(entry.disabled_by_config, "disable flag set");
+        assert_eq!(
+            entry.overridden_by,
+            Some("fileio".to_string()),
+            "override flag also set"
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn empty_disabled_set_matches_start_with() {
+        // `start_with` delegates to `start_with_disabled(.., &[])`; an empty disabled
+        // set must host the built-in exactly as before.
+        let (b, _f) = builtin("tasks", "tasks", "list", BuiltinBehavior::Text("ok".into()));
+        let host = McpHost::start_with_disabled(&[], vec![b], &[]).await;
+        assert!(host.handles("tasks__list"));
+        assert!(!host.builtin_status()[0].disabled_by_config);
         host.shutdown().await;
     }
 }
