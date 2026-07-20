@@ -24,6 +24,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 /// connection, so pass `max_connections = 1` for one (or use
 /// [`create_memory_pool`], which pins a single persistent connection).
 pub async fn create_pool(url: &str, max_connections: u32) -> Result<SqlitePool, sqlx::Error> {
+    // TODO(sqlite inc1b): when this pool is actually wired for a file-backed
+    // DB, enable WAL journal mode + a busy_timeout so concurrent readers don't
+    // block on a writer. Left off here because inc1 is unwired and its tests use
+    // a single-connection in-memory pool where WAL doesn't apply.
     let opts = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .foreign_keys(true);

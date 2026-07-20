@@ -26,6 +26,12 @@
 //! standard workspace build and the daemon are byte-unchanged and never pull
 //! the sqlite C library. Build/test the real adapter with `--features sqlite`.
 
+// TODO(sqlite inc2): add the vector stores (KnowledgeBaseStore,
+// ToolRegistryStore) on sqlite-vec and the FTS5 stores (ScratchpadStore search,
+// ConversationSearchStore). See DESIGN.md for the fixed-dimension-vs-per-model
+// `vector[]` risk that gates the vector half.
+// TODO(sqlite inc3): port the dreaming/consolidation passes and the
+// `execute_database_query` (db_query) tool.
 #[cfg(feature = "sqlite")]
 mod background_tasks;
 #[cfg(feature = "sqlite")]
