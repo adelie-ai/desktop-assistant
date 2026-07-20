@@ -1,0 +1,42 @@
+[package]
+name = "desktop-assistant-storage-sqlite"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Embeddable SQLite adapter for the desktop-assistant storage ports (single-binary enabler)."
+
+[features]
+# Off by default so the standard workspace build (`cargo build`/`--workspace`,
+# and the daemon) is byte-unchanged and never pulls the sqlite C library.
+# Enable with `--features sqlite` to build/test the real adapter.
+default = []
+sqlite = ["dep:sqlx"]
+
+[dependencies]
+# Pure-Rust deps already present in the workspace graph — compiling them
+# unconditionally adds nothing to the default build. Only `sqlx` (which drags
+# in the sqlite C library) is gated behind the `sqlite` feature.
+async-trait.workspace = true
+desktop-assistant-auth-jwt.workspace = true
+desktop-assistant-core.workspace = true
+serde.workspace = true
+serde_json = "1"
+tracing.workspace = true
+chrono.workspace = true
+uuid = { version = "1", features = ["v7"] }
+# Same sqlx version the Postgres adapter pins, with the `sqlite` feature
+# instead of `postgres`. No TLS feature — a local file/in-memory DB needs none.
+# `json` gives serde_json <-> TEXT-column mapping; `macros` powers the
+# `FromRow` derive.
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "macros", "json"], optional = true }
+
+[dev-dependencies]
+# Test-only, pure-Rust, already in the workspace graph. Tests build pools via
+# the crate's own `create_memory_pool`, so no direct `sqlx` dev-dependency is
+# needed (which would otherwise compile the sqlite C library into the default
+# `cargo test --workspace` run).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
+
+[lints]
+workspace = true

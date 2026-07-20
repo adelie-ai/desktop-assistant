@@ -17,6 +17,7 @@ members = [
     "crates/llm-http",
     "crates/mcp-client",
     "crates/storage",
+    "crates/storage-sqlite",
     "crates/client-common",
     "crates/transport-dispatch",
     "crates/uds-interface",
