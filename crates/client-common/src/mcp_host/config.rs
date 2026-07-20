@@ -34,12 +34,21 @@ pub fn is_client_surface(name: &str) -> bool {
     CLIENT_SURFACES.contains(&name)
 }
 
-/// Per-surface tool selection: which defined servers this surface exposes.
+/// Per-surface tool selection: which defined servers this surface exposes, and
+/// which compiled-in built-ins it has turned off.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SurfaceConfig {
     /// Server names (from `[[servers]]`) this surface hosts.
     #[serde(default)]
     pub enabled: Vec<String>,
+    /// Built-in (in-process, compiled-in) server names this surface has explicitly
+    /// **disabled**. A built-in is hosted by default; naming it here turns it off
+    /// for this surface without needing an external override. Names not listed stay
+    /// enabled, so a config written before this key existed leaves every built-in
+    /// on. Skipped when empty so existing files don't gain noise on the next save.
+    /// da#538 slice 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_builtins: Vec<String>,
 }
 
 /// Parsed `client-mcp.toml`: server definitions plus per-surface enable lists.
@@ -181,6 +190,22 @@ impl ClientMcpConfig {
             .unwrap_or(&[])
     }
 
+    /// The **raw** list of built-in server names this surface has disabled.
+    ///
+    /// Like [`surface_enabled_names`](Self::surface_enabled_names) this is the
+    /// per-surface list as written, with **no** [`DEFAULT_SURFACE`] fallback: a
+    /// surface with no entry returns an empty slice, meaning every compiled-in
+    /// built-in stays on for it. This is what
+    /// [`McpHost::start_with_disabled`](crate::mcp_host::McpHost::start_with_disabled)
+    /// consults and what an editor toggles against. Built-in disable is per-surface
+    /// on purpose — a hands-free surface can silence a built-in the desktop keeps.
+    pub fn surface_disabled_builtins(&self, surface: &str) -> &[String] {
+        self.surfaces
+            .get(surface)
+            .map(|s| s.disabled_builtins.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Add a new server definition.
     ///
     /// Rejects an empty name and a duplicate of an existing one — the same
@@ -255,6 +280,28 @@ impl ClientMcpConfig {
             }
         } else {
             entry.enabled.retain(|n| n != name);
+        }
+    }
+
+    /// Disable or re-enable a built-in (in-process) server for one surface.
+    ///
+    /// `disabled = true` adds `name` to the surface's `disabled_builtins` list (the
+    /// built-in stops being hosted); `disabled = false` removes it (the built-in
+    /// returns to its default-on state). Materializes a [`SurfaceConfig`] for
+    /// `surface` if it has none and touches only the named surface, mirroring
+    /// [`set_surface_enabled`](Self::set_surface_enabled). Adding is idempotent.
+    ///
+    /// Unlike a server definition, the `name` is **not** validated against a known
+    /// set: which built-ins are compiled in is a build-time property of each client,
+    /// so a name no client hosts is simply inert (and harmless to carry).
+    pub fn set_builtin_disabled(&mut self, surface: &str, name: &str, disabled: bool) {
+        let entry = self.surfaces.entry(surface.to_string()).or_default();
+        if disabled {
+            if !entry.disabled_builtins.iter().any(|n| n == name) {
+                entry.disabled_builtins.push(name.to_string());
+            }
+        } else {
+            entry.disabled_builtins.retain(|n| n != name);
         }
     }
 
@@ -686,5 +733,77 @@ command = "b"
         // A surface with no entry yields an empty slice, with NO default fallback
         // (unlike `resolved_servers`).
         assert!(cfg.surface_enabled_names("voice").is_empty());
+    }
+
+    // ----- Built-in disable (da#538 slice 4) -----
+
+    #[test]
+    fn old_config_without_disabled_builtins_parses_with_empty() {
+        // A config written before the `disabled_builtins` key existed must parse,
+        // leaving every built-in on (empty disabled list) for every surface.
+        let cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        assert!(cfg.surface_disabled_builtins("gtk").is_empty());
+        assert!(cfg.surface_disabled_builtins("tui").is_empty());
+        assert!(cfg.surface_disabled_builtins("nonesuch").is_empty());
+    }
+
+    #[test]
+    fn set_builtin_disabled_materializes_and_is_idempotent() {
+        let mut cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        // "voice" has no entry of its own.
+        assert!(cfg.surface_disabled_builtins("voice").is_empty());
+
+        cfg.set_builtin_disabled("voice", "web", true);
+        assert_eq!(cfg.surface_disabled_builtins("voice"), &["web"]);
+
+        // Adding the same name again does not duplicate it.
+        cfg.set_builtin_disabled("voice", "web", true);
+        assert_eq!(cfg.surface_disabled_builtins("voice"), &["web"]);
+
+        // Re-enabling removes it; only the named surface is touched.
+        cfg.set_builtin_disabled("voice", "web", false);
+        assert!(cfg.surface_disabled_builtins("voice").is_empty());
+    }
+
+    #[test]
+    fn set_builtin_disabled_is_per_surface() {
+        let mut cfg = ClientMcpConfig::default();
+        cfg.set_builtin_disabled("tui", "terminal", true);
+        assert_eq!(cfg.surface_disabled_builtins("tui"), &["terminal"]);
+        // A different surface is unaffected — built-in disable is per-surface.
+        assert!(cfg.surface_disabled_builtins("gtk").is_empty());
+    }
+
+    #[test]
+    fn disabled_builtins_roundtrips_through_save_load() {
+        let mut cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        cfg.set_builtin_disabled("gtk", "web", true);
+        cfg.set_builtin_disabled("gtk", "tasks", true);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client-mcp.toml");
+        cfg.save(&path).expect("save");
+
+        let reloaded = ClientMcpConfig::load(&path);
+        assert_eq!(reloaded.surface_disabled_builtins("gtk"), &["web", "tasks"]);
+        // Surfaces that disabled nothing round-trip to an empty list.
+        assert!(reloaded.surface_disabled_builtins("locked").is_empty());
+        // The surface's server enable list is preserved alongside.
+        assert_eq!(
+            names(&reloaded.resolved_servers("gtk")),
+            vec!["filesystem", "git"]
+        );
+    }
+
+    #[test]
+    fn empty_disabled_builtins_is_not_serialized() {
+        // A surface that has never disabled a built-in must not gain a
+        // `disabled_builtins = []` line, so existing files stay stable on re-save.
+        let cfg = ClientMcpConfig::from_toml(SAMPLE).unwrap();
+        let toml = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !toml.contains("disabled_builtins"),
+            "empty disabled_builtins should be skipped, got:\n{toml}"
+        );
     }
 }
