@@ -9,6 +9,11 @@ pub enum PromptSectionKind {
     Database,
     Learning,
     ToolUse,
+    /// Delegation to subagents (#550): when and how to hand separable parts of
+    /// a big task to a child agent, bind each to a plan step, review its output
+    /// before trusting it, and roll results up level-by-level. Leans on the
+    /// [`Self::Scratchpad`] step machinery rather than reinventing roll-up.
+    Subagents,
     // Dynamic (built per-turn):
     /// Configurable disposition blurb (issue #226). Rendered from the active
     /// [`Personality`] and injected before [`Self::ToolAvailability`] and the
@@ -180,6 +185,7 @@ const SECTION_SCRATCHPAD: &str = include_str!("sections/scratchpad.txt");
 const SECTION_DATABASE: &str = include_str!("sections/database.txt");
 const SECTION_LEARNING: &str = include_str!("sections/learning.txt");
 const SECTION_TOOL_USE: &str = include_str!("sections/tool_use.txt");
+const SECTION_SUBAGENTS: &str = include_str!("sections/subagents.txt");
 
 /// Return the static (file-based) prompt sections in order.
 pub fn static_sections() -> Vec<PromptSection> {
@@ -194,6 +200,7 @@ pub fn static_sections() -> Vec<PromptSection> {
         PromptSection::new(PromptSectionKind::Database, SECTION_DATABASE),
         PromptSection::new(PromptSectionKind::Learning, SECTION_LEARNING),
         PromptSection::new(PromptSectionKind::ToolUse, SECTION_TOOL_USE),
+        PromptSection::new(PromptSectionKind::Subagents, SECTION_SUBAGENTS),
     ]
 }
 
@@ -237,6 +244,7 @@ mod tests {
         assert_eq!(sections[4].kind, PromptSectionKind::Database);
         assert_eq!(sections[5].kind, PromptSectionKind::Learning);
         assert_eq!(sections[6].kind, PromptSectionKind::ToolUse);
+        assert_eq!(sections[7].kind, PromptSectionKind::Subagents);
     }
 
     #[test]
