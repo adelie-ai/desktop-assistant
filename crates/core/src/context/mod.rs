@@ -210,19 +210,24 @@ pub(crate) struct AmbientContext {
     pub now_line: String,
     /// One-turn system-prompt refinement, or empty for none.
     pub system_refinement: String,
+    /// Self-reported client context (#549): the user + their device. `None` when
+    /// the client sent none — the assembled prompt then carries no client-context
+    /// block (fail-closed; the daemon never substitutes its own host values).
+    pub client_context: Option<crate::prompts::ClientContext>,
 }
 
 impl AmbientContext {
     /// Read the per-turn ambient context from the task-locals the daemon
     /// dispatch wrapper installs. The single place these task-locals are read;
     /// unset (tests, background jobs) yields the defaults — the standard
-    /// personality, no `[Now]` block, no refinement — so those callers behave
-    /// exactly as before.
+    /// personality, no `[Now]` block, no refinement, no client context — so
+    /// those callers behave exactly as before.
     pub fn current() -> Self {
         Self {
             personality: crate::ports::llm::current_personality(),
             now_line: crate::ports::llm::current_now_context(),
             system_refinement: crate::ports::llm::current_system_refinement(),
+            client_context: crate::ports::transport::current_client_context(),
         }
     }
 }
@@ -696,6 +701,22 @@ fn assemble_system_instruction(tool_note: String, ambient: &AmbientContext) -> S
         sections.push(PromptSection::new(
             PromptSectionKind::Personality,
             personality_blurb,
+        ));
+    }
+
+    // Client context (#549): a stable, per-connection grounding block ("about the
+    // user & their device") rendered from the self-reported context. Injected
+    // here — into the cached system instruction, unlike the volatile `[Now]`
+    // line — because it is stable for the connection, so it can be cached. A
+    // DYNAMIC section (not a `static_sections()` member), so it never perturbs
+    // the golden static-prompt snapshot. Omitted entirely when no field is
+    // present (fail-closed): the daemon never substitutes its own host values.
+    if let Some(ctx) = &ambient.client_context
+        && let Some(section) = prompts::render_client_context(ctx)
+    {
+        sections.push(PromptSection::new(
+            PromptSectionKind::ClientContext,
+            section,
         ));
     }
 

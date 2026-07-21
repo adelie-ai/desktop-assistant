@@ -208,6 +208,39 @@ fn looks_like_secret(core: &str) -> bool {
     false
 }
 
+/// Maximum rendered length, in characters, of a single client-context field
+/// (#549). The value is self-reported; capping bounds the blast radius of an
+/// overlong or padded value templated into the system prompt.
+const MAX_CLIENT_FIELD_CHARS: usize = 200;
+
+/// Sanitize one self-reported [`desktop_assistant_protocol::ClientContext`]
+/// field (#549) before it is templated into the system prompt.
+///
+/// The value is untrusted display data, so this:
+/// - collapses every run of whitespace (including newlines and tabs) to a
+///   single space, and drops other control characters — so a value cannot forge
+///   a prompt-section header on its own line or smuggle control sequences;
+/// - trims, and caps the length on a character boundary.
+///
+/// Returns `None` when nothing legible remains, so a blank/whitespace-only value
+/// is treated as absent (fail-closed: the caller then renders no clause for it).
+pub(crate) fn sanitize_client_field(raw: &str) -> Option<String> {
+    // Map any whitespace to a plain space (so newlines/tabs can't survive as
+    // line breaks), then drop remaining control characters entirely.
+    let normalized: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    // Collapse internal whitespace runs and trim the ends.
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    // Cap by character count (not bytes) so a multibyte tail can never panic.
+    Some(collapsed.chars().take(MAX_CLIENT_FIELD_CHARS).collect())
+}
+
 #[cfg(test)]
 mod stream_sanitizer_tests {
     use super::{StreamSanitizer, sanitize_assistant_text_for_stream};

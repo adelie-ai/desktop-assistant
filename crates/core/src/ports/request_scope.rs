@@ -6,7 +6,8 @@
 //! A handful of per-request values propagate through the turn as
 //! `tokio::task_local!`s — the user id (#105), the login-session id (#261),
 //! the connection's transport kind plus its system-id co-location result and
-//! client host label (#243/#248). The transport dispatcher installs all of
+//! client host label (#243/#248), and the self-reported client context (#549).
+//! The transport dispatcher installs all of
 //! them around each request. But `task_local`s do **not** cross a
 //! `tokio::spawn`, and the streaming send-message path spawns the turn body on
 //! a fresh task. So every spawn site has to *capture each value before the
@@ -46,8 +47,9 @@ use crate::domain::TransportKind;
 use crate::ports::auth::{UserId, current_user_id, with_user_id};
 use crate::ports::session::{SessionId, current_session_id, with_session_id};
 use crate::ports::transport::{
-    current_client_label, current_co_location, current_transport_kind, with_client_label,
-    with_co_location, with_transport_kind,
+    ClientContext, current_client_context, current_client_label, current_co_location,
+    current_transport_kind, with_client_context, with_client_label, with_co_location,
+    with_transport_kind,
 };
 
 /// The set of request-scoped task-locals that must be re-installed inside a
@@ -74,6 +76,11 @@ pub struct RequestScope {
     /// Client-reported host label (#248) for a friendlier remote tool note;
     /// `None` when the client sent none.
     pub client_label: Option<String>,
+    /// Self-reported client context (#549) — the user + their device — used to
+    /// ground the system prompt. `None` when the client sent none. Must ride the
+    /// bundle because it is installed at the transport layer but read when the
+    /// prompt is assembled, deep inside the spawned turn body.
+    pub client_context: Option<ClientContext>,
 }
 
 impl RequestScope {
@@ -91,6 +98,7 @@ impl RequestScope {
             transport: current_transport_kind(),
             co_located: current_co_location(),
             client_label: current_client_label(),
+            client_context: current_client_context(),
         }
     }
 
@@ -101,8 +109,8 @@ impl RequestScope {
     /// dispatcher's (and is immaterial — the locals are independent slots).
     ///
     /// `current_user_id()`, `current_session_id()`, `current_transport_kind()`,
-    /// `current_co_location()`, and `current_client_label()` inside `fut` all
-    /// observe the captured values.
+    /// `current_co_location()`, `current_client_label()`, and
+    /// `current_client_context()` inside `fut` all observe the captured values.
     pub async fn scope<F, T>(self, fut: F) -> T
     where
         F: Future<Output = T>,
@@ -113,14 +121,18 @@ impl RequestScope {
             transport,
             co_located,
             client_label,
+            client_context,
         } = self;
-        with_co_location(
-            co_located,
-            with_client_label(
-                client_label,
-                with_transport_kind(
-                    transport,
-                    with_user_id(user_id, with_session_id(session_id, fut)),
+        with_client_context(
+            client_context,
+            with_co_location(
+                co_located,
+                with_client_label(
+                    client_label,
+                    with_transport_kind(
+                        transport,
+                        with_user_id(user_id, with_session_id(session_id, fut)),
+                    ),
                 ),
             ),
         )

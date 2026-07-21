@@ -187,6 +187,9 @@ impl UdsClient {
             jwt: bearer_token.map(str::to_string),
             system_id: system_id.map(str::to_string),
             host_label: host_label.map(str::to_string),
+            // Clients do not yet report a client context (#549 Phase 2); the
+            // daemon-side plumbing lands first, so this stays `None` for now.
+            client_context: None,
         })?;
         write_frame(&mut write_half, &handshake)
             .await

@@ -278,6 +278,68 @@ impl PersonalityOverride {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ClientContext (#549)
+// ---------------------------------------------------------------------------
+
+/// Best-effort, self-reported context about the person using a client and the
+/// device they are on (issue #549). A client fills in whatever it can discover
+/// and omits the rest; the daemon renders only the fields that are present.
+///
+/// # Trust posture
+///
+/// Like the per-machine `system_id` handshake hint, this is **untrusted display
+/// data, not a trust boundary**: it is self-reported by the client, no privilege
+/// is gated on it, it is sanitized before it is templated into the system
+/// prompt, and it is kept out of logs.
+///
+/// # Fail-closed
+///
+/// Every field is optional and an absent field is simply omitted. The daemon
+/// **never** substitutes its own host's `HOME` / `USER` / hostname for a missing
+/// value — doing so would leak the daemon host into a multi-tenant prompt.
+///
+/// Each field is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+/// so an all-absent value serializes to `{}` and never widens the wire shape,
+/// matching the `system_id` / `host_label` handshake convention.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClientContext {
+    /// The user's real / display name (e.g. `"Ada Lovelace"`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_name: Option<String>,
+    /// The user's account / login name on their device (e.g. `"ada"`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The user's home directory on their device (e.g. `"/home/ada"`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_dir: Option<String>,
+    /// The client device's hostname (e.g. `"analytical-engine"`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// The user's IANA timezone (e.g. `"Europe/London"`), if known. The
+    /// highest-value field: it lets the assistant resolve relative local times
+    /// ("now", "tonight", "this morning") in the user's own zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// The client device's operating system description (e.g. `"Ubuntu 24.04"`
+    /// or `"macOS 15.1"`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+}
+
+impl ClientContext {
+    /// Whether every field is absent. The daemon emits no prompt section for an
+    /// empty context (fail-closed).
+    pub fn is_empty(&self) -> bool {
+        self.real_name.is_none()
+            && self.username.is_none()
+            && self.home_dir.is_none()
+            && self.hostname.is_none()
+            && self.timezone.is_none()
+            && self.os.is_none()
+    }
+}
+
 #[cfg(test)]
 mod client_context_tests {
     use super::ClientContext;

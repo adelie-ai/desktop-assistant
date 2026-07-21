@@ -25,6 +25,16 @@
 //! host label (for a friendlier tool note) rides the same path via
 //! [`with_client_label`] / [`current_client_label`].
 //!
+//! ## Client context (#549)
+//!
+//! A connection may also carry a best-effort, self-reported [`ClientContext`]
+//! (the user's name/username/home and their device's hostname/timezone/OS),
+//! installed via [`with_client_context`] and read via [`current_client_context`]
+//! when the system prompt is assembled. It is untrusted display data, not a
+//! trust boundary. Like the other slots here it does not cross `tokio::spawn`,
+//! so it rides [`crate::ports::request_scope::RequestScope`] across the
+//! streaming turn's spawn.
+//!
 //! ## Default
 //!
 //! When no scope is installed — tests, dreaming jobs, and any caller that does
@@ -36,6 +46,11 @@
 //! [`current_client_label`] to `None`.
 
 use crate::domain::TransportKind;
+
+/// Best-effort, self-reported per-connection client context (#549). Defined in
+/// the dependency-light protocol crate and re-exported here because it rides the
+/// same request-scoped task-local plumbing as the #248 client label.
+pub use desktop_assistant_protocol::ClientContext;
 
 tokio::task_local! {
     /// The transport the current turn's connection arrived on. Installed by
@@ -58,6 +73,15 @@ tokio::task_local! {
     /// `None` when the client sent none. Installed via [`with_client_label`];
     /// read via [`current_client_label`].
     static CLIENT_LABEL: Option<String>;
+
+    /// The self-reported [`ClientContext`] for the current connection (#549):
+    /// the user's name/username/home and their device's hostname/timezone/OS,
+    /// used to ground the system prompt. `None` when the client sent none (⇒ no
+    /// client context block). Installed via [`with_client_context`]; read via
+    /// [`current_client_context`]. It is untrusted display data, not a trust
+    /// boundary — no privilege is gated on it, and it is sanitized before it is
+    /// templated into the prompt.
+    static CLIENT_CONTEXT: Option<ClientContext>;
 }
 
 /// Run `fut` with `kind` installed as the current task-local transport. All
@@ -117,6 +141,23 @@ where
 /// installed or the client sent none. Never panics or blocks.
 pub fn current_client_label() -> Option<String> {
     CLIENT_LABEL.try_with(|l| l.clone()).unwrap_or(None)
+}
+
+/// Run `fut` with `ctx` installed as the current connection's self-reported
+/// [`ClientContext`] (#549). `None` means the client sent none. Like every
+/// task-local it does not cross `tokio::spawn` — the streaming turn body must
+/// re-install it (via [`crate::ports::request_scope::RequestScope`]).
+pub async fn with_client_context<F, T>(ctx: Option<ClientContext>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CLIENT_CONTEXT.scope(ctx, fut).await
+}
+
+/// The current connection's self-reported [`ClientContext`] (#549), or `None`
+/// when no scope is installed or the client sent none. Never panics or blocks.
+pub fn current_client_context() -> Option<ClientContext> {
+    CLIENT_CONTEXT.try_with(|c| c.clone()).unwrap_or(None)
 }
 
 #[cfg(test)]

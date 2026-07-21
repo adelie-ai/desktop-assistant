@@ -435,6 +435,9 @@ async fn handle_connection(
         handshake.system_id.as_deref(),
     );
     let client_label = handshake.host_label;
+    // The self-reported client context (#549) rides the handshake alongside the
+    // #248 system-id fields. Best-effort display data, not a trust boundary.
+    let client_context = handshake.client_context;
 
     // Authenticate from the (optional) token and the kernel peer-cred. The
     // default validator requires a valid token; a local-trust daemon (#407)
@@ -512,7 +515,8 @@ async fn handle_connection(
     // the authoritative match result + an optional host label (#248).
     let auth_ctx = AuthContext::new(user_id.into_inner(), TransportKind::Uds)
         .with_co_location(co_located)
-        .with_client_label(client_label);
+        .with_client_label(client_label)
+        .with_client_context(client_context);
 
     dispatch_loop(handler, auth_ctx, inbound, sink).await;
 

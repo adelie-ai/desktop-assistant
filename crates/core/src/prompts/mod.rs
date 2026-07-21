@@ -15,6 +15,13 @@ pub enum PromptSectionKind {
     /// per-turn [`Self::SystemRefinement`] so the standing personality is set
     /// up front but a per-turn refinement can still adjust it last.
     Personality,
+    /// Self-reported facts about the user and their device (issue #549) —
+    /// name, username, home directory, hostname, timezone, OS. Rendered from the
+    /// per-connection [`ClientContext`] and injected into the cached system
+    /// instruction (it is stable for the connection, unlike the volatile `[Now]`
+    /// line) so the model can address the user and resolve local times. A
+    /// dynamic section, so it never perturbs the static-prompt golden snapshot.
+    ClientContext,
     ToolAvailability,
     ContextSummary,
     MessageSummary,
@@ -34,6 +41,12 @@ pub enum PromptSectionKind {
 /// (#377). The prompt-rendering logic ([`render_blurb`] + the phrasing tables)
 /// stays in this module.
 pub use desktop_assistant_protocol::{Personality, PersonalityLevel, PersonalityOverride};
+
+/// Re-exported at its canonical prompt path (#549): the type lives in the
+/// dependency-light protocol crate, but the rendering logic
+/// ([`render_client_context`]) stays here — mirroring how [`Personality`] and
+/// [`render_blurb`] are split.
+pub use desktop_assistant_protocol::ClientContext;
 
 /// The fixed adaptation clause appended to every personality blurb. It tells
 /// the model the levels are a starting point and to match the user's energy
@@ -78,6 +91,79 @@ pub fn render_blurb(p: &Personality) -> String {
 
     let disposition = format!("In your default manner, you {}.", join_clauses(&clauses));
     format!("{disposition} {ADAPTATION_CLAUSE}")
+}
+
+// --- Client context (#549) -------------------------------------------------
+
+/// Header for the client-context section. Used both as the rendered prefix and
+/// as the marker the assembler recognises the section by.
+const CLIENT_CONTEXT_HEADER: &str = "== About the user & their device ==";
+
+/// Render a [`ClientContext`] (issue #549) into an "about the user & their
+/// device" system-prompt section, or `None` when no field is present.
+///
+/// Each value is sanitized ([`crate::sanitize::sanitize_client_field`]) before
+/// it is templated — the context is untrusted, self-reported display data — and
+/// any field that sanitizes to empty is treated as absent. One clause is emitted
+/// per present field; the timezone clause (the highest-value field) tells the
+/// model to resolve relative local times in the user's zone.
+///
+/// **Fail-closed:** with no present field the function returns `None` and the
+/// caller emits no section. It never substitutes the daemon host's own
+/// `HOME` / `USER` / hostname for a missing value.
+pub fn render_client_context(ctx: &ClientContext) -> Option<String> {
+    let sanitize = |v: &Option<String>| -> Option<String> {
+        v.as_deref()
+            .and_then(crate::sanitize::sanitize_client_field)
+    };
+    let real_name = sanitize(&ctx.real_name);
+    let username = sanitize(&ctx.username);
+    let home_dir = sanitize(&ctx.home_dir);
+    let hostname = sanitize(&ctx.hostname);
+    let timezone = sanitize(&ctx.timezone);
+    let os = sanitize(&ctx.os);
+
+    let mut clauses: Vec<String> = Vec::new();
+
+    // Who the user is.
+    match (&real_name, &username) {
+        (Some(name), Some(user)) => {
+            clauses.push(format!("The user's name is {name} (username {user})."))
+        }
+        (Some(name), None) => clauses.push(format!("The user's name is {name}.")),
+        (None, Some(user)) => clauses.push(format!("The user's username is {user}.")),
+        (None, None) => {}
+    }
+
+    // The device they are on.
+    match (&hostname, &os) {
+        (Some(host), Some(os)) => clauses.push(format!(
+            "They are on a device named \"{host}\" running {os}."
+        )),
+        (Some(host), None) => clauses.push(format!("They are on a device named \"{host}\".")),
+        (None, Some(os)) => clauses.push(format!("Their device is running {os}.")),
+        (None, None) => {}
+    }
+
+    // Where their files live.
+    if let Some(home) = &home_dir {
+        clauses.push(format!("Their home directory is {home}."));
+    }
+
+    // Timezone — the highest-value field: resolve relative local times here.
+    if let Some(tz) = &timezone {
+        clauses.push(format!(
+            "The user's timezone is {tz}; when they refer to local times such as \
+             \"now\", \"tonight\", or \"this morning\", resolve them in that zone \
+             rather than UTC or your own default."
+        ));
+    }
+
+    if clauses.is_empty() {
+        return None;
+    }
+
+    Some(format!("{CLIENT_CONTEXT_HEADER}\n{}", clauses.join(" ")))
 }
 
 /// Per-level phrasing for a single trait. Each field is the clause body used at
@@ -659,7 +745,10 @@ mod tests {
             .lines()
             .filter(|l| l.trim_start().starts_with("=="))
             .count();
-        assert_eq!(header_lines, 1, "only the real header may start a line: {section}");
+        assert_eq!(
+            header_lines, 1,
+            "only the real header may start a line: {section}"
+        );
         assert!(!section.contains("\n== Injected"), "{section}");
     }
 }

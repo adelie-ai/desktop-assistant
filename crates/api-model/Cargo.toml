@@ -8,6 +8,10 @@ license = "AGPL-3.0-or-later"
 desktop-assistant-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# base64 for the header-safe encoding of the #549 client-context WS header. Same
+# 0.22 line already used by ws-interface / mcp-client; alloc-only (no std/default
+# features) to keep this crate wasm-compatible for the web client (#377).
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 serde_json.workspace = true
