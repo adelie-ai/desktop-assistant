@@ -8,7 +8,7 @@ When to use it — be selective:
 Keep it current — the pad is live working state, not a write-once scaffold:
 - The [Current task] and [Plan] blocks you see each round are mirrors of your pad. If they've gone stale, that's yours to fix — a notepad full of crossed-out, finished items is worse than no notepad.
 - Once context starts dropping you'll also see a [Scratchpad] line listing the keys of your other notes — your reminder that they exist after the message that wrote them has scrolled away. It shows keys only, so name notes descriptively (e.g. "deploy-target", "api-quirks") and builtin_scratchpad_search the key to read one back.
-- Update as you learn, don't just append: when a finding changes, rewrite the note (same key) instead of piling a contradicting one on top. Delete a note the moment it stops being useful.
+- Update as you learn, don't just append: when a finding changes, rewrite the note (same key) instead of piling a contradicting one on top. And if what you're about to jot is really an updated copy of a note you already keep, reuse that key rather than spawning a near-duplicate. Delete a note the moment it stops being useful, so finished to-dos and stale findings don't pile up.
 - This is a per-round habit, not one-time setup. Glance at your pad as you work and keep it matching reality.
 
 The goal note:
@@ -23,7 +23,8 @@ Work a multi-step task as a stack — push when you dig in, pop when you climb o
 
 Finishing:
 - Close out before you reply: complete_step any step still open, then clear your goal note. A leftover open step or stale goal will resurface next turn and mislead you.
-- Review your notes (the [Plan] and your outcome notes), then tell the user what you did and what you learned — from your notes, not from raw tool output. Promote anything worth keeping beyond this conversation to the knowledge base with builtin_knowledge_base_write, then it's safe to delete here.
+- Re-summarize, don't reconcile: your notes and [Plan] are raw material, not the finished product. Distill them into one clean, current picture of what you did and what you learned, keeping the details that still matter and letting the working scaffolding (finished to-dos, superseded findings, per-step notes) fall away. You don't need to tidy every note one by one; replace the clutter with the summary. Tell the user from that, not from raw tool output, and promote anything worth keeping beyond this conversation to the knowledge base with builtin_knowledge_base_write.
+- Then leave the pad clean: once the task is truly done, clear it (builtin_scratchpad_delete all: true, or delete just the keys that have served their purpose) so nothing bleeds into the next request. A pad full of yesterday's leftovers is worse than an empty one.
 
 Reading:
 - builtin_scratchpad_search with no query lists all notes newest-first; with a query it full-text searches; with keys it fetches specific notes. Always pass max_results. To recover the detail behind a "<compacted to scratchpad …>" pointer, re-read the named note or re-run the tool.

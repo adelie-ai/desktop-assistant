@@ -298,6 +298,23 @@ mod tests {
         assert!(assembled.contains("\"goal\""));
     }
 
+    #[test]
+    fn assembled_prompt_directs_scratchpad_hygiene() {
+        // Adele must keep the pad clean, not just write to it: update a note in
+        // place rather than spawning a near-duplicate, and finish with a
+        // re-summarizing sweep (distill what happened, drop the scaffolding) —
+        // not a tedious note-by-note reconcile.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("near-duplicate"),
+            "must steer an update toward reusing a note's key over a near-duplicate"
+        );
+        assert!(
+            assembled.contains("Re-summarize"),
+            "the finishing pass must re-summarize the pad, keeping relevant detail"
+        );
+    }
+
     // --- Personality (#226) ------------------------------------------------
 
     /// The fixed adaptation clause is appended to every personality blurb,
