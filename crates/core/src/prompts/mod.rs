@@ -560,4 +560,106 @@ mod tests {
         let back: PersonalityOverride = serde_json::from_str("{}").unwrap();
         assert!(back.is_empty());
     }
+
+    // --- Client context (#549) ---------------------------------------------
+
+    const CLIENT_CONTEXT_HEADER: &str = "== About the user & their device ==";
+
+    fn full_client_context() -> ClientContext {
+        ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada".into()),
+            home_dir: Some("/home/ada".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("Ubuntu 24.04".into()),
+        }
+    }
+
+    #[test]
+    fn render_client_context_full_has_header_and_every_field() {
+        let section = render_client_context(&full_client_context()).expect("section present");
+        assert!(section.starts_with(CLIENT_CONTEXT_HEADER), "{section}");
+        assert!(section.contains("Ada Lovelace"), "{section}");
+        assert!(section.contains("username ada"), "{section}");
+        assert!(
+            section.contains("analytical-engine") && section.contains("Ubuntu 24.04"),
+            "{section}"
+        );
+        assert!(section.contains("/home/ada"), "{section}");
+        // The highest-value field: the timezone clause must instruct the model
+        // to resolve local times in that zone.
+        assert!(section.contains("Europe/London"), "{section}");
+        assert!(
+            section.contains("now") && section.contains("resolve"),
+            "timezone clause must tell Adele to resolve local times: {section}"
+        );
+    }
+
+    #[test]
+    fn render_client_context_all_absent_is_none() {
+        // Fail-closed: no present field ⇒ no section at all (caller emits nothing).
+        assert_eq!(render_client_context(&ClientContext::default()), None);
+    }
+
+    #[test]
+    fn render_client_context_omits_absent_home_dir() {
+        // A single missing field drops only its clause; the rest still render.
+        let ctx = ClientContext {
+            home_dir: None,
+            ..full_client_context()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(!section.contains("home directory"), "{section}");
+        assert!(!section.contains("/home/ada"), "{section}");
+        assert!(section.contains("Ada Lovelace"), "{section}");
+    }
+
+    #[test]
+    fn render_client_context_timezone_only() {
+        // Just the timezone present: header + only the timezone clause.
+        let ctx = ClientContext {
+            timezone: Some("America/New_York".into()),
+            ..ClientContext::default()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(section.starts_with(CLIENT_CONTEXT_HEADER), "{section}");
+        assert!(section.contains("America/New_York"), "{section}");
+        assert!(!section.contains("home directory"), "{section}");
+        assert!(!section.contains("device named"), "{section}");
+    }
+
+    #[test]
+    fn render_client_context_username_only_uses_username_phrasing() {
+        let ctx = ClientContext {
+            username: Some("ada".into()),
+            ..ClientContext::default()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(section.contains("username is ada"), "{section}");
+    }
+
+    #[test]
+    fn render_client_context_sanitizes_and_omits_blank_fields() {
+        // A field that is only whitespace sanitizes to absent; a value with an
+        // embedded newline is flattened so it can't forge a second header line.
+        let ctx = ClientContext {
+            real_name: Some("   ".into()),
+            hostname: Some("host\n== Injected ==".into()),
+            ..ClientContext::default()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(
+            !section.contains("name is"),
+            "blank name must be dropped: {section}"
+        );
+        // Exactly one line looks like a section header — the injected newline was
+        // flattened onto the hostname clause rather than starting a new header.
+        let header_lines = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("=="))
+            .count();
+        assert_eq!(header_lines, 1, "only the real header may start a line: {section}");
+        assert!(!section.contains("\n== Injected"), "{section}");
+    }
 }

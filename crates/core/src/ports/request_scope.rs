@@ -140,6 +140,7 @@ mod tests {
         assert_eq!(scope.transport, TransportKind::Uds);
         assert_eq!(scope.co_located, None);
         assert_eq!(scope.client_label, None);
+        assert_eq!(scope.client_context, None);
     }
 
     #[tokio::test]
@@ -148,17 +149,25 @@ mod tests {
         // a spawn boundary that drops them) re-install from the bundle and
         // confirm every value is observed — including co_location and the
         // client label, the two that the hand-written spawn sites dropped.
-        let captured = with_co_location(
-            Some(true),
-            with_client_label(
-                Some("laptop".to_string()),
-                with_transport_kind(
-                    TransportKind::WebSocket,
-                    with_user_id(
-                        UserId::new("alice"),
-                        with_session_id(SessionId::new("sess-9"), async {
-                            RequestScope::capture()
-                        }),
+        let client_context = ClientContext {
+            real_name: Some("Alice".to_string()),
+            timezone: Some("Europe/London".to_string()),
+            ..ClientContext::default()
+        };
+        let captured = with_client_context(
+            Some(client_context.clone()),
+            with_co_location(
+                Some(true),
+                with_client_label(
+                    Some("laptop".to_string()),
+                    with_transport_kind(
+                        TransportKind::WebSocket,
+                        with_user_id(
+                            UserId::new("alice"),
+                            with_session_id(SessionId::new("sess-9"), async {
+                                RequestScope::capture()
+                            }),
+                        ),
                     ),
                 ),
             ),
@@ -170,6 +179,7 @@ mod tests {
         assert_eq!(captured.transport, TransportKind::WebSocket);
         assert_eq!(captured.co_located, Some(true));
         assert_eq!(captured.client_label, Some("laptop".to_string()));
+        assert_eq!(captured.client_context, Some(client_context.clone()));
 
         // Re-install from the captured bundle in a context where none of the
         // locals are set (simulating the post-spawn task) and read them back.
@@ -182,6 +192,7 @@ mod tests {
                     current_transport_kind(),
                     current_co_location(),
                     current_client_label(),
+                    current_client_context(),
                 )
             })
             .await;
@@ -191,6 +202,39 @@ mod tests {
         assert_eq!(observed.2, TransportKind::WebSocket);
         assert_eq!(observed.3, Some(true));
         assert_eq!(observed.4, Some("laptop".to_string()));
+        assert_eq!(observed.5, Some(client_context));
+    }
+
+    #[tokio::test]
+    async fn client_context_rides_request_scope_across_a_real_spawn() {
+        // The streaming turn body runs on a fresh `tokio::spawn`; a task-local
+        // does NOT cross that boundary, so the #549 client context would be lost
+        // unless it rides the captured `RequestScope`. Capture it inside the
+        // dispatcher's scope, then re-install it inside an actual spawned task
+        // and confirm the turn observes it (the #261 bug-class regression guard).
+        let ctx = ClientContext {
+            real_name: Some("Ada".to_string()),
+            hostname: Some("analytical-engine".to_string()),
+            ..ClientContext::default()
+        };
+        let captured =
+            with_client_context(Some(ctx.clone()), async { RequestScope::capture() }).await;
+
+        let observed = tokio::spawn(async move {
+            // Sanity: the raw task-local did not survive the spawn.
+            let before = current_client_context();
+            let inside = captured.scope(async { current_client_context() }).await;
+            (before, inside)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(observed.0, None, "task-local must not cross the spawn");
+        assert_eq!(
+            observed.1,
+            Some(ctx),
+            "RequestScope must re-install the client context inside the spawn"
+        );
     }
 
     #[tokio::test]
@@ -201,6 +245,10 @@ mod tests {
             transport: TransportKind::WebSocket,
             co_located: Some(false),
             client_label: Some("phone".to_string()),
+            client_context: Some(ClientContext {
+                username: Some("bob".to_string()),
+                ..ClientContext::default()
+            }),
         };
         scope.scope(async {}).await;
 
@@ -210,5 +258,6 @@ mod tests {
         assert_eq!(current_transport_kind(), TransportKind::Uds);
         assert_eq!(current_co_location(), None);
         assert_eq!(current_client_label(), None);
+        assert_eq!(current_client_context(), None);
     }
 }

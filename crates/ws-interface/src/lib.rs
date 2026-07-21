@@ -751,6 +751,55 @@ where
     Ok(())
 }
 
+#[cfg(test)]
+mod client_context_header_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    fn header_map(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(api::WS_CLIENT_CONTEXT_HEADER),
+            HeaderValue::from_str(value).expect("valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn client_context_header_round_trips() {
+        // Acceptance (f): a full ClientContext survives the base64(JSON) header
+        // encode/decode the WS upgrade uses (#549).
+        let ctx = api::ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada".into()),
+            home_dir: Some("/home/ada".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("Ubuntu 24.04".into()),
+        };
+        let encoded = encode_client_context_header(&ctx).expect("encode");
+        let decoded = decode_client_context_header(&header_map(&encoded)).expect("decode");
+        assert_eq!(decoded, ctx);
+    }
+
+    #[test]
+    fn absent_header_yields_no_context() {
+        assert_eq!(decode_client_context_header(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn malformed_header_is_fail_closed_none() {
+        // Not base64 at all.
+        assert_eq!(
+            decode_client_context_header(&header_map("not valid base64 !!")),
+            None
+        );
+        // Valid base64, but not JSON for a ClientContext.
+        let junk = base64::engine::general_purpose::STANDARD.encode("this is not json");
+        assert_eq!(decode_client_context_header(&header_map(&junk)), None);
+    }
+}
+
 #[cfg(all(test, feature = "tls"))]
 mod tls_accept_tests {
     use super::*;

@@ -178,4 +178,30 @@ mod tests {
         assert_eq!(observed.as_deref(), Some("laptop"));
         assert_eq!(current_client_label(), None);
     }
+
+    #[tokio::test]
+    async fn current_client_context_defaults_to_none_and_observes_scope() {
+        // Mirrors the client-label slot (#549): unset ⇒ `None`, an installed
+        // scope is observed inside the future, and the slot is unset again after.
+        assert_eq!(current_client_context(), None);
+        let ctx = ClientContext {
+            real_name: Some("Ada".to_string()),
+            timezone: Some("Europe/London".to_string()),
+            ..ClientContext::default()
+        };
+        let observed =
+            with_client_context(Some(ctx.clone()), async { current_client_context() }).await;
+        assert_eq!(observed, Some(ctx));
+        assert_eq!(current_client_context(), None);
+    }
+
+    #[tokio::test]
+    async fn spawned_task_outside_scope_sees_no_client_context() {
+        // task_local slots don't cross `tokio::spawn`; the bundle in
+        // `RequestScope` is what carries the context across the streaming spawn.
+        let observed = tokio::spawn(async { current_client_context() })
+            .await
+            .unwrap();
+        assert_eq!(observed, None);
+    }
 }

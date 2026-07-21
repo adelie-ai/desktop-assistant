@@ -277,3 +277,64 @@ impl PersonalityOverride {
         *self == Self::default()
     }
 }
+
+#[cfg(test)]
+mod client_context_tests {
+    use super::ClientContext;
+
+    fn full() -> ClientContext {
+        ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada".into()),
+            home_dir: Some("/home/ada".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("Ubuntu 24.04".into()),
+        }
+    }
+
+    #[test]
+    fn default_is_empty_and_absent_fields_are_skipped_on_the_wire() {
+        // A fully-absent context is `is_empty()` and serializes to `{}` — the
+        // `skip_serializing_if` on every field keeps an all-`None` value from
+        // widening the wire shape (mirrors the `system_id`/`host_label` pattern).
+        let ctx = ClientContext::default();
+        assert!(ctx.is_empty());
+        assert_eq!(serde_json::to_string(&ctx).unwrap(), "{}");
+    }
+
+    #[test]
+    fn full_context_round_trips_losslessly() {
+        let ctx = full();
+        assert!(!ctx.is_empty());
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: ClientContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ctx);
+    }
+
+    #[test]
+    fn partial_context_omits_absent_fields_but_round_trips() {
+        // Only timezone present: the wire form carries just that key, and a
+        // decode preserves exactly the present field (the rest stay `None`).
+        let ctx = ClientContext {
+            timezone: Some("America/New_York".into()),
+            ..ClientContext::default()
+        };
+        assert!(!ctx.is_empty());
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert_eq!(json, r#"{"timezone":"America/New_York"}"#);
+        let back: ClientContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ctx);
+    }
+
+    #[test]
+    fn unknown_and_missing_keys_decode_leniently() {
+        // Forward/backward compatibility: an unknown key is ignored and any
+        // missing key defaults to `None`, so an older/newer client's payload
+        // never fails to parse.
+        let back: ClientContext =
+            serde_json::from_str(r#"{"username":"ada","future_field":"x"}"#).unwrap();
+        assert_eq!(back.username.as_deref(), Some("ada"));
+        assert!(back.real_name.is_none());
+    }
+}

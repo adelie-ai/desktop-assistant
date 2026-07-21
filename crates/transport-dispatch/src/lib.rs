@@ -746,7 +746,9 @@ mod tests {
         let a = AuthContext::new("dave", TransportKind::WebSocket);
         assert_eq!(a.co_located, None);
         assert_eq!(a.client_label, None);
+        assert_eq!(a.client_context, None);
         assert_eq!(AuthContext::anonymous().co_located, None);
+        assert_eq!(AuthContext::anonymous().client_context, None);
     }
 
     #[test]
@@ -756,6 +758,23 @@ mod tests {
             .with_client_label(Some("laptop".to_string()));
         assert_eq!(a.co_located, Some(true));
         assert_eq!(a.client_label.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn auth_context_builder_attaches_client_context() {
+        // #549: the handshake's client context threads onto the AuthContext so
+        // the dispatcher can install it as a task-local for the turn.
+        let ctx = desktop_assistant_core::ports::transport::ClientContext {
+            username: Some("dave".to_string()),
+            ..Default::default()
+        };
+        let a = AuthContext::new("dave", TransportKind::Uds).with_client_context(Some(ctx.clone()));
+        assert_eq!(a.client_context, Some(ctx));
+        // Default carries none.
+        assert_eq!(
+            AuthContext::new("dave", TransportKind::Uds).client_context,
+            None
+        );
     }
 
     #[test]

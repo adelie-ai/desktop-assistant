@@ -1690,6 +1690,7 @@ mod tests {
             jwt: Some("tok".into()),
             system_id: None,
             host_label: None,
+            client_context: None,
         };
         let json = serde_json::to_string(&h).unwrap();
         assert_eq!(json, r#"{"jwt":"tok"}"#, "absent fields must not appear");
@@ -1698,6 +1699,36 @@ mod tests {
         assert_eq!(legacy.jwt.as_deref(), Some("tok"));
         assert_eq!(legacy.system_id, None);
         assert_eq!(legacy.host_label, None);
+        assert_eq!(legacy.client_context, None);
+    }
+
+    #[test]
+    fn uds_handshake_carries_client_context_and_round_trips() {
+        // The optional #549 client context rides the handshake alongside the
+        // #248 system-id fields; when present it must round-trip losslessly, and
+        // when absent it must not appear on the wire (skip_serializing_if).
+        let ctx = ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            timezone: Some("Europe/London".into()),
+            ..ClientContext::default()
+        };
+        let h = UdsHandshake {
+            jwt: Some("tok".into()),
+            client_context: Some(ctx.clone()),
+            ..UdsHandshake::default()
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("client_context"), "json: {json}");
+        assert!(json.contains("Europe/London"), "json: {json}");
+        let back: UdsHandshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.client_context, Some(ctx));
+
+        // Absent context is skipped entirely.
+        let bare = UdsHandshake {
+            jwt: Some("tok".into()),
+            ..UdsHandshake::default()
+        };
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"jwt":"tok"}"#);
     }
 
     #[test]
@@ -1715,6 +1746,7 @@ mod tests {
             jwt: Some("tok".into()),
             system_id: Some("machine-abc".into()),
             host_label: Some("laptop".into()),
+            client_context: None,
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: UdsHandshake = serde_json::from_str(&json).unwrap();
