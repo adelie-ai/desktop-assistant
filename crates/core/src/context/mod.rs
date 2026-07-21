@@ -210,19 +210,24 @@ pub(crate) struct AmbientContext {
     pub now_line: String,
     /// One-turn system-prompt refinement, or empty for none.
     pub system_refinement: String,
+    /// Self-reported client context (#549): the user + their device. `None` when
+    /// the client sent none — the assembled prompt then carries no client-context
+    /// block (fail-closed; the daemon never substitutes its own host values).
+    pub client_context: Option<crate::prompts::ClientContext>,
 }
 
 impl AmbientContext {
     /// Read the per-turn ambient context from the task-locals the daemon
     /// dispatch wrapper installs. The single place these task-locals are read;
     /// unset (tests, background jobs) yields the defaults — the standard
-    /// personality, no `[Now]` block, no refinement — so those callers behave
-    /// exactly as before.
+    /// personality, no `[Now]` block, no refinement, no client context — so
+    /// those callers behave exactly as before.
     pub fn current() -> Self {
         Self {
             personality: crate::ports::llm::current_personality(),
             now_line: crate::ports::llm::current_now_context(),
             system_refinement: crate::ports::llm::current_system_refinement(),
+            client_context: crate::ports::transport::current_client_context(),
         }
     }
 }
@@ -696,6 +701,22 @@ fn assemble_system_instruction(tool_note: String, ambient: &AmbientContext) -> S
         sections.push(PromptSection::new(
             PromptSectionKind::Personality,
             personality_blurb,
+        ));
+    }
+
+    // Client context (#549): a stable, per-connection grounding block ("about the
+    // user & their device") rendered from the self-reported context. Injected
+    // here — into the cached system instruction, unlike the volatile `[Now]`
+    // line — because it is stable for the connection, so it can be cached. A
+    // DYNAMIC section (not a `static_sections()` member), so it never perturbs
+    // the golden static-prompt snapshot. Omitted entirely when no field is
+    // present (fail-closed): the daemon never substitutes its own host values.
+    if let Some(ctx) = &ambient.client_context
+        && let Some(section) = prompts::render_client_context(ctx)
+    {
+        sections.push(PromptSection::new(
+            PromptSectionKind::ClientContext,
+            section,
         ));
     }
 
@@ -1367,6 +1388,112 @@ mod tests {
             assembled.contains(&default_blurb),
             "default personality must be injected even without a scope:\n{assembled}"
         );
+    }
+
+    // --- Client context in the system instruction (#549) -------------------
+
+    fn full_client_context() -> crate::prompts::ClientContext {
+        crate::prompts::ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada".into()),
+            home_dir: Some("/home/ada".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("Ubuntu 24.04".into()),
+        }
+    }
+
+    #[test]
+    fn assemble_system_instruction_includes_client_context_block() {
+        // Acceptance (a): a full injected ClientContext renders an "about the
+        // user" block inside the cached system instruction, before the tool note.
+        let assembled = assemble_system_instruction(
+            "TOOLNOTE".to_string(),
+            &AmbientContext {
+                client_context: Some(full_client_context()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            assembled.contains("== About the user & their device =="),
+            "{assembled}"
+        );
+        assert!(assembled.contains("Ada Lovelace"), "{assembled}");
+        assert!(assembled.contains("Europe/London"), "{assembled}");
+        assert!(assembled.contains("/home/ada"), "{assembled}");
+        // Dynamic section is part of the cached system block, ahead of the tools.
+        let c_idx = assembled.find("== About the user").unwrap();
+        let t_idx = assembled.find("TOOLNOTE").unwrap();
+        assert!(c_idx < t_idx, "client context must precede the tool note");
+    }
+
+    #[test]
+    fn assemble_system_instruction_omits_absent_home_dir_line() {
+        // Acceptance (b): an absent field drops only its clause — no home line.
+        let ctx = crate::prompts::ClientContext {
+            home_dir: None,
+            ..full_client_context()
+        };
+        let assembled = assemble_system_instruction(
+            "TOOLNOTE".to_string(),
+            &AmbientContext {
+                client_context: Some(ctx),
+                ..Default::default()
+            },
+        );
+        assert!(assembled.contains("== About the user & their device =="));
+        assert!(!assembled.contains("home directory"), "{assembled}");
+        assert!(!assembled.contains("/home/ada"), "{assembled}");
+    }
+
+    #[test]
+    fn assemble_system_instruction_no_client_context_is_identical_to_none() {
+        // Acceptance (c): an all-absent context emits no header at all, and the
+        // output is byte-identical to having no client context installed.
+        let baseline =
+            assemble_system_instruction("TOOLNOTE".to_string(), &AmbientContext::default());
+        let all_absent = assemble_system_instruction(
+            "TOOLNOTE".to_string(),
+            &AmbientContext {
+                client_context: Some(crate::prompts::ClientContext::default()),
+                ..Default::default()
+            },
+        );
+        assert!(!baseline.contains("== About the user"));
+        assert_eq!(
+            baseline, all_absent,
+            "all-absent context must add nothing to the prompt"
+        );
+    }
+
+    #[test]
+    fn assemble_system_instruction_never_substitutes_daemon_host_values() {
+        // Acceptance (d): fail-closed. With every field `None`, the daemon must
+        // NOT fall back to its own process HOME / hostname — that substitution
+        // would leak the daemon host into a multi-tenant prompt. We read the
+        // ambient env (never set it) and assert it does not appear.
+        let assembled = assemble_system_instruction(
+            "TOOLNOTE".to_string(),
+            &AmbientContext {
+                client_context: Some(crate::prompts::ClientContext::default()),
+                ..Default::default()
+            },
+        );
+        assert!(!assembled.contains("== About the user"), "{assembled}");
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(
+                !assembled.contains(&home),
+                "daemon HOME must never leak into the prompt as a fallback"
+            );
+        }
+        if let Ok(host) = std::env::var("HOSTNAME")
+            && !host.is_empty()
+        {
+            assert!(
+                !assembled.contains(&host),
+                "daemon hostname must never leak into the prompt as a fallback"
+            );
+        }
     }
 
     #[tokio::test]

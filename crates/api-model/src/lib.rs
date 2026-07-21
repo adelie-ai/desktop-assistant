@@ -1363,6 +1363,12 @@ pub use desktop_assistant_protocol::PurposeKind as PurposeKindApi;
 // (the 7 trait levels); it is the `Personality` struct verbatim, so converting
 // between the wire view and the type is the identity `From` impl.
 pub use desktop_assistant_protocol::{Personality, PersonalityLevel};
+
+// The self-reported, best-effort per-connection client context (#549) is defined
+// in `desktop-assistant-protocol` (the dependency-light crate `core` also
+// depends on) and re-exported here as a wire type so it can ride the connect
+// handshake alongside the #248 system-id fields.
+pub use desktop_assistant_protocol::ClientContext;
 pub type PersonalitySettingsView = Personality;
 
 // Per-conversation personality override (#227, Phase 2). Re-export the canonical
@@ -1664,6 +1670,13 @@ pub struct UdsHandshake {
     /// hostname. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_label: Option<String>,
+    /// Best-effort, self-reported context about the user and their device
+    /// (#549) — name, username, home directory, hostname, timezone, and OS —
+    /// used to ground the system prompt. Absent for older clients (⇒ no client
+    /// context block). Like `system_id`, it is a display/routing hint, **not a
+    /// trust boundary**: it is self-reported and no privilege is gated on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_context: Option<ClientContext>,
 }
 
 /// HTTP header carrying the client's per-machine **system id** on the WebSocket
@@ -1676,6 +1689,46 @@ pub const WS_SYSTEM_ID_HEADER: &str = "x-adelie-system-id";
 /// HTTP header carrying the client's friendly host label on the WebSocket
 /// upgrade (issue #248). Optional companion to [`WS_SYSTEM_ID_HEADER`].
 pub const WS_HOST_LABEL_HEADER: &str = "x-adelie-host-label";
+
+/// HTTP header carrying the client's best-effort [`ClientContext`] (#549) on the
+/// WebSocket upgrade. Unlike the #248 system-id / host-label headers — each a
+/// single scalar — the client context is a small struct, so it rides one header
+/// as its JSON serialization, then standard **base64** so an arbitrary UTF-8
+/// field value (a display name, a filesystem path) is always a valid HTTP header
+/// value. Optional: older clients omit it and the daemon renders no client
+/// context block (fail-closed). The daemon decodes it best-effort — a missing,
+/// non-base64, or non-JSON value yields no context rather than an error.
+pub const WS_CLIENT_CONTEXT_HEADER: &str = "x-adelie-client-context";
+
+/// Encode a [`ClientContext`] as the value of the [`WS_CLIENT_CONTEXT_HEADER`]
+/// (#549): JSON, then standard **base64** so an arbitrary UTF-8 field value (a
+/// display name, a filesystem path) is always a valid HTTP header value.
+///
+/// The codec lives here, next to the header const and the type, so the daemon
+/// (which decodes) and the client (which encodes, Phase 2) share one definition.
+/// Serialization is infallible for this plain struct, so this returns a plain
+/// `String`.
+pub fn encode_client_context(ctx: &ClientContext) -> String {
+    use base64::Engine;
+    // `to_vec` on a struct of `Option<String>` cannot fail; fall back to the
+    // empty object rather than surfacing an error the caller cannot act on.
+    let json = serde_json::to_vec(ctx).unwrap_or_else(|_| b"{}".to_vec());
+    base64::engine::general_purpose::STANDARD.encode(json)
+}
+
+/// Decode a [`WS_CLIENT_CONTEXT_HEADER`] value produced by
+/// [`encode_client_context`] back into a [`ClientContext`] (#549).
+///
+/// **Fail-closed:** a non-base64 or non-JSON value yields `None` (no client
+/// context) rather than an error — the context is a best-effort hint, never a
+/// trust boundary, so a malformed value must never reject the connection.
+pub fn decode_client_context(value: &str) -> Option<ClientContext> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()?;
+    serde_json::from_slice::<ClientContext>(&bytes).ok()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1690,6 +1743,7 @@ mod tests {
             jwt: Some("tok".into()),
             system_id: None,
             host_label: None,
+            client_context: None,
         };
         let json = serde_json::to_string(&h).unwrap();
         assert_eq!(json, r#"{"jwt":"tok"}"#, "absent fields must not appear");
@@ -1698,6 +1752,67 @@ mod tests {
         assert_eq!(legacy.jwt.as_deref(), Some("tok"));
         assert_eq!(legacy.system_id, None);
         assert_eq!(legacy.host_label, None);
+        assert_eq!(legacy.client_context, None);
+    }
+
+    #[test]
+    fn uds_handshake_carries_client_context_and_round_trips() {
+        // The optional #549 client context rides the handshake alongside the
+        // #248 system-id fields; when present it must round-trip losslessly, and
+        // when absent it must not appear on the wire (skip_serializing_if).
+        let ctx = ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            timezone: Some("Europe/London".into()),
+            ..ClientContext::default()
+        };
+        let h = UdsHandshake {
+            jwt: Some("tok".into()),
+            client_context: Some(ctx.clone()),
+            ..UdsHandshake::default()
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("client_context"), "json: {json}");
+        assert!(json.contains("Europe/London"), "json: {json}");
+        let back: UdsHandshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.client_context, Some(ctx));
+
+        // Absent context is skipped entirely.
+        let bare = UdsHandshake {
+            jwt: Some("tok".into()),
+            ..UdsHandshake::default()
+        };
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"jwt":"tok"}"#);
+    }
+
+    #[test]
+    fn client_context_header_codec_round_trips() {
+        // The base64(JSON) header codec (#549) must round-trip a full context —
+        // this is what the WS upgrade header carries and the daemon decodes.
+        let ctx = ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada".into()),
+            home_dir: Some("/home/ada".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("Ubuntu 24.04".into()),
+        };
+        let encoded = encode_client_context(&ctx);
+        // Header-safe: base64 alphabet only, no raw JSON punctuation.
+        assert!(!encoded.contains('{') && !encoded.contains('"'));
+        assert_eq!(decode_client_context(&encoded), Some(ctx));
+    }
+
+    #[test]
+    fn client_context_header_codec_is_fail_closed_on_garbage() {
+        // Not base64 at all, and valid base64 that isn't a JSON object: both
+        // decode to `None` rather than erroring (the header is a hint, not a
+        // trust boundary).
+        assert_eq!(decode_client_context("not valid base64 !!"), None);
+        let junk = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode("this is not json")
+        };
+        assert_eq!(decode_client_context(&junk), None);
     }
 
     #[test]
@@ -1715,6 +1830,7 @@ mod tests {
             jwt: Some("tok".into()),
             system_id: Some("machine-abc".into()),
             host_label: Some("laptop".into()),
+            client_context: None,
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: UdsHandshake = serde_json::from_str(&json).unwrap();

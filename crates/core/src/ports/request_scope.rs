@@ -6,7 +6,8 @@
 //! A handful of per-request values propagate through the turn as
 //! `tokio::task_local!`s — the user id (#105), the login-session id (#261),
 //! the connection's transport kind plus its system-id co-location result and
-//! client host label (#243/#248). The transport dispatcher installs all of
+//! client host label (#243/#248), and the self-reported client context (#549).
+//! The transport dispatcher installs all of
 //! them around each request. But `task_local`s do **not** cross a
 //! `tokio::spawn`, and the streaming send-message path spawns the turn body on
 //! a fresh task. So every spawn site has to *capture each value before the
@@ -46,8 +47,9 @@ use crate::domain::TransportKind;
 use crate::ports::auth::{UserId, current_user_id, with_user_id};
 use crate::ports::session::{SessionId, current_session_id, with_session_id};
 use crate::ports::transport::{
-    current_client_label, current_co_location, current_transport_kind, with_client_label,
-    with_co_location, with_transport_kind,
+    ClientContext, current_client_context, current_client_label, current_co_location,
+    current_transport_kind, with_client_context, with_client_label, with_co_location,
+    with_transport_kind,
 };
 
 /// The set of request-scoped task-locals that must be re-installed inside a
@@ -74,6 +76,11 @@ pub struct RequestScope {
     /// Client-reported host label (#248) for a friendlier remote tool note;
     /// `None` when the client sent none.
     pub client_label: Option<String>,
+    /// Self-reported client context (#549) — the user + their device — used to
+    /// ground the system prompt. `None` when the client sent none. Must ride the
+    /// bundle because it is installed at the transport layer but read when the
+    /// prompt is assembled, deep inside the spawned turn body.
+    pub client_context: Option<ClientContext>,
 }
 
 impl RequestScope {
@@ -91,6 +98,7 @@ impl RequestScope {
             transport: current_transport_kind(),
             co_located: current_co_location(),
             client_label: current_client_label(),
+            client_context: current_client_context(),
         }
     }
 
@@ -101,8 +109,8 @@ impl RequestScope {
     /// dispatcher's (and is immaterial — the locals are independent slots).
     ///
     /// `current_user_id()`, `current_session_id()`, `current_transport_kind()`,
-    /// `current_co_location()`, and `current_client_label()` inside `fut` all
-    /// observe the captured values.
+    /// `current_co_location()`, `current_client_label()`, and
+    /// `current_client_context()` inside `fut` all observe the captured values.
     pub async fn scope<F, T>(self, fut: F) -> T
     where
         F: Future<Output = T>,
@@ -113,14 +121,18 @@ impl RequestScope {
             transport,
             co_located,
             client_label,
+            client_context,
         } = self;
-        with_co_location(
-            co_located,
-            with_client_label(
-                client_label,
-                with_transport_kind(
-                    transport,
-                    with_user_id(user_id, with_session_id(session_id, fut)),
+        with_client_context(
+            client_context,
+            with_co_location(
+                co_located,
+                with_client_label(
+                    client_label,
+                    with_transport_kind(
+                        transport,
+                        with_user_id(user_id, with_session_id(session_id, fut)),
+                    ),
                 ),
             ),
         )
@@ -140,6 +152,7 @@ mod tests {
         assert_eq!(scope.transport, TransportKind::Uds);
         assert_eq!(scope.co_located, None);
         assert_eq!(scope.client_label, None);
+        assert_eq!(scope.client_context, None);
     }
 
     #[tokio::test]
@@ -148,17 +161,25 @@ mod tests {
         // a spawn boundary that drops them) re-install from the bundle and
         // confirm every value is observed — including co_location and the
         // client label, the two that the hand-written spawn sites dropped.
-        let captured = with_co_location(
-            Some(true),
-            with_client_label(
-                Some("laptop".to_string()),
-                with_transport_kind(
-                    TransportKind::WebSocket,
-                    with_user_id(
-                        UserId::new("alice"),
-                        with_session_id(SessionId::new("sess-9"), async {
-                            RequestScope::capture()
-                        }),
+        let client_context = ClientContext {
+            real_name: Some("Alice".to_string()),
+            timezone: Some("Europe/London".to_string()),
+            ..ClientContext::default()
+        };
+        let captured = with_client_context(
+            Some(client_context.clone()),
+            with_co_location(
+                Some(true),
+                with_client_label(
+                    Some("laptop".to_string()),
+                    with_transport_kind(
+                        TransportKind::WebSocket,
+                        with_user_id(
+                            UserId::new("alice"),
+                            with_session_id(SessionId::new("sess-9"), async {
+                                RequestScope::capture()
+                            }),
+                        ),
                     ),
                 ),
             ),
@@ -170,6 +191,7 @@ mod tests {
         assert_eq!(captured.transport, TransportKind::WebSocket);
         assert_eq!(captured.co_located, Some(true));
         assert_eq!(captured.client_label, Some("laptop".to_string()));
+        assert_eq!(captured.client_context, Some(client_context.clone()));
 
         // Re-install from the captured bundle in a context where none of the
         // locals are set (simulating the post-spawn task) and read them back.
@@ -182,6 +204,7 @@ mod tests {
                     current_transport_kind(),
                     current_co_location(),
                     current_client_label(),
+                    current_client_context(),
                 )
             })
             .await;
@@ -191,6 +214,39 @@ mod tests {
         assert_eq!(observed.2, TransportKind::WebSocket);
         assert_eq!(observed.3, Some(true));
         assert_eq!(observed.4, Some("laptop".to_string()));
+        assert_eq!(observed.5, Some(client_context));
+    }
+
+    #[tokio::test]
+    async fn client_context_rides_request_scope_across_a_real_spawn() {
+        // The streaming turn body runs on a fresh `tokio::spawn`; a task-local
+        // does NOT cross that boundary, so the #549 client context would be lost
+        // unless it rides the captured `RequestScope`. Capture it inside the
+        // dispatcher's scope, then re-install it inside an actual spawned task
+        // and confirm the turn observes it (the #261 bug-class regression guard).
+        let ctx = ClientContext {
+            real_name: Some("Ada".to_string()),
+            hostname: Some("analytical-engine".to_string()),
+            ..ClientContext::default()
+        };
+        let captured =
+            with_client_context(Some(ctx.clone()), async { RequestScope::capture() }).await;
+
+        let observed = tokio::spawn(async move {
+            // Sanity: the raw task-local did not survive the spawn.
+            let before = current_client_context();
+            let inside = captured.scope(async { current_client_context() }).await;
+            (before, inside)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(observed.0, None, "task-local must not cross the spawn");
+        assert_eq!(
+            observed.1,
+            Some(ctx),
+            "RequestScope must re-install the client context inside the spawn"
+        );
     }
 
     #[tokio::test]
@@ -201,6 +257,10 @@ mod tests {
             transport: TransportKind::WebSocket,
             co_located: Some(false),
             client_label: Some("phone".to_string()),
+            client_context: Some(ClientContext {
+                username: Some("bob".to_string()),
+                ..ClientContext::default()
+            }),
         };
         scope.scope(async {}).await;
 
@@ -210,5 +270,6 @@ mod tests {
         assert_eq!(current_transport_kind(), TransportKind::Uds);
         assert_eq!(current_co_location(), None);
         assert_eq!(current_client_label(), None);
+        assert_eq!(current_client_context(), None);
     }
 }

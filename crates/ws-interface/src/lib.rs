@@ -298,6 +298,18 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Decode the [`api::WS_CLIENT_CONTEXT_HEADER`] value off the upgrade headers
+/// into a [`api::ClientContext`] (#549). The base64(JSON) codec itself lives in
+/// `api-model` ([`api::decode_client_context`]); this only pulls the header
+/// string. Fail-closed: a missing, non-ASCII, non-base64, or non-JSON header
+/// yields `None` (no client context) rather than an error — the context is a
+/// best-effort hint, never a trust boundary, so a malformed value must never
+/// reject the connection.
+fn decode_client_context_header(headers: &HeaderMap) -> Option<api::ClientContext> {
+    let raw = header_string(headers, api::WS_CLIENT_CONTEXT_HEADER)?;
+    api::decode_client_context(&raw)
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsServerState>,
@@ -340,10 +352,23 @@ async fn ws_handler(
         state.daemon_system_id.as_deref(),
         client_system_id.as_deref(),
     );
+    // Self-reported client context (#549) from its own base64(JSON) upgrade
+    // header. Fail-closed: a missing or malformed header yields no context (the
+    // connection is never rejected on it — it is a hint, not a trust boundary).
+    let client_context = decode_client_context_header(&headers);
 
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state, user_id, co_located, client_label))
+        .on_upgrade(move |socket| {
+            handle_socket(
+                socket,
+                state,
+                user_id,
+                co_located,
+                client_label,
+                client_context,
+            )
+        })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -427,6 +452,7 @@ async fn handle_socket(
     user_id: UserId,
     co_located: Option<bool>,
     client_label: Option<String>,
+    client_context: Option<api::ClientContext>,
 ) {
     use axum::extract::ws::CloseFrame;
     use futures::stream::StreamExt;
@@ -461,7 +487,8 @@ async fn handle_socket(
     // and an optional client host label makes the remote tool note friendlier.
     let auth = AuthContext::new(user_id.into_inner(), TransportKind::WebSocket)
         .with_co_location(co_located)
-        .with_client_label(client_label);
+        .with_client_label(client_label)
+        .with_client_context(client_context);
 
     let handler = Arc::clone(&state.handler);
     let mut dispatcher = tokio::spawn(async move {
@@ -749,6 +776,57 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod client_context_header_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    fn header_map(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(api::WS_CLIENT_CONTEXT_HEADER),
+            HeaderValue::from_str(value).expect("valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn client_context_header_round_trips() {
+        // Acceptance (f): a full ClientContext survives the base64(JSON) header
+        // encode/decode the WS upgrade uses (#549).
+        let ctx = api::ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada".into()),
+            home_dir: Some("/home/ada".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("Ubuntu 24.04".into()),
+        };
+        // The client (Phase 2) encodes via the shared api-model codec; the WS
+        // handler extracts it from the header map on its side.
+        let encoded = api::encode_client_context(&ctx);
+        let decoded = decode_client_context_header(&header_map(&encoded)).expect("decode");
+        assert_eq!(decoded, ctx);
+    }
+
+    #[test]
+    fn absent_header_yields_no_context() {
+        assert_eq!(decode_client_context_header(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn malformed_header_is_fail_closed_none() {
+        // Not base64 at all.
+        assert_eq!(
+            decode_client_context_header(&header_map("not valid base64 !!")),
+            None
+        );
+        // Valid base64, but not JSON for a ClientContext.
+        let junk = base64::engine::general_purpose::STANDARD.encode("this is not json");
+        assert_eq!(decode_client_context_header(&header_map(&junk)), None);
+    }
 }
 
 #[cfg(all(test, feature = "tls"))]

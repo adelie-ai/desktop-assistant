@@ -27,7 +27,7 @@ use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
 use desktop_assistant_core::ports::session::{SessionId, with_session_id};
 use desktop_assistant_core::ports::transport::{
-    with_client_label, with_co_location, with_transport_kind,
+    ClientContext, with_client_context, with_client_label, with_co_location, with_transport_kind,
 };
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
@@ -55,12 +55,13 @@ fn mint_session_id() -> String {
 
 /// Pre-validated identity for the connection.
 ///
-/// Carries the JWT `sub` (`user_id`), the connection's [`TransportKind`], and
+/// Carries the JWT `sub` (`user_id`), the connection's [`TransportKind`],
 /// (issue #248) the authoritative per-machine **system-id co-location** result
-/// plus an optional client-reported host label. The dispatcher uses these to
-/// scope per-user state (#105) and tag tool co-location (#243/#248). Structured
-/// as a type so further per-connection fields can be added without changing the
-/// dispatcher signature.
+/// plus an optional client-reported host label, and (issue #549) the
+/// self-reported [`ClientContext`]. The dispatcher uses these to scope per-user
+/// state (#105), tag tool co-location (#243/#248), and ground the system prompt
+/// (#549). Structured as a type so further per-connection fields can be added
+/// without changing the dispatcher signature.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     /// JWT `sub` claim.
@@ -78,6 +79,12 @@ pub struct AuthContext {
     /// A client-reported host label (#248) for a friendlier remote tool note
     /// (e.g. `your device 'laptop'`); `None` when the client sent none.
     pub client_label: Option<String>,
+    /// The connection's self-reported [`ClientContext`] (#549): the user and
+    /// their device, used to ground the system prompt. `None` when the client
+    /// sent none. Installed as a task-local around each request (and re-installed
+    /// across the streaming spawn via `RequestScope`). Untrusted display data,
+    /// not a trust boundary.
+    pub client_context: Option<ClientContext>,
     /// Unique id for this login session / connection (#261), minted by the
     /// constructors. Installed as a task-local around every request so
     /// per-connection state (client-local tool registration) keys on it
@@ -96,6 +103,7 @@ impl AuthContext {
             transport,
             co_located: None,
             client_label: None,
+            client_context: None,
             session_id: mint_session_id(),
         }
     }
@@ -114,6 +122,13 @@ impl AuthContext {
         self
     }
 
+    /// Attach the connection's self-reported [`ClientContext`] (#549). `None`
+    /// leaves the connection with no client context (⇒ no prompt block).
+    pub fn with_client_context(mut self, ctx: Option<ClientContext>) -> Self {
+        self.client_context = ctx;
+        self
+    }
+
     /// Convenience for tests that don't need a real subject. Defaults to the
     /// co-located UDS transport with no system-id result.
     pub fn anonymous() -> Self {
@@ -122,6 +137,7 @@ impl AuthContext {
             transport: TransportKind::Uds,
             co_located: None,
             client_label: None,
+            client_context: None,
             session_id: mint_session_id(),
         }
     }
@@ -238,6 +254,11 @@ pub async fn dispatch_loop<R, W>(
     // transport so the turn loop prefers the id match over the heuristic.
     let co_located = auth.co_located;
     let client_label = auth.client_label.clone();
+    // The connection's self-reported client context (#549), installed around the
+    // send-message dispatch so the prompt-assembly path can ground the system
+    // prompt. Re-installed on the spawned send task (task-locals don't cross
+    // `tokio::spawn`); only the send-message paths assemble a prompt.
+    let client_context = auth.client_context.clone();
 
     // Per-connection state for `SubscribeBackgroundTasks` (#114).
     // At most one forwarder runs per connection — Subscribe is
@@ -315,24 +336,27 @@ pub async fn dispatch_loop<R, W>(
                 // streamed events are stamped with, so a socket client
                 // can correlate the response (voice#49); the legacy path
                 // simply leaves `task_id` empty.
-                let task_id = with_co_location(
-                    co_located,
-                    with_client_label(
-                        client_label.clone(),
-                        with_transport_kind(
-                            transport,
-                            with_user_id(
-                                user_id.clone(),
-                                with_session_id(
-                                    session_id.clone(),
-                                    handler.start_send_message(
-                                        conversation_id.clone(),
-                                        content.clone(),
-                                        override_selection.clone(),
-                                        system_refinement.clone(),
-                                        request_id.clone(),
-                                        idempotency_key.clone(),
-                                        Arc::clone(&sink),
+                let task_id = with_client_context(
+                    client_context.clone(),
+                    with_co_location(
+                        co_located,
+                        with_client_label(
+                            client_label.clone(),
+                            with_transport_kind(
+                                transport,
+                                with_user_id(
+                                    user_id.clone(),
+                                    with_session_id(
+                                        session_id.clone(),
+                                        handler.start_send_message(
+                                            conversation_id.clone(),
+                                            content.clone(),
+                                            override_selection.clone(),
+                                            system_refinement.clone(),
+                                            request_id.clone(),
+                                            idempotency_key.clone(),
+                                            Arc::clone(&sink),
+                                        ),
                                     ),
                                 ),
                             ),
@@ -393,29 +417,33 @@ pub async fn dispatch_loop<R, W>(
                         let session_id_for_task = session_id.clone();
                         let transport_for_task = transport;
                         // Re-install the #248 co-location result + client label
-                        // inside the spawn, like the transport, since task-locals
-                        // don't cross `tokio::spawn`.
+                        // and the #549 client context inside the spawn, like the
+                        // transport, since task-locals don't cross `tokio::spawn`.
                         let co_located_for_task = co_located;
                         let client_label_for_task = client_label.clone();
+                        let client_context_for_task = client_context.clone();
                         tokio::spawn(async move {
-                            let _ = with_co_location(
-                                co_located_for_task,
-                                with_client_label(
-                                    client_label_for_task,
-                                    with_transport_kind(
-                                        transport_for_task,
-                                        with_user_id(
-                                            user_id_for_task,
-                                            with_session_id(
-                                                session_id_for_task,
-                                                handler.handle_send_message_with_override(
-                                                    conversation_id,
-                                                    content,
-                                                    override_selection,
-                                                    system_refinement,
-                                                    request_id,
-                                                    idempotency_key,
-                                                    sink,
+                            let _ = with_client_context(
+                                client_context_for_task,
+                                with_co_location(
+                                    co_located_for_task,
+                                    with_client_label(
+                                        client_label_for_task,
+                                        with_transport_kind(
+                                            transport_for_task,
+                                            with_user_id(
+                                                user_id_for_task,
+                                                with_session_id(
+                                                    session_id_for_task,
+                                                    handler.handle_send_message_with_override(
+                                                        conversation_id,
+                                                        content,
+                                                        override_selection,
+                                                        system_refinement,
+                                                        request_id,
+                                                        idempotency_key,
+                                                        sink,
+                                                    ),
                                                 ),
                                             ),
                                         ),
@@ -746,7 +774,9 @@ mod tests {
         let a = AuthContext::new("dave", TransportKind::WebSocket);
         assert_eq!(a.co_located, None);
         assert_eq!(a.client_label, None);
+        assert_eq!(a.client_context, None);
         assert_eq!(AuthContext::anonymous().co_located, None);
+        assert_eq!(AuthContext::anonymous().client_context, None);
     }
 
     #[test]
@@ -756,6 +786,23 @@ mod tests {
             .with_client_label(Some("laptop".to_string()));
         assert_eq!(a.co_located, Some(true));
         assert_eq!(a.client_label.as_deref(), Some("laptop"));
+    }
+
+    #[test]
+    fn auth_context_builder_attaches_client_context() {
+        // #549: the handshake's client context threads onto the AuthContext so
+        // the dispatcher can install it as a task-local for the turn.
+        let ctx = desktop_assistant_core::ports::transport::ClientContext {
+            username: Some("dave".to_string()),
+            ..Default::default()
+        };
+        let a = AuthContext::new("dave", TransportKind::Uds).with_client_context(Some(ctx.clone()));
+        assert_eq!(a.client_context, Some(ctx));
+        // Default carries none.
+        assert_eq!(
+            AuthContext::new("dave", TransportKind::Uds).client_context,
+            None
+        );
     }
 
     #[test]

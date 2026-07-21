@@ -13,5 +13,10 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 serde.workspace = true
 
+[dev-dependencies]
+# JSON round-trip tests for the wire types (dev-only, so the library keeps its
+# dependency-light / wasm-friendly profile).
+serde_json.workspace = true
+
 [lints]
 workspace = true
