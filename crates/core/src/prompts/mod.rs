@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn static_sections_count() {
-        assert_eq!(static_sections().len(), 7);
+        assert_eq!(static_sections().len(), 8);
     }
 
     #[test]
@@ -312,6 +312,65 @@ mod tests {
         assert!(
             assembled.contains("Re-summarize"),
             "the finishing pass must re-summarize the pad, keeping relevant detail"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_guides_subagent_delegation() {
+        // The prompt must teach Adele that she can delegate separable parts of a
+        // big task to subagents, and name the tools so she knows they exist
+        // (#550, completing the Phase 0 subagent slice with #134/#287).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("== Delegating to subagents =="),
+            "the prompt must advertise subagent delegation"
+        );
+        assert!(
+            assembled.contains("spawn_subagent"),
+            "and name the spawn tool"
+        );
+        assert!(
+            assembled.contains("get_subagent_status"),
+            "and the poll/collect tool for wait=false children"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_urges_reviewing_subagent_output() {
+        // A subagent's answer must be reviewed before it is trusted — the core
+        // discipline the user asked for. Never bank a conclusion unchecked.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("Review before you trust"),
+            "the prompt must direct Adele to review subagent output before trusting it"
+        );
+        assert!(
+            assembled.contains("raw material"),
+            "framing a subagent's answer as raw material, not truth"
+        );
+        assert!(
+            assembled.contains("verifier"),
+            "and offer spawning a verifier / redoing the part when it doesn't hold up"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_ties_subagents_to_plan_steps() {
+        // Each subagent binds to a plan step and rolls up through the existing
+        // begin_step/complete_step machinery — the section must lean on it, not
+        // reinvent roll-up.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("Bind each subagent to a plan step"),
+            "the prompt must tie a subagent to a begin_step-tracked sub-task"
+        );
+        assert!(
+            assembled.contains("Roll up at every level"),
+            "and direct level-by-level roll-up of reviewed outcomes"
+        );
+        assert!(
+            assembled.contains("1.1.1 rolls into 1.1"),
+            "with a concrete nested roll-up example"
         );
     }
 
