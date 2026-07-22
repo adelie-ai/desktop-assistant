@@ -22,6 +22,15 @@ use serde::{Deserialize, Serialize};
 const OPENAI_CONNECT_TIMEOUT: std::time::Duration = STREAM_CONNECT_TIMEOUT;
 const OPENAI_EVENT_TIMEOUT: std::time::Duration = STREAM_EVENT_TIMEOUT;
 
+/// Overall wall-clock budget for a *non-streaming* request (embeddings).
+///
+/// Why: streaming completions are bounded by the connect + per-event stall
+/// timeouts instead, because a healthy long completion can legitimately run
+/// longer than any single fixed cap; but a non-streaming embeddings call has
+/// no per-event heartbeat, so a wedged backend would otherwise hang the
+/// caller forever. 60s is generous for a batch embed yet still bounded.
+const OPENAI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Return the prompt-token context window for a known OpenAI model id.
 ///
 /// OpenAI exposes context windows through `/v1/models` only inconsistently,
@@ -69,6 +78,9 @@ pub struct OpenAiClient {
     connect_timeout: std::time::Duration,
     /// Per-chunk stall budget; defaults to [`OPENAI_EVENT_TIMEOUT`].
     event_timeout: std::time::Duration,
+    /// Overall budget for non-streaming requests (embeddings); defaults to
+    /// [`OPENAI_REQUEST_TIMEOUT`], overridable per-connection.
+    request_timeout: std::time::Duration,
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
@@ -95,6 +107,7 @@ impl OpenAiClient {
             hosted_tool_search: false,
             connect_timeout: OPENAI_CONNECT_TIMEOUT,
             event_timeout: OPENAI_EVENT_TIMEOUT,
+            request_timeout: OPENAI_REQUEST_TIMEOUT,
             context_cap: None,
         }
     }
@@ -122,6 +135,15 @@ impl OpenAiClient {
     pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = std::time::Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the overall budget for non-streaming requests (embeddings).
+    /// `None`/`Some(0)` keeps the [`OPENAI_REQUEST_TIMEOUT`] default. Seconds.
+    pub fn with_request_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.request_timeout = std::time::Duration::from_secs(s);
         }
         self
     }
@@ -201,6 +223,42 @@ impl OpenAiClient {
             client.base_url = url;
         }
         Ok(client)
+    }
+}
+
+/// Non-reversible fingerprint of an API key for safe logging.
+///
+/// Returns the key length plus an FNV-1a64 digest (never the key bytes), so
+/// a debug/log line can still tell two keys apart or confirm "the expected
+/// key is loaded" without ever printing the secret. Mirrors the daemon's
+/// `redacted_secret_audit` fingerprint style.
+fn api_key_fingerprint(key: &str) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("<redacted len={} fnv1a64:{hash:016x}>", key.len())
+}
+
+/// Hand-written `Debug` that fingerprints the API key instead of printing it.
+///
+/// Why: the derived `Debug` would render `api_key` verbatim, and this client
+/// is exactly the kind of value that ends up in a `tracing` field or a
+/// wrapping struct's `{:?}`. Redacting at the `Debug` boundary means the
+/// secret cannot leak through any formatting path.
+impl std::fmt::Debug for OpenAiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiClient")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key", &api_key_fingerprint(&self.api_key))
+            .field("connect_timeout", &self.connect_timeout)
+            .field("event_timeout", &self.event_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1893,5 +1951,314 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "stream should abort promptly on cancellation; took {elapsed:?}"
         );
+    }
+
+    // --- Timeouts configurable (#561) ------------------------------------
+
+    #[test]
+    fn openai_timeouts_configurable() {
+        use std::time::Duration;
+        let c = OpenAiClient::new("k".into())
+            .with_connect_timeout(Some(5))
+            .with_event_timeout(Some(7))
+            .with_request_timeout(Some(9));
+        assert_eq!(c.connect_timeout, Duration::from_secs(5));
+        assert_eq!(c.event_timeout, Duration::from_secs(7));
+        assert_eq!(c.request_timeout, Duration::from_secs(9));
+
+        // `None` and `Some(0)` are both "keep the default" — a zero timeout
+        // would mean "fail instantly", which is never what a caller wants.
+        let d = OpenAiClient::new("k".into())
+            .with_connect_timeout(Some(0))
+            .with_event_timeout(None)
+            .with_request_timeout(Some(0));
+        assert_eq!(d.connect_timeout, OPENAI_CONNECT_TIMEOUT);
+        assert_eq!(d.event_timeout, OPENAI_EVENT_TIMEOUT);
+        assert_eq!(d.request_timeout, OPENAI_REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn openai_connect_timeout_configurable() {
+        use std::time::Duration;
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .delay(Duration::from_secs(3))
+                .body(STUB_SSE_BODY);
+        });
+
+        let mut client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        // Reach past the public builder (min 1s) to keep the test fast; the
+        // production path uses `with_connect_timeout`.
+        client.connect_timeout = Duration::from_millis(50);
+
+        let start = std::time::Instant::now();
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("a stalled connect must fail, not hang");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, CoreError::Llm(ref d) if d.contains("stalled")),
+            "expected a stall error, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "connect timeout should fire near its configured value; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_embed_times_out_when_backend_stalls() {
+        use std::time::Duration;
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/embeddings");
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(Duration::from_secs(3))
+                .body(r#"{"data":[{"embedding":[0.1,0.2]}]}"#);
+        });
+
+        let mut client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        client.request_timeout = Duration::from_millis(50);
+
+        let start = std::time::Instant::now();
+        let err = client
+            .embed(vec!["hello".into()])
+            .await
+            .expect_err("a wedged embeddings backend must time out, not hang");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, CoreError::Llm(ref d) if d.contains("timed out")),
+            "expected a timeout error, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "embed timeout should fire near its configured value; took {elapsed:?}"
+        );
+    }
+
+    // --- Streaming truncation (#561) -------------------------------------
+
+    #[tokio::test]
+    async fn openai_stream_truncation_surfaces_error() {
+        // A 200 response whose SSE body ends *without* `response.completed`
+        // is a dropped/truncated stream. Returning the partial text as a
+        // successful completion would silently feed a half-answer downstream,
+        // so it must surface as a clear error instead.
+        let truncated = "event: response.output_text.delta\n\
+                         data: {\"delta\":\"partial ans\"}\n\n";
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(truncated);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("a truncated stream must fail");
+
+        assert!(
+            matches!(err, CoreError::Llm(ref d) if d.contains("truncat")),
+            "expected a truncation error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_stream_completed_is_not_truncation() {
+        // The happy path (body carries `response.completed`) must still
+        // succeed — the truncation guard must not fire on a clean close.
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let resp = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect("a completed stream must succeed");
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn openai_stream_callback_abort_is_not_truncation() {
+        // When the caller's chunk callback returns false it is an intentional
+        // client-side stop, not a dropped stream — the partial response is
+        // returned as success, never re-labelled as truncation.
+        let body = "event: response.output_text.delta\n\
+                    data: {\"delta\":\"first\"}\n\n\
+                    event: response.output_text.delta\n\
+                    data: {\"delta\":\"second\"}\n\n";
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let resp = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                // Abort after the very first chunk.
+                Box::new(|_| false),
+            )
+            .await
+            .expect("callback abort must return the partial response, not error");
+        assert_eq!(resp.text, "first");
+    }
+
+    // --- Transient-failure classification / retries (#561) ---------------
+
+    #[tokio::test]
+    async fn openai_http_5xx_maps_to_rate_limited() {
+        // 500 / 502 / 504 are transient server-side failures. They arrive
+        // before any stream byte is consumed, so retrying is idempotency-safe;
+        // mapping them to `RateLimited` is what makes the core retry decorator
+        // back off and retry rather than hard-failing the turn.
+        for status in [500u16, 502, 504] {
+            let server = httpmock::MockServer::start();
+            let _m = server.mock(|when, then| {
+                when.method(httpmock::Method::POST).path("/responses");
+                then.status(status)
+                    .header("content-type", "application/json")
+                    .body(r#"{"error":{"message":"internal error"}}"#);
+            });
+
+            let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+            let err = client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(err, CoreError::RateLimited { .. }),
+                "HTTP {status} should map to RateLimited (retryable); got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_http_404_model_not_found_is_terminal() {
+        // An unknown/unavailable model id is a permanent condition — it must
+        // NOT be swept into the retryable 5xx bucket, or the daemon would
+        // burn its whole retry budget on a request that can never succeed.
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(404)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"error":{"code":"model_not_found","type":"invalid_request_error","message":"The model 'gpt-nope' does not exist"}}"#,
+                );
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            CoreError::Llm(detail) => {
+                assert!(
+                    detail.contains("model_not_found"),
+                    "detail should carry the reason: {detail}"
+                );
+            }
+            other => panic!("404 model-not-found should stay terminal Llm; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_connection_error_is_retryable() {
+        // A connection that never establishes (nothing listening) is a
+        // transport-phase failure — no request reached the server and nothing
+        // streamed, so it is safe to retry. It must map to `RateLimited`, not
+        // a terminal `Llm`, to match the AWS-SDK transport-retry bar Bedrock
+        // gets for free.
+        let client = OpenAiClient::new("key".into()).with_base_url("http://127.0.0.1:1");
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("connection refused must fail");
+
+        assert!(
+            matches!(err, CoreError::RateLimited { .. }),
+            "a connection error should be retryable; got {err:?}"
+        );
+    }
+
+    // --- API-key redaction (#561) ----------------------------------------
+
+    #[test]
+    fn openai_api_key_redacted_in_display() {
+        let secret = "sk-supersecret-ABC123XYZ";
+        let client = OpenAiClient::new(secret.into());
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains(secret),
+            "raw API key leaked through Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "expected a redaction marker in Debug output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn api_key_fingerprint_hides_key_but_is_stable() {
+        let a = api_key_fingerprint("sk-abc");
+        let b = api_key_fingerprint("sk-abc");
+        let c = api_key_fingerprint("sk-different");
+        assert!(!a.contains("sk-abc"), "fingerprint leaked the key: {a}");
+        assert_eq!(a, b, "fingerprint must be deterministic");
+        assert_ne!(a, c, "different keys must fingerprint differently");
     }
 }
