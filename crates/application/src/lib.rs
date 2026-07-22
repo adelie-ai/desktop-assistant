@@ -5533,16 +5533,65 @@ mod tests {
         );
         let evs = sink.0.lock().await.clone();
         assert!(
-            matches!(&evs[0], api::Event::AssistantDelta { request_id, chunk, .. }
-                if request_id == "retry-req" && chunk == "stored answer"),
-            "replay emits the stored reply as a delta keyed by the retry's request id, got {:?}",
+            matches!(&evs[0], api::Event::UserMessageAdded { request_id, idempotency_key, .. }
+                if request_id == "retry-req" && idempotency_key.as_deref() == Some("k1")),
+            "replay opens with a UserMessageAdded echoing the retry's request id and key, got {:?}",
             evs.first()
         );
         assert!(
-            matches!(&evs[1], api::Event::AssistantCompleted { request_id, full_response, .. }
+            matches!(&evs[1], api::Event::AssistantDelta { request_id, chunk, .. }
+                if request_id == "retry-req" && chunk == "stored answer"),
+            "replay emits the stored reply as a delta keyed by the retry's request id, got {:?}",
+            evs.get(1)
+        );
+        assert!(
+            matches!(&evs[2], api::Event::AssistantCompleted { request_id, full_response, .. }
                 if request_id == "retry-req" && full_response == "stored answer"),
             "replay completes with the stored reply, got {:?}",
-            evs.get(1)
+            evs.get(2)
+        );
+    }
+
+    /// The completed-replay retry path echoes the retry's `idempotency_key` on
+    /// its opening `UserMessageAdded`, matching the fresh-turn and in-flight
+    /// re-attach paths so a retrying client with an optimistic bubble Case-0
+    /// dedupes it (#570) rather than rendering a second bubble.
+    #[tokio::test]
+    async fn completed_replay_echoes_idempotency_key() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "fresh".into(),
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        store
+            .record_response("c1", "k1", "orig-req", "stored answer")
+            .await
+            .unwrap();
+        let h = idem_handler(conv, Arc::clone(&store));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "retry-req".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let evs = sink.0.lock().await.clone();
+        let first = evs.first().expect("replay emits at least one event");
+        assert!(
+            matches!(first, api::Event::UserMessageAdded { conversation_id, request_id, content, idempotency_key }
+                if conversation_id == "c1"
+                    && request_id == "retry-req"
+                    && content == "hi"
+                    && idempotency_key.as_deref() == Some("k1")),
+            "completed replay must echo the retry's idempotency_key on UserMessageAdded, got {first:?}"
         );
     }
 
