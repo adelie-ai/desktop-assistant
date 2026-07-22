@@ -1399,6 +1399,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-llm-azure"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "desktop-assistant-core",
+ "desktop-assistant-llm-http",
+ "desktop-assistant-llm-openai-compat",
+ "httpmock",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "desktop-assistant-llm-bedrock"
 version = "0.1.0"
 dependencies = [
