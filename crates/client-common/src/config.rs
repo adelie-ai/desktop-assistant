@@ -51,7 +51,7 @@ pub fn default_desktop_socket_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("adelie").join("sock"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransportMode {
     Ws,
     Dbus,
@@ -61,7 +61,16 @@ pub enum TransportMode {
     Uds,
 }
 
-#[derive(Debug, Clone)]
+/// Runtime connection settings for a client.
+///
+/// Deserializable from a client's config file with **container-level
+/// `#[serde(default)]`**: any field a config omits falls back to this struct's
+/// [`Default`] impl, so an older config that predates a field keeps working and
+/// gains the new default. Only `Deserialize` is derived, not `Serialize` — the
+/// struct carries secrets (`ws_jwt`, `ws_login_password`) that must never be
+/// written back out to disk.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct ConnectionConfig {
     pub transport_mode: TransportMode,
     pub ws_url: String,
@@ -89,6 +98,14 @@ pub struct ConnectionConfig {
     /// to make the remote tool note nicer (e.g. the client's hostname). Stored
     /// on the config for the same reconnect reason.
     pub host_label: Option<String>,
+    /// Share basic device context (name, username, home dir, hostname,
+    /// timezone, OS) with the assistant so it can personalize; unchecked, the
+    /// client sends nothing (#549). Default **on**: an absent field in an
+    /// existing config still means on (`#[serde(default)]` routes through
+    /// [`Default`]). When on, the Connector resolves the context best-effort and
+    /// attaches it to the connect handshake on every transport (and re-sends it
+    /// on reconnect); when off, no context field / header is attached at all.
+    pub share_client_context: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -104,6 +121,7 @@ impl Default for ConnectionConfig {
             socket_path: None,
             system_id: None,
             host_label: None,
+            share_client_context: true,
         }
     }
 }
