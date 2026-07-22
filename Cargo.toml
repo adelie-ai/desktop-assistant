@@ -13,6 +13,7 @@ members = [
     "crates/llm-openai",
     "crates/llm-openai-compat",
     "crates/llm-openrouter",
+    "crates/llm-azure",
     "crates/llm-bedrock",
     "crates/llm-anthropic",
     "crates/llm-ollama",
@@ -54,6 +55,7 @@ desktop-assistant-llm-anthropic = { path = "crates/llm-anthropic" }
 desktop-assistant-llm-openai = { path = "crates/llm-openai" }
 desktop-assistant-llm-openai-compat = { path = "crates/llm-openai-compat" }
 desktop-assistant-llm-openrouter = { path = "crates/llm-openrouter" }
+desktop-assistant-llm-azure = { path = "crates/llm-azure" }
 desktop-assistant-llm-ollama = { path = "crates/llm-ollama" }
 desktop-assistant-llm-bedrock = { path = "crates/llm-bedrock" }
 desktop-assistant-llm-http = { path = "crates/llm-http" }
