@@ -1,0 +1,775 @@
+{
+  "summary": "Fan out expert readers over every subsystem of the multi-agent scratchpad mechanism, synthesize an exact build blueprint, then adversarially verify it before any code is cut",
+  "agentCount": 13,
+  "logs": [
+    "Investigate: 7/7 edit-plans returned",
+    "Blueprint: 9 slices",
+    "Verify: 5/5 critics; 8 blocker/high findings"
+  ],
+  "result": {
+    "blueprint": {
+      "slices": [
+        {
+          "order": 1,
+          "name": "scratchpad-scope-task-locals",
+          "goal": "Add the three per-subagent-turn task-locals in core that the storage adapter, the builtin scratchpad tool, and the cleanup cascade all consume. Getters return None outside any installed scope, so top-level behavior is byte-for-byte unchanged and there is no consumer yet. Pure core, zero ripple, unit-tested.",
+          "db_backed": false,
+          "merge_deploy_milestone": false,
+          "commit_message": "feat(core): add scratchpad-scope task-locals for subagent orchestration",
+          "edits": [
+            "crates/core/src/ports/scratchpad_scope.rs - NEW module mirroring ports/conversation_ctx.rs + ports/auth.rs. tokio::task_local! SCRATCHPAD_SCOPE: ConversationId (session-pad redirect), SCRATCHPAD_OWNER_TODO: String (materialized path; unset = root), SCRATCHPAD_VISIBLE_BEFORE: String (canonical UUIDv7 spawn snapshot cut; unset = unbounded). with_/current_ accessor pairs; current_* return Option (None => today's behavior). SubagentScope { session_conversation_id: ConversationId, owner_todo: String, visible_before: String } bundle + with_subagent_scope(scope, fut) nesting all three .scope() calls so a spawn can never install a partial scope. Module-level doc states the contract.",
+            "crates/core/src/ports/mod.rs - register `pub mod scratchpad_scope;` immediately after the conversation_ctx declaration (L56)."
+          ],
+          "tests": [
+            "scope_getters_return_none_outside_scope",
+            "scope_returns_installed_conversation",
+            "owner_todo_returns_installed_path",
+            "visible_before_returns_installed_marker",
+            "nested_owner_todo_overrides_then_restores",
+            "locals_do_not_cross_tokio_spawn (pins the re-install-in-body contract the spawn slice depends on)",
+            "with_subagent_scope_installs_all_three_at_once"
+          ]
+        },
+        {
+          "order": 2,
+          "name": "scratchpad-owner-todo-namespacing",
+          "goal": "Namespace the shared per-conversation scratchpad by owner_todo and add spawn-marker snapshot reads, consumed DIRECTLY from the task-locals (mirroring current_user_id) so trait/closure/daemon/API signatures are untouched. Behavior-preserving for top-level: no scope is installed anywhere yet, so owner_todo is '' everywhere and the snapshot predicate is omitted entirely. Migration 031 co-lands with the ON CONFLICT swap because it cannot ship standalone (dropping the old 2-col unique with the old ON CONFLICT (conversation_id,note_key) still in code would 500 every write).",
+          "db_backed": true,
+          "merge_deploy_milestone": false,
+          "commit_message": "feat(storage): namespace scratchpad by owner_todo with spawn-marker snapshot reads",
+          "edits": [
+            "crates/storage/migrations/031_scratchpad_owner_todo.sql - NEW (reconciled DDL; unique INDEX not CONSTRAINT for idempotency, since pool.rs re-runs every migration every startup with no version table): ADD COLUMN IF NOT EXISTS owner_todo TEXT NOT NULL DEFAULT ''; DROP CONSTRAINT IF EXISTS scratchpads_conversation_id_note_key_key; CREATE UNIQUE INDEX IF NOT EXISTS scratchpads_conv_owner_key_uidx ON (conversation_id, owner_todo, note_key); CREATE INDEX IF NOT EXISTS scratchpads_user_conv_owner_idx ON (user_id, conversation_id, owner_todo text_pattern_ops).",
+            "crates/storage/src/pool.rs - register `sqlx::raw_sql(include_str!(\"../migrations/031_scratchpad_owner_todo.sql\"))` after the 030 block and before Ok(()) at ~L255 (required by the every_migration_is_registered guard).",
+            "crates/core/src/domain/scratchpad.rs - ScratchpadNote (read type) gains owner_todo: String; ScratchpadNote::new defaults ''; update the serde roundtrip test. (NewScratchpadNote is intentionally NOT changed - storage stamps owner_todo from the task-local, not from a caller-set field.)",
+            "crates/storage/src/scratchpad.rs - SpRow + into_note gain owner_todo. write(): read `let owner_todo = current_owner_todo().unwrap_or_default();` before .await; INSERT column list + UNNEST($N owner_todo = vec![owner; n]); ON CONFLICT -> (conversation_id, owner_todo, note_key); RETURNING adds owner_todo. get_many/list/search: read current_visible_before()/current_owner_todo() into owned strings; when visible_before is Some, AND `(id < $vb OR owner_todo = $me OR owner_todo LIKE $me || '.%')`; when None, emit NO extra predicate (byte-for-byte). delete_many/clear: AND `owner_todo = $me` (own namespace only). user_id = $1 stays first in every query.",
+            "crates/core/src/ports/scratchpad.rs - MockScratchpadStore + its literals populate owner_todo default; ScratchpadStore trait method signatures UNCHANGED (direct task-local read).",
+            "crates/storage/tests/scratchpad.rs - update existing calls (unwrapped => owner_todo '' + unbounded, byte-for-byte); add the new DB tests below wrapped in with_owner_todo/with_visible_before."
+          ],
+          "tests": [
+            "migration_031_is_idempotent (DB) - run_migrations twice on one schema succeeds",
+            "id_lt_marker_orders_by_uuidv7_time (DB) - pins the lexicographic-monotonicity of TEXT UUIDv7 ids vs a minted now_v7 marker",
+            "write_confined_to_owner_namespace (DB) - same note_key under '' and '1.1' create two rows; upsert collides only within one namespace",
+            "snapshot_hides_rows_written_after_spawn_marker (DB)",
+            "snapshot_includes_own_and_descendant_writes_after_marker (DB) - '1.1' and '1.1.2' visible, sibling '1.2' not",
+            "subtree_prefix_does_not_leak_11_vs_111 (DB) - '1.1' must not match '1.11' (dot-delimited LIKE '1.1.%')",
+            "top_level_read_is_unbounded (DB) - visible_before None returns the full pad across all namespaces",
+            "delete_many_only_touches_own_namespace (DB) - leaves root and sibling rows intact",
+            "clear_only_wipes_own_namespace (DB) - proves scratchpad_delete all:true cannot wipe the parent pad",
+            "cross_user_isolation_still_holds_with_owner_todo (DB) - bob sees/deletes none of alice's rows regardless of owner_todo",
+            "write_and_read_carry_owner_todo (DB)"
+          ]
+        },
+        {
+          "order": 3,
+          "name": "background-task-subagent-columns",
+          "goal": "Durably persist owner_todo + spawn_marker on every background task as ROW columns (single source of truth), threaded through TaskContext/TaskState/TaskView/BackgroundTaskRow and both the Postgres and SQLite adapters. Set-once: update_task never touches them. Values default to '' / None until the spawn slice populates them. Additive + behavior-preserving; both adapters compile and round-trip green.",
+          "db_backed": true,
+          "merge_deploy_milestone": false,
+          "commit_message": "feat(tasks): persist owner_todo + spawn_marker columns on background tasks",
+          "edits": [
+            "crates/storage/migrations/032_subagent_task_columns.sql - NEW: ALTER TABLE background_tasks ADD COLUMN IF NOT EXISTS owner_todo TEXT NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS spawn_marker TEXT. Idempotent; RLS 029 row-level policy covers new columns unchanged.",
+            "crates/storage/src/pool.rs - register 032 after 031.",
+            "crates/storage-sqlite/migrations/001_relational_schema.sql - add `owner_todo TEXT NOT NULL DEFAULT ''` + `spawn_marker TEXT` inside CREATE TABLE background_tasks (baseline edit; adapter unreleased).",
+            "crates/core/src/ports/store.rs - BackgroundTaskRow gains owner_todo: String + spawn_marker: Option<String> (doc set-once); trait method signatures unchanged (row carries them; update_task excluded).",
+            "crates/storage/src/background_tasks.rs - row_from_db +2 trailing params; create_task INSERT +owner_todo,spawn_marker cols/$11,$12/binds; get_task + list_tasks_for_user (BOTH branches) + scan_non_terminal SELECT column lists +2 and tuple type 10->12; update_task UNCHANGED.",
+            "crates/storage-sqlite/src/background_tasks.rs - TaskTuple alias 10->12; row_from_db +2; row_from_tuple maps t.10/t.11; create_task +2 cols/placeholders/binds; get/list(both)/scan SELECTs +2; update_task UNCHANGED.",
+            "crates/api-model/src/lib.rs - TaskView gains owner_todo `#[serde(default, skip_serializing_if=\"String::is_empty\")]` + spawn_marker: Option<String> `#[serde(default, skip_serializing_if=\"Option::is_none\")]` (D-Bus/WS mappers stay serde-driven); update sample_task_view + Event::TaskStarted test literals.",
+            "crates/application/src/background_tasks.rs - TaskContext +owner_todo+spawn_marker; TaskState +owner_todo+spawn_marker (NO next_child_ordinal - owner_todo is a passthrough, not a registry-derived ordinal); spawn() sets owner_todo='' + spawn_marker=None placeholders (populated in the spawn slice); persist_create + sweep_non_terminal_on_startup + TaskView/TaskContext/TaskState literals.",
+            "test-literal updates (compile-forced): application/tests/durable_background_tasks.rs, storage/tests/storage_row_level.rs, storage/tests/user_id_scoping.rs, storage-sqlite/tests/background_tasks.rs, client-common/src/dbus_client.rs + ws_client.rs, dbus-bridge/tests/background_tasks.rs."
+          ],
+          "tests": [
+            "migration_032_adds_columns_pg (DB) - owner_todo NOT NULL DEFAULT '' + nullable spawn_marker",
+            "sqlite_baseline_has_owner_todo_and_marker_columns (DB)",
+            "owner_todo_and_marker_round_trip_pg (DB)",
+            "owner_todo_and_marker_round_trip_sqlite (DB)",
+            "legacy_row_defaults_to_empty_owner_todo_and_none_marker (DB) - raw insert omitting both columns => '' and None",
+            "list_and_scan_select_new_columns (DB) - guards against a column omitted from one widened SELECT",
+            "update_task_leaves_owner_todo_and_marker_unchanged (DB) - pins set-once immutability",
+            "sweep_surfaces_owner_todo_and_marker (DB)",
+            "cross_user_get_opaque_with_new_columns (DB) - fail-closed unaffected",
+            "taskview_serde_roundtrip_backcompat - missing keys => '' / None; root task emits neither (skip_serializing_if)"
+          ]
+        },
+        {
+          "order": 4,
+          "name": "cascade-and-plan-primitives",
+          "goal": "Add the irreversible subtree-delete store primitive plus the StepStack fan-out / owner-path helpers, and thread owner_todo through render_plan_from_notes so colliding cross-namespace local keys don't misrender in the parent's rolled-up [Plan]. Primitives only - no handler calls the cascade yet; each is fully tested in isolation so the wiring slice is pure composition.",
+          "db_backed": true,
+          "merge_deploy_milestone": false,
+          "commit_message": "feat(core): add scratchpad subtree-delete + plan fan-out/owner-path primitives",
+          "edits": [
+            "crates/core/src/ports/scratchpad.rs - trait method `delete_owner_subtree(conversation_id, owner_todo) -> Result<u64>` (deletes owner_todo AND descendants; user-scoped via current_user_id, fail-closed, idempotent); ScratchpadDeleteSubtreeFn = Arc<dyn Fn(String,String)->Pin<Box<...>>>; MockScratchpadStore impl (Ok(0)).",
+            "crates/storage/src/scratchpad.rs - impl delete_owner_subtree: DELETE FROM scratchpads WHERE user_id=$1 AND conversation_id=$2 AND (owner_todo=$3 OR owner_todo LIKE $3||'.%'); returns rows_affected().",
+            "crates/core/src/planning.rs - StepStack::fan_out(n) mints n FLAT sibling keys under the current frame (or root when empty) WITHOUT pushing frames, advancing the same child_counter/root_counter as begin() (later begin never reuses a fanned-out key); owner_subtree_prefix(owner_self, step_key) helper (''+ '1' => '1'; '9.3'+'1' => '9.3.1'); RawNote gains owner_todo and render_plan_from_notes keys the rollup tree by (owner_todo, note_key) not note_key alone. Colocated unit tests."
+          ],
+          "tests": [
+            "delete_owner_subtree_removes_self_and_descendants (DB) - '1','1.1','1.2.3' deleted deleting subtree '1'; returns 3",
+            "delete_owner_subtree_is_dot_boundary_safe (DB) - removes '1'/'1.1' but NOT '10','11','2'",
+            "delete_owner_subtree_is_user_and_conversation_scoped_fail_closed (DB) - another user's/conversation's rows untouched; cross-user returns 0",
+            "delete_owner_subtree_idempotent (DB) - second call returns 0",
+            "fan_out_mints_flat_siblings_without_pushing (unit) - under '1': fan_out(3)=[('1.1',1),('1.2',2),('1.3',3)]; depth unchanged",
+            "fan_out_advances_counter_so_later_begin_never_reuses (unit) - begin() after fan_out(2) yields '1.3'",
+            "fan_out_on_empty_stack_mints_top_level_siblings (unit) - fan_out(2)=['1','2'], depth 0",
+            "fan_out_zero_returns_empty_and_is_noop (unit)",
+            "owner_subtree_prefix_composes_root_and_nested (unit)",
+            "render_plan_disambiguates_cross_namespace_local_keys (unit) - two namespaces each numbering '1'/'1.1' roll up without collision"
+          ]
+        },
+        {
+          "order": 5,
+          "name": "subagent-scope-install-at-spawn",
+          "goal": "At spawn: resolve the session (root) pad, freeze the plan-step-aligned child owner_todo, mint the UUIDv7 spawn_marker, and install them as the SubagentScope bundle around the child turn body inside spawn_agent_conversation (moved in as plain data, re-installed in the spawned body - never read across tokio::spawn). Persist owner_todo/spawn_marker on the task row and session_conversation_id in TaskKind::Subagent. Redirect the builtin scratchpad tool to the session pad. Fail-closed when no active step anchors the child. Standalone path byte-for-byte unchanged.",
+          "db_backed": false,
+          "merge_deploy_milestone": false,
+          "commit_message": "feat(subagent): install session-pad scope + pin owner_todo/spawn_marker at spawn",
+          "edits": [
+            "crates/application/src/lib.rs - AgentConversationSpec gains subagent_scope: Option<SubagentScope>; spawn_agent_conversation wraps `inner` with with_subagent_scope(scope, ...) when Some, composed with the existing with_user_id/with_tool_allowlist nest, INSIDE the registry.spawn body; SpawnStandaloneAgent passes subagent_scope: None.",
+            "crates/application/src/subagent_tools.rs - spawn(): session = current_scratchpad_scope().or_else(current_conversation_id) (fail-closed recoverable CoreError if both None); child_owner_todo = current_owner_todo() (recoverable refuse if it resolves to root '' - the model must begin_step the sub-task first, per subagents.txt:6-7); spawn_marker = uuid::Uuid::now_v7().to_string(); build SubagentScope and set spec.subagent_scope; stash owner_todo/spawn_marker onto the task (row columns) + session_conversation_id into TaskKind::Subagent; effective_prompt(prompt, system_prompt, name, owner_todo) folds the owner_todo slot + goal + shared-pad brief.",
+            "crates/application/Cargo.toml - uuid features add \"v7\" (application only has v4 today).",
+            "crates/api-model/src/lib.rs - TaskKind::Subagent gains session_conversation_id: String (owner_todo/spawn_marker live on the row, not duplicated here); constructor + api-model test literals updated (most match sites use `{ .. }`).",
+            "crates/mcp-client/src/builtin.rs - scratchpad_conversation() prefers current_scratchpad_scope() over current_conversation_id() (single chokepoint feeding write/search/delete); read synchronously into an owned String before any .await; KB-provenance stamp at builtin.rs:857 keeps using current_conversation_id (child conv), unchanged. Inert until a scope is installed.",
+            "crates/application/src/background_tasks.rs - spawn() populates owner_todo/spawn_marker for the Subagent path from spec.subagent_scope (replaces the slice-3 placeholder defaults)."
+          ],
+          "tests": [
+            "subagent_run_installs_session_scratchpad_scope_not_child_conv",
+            "standalone_agent_leaves_subagent_scope_unset",
+            "owner_todo_pinned_at_spawn_equals_parent_current_step_path",
+            "nested_subagent_owner_todo_extends_parent_path",
+            "spawn_marker_is_uuidv7_and_orders_after_presnapshot_writes",
+            "scope_crosses_registry_spawn_as_data_not_task_local",
+            "spawn_fails_closed_without_session_anchor",
+            "spawn_refuses_when_no_active_step_to_anchor_child",
+            "effective_prompt_names_owner_todo_and_goal",
+            "scratchpad_write_targets_session_pad_under_scope",
+            "scratchpad_no_scope_uses_own_conversation_unchanged (byte-for-byte parity guard)"
+          ]
+        },
+        {
+          "order": 6,
+          "name": "cleanup-cascade-and-owner-todo-maintenance",
+          "goal": "Maintain SCRATCHPAD_OWNER_TODO (base + active step path) across begin_step/complete_step so writes stamp the right namespace and nested spawns compose, and hard-code the complete_step CASCADE that delete-subtrees a completed step's descendant owner_todo rows (extending the existing evict-tool-results from hide to DELETE). Targets the session/root conversation; guards the empty-root prefix; leaf steps (child_counter==0) skip. Tested with a fake delete closure that captures its args.",
+          "db_backed": false,
+          "merge_deploy_milestone": false,
+          "commit_message": "feat(core): hard-code complete_step subtree cascade cleanup + owner_todo maintenance",
+          "edits": [
+            "crates/core/src/service.rs - ConversationHandler gains scratchpad_delete_subtree: Option<ScratchpadDeleteSubtreeFn> (default None in both constructors) + with_scratchpad_delete_subtree builder; begin_step/complete_step maintain SCRATCHPAD_OWNER_TODO as base+active-step (push composes, pop restores); handle_step_control complete_step branch: after pop + write-outcome + evict_tool_results, gate on frame.child_counter>0, compute prefix = planning::owner_subtree_prefix(current_owner_todo(), &frame.key), guard prefix.is_empty() (never cascade root ''), call scratchpad_delete_subtree(session/root conversation id, prefix). The parent's own done-todo/outcome at owner_todo=SELF survive (prefix SELF.frame.key is strictly deeper).",
+            "crates/daemon/src/main.rs - delete_subtree_fn closure -> store.delete_owner_subtree(&conv,&owner) + reg.notify_scratchpad_changed so clients drop the reclaimed subtree; capture alongside write/list closures and pass handler.with_scratchpad_delete_subtree(...)."
+          ],
+          "tests": [
+            "complete_step_cascade_deletes_descendant_owner_subtree - fake closure called once with (root_conv, '1')",
+            "complete_step_leaf_step_skips_cascade_delete - child_counter==0 never invokes the closure",
+            "complete_step_preserves_parent_outcome_survivor - key='1'/outcome:1 at owner=SELF not targeted",
+            "complete_step_cascade_uses_root_conversation_not_subagent_own",
+            "complete_step_cascade_guards_empty_root_prefix",
+            "begin_step_composes_owner_todo_base_plus_step",
+            "complete_step_restores_parent_owner_todo"
+          ]
+        },
+        {
+          "order": 7,
+          "name": "executor-wiring-134-arc-cycle",
+          "goal": "Route spawn_subagent/get_subagent_status to SubagentTools via a generic SubagentAwareToolExecutor wrapper, breaking the executor<->conversation Arc/type cycle with a late-set Arc<OnceLock<Weak<dyn ConversationService>>> slot and a ?Sized SubagentTools over dyn ConversationService. This makes the whole mechanism live end-to-end and is the FIRST merge + deploy milestone.",
+          "db_backed": false,
+          "merge_deploy_milestone": true,
+          "commit_message": "feat(daemon): wire subagent tools into the live executor via Weak-slot cycle break",
+          "edits": [
+            "crates/application/src/subagent_executor.rs - NEW generic SubagentAwareToolExecutor<T: ToolExecutor> { inner, registry, conversations: Arc<OnceLock<Weak<dyn ConversationService>>> }. 5 concrete async fn bodies (static-dispatch, not async_trait): core_tools = inner + subagent_tools::tool_definitions(); search_tools/tool_namespaces delegate; tool_definition returns subagent def when supports_tool(name) else inner; execute_tool routes subagent names by upgrading the Weak + SubagentTools::<dyn ConversationService>::new(...).execute_tool, else inner. None / upgrade-failure => recoverable CoreError::ToolExecution, never panic.",
+            "crates/application/src/subagent_tools.rs - relax SubagentTools<C: ConversationService> to <C: ?Sized + ConversationService> on the struct def, the Clone impl, and the main impl (add ?Sized) so C = dyn ConversationService is representable (breaks the type-level recursion). Bodies unchanged (all use is via Arc<C>/&C).",
+            "crates/application/src/lib.rs - relax spawn_agent_conversation<C> where-bound to `C: ?Sized + ConversationService + Send + Sync + 'static`; declare `pub mod subagent_executor;` next to subagent_tools.",
+            "crates/daemon/src/main.rs - `let conversation_slot: Arc<OnceLock<Weak<dyn ConversationService>>> = Arc::new(OnceLock::new());`; keep McpToolExecutor-specific calls (start/tools_by_service/core_tools/mcp_providers) on the bare tool_executor BEFORE the wrap; at the with_tools call replace tool_executor with SubagentAwareToolExecutor::new(tool_executor, Arc::clone(&background_task_registry), Arc::clone(&conversation_slot)); immediately after `let conversation_service = Arc::new(routing_conv);` do `let conv_dyn: Arc<dyn ConversationService> = Arc::clone(&conversation_service); let _ = conversation_slot.set(Arc::downgrade(&conv_dyn));`."
+          ],
+          "tests": [
+            "wrapper_core_tools_include_subagent_definitions",
+            "wrapper_routes_spawn_subagent_to_subagent_tools",
+            "wrapper_routes_get_subagent_status_to_subagent_tools",
+            "wrapper_delegates_unknown_tool_to_inner",
+            "wrapper_tool_definition_resolves_subagent_names_else_inner",
+            "wrapper_search_and_namespaces_delegate_to_inner",
+            "wrapper_execute_before_slot_set_returns_recoverable_error (None-window)",
+            "wrapper_execute_after_service_dropped_returns_recoverable_error (Weak upgrade fails)",
+            "subagent_tools_construct_and_dispatch_over_dyn_conversation_service (guards the ?Sized relaxation)",
+            "wrapper_impls_tool_executor_and_is_send_sync (static assertion)"
+          ]
+        },
+        {
+          "order": 8,
+          "name": "scratchpad-embeddings-554",
+          "goal": "Synchronous write-time embeddings + hybrid (vector + FTS RRF) search on the scratchpad, Postgres-only, within EMBED_TIMEOUT with FTS-only fallback and NO backfill. Embedding lives in the store (single chokepoint covering both the tool write and the client write). A query-time embedding_model filter drops stale-dimension rows out of the vector branch before <=> so a model change can never error the query. Deploy milestone.",
+          "db_backed": true,
+          "merge_deploy_milestone": true,
+          "commit_message": "feat(scratchpad): synchronous write-time embeddings + hybrid RRF search (#554)",
+          "edits": [
+            "crates/storage/migrations/033_scratchpad_embeddings.sql - NEW: ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS embedding vector[]; ADD COLUMN IF NOT EXISTS embedding_model TEXT. No ANN index (tiny per-conversation corpus, brute-force <=>), no freshness column (deliberate divergence from KB migration 026).",
+            "crates/storage/src/pool.rs - register 033 after 032.",
+            "crates/core/src/ports/embedding.rs - EMBED_TIMEOUT shared const (moved from mcp-client builtin.rs:44 so store + tool share one constant).",
+            "crates/core/src/ports/scratchpad.rs - search gains query_embedding: Vec<f32> (after query); ScratchpadSearchFn adds Vec<f32>; doc -> hybrid vector+FTS (RRF), empty embedding = FTS-only; MockScratchpadStore search updated.",
+            "crates/storage/src/scratchpad.rs - PgScratchpadStore::new(pool, embed_fn: Option<EmbedFn>, embedding_model: Option<String>); write() embeds EVERY upserted row inside the txn and ALWAYS overwrites embedding/embedding_model (to the new vector, or NULL on timeout/error/absent-backend) since there is no backfill to repair a stale vector on a content upsert; search() runs the RRF hybrid (vector CTE over unnest(embedding) filtered by embedding_model=$model, text CTE, FULL OUTER JOIN 1/(60+rank)) scoped by user_id+conversation_id+optional note_type when query_embedding is non-empty, else the current FTS-only body unchanged.",
+            "crates/mcp-client/src/builtin.rs - scratchpad_search embeds the query via `embed_text(&query).await.unwrap_or_default()` and passes it into the search closure; tool description -> 'hybrid vector + full-text'. scratchpad_write unchanged (embedding now lives in the store).",
+            "crates/daemon/src/main.rs - PgScratchpadStore::new gets embedding_fn.clone() + Some(embedding_model_id.clone()) (FTS-only when embedding_fn is None); search_fn closure forwards query_embedding.",
+            "test updates: storage/tests/scratchpad.rs (3-arg new + query_embedding + a deterministic fake EmbedFn) and the builtin.rs test search_fn closure."
+          ],
+          "tests": [
+            "scratchpad_write_embeds_synchronously (DB)",
+            "scratchpad_write_embed_timeout_stores_null_embedding (DB) - returns within EMBED_TIMEOUT, FTS still finds it",
+            "scratchpad_update_reembeds_and_never_leaves_stale_vector (DB)",
+            "scratchpad_hybrid_search_ranks_semantic_match (DB)",
+            "scratchpad_search_empty_embedding_falls_back_to_fts (DB) - pre-#554 parity",
+            "scratchpad_hybrid_search_rrf_orders_by_fused_rank (DB)",
+            "scratchpad_hybrid_search_is_user_scoped (DB)",
+            "scratchpad_hybrid_search_is_conversation_scoped (DB)",
+            "scratchpad_hybrid_search_respects_note_type_filter (DB)",
+            "scratchpad_hybrid_search_stale_model_row_does_not_error_query (DB)",
+            "scratchpad_search_query_path_invokes_embedder (mcp-client, no DB)",
+            "scratchpad_write_no_embed_backend_is_fts_only (DB)"
+          ]
+        },
+        {
+          "order": 9,
+          "name": "ui-owner-todo-grouping",
+          "goal": "Surface owner_todo on ScratchpadNoteView and group notes by subagent namespace in the two scratchpad clients (gtk + web); optional nested parent/child task display. Serde-defaulted so the D-Bus/WS mappers fan out with no manual wiring. Deploy milestone.",
+          "db_backed": false,
+          "merge_deploy_milestone": true,
+          "commit_message": "feat(ui): group scratchpad notes by subagent owner_todo namespace",
+          "edits": [
+            "crates/api-model/src/lib.rs - ScratchpadNoteView (~L698) gains owner_todo: String `#[serde(default, skip_serializing_if=\"String::is_empty\")]`.",
+            "crates/application/src/lib.rs - scratchpad_note_to_view (~L1155) populates owner_todo from the ScratchpadNote.",
+            "crates/client-ui-common - shared group_notes / tree pure-fn keyed by owner_todo, reused by gtk + web (earns the abstraction at 2 call sites now, per the mapped touch-points).",
+            "gtk conversation_side_pane.rs group_notes + web scratchpad.rs group_notes - group notes by owner_todo namespace.",
+            "OPTIONAL polish (TaskView.parent/children already exist): gtk tasks_panel.rs / web tasks.rs / kde TasksView.qml nested subagent display."
+          ],
+          "tests": [
+            "scratchpad_note_view_carries_owner_todo_serde_default (missing key => '')",
+            "group_notes_partitions_by_owner_todo",
+            "group_notes_root_only_when_no_subagent_namespaces (regression guard for the common single-agent case)"
+          ]
+        }
+      ],
+      "migrations_ddl": [
+        "POSTGRES 031_scratchpad_owner_todo.sql (register in pool.rs after 030; idempotent because the runner re-executes every migration on every startup with no version table). ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS owner_todo TEXT NOT NULL DEFAULT ''; ALTER TABLE scratchpads DROP CONSTRAINT IF EXISTS scratchpads_conversation_id_note_key_key; CREATE UNIQUE INDEX IF NOT EXISTS scratchpads_conv_owner_key_uidx ON scratchpads (conversation_id, owner_todo, note_key); CREATE INDEX IF NOT EXISTS scratchpads_user_conv_owner_idx ON scratchpads (user_id, conversation_id, owner_todo text_pattern_ops);  -- unique INDEX (not ADD CONSTRAINT) so IF NOT EXISTS is idempotent AND ON CONFLICT (conversation_id, owner_todo, note_key) can still infer from it; existing rows backfill to owner_todo='' preserving old (conversation_id,note_key) uniqueness for root rows.",
+        "POSTGRES 032_subagent_task_columns.sql (register after 031). ALTER TABLE background_tasks ADD COLUMN IF NOT EXISTS owner_todo TEXT NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS spawn_marker TEXT;  -- owner_todo backfills legacy rows as root; spawn_marker nullable (legacy/non-subagent tasks never read a pad snapshot). RLS 029 background_tasks_user_isolation is row-level, covers the new columns unchanged.",
+        "POSTGRES 033_scratchpad_embeddings.sql (register after 032; #554). ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS embedding vector[]; ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS embedding_model TEXT;  -- pgvector `vector` already created in pool.rs; no ANN index (brute-force <=> over a tiny per-conversation corpus, mirrors KB); no freshness column (no backfill loop).",
+        "SQLITE baseline edit crates/storage-sqlite/migrations/001_relational_schema.sql (the single unreleased baseline; edit inline rather than adding a 2nd file, because the pool guard test forbids unreferenced .sql and SQLite ADD COLUMN has no clean IF NOT EXISTS). Inside CREATE TABLE IF NOT EXISTS background_tasks add:   owner_todo   TEXT NOT NULL DEFAULT '',   spawn_marker TEXT,  -- matching PG nullability. (Only takes effect on a fresh DB; a pre-existing dev DB from #546 needs a rebuild - flagged in open_questions.)",
+        "SQLITE scratchpads: NO migration this epic. storage-sqlite has NO scratchpads table and NO ScratchpadStore (deferred to increment 2, lib.rs:29-32). When increment 2 adds the table it must be created WITH owner_todo TEXT NOT NULL DEFAULT '', UNIQUE(conversation_id,owner_todo,note_key), INDEX(user_id,conversation_id,owner_todo), embedding + embedding_model columns, and implement the identical snapshot predicate + delete_owner_subtree from the start. Any plan that ships a sqlite scratchpads ALTER now is wrong (nothing to alter)."
+      ],
+      "task_locals": [
+        "SCRATCHPAD_SCOPE: ConversationId - which conversation's pad the subagent's scratchpad tools/assembler operate on (= the SESSION/root conversation), distinct from CONVERSATION_ID which stays the child conv (history/LLM/KB-provenance). Consumed by builtin.rs scratchpad_conversation() to redirect the pad. current_scratchpad_scope() -> Option<ConversationId>.",
+        "SCRATCHPAD_OWNER_TODO: String - the pinned materialized-path anchor the running agent operates under (base + active step); root sentinel '' / unset = top-level. Consumed DIRECTLY by PgScratchpadStore (stamp on write, confine delete_many/clear) and by handle_step_control (cascade prefix compose) and maintained by begin_step/complete_step. current_owner_todo() -> Option<String>.",
+        "SCRATCHPAD_VISIBLE_BEFORE: String - canonical lowercase-hyphenated UUIDv7 spawn snapshot cut (= spawn_marker.to_string()); bound AS TEXT because scratchpads.id is TEXT and UUIDv7 canonical strings are lexicographically time-ordered. Consumed DIRECTLY by PgScratchpadStore reads (get_many/list/search): its Some/None presence gates whether the snapshot predicate is applied at all. current_visible_before() -> Option<String>.",
+        "(All three live in crates/core/src/ports/scratchpad_scope.rs, installed together via the SubagentScope bundle + with_subagent_scope() inside the spawn body - never read across tokio::spawn. Plan 2's proposed CURRENT_OWNER_TODO / CURRENT_SPAWN_MARKER companions are SUBSUMED by these three; do not add them.)"
+      ],
+      "arc_cycle_resolution": "\"Late-set Weak-in-OnceLock slot, NOT Arc::new_cyclic. SubagentAwareToolExecutor<T> holds `conversations: Arc<OnceLock<Weak<dyn ConversationService>>>` (plus inner: T and registry). In daemon/main.rs: (1) create the empty slot before the handler is built: `let conversation_slot: Arc<OnceLock<Weak<dyn ConversationService>>> = Arc::new(OnceLock::new());`; (2) move Arc::clone(&conversation_slot) into the wrapper at the ConversationHandler::with_tools call; (3) after `let conversation_service = Arc::new(routing_conv);`, unsize and downgrade into the SAME slot: `let conv_dyn: Arc<dyn ConversationService> = Arc::clone(&conversation_service); let _ = conversation_slot.set(Arc::downgrade(&conv_dyn));` (Arc unsizing shares the allocation/refcount, so the Weak tracks conversation_service's real lifetime). execute_tool does `self.conversations.get().and_then(Weak::upgrade)` per call; a None (pre-set construction window) or a failed upgrade (post-shutdown drop) returns a clean recoverable CoreError::ToolExecution - never a panic - matching SubagentTools' refuse-cleanly posture. Storing Weak (not Arc) is what breaks the strong cycle executor -> slot -> conversation_service -> RoutingConversationHandler -> inner_conv -> handler -> wrapper; an Arc there would leak the whole graph forever. The type-level recursion is broken separately by relaxing SubagentTools<C> and spawn_agent_conversation<C> to `C: ?Sized + ConversationService` and instantiating over `dyn ConversationService` (a concrete C = RoutingConversationHandler<..ConversationHandler<..SubagentAwareToolExecutor<..>>> is an infinitely-nested, unrepresentable type). This relies on ConversationService keeping its #[async_trait] boxing (inbound.rs:211) to stay dyn-compatible. Arc::new_cyclic is INFEASIBLE: its initializer is a synchronous FnOnce(&Weak<T>) -> T, but the self-referential construction chain includes async awaits (tool_executor.start().await at main.rs:1586 and ~170 lines of handler wiring), which cannot run inside a sync initializer; the late-set slot leaves all that async construction untouched.\"",
+      "parallel_fanout_owner_paths": "\"StepStack is single-active-path (one open frame chain) and cannot represent N concurrently-open sibling subagents. Resolution: StepStack::fan_out(n) mints n FLAT sibling owner-path keys under the current frame (or under the implicit root when the stack is empty) WITHOUT pushing frames - e.g. under frame '1', fan_out(3) -> ['1.1','1.2','1.3'] - advancing the same child_counter/root_counter that begin() uses, so a later begin() yields '1.4' and never recycles a fanned-out key (fan_out(0) is a no-op returning []). Each of the N concurrently-spawned subagents is pinned to exactly ONE sibling path as its owner_todo (frozen + persisted at spawn on the task row). All N stay 'open' simultaneously as independent owner_todo namespace anchors; none sits on the active frame stack, so they don't serialize. The parent reads their outcomes up in a prior round, then on completing the ENCLOSING step the hard-coded cascade owner_subtree_prefix(parent_self, enclosing_step_key) delete-subtrees the whole fanned-out group in one shot. CRITICAL companion: render_plan_from_notes must key the rolled-up [Plan] tree by (owner_todo, note_key) - NOT note_key alone - because each fanned-out namespace numbers its own local keys ('1','1.1') independently and a subtree-inclusive parent read would otherwise mix colliding keys across namespaces and misrender. This must land WITH the fan_out change (slice 4).\"",
+      "decisions": [
+        "MIGRATION ORDINAL COLLISION (all 4 storage plans claimed 031): resolved to 031=scratchpad owner_todo namespacing, 032=background_tasks subagent columns, 033=scratchpad embeddings (#554), in build order. Each registered in pool.rs before Ok(()) (the every_migration_is_registered guard enforces it).",
+        "UNIQUE INDEX vs ADD CONSTRAINT (plan 1 vs plans 3/5): resolved to CREATE UNIQUE INDEX IF NOT EXISTS. The migration runner re-executes every migration on every startup with no version table, and Postgres ADD CONSTRAINT has no IF NOT EXISTS, so a bare ADD CONSTRAINT crash-loops the daemon on the 2nd boot. A unique index is idempotent AND ON CONFLICT can infer from it.",
+        "owner_todo/visible_before CONSUMPTION (plan 1 thread-through-trait vs plan 5 direct-read): resolved to DIRECT task-local read inside PgScratchpadStore, exactly like the existing current_user_id() reads. ScratchpadStore trait/closure/daemon/API signatures are UNCHANGED (only search gains query_embedding, in the embeddings slice). This makes confinement spoof-proof (an LLM tool call cannot set a task-local) with ~zero ripple.",
+        "WRITE STAMP SOURCE (plan 3 owner_todo-on-NewScratchpadNote vs plan 5 storage-stamps-from-task-local): resolved to storage stamps owner_todo = current_owner_todo().unwrap_or_default() for the whole batch. NewScratchpadNote gains NO field; the read type ScratchpadNote DOES gain owner_todo (roll-up attribution + UI grouping).",
+        "owner_todo VALUE / DERIVATION (plan 2 registry next_child_ordinal vs plan 3 plan-step path): resolved to the plan-step-aligned materialized path, captured-and-FROZEN at spawn from current_owner_todo() (parallel: fan_out keys), then persisted. Plan 2's next_child_ordinal is DROPPED (TaskState does not gain it) - the registry is a passthrough for owner_todo. This is what makes the complete_step cascade (owner_subtree_prefix(parent_self, step_key)) actually match the spawned child's subtree.",
+        "spawn_marker MINT SITE (plan 2 registry-for-all vs plan 3 SubagentTools-for-subagents): resolved to SubagentTools::spawn mints uuid::Uuid::now_v7().to_string() (it needs it for the SubagentScope.visible_before it installs), threaded through the spec and persisted as Some(marker) on the row; non-subagent tasks persist None.",
+        "PERSISTENCE LOCATION (plan 2 row columns vs plan 3 kind_json): resolved to owner_todo + spawn_marker = background_tasks ROW columns (single source of truth, queryable, used by sweep + any future cascade); session_conversation_id = TaskKind::Subagent kind_json field. No dual source of truth for owner_todo.",
+        "TASK-LOCAL MODULE (plan 3 subagent_scope.rs w/ Uuid vs plan 5 scratchpad_scope.rs w/ String): resolved to crates/core/src/ports/scratchpad_scope.rs; VISIBLE_BEFORE is a String (canonical UUIDv7, matches the TEXT id<marker binding); expose the SubagentScope bundle + with_subagent_scope for install AND individual Option-returning current_* accessors for read.",
+        "ScratchpadNote + ScratchpadNoteView gain owner_todo (both plans' lean-yes open question): resolved YES - needed for the top-level roll-up to attribute a surviving note to the child that wrote it and for client grouping.",
+        "SUBTREE INDEX shape (plan 1 (conv,owner) vs plan 3 (conv,owner text_pattern_ops) vs plan 5 (user,conv,owner)): resolved to (user_id, conversation_id, owner_todo text_pattern_ops) - leads with user_id (every query filters user_id first, matching scratchpads_user_conv_updated_idx) and text_pattern_ops backs the LIKE prefix subtree DELETE under any collation.",
+        "MIGRATION 031 IS NOT STANDALONE-SHIPPABLE: it co-lands with the PgScratchpadStore ON CONFLICT swap in one slice. Dropping the old 2-col unique while the code still does ON CONFLICT (conversation_id, note_key) would 500 every write. Together they are additive + behavior-preserving (top-level owner_todo is uniformly '').",
+        "delete_many/clear MUST be namespace-confined (AND owner_todo=$me): highest-severity correctness item - without it a subagent's scratchpad_delete{all:true} wipes the parent's and siblings' notes. delete_owner_subtree (subtree, param owner_todo) is a SEPARATE additive trait method used only by the cascade.",
+        "EMBEDDINGS live in the store (single chokepoint covering both tool + client writes), always overwrite the vector (or NULL on failure) since there is no backfill; a query-time embedding_model=$model filter drops stale-dimension rows before <=> so a model change never errors the query. EMBED_TIMEOUT moves to core::ports::embedding as one shared const.",
+        "FAIL-CLOSED: spawn_subagent refuses (recoverable CoreError) when no session anchor OR no active plan step exists to anchor the child (child owner_todo would be root '' and collide with the session namespace) - the model must begin_step the sub-task first (subagents.txt:6-7). Every new/changed query keeps user_id first; the explicit WHERE user_id is the real tenant guard (RLS 029 is a non-FORCE backstop).",
+        "owner_todo values are constrained to system-generated dot-delimited numeric paths ([0-9.]+) at the write boundary so `owner_todo LIKE $me || '.%'` needs no LIKE-escaping; $me is always bound as a parameter, never string-built."
+      ],
+      "open_questions": [
+        "begin_step/complete_step SINGLE-SESSION nested-step cleanup: the design's hide->DELETE also implies deleting a completing agent's OWN key-descendant step rows (owner_todo=SELF, note_key like 'F.%'/'outcome:F.%') that render_plan_from_notes today only HIDES. delete_owner_subtree (a deeper owner_todo namespace) does NOT match these. Fork: (a) also run a SELF-namespace enumerated-key delete_many, keeping storage ignorant of key conventions, or (b) give every nested step its OWN owner_todo = its dotted path so one delete_owner_subtree covers both single-session nesting and subagents (cleanest; changes how begin_step tags owner_todo). Not guessed - needs an architect call; it changes what begin_step maintains in SCRATCHPAD_OWNER_TODO.",
+        "current_owner_todo() CONTRACT: base-only (the spawn-pinned anchor) vs base+active-step (composed). The cascade and the write-stamp both want base+active-step; the blueprint assumes begin_step/complete_step maintain the composed value. Confirm the plan subsystem writes SCRATCHPAD_OWNER_TODO directly (vs a separate CURRENT_STEP local that the store composes).",
+        "UUIDv7 intra-millisecond monotonicity: uuid now_v7() randomizes low bits and does not order two v7s minted in the same ms. If the parent writes a note and spawns within the same ms, that note's id could exceed the spawn_marker and be wrongly excluded from the child's snapshot. Accept the human-cadence race, or adopt a process-wide monotonic ContextV7 for both the scratchpad id mint and the marker?",
+        "complete_step vs still-running wait=false children: the cascade DELETE is irreversible, so if the model completes a fan-out step before all wait=false descendants finish, their later-id writes to the deleted subtree are orphaned. Should complete_step REFUSE or DEFER while descendant subagent tasks are still non-terminal (get_subagent_status is the only current guard)?",
+        "CLIENT reads see all namespaces: GetConversationScratchpad carries no subagent scope -> top-level unbounded -> a user's client renders in-flight subagent scratch notes. Transparency (desired) vs noise (filter to root)? Product call; drives whether the slice-9 grouping is default-collapsed.",
+        "TOP-LEVEL clear() semantics: exact owner_todo='' (root only, leaving subagent rows for the cascade/backstop) vs a full-conversation wipe on top-level goal clear. Storage exposes owner-scoped delete + delete_owner_subtree; who issues the 'backstop delete on top-level goal clear'?",
+        "KB provenance stamps source_conversation_id from current_conversation_id() (the child conv), so a subagent's KB writes trace to the ephemeral child, not the session. Acceptable, or should KB provenance also prefer current_scratchpad_scope()?",
+        "SQLITE background_tasks baseline edit only affects a FRESH db (CREATE TABLE IF NOT EXISTS won't ALTER an existing dev DB from #546). Confirm editing baseline 001 inline (chosen, adapter unreleased) vs adding a 002 ALTER migration; and confirm the whole sqlite ScratchpadStore (owner_todo + snapshot + delete_owner_subtree + FTS5 + sqlite-vec embeddings) is one deferred increment-2 unit, i.e. #554 ships Postgres-only now.",
+        "#135 timing: the subagent brief rides in effective_prompt folded text until real Role::System lands; confirm effective_prompt stays the interim carrier and the owner_todo arg survives that migration.",
+        "#129 resume durability: owner_todo/spawn_marker are frozen+persisted so a wait=false child survives a restart, and a swept parent is marked Failed (won't spawn more). If a future #129 ever REVIVES a parent, confirm no ordinal/path recycling can collide with a surviving child's namespace (mitigation: derive nothing from in-memory state on revive)."
+      ]
+    },
+    "risks": [
+      {
+        "lens": "compile-completeness (struct-field additions + changed signatures threaded through every construction/destructure/impl site)",
+        "findings": [
+          {
+            "severity": "high",
+            "where": "Slice 5 (subagent-scope-install-at-spawn): api-model TaskKind::Subagent gains session_conversation_id: String",
+            "claim": "Adding session_conversation_id to the TaskKind::Subagent struct-variant makes every 4-field literal construction and every exhaustive destructure fail to compile. Slice 5's edit list only names the constructor in subagent_tools.rs:322 and 'api-model test literals' (api-model/src/lib.rs:2225, 2265). It omits four compile-forced sites in the application test crates, all of which are part of `cargo test --workspace`: crates/application/tests/background_tasks.rs:1275 (construction, fields parent_task_id/conversation_id/name), crates/application/tests/durable_background_tasks.rs:646 (construction), crates/application/tests/spawn_subagent.rs:1306 (construction), and crates/application/tests/spawn_subagent.rs:1092 (EXHAUSTIVE destructure `let api::TaskKind::Subagent { parent_task_id, conversation_id, name } = &child.kind` with no `..`). Also in-file crates/application/src/background_tasks.rs:1429 (test-module construction) is in a slice-5-touched file but at a line far from the spawn() edit. Every one of these breaks the build the moment the field lands.",
+            "fix": "Add `session_conversation_id: ...` to the three constructions (application/tests/background_tasks.rs:1275, durable_background_tasks.rs:646, spawn_subagent.rs:1306, src/background_tasks.rs:1429) and either add the field or a trailing `..` to the exhaustive destructure at spawn_subagent.rs:1092. Add these files to slice 5's compile-forced edit list."
+          },
+          {
+            "severity": "high",
+            "where": "Slice 9 (ui-owner-todo-grouping): api-model ScratchpadNoteView gains owner_todo: String",
+            "claim": "ScratchpadNoteView derives no Default, so `#[serde(default)]` does NOT satisfy struct-literal construction - every literal must set owner_todo. Slice 9's edit list names only the field addition, scratchpad_note_to_view (application/src/lib.rs:1155), and the gtk/web group_notes (separate repos). It omits two in-repo struct-literal sites that are compiled by `cargo test --workspace`: crates/api-model/src/lib.rs:2767 (ScratchpadNoteView { id, key, content, note_type, sequence, done, updated_at }) and crates/client-common/src/commands.rs:904 (same shape). Both fail to compile when the field is added.",
+            "fix": "Add `owner_todo: \"\".into()` (or a value) to the literals at api-model/src/lib.rs:2767 and client-common/src/commands.rs:904, and list both in slice 9's edits."
+          },
+          {
+            "severity": "low",
+            "where": "Slice 8 (scratchpad-embeddings-554): PgScratchpadStore::new becomes 3-arg (pool, embed_fn, embedding_model)",
+            "claim": "Slice 8 lists 'storage/tests/scratchpad.rs (3-arg new + ...)' generically, but PgScratchpadStore::new(fx.pool.clone()) is called at NINE sites in that one file: crates/storage/tests/scratchpad.rs:139, 175, 207, 244, 276, 308, 362, 406, 448 (plus the daemon site at main.rs:1404). All nine must change or the storage integration test target won't compile. Low severity because the file is already flagged, but the count is easy to under-apply given it reads as a single edit.",
+            "fix": "Update all nine PgScratchpadStore::new call sites in storage/tests/scratchpad.rs to the 3-arg form (a shared test helper minting (pool, Some(fake_embed_fn), Some(model)) would collapse the nine into one)."
+          }
+        ]
+      },
+      {
+        "lens": "migration-safety + multi-tenancy",
+        "findings": [
+          {
+            "severity": "low",
+            "where": "crates/storage/migrations/ (max = 030_tool_definitions_provider.sql); worktree scan clean",
+            "claim": "VERIFIED SOUND: migration ordinals 031/032/033 are the next-free numbers. Highest existing on this branch is 030 (crates/storage/migrations/030_tool_definitions_provider.sql, registered pool.rs:249-253). Scan of all .worktrees/* and .claude/worktrees/* found no 031+ storage migration, so no cross-branch ordinal collision is pending.",
+            "fix": "No change needed. Still re-check the number at push time per AGENTS.md 'Storage & migrations' (invisible-until-merge conflict)."
+          },
+          {
+            "severity": "low",
+            "where": "031_scratchpad_owner_todo.sql: ADD COLUMN owner_todo TEXT NOT NULL DEFAULT '' + CREATE UNIQUE INDEX (conversation_id, owner_todo, note_key)",
+            "claim": "VERIFIED SOUND: NOT NULL DEFAULT '' (not NULL) is the correct root sentinel. A NULL sentinel would break root uniqueness because Postgres treats NULLs as distinct in a UNIQUE index, so many root rows sharing a note_key would all be allowed. With '' the widened key (conversation_id, '', note_key) is byte-identical in effect to the old (conversation_id, note_key) for backfilled rows, so the CREATE UNIQUE INDEX cannot fail on existing data (old 2-col UNIQUE already guaranteed it). Existing rows backfill to '' via DEFAULT. Using CREATE UNIQUE INDEX IF NOT EXISTS (not ADD CONSTRAINT) is correct given the version-table-less runner (pool.rs re-executes every migration each boot; confirmed no version table, run_migrations pool.rs:20-256).",
+            "fix": "No change needed."
+          },
+          {
+            "severity": "medium",
+            "where": "crates/storage-sqlite/migrations/001_relational_schema.sql:108 (background_tasks CREATE TABLE IF NOT EXISTS)",
+            "claim": "Editing the SQLite baseline inline to add owner_todo/spawn_marker only takes effect on a FRESH database. #546 (commit 30dc469) already shipped the SQLite adapter, so any dev who has run the daemon has a background_tasks table WITHOUT the new columns; CREATE TABLE IF NOT EXISTS is a no-op against it. After slice 3 the SQLite adapter's create_task INSERT and get/list/scan SELECTs reference owner_todo/spawn_marker and will fail at runtime with 'no such column', and fresh-DB CI will not catch it.",
+            "fix": "Do not rely on baseline-edit alone. Either add an idempotent SQLite ALTER (SQLite supports ALTER TABLE ... ADD COLUMN; guard by PRAGMA table_info or by catching the duplicate-column error) run after CREATE TABLE, or add a startup schema-check that fails fast with a 'rebuild your dev DB' message. Document the required rebuild in the same change."
+          },
+          {
+            "severity": "medium",
+            "where": "delete_owner_subtree + snapshot predicate: owner_todo LIKE $me || '.%' (storage/src/scratchpad.rs, per slice 2/4)",
+            "claim": "Injection is correctly avoided ($me is always a bound parameter; only the literal '.%' is concatenated in SQL). However correctness of the prefix match depends on owner_todo containing no SQL-LIKE metacharacters (% or _). The blueprint asserts owner_todo is constrained to [0-9.]+ 'at the write boundary', but there is no DB CHECK constraint and no validated newtype shown enforcing it. If any code path ever stamps an owner_todo containing % or _ (e.g. a future non-numeric anchor), the subtree LIKE over-matches (deletes/reads sibling namespaces = cross-namespace leak) or under-matches (orphans cleanup).",
+            "fix": "Add a column CHECK in 031 (e.g. CHECK (owner_todo ~ '^[0-9.]*$')) so the invariant is enforced by the DB, or introduce a validated OwnerTodo newtype minted only by the plan/spawn subsystem. Belt-and-suspenders, keep the parameter binding."
+          },
+          {
+            "severity": "low",
+            "where": "031 migration: DROP CONSTRAINT IF EXISTS scratchpads_conversation_id_note_key_key",
+            "claim": "The migration hard-codes the auto-generated constraint name. It is the deterministic Postgres default (tablename_columns_key) for the inline UNIQUE in 019_scratchpads.sql:37, so it matches on a normally-migrated DB. But if a DB was restored/renamed and the 2-col unique carries a non-default name, DROP CONSTRAINT IF EXISTS silently no-ops, the old (conversation_id, note_key) unique survives, and the FIRST subagent write reusing a root note_key under a different owner_todo raises a unique violation -> 500 on every such write. This is exactly the case the epic depends on.",
+            "fix": "Additionally DROP INDEX IF EXISTS the backing index, or locate/drop the 2-col unique via pg_constraint by column set rather than by literal name, or add a post-migration assertion that no 2-col unique on (conversation_id, note_key) remains."
+          },
+          {
+            "severity": "low",
+            "where": "snapshot read predicate: (id < $vb OR ...), on scratchpads.id (TEXT PRIMARY KEY)",
+            "claim": "The id<marker snapshot bound compares TEXT UUIDv7 canonical strings under the column's DEFAULT collation. Under a non-C locale collation (glibc en_US.UTF-8 is a common default) lexicographic ordering of hyphenated hex is not guaranteed to equal UUIDv7 time order, so a boundary row could be wrongly included/excluded from a child's snapshot. text_pattern_ops on the new index only backs the LIKE prefix, not the '<' comparison on id.",
+            "fix": "Compare collation-independently: 'id COLLATE \"C\" < $vb' (or store/compare id as uuid type). Pin id_lt_marker_orders_by_uuidv7_time on a locale-collated test DB, not just the default CI locale, so the ordering assumption is actually exercised."
+          },
+          {
+            "severity": "low",
+            "where": "Multi-tenancy: RLS 029 vs the scratchpad store path; current_user_id() fallback (crates/core/src/ports/auth.rs:69-70)",
+            "claim": "RLS migration 029 is non-FORCE and only filters the dedicated adele_query read role (SET LOCAL ROLE, db_query tool). The PgScratchpadStore runs as the table OWNER and is therefore EXEMPT from RLS, so RLS is NOT a backstop for scratchpad writes/reads/deletes or the new owner_todo queries. Their ONLY tenant guard is the explicit 'WHERE user_id = $1' from current_user_id(), which falls back to the 'default' sentinel when no with_user_id scope is installed (auth.rs:69). Confirmed the subagent turn body runs inside with_user_id(owner) (background_tasks.rs:738 and 1021), and the SubagentScope bundle (3 scratchpad locals only) carries NO user_id -- so confinement is within the correct tenant ONLY while with_subagent_scope stays nested inside with_user_id.",
+            "fix": "Keep user_id=$1 first in every new/changed query (blueprint does). Add an invariant/debug_assert that a scratchpad scope is never installed without a user_id scope, and a cross-tenant DB test (bob cannot see/delete alice's rows regardless of owner_todo) as blueprint test cross_user_isolation_still_holds_with_owner_todo already specifies -- ensure it also covers delete_owner_subtree and the snapshot reads, not just write/read."
+          },
+          {
+            "severity": "low",
+            "where": "PG vs SQLite parity for the deferred increment-2 scratchpad port",
+            "claim": "This epic ships scratchpad namespacing/snapshot Postgres-only (SQLite has no scratchpads table), which is correct. Two latent parity gotchas for the future SQLite port: SQLite LIKE is CASE-INSENSITIVE for ASCII by default (harmless for [0-9.] paths but a trap if owner_todo ever gains letters), and the id<marker bound relies on SQLite's default BINARY collation matching UUIDv7 byte order (true today). The dot-boundary logic itself is correct on both engines: '1.1' vs '1.11' -- LIKE '1.1.%' requires a literal dot at position 4, which '1.11' lacks, and the exact match is caught by the separate 'owner_todo = $me' branch. '.' is a literal in SQL LIKE (only % and _ are wildcards).",
+            "fix": "No change now. Record in the increment-2 ticket that the SQLite scratchpads table must enforce the [0-9.] invariant and preserve BINARY-collation id ordering, and re-run the dot-boundary and snapshot tests against the SQLite adapter."
+          }
+        ]
+      },
+      {
+        "lens": "Adversarial type-check & lifetime audit of the arc-cycle resolution (late-set Weak-in-OnceLock slot + ?Sized-over-dyn) for wiring SubagentTools into the live executor. Verdict: the resolution is fundamentally SOUND and type-checks. dyn ConversationService is object-safe (async_trait boxing at crates/core/src/ports/inbound.rs:211), Send+Sync+'static is satisfied via the trait's Send+Sync supertrait (inbound.rs:212) plus the default 'static object bound, so C = dyn ConversationService satisfies SubagentTools' bound once the ?Sized relaxation lands. The wrapper stores Weak, not Arc, so no strong cycle/leak. tool_executor is last used at main.rs:2036 (moved into with_tools), so wrapping it there introduces no move-after-use. No type recursion exists because the wrapper erases the conversation to Weak<dyn> rather than embedding a concrete conversation type. Findings below are refinements/risks, not blockers.",
+        "findings": [
+          {
+            "severity": "low",
+            "where": "crates/daemon/src/main.rs:2033-2201 (wrapper built at 2033/2036, slot set after 2201) vs backend-task wiring at ~2051-2185",
+            "claim": "None-window: the OnceLock slot is only set after `let conversation_service = Arc::new(routing_conv);` (~2201), while the SubagentAwareToolExecutor is already live inside `handler`/`inner_conv` from 2033. Any spawn_subagent invoked before the set returns a recoverable CoreError (self.conversations.get()==None). This is benign in the normal path (transport servers + api_handler start after 2201) and there are NO `?`/early-returns in the 2033-2201 window (verified by grep), so control always reaches the set once it enters. Residual risk is only a startup-initiated turn (task resumption #129 / dreaming scheduler wired at 2051-2185) that could call spawn_subagent before 2201.",
+            "fix": "Confirm no startup path (sweep_non_terminal_on_startup / dreaming first-fire) executes a turn synchronously before 2201; the blueprint already marks swept parents Failed and dreaming is interval-gated, so this holds today. Keep the set as the first statement after 2201 and start no serving/scheduling that can reach spawn_subagent before it."
+          },
+          {
+            "severity": "low",
+            "where": "blueprint arc_cycle_resolution rationale vs crates/daemon/src/main.rs:1586",
+            "claim": "Rationale inaccuracy: the resolution cites `tool_executor.start().await at main.rs:1586` as part of the 'self-referential construction chain' proving Arc::new_cyclic infeasible. start() runs on the BARE McpToolExecutor before it is wrapped (last bare use at 2036) and is not part of any self-reference. The load-bearing reason new_cyclic is infeasible is the ~165 lines of async handler wiring (2036-2201) whose awaits cannot run inside new_cyclic's synchronous FnOnce(&Weak)->T initializer.",
+            "fix": "Drop the 1586/start() citation from the justification; the conclusion (new_cyclic infeasible, late-set slot correct) stands on the 2036-2201 async wiring alone."
+          },
+          {
+            "severity": "low",
+            "where": "crates/application/src/subagent_executor.rs (planned execute_tool None/upgrade-failure branch)",
+            "claim": "Observability gap: the wrapper collapses two distinct conditions into one identical recoverable CoreError::ToolExecution — (a) slot never wired (a real construction bug, e.g. a future refactor adds an early return between 2033 and 2201) and (b) post-shutdown Weak::upgrade failure (expected). A silently-unwired slot would degrade every subagent spawn with no loud signal.",
+            "fix": "In the None branch log a warn-once distinct from the failed-upgrade branch (e.g. 'subagent executor conversation slot not yet wired' vs 'conversation service dropped'), so a wiring regression surfaces loudly instead of masquerading as normal shutdown behavior."
+          },
+          {
+            "severity": "low",
+            "where": "crates/application/src/subagent_tools.rs:85 (struct), :90 (Clone impl), :178 (main impl); crates/application/src/lib.rs:2815 (spawn_agent_conversation where-bound)",
+            "claim": "Completeness gate on the ?Sized relaxation: C = dyn ConversationService requires `?Sized` on ALL FOUR sites — the struct def (:85 `SubagentTools<C: ConversationService>` has an implicit Sized bound), the Clone impl (:90), the inherent impl block (:178, which also transitively covers new/execute_tool/spawn/status/subagent_depth/wait_for_child), and spawn_agent_conversation<C> (lib.rs:2815, currently `C: ConversationService + Send + Sync + 'static` without ?Sized, called with Arc<dyn> from spawn). Omitting any one fails to compile; the blueprint lists all four, so this is a verification, not a defect.",
+            "fix": "Ensure the edit adds `?Sized` to each of the four bounds. No body changes are needed: every use of C is via Arc<C> or &C (deref to trait method), and dyn ConversationService inherits Send+Sync from the supertrait (inbound.rs:212) and 'static from the default object bound, so the relaxed bounds remain satisfiable by both dyn and the existing concrete callers (e.g. SpawnStandaloneAgent)."
+          },
+          {
+            "severity": "low",
+            "where": "blueprint arc_cycle_resolution: 'a concrete C = RoutingConversationHandler<..ConversationHandler<..SubagentAwareToolExecutor<..>>> is an infinitely-nested, unrepresentable type'",
+            "claim": "Imprecise framing: the wrapper SubagentAwareToolExecutor<T> is monomorphized only over T=McpToolExecutor and type-erases the conversation to Arc<OnceLock<Weak<dyn ConversationService>>>, so the concrete type of `conversation_service` (RoutingConversationHandler<S, ConversationHandler<S,L,SubagentAwareToolExecutor<McpToolExecutor>>>) IS finite and representable. The recursion only arises IF the wrapper embedded a concrete SubagentTools<C> field — which it deliberately does not. dyn is required not to escape an unrepresentable type but because (a) the generic wrapper in the application crate cannot name the daemon's concrete handler stack and (b) it is constructed before conversation_service exists (late binding).",
+            "fix": "Reword the justification to state dyn erasure is needed for cross-crate naming + late-binding; the 'infinite type' is the hypothetical fully-static alternative, not the chosen design's concrete type."
+          }
+        ]
+      },
+      {
+        "lens": "Concurrency + semantic correctness of the subagent scratchpad snapshot/cascade vs the locked design. Verified against actual code: storage/src/scratchpad.rs (read/write/delete sites), application/src/subagent_tools.rs (spawn, wait=false fire-and-forget), application/src/background_tasks.rs (registry double tokio::spawn + CURRENT_TASK_ID.scope at L409), application/src/lib.rs:2831-2891 (spawn_agent_conversation re-installs with_user_id inside the body), core/src/service.rs:1409-1522 (StepStack is loop-owned; with_conversation_id installed per-exec) + handle_step_control:379-424, core/src/ports/conversation_ctx.rs (task-local scope semantics), and uuid-1.23.1 v7.rs:12-20 / timestamp.rs:711-717. Task-local propagation into the child works via the established with_user_id-inside-body pattern, and there is NO await-holding-lock defect: current_user_id/current_owner_todo/current_visible_before are try_with(|v| v.clone()) reads (owned, no guard), and now_v7's std::sync::Mutex is never held across an await. The snapshot rule is correct for the nested-parent-sees-descendants case and for top-level-unbounded, but NOT for sibling isolation, and the cascade + owner_todo-maintenance mechanisms have real defects. Detailed below.",
+        "findings": [
+          {
+            "severity": "high",
+            "where": "Blueprint slice 2 read predicate `(id < $vb OR owner_todo = $me OR owner_todo LIKE $me||'.%')`, applied at storage/src/scratchpad.rs get_many:123, list:150, search:179; concurrency model in parallel_fanout_owner_paths",
+            "claim": "The `id < spawn_marker` temporal branch is namespace-blind: it admits ANY row created before the marker, including a concurrent sibling's/cousin's in-flight notes whose owner_todo is neither self nor a descendant. Under the fan_out model siblings run concurrently as wait=false children (subagent_tools.rs:346-352 returns immediately; body runs on its own tokio::spawn). Sibling A minted marker M_A before sibling B minted M_B; A begins writing (e.g. its begin_step todo, handle_step_control writes at service.rs:413) with ids in (M_A, M_B). Those ids are < M_B, so B's frozen snapshot includes A's owner='1.1' rows — directly violating the locked contract 'never a concurrent sibling/uncle's in-flight notes.' The isolation the design claims holds only if siblings are spawned strictly serially (wait=true), which the fan-out path explicitly is not.",
+            "fix": "Restrict the temporal branch to the ancestor chain instead of all namespaces. Capture the child's ancestor path list at spawn (['', '1', '1.1'] for me='1.1') and read: `(owner_todo = $me OR owner_todo LIKE $me||'.%') OR (id < $vb AND owner_todo = ANY($ancestors))`. Ancestors/root supply frozen inherited context; own subtree supplies roll-up at any id; siblings and cousins are excluded regardless of id. Bind $ancestors as an array param (no string-building)."
+          },
+          {
+            "severity": "high",
+            "where": "Blueprint slice 6 complete_step cascade (unconditional hard-delete) invoked from the complete_step branch at core/src/service.rs:1409-1420; get_subagent_status is lifecycle-only at application/src/subagent_tools.rs:402-439; wait=false spawn at subagent_tools.rs:346-352",
+            "claim": "complete_step of an enclosing step unconditionally delete_owner_subtree()s the descendant namespace, but a wait=false subagent pinned into that subtree can still be non-terminal — its body is fire-and-forget and outlives the parent's turn. Its later writes (ids after the DELETE) are inserted into an already-deleted namespace: they become orphan zombie rows the (already-executed) cascade will never reclaim, and they surface to the top-level unbounded read. Worse, per the locked design the child's RESULT travels via the shared pad (not a result blob — get_subagent_status is signal-only), so deleting the subtree while the child is mid-flight destroys the child's outcome outright. This is data loss, not just orphaning.",
+            "fix": "Gate the cascade on descendant task lifecycle: before delete_owner_subtree, query background_tasks for any task whose owner_todo is under the target prefix and whose status is non-terminal (Pending/Running); if any exist, REFUSE or DEFER complete_step (surface a recoverable 'children still running' and let the model poll), or tombstone the subtree and run the delete from the last child's finalize. Mirror get_subagent_status as the readiness guard the design already relies on."
+          },
+          {
+            "severity": "high",
+            "where": "Blueprint slice 6 ('begin_step/complete_step maintain SCRATCHPAD_OWNER_TODO as base+active-step, push composes/pop restores'); dispatch loop core/src/service.rs:1522 (with_conversation_id installed per single exec) and handle_step_control call at service.rs:1409-1417; task-local scope semantics in core/src/ports/conversation_ctx.rs:37-42 + the spawned_task_outside_scope test at :84-92",
+            "claim": "A tokio task_local is immutable within a scope and only set for the wrapped future; it cannot be push/pop-'maintained' by a tool handler across a flat dispatch loop. handle_step_control (service.rs:379) and each tool exec (service.rs:1522) run as independent per-iteration futures — a scope opened inside begin_step does not survive to the next iteration, and the exec site installs only CONVERSATION_ID. So the store's current_owner_todo() read never observes an active-step-qualified value: for the top-level turn it reads '' (unset) and for a subagent it reads only the frozen spawn base (which IS live via the enclosing with_subagent_scope), never base+step. Consequence: every one of a subagent's own steps lands at owner_todo=base (e.g. '1.1') differentiated only by note_key, so (a) the child's internal complete_step cascade computes owner_subtree_prefix(base, frame.key) = a path with no rows and deletes nothing, and (b) render_plan's (owner_todo, note_key) keying collapses all the child's steps under one owner. The 'push composes/pop restores' description is not mechanically realizable.",
+            "fix": "Do not try to mutate the local from the handlers. Each loop iteration, derive the current owner_todo from the loop-owned StepStack (planning.rs current_key:115) composed with the spawn-pinned base (read once from current_owner_todo), and install SCRATCHPAD_OWNER_TODO around BOTH the exec at service.rs:1522 and the handle_step_control call at :1409 (so begin_step's own todo note is stamped in-namespace). This re-installs the correct value per call instead of relying on scope persistence."
+          },
+          {
+            "severity": "medium",
+            "where": "Contradiction between slice 2 decision ('top-level owner_todo is uniformly \"\", behavior-preserving') and slice 6 + open_question #1 (begin_step tags owner_todo with the step path); cascade uses owner_subtree_prefix(current_owner_todo, frame.key); confirmed against handle_step_control writes at core/src/service.rs:404-415",
+            "claim": "The two slices are mutually inconsistent. If top-level steps keep owner_todo='' (to preserve slice-2 parity and the slice-8 snapshot-omitted path), then a top-level complete_step's cascade prefix = owner_subtree_prefix('', '1') = '1', but no rows carry owner '1' (all top-level rows are ''), so delete_owner_subtree('1') is a no-op — the promised hide->DELETE cleanup of a completed single-session step's descendant notes never fires; only true subagent subtrees ever get cleaned. If instead begin_step tags owner_todo with the dotted step path to make the cascade match, top-level notes stop being '' and slice 2's byte-for-byte parity (and the FTS/snapshot-omission guarantees) break. As written, single-session nested-step cleanup cannot work without contradicting the parity slice.",
+            "fix": "Architect decision (open_q #1) needed before slices 4/6 land: either (b) give every nested step its own owner_todo = its dotted path uniformly for both single-session and subagent nesting — one delete_owner_subtree covers both — and restate slice-2 parity as 'root-step notes at owner_todo=\"\"'; or (a) keep storage key-convention-agnostic and add a SELF-namespace enumerated delete_many over the completed step's key-descendants ('F.%' / 'outcome:F.%'). Pick one; the choice changes what begin_step must install."
+          },
+          {
+            "severity": "low",
+            "where": "open_question #3 (UUIDv7 intra-millisecond monotonicity); id mint at storage/src/scratchpad.rs:75-77 and the spawn_marker mint in SubagentTools::spawn; uuid 1.23.1 (Cargo.lock:4581) v7.rs:12-20 + timestamp.rs:711-717",
+            "claim": "open_question #3's intra-ms race does NOT exist for the pinned uuid 1.23.1. Uuid::now_v7() draws from a process-global monotonic shared context — a single `static CONTEXT_V7: SharedContextV7(Mutex<ContextV7>)` (timestamp.rs:711-717), with the documented guarantee 'All UUIDs generated through this method by the same process are guaranteed to be ordered by their creation' (v7.rs:12-20), including within a millisecond and under clock jitter/regression (the counter reseeds/adjusts the timestamp). Because both the scratchpad id and the marker are minted via now_v7() in the same daemon process, a note written before the marker is minted is guaranteed id < marker. The only residual exposure is multi-process: a k8s multi-replica deployment sharing one pad has one CONTEXT_V7 per replica, so cross-replica ordering within a ms is not guaranteed if a conversation's writes+marker ever originate on different replicas.",
+            "fix": "No code change needed for the single-daemon case. Pin the invariant: keep BOTH sites on Uuid::now_v7() (never new_v7(Timestamp::from_unix(NoContext,...)) which drops the shared context), and land the blueprint's id_lt_marker_orders_by_uuidv7_time test as a regression guard. Record the multi-replica/conversation-migration caveat as an explicit open question if a conversation can move daemons mid-turn."
+          },
+          {
+            "severity": "low",
+            "where": "task_locals note ('bound AS TEXT because scratchpads.id is TEXT and UUIDv7 canonical strings are lexicographically time-ordered'); `id < $vb` comparison at the slice-2 read sites; scratchpads.id TEXT column",
+            "claim": "The `id < $vb` cut is a TEXT comparison evaluated under the column/database collation, not guaranteed byte order. UUIDv7 creation-monotonicity maps to lexicographic order only under a C-like collation over the hyphenated-hex charset [0-9a-f-]. For that charset virtually every locale collation agrees with byte order, but the design leans on an ordering property Postgres does not formally guarantee for a non-C collation, and a future collation change on the column could silently shift the snapshot boundary.",
+            "fix": "Make the comparison collation-deterministic: apply `COLLATE \"C\"` to the id/marker comparison (or compare as uuid type with a fixed order), and add a test asserting the ordering holds under the deployed collation. Low priority given the charset."
+          }
+        ]
+      },
+      {
+        "lens": "Design fidelity to locked #287 + slice independence/milestone placement, verified against the code on `main` (HEAD e70a58a)",
+        "findings": [
+          {
+            "severity": "blocker",
+            "where": "Slice 6 (service.rs handle_step_control) + Slice 5 (subagent_tools.rs:251-257 spawn refuse). SCRATCHPAD_OWNER_TODO is never installed for a top-level turn.",
+            "claim": "The blueprint says begin_step/complete_step 'maintain SCRATCHPAD_OWNER_TODO (push composes, pop restores)', but a tokio task_local is dynamic-extent `.scope()`-only and cannot be push/pop-mutated across the dispatch loop's iterations (contrast the ONLY precedent: CONVERSATION_ID is installed once around the whole turn, conversation_ctx.rs:37-42; the loop-local StepStack lives at service.rs:959 and step control is handled inline at service.rs:1393-1412). Slice 6 edits only handle_step_control + daemon main.rs; nothing installs SCRATCHPAD_OWNER_TODO around the per-tool `execute_tool` path of a top-level turn, and with_subagent_scope (slice 5) wraps only a CHILD body. So during a top-level parent's step, current_owner_todo() == None. Slice 5 spawn() then computes child_owner_todo = current_owner_todo() and 'refuses when it resolves to root'. Net: every top-level spawn_subagent refuses -> the feature is dead after slice 7 ships.",
+            "fix": "SCRATCHPAD_OWNER_TODO cannot be a mutable stack. Install it explicitly in the dispatch loop by re-scoping around each execute_tool call (and around handle_step_control's own note writes) with the path computed from step_stack.current_key() at service.rs — an edit slice 6 must list. Resolve open_question #2 (the local must already hold the composed child-anchor path at execute time, since subagent_tools.rs:236 has no StepStack handle to append the step key itself). Add a named test 'top_level_agent_can_spawn_subagent_during_active_step' that exercises the real dispatch loop, not just subagent_tools in isolation."
+          },
+          {
+            "severity": "high",
+            "where": "Slice 4 fan_out primitive (planning.rs) vs Slice 5 spawn (subagent_tools.rs:236-327); parallel_fanout_owner_paths narrative.",
+            "claim": "fan_out(n) is added as a StepStack method (StepStack.frames is private, planning.rs:87) and unit-tested, but NO slice ever calls it. It is architecturally unreachable from the spawn path: StepStack is a local in the core dispatch loop (service.rs:959) while spawn_subagent executes through the ToolExecutor and sees only the current_owner_todo() String task-local. subagent_tools::spawn (subagent_tools.rs:265+) has no StepStack, no child_counter, and no n. Consequently N concurrent spawn_subagent calls inside one step all read the identical current_owner_todo() and receive the SAME owner_todo -> they share one namespace. That breaks the design's per-sibling write-confinement AND the subtree-inclusive snapshot isolation ('never a concurrent sibling/uncle's in-flight notes'): siblings' `owner_todo LIKE me||'.%'` reads and delete_many/clear would see and clobber each other.",
+            "fix": "Either drop the parallel-fan-out claim from the design, or move key minting into the dispatch loop: intercept spawn_subagent where the loop owns step_stack (like begin_step/complete_step at service.rs:1393) so each spawn advances child_counter and installs a distinct fanned key as that child's scope. The current 'primitive in slice 4, consumed by pure composition later' framing is false — there is no composition site."
+          },
+          {
+            "severity": "high",
+            "where": "Slice 6 cascade survivor invariant (complete_step) + open_question #1/#2.",
+            "claim": "The cascade-survival guarantee ('parent's own done-todo/outcome at owner_todo=SELF survive; prefix SELF.frame.key is strictly deeper') is unproven and forks on an unresolved contract. handle_step_control writes the step's todo (begin) and outcome:<key> (complete) via the scratchpad write closures (service.rs:407, ~500). If SCRATCHPAD_OWNER_TODO is composed to the step path ('1') at the time those writes execute, the parent's own '1'/'outcome:1' notes are stamped owner_todo='1' and are DELETED by delete_owner_subtree('1') — the exact opposite of the stated invariant. Making them survive requires begin to stamp the todo at the PARENT level BEFORE composing deeper and complete to write the outcome AFTER popping — but that same composed value is what a spawned child must read as its anchor, so one task-local cannot serve both consumers. This is open_question #1/#2, and the two requirements are in direct tension, not merely 'to confirm'.",
+            "fix": "Make it an architect decision before slicing: adopt OQ#1 option (b) (every nested step owns its dotted-path owner_todo) and redefine the survivor as the SELF-level rolled-up outcome only, then pin exact write-ordering in complete_step (pop -> write-outcome at restored SELF -> evict -> cascade). Add tests that assert the parent's own todo/outcome ROW survives a cascade and a child's rows are gone, driven through the real begin/complete path."
+          },
+          {
+            "severity": "medium",
+            "where": "Slice 3 + Slice 5 edits to application/src/background_tasks.rs::spawn vs registry.spawn signature (background_tasks.rs:297-308).",
+            "claim": "Slices 3/5 say spawn() 'sets'/'populates owner_todo/spawn_marker ... from spec.subagent_scope' and persists them as row columns, but registry.spawn only receives (user_id, kind, title, body) (background_tasks.rs:297-303) and persist_create builds the row from `view` before the body runs (background_tasks.rs:393-395, view literal at :313). spec lives in spawn_agent_conversation (lib.rs:2817-2831), not in registry.spawn. update_task is set-once/excluded, so a post-hoc update is disallowed. There is no wire from spec.subagent_scope into the persisted columns without adding owner_todo/spawn_marker parameters to registry.spawn and updating all call sites — lib.rs:716, 738, 1698, 2509, 2631 and spawn_agent_conversation at 2831 (non-subagent passing '' / None). Reading the task-locals inside registry.spawn is wrong: it would capture the parent's owner_todo and a freshly re-minted marker that differs from the scope's visible_before.",
+            "fix": "Add the signature change + all six call-site updates to slices 3/5 explicitly (a small SpawnMeta{owner_todo, spawn_marker} struct threaded from spec keeps clippy::too_many_arguments quiet), and assert the persisted row's spawn_marker equals the child scope's VISIBLE_BEFORE."
+          },
+          {
+            "severity": "low",
+            "where": "Slice ordering / milestone placement (slices 1-7).",
+            "claim": "The FIRST merge/deploy milestone (slice 7) is correctly placed in principle — SubagentTools::execute_tool has no live caller today (dispatch is 'out of scope' per subagent_tools.rs:189-193; subagent_executor.rs is NEW in slice 7), so slices 1-6 are dormant-until-wired and behavior-preserving, and the migrations (031 idempotent given pool.rs re-runs every migration with no version table, confirmed pool.rs:20-256 + guard test :270) do not break main. BUT slice 7 is marked the point where 'the whole mechanism is live end-to-end', while findings 1-3 mean the mechanism is NOT functional at slice 7 (top-level spawns refuse; parallel collides; row columns unpopulated). The milestone flag is premature relative to actual end-to-end viability.",
+            "fix": "Do not treat slice 7 as the deploy milestone until findings 1-4 are resolved; add an end-to-end handoff test (parent begins step -> spawns wait=false child -> child writes to session pad -> parent reads child's rolled-up note via unbounded read -> completes step -> cascade removes the child subtree) as the milestone's gating acceptance test, rather than the per-wrapper unit tests currently listed."
+          }
+        ]
+      }
+    ],
+    "blocker_high_count": 8
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Investigate"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Synthesize"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Verify"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "investigate:scratchpad-storage",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "a4b412dd7b05a0807",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728264572,
+      "queuedAt": 1784728264517,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Scratchpad storage + port + adapters: add owner_todo namesp…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784728815917,
+      "tokens": 128990,
+      "toolCalls": 29,
+      "durationMs": 551344,
+      "resultPreview": "{\"subsystem\":\"Scratchpad storage + port + adapters: add owner_todo namespacing + spawn-marker snapshot reads to the shared per-conversation scratchpad, for subagent orchestration. KEY FINDING: sqlite has NO scratchpads table or ScratchpadStore yet (deferred to sqlite increment 2, crates/storage-sqlite/src/lib.rs:29-32); the only live implementor is PgScratchpadStore. Only 2 trait impls exist total…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "investigate:registry-task",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "a557f266719ab3bb5",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728264575,
+      "queuedAt": 1784728264519,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "background-task registry + task persistence: durably persis…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784728724401,
+      "tokens": 156473,
+      "toolCalls": 27,
+      "durationMs": 459825,
+      "resultPreview": "{\"subsystem\":\"background-task registry + task persistence: durably persist per-subagent-task (1) spawn_marker (UUIDv7 read-snapshot boundary) and (2) owner_todo (materialized subagent-tree path) across TaskContext / TaskState (application), api::TaskView (wire), BackgroundTaskRow + BackgroundTaskStore (core port), the Postgres + SQLite adapters (INSERT/SELECT/row-mapper), and a Postgres migration …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "investigate:subagent-spawn",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "a9f7de5a317ae404e",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728264577,
+      "queuedAt": 1784728264519,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Subagent spawn + agent-conversation run: at spawn mint a UU…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784728965667,
+      "tokens": 181555,
+      "toolCalls": 41,
+      "durationMs": 701090,
+      "resultPreview": "{\"subsystem\":\"Subagent spawn + agent-conversation run: at spawn mint a UUIDv7 spawn_marker, resolve the SESSION (top-level) scratchpad conversation, compute + pin the child owner_todo path, then install those as task-locals (scratchpad scope, owner_todo, visible_before) around the child turn body inside spawn_agent_conversation — composed with the existing with_user_id / with_tool_allowlist / CURR…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "investigate:planning-cleanup",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "a582a1775ecbb0110",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728264578,
+      "queuedAt": 1784728264519,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Plan steps + hard-coded cleanup cascade (crates/core/src/pl…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784728901324,
+      "tokens": 157907,
+      "toolCalls": 34,
+      "durationMs": 636745,
+      "resultPreview": "{\"subsystem\":\"Plan steps + hard-coded cleanup cascade (crates/core/src/planning.rs StepStack + crates/core/src/service.rs handle_step_control), backed by a new ScratchpadStore::delete_owner_subtree + owner_todo column. Focus: (a) where the cascade DELETE hooks in and the delete-by-owner-subtree store method, (b) parallel fan-out flat-todo/owner-path assignment given StepStack is single-active-path…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "investigate:executor-wiring-arccycle",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "ad644ee3a505800ea",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728264580,
+      "queuedAt": 1784728264519,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Wire subagent tools into the live executor + break the Arc/…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784728790246,
+      "tokens": 119090,
+      "toolCalls": 22,
+      "durationMs": 525666,
+      "resultPreview": "{\"subsystem\":\"Wire subagent tools into the live executor + break the Arc/type cycle (#134): a daemon/application-side wrapping `ToolExecutor` that advertises the two subagent tool defs as core tools and routes `spawn_subagent`/`get_subagent_status` to `SubagentTools`, everything else to `McpToolExecutor`. Cycle broken with a late-set `Arc<OnceLock<Weak<dyn ConversationService>>>` slot (NOT `Arc::n…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "investigate:scratchpad-scope-tasklocal",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "ab6a731a8677b3e03",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728264581,
+      "queuedAt": 1784728264520,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Scratchpad scope task-locals + the builtin scratchpad tool.…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784728912538,
+      "tokens": 141155,
+      "toolCalls": 46,
+      "durationMs": 647957,
+      "resultPreview": "{\"subsystem\":\"Scratchpad scope task-locals + the builtin scratchpad tool. Three new task-locals in `crates/core` (SCRATCHPAD_SCOPE / SCRATCHPAD_OWNER_TODO / SCRATCHPAD_VISIBLE_BEFORE), read at two layers: the SCOPE redirect is consumed in the builtin tool (mcp-client) to target the session pad; OWNER_TODO + VISIBLE_BEFORE are consumed directly by the storage adapter (like `current_user_id`) to sta…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "investigate:embeddings-554",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "a8d6bdf6962250417",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728264583,
+      "queuedAt": 1784728264520,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Synchronous scratchpad write-time embeddings + hybrid (vect…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784728775994,
+      "tokens": 140668,
+      "toolCalls": 42,
+      "durationMs": 511411,
+      "resultPreview": "{\"subsystem\":\"Synchronous scratchpad write-time embeddings + hybrid (vector+FTS RRF) search (issue #554). Brings the KB's embed-on-write-then-hybrid-search pattern to the per-conversation scratchpad, but SYNCHRONOUS at write time (within EMBED_TIMEOUT, FTS-only fallback) with NO dream/background backfill. Postgres path ships now; sqlite-vec path is fully deferred (storage-sqlite is at increment 1,…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "synthesize:blueprint",
+      "phaseIndex": 2,
+      "phaseTitle": "Synthesize",
+      "agentId": "a8d2d88e2d188e9f2",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784728965686,
+      "queuedAt": 1784728965669,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "\"Late-set Weak-in-OnceLock slot, NOT Arc::new_cyclic. Subag…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784729714007,
+      "tokens": 128138,
+      "toolCalls": 4,
+      "durationMs": 748321,
+      "resultPreview": "{\"slices\":[{\"order\":1,\"name\":\"scratchpad-scope-task-locals\",\"goal\":\"Add the three per-subagent-turn task-locals in core that the storage adapter, the builtin scratchpad tool, and the cleanup cascade all consume. Getters return None outside any installed scope, so top-level behavior is byte-for-byte unchanged and there is no consumer yet. Pure core, zero ripple, unit-tested.\",\"db_backed\":false,\"mer…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "verify:compile-completeness",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "ae14e094be6c4bb9e",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784729714029,
+      "queuedAt": 1784729714010,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "compile-completeness (struct-field additions + changed sign…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784730090418,
+      "tokens": 121459,
+      "toolCalls": 43,
+      "durationMs": 376389,
+      "resultPreview": "{\"lens\":\"compile-completeness (struct-field additions + changed signatures threaded through every construction/destructure/impl site)\",\"findings\":[{\"severity\":\"high\",\"where\":\"Slice 5 (subagent-scope-install-at-spawn): api-model TaskKind::Subagent gains session_conversation_id: String\",\"claim\":\"Adding session_conversation_id to the TaskKind::Subagent struct-variant makes every 4-field literal const…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "verify:migration-multitenancy",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "ae01c349f23b65aac",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784729714030,
+      "queuedAt": 1784729714010,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "migration-safety + multi-tenancy",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784729932579,
+      "tokens": 82079,
+      "toolCalls": 16,
+      "durationMs": 218548,
+      "resultPreview": "{\"lens\":\"migration-safety + multi-tenancy\",\"findings\":[{\"severity\":\"low\",\"where\":\"crates/storage/migrations/ (max = 030_tool_definitions_provider.sql); worktree scan clean\",\"claim\":\"VERIFIED SOUND: migration ordinals 031/032/033 are the next-free numbers. Highest existing on this branch is 030 (crates/storage/migrations/030_tool_definitions_provider.sql, registered pool.rs:249-253). Scan of all .w…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 11,
+      "label": "verify:arc-cycle-types",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "acd7ccbf8877c2e30",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784729714031,
+      "queuedAt": 1784729714011,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Adversarial type-check & lifetime audit of the arc-cycle re…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784730137212,
+      "tokens": 107170,
+      "toolCalls": 20,
+      "durationMs": 423181,
+      "resultPreview": "{\"lens\":\"Adversarial type-check & lifetime audit of the arc-cycle resolution (late-set Weak-in-OnceLock slot + ?Sized-over-dyn) for wiring SubagentTools into the live executor. Verdict: the resolution is fundamentally SOUND and type-checks. dyn ConversationService is object-safe (async_trait boxing at crates/core/src/ports/inbound.rs:211), Send+Sync+'static is satisfied via the trait's Send+Sync s…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 12,
+      "label": "verify:concurrency-correctness",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a608151ace19c62b9",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784729714032,
+      "queuedAt": 1784729714011,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Concurrency + semantic correctness of the subagent scratchp…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784730161899,
+      "tokens": 132672,
+      "toolCalls": 19,
+      "durationMs": 447867,
+      "resultPreview": "{\"lens\":\"Concurrency + semantic correctness of the subagent scratchpad snapshot/cascade vs the locked design. Verified against actual code: storage/src/scratchpad.rs (read/write/delete sites), application/src/subagent_tools.rs (spawn, wait=false fire-and-forget), application/src/background_tasks.rs (registry double tokio::spawn + CURRENT_TASK_ID.scope at L409), application/src/lib.rs:2831-2891 (sp…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 13,
+      "label": "verify:design-fidelity",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a955995e76662f8a7",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784729714032,
+      "queuedAt": 1784729714011,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Design fidelity to locked #287 + slice independence/milesto…",
+      "promptPreview": "LOCKED DESIGN — multi-agent orchestration for the Adele daemon (repo: undefined):\n- Subagents are spawned per todo. SESSION-GLOBAL scratchpad: subagents read+write ONE shared pad = the TOP-LEVEL session's conversation, with every entry tagged by owner_todo (a materialized path, e.g. \"1.1.1\"; top-level session's own notes use root sentinel '').\n- SUBAGENT WRITES: confined to its own owner_todo name…",
+      "lastProgressAt": 1784730256512,
+      "tokens": 142258,
+      "toolCalls": 30,
+      "durationMs": 542480,
+      "resultPreview": "{\"lens\":\"Design fidelity to locked #287 + slice independence/milestone placement, verified against the code on `main` (HEAD e70a58a)\",\"findings\":[{\"severity\":\"blocker\",\"where\":\"Slice 6 (service.rs handle_step_control) + Slice 5 (subagent_tools.rs:251-257 spawn refuse). SCRATCHPAD_OWNER_TODO is never installed for a top-level turn.\",\"claim\":\"The blueprint says begin_step/complete_step 'maintain SCR…"
+    }
+  ],
+  "totalTokens": 1739614,
+  "totalToolCalls": 373
+}

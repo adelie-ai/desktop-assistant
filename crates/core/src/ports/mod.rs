@@ -55,6 +55,10 @@ pub mod transport;
 /// executors can scope per-conversation side state (e.g. the scratchpad).
 pub mod conversation_ctx;
 
+/// Per-subagent-turn scratchpad scope task-locals (#287): the session-pad
+/// redirect, `owner_todo` namespace, spawn snapshot cut, and ancestor chain.
+pub mod scratchpad_scope;
+
 /// Bundle of the request-scoped task-locals that must cross a `tokio::spawn`
 /// boundary ([`request_scope::RequestScope`]) — captured before the spawn and
 /// re-installed in one call inside the spawned turn body, so a new
