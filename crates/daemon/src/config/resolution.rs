@@ -13,18 +13,40 @@ use desktop_assistant_core::ports::llm::{BudgetSource, ContextBudget};
 use desktop_assistant_core::ports::store::LearnedWindow;
 
 use crate::connections::{
-    AnthropicConnection, BedrockConnection, ConnectionConfig, Connector, OllamaConnection,
-    OpenAiConnection,
+    AnthropicConnection, AzureConnection, BedrockConnection, ConnectionConfig, Connector,
+    GoogleConnection, OllamaConnection, OpenAiConnection, OpenRouterConnection,
 };
 use crate::purposes::PurposeKind;
 
 use super::secrets::read_secret_from_backend;
 use super::{
-    DaemonConfig, EmbeddingsSettingsView, LlmConfig, ResolvedLlmConfig, ResolvedPersistenceConfig,
-    SecretConfig, default_api_key_env, default_base_url_env, default_connector,
-    default_database_max_connections, default_git_remote_name, default_model_env,
-    default_push_on_update,
+    ConnectorExtras, DaemonConfig, EmbeddingsSettingsView, LlmConfig, ResolvedLlmConfig,
+    ResolvedPersistenceConfig, SecretConfig, default_api_key_env, default_base_url_env,
+    default_connector, default_database_max_connections, default_git_remote_name,
+    default_model_env, default_push_on_update,
 };
+
+/// Azure's conventional key env var, used when a connection doesn't set an
+/// explicit `api_key_env`. The connector key `azure` derives `AZURE_API_KEY`
+/// (see [`default_api_key_env`]), but Azure OpenAI's documented variable is
+/// `AZURE_OPENAI_API_KEY`, so the resolver defaults to that instead.
+const AZURE_DEFAULT_API_KEY_ENV: &str = "AZURE_OPENAI_API_KEY";
+
+/// Resolve a value from the connection field first, then a prioritized list of
+/// environment variables, returning the first non-empty match. Used to fill
+/// Google's `project` / `location` from the connection or the GCP-conventional
+/// env vars.
+fn field_or_env(field: Option<&str>, env_vars: &[&str]) -> Option<String> {
+    if let Some(v) = field.map(str::trim).filter(|v| !v.is_empty()) {
+        return Some(v.to_string());
+    }
+    env_vars.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
 
 /// Whether `model` is, by name, a clearly text-*generation* model family that
 /// cannot produce embeddings.
@@ -130,7 +152,7 @@ pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSet
 
     let is_default = explicit_connector.is_none();
     let connector = explicit_connector.unwrap_or_else(|| llm_connector.clone());
-    let available = connector != "anthropic";
+    let available = connector_supports_embeddings(&connector);
 
     let model = emb_config
         .and_then(|c| c.model.clone())
@@ -169,7 +191,7 @@ fn resolve_purpose_embeddings_view(
     config: Option<&DaemonConfig>,
 ) -> Option<EmbeddingsSettingsView> {
     let resolved = resolve_purpose_llm_config(config, PurposeKind::Embedding)?;
-    let available = resolved.connector != "anthropic";
+    let available = connector_supports_embeddings(&resolved.connector);
     let has_api_key = !resolved.api_key.trim().is_empty();
     Some(EmbeddingsSettingsView {
         connector: resolved.connector,
@@ -233,6 +255,19 @@ pub fn resolve_database_config(config: Option<&DaemonConfig>) -> (Option<String>
 /// every match (#47).
 pub(crate) fn parse_connector_or_openai(connector: &str) -> Connector {
     Connector::parse(connector).unwrap_or(Connector::OpenAi)
+}
+
+/// Whether a connector string exposes embeddings, via the typed
+/// [`Connector::supports_embeddings`] allowlist. An unrecognised connector
+/// defaults to `true` (offer embeddings) so a bespoke/future connector isn't
+/// silently denied; the startup embed probe is the general safety net.
+///
+/// Replaces the historical literal `connector != "anthropic"`: OpenRouter has
+/// no embeddings (`false`), while Azure and Google do (`true`).
+fn connector_supports_embeddings(connector: &str) -> bool {
+    Connector::parse(connector)
+        .map(|c| c.supports_embeddings())
+        .unwrap_or(true)
 }
 
 fn default_embedding_model(connector: &str) -> String {
@@ -571,6 +606,9 @@ fn resolve_llm_config_from(llm_config: Option<&LlmConfig>) -> ResolvedLlmConfig 
         stream_timeout_secs: None,
         keep_warm: false,
         max_context_tokens: None,
+        // The legacy `[llm]` block has no Azure/Google surface fields; the
+        // multi-field configs are `[connections]`-only.
+        extras: ConnectorExtras::None,
     }
 }
 
@@ -609,6 +647,35 @@ pub fn resolve_connection_llm_config(
             ..
         })
         | ConnectionConfig::Anthropic(AnthropicConnection {
+            base_url,
+            api_key_env,
+            secret,
+            ..
+        })
+        | ConnectionConfig::OpenRouter(OpenRouterConnection {
+            base_url,
+            api_key_env,
+            secret,
+            ..
+        }) => (base_url.clone(), api_key_env.clone(), secret.clone(), None),
+        ConnectionConfig::Azure(AzureConnection {
+            base_url,
+            api_key_env,
+            secret,
+            ..
+        }) => (
+            base_url.clone(),
+            // Azure's key env defaults to AZURE_OPENAI_API_KEY (not the derived
+            // AZURE_API_KEY) when the connection doesn't set one explicitly.
+            Some(
+                api_key_env
+                    .clone()
+                    .unwrap_or_else(|| AZURE_DEFAULT_API_KEY_ENV.to_string()),
+            ),
+            secret.clone(),
+            None,
+        ),
+        ConnectionConfig::Google(GoogleConnection {
             base_url,
             api_key_env,
             secret,
@@ -700,6 +767,24 @@ pub fn resolve_connection_llm_config(
                 false,
                 c.max_context_tokens,
             ),
+            ConnectionConfig::OpenRouter(c) => (
+                c.connect_timeout_secs,
+                c.stream_timeout_secs,
+                false,
+                c.max_context_tokens,
+            ),
+            ConnectionConfig::Azure(c) => (
+                c.connect_timeout_secs,
+                c.stream_timeout_secs,
+                false,
+                c.max_context_tokens,
+            ),
+            ConnectionConfig::Google(c) => (
+                c.connect_timeout_secs,
+                c.stream_timeout_secs,
+                false,
+                c.max_context_tokens,
+            ),
             ConnectionConfig::Bedrock(c) => (
                 c.connect_timeout_secs,
                 c.stream_timeout_secs,
@@ -713,6 +798,31 @@ pub fn resolve_connection_llm_config(
                 c.max_context_tokens,
             ),
         };
+
+    // Provider-specific surface/auth/endpoint knobs the flat struct can't hold.
+    // Google resolves project/location from the connection then GCP-conventional
+    // env vars; Azure passes its surface/auth/version strings through for the
+    // factory to parse.
+    let extras = match connection {
+        ConnectionConfig::Azure(c) => ConnectorExtras::Azure {
+            api_surface: c.api_surface.clone(),
+            auth_mode: c.auth_mode.clone(),
+            api_version: c.api_version.clone(),
+        },
+        ConnectionConfig::Google(c) => ConnectorExtras::Google {
+            project: field_or_env(
+                c.project.as_deref(),
+                &["GOOGLE_CLOUD_PROJECT", "GOOGLE_PROJECT"],
+            ),
+            location: field_or_env(
+                c.location.as_deref(),
+                &["GOOGLE_CLOUD_LOCATION", "GOOGLE_LOCATION"],
+            ),
+            auth_mode: c.auth_mode.clone(),
+            credentials_path: c.credentials_path.clone(),
+        },
+        _ => ConnectorExtras::None,
+    };
 
     ResolvedLlmConfig {
         connector,
@@ -728,6 +838,7 @@ pub fn resolve_connection_llm_config(
         stream_timeout_secs,
         keep_warm,
         max_context_tokens,
+        extras,
     }
 }
 

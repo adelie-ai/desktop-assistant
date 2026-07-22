@@ -27,6 +27,12 @@ struct DefaultsFile {
     openai: Vec<DefaultEntry>,
     #[serde(default)]
     bedrock: Vec<DefaultEntry>,
+    #[serde(default)]
+    openrouter: Vec<DefaultEntry>,
+    #[serde(default)]
+    azure: Vec<DefaultEntry>,
+    #[serde(default)]
+    google: Vec<DefaultEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +88,9 @@ pub fn defaults_for(connector_type: &str) -> Vec<ModelInfo> {
         "anthropic" => &file.anthropic,
         "openai" => &file.openai,
         "bedrock" => &file.bedrock,
+        "openrouter" => &file.openrouter,
+        "azure" => &file.azure,
+        "google" => &file.google,
         _ => return Vec::new(),
     };
     raw.iter().cloned().map(Into::into).collect()
@@ -139,5 +148,29 @@ mod tests {
     #[test]
     fn unknown_connector_returns_empty() {
         assert!(defaults_for("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn defaults_load_for_new_cloud_connectors() {
+        // OpenRouter and Google seed the picker with common chat ids.
+        assert!(
+            defaults_for("openrouter")
+                .iter()
+                .any(|m| m.id == "anthropic/claude-sonnet-4-6"),
+            "openrouter defaults missing"
+        );
+        assert!(
+            defaults_for("google")
+                .iter()
+                .any(|m| m.id == "gemini-2.5-pro" && m.capabilities.reasoning),
+            "google defaults missing or mis-tagged"
+        );
+        // Azure carries curated base-model metadata (not directly selectable).
+        assert!(
+            defaults_for("azure")
+                .iter()
+                .any(|m| m.id == "text-embedding-3-small" && m.capabilities.embedding),
+            "azure embedding default missing or mis-tagged"
+        );
     }
 }

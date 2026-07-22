@@ -49,8 +49,8 @@ use crate::config::{
     DaemonConfig, default_daemon_config_path, load_daemon_config, save_daemon_config,
 };
 use crate::connections::{
-    AnthropicConnection, BedrockConnection, ConnectionConfig, ConnectionId, OllamaConnection,
-    OpenAiConnection,
+    AnthropicConnection, AzureConnection, BedrockConnection, ConnectionConfig, ConnectionId,
+    GoogleConnection, OllamaConnection, OpenAiConnection, OpenRouterConnection,
 };
 use crate::purposes::{ConnectionRef, Effort, ModelRef, PurposeConfig, PurposeKind};
 use crate::registry::{ConnectionHealth, ConnectionRegistry, build_registry};
@@ -1011,16 +1011,34 @@ pub fn map_effort_to_reasoning_config(
                 ReasoningConfig::with_thinking_budget(budget)
             }
         }
-        "openai" => {
+        // OpenAI, OpenRouter, and Azure all take a `reasoning_effort` literal;
+        // each connector applies its own per-model gate and drops the field for
+        // non-reasoning models.
+        "openai" | "openrouter" | "azure" => {
             let level = map_effort_to_reasoning_level(effort);
             tracing::debug!(
                 connector = connector_type,
                 model = model_id,
                 effort = ?effort,
                 reasoning_level = ?level,
-                "mapped effort to OpenAI reasoning_effort"
+                "mapped effort to reasoning_effort"
             );
             ReasoningConfig::with_reasoning_effort(level)
+        }
+        // Google Gemini has no effort literal; it takes a thinking-token budget
+        // via `generationConfig.thinkingConfig`. Use Gemini-calibrated budgets
+        // (NOT the Claude extended-thinking table). The connector further gates
+        // this to thinking-capable models (2.5+) and omits it otherwise.
+        "google" => {
+            let budget = map_gemini_thinking_budget(effort);
+            tracing::debug!(
+                connector = connector_type,
+                model = model_id,
+                effort = ?effort,
+                thinking_budget_tokens = budget,
+                "mapped effort to Gemini thinking budget"
+            );
+            ReasoningConfig::with_thinking_budget(budget)
         }
         _ => {
             tracing::debug!(
@@ -1365,6 +1383,22 @@ pub fn map_anthropic_thinking_budget(e: Effort) -> u32 {
     }
 }
 
+/// Google Gemini `thinkingConfig.thinkingBudget` (tokens) for an effort hint.
+///
+/// Gemini-calibrated budgets, deliberately distinct from the Claude
+/// extended-thinking table ([`map_anthropic_thinking_budget`]): Gemini's
+/// thinking budget is a smaller, differently-scaled knob. Low = 2_048,
+/// Medium = 8_192, High = 16_384. All are positive, so unlike the Anthropic
+/// mapping (Low = 0 = off) an explicit effort always requests some thinking;
+/// the connector still omits the field for non-thinking-capable models.
+pub fn map_gemini_thinking_budget(e: Effort) -> u32 {
+    match e {
+        Effort::Low => 2_048,
+        Effort::Medium => 8_192,
+        Effort::High => 16_384,
+    }
+}
+
 /// OpenAI `reasoning_effort` wire literal for an effort hint.
 ///
 /// Composed from [`map_effort_to_reasoning_level`] +
@@ -1416,6 +1450,65 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
             base_url,
             api_key_env,
             secret: None,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
+        }),
+        ConnectionConfigPayload::OpenRouter {
+            base_url,
+            api_key_env,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
+        } => ConnectionConfig::OpenRouter(OpenRouterConnection {
+            base_url,
+            api_key_env,
+            secret: None,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
+        }),
+        ConnectionConfigPayload::Azure {
+            base_url,
+            api_key_env,
+            api_surface,
+            auth_mode,
+            api_version,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
+        } => ConnectionConfig::Azure(AzureConnection {
+            base_url,
+            api_key_env,
+            // Secrets never cross the non-secret payload boundary; set
+            // out-of-band via `set_connection_secret`.
+            secret: None,
+            api_surface,
+            auth_mode,
+            api_version,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
+        }),
+        ConnectionConfigPayload::Google {
+            base_url,
+            api_key_env,
+            project,
+            location,
+            auth_mode,
+            credentials_path,
+            connect_timeout_secs,
+            stream_timeout_secs,
+            max_context_tokens,
+        } => ConnectionConfig::Google(GoogleConnection {
+            base_url,
+            api_key_env,
+            // Secrets never cross the non-secret payload boundary.
+            secret: None,
+            project,
+            location,
+            auth_mode,
+            credentials_path,
             connect_timeout_secs,
             stream_timeout_secs,
             max_context_tokens,
@@ -1477,6 +1570,37 @@ fn connection_to_payload(conn: &ConnectionConfig) -> ConnectionConfigPayload {
         ConnectionConfig::OpenAi(c) => ConnectionConfigPayload::OpenAi {
             base_url: c.base_url.clone(),
             api_key_env: c.api_key_env.clone(),
+            // `c.secret` (keyring coordinates) intentionally not echoed.
+            connect_timeout_secs: c.connect_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            max_context_tokens: c.max_context_tokens,
+        },
+        ConnectionConfig::OpenRouter(c) => ConnectionConfigPayload::OpenRouter {
+            base_url: c.base_url.clone(),
+            api_key_env: c.api_key_env.clone(),
+            // `c.secret` (keyring coordinates) intentionally not echoed.
+            connect_timeout_secs: c.connect_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            max_context_tokens: c.max_context_tokens,
+        },
+        ConnectionConfig::Azure(c) => ConnectionConfigPayload::Azure {
+            base_url: c.base_url.clone(),
+            api_key_env: c.api_key_env.clone(),
+            api_surface: c.api_surface.clone(),
+            auth_mode: c.auth_mode.clone(),
+            api_version: c.api_version.clone(),
+            // `c.secret` (keyring coordinates) intentionally not echoed.
+            connect_timeout_secs: c.connect_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
+            max_context_tokens: c.max_context_tokens,
+        },
+        ConnectionConfig::Google(c) => ConnectionConfigPayload::Google {
+            base_url: c.base_url.clone(),
+            api_key_env: c.api_key_env.clone(),
+            project: c.project.clone(),
+            location: c.location.clone(),
+            auth_mode: c.auth_mode.clone(),
+            credentials_path: c.credentials_path.clone(),
             // `c.secret` (keyring coordinates) intentionally not echoed.
             connect_timeout_secs: c.connect_timeout_secs,
             stream_timeout_secs: c.stream_timeout_secs,

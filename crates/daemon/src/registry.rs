@@ -25,9 +25,10 @@ use desktop_assistant_core::ports::llm::LlmClient;
 use indexmap::IndexMap;
 
 use crate::config::{
-    DaemonConfig, ResolvedLlmConfig, resolve_connection_llm_config, resolve_llm_config,
+    ConnectorExtras, DaemonConfig, ResolvedLlmConfig, resolve_connection_llm_config,
+    resolve_llm_config,
 };
-use crate::connections::{ConnectionConfig, ConnectionId};
+use crate::connections::{ConnectionConfig, ConnectionId, Connector};
 
 /// Availability of a single connection in the registry.
 #[derive(Debug, Clone, PartialEq)]
@@ -187,9 +188,15 @@ impl Default for ConnectionRegistry {
 /// *before* calling this so misconfigured connections can be marked
 /// unavailable up front.
 pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
-    let connector = resolved.connector.clone();
-    let inner: Arc<dyn LlmClient> = match resolved.connector.as_str() {
-        "ollama" => {
+    // Label for the classifier (below); the typed `Connector` drives dispatch.
+    let connector_label = resolved.connector.clone();
+    // Dispatch through the typed enum with NO catch-all arm, so a future
+    // `Connector` variant fails to compile here until it is wired (#47). An
+    // unrecognised connector string still defaults to OpenAi, matching the
+    // historical `_` behaviour.
+    let connector = Connector::parse(&resolved.connector).unwrap_or(Connector::OpenAi);
+    let inner: Arc<dyn LlmClient> = match connector {
+        Connector::Ollama => {
             let ollama = Arc::new(
                 desktop_assistant_llm_ollama::OllamaClient::new(resolved.base_url, resolved.model)
                     .with_temperature(resolved.temperature)
@@ -213,7 +220,7 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
             }
             ollama as Arc<dyn LlmClient>
         }
-        "anthropic" => {
+        Connector::Anthropic => {
             if resolved.api_key.is_empty() {
                 tracing::warn!(
                     "No API key resolved from configured secret backend or environment; LLM calls may fail"
@@ -234,7 +241,7 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
             }
             Arc::new(client)
         }
-        "bedrock" | "aws-bedrock" => Arc::new(
+        Connector::Bedrock => Arc::new(
             desktop_assistant_llm_bedrock::BedrockClient::new(resolved.api_key)
                 .with_model(resolved.model)
                 .with_base_url(resolved.base_url)
@@ -246,7 +253,7 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
                 .with_event_timeout(resolved.stream_timeout_secs)
                 .with_max_context_tokens(resolved.max_context_tokens),
         ),
-        _ => {
+        Connector::OpenAi => {
             if resolved.api_key.is_empty() {
                 tracing::warn!(
                     "No API key resolved from configured secret backend or environment; LLM calls may fail"
@@ -266,6 +273,104 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
             }
             Arc::new(client)
         }
+        Connector::OpenRouter => {
+            if resolved.api_key.is_empty() {
+                tracing::warn!(
+                    "No API key resolved from configured secret backend or environment; LLM calls may fail"
+                );
+            }
+            let mut client =
+                desktop_assistant_llm_openrouter::OpenRouterClient::new(resolved.api_key)
+                    .with_model(resolved.model)
+                    .with_base_url(resolved.base_url)
+                    .with_temperature(resolved.temperature)
+                    .with_top_p(resolved.top_p)
+                    .with_max_tokens(resolved.max_tokens)
+                    .with_connect_timeout(resolved.connect_timeout_secs)
+                    .with_event_timeout(resolved.stream_timeout_secs)
+                    .with_max_context_tokens(resolved.max_context_tokens);
+            if let Some(hts) = resolved.hosted_tool_search {
+                client = client.with_hosted_tool_search(hts);
+            }
+            Arc::new(client)
+        }
+        Connector::Azure => {
+            // `resolved.model` is the deployment name. The api key is only used
+            // in api-key auth mode; Entra mode leaves it empty and (until a
+            // TokenProvider is injected) fails at request time with a clear error.
+            let mut client = desktop_assistant_llm_azure::AzureClient::new(resolved.api_key)
+                .with_model(resolved.model)
+                .with_temperature(resolved.temperature)
+                .with_top_p(resolved.top_p)
+                .with_max_tokens(resolved.max_tokens)
+                .with_connect_timeout(resolved.connect_timeout_secs)
+                .with_event_timeout(resolved.stream_timeout_secs)
+                .with_max_context_tokens(resolved.max_context_tokens);
+            if let ConnectorExtras::Azure {
+                api_surface,
+                auth_mode,
+                api_version,
+            } = &resolved.extras
+            {
+                if let Some(s) = api_surface {
+                    match s.parse::<desktop_assistant_llm_azure::ApiSurface>() {
+                        Ok(surface) => client = client.with_api_surface(surface),
+                        Err(e) => tracing::warn!(
+                            "invalid Azure api_surface {s:?}: {e}; using connector default (v1)"
+                        ),
+                    }
+                }
+                if let Some(a) = auth_mode {
+                    match a.parse::<desktop_assistant_llm_azure::AuthMode>() {
+                        Ok(mode) => client = client.with_auth_mode(mode),
+                        Err(e) => tracing::warn!(
+                            "invalid Azure auth_mode {a:?}: {e}; using connector default (api_key)"
+                        ),
+                    }
+                }
+                if let Some(v) = api_version {
+                    client = client.with_api_version(v.clone());
+                }
+            }
+            client = client.with_base_url(resolved.base_url);
+            Arc::new(client)
+        }
+        Connector::Google => {
+            // The api key is used only in api-key (AI Studio) mode; Vertex mode
+            // authenticates via the credential path / ADC token provider.
+            let mut client = desktop_assistant_llm_google::GoogleClient::new(resolved.api_key)
+                .with_model(resolved.model)
+                .with_temperature(resolved.temperature)
+                .with_top_p(resolved.top_p)
+                .with_max_tokens(resolved.max_tokens)
+                .with_connect_timeout(resolved.connect_timeout_secs)
+                .with_event_timeout(resolved.stream_timeout_secs)
+                .with_max_context_tokens(resolved.max_context_tokens);
+            if let ConnectorExtras::Google {
+                project,
+                location,
+                auth_mode,
+                credentials_path,
+            } = &resolved.extras
+            {
+                client = client.with_project(project.clone());
+                if let Some(l) = location {
+                    client = client.with_location(l.clone());
+                }
+                if let Some(a) = auth_mode {
+                    client =
+                        client.with_auth_mode(desktop_assistant_llm_google::AuthMode::parse(a));
+                }
+                client = client.with_credentials_path(credentials_path.clone());
+            }
+            // Only override the host when explicitly configured; otherwise the
+            // client composes the Vertex host from `location` (or uses the fixed
+            // Gemini API host in api-key mode).
+            if !resolved.base_url.trim().is_empty() {
+                client = client.with_base_url(resolved.base_url);
+            }
+            Arc::new(client)
+        }
     };
 
     // Classify opaque backend errors (#178): innermost wrap, so it sees the
@@ -276,32 +381,118 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
     // and single-shot, and it sits inside `RetryingLlmClient`, which only
     // retries `RateLimited` — terminal causes are never retried.
     Arc::new(crate::classifying_llm::ClassifyingLlmClient::new(
-        inner, connector,
+        inner,
+        connector_label,
     ))
 }
 
 /// Validate a resolved connection config before building the client.
 ///
-/// Flags the cases that definitely cannot work at request time:
-/// - OpenAI / Anthropic with no API key (neither secret backend nor env).
-/// - An empty/whitespace base URL (the connector constructors accept these
-///   silently and then fail on the first request with a less obvious error).
+/// Auth-aware and field-aware preflight ("no silent failures"): each connector
+/// checks the pieces it genuinely needs and returns a specific reason naming the
+/// missing one, rather than passing preflight and failing the first turn with a
+/// raw 401/404. Dispatches through the typed [`Connector`] so a new variant is
+/// forced to declare its requirements.
 ///
-/// Returns `Ok(())` when the config looks plausible. Returns
-/// `Err(reason)` when the daemon should mark the connection unavailable
-/// rather than spin up a client that will just fail every request.
+/// - OpenAI / Anthropic / OpenRouter: a non-empty base URL and a non-empty API
+///   key.
+/// - Ollama: a non-empty base URL (no API key; local endpoint).
+/// - Bedrock: nothing here — `base_url` carries the region and auth flows
+///   through the AWS credential chain, so the empty-base-url check must not fire.
+/// - Azure: a resource endpoint (`base_url`) and a deployment (`model`); plus an
+///   API key when `auth_mode = api_key` (Entra needs none).
+/// - Google/Vertex: a `project` and a `location` (the base URL is derived from
+///   the location, so its emptiness is not an error); plus an API key in the
+///   `api_key` (AI Studio) mode. The credential's resolvability is checked by
+///   the client at request time.
+///
+/// Returns `Ok(())` when the config looks plausible, or `Err(reason)` when the
+/// daemon should mark the connection unavailable rather than spin up a client
+/// that will just fail every request.
 fn sanity_check_resolved(resolved: &ResolvedLlmConfig) -> Result<(), String> {
-    if resolved.base_url.trim().is_empty() {
-        return Err("base_url is empty after resolution".to_string());
-    }
-    if matches!(resolved.connector.as_str(), "openai" | "anthropic")
-        && resolved.api_key.trim().is_empty()
-    {
-        return Err(format!(
+    let connector = Connector::parse(&resolved.connector).unwrap_or(Connector::OpenAi);
+    let has_key = !resolved.api_key.trim().is_empty();
+    let has_base = !resolved.base_url.trim().is_empty();
+    let has_model = !resolved.model.trim().is_empty();
+
+    let missing_api_key = || {
+        format!(
             "{} connector has no api key (check `api_key_env`, `secret`, or the {}_API_KEY env var)",
             resolved.connector,
             resolved.connector.to_ascii_uppercase()
-        ));
+        )
+    };
+
+    match connector {
+        Connector::OpenAi | Connector::Anthropic | Connector::OpenRouter => {
+            if !has_base {
+                return Err("base_url is empty after resolution".to_string());
+            }
+            if !has_key {
+                return Err(missing_api_key());
+            }
+        }
+        Connector::Ollama => {
+            if !has_base {
+                return Err("base_url is empty after resolution".to_string());
+            }
+        }
+        // Bedrock auth flows through the AWS credential chain and `base_url`
+        // carries the region; nothing to require here.
+        Connector::Bedrock => {}
+        Connector::Azure => {
+            if !has_base || !has_model {
+                return Err(
+                    "Azure connection needs a resource endpoint (base_url) and a deployment (model)"
+                        .to_string(),
+                );
+            }
+            // Only api-key auth needs a key; Entra authenticates via a token
+            // provider. Default (unset/invalid) auth mode is api_key.
+            let auth_is_api_key = match &resolved.extras {
+                ConnectorExtras::Azure {
+                    auth_mode: Some(a), ..
+                } => a
+                    .parse::<desktop_assistant_llm_azure::AuthMode>()
+                    .map(|m| matches!(m, desktop_assistant_llm_azure::AuthMode::ApiKey))
+                    .unwrap_or(true),
+                _ => true,
+            };
+            if auth_is_api_key && !has_key {
+                return Err("Azure connection (api_key auth) has no api key \
+                     (check `api_key_env`, `secret`, or AZURE_OPENAI_API_KEY)"
+                    .to_string());
+            }
+        }
+        Connector::Google => {
+            let (project, location, api_key_mode) = match &resolved.extras {
+                ConnectorExtras::Google {
+                    project,
+                    location,
+                    auth_mode,
+                    ..
+                } => {
+                    let mode = auth_mode
+                        .as_deref()
+                        .map(desktop_assistant_llm_google::AuthMode::parse)
+                        .unwrap_or_default();
+                    (
+                        project.clone(),
+                        location.clone(),
+                        matches!(mode, desktop_assistant_llm_google::AuthMode::ApiKey),
+                    )
+                }
+                _ => (None, None, false),
+            };
+            if project.is_none() || location.is_none() {
+                return Err("Vertex connection needs project and location".to_string());
+            }
+            if api_key_mode && !has_key {
+                return Err("Google (api_key / AI Studio) connection has no api key \
+                     (check `api_key_env`, `secret`, or GOOGLE_API_KEY)"
+                    .to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -450,6 +641,34 @@ mod tests {
         OpenAiConnection,
     };
     use indexmap::IndexMap;
+
+    /// Build a bare [`ResolvedLlmConfig`] with only the identity/credential
+    /// fields set — the rest default to `None`/`false`. Keeps the new-connector
+    /// tests readable.
+    fn resolved(
+        connector: &str,
+        model: &str,
+        base_url: &str,
+        api_key: &str,
+        extras: ConnectorExtras,
+    ) -> ResolvedLlmConfig {
+        ResolvedLlmConfig {
+            connector: connector.to_string(),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            hosted_tool_search: None,
+            aws_profile: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            keep_warm: false,
+            max_context_tokens: None,
+            extras,
+        }
+    }
 
     fn config_from_pairs(pairs: Vec<(ConnectionId, ConnectionConfig)>) -> DaemonConfig {
         // Re-insert into a raw `IndexMap<String, _>` so `DaemonConfig::validated_connections`
@@ -707,6 +926,7 @@ mod tests {
             stream_timeout_secs: None,
             keep_warm: false,
             max_context_tokens: None,
+            extras: ConnectorExtras::None,
         };
         let err = sanity_check_resolved(&resolved).unwrap_err();
         assert!(err.contains("base_url"), "got: {err}");
@@ -729,6 +949,7 @@ mod tests {
             stream_timeout_secs: None,
             keep_warm: false,
             max_context_tokens: None,
+            extras: ConnectorExtras::None,
         };
         sanity_check_resolved(&resolved).expect("bedrock without api key should pass");
     }
@@ -749,6 +970,7 @@ mod tests {
             stream_timeout_secs: None,
             keep_warm: false,
             max_context_tokens: None,
+            extras: ConnectorExtras::None,
         };
         sanity_check_resolved(&resolved).expect("ollama without api key should pass");
     }
@@ -849,5 +1071,126 @@ mod tests {
             registry.status_of(&id).unwrap().health,
             ConnectionHealth::Ok
         ));
+    }
+
+    // --- New cloud connectors (OpenRouter / Azure / Google) -----------------
+
+    #[test]
+    fn build_llm_client_constructs_openrouter_azure_google() {
+        // OpenRouter: OpenAI-compatible; the default model surfaces through the
+        // ClassifyingLlmClient decorator.
+        let openrouter = build_llm_client(resolved(
+            "openrouter",
+            "anthropic/claude-sonnet-4-6",
+            "https://openrouter.ai/api/v1",
+            "test-key",
+            ConnectorExtras::None,
+        ));
+        assert_eq!(
+            openrouter.get_default_model(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+
+        // Azure: deployment-addressed; no default model (operator-named).
+        let azure = build_llm_client(resolved(
+            "azure",
+            "my-deployment",
+            "https://x.openai.azure.com",
+            "test-key",
+            ConnectorExtras::Azure {
+                api_surface: Some("v1".to_string()),
+                auth_mode: Some("api_key".to_string()),
+                api_version: None,
+            },
+        ));
+        assert_eq!(azure.get_default_model(), None);
+
+        // Google: base_url empty -> host composed from location; default model
+        // surfaces through the decorator.
+        let google = build_llm_client(resolved(
+            "google",
+            "gemini-2.5-pro",
+            "",
+            "test-key",
+            ConnectorExtras::Google {
+                project: Some("my-project".to_string()),
+                location: Some("us-central1".to_string()),
+                auth_mode: Some("api_key".to_string()),
+                credentials_path: None,
+            },
+        ));
+        assert_eq!(google.get_default_model(), Some("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn sanity_check_keyless_openrouter_names_missing_key() {
+        let err = sanity_check_resolved(&resolved(
+            "openrouter",
+            "anthropic/claude-sonnet-4-6",
+            "https://openrouter.ai/api/v1",
+            "",
+            ConnectorExtras::None,
+        ))
+        .unwrap_err();
+        assert!(err.contains("api key"), "got: {err}");
+        assert!(err.contains("OPENROUTER"), "should name the env var: {err}");
+    }
+
+    #[test]
+    fn sanity_check_base_url_less_azure_names_endpoint_and_deployment() {
+        // Deployment is set, endpoint is empty -> the combined field-aware
+        // message fires (not the generic "base_url is empty").
+        let err = sanity_check_resolved(&resolved(
+            "azure",
+            "my-deployment",
+            "   ",
+            "test-key",
+            ConnectorExtras::Azure {
+                api_surface: None,
+                auth_mode: Some("api_key".to_string()),
+                api_version: None,
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Azure connection needs a resource endpoint (base_url) and a deployment (model)"
+        );
+    }
+
+    #[test]
+    fn sanity_check_project_less_google_names_project_and_location() {
+        let err = sanity_check_resolved(&resolved(
+            "google",
+            "gemini-2.5-pro",
+            "",
+            "test-key",
+            ConnectorExtras::Google {
+                project: None,
+                location: Some("us-central1".to_string()),
+                auth_mode: Some("vertex".to_string()),
+                credentials_path: None,
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(err, "Vertex connection needs project and location");
+    }
+
+    #[test]
+    fn sanity_check_azure_entra_needs_no_api_key() {
+        // Entra auth authenticates via a token provider, so a missing api key is
+        // fine at preflight (it fails later only if no provider is injected).
+        sanity_check_resolved(&resolved(
+            "azure",
+            "my-deployment",
+            "https://x.openai.azure.com",
+            "",
+            ConnectorExtras::Azure {
+                api_surface: None,
+                auth_mode: Some("entra".to_string()),
+                api_version: None,
+            },
+        ))
+        .expect("Azure Entra without an api key should pass preflight");
     }
 }

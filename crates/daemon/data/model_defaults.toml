@@ -60,3 +60,70 @@ id = "qwen2.5:latest"
 display_name = "Qwen 2.5"
 context_limit = 32768
 capabilities = { reasoning = false, vision = false, tools = true, embedding = false }
+
+# --- OpenRouter -------------------------------------------------------------
+# OpenRouter's live /models catalog is authoritative; these seed the picker
+# before the live fetch and cover the common vendor/model slugs. Slugs are
+# version-fragile — treat as a convenience seed, not a source of truth.
+
+[[openrouter]]
+id = "anthropic/claude-sonnet-4-6"
+display_name = "Claude Sonnet 4.6 (Anthropic)"
+context_limit = 200000
+capabilities = { reasoning = true, vision = true, tools = true, embedding = false }
+
+[[openrouter]]
+id = "openai/gpt-5.4"
+display_name = "GPT-5.4 (OpenAI)"
+context_limit = 400000
+capabilities = { reasoning = true, vision = true, tools = true, embedding = false }
+
+[[openrouter]]
+id = "google/gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro (Google)"
+context_limit = 1048576
+capabilities = { reasoning = true, vision = true, tools = true, embedding = false }
+
+# --- Azure OpenAI -----------------------------------------------------------
+# Azure deployments are operator-named, so these base-model entries are NOT
+# directly selectable ids (a curated `gpt-4o` when the deployment is `my-gpt4`
+# yields a 404). They carry capability/context metadata for the picker only;
+# the operator types their own deployment name.
+
+[[azure]]
+id = "gpt-4o"
+display_name = "GPT-4o (base model)"
+context_limit = 128000
+capabilities = { reasoning = false, vision = true, tools = true, embedding = false }
+
+[[azure]]
+id = "gpt-4.1"
+display_name = "GPT-4.1 (base model)"
+context_limit = 1000000
+capabilities = { reasoning = false, vision = true, tools = true, embedding = false }
+
+[[azure]]
+id = "text-embedding-3-small"
+display_name = "Text Embedding 3 Small (base model)"
+capabilities = { reasoning = false, vision = false, tools = false, embedding = true }
+
+# --- Google Vertex / Gemini -------------------------------------------------
+# Vertex's live publisher-models listing is authoritative; these seed the
+# picker with the common Gemini ids.
+
+[[google]]
+id = "gemini-2.5-pro"
+display_name = "Gemini 2.5 Pro"
+context_limit = 1048576
+capabilities = { reasoning = true, vision = true, tools = true, embedding = false }
+
+[[google]]
+id = "gemini-2.5-flash"
+display_name = "Gemini 2.5 Flash"
+context_limit = 1048576
+capabilities = { reasoning = true, vision = true, tools = true, embedding = false }
+
+[[google]]
+id = "text-embedding-004"
+display_name = "Text Embedding 004"
+capabilities = { reasoning = false, vision = false, tools = false, embedding = true }

@@ -123,6 +123,12 @@ pub enum ConnectionConfig {
     Anthropic(AnthropicConnection),
     #[serde(rename = "openai")]
     OpenAi(OpenAiConnection),
+    #[serde(rename = "openrouter")]
+    OpenRouter(OpenRouterConnection),
+    #[serde(rename = "azure")]
+    Azure(AzureConnection),
+    #[serde(rename = "google")]
+    Google(GoogleConnection),
     Bedrock(BedrockConnection),
     Ollama(OllamaConnection),
 }
@@ -141,6 +147,9 @@ impl ConnectionConfig {
         match self {
             Self::Anthropic(_) => Connector::Anthropic,
             Self::OpenAi(_) => Connector::OpenAi,
+            Self::OpenRouter(_) => Connector::OpenRouter,
+            Self::Azure(_) => Connector::Azure,
+            Self::Google(_) => Connector::Google,
             Self::Bedrock(_) => Connector::Bedrock,
             Self::Ollama(_) => Connector::Ollama,
         }
@@ -155,6 +164,12 @@ impl ConnectionConfig {
         match self {
             Self::Anthropic(c) => c.secret = secret,
             Self::OpenAi(c) => c.secret = secret,
+            Self::OpenRouter(c) => c.secret = secret,
+            Self::Azure(c) => c.secret = secret,
+            // Google's secret is consumed only in api-key mode, but allow
+            // setting it so operators can pre-provision the credential
+            // regardless of the connection's current `auth_mode`.
+            Self::Google(c) => c.secret = secret,
             Self::Bedrock(c) => c.secret = secret,
             Self::Ollama(_) => return Err("ollama connections do not use a stored credential"),
         }
@@ -174,6 +189,9 @@ pub enum Connector {
     Anthropic,
     Bedrock,
     OpenAi,
+    OpenRouter,
+    Azure,
+    Google,
 }
 
 impl Connector {
@@ -185,6 +203,9 @@ impl Connector {
             Self::Anthropic => "anthropic",
             Self::Bedrock => "bedrock",
             Self::OpenAi => "openai",
+            Self::OpenRouter => "openrouter",
+            Self::Azure => "azure",
+            Self::Google => "google",
         }
     }
 
@@ -204,6 +225,11 @@ impl Connector {
             "anthropic" => Some(Self::Anthropic),
             "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
             "openai" => Some(Self::OpenAi),
+            "openrouter" => Some(Self::OpenRouter),
+            "azure" => Some(Self::Azure),
+            // Deliberately no "gemini" alias: an unknown `type = "gemini"` must
+            // stay unrecognised so the negative config test keeps rejecting it.
+            "google" => Some(Self::Google),
             _ => None,
         }
     }
@@ -226,6 +252,16 @@ impl Connector {
             Self::OpenAi => {
                 desktop_assistant_llm_openai::OpenAiClient::get_default_base_url().unwrap_or("")
             }
+            Self::OpenRouter => {
+                desktop_assistant_llm_openrouter::OpenRouterClient::get_default_base_url()
+                    .unwrap_or("")
+            }
+            // Azure's host is resource-specific (`https://<name>.openai.azure.com`),
+            // so there is no shippable default — the operator must set it.
+            Self::Azure => "",
+            Self::Google => {
+                desktop_assistant_llm_google::GoogleClient::get_default_base_url().unwrap_or("")
+            }
         }
     }
 
@@ -245,6 +281,15 @@ impl Connector {
             Self::OpenAi => {
                 desktop_assistant_llm_openai::OpenAiClient::get_default_model().unwrap_or("")
             }
+            Self::OpenRouter => {
+                desktop_assistant_llm_openrouter::OpenRouterClient::get_default_model()
+                    .unwrap_or("")
+            }
+            // Azure deployments are operator-named; no default deployment exists.
+            Self::Azure => "",
+            Self::Google => {
+                desktop_assistant_llm_google::GoogleClient::get_default_model().unwrap_or("")
+            }
         }
     }
 
@@ -260,6 +305,17 @@ impl Connector {
             Self::Anthropic => "claude-haiku-4-5-20251001",
             Self::Bedrock => "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             Self::OpenAi => "gpt-4o-mini",
+            // OpenRouter has no dedicated cheaper-backend static; reuse its
+            // vetted default model rather than ship a possibly-stale cheap slug
+            // (operators override per purpose when they want a cheaper backend).
+            Self::OpenRouter => {
+                desktop_assistant_llm_openrouter::OpenRouterClient::get_default_model()
+                    .unwrap_or("")
+            }
+            // Azure deployments are operator-named; no default backend deployment.
+            Self::Azure => "",
+            Self::Google => desktop_assistant_llm_google::GoogleClient::get_default_backend_model()
+                .unwrap_or(""),
         }
     }
 
@@ -272,7 +328,17 @@ impl Connector {
             Self::Ollama => "nomic-embed-text",
             Self::Bedrock => "amazon.titan-embed-text-v2:0",
             Self::OpenAi => "text-embedding-3-small",
+            // Anthropic and OpenRouter ship no embeddings — callers must check
+            // `supports_embeddings` first (returns `false` for both).
             Self::Anthropic => "",
+            Self::OpenRouter => "",
+            // Azure serves OpenAI's embedding models under an operator-named
+            // deployment; the base-model default is the small text-embedding-3.
+            Self::Azure => "text-embedding-3-small",
+            Self::Google => {
+                desktop_assistant_llm_google::GoogleClient::get_default_embedding_model()
+                    .unwrap_or("")
+            }
         }
     }
 
@@ -286,13 +352,30 @@ impl Connector {
             Self::Anthropic => "https://api.anthropic.com",
             Self::Bedrock => "us-east-1",
             Self::OpenAi => "https://api.openai.com/v1",
+            Self::OpenRouter => {
+                desktop_assistant_llm_openrouter::OpenRouterClient::get_default_base_url()
+                    .unwrap_or("")
+            }
+            // Azure's endpoint is resource-specific; empty so the resolver
+            // leaves `base_url` empty and preflight names the missing endpoint.
+            Self::Azure => "",
+            // Empty on purpose: Google composes the Vertex host from `location`
+            // when no explicit base_url is set, so the resolver must NOT fill a
+            // fixed regional URL here (that would pin the host to one region and
+            // mismatch a differently-located deployment). The display default is
+            // still available via `default_base_url`.
+            Self::Google => "",
         }
     }
 
-    /// Whether this connector exposes an embeddings endpoint. Anthropic
-    /// doesn't.
+    /// Whether this connector exposes an embeddings endpoint. Explicit
+    /// per-variant allowlist: Anthropic and OpenRouter don't; every other
+    /// connector (including Azure and Google) does.
     pub fn supports_embeddings(self) -> bool {
-        !matches!(self, Self::Anthropic)
+        match self {
+            Self::Anthropic | Self::OpenRouter => false,
+            Self::Ollama | Self::Bedrock | Self::OpenAi | Self::Azure | Self::Google => true,
+        }
     }
 
     /// Whether this connector supports server-side hosted tool search
@@ -350,6 +433,135 @@ pub struct OpenAiConnection {
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<SecretConfig>,
+    /// Seconds to wait for the first streaming response before treating the
+    /// request as stalled. Overrides the shared 30s default. See
+    /// [`AnthropicConnection::connect_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait between streaming chunks. Overrides the shared 60s
+    /// default. See [`AnthropicConnection::stream_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout_secs: Option<u64>,
+    /// Hard ceiling on the effective context window, in tokens. `None` = "max
+    /// available". See [`AnthropicConnection::max_context_tokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
+}
+
+/// OpenRouter connection fields.
+///
+/// OpenRouter is an OpenAI-compatible aggregator, so its config surface is
+/// identical to [`OpenAiConnection`]; a distinct struct keeps the connector
+/// identity typed and lets the two diverge later without a wire break.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterConnection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretConfig>,
+    /// Seconds to wait for the first streaming response before treating the
+    /// request as stalled. Overrides the shared 30s default. See
+    /// [`AnthropicConnection::connect_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait between streaming chunks. Overrides the shared 60s
+    /// default. See [`AnthropicConnection::stream_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout_secs: Option<u64>,
+    /// Hard ceiling on the effective context window, in tokens. `None` = "max
+    /// available". See [`AnthropicConnection::max_context_tokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
+}
+
+/// Azure OpenAI (Microsoft Foundry) connection fields.
+///
+/// Extends the OpenAI-compatible base with the resource-specific knobs Azure
+/// needs: which REST surface to speak, how to authenticate, and (classic only)
+/// the `api-version`. The `model` is an operator-provisioned *deployment* name,
+/// carried through the shared resolver/purpose layer like every other model.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AzureConnection {
+    /// The resource endpoint, e.g. `https://<name>.openai.azure.com`. Required
+    /// (there is no shippable default); preflight names it when missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Env var holding the resource key. Defaults to `AZURE_OPENAI_API_KEY`
+    /// (resolved in [`crate::config::resolve_connection_llm_config`]) rather
+    /// than the derived `AZURE_API_KEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretConfig>,
+    /// Which REST surface to target: `v1` (GA, default) or `classic` (legacy
+    /// deployments path). Parsed by the factory into the connector's
+    /// `ApiSurface` enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_surface: Option<String>,
+    /// How to authenticate: `api_key` (default) or `entra` (Entra ID / managed
+    /// identity). Parsed by the factory into the connector's `AuthMode` enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+    /// `api-version` for the classic surface; ignored on `v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    /// Seconds to wait for the first streaming response before treating the
+    /// request as stalled. Overrides the shared 30s default. See
+    /// [`AnthropicConnection::connect_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait between streaming chunks. Overrides the shared 60s
+    /// default. See [`AnthropicConnection::stream_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout_secs: Option<u64>,
+    /// Hard ceiling on the effective context window, in tokens. `None` = "max
+    /// available". See [`AnthropicConnection::max_context_tokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
+}
+
+/// Google Vertex AI / Gemini connection fields.
+///
+/// Vertex is project/region-scoped and cloud-credential authenticated; the
+/// simpler Gemini API (AI Studio) is folded in as `auth_mode = api_key`. The
+/// `model` is the Gemini model id, carried through the shared resolver/purpose
+/// layer.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoogleConnection {
+    /// Explicit host override; when unset the connector composes the Vertex
+    /// host from `location` (or uses the fixed Gemini API host in api-key mode),
+    /// so this stays `None` for a normal region-scoped setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Env var holding the API key (api-key / AI-Studio mode only). Defaults to
+    /// the derived `GOOGLE_API_KEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Used only in `auth_mode = api_key`; allowed on any connection so the
+    /// credential can be pre-provisioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretConfig>,
+    /// GCP project id (Vertex). Falls back to `GOOGLE_CLOUD_PROJECT` /
+    /// `GOOGLE_PROJECT` at resolve time when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Vertex region, e.g. `us-central1`. Falls back to `GOOGLE_CLOUD_LOCATION`
+    /// / `GOOGLE_LOCATION` at resolve time when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// How to authenticate: `vertex` (default, OAuth2 bearer) or `api_key`
+    /// (AI Studio). Parsed by the factory into the connector's `AuthMode` enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+    /// Path to a service-account JSON key file (Vertex). When unset the
+    /// connector falls back to Application Default Credentials at request time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_path: Option<String>,
     /// Seconds to wait for the first streaming response before treating the
     /// request as stalled. Overrides the shared 30s default. See
     /// [`AnthropicConnection::connect_timeout_secs`].
@@ -498,6 +710,24 @@ pub(crate) fn connection_from_legacy_llm(llm: &LlmConfig) -> ConnectionConfig {
         }),
         "ollama" => ConnectionConfig::Ollama(OllamaConnection {
             base_url: llm.base_url.clone(),
+            ..Default::default()
+        }),
+        "openrouter" => ConnectionConfig::OpenRouter(OpenRouterConnection {
+            base_url: llm.base_url.clone(),
+            api_key_env: llm.api_key_env.clone(),
+            secret: llm.secret.clone(),
+            ..Default::default()
+        }),
+        "azure" => ConnectionConfig::Azure(AzureConnection {
+            base_url: llm.base_url.clone(),
+            api_key_env: llm.api_key_env.clone(),
+            secret: llm.secret.clone(),
+            ..Default::default()
+        }),
+        "google" => ConnectionConfig::Google(GoogleConnection {
+            base_url: llm.base_url.clone(),
+            api_key_env: llm.api_key_env.clone(),
+            secret: llm.secret.clone(),
             ..Default::default()
         }),
         "bedrock" | "aws-bedrock" => ConnectionConfig::Bedrock(BedrockConnection {
@@ -780,6 +1010,70 @@ api_key_env = "ANTHROPIC_API_KEY"
     }
 
     #[test]
+    fn roundtrip_openrouter_toml() {
+        let toml_src = r#"
+type = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+"#;
+        let parsed: ConnectionConfig = toml::from_str(toml_src).unwrap();
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ConnectionConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed, reparsed);
+        assert_eq!(parsed.connector_type(), "openrouter");
+    }
+
+    #[test]
+    fn roundtrip_azure_toml() {
+        let toml_src = r#"
+type = "azure"
+base_url = "https://my-resource.openai.azure.com"
+api_key_env = "AZURE_OPENAI_API_KEY"
+api_surface = "classic"
+auth_mode = "entra"
+api_version = "2024-10-21"
+"#;
+        let parsed: ConnectionConfig = toml::from_str(toml_src).unwrap();
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ConnectionConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed, reparsed);
+        assert_eq!(parsed.connector_type(), "azure");
+        match parsed {
+            ConnectionConfig::Azure(c) => {
+                assert_eq!(c.api_surface.as_deref(), Some("classic"));
+                assert_eq!(c.auth_mode.as_deref(), Some("entra"));
+                assert_eq!(c.api_version.as_deref(), Some("2024-10-21"));
+            }
+            other => panic!("expected Azure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_google_toml() {
+        let toml_src = r#"
+type = "google"
+project = "my-gcp-project"
+location = "us-central1"
+auth_mode = "vertex"
+credentials_path = "/etc/adele/sa.json"
+"#;
+        let parsed: ConnectionConfig = toml::from_str(toml_src).unwrap();
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ConnectionConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed, reparsed);
+        assert_eq!(parsed.connector_type(), "google");
+        match parsed {
+            ConnectionConfig::Google(c) => {
+                assert_eq!(c.project.as_deref(), Some("my-gcp-project"));
+                assert_eq!(c.location.as_deref(), Some("us-central1"));
+                assert_eq!(c.auth_mode.as_deref(), Some("vertex"));
+                assert_eq!(c.credentials_path.as_deref(), Some("/etc/adele/sa.json"));
+            }
+            other => panic!("expected Google, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_unknown_type() {
         let toml_src = r#"
 type = "gemini"
@@ -812,6 +1106,16 @@ mystery_key = "x"
         assert_eq!(Connector::parse("anthropic"), Some(Connector::Anthropic));
         assert_eq!(Connector::parse("bedrock"), Some(Connector::Bedrock));
         assert_eq!(Connector::parse("openai"), Some(Connector::OpenAi));
+        assert_eq!(Connector::parse("openrouter"), Some(Connector::OpenRouter));
+        assert_eq!(Connector::parse("azure"), Some(Connector::Azure));
+        assert_eq!(Connector::parse("google"), Some(Connector::Google));
+    }
+
+    #[test]
+    fn connector_parse_rejects_gemini_alias() {
+        // `google` is the canonical id; `gemini` must stay unrecognised so the
+        // negative config fixture (`rejects_unknown_type`) keeps rejecting it.
+        assert_eq!(Connector::parse("gemini"), None);
     }
 
     #[test]
@@ -844,6 +1148,9 @@ mystery_key = "x"
             Connector::Anthropic,
             Connector::Bedrock,
             Connector::OpenAi,
+            Connector::OpenRouter,
+            Connector::Azure,
+            Connector::Google,
         ] {
             assert_eq!(Connector::parse(c.as_str()), Some(c));
         }
@@ -859,16 +1166,24 @@ mystery_key = "x"
         assert!(Connector::Bedrock.supports_embeddings());
         assert!(Connector::OpenAi.supports_embeddings());
         assert!(!Connector::Anthropic.supports_embeddings());
+        // New connectors: OpenRouter has no embeddings; Azure and Google do.
+        assert!(!Connector::OpenRouter.supports_embeddings());
+        assert!(Connector::Azure.supports_embeddings());
+        assert!(Connector::Google.supports_embeddings());
 
         assert!(!Connector::Ollama.supports_hosted_tool_search());
         assert!(!Connector::Bedrock.supports_hosted_tool_search());
         assert!(Connector::OpenAi.supports_hosted_tool_search());
         assert!(Connector::Anthropic.supports_hosted_tool_search());
+        // None of the new connectors expose hosted tool search in v1.
+        assert!(!Connector::OpenRouter.supports_hosted_tool_search());
+        assert!(!Connector::Azure.supports_hosted_tool_search());
+        assert!(!Connector::Google.supports_hosted_tool_search());
     }
 
     #[test]
     fn connection_config_connector_method_matches_type_tag() {
-        let cases: [(ConnectionConfig, Connector); 4] = [
+        let cases: [(ConnectionConfig, Connector); 7] = [
             (
                 ConnectionConfig::Ollama(OllamaConnection::default()),
                 Connector::Ollama,
@@ -884,6 +1199,18 @@ mystery_key = "x"
             (
                 ConnectionConfig::OpenAi(OpenAiConnection::default()),
                 Connector::OpenAi,
+            ),
+            (
+                ConnectionConfig::OpenRouter(OpenRouterConnection::default()),
+                Connector::OpenRouter,
+            ),
+            (
+                ConnectionConfig::Azure(AzureConnection::default()),
+                Connector::Azure,
+            ),
+            (
+                ConnectionConfig::Google(GoogleConnection::default()),
+                Connector::Google,
             ),
         ];
         for (cfg, expected) in cases {

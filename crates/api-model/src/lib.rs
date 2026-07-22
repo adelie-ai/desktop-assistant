@@ -1256,6 +1256,64 @@ pub enum ConnectionConfigView {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
     },
+    /// OpenRouter carries the same non-secret fields as [`Self::OpenAi`].
+    #[serde(rename = "openrouter")]
+    OpenRouter {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connect_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
+    },
+    /// Azure OpenAI: OpenAI-compatible fields plus surface/auth/version knobs.
+    /// A secret value is never serialized through this view.
+    #[serde(rename = "azure")]
+    Azure {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_surface: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connect_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
+    },
+    /// Google Vertex / Gemini: project/region/auth knobs. A secret value is
+    /// never serialized through this view.
+    #[serde(rename = "google")]
+    Google {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credentials_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connect_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
+    },
     Bedrock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         aws_profile: Option<String>,
@@ -1292,6 +1350,9 @@ impl ConnectionConfigView {
         match self {
             Self::Anthropic { .. } => "anthropic",
             Self::OpenAi { .. } => "openai",
+            Self::OpenRouter { .. } => "openrouter",
+            Self::Azure { .. } => "azure",
+            Self::Google { .. } => "google",
             Self::Bedrock { .. } => "bedrock",
             Self::Ollama { .. } => "ollama",
         }
