@@ -399,6 +399,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assembled_prompt_directs_self_contained_subagent_brief() {
+        // #2: a subagent runs in its own isolated context and cannot see the
+        // parent's history, so the parent must hand it a self-contained brief
+        // (goal + just the facts it needs), and only a summary comes back.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("self-contained brief"),
+            "the prompt must direct the parent to give the subagent a self-contained brief"
+        );
+        assert!(
+            assembled.contains("starts fresh"),
+            "framing that the child starts fresh with no view of the parent's context"
+        );
+    }
+
     // --- Personality (#226) ------------------------------------------------
 
     /// The fixed adaptation clause is appended to every personality blurb,
