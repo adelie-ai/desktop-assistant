@@ -378,6 +378,24 @@ impl UdsServer {
     }
 }
 
+/// Resolve the client context to attach for a UDS connection (#549/#558).
+///
+/// A client that reported a non-empty context keeps it verbatim. Otherwise the
+/// local, co-located client sent none (e.g. the KDE FFI client, which cannot
+/// build one): fall back to the kernel-attested peer identity so the prompt is
+/// still grounded with the connecting user's real name / login / home. The
+/// fallback fills ONLY those user-identity fields — peer-cred does not attest a
+/// device hostname / OS / timezone, so those stay absent rather than borrowing
+/// the daemon host's. Returns `None` when nothing at all is known.
+fn resolve_local_client_context(
+    reported: Option<api::ClientContext>,
+    peer: Option<&PeerIdentity>,
+) -> Option<api::ClientContext> {
+    // Spec stub — the peer-cred fallback lands in the implementation commit.
+    let _ = peer;
+    reported.filter(|c| !c.is_empty())
+}
+
 /// Per-connection lifecycle: handshake + dispatcher loop.
 async fn handle_connection(
     stream: UnixStream,
@@ -436,8 +454,11 @@ async fn handle_connection(
     );
     let client_label = handshake.host_label;
     // The self-reported client context (#549) rides the handshake alongside the
-    // #248 system-id fields. Best-effort display data, not a trust boundary.
-    let client_context = handshake.client_context;
+    // #248 system-id fields. Best-effort display data, not a trust boundary. When
+    // a local client sent none (e.g. the KDE FFI client), fall back to the kernel
+    // peer identity so the user's name / login / home still ground the prompt
+    // (#558).
+    let client_context = resolve_local_client_context(handshake.client_context, peer.as_ref());
 
     // Authenticate from the (optional) token and the kernel peer-cred. The
     // default validator requires a valid token; a local-trust daemon (#407)
@@ -565,3 +586,83 @@ where
 // here under the historical `read_frame`/`write_frame` names this crate's
 // integration tests import.
 pub use desktop_assistant_frame_codec::{read_frame, write_frame};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer_with(real_name: Option<&str>, home_dir: Option<&str>) -> PeerIdentity {
+        PeerIdentity {
+            uid: 1000,
+            username: "ada".to_string(),
+            real_name: real_name.map(str::to_string),
+            home_dir: home_dir.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn reported_client_context_is_kept_verbatim() {
+        // #558: when the client reported a non-empty context the peer identity is
+        // ignored — the client's self-report wins.
+        let reported = api::ClientContext {
+            real_name: Some("Reported Name".into()),
+            timezone: Some("Europe/London".into()),
+            ..api::ClientContext::default()
+        };
+        let resolved = resolve_local_client_context(
+            Some(reported.clone()),
+            Some(&peer_with(Some("Peer Name"), Some("/home/peer"))),
+        );
+        assert_eq!(resolved, Some(reported));
+    }
+
+    #[test]
+    fn missing_client_context_falls_back_to_peer_identity() {
+        // #558: a local client that sent no context (None) still grounds the
+        // prompt with the peer's name / login / home from kernel peer-cred.
+        let resolved = resolve_local_client_context(
+            None,
+            Some(&peer_with(Some("Ada Lovelace"), Some("/home/ada"))),
+        )
+        .expect("peer fallback should produce a context");
+        assert_eq!(resolved.real_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(resolved.username.as_deref(), Some("ada"));
+        assert_eq!(resolved.home_dir.as_deref(), Some("/home/ada"));
+        // peer-cred does not attest a device hostname / OS / timezone.
+        assert_eq!(resolved.hostname, None);
+        assert_eq!(resolved.os, None);
+        assert_eq!(resolved.timezone, None);
+    }
+
+    #[test]
+    fn empty_reported_context_falls_back_to_peer_identity() {
+        // An all-absent reported context ({}) counts as "sent none", so the peer
+        // fallback still applies.
+        let resolved = resolve_local_client_context(
+            Some(api::ClientContext::default()),
+            Some(&peer_with(None, Some("/home/ada"))),
+        )
+        .expect("empty reported context should fall back to peer");
+        assert_eq!(resolved.username.as_deref(), Some("ada"));
+        assert_eq!(resolved.home_dir.as_deref(), Some("/home/ada"));
+        assert_eq!(resolved.real_name, None);
+    }
+
+    #[test]
+    fn peer_without_name_or_home_still_yields_username() {
+        // The peer identity always carries a username, so even with no GECOS name
+        // / home dir the fallback is a non-empty context (username only).
+        let resolved = resolve_local_client_context(None, Some(&peer_with(None, None)))
+            .expect("username-only peer still yields a context");
+        assert_eq!(resolved.username.as_deref(), Some("ada"));
+        assert_eq!(resolved.real_name, None);
+        assert_eq!(resolved.home_dir, None);
+    }
+
+    #[test]
+    fn no_context_and_no_peer_is_none() {
+        // A remote connection (no peer-cred) that sent no context yields nothing
+        // to attach.
+        assert_eq!(resolve_local_client_context(None, None), None);
+    }
+}
