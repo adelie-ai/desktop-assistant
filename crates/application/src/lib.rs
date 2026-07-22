@@ -678,6 +678,7 @@ where
         conversation_id: &str,
         idempotency_key: Option<&str>,
         request_id: &str,
+        content: &str,
         sink: &Arc<dyn EventSink>,
     ) -> ApiResult<bool> {
         let (Some(key), Some(store)) = (idempotency_key, self.idempotency.as_ref()) else {
@@ -690,7 +691,17 @@ where
         else {
             return Ok(false);
         };
-        replay_completed_response(sink, conversation_id, request_id, response).await;
+        // Echo the retry's key on the opening `UserMessageAdded` (#570) so the
+        // completed-replay path matches the fresh-turn / re-attach paths.
+        replay_completed_response(
+            sink,
+            conversation_id,
+            request_id,
+            content,
+            Some(key.to_string()),
+            response,
+        )
+        .await;
         Ok(true)
     }
 
@@ -720,12 +731,17 @@ where
     }
 
     /// Spawn a registry task that replays a completed turn's stored reply to
-    /// `sink` (#204 phase 1), keyed by the retry's own `request_id`.
+    /// `sink` (#204 phase 1), keyed by the retry's own `request_id`. The replay
+    /// opens with a `UserMessageAdded` echoing the retry's `idempotency_key`
+    /// (#570) so a retrying client Case-0 dedupes its optimistic bubble.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_completed_replay(
         registry: &BackgroundTaskRegistry,
         user_id: UserId,
         conversation_id: &str,
         request_id: &str,
+        content: String,
+        echo_idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
         response: String,
     ) -> api::TaskId {
@@ -736,7 +752,8 @@ where
         let conv = conversation_id.to_string();
         let req = request_id.to_string();
         registry.spawn(user_id, kind, title, move |_ctx| async move {
-            replay_completed_response(&sink, &conv, &req, response).await;
+            replay_completed_response(&sink, &conv, &req, &content, echo_idempotency_key, response)
+                .await;
             Ok(())
         })
     }
@@ -2304,12 +2321,17 @@ where
                 &conversation_id,
                 idempotency_key.as_deref(),
                 &request_id,
+                &content,
                 &sink,
             )
             .await?
         {
             return Ok(());
         }
+        // The raw key echoed back on `UserMessageAdded` (#570) — captured before
+        // the `zip` below MOVES `idempotency_key`, and kept separate from
+        // `idempotency` because the echo must fire even with no store attached.
+        let echo_idempotency_key = idempotency_key.clone();
         // Pair the store with the key (both-or-neither) so the turn body
         // records the reply on completion for a future retry.
         let idempotency = self.idempotency.clone().zip(idempotency_key);
@@ -2333,6 +2355,7 @@ where
                 system_refinement,
                 request_id,
                 idempotency,
+                echo_idempotency_key,
                 sink,
             )
             .await
@@ -2350,6 +2373,7 @@ where
                 system_refinement,
                 request_id,
                 idempotency,
+                echo_idempotency_key,
                 sink,
                 tokio_util::sync::CancellationToken::new(),
                 None,
@@ -2418,6 +2442,8 @@ where
                         user_id,
                         &conversation_id,
                         &request_id,
+                        content.clone(),
+                        Some(key.to_string()),
                         Arc::clone(&sink),
                         response,
                     );
@@ -2455,6 +2481,10 @@ where
         };
 
         let conversations = Arc::clone(&self.conversations);
+        // The raw key echoed back on `UserMessageAdded` (#570) — captured before
+        // the `zip` below MOVES `idempotency_key`, and separate from
+        // `idempotency` because the echo fires even with no store attached.
+        let echo_idempotency_key = idempotency_key.clone();
         // Pair the store with the key (both-or-neither) so the turn body
         // records the reply on completion for a future retry (#204).
         let idempotency = self.idempotency.clone().zip(idempotency_key);
@@ -2539,6 +2569,7 @@ where
                     system_refinement,
                     request_id_for_body,
                     idempotency,
+                    echo_idempotency_key,
                     turn_sink,
                     ctx.token.clone(),
                     client_tool_port,
@@ -2608,6 +2639,7 @@ where
         system_refinement: String,
         request_id: String,
         idempotency: Option<(Arc<dyn IdempotencyKeyStore>, String)>,
+        echo_idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
@@ -2660,6 +2692,7 @@ where
                     system_refinement,
                     request_id_for_body,
                     idempotency,
+                    echo_idempotency_key,
                     sink_for_body,
                     ctx.token.clone(),
                     client_tool_port,
@@ -2923,16 +2956,29 @@ where
 }
 
 /// Re-emit a stored idempotent reply (#204) as the canonical event
-/// sequence a fresh turn produces — one `AssistantDelta` carrying the full
-/// text, then `AssistantCompleted` — keyed by the *current* `request_id` so
-/// the retrying client correlates it with its pending request. Best-effort:
-/// a dropped sink just means the client went away.
+/// sequence a fresh turn produces — an opening `UserMessageAdded` echoing the
+/// retry's `idempotency_key` (mirrors the fresh-turn emit, #570), then one
+/// `AssistantDelta` carrying the full text, then `AssistantCompleted` — all
+/// keyed by the *current* `request_id` so the retrying client correlates it
+/// with its pending request. The leading `UserMessageAdded` lets a retrying
+/// client with an optimistic bubble Case-0 dedupe rather than double-render.
+/// Best-effort: a dropped sink just means the client went away.
 async fn replay_completed_response(
     sink: &Arc<dyn EventSink>,
     conversation_id: &str,
     request_id: &str,
+    content: &str,
+    echo_idempotency_key: Option<String>,
     response: String,
 ) {
+    let _ = sink
+        .emit(api::Event::UserMessageAdded {
+            conversation_id: conversation_id.to_string(),
+            request_id: request_id.to_string(),
+            content: content.to_string(),
+            idempotency_key: echo_idempotency_key,
+        })
+        .await;
     let _ = sink
         .emit(api::Event::AssistantDelta {
             conversation_id: conversation_id.to_string(),
@@ -3018,6 +3064,12 @@ async fn run_send_turn<C>(
     system_refinement: String,
     request_id: String,
     idempotency: Option<(Arc<dyn IdempotencyKeyStore>, String)>,
+    // The client-supplied key echoed back on `UserMessageAdded` (#570), raw and
+    // independent of `idempotency`: the `String` in `idempotency` is present
+    // only when a dedup store is *attached*, whereas the echo must fire on every
+    // keyed send so the initiator can correlate its optimistic bubble even with
+    // no store configured. `None` for keyless sends.
+    echo_idempotency_key: Option<String>,
     sink: Arc<dyn EventSink>,
     cancellation: tokio_util::sync::CancellationToken,
     client_tool_port: Option<Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>>,
@@ -3049,13 +3101,15 @@ where
     // including ones that did NOT initiate this turn (a voice turn, or a second
     // client on the same account) — so they render the user bubble live rather
     // than only after a reload (#1). Emitted before dispatch so it precedes the
-    // assistant's chunks; the initiating client dedupes on `request_id` (it
-    // already rendered the bubble optimistically).
+    // assistant's chunks; the initiating client dedupes on `request_id`, or on
+    // the echoed `idempotency_key` when it supplied one (#570) — it already
+    // rendered the bubble optimistically.
     let _ = sink
         .emit(api::Event::UserMessageAdded {
             conversation_id: conversation_id.clone(),
             request_id: request_id.clone(),
             content: content.clone(),
+            idempotency_key: echo_idempotency_key,
         })
         .await;
 
@@ -4424,6 +4478,90 @@ mod tests {
         assert!(matches!(evs[3], api::Event::AssistantCompleted { .. }));
     }
 
+    /// #570 Phase 1: a keyed `SendMessage` echoes its `idempotency_key` back on
+    /// the opening `UserMessageAdded` so the initiator can correlate its
+    /// optimistic bubble by exact key match. Crucially this handler has NO
+    /// idempotency store attached — the echo must fire regardless, because it is
+    /// a raw round-trip of the client's key, not a function of the dedup store.
+    #[tokio::test]
+    async fn daemon_echoes_idempotency_key_back() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+        // No `.with_idempotency_store(..)` — proves the echo is not gated on it.
+        assert!(h.idempotency.is_none(), "test asserts the store-less path");
+
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let evs = sink.0.lock().await.clone();
+        let echoed = evs.iter().find_map(|e| match e {
+            api::Event::UserMessageAdded {
+                idempotency_key, ..
+            } => Some(idempotency_key.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            echoed,
+            Some(Some("k1".to_string())),
+            "UserMessageAdded must echo the client's idempotency_key: {evs:?}"
+        );
+    }
+
+    /// #570 Phase 1 unhappy path: a keyless send (no `idempotency_key`) still
+    /// opens the turn and echoes a `None` key — no error, backward-compatible
+    /// with the keyless `send_prompt_full` paths.
+    #[tokio::test]
+    async fn daemon_tolerates_absent_idempotency_key() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            None,
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let evs = sink.0.lock().await.clone();
+        let echoed = evs.iter().find_map(|e| match e {
+            api::Event::UserMessageAdded {
+                idempotency_key, ..
+            } => Some(idempotency_key.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            echoed,
+            Some(None),
+            "a keyless send emits UserMessageAdded with a None key: {evs:?}"
+        );
+    }
+
     /// #1 live multi-client sync: a turn fans its events to other connections
     /// viewing the conversation, and excludes the originating connection (which
     /// gets them through its own request stream).
@@ -5428,16 +5566,65 @@ mod tests {
         );
         let evs = sink.0.lock().await.clone();
         assert!(
-            matches!(&evs[0], api::Event::AssistantDelta { request_id, chunk, .. }
-                if request_id == "retry-req" && chunk == "stored answer"),
-            "replay emits the stored reply as a delta keyed by the retry's request id, got {:?}",
+            matches!(&evs[0], api::Event::UserMessageAdded { request_id, idempotency_key, .. }
+                if request_id == "retry-req" && idempotency_key.as_deref() == Some("k1")),
+            "replay opens with a UserMessageAdded echoing the retry's request id and key, got {:?}",
             evs.first()
         );
         assert!(
-            matches!(&evs[1], api::Event::AssistantCompleted { request_id, full_response, .. }
+            matches!(&evs[1], api::Event::AssistantDelta { request_id, chunk, .. }
+                if request_id == "retry-req" && chunk == "stored answer"),
+            "replay emits the stored reply as a delta keyed by the retry's request id, got {:?}",
+            evs.get(1)
+        );
+        assert!(
+            matches!(&evs[2], api::Event::AssistantCompleted { request_id, full_response, .. }
                 if request_id == "retry-req" && full_response == "stored answer"),
             "replay completes with the stored reply, got {:?}",
-            evs.get(1)
+            evs.get(2)
+        );
+    }
+
+    /// The completed-replay retry path echoes the retry's `idempotency_key` on
+    /// its opening `UserMessageAdded`, matching the fresh-turn and in-flight
+    /// re-attach paths so a retrying client with an optimistic bubble Case-0
+    /// dedupes it (#570) rather than rendering a second bubble.
+    #[tokio::test]
+    async fn completed_replay_echoes_idempotency_key() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conv = Arc::new(CountingConversations {
+            runs: Arc::clone(&runs),
+            reply: "fresh".into(),
+        });
+        let store = Arc::new(InMemoryIdempotency::default());
+        store
+            .record_response("c1", "k1", "orig-req", "stored answer")
+            .await
+            .unwrap();
+        let h = idem_handler(conv, Arc::clone(&store));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "retry-req".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let evs = sink.0.lock().await.clone();
+        let first = evs.first().expect("replay emits at least one event");
+        assert!(
+            matches!(first, api::Event::UserMessageAdded { conversation_id, request_id, content, idempotency_key }
+                if conversation_id == "c1"
+                    && request_id == "retry-req"
+                    && content == "hi"
+                    && idempotency_key.as_deref() == Some("k1")),
+            "completed replay must echo the retry's idempotency_key on UserMessageAdded, got {first:?}"
         );
     }
 

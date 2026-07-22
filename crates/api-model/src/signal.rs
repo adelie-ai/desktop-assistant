@@ -26,6 +26,10 @@ pub enum SignalEvent {
         conversation_id: String,
         request_id: String,
         content: String,
+        /// Echoes the initiating `SendMessage.idempotency_key` (when present)
+        /// so the initiator can correlate its optimistic user bubble by exact
+        /// key match (#570). `None` for keyless send paths.
+        idempotency_key: Option<String>,
     },
     Chunk {
         conversation_id: String,
@@ -144,10 +148,12 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             conversation_id,
             request_id,
             content,
+            idempotency_key,
         } => Some(SignalEvent::UserMessageAdded {
             conversation_id,
             request_id,
             content,
+            idempotency_key,
         }),
         api::Event::AssistantDelta {
             conversation_id,

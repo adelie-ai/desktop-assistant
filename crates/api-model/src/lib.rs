@@ -765,6 +765,14 @@ pub enum Event {
         conversation_id: String,
         request_id: String,
         content: String,
+        /// Echoes the initiating `SendMessage.idempotency_key` (when the client
+        /// supplied one) so the initiator can correlate this event with its
+        /// optimistic user bubble by exact key match (#570). `None` for keyless
+        /// send paths. Omitted on the wire when absent, so an older client that
+        /// does not know the field is unaffected. An initiator may dedupe on
+        /// either `idempotency_key` or `request_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
 
     /// Streaming chunk for a content response.
@@ -2319,6 +2327,43 @@ mod tests {
             message: "calling tool".into(),
             data: Some(serde_json::json!({"tool": "search"})),
         }
+    }
+
+    #[test]
+    fn user_message_added_idempotency_key_round_trips_via_serde() {
+        // Present key survives a serialize -> deserialize round trip so a
+        // client can correlate its optimistic bubble by exact key match (#570).
+        let with_key = Event::UserMessageAdded {
+            conversation_id: "c1".into(),
+            request_id: "r1".into(),
+            content: "hi".into(),
+            idempotency_key: Some("k1".into()),
+        };
+        let json = serde_json::to_string(&with_key).unwrap();
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_key, back);
+
+        // Absent key: `skip_serializing_if` omits the field on the wire, and an
+        // older/keyless event with no field deserializes to `None`
+        // (backward-compat with keyless send paths).
+        let without_key = Event::UserMessageAdded {
+            conversation_id: "c1".into(),
+            request_id: "r1".into(),
+            content: "hi".into(),
+            idempotency_key: None,
+        };
+        let json = serde_json::to_string(&without_key).unwrap();
+        assert!(
+            !json.contains("idempotency_key"),
+            "None key is skipped on the wire: {json}"
+        );
+        let legacy =
+            r#"{"user_message_added":{"conversation_id":"c1","request_id":"r1","content":"hi"}}"#;
+        let back: Event = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            without_key, back,
+            "a keyless legacy event deserializes to None"
+        );
     }
 
     #[test]

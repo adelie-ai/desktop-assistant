@@ -46,6 +46,12 @@ pub struct ChatMessage {
     pub content: String,
     /// Presentation metadata (voice#126); `Normal` for daemon-sourced messages.
     pub kind: MessageKind,
+    /// The client-minted idempotency key stamped on a locally-drawn optimistic
+    /// user bubble (#570), so the echoed-back `UserMessageAdded` carrying the
+    /// same key can be deduped by exact match rather than a content compare.
+    /// `None` for every daemon-sourced message (they carry a real `id`) and for
+    /// keyless send paths.
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +85,9 @@ impl From<api::MessageView> for ChatMessage {
             // Daemon-sourced messages are always ordinary; clients tag the lines
             // they generate locally (voice#126).
             kind: MessageKind::Normal,
+            // A daemon-sourced message carries a real `id`; the idempotency key
+            // is a client-local stamp on optimistic bubbles only (#570).
+            idempotency_key: None,
         }
     }
 }
@@ -115,5 +124,9 @@ mod tests {
         });
         assert_eq!(m.kind, MessageKind::Normal);
         assert_eq!(m.content, "hi");
+        assert!(
+            m.idempotency_key.is_none(),
+            "a daemon-sourced message never carries a client idempotency stamp"
+        );
     }
 }
