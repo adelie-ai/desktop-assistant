@@ -113,6 +113,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn share_client_context_defaults_true() {
+        assert!(ConnectionConfig::default().share_client_context);
+    }
+
+    #[test]
+    fn config_toml_without_share_client_context_key_parses_true() {
+        // Back-compat: a config that predates the field (here, an empty
+        // document) still deserializes with sharing ON.
+        let cfg: ConnectionConfig = toml::from_str("").expect("empty config parses");
+        assert!(cfg.share_client_context);
+    }
+
+    #[test]
+    fn config_toml_can_disable_sharing() {
+        let cfg: ConnectionConfig =
+            toml::from_str("share_client_context = false").expect("config parses");
+        assert!(!cfg.share_client_context);
+    }
+
+    #[test]
     fn default_config_uses_ws_and_no_socket_path() {
         let config = ConnectionConfig::default();
         assert_eq!(config.transport_mode, TransportMode::Ws);

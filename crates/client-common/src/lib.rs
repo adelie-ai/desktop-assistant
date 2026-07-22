@@ -3,6 +3,7 @@
 pub mod auth;
 #[cfg(feature = "clap")]
 pub mod cli;
+pub mod client_context;
 pub mod commands;
 pub mod config;
 pub mod connector;
@@ -20,6 +21,7 @@ pub mod ws_client;
 
 #[cfg(feature = "clap")]
 pub use cli::TransportArgs;
+pub use client_context::resolve_client_context;
 pub use commands::AssistantCommands;
 pub use config::{ConnectionConfig, TransportMode, default_desktop_socket_path};
 pub use connector::Connector;

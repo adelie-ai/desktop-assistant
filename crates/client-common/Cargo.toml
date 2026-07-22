@@ -64,6 +64,9 @@ desktop-assistant-auth-jwt.workspace = true
 # generate the local CA these tests stand in for.
 rcgen = "0.14"
 tempfile = "3"
+# Parse a client config TOML in tests to assert the `share_client_context`
+# serde default (#549). `toml` is already an optional runtime dep (mcp-host).
+toml = "1"
 tokio = { workspace = true, features = [
     "macros",
     "rt-multi-thread",

@@ -755,4 +755,33 @@ mod tests {
         });
         assert!(event.is_none());
     }
+
+    #[test]
+    fn client_context_header_absent_when_no_context() {
+        use tokio_tungstenite::tungstenite::http::HeaderMap;
+        let mut headers = HeaderMap::new();
+        insert_client_context_header(&mut headers, None);
+        assert!(!headers.contains_key(api::WS_CLIENT_CONTEXT_HEADER));
+    }
+
+    #[test]
+    fn client_context_header_is_present_and_decodable() {
+        // The send path encodes the context into the #549 upgrade header, and
+        // the daemon's decoder must round-trip it back to the same value.
+        use desktop_assistant_api_model::ClientContext;
+        use tokio_tungstenite::tungstenite::http::HeaderMap;
+        let ctx = ClientContext {
+            username: Some("ada".into()),
+            timezone: Some("Europe/London".into()),
+            ..ClientContext::default()
+        };
+        let mut headers = HeaderMap::new();
+        insert_client_context_header(&mut headers, Some(&ctx));
+        let raw = headers
+            .get(api::WS_CLIENT_CONTEXT_HEADER)
+            .expect("client-context header present")
+            .to_str()
+            .expect("base64 header is ASCII");
+        assert_eq!(api::decode_client_context(raw), Some(ctx));
+    }
 }
