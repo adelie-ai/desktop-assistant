@@ -62,24 +62,9 @@ struct PasswdInfo {
 /// separated field, trimmed, or `None` when that field is blank. GECOS is a
 /// comma-separated list (full name, office, phones); the first field is the
 /// display name. Pure so it is unit-tested without touching the passwd db.
-fn real_name_from_gecos(_gecos: &str) -> Option<String> {
-    // Spec stub — see the implementation commit.
-    None
-}
-
-/// Look up the passwd entry for `uid` via `getpwuid_r`, extracting the login
-/// name plus the best-effort GECOS real name and home directory.
-///
-/// Returns `Ok(None)` when the UID has no matching entry rather than an error so
-/// callers can distinguish "system call failed" from "no such user".
-fn passwd_for_uid(uid: u32) -> anyhow::Result<Option<PasswdInfo>> {
-    // Spec stub — real GECOS / home extraction lands in the implementation
-    // commit. For now only the username is resolved.
-    Ok(username_for_uid(uid)?.map(|username| PasswdInfo {
-        username,
-        real_name: real_name_from_gecos(""),
-        home_dir: None,
-    }))
+fn real_name_from_gecos(gecos: &str) -> Option<String> {
+    let name = gecos.split(',').next().unwrap_or_default().trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Look up the username for `uid` via `getpwuid_r`.
@@ -87,6 +72,19 @@ fn passwd_for_uid(uid: u32) -> anyhow::Result<Option<PasswdInfo>> {
 /// Returns `Ok(None)` when the UID has no matching entry rather than an
 /// error so callers can distinguish "system call failed" from "no such user".
 pub fn username_for_uid(uid: u32) -> anyhow::Result<Option<String>> {
+    Ok(passwd_for_uid(uid)?.map(|info| info.username))
+}
+
+/// Look up the passwd entry for `uid` via `getpwuid_r`, extracting the login
+/// name plus the best-effort GECOS real name and home directory.
+///
+/// Returns `Ok(None)` when the UID has no matching entry rather than an error so
+/// callers can distinguish "system call failed" from "no such user". The login
+/// name (`pw_name`) is the identity and must be valid UTF-8, so a non-UTF-8
+/// value is a hard error; the GECOS name (`pw_gecos`) and home dir (`pw_dir`)
+/// are best-effort display hints (#558), so a null / blank / non-UTF-8 value
+/// simply yields `None` for that field rather than failing the lookup.
+fn passwd_for_uid(uid: u32) -> anyhow::Result<Option<PasswdInfo>> {
     // Start with a comfortable buffer and grow on ERANGE.
     let mut buf_size = sysconf_or(libc::_SC_GETPW_R_SIZE_MAX, 1024).max(1024);
     let mut buf: Vec<libc::c_char> = vec![0; buf_size];
@@ -110,14 +108,23 @@ pub fn username_for_uid(uid: u32) -> anyhow::Result<Option<String>> {
             if result.is_null() {
                 return Ok(None);
             }
-            // SAFETY: `pwd.pw_name` is a NUL-terminated C string owned by
-            // `buf` (filled by `getpwuid_r`); we copy it into an owned
-            // `String` before `buf` is dropped.
-            let name = unsafe { CStr::from_ptr(pwd.pw_name) }
+            // SAFETY: on success with a non-null `result`, `getpwuid_r` has
+            // filled `pwd`; `pw_name` is a NUL-terminated C string owned by
+            // `buf`. We copy it into an owned `String` before `buf` is dropped.
+            let username = unsafe { CStr::from_ptr(pwd.pw_name) }
                 .to_str()
                 .context("passwd entry username is not valid UTF-8")?
                 .to_string();
-            return Ok(Some(name));
+            // `pw_gecos` / `pw_dir` are best-effort: they may be null on some
+            // entries and need not be valid UTF-8. SAFETY: when non-null each is
+            // a NUL-terminated C string owned by `buf`, copied out before drop.
+            let real_name = cstr_field(pwd.pw_gecos).and_then(|g| real_name_from_gecos(&g));
+            let home_dir = cstr_field(pwd.pw_dir).filter(|d| !d.is_empty());
+            return Ok(Some(PasswdInfo {
+                username,
+                real_name,
+                home_dir,
+            }));
         }
         if rc == libc::ERANGE {
             buf_size = buf_size.saturating_mul(2);
@@ -132,6 +139,24 @@ pub fn username_for_uid(uid: u32) -> anyhow::Result<Option<String>> {
         return Err(std::io::Error::from_raw_os_error(rc))
             .with_context(|| format!("getpwuid_r({uid}) failed"));
     }
+}
+
+/// Copy a best-effort, NUL-terminated C string passwd field into a trimmed
+/// owned `String`, or `None` when the pointer is null or the value is not valid
+/// UTF-8. Used for the display-only `pw_gecos` / `pw_dir` fields, whose absence
+/// must degrade to `None` rather than fail the lookup.
+///
+/// The caller must only pass a `passwd` field pointer that is either null or a
+/// NUL-terminated C string owned by a buffer live for the duration of the call.
+fn cstr_field(ptr: *const libc::c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is non-null and, per the caller's contract, a
+    // NUL-terminated C string owned by a buffer live across this read; we copy
+    // the bytes into an owned `String` before returning.
+    let value = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?.trim();
+    Some(value.to_string())
 }
 
 /// The UID of the current process.

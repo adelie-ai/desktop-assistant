@@ -391,9 +391,19 @@ fn resolve_local_client_context(
     reported: Option<api::ClientContext>,
     peer: Option<&PeerIdentity>,
 ) -> Option<api::ClientContext> {
-    // Spec stub — the peer-cred fallback lands in the implementation commit.
-    let _ = peer;
-    reported.filter(|c| !c.is_empty())
+    // A non-empty self-report always wins.
+    if let Some(ctx) = reported.filter(|c| !c.is_empty()) {
+        return Some(ctx);
+    }
+    // No usable self-report: ground the prompt from the kernel peer identity.
+    let peer = peer?;
+    let ctx = api::ClientContext {
+        real_name: peer.real_name.clone(),
+        username: Some(peer.username.clone()),
+        home_dir: peer.home_dir.clone(),
+        ..api::ClientContext::default()
+    };
+    (!ctx.is_empty()).then_some(ctx)
 }
 
 /// Per-connection lifecycle: handshake + dispatcher loop.
