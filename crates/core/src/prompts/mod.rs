@@ -421,18 +421,44 @@ mod tests {
     }
 
     #[test]
-    fn assembled_prompt_parent_resolves_finished_subagent_entries() {
-        // Settled model: on subagent finish the parent decides each marked
-        // entry's fate — leave it on the pad (available going forward like any
-        // note), roll it up into a larger story, or delete it as spent.
+    fn assembled_prompt_cleanup_of_lower_levels_is_automatic() {
+        // Cleanup is mechanism, not discipline: completing a step unwinds its
+        // descendants' todos/entries automatically (stack-frame semantics), so
+        // the parent carries up what matters rather than hand-deleting.
         let assembled = assemble(&static_sections());
         assert!(
-            assembled.contains("stays available going forward"),
-            "an entry the parent leaves on the pad is just available going forward"
+            assembled.contains("Carry up what matters"),
+            "the parent must carry salient findings up into the outcome / KB"
         );
         assert!(
-            assembled.contains("delete it as spent"),
-            "and the parent deletes a spent entry"
+            assembled.contains("unwinds them automatically"),
+            "and lower-level notes are cleaned up automatically on completion, not by hand"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_privileges_scratchpad_maintenance() {
+        // Todo/scratchpad tools + their ongoing upkeep must sit at a privileged
+        // position, and the pad kept to only what's currently relevant.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("first-class part of the task"),
+            "scratchpad upkeep must be framed as first-class, not optional"
+        );
+        assert!(
+            assembled.contains("only what's relevant to the task right now"),
+            "and the pad kept to only what's currently relevant, pruned as you go"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_directs_subagent_scratchpad_upkeep() {
+        // A subagent must record salient findings on the shared pad tied to its
+        // todo, and know its lower-level notes are cleaned up for it.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("If you are yourself a subagent"),
+            "the prompt must give subagent-facing scratchpad guidance"
         );
     }
 
