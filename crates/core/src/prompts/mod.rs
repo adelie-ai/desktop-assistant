@@ -382,6 +382,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assembled_prompt_curates_subagent_results_into_memory() {
+        // End-state of the roll-up: the surviving top-level outcomes are the
+        // curated, usable result for the session — kept on the pad while
+        // salient, and promoted to the durable KB when worth keeping beyond the
+        // conversation (the user's stated terminal behavior).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("curated"),
+            "the prompt must frame rolled-up subagent outcomes as curated, usable session memory"
+        );
+        assert!(
+            assembled.contains("builtin_knowledge_base_write"),
+            "and direct promoting lasting subagent findings to the knowledge base"
+        );
+    }
+
     // --- Personality (#226) ------------------------------------------------
 
     /// The fixed adaptation clause is appended to every personality blurb,
