@@ -110,6 +110,18 @@ pub enum Command {
     /// "respond briefly, by voice" to a single turn dictated into an existing
     /// chat without polluting the visible transcript or permanently changing
     /// that conversation's behaviour.
+    ///
+    /// `client_context` (optional; omitted on the wire when absent) is a
+    /// per-turn [`ClientContext`] for THIS send only. When present and
+    /// non-empty it **replaces** the connection's handshake-supplied client
+    /// context for this turn's system-prompt grounding (issue #557); absent or
+    /// empty leaves the per-connection context in effect. Its purpose is the
+    /// browser-multiplexed web BFF (epic #549), which shares ONE daemon
+    /// connection across many browsers and therefore cannot carry each user's
+    /// context on the per-connection handshake — it supplies the real user's
+    /// context per send instead. Like `system_refinement` it is request-scoped:
+    /// never stored, never attached to the conversation, never in chat history.
+    /// Untrusted, self-reported display data, not a trust boundary.
     SendMessage {
         conversation_id: String,
         content: String,
@@ -117,6 +129,11 @@ pub enum Command {
         override_selection: Option<SendPromptOverride>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         system_refinement: String,
+        /// Optional per-turn client context (#557) that replaces the connection
+        /// context for this send when present and non-empty; see the variant
+        /// doc. Absent = fall back to the per-connection context.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_context: Option<ClientContext>,
         /// Optional client-supplied idempotency key, scoped to the conversation.
         /// A retry carrying the same key is de-duplicated by the daemon — the
         /// still-running request is re-attached, or a completed reply replayed —
@@ -2068,6 +2085,7 @@ mod tests {
                 effort: Some(EffortLevel::High),
             }),
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd2).unwrap();
@@ -2096,6 +2114,7 @@ mod tests {
             content: "hi".into(),
             override_selection: None,
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         };
         let json_empty = serde_json::to_string(&empty).unwrap();
@@ -2110,6 +2129,7 @@ mod tests {
             content: "hi".into(),
             override_selection: None,
             system_refinement: "Respond briefly, by voice.".into(),
+            client_context: None,
             idempotency_key: None,
         };
         let json = serde_json::to_string(&with_refinement).unwrap();
@@ -2138,6 +2158,7 @@ mod tests {
             content: "hi".into(),
             override_selection: None,
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         };
         let json = serde_json::to_string(&without).unwrap();
@@ -2152,12 +2173,63 @@ mod tests {
             content: "hi".into(),
             override_selection: None,
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: Some("turn-uuid-1".into()),
         };
         let json = serde_json::to_string(&with_key).unwrap();
         assert!(json.contains("\"idempotency_key\":\"turn-uuid-1\""));
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(with_key, back);
+    }
+
+    #[test]
+    fn send_message_client_context_is_optional_and_round_trips() {
+        // Absent on the wire → None (byte-compatible with pre-#557 SendMessage).
+        let cmd: Command =
+            serde_json::from_str(r#"{"send_message":{"conversation_id":"c1","content":"hi"}}"#)
+                .unwrap();
+        match &cmd {
+            Command::SendMessage { client_context, .. } => assert!(client_context.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // None is omitted from the serialized form (no wire bloat for callers
+        // that ride the per-connection handshake context instead).
+        let without = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            client_context: None,
+            idempotency_key: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(
+            !json.contains("client_context"),
+            "an absent per-turn context must not appear on the wire: {json}"
+        );
+
+        // A present per-turn context serializes and round-trips.
+        let with_ctx = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            client_context: Some(ClientContext {
+                real_name: Some("Ada Lovelace".into()),
+                timezone: Some("Europe/London".into()),
+                ..ClientContext::default()
+            }),
+            idempotency_key: None,
+        };
+        let json = serde_json::to_string(&with_ctx).unwrap();
+        assert!(
+            json.contains("\"client_context\":"),
+            "a present per-turn context must appear on the wire: {json}"
+        );
+        assert!(json.contains("\"real_name\":\"Ada Lovelace\""));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_ctx, back);
     }
 
     #[test]

@@ -1051,6 +1051,7 @@ async fn ws_send_message_ack_then_streaming_events() {
             conversation_id: "c1".into(),
             content: "hello".into(),
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         },
     };
@@ -1207,6 +1208,7 @@ async fn ws_send_message_cancels_when_client_disconnects() {
             conversation_id: "c1".into(),
             content: "cancel-me".into(),
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         },
     };

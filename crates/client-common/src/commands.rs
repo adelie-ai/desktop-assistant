@@ -240,6 +240,10 @@ pub trait AssistantCommands: Send + Sync {
                 content: prompt.to_string(),
                 override_selection,
                 system_refinement,
+                // These shared clients carry their client context on the
+                // per-connection handshake, not per turn (#557 is for the
+                // browser-multiplexed web BFF); so no per-turn override here.
+                client_context: None,
                 idempotency_key,
             })
             .await?;

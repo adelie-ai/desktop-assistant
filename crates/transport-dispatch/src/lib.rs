@@ -316,6 +316,9 @@ pub async fn dispatch_loop<R, W>(
                 content,
                 override_selection,
                 system_refinement,
+                // Per-turn client context (#557): not yet honored — the spec
+                // tests below pin the desired override behavior first.
+                client_context: _,
                 idempotency_key,
             } => {
                 // Per-request id for event correlation (matches old WS path).

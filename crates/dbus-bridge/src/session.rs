@@ -484,6 +484,7 @@ mod tests {
             content: "hi".to_string(),
             override_selection: None,
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         }
     }
