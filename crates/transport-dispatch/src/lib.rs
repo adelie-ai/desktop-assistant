@@ -53,6 +53,26 @@ fn mint_session_id() -> String {
     format!("sess-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Resolve the [`ClientContext`] that grounds a single turn's system prompt.
+///
+/// A per-turn context supplied on `SendMessage` (#557) **replaces** the
+/// connection's handshake context (#549) for that turn when it is present and
+/// non-empty: the browser-multiplexed web BFF shares one daemon connection
+/// across many browsers, so it cannot carry each user's context on the
+/// per-connection handshake and supplies the real user's context per send. An
+/// absent or empty (`ClientContext::is_empty`) per-turn context leaves the
+/// connection context in effect — fail-closed to the per-connection value, so a
+/// blank override never wipes the grounding.
+fn effective_client_context(
+    per_turn: Option<ClientContext>,
+    connection: Option<ClientContext>,
+) -> Option<ClientContext> {
+    match per_turn {
+        Some(ctx) if !ctx.is_empty() => Some(ctx),
+        _ => connection,
+    }
+}
+
 /// Pre-validated identity for the connection.
 ///
 /// Carries the JWT `sub` (`user_id`), the connection's [`TransportKind`],
@@ -316,8 +336,24 @@ pub async fn dispatch_loop<R, W>(
                 content,
                 override_selection,
                 system_refinement,
+                client_context: per_turn_client_context,
                 idempotency_key,
             } => {
+                // Per-turn client context (#557, epic #549): a per-turn context
+                // supplied on the command REPLACES the connection's handshake
+                // context (#549) for this turn when present and non-empty; else
+                // the connection context stays in effect. The browser-multiplexed
+                // web BFF shares one daemon connection across many browsers, so it
+                // cannot carry each user's context on the per-connection handshake
+                // — it supplies the real user's context per send instead.
+                //
+                // We install the resolved value as the `CLIENT_CONTEXT`
+                // task-local right here — before the handler's
+                // `RequestScope::capture` — so it rides the streaming
+                // `tokio::spawn` to prompt assembly exactly like the connection
+                // value, closing the #261 spawn-drop class for the override too.
+                let client_context =
+                    effective_client_context(per_turn_client_context, client_context.clone());
                 // Per-request id for event correlation (matches old WS path).
                 let request_id = uuid::Uuid::new_v4().to_string();
                 // Reliable delivery to THIS connection. The handler additionally
@@ -812,5 +848,58 @@ mod tests {
         let a =
             AuthContext::new("dave", TransportKind::Uds).with_client_label(Some("   ".to_string()));
         assert_eq!(a.client_label, None);
+    }
+
+    fn ctx(real_name: &str) -> ClientContext {
+        ClientContext {
+            real_name: Some(real_name.to_string()),
+            ..ClientContext::default()
+        }
+    }
+
+    #[test]
+    fn effective_client_context_per_turn_overrides_connection() {
+        // #557: a present, non-empty per-turn context replaces the connection's.
+        let per_turn = ctx("BFF User");
+        let connection = ctx("Connection User");
+        assert_eq!(
+            effective_client_context(Some(per_turn.clone()), Some(connection)),
+            Some(per_turn)
+        );
+    }
+
+    #[test]
+    fn effective_client_context_per_turn_used_when_connection_absent() {
+        // The web BFF case: no connection context, per-turn context supplied.
+        let per_turn = ctx("BFF User");
+        assert_eq!(
+            effective_client_context(Some(per_turn.clone()), None),
+            Some(per_turn)
+        );
+    }
+
+    #[test]
+    fn effective_client_context_absent_per_turn_keeps_connection() {
+        let connection = ctx("Connection User");
+        assert_eq!(
+            effective_client_context(None, Some(connection.clone())),
+            Some(connection)
+        );
+    }
+
+    #[test]
+    fn effective_client_context_empty_per_turn_keeps_connection() {
+        // Fail-closed: an all-absent per-turn context must not wipe the
+        // connection grounding — it is treated the same as absent.
+        let connection = ctx("Connection User");
+        assert_eq!(
+            effective_client_context(Some(ClientContext::default()), Some(connection.clone())),
+            Some(connection)
+        );
+    }
+
+    #[test]
+    fn effective_client_context_both_absent_is_none() {
+        assert_eq!(effective_client_context(None, None), None);
     }
 }
