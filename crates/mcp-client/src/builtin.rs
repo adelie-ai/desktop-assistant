@@ -2442,6 +2442,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sys_props_prefers_client_context_over_daemon_env() {
+        // #558: the daemon may be remote/containerized, so its host env is NOT
+        // the user's. When the connecting client reported a context, the
+        // identity fields must be the CLIENT's, and the source is labeled
+        // `client`.
+        use desktop_assistant_core::ports::transport::{ClientContext, with_client_context};
+
+        let service = BuiltinToolService::new();
+        let ctx = ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada-client".into()),
+            home_dir: Some("/home/ada-client".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("TestOS 9000".into()),
+        };
+        let response = with_client_context(Some(ctx), async {
+            service
+                .execute_tool("builtin_sys_props", serde_json::json!({}))
+                .await
+        })
+        .await
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let props = json
+            .get("props")
+            .and_then(serde_json::Value::as_object)
+            .expect("props object");
+
+        let s = |k: &str| props.get(k).and_then(serde_json::Value::as_str);
+        assert_eq!(s("identity_source"), Some("client"));
+        assert_eq!(s("real_name"), Some("Ada Lovelace"));
+        assert_eq!(s("username"), Some("ada-client"));
+        assert_eq!(s("home_dir"), Some("/home/ada-client"));
+        assert_eq!(s("hostname"), Some("analytical-engine"));
+        assert_eq!(s("timezone"), Some("Europe/London"));
+        assert_eq!(s("os"), Some("TestOS 9000"));
+
+        // The daemon host is still reported, but under a clearly-labeled block —
+        // never AS the client's identity. Its username is the real daemon env
+        // user (or absent), which is never our synthetic client username.
+        let daemon = props
+            .get("daemon_host")
+            .and_then(serde_json::Value::as_object)
+            .expect("daemon_host object");
+        assert!(daemon.contains_key("cwd"), "daemon working dir is labeled");
+        assert_ne!(
+            daemon.get("username").and_then(serde_json::Value::as_str),
+            Some("ada-client"),
+            "daemon-host username must never be the client's value"
+        );
+    }
+
+    #[tokio::test]
+    async fn sys_props_partial_client_context_does_not_borrow_daemon_identity() {
+        // #558: a client that reports only its timezone must not have the OTHER
+        // identity fields silently filled from the daemon host — that would
+        // present daemon-host values AS the client's. Absent client fields stay
+        // null under the `client` source.
+        use desktop_assistant_core::ports::transport::{ClientContext, with_client_context};
+
+        let service = BuiltinToolService::new();
+        let ctx = ClientContext {
+            timezone: Some("America/New_York".into()),
+            ..ClientContext::default()
+        };
+        let response = with_client_context(Some(ctx), async {
+            service
+                .execute_tool("builtin_sys_props", serde_json::json!({}))
+                .await
+        })
+        .await
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let props = json
+            .get("props")
+            .and_then(serde_json::Value::as_object)
+            .expect("props object");
+
+        assert_eq!(
+            props
+                .get("identity_source")
+                .and_then(serde_json::Value::as_str),
+            Some("client")
+        );
+        assert_eq!(
+            props.get("timezone").and_then(serde_json::Value::as_str),
+            Some("America/New_York")
+        );
+        assert!(
+            props
+                .get("username")
+                .expect("username key present")
+                .is_null(),
+            "absent client username must stay null, not borrow the daemon's"
+        );
+        assert!(
+            props
+                .get("home_dir")
+                .expect("home_dir key present")
+                .is_null(),
+            "absent client home_dir must stay null, not borrow the daemon's"
+        );
+        assert!(
+            props
+                .get("hostname")
+                .expect("hostname key present")
+                .is_null(),
+            "absent client hostname must stay null, not borrow the daemon's"
+        );
+    }
+
+    #[tokio::test]
+    async fn sys_props_without_client_context_labels_daemon_host_fallback() {
+        // #558: with no client context installed (the common unset case) the
+        // identity fields fall back to the daemon host, explicitly labeled so a
+        // reader never mistakes them for the connecting client's values.
+        let service = BuiltinToolService::new();
+        let response = service
+            .execute_tool("builtin_sys_props", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let props = json
+            .get("props")
+            .and_then(serde_json::Value::as_object)
+            .expect("props object");
+
+        assert_eq!(
+            props
+                .get("identity_source")
+                .and_then(serde_json::Value::as_str),
+            Some("daemon_host_fallback")
+        );
+        // `real_name` has no daemon-host equivalent, so it stays null in fallback.
+        assert!(
+            props
+                .get("real_name")
+                .expect("real_name key present")
+                .is_null(),
+            "daemon host has no real_name to report"
+        );
+        // The daemon host block is present with the daemon's own os.
+        let daemon = props
+            .get("daemon_host")
+            .and_then(serde_json::Value::as_object)
+            .expect("daemon_host object");
+        assert!(
+            daemon
+                .get("os")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+    }
+
+    #[tokio::test]
     async fn kb_write_without_store_returns_error() {
         let service = BuiltinToolService::new();
         let result = service
