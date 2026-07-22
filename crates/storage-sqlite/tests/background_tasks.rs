@@ -26,6 +26,8 @@ fn row(id: &str, user: &str, status: BackgroundTaskStatus, started_at: i64) -> B
         progress_hint: None,
         started_at,
         ended_at: None,
+        owner_todo: String::new(),
+        spawn_marker: None,
     }
 }
 
@@ -175,4 +177,61 @@ async fn scan_non_terminal_crosses_users_and_excludes_terminal() {
         .collect();
     ids.sort();
     assert_eq!(ids, vec!["p".to_string(), "r".to_string()]);
+}
+
+#[tokio::test]
+async fn owner_todo_and_marker_round_trip_sqlite() {
+    let s = store().await;
+    with_user_id(UserId::new("alice"), async {
+        let mut r = row("t1", "alice", BackgroundTaskStatus::Running, 100);
+        r.owner_todo = "1.1".into();
+        r.spawn_marker = Some("marker-abc".into());
+        s.create_task(r).await.expect("create");
+        let got = s.get_task("t1").await.unwrap().expect("present");
+        assert_eq!(got.owner_todo, "1.1");
+        assert_eq!(got.spawn_marker.as_deref(), Some("marker-abc"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn legacy_row_defaults_to_empty_owner_todo_and_none_marker_sqlite() {
+    // The `row` helper omits the new fields (pre-#287 caller shape); they
+    // round-trip as '' / None.
+    let s = store().await;
+    with_user_id(UserId::new("alice"), async {
+        s.create_task(row("t1", "alice", BackgroundTaskStatus::Running, 100))
+            .await
+            .expect("create");
+        let got = s.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(got.owner_todo, "");
+        assert_eq!(got.spawn_marker, None);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn update_task_leaves_owner_todo_and_marker_unchanged_sqlite() {
+    let s = store().await;
+    with_user_id(UserId::new("alice"), async {
+        let mut r = row("t1", "alice", BackgroundTaskStatus::Running, 100);
+        r.owner_todo = "1.1".into();
+        r.spawn_marker = Some("marker-abc".into());
+        s.create_task(r).await.expect("create");
+        s.update_task("t1", BackgroundTaskStatus::Completed, None, None, Some(200))
+            .await
+            .expect("update");
+        let got = s.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(
+            got.owner_todo, "1.1",
+            "update_task must not touch owner_todo"
+        );
+        assert_eq!(
+            got.spawn_marker.as_deref(),
+            Some("marker-abc"),
+            "update_task must not touch spawn_marker"
+        );
+        assert_eq!(got.status, BackgroundTaskStatus::Completed);
+    })
+    .await;
 }

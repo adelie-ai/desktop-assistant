@@ -764,6 +764,8 @@ async fn concurrent_spawn_and_restart_does_not_corrupt_state() {
             progress_hint: None,
             started_at: 1_700_000_000,
             ended_at: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         })
         .await
         .unwrap();
@@ -1007,6 +1009,8 @@ fn running_row(id: &str, user: &str, kind: &api::TaskKind) -> BackgroundTaskRow 
         progress_hint: None,
         started_at: 1_700_000_000,
         ended_at: None,
+        owner_todo: String::new(),
+        spawn_marker: None,
     }
 }
 

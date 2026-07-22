@@ -42,6 +42,8 @@ fn row_from_db(
     progress_hint: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
+    owner_todo: String,
+    spawn_marker: Option<String>,
 ) -> Result<BackgroundTaskRow, CoreError> {
     let status = BackgroundTaskStatus::from_key(&status_key).ok_or_else(|| {
         CoreError::Storage(format!(
@@ -59,6 +61,8 @@ fn row_from_db(
         progress_hint,
         started_at,
         ended_at,
+        owner_todo,
+        spawn_marker,
     })
 }
 
@@ -71,8 +75,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
         let result = sqlx::query(
             "INSERT INTO background_tasks (\
                 id, user_id, kind_json, task_status, parent_task_id, title, \
-                last_error, progress_hint, started_at, ended_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                last_error, progress_hint, started_at, ended_at, owner_todo, spawn_marker) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -84,6 +88,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
         .bind(row.progress_hint.as_deref())
         .bind(row.started_at)
         .bind(row.ended_at)
+        .bind(&row.owner_todo)
+        .bind(row.spawn_marker.as_deref())
         .execute(&self.pool)
         .await;
         match result {
@@ -110,9 +116,12 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
             Option<String>,
             i64,
             Option<i64>,
+            String,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                    title, last_error, progress_hint, started_at, ended_at \
+                    title, last_error, progress_hint, started_at, ended_at, \
+                    owner_todo, spawn_marker \
              FROM background_tasks \
              WHERE user_id = $1 AND id = $2",
         )
@@ -134,6 +143,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
                 progress_hint,
                 started_at,
                 ended_at,
+                owner_todo,
+                spawn_marker,
             )) => Ok(Some(row_from_db(
                 id,
                 user_id,
@@ -145,6 +156,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
                 progress_hint,
                 started_at,
                 ended_at,
+                owner_todo,
+                spawn_marker,
             )?)),
         }
     }
@@ -203,10 +216,13 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
             Option<String>,
             i64,
             Option<i64>,
+            String,
+            Option<String>,
         )> = if include_finished {
             sqlx::query_as(
                 "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                        title, last_error, progress_hint, started_at, ended_at \
+                        title, last_error, progress_hint, started_at, ended_at, \
+                        owner_todo, spawn_marker \
                  FROM background_tasks \
                  WHERE user_id = $1 \
                  ORDER BY started_at DESC \
@@ -220,7 +236,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
         } else {
             sqlx::query_as(
                 "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                        title, last_error, progress_hint, started_at, ended_at \
+                        title, last_error, progress_hint, started_at, ended_at, \
+                        owner_todo, spawn_marker \
                  FROM background_tasks \
                  WHERE user_id = $1 AND task_status IN ('pending', 'running') \
                  ORDER BY started_at DESC \
@@ -244,6 +261,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
             progress_hint,
             started_at,
             ended_at,
+            owner_todo,
+            spawn_marker,
         ) in rows
         {
             out.push(row_from_db(
@@ -257,6 +276,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
                 progress_hint,
                 started_at,
                 ended_at,
+                owner_todo,
+                spawn_marker,
             )?);
         }
         Ok(out)
@@ -275,9 +296,12 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
             Option<String>,
             i64,
             Option<i64>,
+            String,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                    title, last_error, progress_hint, started_at, ended_at \
+                    title, last_error, progress_hint, started_at, ended_at, \
+                    owner_todo, spawn_marker \
              FROM background_tasks \
              WHERE task_status NOT IN ('completed', 'failed', 'cancelled')",
         )
@@ -296,6 +320,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
             progress_hint,
             started_at,
             ended_at,
+            owner_todo,
+            spawn_marker,
         ) in rows
         {
             out.push(row_from_db(
@@ -309,6 +335,8 @@ impl BackgroundTaskStore for PgBackgroundTaskStore {
                 progress_hint,
                 started_at,
                 ended_at,
+                owner_todo,
+                spawn_marker,
             )?);
         }
         Ok(out)

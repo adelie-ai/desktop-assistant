@@ -616,6 +616,8 @@ mod tests {
             children: Vec::new(),
             title: "Researcher: pricing data".into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         };
         let signal = map_event_to_signal(api::Event::TaskStarted { task });
         match signal {

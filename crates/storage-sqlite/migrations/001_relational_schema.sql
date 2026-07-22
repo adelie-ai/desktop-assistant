@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS background_tasks (
     progress_hint   TEXT,
     started_at      INTEGER NOT NULL,   -- unix epoch millis (Postgres BIGINT)
     ended_at        INTEGER,
+    owner_todo      TEXT NOT NULL DEFAULT '',   -- #287 subagent namespace (root '')
+    spawn_marker    TEXT,                        -- #287 spawn snapshot marker (UUIDv7)
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
 );

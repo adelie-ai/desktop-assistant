@@ -1575,6 +1575,14 @@ pub struct TaskView {
     /// Short progress string the task can update via `Event::TaskProgress`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_hint: Option<String>,
+    /// The subagent-tree namespace this task owns (a materialized path like
+    /// `"1.1"`); empty for the top-level session and non-subagent tasks (#287).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner_todo: String,
+    /// The task's spawn snapshot marker (a canonical UUIDv7 string) for a
+    /// subagent; `None` otherwise (#287).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_marker: Option<String>,
 }
 
 /// Severity for a single log line.
@@ -2119,7 +2127,40 @@ mod tests {
             children: vec![TaskId("child-a".into()), TaskId("child-b".into())],
             title: "Researching subagent".into(),
             progress_hint: Some("step 2/4".into()),
+            owner_todo: String::new(),
+            spawn_marker: None,
         }
+    }
+
+    #[test]
+    fn taskview_serde_roundtrip_backcompat() {
+        // #287: a root task (owner_todo "" / spawn_marker None) omits both keys
+        // on the wire (skip_serializing_if), and a JSON lacking them
+        // deserializes back to the defaults — so old clients/payloads stay
+        // compatible.
+        let root = sample_task_view();
+        let json = serde_json::to_string(&root).unwrap();
+        assert!(
+            !json.contains("owner_todo"),
+            "root omits owner_todo: {json}"
+        );
+        assert!(
+            !json.contains("spawn_marker"),
+            "root omits spawn_marker: {json}"
+        );
+        let back: TaskView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.owner_todo, "");
+        assert_eq!(back.spawn_marker, None);
+
+        // A subagent task carries and round-trips both.
+        let mut sub = sample_task_view();
+        sub.owner_todo = "1.1".into();
+        sub.spawn_marker = Some("mk".into());
+        let sub_json = serde_json::to_string(&sub).unwrap();
+        assert!(sub_json.contains("owner_todo"), "subagent emits owner_todo");
+        let sub_back: TaskView = serde_json::from_str(&sub_json).unwrap();
+        assert_eq!(sub_back.owner_todo, "1.1");
+        assert_eq!(sub_back.spawn_marker.as_deref(), Some("mk"));
     }
 
     fn sample_log_entry() -> TaskLogEntry {

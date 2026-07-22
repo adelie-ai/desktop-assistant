@@ -321,6 +321,10 @@ impl BackgroundTaskRegistry {
             children: Vec::new(),
             title,
             progress_hint: None,
+            // Placeholders: slice 5 populates these at spawn for subagents via
+            // SpawnMeta; non-subagent tasks stay root '' / None (#287).
+            owner_todo: String::new(),
+            spawn_marker: None,
         };
 
         // Insert state, register child-link with parent (if any), and
@@ -767,6 +771,8 @@ impl BackgroundTaskRegistry {
                 children: Vec::new(),
                 title: row.title.clone(),
                 progress_hint: row.progress_hint.clone(),
+                owner_todo: row.owner_todo.clone(),
+                spawn_marker: row.spawn_marker.clone(),
             };
             {
                 let mut tasks = self.inner.tasks.lock().expect("tasks poisoned");
@@ -982,6 +988,8 @@ impl Inner {
             progress_hint: view.progress_hint.clone(),
             started_at: view.started_at,
             ended_at: view.ended_at,
+            owner_todo: view.owner_todo.clone(),
+            spawn_marker: view.spawn_marker.clone(),
         };
         if let Err(e) = store.create_task(row).await {
             warn!(

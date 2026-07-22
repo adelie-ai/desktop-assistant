@@ -258,6 +258,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // #287: persist owner_todo + spawn_marker on background tasks so a
+    // wait=false subagent's namespace/snapshot survive a daemon restart.
+    sqlx::raw_sql(include_str!("../migrations/032_subagent_task_columns.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 
