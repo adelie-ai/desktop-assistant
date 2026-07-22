@@ -11,17 +11,12 @@ use reqwest::header::HeaderMap;
 /// The OpenAI-shaped error envelope `{ "error": { code, message, type } }`,
 /// shared by the Chat Completions and Responses surfaces and echoed by the
 /// OpenAI-compatible aggregators. Only the inner `error` shape is inspected.
-// Read only by the detectors, which are `todo!()` in this failing-spec commit.
-#[allow(dead_code)]
 #[derive(Deserialize, Default)]
 struct ErrorEnvelope {
     #[serde(default)]
     error: ErrorBody,
 }
 
-// Fields are read only by the detectors, which are `todo!()` in this
-// failing-spec commit; the reads (and this allow) land with the implementation.
-#[allow(dead_code)]
 #[derive(Deserialize, Default)]
 struct ErrorBody {
     #[serde(default)]
@@ -66,8 +61,35 @@ pub struct ContextOverflowInfo {
 /// echoes flagged user content) handles that case before calling this and does
 /// not fall through here.
 pub fn classify_error(status: StatusCode, headers: &HeaderMap, body: &str) -> CoreError {
-    let _ = (status, headers, body, parse_retry_after_header);
-    todo!("implemented in the next commit")
+    let detail = format!("OpenAI-compatible API error (HTTP {status}): {body}");
+
+    if let Some(info) = detect_context_overflow(body) {
+        return CoreError::ContextOverflow {
+            prompt_tokens: info.prompt_tokens,
+            max_tokens: info.max_tokens,
+            detail,
+        };
+    }
+
+    if detect_insufficient_quota(body) {
+        return CoreError::QuotaExceeded { detail };
+    }
+
+    if status.as_u16() == 429 {
+        return CoreError::RateLimited {
+            retry_after: parse_retry_after_header(headers),
+            detail,
+        };
+    }
+
+    if status.is_server_error() {
+        return CoreError::RateLimited {
+            retry_after: parse_retry_after_header(headers),
+            detail,
+        };
+    }
+
+    CoreError::Llm(detail)
 }
 
 /// Detect a context-window-overflow rejection in an HTTP error body.
@@ -83,9 +105,21 @@ pub fn classify_error(status: StatusCode, headers: &HeaderMap, body: &str) -> Co
 /// providers give for a context rejection, and converting it to a structured
 /// [`CoreError::ContextOverflow`] here means downstream code never has to.
 pub fn detect_context_overflow(body: &str) -> Option<ContextOverflowInfo> {
-    let _: Option<ErrorEnvelope> = None;
-    let _ = (body, parse_context_length_message);
-    todo!("implemented in the next commit")
+    let envelope: ErrorEnvelope = serde_json::from_str(body).ok()?;
+    let code_matches = envelope.error.code.as_deref() == Some("context_length_exceeded");
+    let message_matches = envelope
+        .error
+        .message
+        .to_ascii_lowercase()
+        .contains("maximum context");
+    if !code_matches && !message_matches {
+        return None;
+    }
+    let (prompt_tokens, max_tokens) = parse_context_length_message(&envelope.error.message);
+    Some(ContextOverflowInfo {
+        prompt_tokens,
+        max_tokens,
+    })
 }
 
 /// Detect the permanent `insufficient_quota` billing error in an HTTP error
@@ -99,8 +133,11 @@ pub fn detect_context_overflow(body: &str) -> Option<ContextOverflowInfo> {
 /// distinguishing them here keeps `is_retryable_error` a flat variant match
 /// downstream.
 pub fn detect_insufficient_quota(body: &str) -> bool {
-    let _ = body;
-    todo!("implemented in the next commit")
+    let Ok(envelope): Result<ErrorEnvelope, _> = serde_json::from_str(body) else {
+        return false;
+    };
+    envelope.error.code.as_deref() == Some("insufficient_quota")
+        || envelope.error.error_type.as_deref() == Some("insufficient_quota")
 }
 
 /// Parse OpenAI's `"This model's maximum context length is 128000 tokens.

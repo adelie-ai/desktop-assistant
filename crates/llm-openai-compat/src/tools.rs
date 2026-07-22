@@ -34,8 +34,17 @@ pub struct ChatToolFunction {
 /// [`sanitize_tool_schema`] so a single MCP schema carrying a top-level
 /// composite keyword cannot 400 the whole turn.
 pub fn to_chat_tools(tools: &[ToolDefinition]) -> Vec<ChatTool> {
-    let _ = tools;
-    todo!("implemented in the next commit")
+    tools
+        .iter()
+        .map(|t| ChatTool {
+            tool_type: "function".to_string(),
+            function: ChatToolFunction {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: sanitize_tool_schema(&t.parameters),
+            },
+        })
+        .collect()
 }
 
 /// Strip the composite keywords strict OpenAI-compatible backends reject at the
@@ -55,8 +64,29 @@ pub fn to_chat_tools(tools: &[ToolDefinition]) -> Vec<ChatTool> {
 ///   so the result is still a valid object schema. A clean schema that
 ///   legitimately omits `type` is returned exactly as given.
 pub fn sanitize_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
-    let _ = schema;
-    todo!("implemented in the next commit")
+    let serde_json::Value::Object(map) = schema else {
+        // Non-object schema -- nothing to strip, and we must not wrap it.
+        return schema.clone();
+    };
+    let mut map = map.clone();
+
+    let mut removed_any = false;
+    for key in ["oneOf", "anyOf", "allOf"] {
+        if map.remove(key).is_some() {
+            removed_any = true;
+        }
+    }
+
+    // Only ensure a `type` when we actually altered the schema and left it
+    // without one -- a clean schema that omits `type` is left as-is.
+    if removed_any && !map.contains_key("type") {
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+    }
+
+    serde_json::Value::Object(map)
 }
 
 #[cfg(test)]

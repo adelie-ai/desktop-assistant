@@ -93,8 +93,7 @@ pub struct ChatFunctionDelta {
 /// unit-testable without a live stream; [`consume_chat_stream`] uses it per
 /// frame and warns-and-skips on error.
 pub fn parse_chat_chunk(data: &str) -> Result<ChatChunk, serde_json::Error> {
-    let _ = data;
-    todo!("implemented in the next commit")
+    serde_json::from_str(data)
 }
 
 /// Consume an SSE byte stream of `chat/completions` frames into an
@@ -124,16 +123,95 @@ where
     B: AsRef<[u8]>,
     E: std::fmt::Display,
 {
-    // Stub for the failing-spec commit; the real streaming loop lands next.
-    // The references below keep the shared `llm-http` primitives and helpers
-    // in scope so the crate still builds warning-clean.
     let mut events = byte_stream.eventsource();
-    let _ = next_step(&mut events, cancellation, event_timeout).await;
-    let _acc: ToolCallAccumulator<usize> = ToolCallAccumulator::new();
-    let _usage: Option<TokenUsage> = None;
-    let _make_step: fn() -> StreamStep<()> = || StreamStep::Done;
-    let _ = (parse_usage, build_response, &mut on_chunk);
-    todo!("implemented in the next commit")
+
+    let mut text = String::new();
+    let mut tool_acc: ToolCallAccumulator<usize> = ToolCallAccumulator::new();
+    let mut token_usage: Option<TokenUsage> = None;
+
+    'stream: loop {
+        let event = match next_step(&mut events, cancellation, event_timeout).await {
+            StreamStep::Item(Ok(ev)) => ev,
+            StreamStep::Item(Err(e)) => {
+                // A frame-level SSE/transport hiccup: warn and skip rather
+                // than fail the whole turn.
+                tracing::warn!("skipping unreadable SSE frame: {e}");
+                continue;
+            }
+            StreamStep::Done => break,
+            StreamStep::Cancelled => {
+                tracing::debug!("chat stream cancelled by token");
+                return Err(CoreError::Cancelled);
+            }
+            StreamStep::Stalled => {
+                tracing::error!(
+                    timeout_s = event_timeout.as_secs(),
+                    "chat stream stalled -- no further event"
+                );
+                return Err(CoreError::Llm("chat stream stalled".to_string()));
+            }
+        };
+
+        let data = event.data.as_str();
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        let chunk = match parse_chat_chunk(data) {
+            Ok(c) => c,
+            Err(e) => {
+                // Tolerate a malformed frame; a single bad chunk must not
+                // sink an otherwise good stream.
+                tracing::warn!("skipping malformed chat chunk: {e}");
+                continue;
+            }
+        };
+
+        if let Some(usage_val) = &chunk.usage
+            && let Some(u) = parse_usage(usage_val)
+        {
+            token_usage = Some(u);
+        }
+
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            // No choices (e.g. a usage-only final chunk): nothing more to do.
+            continue;
+        };
+
+        // Tool calls first, so a same-frame content abort still preserves any
+        // tool-call fragments carried alongside it.
+        for tc in &choice.delta.tool_calls {
+            let name = tc.function.as_ref().and_then(|f| f.name.clone());
+            if tc.id.is_some() || name.is_some() {
+                tool_acc.start(
+                    tc.index,
+                    tc.id.clone().unwrap_or_default(),
+                    name.unwrap_or_default(),
+                );
+            }
+            if let Some(f) = &tc.function
+                && let Some(args) = &f.arguments
+            {
+                tool_acc.append(tc.index, args);
+            }
+        }
+
+        if let Some(content) = choice.delta.content
+            && !content.is_empty()
+        {
+            text.push_str(&content);
+            if !on_chunk(content) {
+                tracing::debug!("chat streaming aborted by callback");
+                break 'stream;
+            }
+        }
+    }
+
+    Ok(build_response(
+        text,
+        tool_acc.into_tool_calls(),
+        token_usage,
+    ))
 }
 
 #[cfg(test)]

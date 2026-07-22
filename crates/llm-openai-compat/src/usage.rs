@@ -15,9 +15,31 @@ use desktop_assistant_core::ports::llm::TokenUsage;
 /// empty `usage`), so a caller can distinguish "no usage reported" from
 /// "usage reported as zero".
 pub fn parse_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
-    let _: Option<TokenUsage> = None;
-    let _ = usage;
-    todo!("implemented in the next commit")
+    let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+    let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64());
+
+    let details = usage.get("prompt_tokens_details");
+    let cache_read_input_tokens = details
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64());
+    let cache_creation_input_tokens = details
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(|v| v.as_u64());
+
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && cache_read_input_tokens.is_none()
+        && cache_creation_input_tokens.is_none()
+    {
+        return None;
+    }
+
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    })
 }
 
 #[cfg(test)]

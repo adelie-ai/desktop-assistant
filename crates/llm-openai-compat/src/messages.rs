@@ -114,8 +114,63 @@ pub struct ChatFunctionCall {
 ///   A tool message without a `tool_call_id` is dropped, since the API rejects
 ///   a `tool` message that answers no call.
 pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessage> {
-    let _ = (messages, Role::System);
-    todo!("implemented in the next commit")
+    let mut out = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match msg.role {
+            Role::System => out.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(ChatContent::Text(msg.content.clone())),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }),
+            Role::User => out.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(ChatContent::Text(msg.content.clone())),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }),
+            Role::Assistant => {
+                let tool_calls = msg
+                    .tool_calls
+                    .iter()
+                    .map(|tc| ChatToolCall {
+                        id: tc.id.clone(),
+                        call_type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: tc.name.clone(),
+                            arguments: sanitize_tool_arguments(&tc.arguments),
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                // Omit content on a tool-call-only turn; keep it otherwise.
+                let content = if msg.content.is_empty() {
+                    None
+                } else {
+                    Some(ChatContent::Text(msg.content.clone()))
+                };
+                out.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    tool_calls,
+                    tool_call_id: None,
+                });
+            }
+            Role::Tool => {
+                let Some(call_id) = &msg.tool_call_id else {
+                    // A tool result with no id answers no call; drop it rather
+                    // than emit a message the API will reject.
+                    continue;
+                };
+                out.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(ChatContent::Text(msg.content.clone())),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(call_id.clone()),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Normalize a tool-call `arguments` JSON string on the history path.
@@ -128,8 +183,20 @@ pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessage> {
 /// arguments pass through unchanged (modulo key re-serialization). Mirrors
 /// `llm-bedrock`'s `sanitize_tool_input`.
 pub fn sanitize_tool_arguments(arguments: &str) -> String {
-    let _ = arguments;
-    todo!("implemented in the next commit")
+    let value: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        // Not valid JSON at all -> represent "no arguments" as `{}`.
+        Err(_) => return "{}".to_string(),
+    };
+    match value {
+        serde_json::Value::Object(map) => {
+            let cleaned: serde_json::Map<String, serde_json::Value> =
+                map.into_iter().filter(|(k, _)| !k.is_empty()).collect();
+            serde_json::Value::Object(cleaned).to_string()
+        }
+        // A non-object arguments payload is not valid; coerce to `{}`.
+        _ => "{}".to_string(),
+    }
 }
 
 /// Stamp an ephemeral `cache_control` marker on the **last** system message,
@@ -145,8 +212,26 @@ pub fn sanitize_tool_arguments(arguments: &str) -> String {
 /// - `content` = parts -> the last part gains the marker.
 /// - `content` = absent, or no system message present -> no-op.
 pub fn mark_system_cache_breakpoint(messages: &mut [ChatMessage]) {
-    let _ = messages;
-    todo!("implemented in the next commit")
+    let Some(system) = messages.iter_mut().rev().find(|m| m.role == "system") else {
+        return;
+    };
+    match system.content.take() {
+        Some(ChatContent::Text(text)) => {
+            system.content = Some(ChatContent::Parts(vec![ChatContentPart {
+                part_type: "text".to_string(),
+                text,
+                cache_control: Some(CacheControl::ephemeral()),
+            }]));
+        }
+        Some(ChatContent::Parts(mut parts)) => {
+            if let Some(last) = parts.last_mut() {
+                last.cache_control = Some(CacheControl::ephemeral());
+            }
+            system.content = Some(ChatContent::Parts(parts));
+        }
+        // No content to cache; leave the message untouched.
+        None => {}
+    }
 }
 
 #[cfg(test)]
