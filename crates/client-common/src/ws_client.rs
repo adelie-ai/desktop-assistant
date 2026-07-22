@@ -71,13 +71,15 @@ impl WsClient {
     /// `system_id` / `host_label` (#248) ride custom upgrade headers (WS
     /// authenticates via the `Authorization` header at upgrade time, not an
     /// in-band frame) so the daemon can compute exact co-location even over
-    /// WebSocket; `None`/`None` simply omits them.
+    /// WebSocket; `None`/`None` simply omits them. `client_context` (#549) rides
+    /// one further base64(JSON) header; `None` omits it.
     pub async fn connect(
         ws_url: &str,
         bearer_token: &str,
         tls_ca_cert: Option<&Path>,
         system_id: Option<&str>,
         host_label: Option<&str>,
+        client_context: Option<&api::ClientContext>,
     ) -> Result<(
         Self,
         mpsc::UnboundedReceiver<SignalEvent>,
@@ -96,6 +98,7 @@ impl WsClient {
             tls_ca_cert,
             system_id,
             host_label,
+            client_context,
             Arc::clone(&pending),
             signal_tx.clone(),
             drop_tx.clone(),
@@ -120,8 +123,9 @@ impl WsClient {
     /// writer handle. Shared by [`connect`](Self::connect) and
     /// [`reconnect`](Self::reconnect) (#246).
     // Each argument is a distinct connection input (endpoint, credential, TLS,
-    // the #248 id/label, and the three persistent channels); bundling them into
-    // a struct would just relocate the same fan-out without making it clearer.
+    // the #248 id/label, the #549 client context, and the three persistent
+    // channels); bundling them into a struct would just relocate the same
+    // fan-out without making it clearer.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_connection(
         ws_url: &str,
@@ -129,6 +133,7 @@ impl WsClient {
         tls_ca_cert: Option<&Path>,
         system_id: Option<&str>,
         host_label: Option<&str>,
+        client_context: Option<&api::ClientContext>,
         pending: Arc<Mutex<PendingState>>,
         signal_tx: mpsc::UnboundedSender<SignalEvent>,
         drop_tx: mpsc::UnboundedSender<()>,
@@ -159,6 +164,8 @@ impl WsClient {
                 .headers_mut()
                 .insert(HeaderName::from_static(api::WS_HOST_LABEL_HEADER), value);
         }
+        // Best-effort client context (#549) rides one base64(JSON) header.
+        insert_client_context_header(request.headers_mut(), client_context);
 
         let connector = if ws_url.starts_with("wss://") {
             Some(build_tls_connector(tls_ca_cert)?)
@@ -249,10 +256,11 @@ impl WsClient {
     /// channels, and swap in the new writer. On failure the error is returned so
     /// the supervisor can back off and retry.
     ///
-    /// The system id + host label (#248) are re-sent on every reconnect — the
-    /// caller (`TransportClient::reconnect`) re-reads them from the stored
-    /// `ConnectionConfig`, so the co-location handshake field survives a daemon
-    /// restart exactly like the bearer token does.
+    /// The system id + host label (#248) and the client context (#549) are
+    /// re-sent on every reconnect — the caller (`TransportClient::reconnect`)
+    /// re-derives them from the stored `ConnectionConfig`, so the co-location
+    /// header and the client-context header survive a daemon restart exactly
+    /// like the bearer token does.
     pub(crate) async fn reconnect(
         &self,
         ws_url: &str,
@@ -260,6 +268,7 @@ impl WsClient {
         tls_ca_cert: Option<&Path>,
         system_id: Option<&str>,
         host_label: Option<&str>,
+        client_context: Option<&api::ClientContext>,
     ) -> Result<()> {
         let outbound_tx = Self::spawn_connection(
             ws_url,
@@ -267,6 +276,7 @@ impl WsClient {
             tls_ca_cert,
             system_id,
             host_label,
+            client_context,
             Arc::clone(&self.pending),
             self.signal_tx.clone(),
             self.drop_tx.clone(),
@@ -439,6 +449,28 @@ fn build_tls_connector(ca_cert_path: Option<&Path>) -> Result<tokio_tungstenite:
 // transport tail, #377). Re-exported here so `crate::ws_client::map_event_to_signal`
 // callers (uds_client, the streaming loop above) are unchanged.
 pub use desktop_assistant_api_model::signal::map_event_to_signal;
+
+/// Insert the #549 client-context upgrade header when a context is attached.
+///
+/// The context rides one header as base64(JSON) (see
+/// [`encode_client_context`](api::encode_client_context)). Base64 is always a
+/// valid header value, but a parse failure is still tolerated silently — the
+/// context is a display hint, not load-bearing, so we degrade rather than fail
+/// the connect. `None` inserts nothing (older/opted-out clients).
+fn insert_client_context_header(
+    headers: &mut tokio_tungstenite::tungstenite::http::HeaderMap,
+    client_context: Option<&api::ClientContext>,
+) {
+    use tokio_tungstenite::tungstenite::http::HeaderName;
+    if let Some(ctx) = client_context
+        && let Ok(value) = api::encode_client_context(ctx).parse()
+    {
+        headers.insert(
+            HeaderName::from_static(api::WS_CLIENT_CONTEXT_HEADER),
+            value,
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -754,5 +786,34 @@ mod tests {
             },
         });
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn client_context_header_absent_when_no_context() {
+        use tokio_tungstenite::tungstenite::http::HeaderMap;
+        let mut headers = HeaderMap::new();
+        insert_client_context_header(&mut headers, None);
+        assert!(!headers.contains_key(api::WS_CLIENT_CONTEXT_HEADER));
+    }
+
+    #[test]
+    fn client_context_header_is_present_and_decodable() {
+        // The send path encodes the context into the #549 upgrade header, and
+        // the daemon's decoder must round-trip it back to the same value.
+        use desktop_assistant_api_model::ClientContext;
+        use tokio_tungstenite::tungstenite::http::HeaderMap;
+        let ctx = ClientContext {
+            username: Some("ada".into()),
+            timezone: Some("Europe/London".into()),
+            ..ClientContext::default()
+        };
+        let mut headers = HeaderMap::new();
+        insert_client_context_header(&mut headers, Some(&ctx));
+        let raw = headers
+            .get(api::WS_CLIENT_CONTEXT_HEADER)
+            .expect("client-context header present")
+            .to_str()
+            .expect("base64 header is ASCII");
+        assert_eq!(api::decode_client_context(raw), Some(ctx));
     }
 }

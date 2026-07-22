@@ -253,27 +253,6 @@ fn jittered_backoff(current: Duration) -> Duration {
     base + Duration::from_millis(jitter)
 }
 
-/// Best-effort local hostname for the friendly tool-note host label (#248).
-/// Dependency-free: the Linux kernel hostname, then `/etc/hostname`, then the
-/// `HOSTNAME` env var. `None` when none resolve — the label is purely cosmetic,
-/// so omitting it is fine (the daemon shows the generic "your device").
-fn local_hostname() -> Option<String> {
-    let from_file = |path: &str| {
-        std::fs::read_to_string(path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    from_file("/proc/sys/kernel/hostname")
-        .or_else(|| from_file("/etc/hostname"))
-        .or_else(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-}
-
 /// Fill in the per-machine system id and host label on `config` for the connect
 /// handshake (#248), unless the caller already set them (respected so tests can
 /// inject a specific id). Reads the local id once (cached). Returns the
@@ -284,7 +263,7 @@ fn stamp_system_id(mut config: ConnectionConfig) -> ConnectionConfig {
         config.system_id = crate::system_id::local_system_id();
     }
     if config.host_label.is_none() {
-        config.host_label = local_hostname();
+        config.host_label = crate::client_context::local_hostname();
     }
     config
 }

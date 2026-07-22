@@ -110,7 +110,8 @@ impl UdsClient {
     /// socket close (#246) — the Connector uses the latter to drive reconnect.
     ///
     /// `system_id` / `host_label` (#248) ride the handshake frame so the daemon
-    /// can compute exact co-location.
+    /// can compute exact co-location; `client_context` (#549) rides the same
+    /// frame, `None` omitting it.
     ///
     /// `bearer_token` is `None` for the local peer-cred path (#407): the daemon
     /// authenticates the connection by its kernel `SO_PEERCRED`, so no JWT is
@@ -122,6 +123,7 @@ impl UdsClient {
         bearer_token: Option<&str>,
         system_id: Option<&str>,
         host_label: Option<&str>,
+        client_context: Option<&api::ClientContext>,
     ) -> Result<(
         Self,
         mpsc::UnboundedReceiver<SignalEvent>,
@@ -139,6 +141,7 @@ impl UdsClient {
             bearer_token,
             system_id,
             host_label,
+            client_context,
             Arc::clone(&pending),
             signal_tx.clone(),
             drop_tx.clone(),
@@ -162,11 +165,16 @@ impl UdsClient {
     /// reader/writer tasks wired to the **persistent** `pending` / `signal_tx` /
     /// `drop_tx`. Returns the new writer handle. Shared by the initial
     /// [`connect`](Self::connect) and [`reconnect`](Self::reconnect) (#246).
+    // Each argument is a distinct handshake input (endpoint, credential, the
+    // #248 id/label, the #549 client context) plus the three persistent
+    // channels; bundling them into a struct would just relocate the fan-out.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_connection(
         socket_path: &Path,
         bearer_token: Option<&str>,
         system_id: Option<&str>,
         host_label: Option<&str>,
+        client_context: Option<&api::ClientContext>,
         pending: Arc<Mutex<PendingState>>,
         signal_tx: mpsc::UnboundedSender<SignalEvent>,
         drop_tx: mpsc::UnboundedSender<()>,
@@ -187,9 +195,10 @@ impl UdsClient {
             jwt: bearer_token.map(str::to_string),
             system_id: system_id.map(str::to_string),
             host_label: host_label.map(str::to_string),
-            // Clients do not yet report a client context (#549 Phase 2); the
-            // daemon-side plumbing lands first, so this stays `None` for now.
-            client_context: None,
+            // Best-effort self-reported client context (#549). `None` when the
+            // client opts out or nothing resolves — the field is then skipped on
+            // the wire, keeping the handshake byte-identical to older clients.
+            client_context: client_context.cloned(),
         })?;
         write_frame(&mut write_half, &handshake)
             .await
@@ -266,22 +275,25 @@ impl UdsClient {
     /// `&TransportClient` resumes working; on failure the error is returned so
     /// the supervisor can back off and retry.
     ///
-    /// The system id + host label (#248) are re-sent on every reconnect — the
-    /// caller (`TransportClient::reconnect`) re-reads them from the stored
-    /// `ConnectionConfig`, so a handshake field added in #248 survives a daemon
-    /// restart exactly like the bearer token does.
+    /// The system id + host label (#248) and the client context (#549) are
+    /// re-sent on every reconnect — the caller (`TransportClient::reconnect`)
+    /// re-derives them from the stored `ConnectionConfig`, so a handshake field
+    /// added in #248 / #549 survives a daemon restart exactly like the bearer
+    /// token does.
     pub(crate) async fn reconnect(
         &self,
         socket_path: &Path,
         bearer_token: Option<&str>,
         system_id: Option<&str>,
         host_label: Option<&str>,
+        client_context: Option<&api::ClientContext>,
     ) -> Result<()> {
         let outbound_tx = Self::spawn_connection(
             socket_path,
             bearer_token,
             system_id,
             host_label,
+            client_context,
             Arc::clone(&self.pending),
             self.signal_tx.clone(),
             self.drop_tx.clone(),

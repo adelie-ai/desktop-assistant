@@ -132,9 +132,10 @@ async fn no_system_id_yields_legacy_handshake_shape() {
     spawn_handshake_capture_server(path.clone(), tx);
     wait_for_socket(&path).await;
 
-    let (_client, _signals, _drop) = UdsClient::connect(&path, Some("legacy-token"), None, None)
-        .await
-        .expect("raw uds connect");
+    let (_client, _signals, _drop) =
+        UdsClient::connect(&path, Some("legacy-token"), None, None, None)
+            .await
+            .expect("raw uds connect");
 
     let frame = timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -143,6 +144,7 @@ async fn no_system_id_yields_legacy_handshake_shape() {
     assert_eq!(frame.jwt.as_deref(), Some("legacy-token"));
     assert_eq!(frame.system_id, None, "no-id client must omit system_id");
     assert_eq!(frame.host_label, None);
+    assert_eq!(frame.client_context, None, "no-context client must omit it");
 }
 
 #[tokio::test]
@@ -158,7 +160,7 @@ async fn peer_cred_handshake_omits_jwt() {
     spawn_handshake_capture_server(path.clone(), tx);
     wait_for_socket(&path).await;
 
-    let (_client, _signals, _drop) = UdsClient::connect(&path, None, None, None)
+    let (_client, _signals, _drop) = UdsClient::connect(&path, None, None, None, None)
         .await
         .expect("raw uds connect");
 
@@ -169,4 +171,88 @@ async fn peer_cred_handshake_omits_jwt() {
     assert_eq!(frame.jwt, None, "peer-cred client must omit jwt");
     assert_eq!(frame.system_id, None);
     assert_eq!(frame.host_label, None);
+}
+
+/// #549 Phase 2a: with the default-on `share_client_context` setting, the
+/// Connector must attach the resolved client context to the handshake on the
+/// initial connect AND re-attach it on reconnect. The expected value is the
+/// gated resolution itself (dropped to `None` when the host resolves nothing),
+/// so the assertion is deterministic and host-independent.
+#[tokio::test]
+async fn client_context_is_sent_on_connect_and_resent_on_reconnect_when_enabled() {
+    use desktop_assistant_client_common::resolve_client_context;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ctx.sock");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    spawn_handshake_capture_server(path.clone(), tx);
+    wait_for_socket(&path).await;
+
+    let config = ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        socket_path: Some(path.clone()),
+        ws_jwt: Some("test-token".to_string()),
+        // Default is on, but set it explicitly so the test states its premise.
+        share_client_context: true,
+        ..ConnectionConfig::default()
+    };
+
+    // What the client is expected to send: the resolved context, or `None` when
+    // nothing resolves (an empty context collapses to no field on the wire).
+    let resolved = resolve_client_context();
+    let expected = (!resolved.is_empty()).then_some(resolved);
+
+    let _connector = Connector::connect(&config)
+        .await
+        .expect("connector connects");
+
+    let first = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("first handshake captured")
+        .expect("handshake present");
+    assert_eq!(
+        first.client_context, expected,
+        "the resolved client context must ride the initial handshake"
+    );
+
+    let second = timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("reconnect handshake captured")
+        .expect("handshake present");
+    assert_eq!(
+        second.client_context, expected,
+        "the client context must be re-sent on reconnect, not dropped"
+    );
+}
+
+/// #549 Phase 2a: with the setting off, the client attaches no context at all —
+/// the handshake `client_context` field is absent. Fully deterministic.
+#[tokio::test]
+async fn client_context_is_omitted_when_sharing_disabled() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("noctx.sock");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    spawn_handshake_capture_server(path.clone(), tx);
+    wait_for_socket(&path).await;
+
+    let config = ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        socket_path: Some(path.clone()),
+        ws_jwt: Some("test-token".to_string()),
+        share_client_context: false,
+        ..ConnectionConfig::default()
+    };
+
+    let _connector = Connector::connect(&config)
+        .await
+        .expect("connector connects");
+
+    let first = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("first handshake captured")
+        .expect("handshake present");
+    assert_eq!(
+        first.client_context, None,
+        "sharing disabled must attach no client context"
+    );
 }

@@ -1266,6 +1266,8 @@ dependencies = [
  "desktop-assistant-mcp-client",
  "desktop-assistant-uds",
  "futures",
+ "iana-time-zone",
+ "libc",
  "mcp-core",
  "rcgen",
  "reqwest",

@@ -4,6 +4,7 @@ use desktop_assistant_api_model as api;
 use tokio::sync::mpsc;
 
 use crate::auth::resolve_ws_bearer_token;
+use crate::client_context::{context_to_attach, resolve_client_context};
 use crate::commands::AssistantCommands;
 use crate::config::{ConnectionConfig, TransportMode, default_desktop_socket_path};
 use crate::signal::SignalEvent;
@@ -115,9 +116,11 @@ impl TransportClient {
             )),
             Self::Ws(client) => {
                 let token = resolve_ws_bearer_token(config).await?;
-                // Re-send the #248 system id + host label from the stored config
-                // so co-location survives a reconnect (the supervisor re-reads
-                // this same config).
+                // Re-send the #248 system id + host label and the #549 client
+                // context from the stored config so both survive a reconnect
+                // (the supervisor re-reads this same config).
+                let client_context =
+                    context_to_attach(config.share_client_context, resolve_client_context);
                 client
                     .reconnect(
                         &config.ws_url,
@@ -125,6 +128,7 @@ impl TransportClient {
                         config.tls_ca_cert.as_deref(),
                         config.system_id.as_deref(),
                         config.host_label.as_deref(),
+                        client_context.as_ref(),
                     )
                     .await
             }
@@ -140,12 +144,15 @@ impl TransportClient {
                             "no UDS socket path: set ConnectionConfig.socket_path or XDG_RUNTIME_DIR"
                         )
                     })?;
+                let client_context =
+                    context_to_attach(config.share_client_context, resolve_client_context);
                 client
                     .reconnect(
                         &path,
                         config.ws_jwt.as_deref(),
                         config.system_id.as_deref(),
                         config.host_label.as_deref(),
+                        client_context.as_ref(),
                     )
                     .await
             }
@@ -425,14 +432,19 @@ pub async fn connect_transport(
         )),
         TransportMode::Ws => {
             let token = resolve_ws_bearer_token(config).await?;
-            // Carry the #248 system id + host label from the config into the
-            // handshake (custom upgrade headers); the Connector stamps them on.
+            // Carry the #248 system id + host label and the #549 client context
+            // from the config into the handshake (custom upgrade headers); the
+            // Connector stamps them on. The context is resolved only when the
+            // `share_client_context` setting is on.
+            let client_context =
+                context_to_attach(config.share_client_context, resolve_client_context);
             let (client, signal_rx, drop_rx) = WsClient::connect(
                 &config.ws_url,
                 &token,
                 config.tls_ca_cert.as_deref(),
                 config.system_id.as_deref(),
                 config.host_label.as_deref(),
+                client_context.as_ref(),
             )
             .await?;
             Ok((TransportClient::Ws(client), signal_rx, Some(drop_rx)))
@@ -451,13 +463,18 @@ pub async fn connect_transport(
                         "no UDS socket path: set ConnectionConfig.socket_path or XDG_RUNTIME_DIR"
                     )
                 })?;
-            // Carry the #248 system id + host label from the config into the
-            // handshake frame; the Connector stamps them on.
+            // Carry the #248 system id + host label and the #549 client context
+            // from the config into the handshake frame; the Connector stamps
+            // them on. The context is resolved only when the
+            // `share_client_context` setting is on.
+            let client_context =
+                context_to_attach(config.share_client_context, resolve_client_context);
             let (client, signal_rx, drop_rx) = UdsClient::connect(
                 &path,
                 config.ws_jwt.as_deref(),
                 config.system_id.as_deref(),
                 config.host_label.as_deref(),
+                client_context.as_ref(),
             )
             .await?;
             Ok((TransportClient::Uds(client), signal_rx, Some(drop_rx)))
