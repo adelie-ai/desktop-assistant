@@ -252,6 +252,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // #287: namespace the scratchpad by owner_todo (subagent-tree path) so
+    // subagent writes are confined and reads snapshot by spawn marker.
+    sqlx::raw_sql(include_str!("../migrations/031_scratchpad_owner_todo.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 

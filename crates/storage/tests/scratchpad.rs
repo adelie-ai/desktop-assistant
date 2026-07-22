@@ -21,8 +21,11 @@ mod support;
 
 use std::sync::Arc;
 
+use std::collections::HashSet;
+
 use desktop_assistant_core::domain::{Conversation, ConversationId, Message, Role};
 use desktop_assistant_core::ports::scratchpad::{NewScratchpadNote, ScratchpadStore};
+use desktop_assistant_core::ports::scratchpad_scope::{SubagentScope, with_subagent_scope};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::{
     PgConversationStore, PgScratchpadStore, UserId, run_migrations, with_user_id,
@@ -468,6 +471,288 @@ async fn rewrite_toggles_done_and_updates_fields() {
             assert!(after[0].done, "done flips on re-write");
         })
         .await;
+        fx
+    })
+    .await;
+}
+
+// --- #287: owner_todo namespacing + ancestor-restricted snapshot reads ------
+
+/// A subagent scope over the "c1" session pad: the given `owner_todo`
+/// namespace, a snapshot `marker`, and the ancestor-namespace chain.
+fn sub_scope(owner: &str, marker: &str, ancestors: &[&str]) -> SubagentScope {
+    SubagentScope {
+        session_conversation_id: ConversationId::from("c1"),
+        owner_todo: owner.to_string(),
+        visible_before: marker.to_string(),
+        ancestors: ancestors.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn key_set(notes: &[desktop_assistant_core::domain::ScratchpadNote]) -> HashSet<String> {
+    notes.iter().map(|n| n.key.clone()).collect()
+}
+
+#[tokio::test]
+async fn write_and_read_carry_owner_todo() {
+    with_fixture("write_and_read_carry_owner_todo", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            convs.create(make_conversation("c1")).await.expect("conv");
+            with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                pad.write("c1", &[note("finding", "x")])
+                    .await
+                    .expect("write");
+            })
+            .await;
+            let all = pad.list("c1", None, 50).await.expect("list");
+            let n = all
+                .iter()
+                .find(|n| n.key == "finding")
+                .expect("finding note");
+            assert_eq!(n.owner_todo, "1.1", "note carries its writer's owner_todo");
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn write_confined_to_owner_namespace() {
+    with_fixture("write_confined_to_owner_namespace", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            convs.create(make_conversation("c1")).await.expect("conv");
+            // Same note_key under root and under a subagent namespace = two rows
+            // (an upsert collides only within one namespace).
+            pad.write("c1", &[note("k", "root-val")])
+                .await
+                .expect("root write");
+            with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                pad.write("c1", &[note("k", "sub-val")])
+                    .await
+                    .expect("sub write");
+            })
+            .await;
+            let all = pad.list("c1", None, 50).await.expect("list");
+            let mut owners: Vec<String> = all
+                .iter()
+                .filter(|n| n.key == "k")
+                .map(|n| n.owner_todo.clone())
+                .collect();
+            owners.sort();
+            assert_eq!(owners, vec!["".to_string(), "1.1".to_string()]);
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_includes_own_and_descendant_excludes_sibling() {
+    // #287 finding 1: the `id < marker` branch must be ancestor-restricted, not
+    // namespace-blind. The sibling here is written BEFORE the marker (its id <
+    // marker), so a naive namespace-blind predicate would wrongly include it.
+    with_fixture(
+        "snapshot_includes_own_and_descendant_excludes_sibling",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                // Parent (root) context, then a concurrent sibling 1.2 — both
+                // BEFORE the child's spawn marker (ids < marker).
+                pad.write("c1", &[note("ctx", "from-parent")])
+                    .await
+                    .expect("ctx");
+                with_subagent_scope(sub_scope("1.2", "", &[]), async {
+                    pad.write("c1", &[note("sib", "sibling")])
+                        .await
+                        .expect("sib");
+                })
+                .await;
+                let marker = Uuid::now_v7().to_string();
+                // Own + descendant writes AFTER the marker (ids > marker).
+                with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                    pad.write("c1", &[note("own", "mine")]).await.expect("own");
+                })
+                .await;
+                with_subagent_scope(sub_scope("1.1.1", "", &[]), async {
+                    pad.write("c1", &[note("desc", "grandchild")])
+                        .await
+                        .expect("desc");
+                })
+                .await;
+                // Read as subagent 1.1 with the snapshot marker; ancestors = root.
+                let seen = with_subagent_scope(sub_scope("1.1", &marker, &[""]), async {
+                    pad.list("c1", None, 50).await.expect("scoped list")
+                })
+                .await;
+                let keys = key_set(&seen);
+                assert!(keys.contains("ctx"), "ancestor pre-marker context visible");
+                assert!(keys.contains("own"), "own namespace visible at any id");
+                assert!(keys.contains("desc"), "descendant namespace visible");
+                assert!(
+                    !keys.contains("sib"),
+                    "concurrent sibling 1.2 must NOT be visible even though its id < marker"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn subtree_prefix_does_not_leak_11_vs_111() {
+    with_fixture("subtree_prefix_does_not_leak_11_vs_111", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            convs.create(make_conversation("c1")).await.expect("conv");
+            // "1.11" is a SIBLING of "1.1", not a descendant; "1.1.9" is a real
+            // descendant. The dot-delimited LIKE '1.1.%' must match only the latter.
+            with_subagent_scope(sub_scope("1.11", "", &[]), async {
+                pad.write("c1", &[note("eleven", "x")])
+                    .await
+                    .expect("eleven");
+            })
+            .await;
+            with_subagent_scope(sub_scope("1.1.9", "", &[]), async {
+                pad.write("c1", &[note("real_desc", "y")])
+                    .await
+                    .expect("desc");
+            })
+            .await;
+            let marker = Uuid::now_v7().to_string();
+            let seen = with_subagent_scope(sub_scope("1.1", &marker, &[""]), async {
+                pad.list("c1", None, 50).await.expect("scoped list")
+            })
+            .await;
+            let keys = key_set(&seen);
+            assert!(
+                keys.contains("real_desc"),
+                "1.1.9 is a real descendant of 1.1"
+            );
+            assert!(
+                !keys.contains("eleven"),
+                "1.11 must NOT be seen as a descendant of 1.1 (dot boundary)"
+            );
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn clear_only_wipes_own_namespace() {
+    // Highest-severity guard: a subagent's `clear`/`delete all:true` must never
+    // wipe the parent's pad.
+    with_fixture("clear_only_wipes_own_namespace", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            convs.create(make_conversation("c1")).await.expect("conv");
+            pad.write("c1", &[note("rootnote", "r")])
+                .await
+                .expect("root");
+            with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                pad.write("c1", &[note("subnote", "s")]).await.expect("sub");
+            })
+            .await;
+            let cleared = with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                pad.clear("c1").await.expect("clear")
+            })
+            .await;
+            assert_eq!(cleared, 1, "subagent clear wipes only its own namespace");
+            let keys = key_set(&pad.list("c1", None, 50).await.expect("list"));
+            assert!(
+                keys.contains("rootnote"),
+                "parent pad survives a subagent clear"
+            );
+            assert!(!keys.contains("subnote"), "subagent's own note is cleared");
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn top_level_read_is_unbounded() {
+    with_fixture("top_level_read_is_unbounded", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            convs.create(make_conversation("c1")).await.expect("conv");
+            pad.write("c1", &[note("root", "r")]).await.expect("root");
+            with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                pad.write("c1", &[note("sub", "s")]).await.expect("sub");
+            })
+            .await;
+            // No scope installed => unbounded: the top-level sees every namespace.
+            let keys = key_set(&pad.list("c1", None, 50).await.expect("list"));
+            assert!(keys.contains("root") && keys.contains("sub"));
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cross_user_isolation_still_holds_with_owner_todo() {
+    with_fixture(
+        "cross_user_isolation_still_holds_with_owner_todo",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                    pad.write("c1", &[note("secret", "alice-only")])
+                        .await
+                        .expect("write");
+                })
+                .await;
+            })
+            .await;
+            // Bob, even reading the same conversation id under a matching scope, sees
+            // and deletes nothing — the user_id=$1 guard holds regardless of owner_todo.
+            with_user_id(UserId::new("bob"), async {
+                let marker = Uuid::now_v7().to_string();
+                let seen = with_subagent_scope(sub_scope("1.1", &marker, &[""]), async {
+                    pad.list("c1", None, 50).await.expect("list")
+                })
+                .await;
+                assert!(seen.is_empty(), "bob sees none of alice's rows");
+                let cleared = with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                    pad.clear("c1").await.expect("clear")
+                })
+                .await;
+                assert_eq!(cleared, 0, "bob deletes none of alice's rows");
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn migration_031_is_idempotent() {
+    with_fixture("migration_031_is_idempotent", |fx| async move {
+        // The runner re-executes every migration on every startup with no
+        // version table, so a second run on the same schema must succeed.
+        run_migrations(&fx.pool)
+            .await
+            .expect("second run_migrations is idempotent");
         fx
     })
     .await;
