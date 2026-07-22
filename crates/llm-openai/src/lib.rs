@@ -184,32 +184,50 @@ impl OpenAiClient {
     }
 
     /// Generate embeddings for a batch of texts.
+    ///
+    /// Bounded by [`Self::with_request_timeout`] (default
+    /// [`OPENAI_REQUEST_TIMEOUT`]): unlike the streaming path there is no
+    /// per-event heartbeat to detect a stall, so the whole request/parse is
+    /// wrapped in a wall-clock timeout to keep a wedged backend from hanging
+    /// the caller indefinitely.
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
         let body = serde_json::json!({
             "model": self.model,
             "input": texts,
         });
 
-        let response = self
-            .client
-            .post(format!("{}/embeddings", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("embedding HTTP request failed: {e}")))?;
+        let request = async {
+            let response = self
+                .client
+                .post(format!("{}/embeddings", self.base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| CoreError::Llm(format!("embedding HTTP request failed: {e}")))?;
 
-        let response =
-            desktop_assistant_llm_http::bail_for_status(response, "OpenAI embeddings API error")
-                .await?;
+            let response = desktop_assistant_llm_http::bail_for_status(
+                response,
+                "OpenAI embeddings API error",
+            )
+            .await?;
 
-        let parsed: EmbeddingResponse = response
-            .json()
-            .await
-            .map_err(|e| CoreError::Llm(format!("failed to parse embedding response: {e}")))?;
+            let parsed: EmbeddingResponse = response
+                .json()
+                .await
+                .map_err(|e| CoreError::Llm(format!("failed to parse embedding response: {e}")))?;
 
-        Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+            Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+        };
+
+        match tokio::time::timeout(self.request_timeout, request).await {
+            Ok(result) => result,
+            Err(_) => Err(CoreError::Llm(format!(
+                "OpenAI embeddings request timed out after {}s",
+                self.request_timeout.as_secs()
+            ))),
+        }
     }
 
     pub fn from_env() -> Result<Self, CoreError> {
@@ -552,6 +570,31 @@ fn convert_messages(messages: &[Message]) -> (Vec<InputItem>, Option<String>) {
 // Streaming implementation
 // ---------------------------------------------------------------------------
 
+/// Classify a `reqwest` transport error from the initial `send()` into a
+/// `CoreError`.
+///
+/// Connection-phase (`is_connect`) and timeout (`is_timeout`) failures are
+/// transient: the request never established a stream, so nothing has been
+/// emitted downstream and a retry is idempotency-safe. They map to
+/// [`CoreError::RateLimited`], the one variant the core `RetryingLlmClient`
+/// decorator retries with backoff (guarded by its stream-not-started check).
+/// This brings the reqwest path up to the transport-retry bar that Bedrock
+/// gets for free from the AWS SDK. Any other transport error (e.g. a
+/// malformed request builder) is a permanent [`CoreError::Llm`].
+///
+/// `reqwest::Error`'s `Display` never includes request headers, so the
+/// bearer token cannot leak through the formatted `detail`.
+fn classify_send_error(e: &reqwest::Error) -> CoreError {
+    if e.is_connect() || e.is_timeout() {
+        CoreError::RateLimited {
+            retry_after: None,
+            detail: format!("OpenAI connection error: {e}"),
+        }
+    } else {
+        CoreError::Llm(format!("HTTP request failed: {e}"))
+    }
+}
+
 impl OpenAiClient {
     /// Send a Responses API request and parse the SSE stream into an LlmResponse.
     async fn send_and_stream(
@@ -597,7 +640,7 @@ impl OpenAiClient {
                 );
                 return Err(CoreError::Llm("OpenAI stream stalled".into()));
             }
-            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+            r = send_fut => r.map_err(|e| classify_send_error(&e))?,
         };
 
         if !response.status().is_success() {
@@ -641,9 +684,14 @@ impl OpenAiClient {
                     detail: format!("OpenAI API error (HTTP {status}): {body}"),
                 });
             }
-            // 503 Service Unavailable is OpenAI's "server overloaded"
-            // signal; retry-with-backoff recovers the same as 429.
-            if status.as_u16() == 503 {
+            // Any 5xx is a transient server-side failure (500 internal, 502
+            // bad gateway, 503 overloaded, 504 gateway timeout). These arrive
+            // before any stream byte is consumed, so a retry is
+            // idempotency-safe; map them to `RateLimited` so the retry
+            // decorator backs off and retries rather than hard-failing the
+            // turn. 4xx (bad request, auth, unknown model) stay terminal
+            // below — they can never succeed on retry.
+            if status.is_server_error() {
                 return Err(CoreError::RateLimited {
                     retry_after,
                     detail: format!("OpenAI API error (HTTP {status}): {body}"),
@@ -659,6 +707,15 @@ impl OpenAiClient {
         let mut full_response = String::new();
         let mut tool_acc = ResponseToolAccumulator::default();
         let mut token_usage: Option<TokenUsage> = None;
+        // Truncation guard (#561): the Responses API always terminates a
+        // healthy stream with `response.completed`. If the SSE stream instead
+        // ends (`StreamStep::Done`) without it, the connection was dropped
+        // mid-response and the accumulated text is a partial answer — surface
+        // that as an error rather than a successful completion. A caller-driven
+        // stop (the chunk callback returning false) is a deliberate abort, not
+        // a truncation, so it is tracked separately.
+        let mut saw_completed = false;
+        let mut aborted_by_callback = false;
 
         loop {
             // Race the next SSE event against cancellation and a stall
@@ -690,6 +747,7 @@ impl OpenAiClient {
                         full_response.push_str(&td.delta);
                         if !on_chunk(td.delta) {
                             tracing::debug!("streaming aborted by callback");
+                            aborted_by_callback = true;
                             break;
                         }
                     }
@@ -752,12 +810,25 @@ impl OpenAiClient {
                             ..Default::default()
                         });
                     }
+                    saw_completed = true;
                     break;
                 }
                 other => {
                     tracing::debug!("ignoring SSE event: {:?}", other);
                 }
             }
+        }
+
+        // A stream that ended without `response.completed` and was not
+        // deliberately aborted by the caller is a dropped/truncated response.
+        if !saw_completed && !aborted_by_callback {
+            tracing::error!(
+                text_len = full_response.len(),
+                "OpenAI stream ended before response.completed (truncated)"
+            );
+            return Err(CoreError::Llm(
+                "OpenAI stream truncated: connection ended before response.completed".into(),
+            ));
         }
 
         let tool_calls = tool_acc.into_tool_calls();
