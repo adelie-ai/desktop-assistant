@@ -19,6 +19,7 @@ use desktop_assistant_core::ports::scratchpad::{
     ScratchpadListFn, ScratchpadSearchFn, ScratchpadWriteFn,
 };
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
+use desktop_assistant_core::ports::transport::current_client_context;
 
 use crate::executor::McpControlHandle;
 
@@ -736,25 +737,75 @@ impl BuiltinToolService {
 
     fn sys_props(&self) -> String {
         let now = NowSnapshot::now();
+
+        // Prefer the CONNECTING CLIENT's self-reported context (#549/#558) for
+        // the user + device identity fields. The daemon may be remote or
+        // containerized, so its own host env is NOT the user's environment —
+        // reporting the daemon host AS the user (the pre-#558 bug) is wrong.
+        // We fall back to daemon-host detection only when the client sent no
+        // context, and label the source with `identity_source` so daemon-host
+        // values are never mistaken for the client's. An empty context counts
+        // as absent (fail-closed), and fields the client omitted stay null
+        // rather than borrowing the daemon's — a partial client context never
+        // leaks a daemon-host value as if it were the user's.
+        let client = current_client_context().filter(|c| !c.is_empty());
+
+        let identity = match &client {
+            Some(c) => IdentityFields {
+                source: "client",
+                real_name: c.real_name.clone(),
+                username: c.username.clone(),
+                home_dir: c.home_dir.clone(),
+                hostname: c.hostname.clone(),
+                os: c.os.clone(),
+                timezone: c.timezone.clone(),
+            },
+            None => IdentityFields {
+                source: "daemon_host_fallback",
+                // The daemon host has no notion of the user's real name.
+                real_name: None,
+                username: detect_username(),
+                home_dir: detect_home_dir(),
+                hostname: detect_hostname(),
+                os: Some(std::env::consts::OS.to_string()),
+                timezone: Some(now.timezone()),
+            },
+        };
+
         serde_json::json!({
             "ok": true,
             "props": {
-                "note": "Relative paths are interpreted from daemon_cwd unless a tool specifies otherwise.",
+                "note": "`identity_source` says where the user/device fields came \
+                         from: \"client\" = the connecting client reported them; \
+                         \"daemon_host_fallback\" = the client sent none, so these \
+                         are the daemon host's own values and may not be the \
+                         user's. Server-side tools (file, terminal) run on the \
+                         daemon host: relative paths resolve from `daemon_host.cwd`, \
+                         not the client's home.",
                 "generated_at_epoch": now.epoch_secs(),
                 "generated_at_utc": now.utc_rfc3339(),
-                "generated_at_local": now.local_rfc3339(),
-                "timezone": now.timezone(),
-                "username": detect_username(),
-                "home_dir": detect_home_dir(),
-                "daemon_cwd": detect_daemon_cwd(),
-                "xdg_dirs": detect_xdg_dirs(),
-                "shell": detect_shell(),
-                "locale": detect_locale(),
-                "session_type": detect_session_type(),
-                "hostname": detect_hostname(),
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-                "os_version": detect_os_version(),
+                "identity_source": identity.source,
+                "real_name": identity.real_name,
+                "username": identity.username,
+                "home_dir": identity.home_dir,
+                "hostname": identity.hostname,
+                "os": identity.os,
+                "timezone": identity.timezone,
+                "daemon_host": {
+                    "cwd": detect_daemon_cwd(),
+                    "generated_at_local": now.local_rfc3339(),
+                    "timezone": now.timezone(),
+                    "hostname": detect_hostname(),
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "os_version": detect_os_version(),
+                    "username": detect_username(),
+                    "home_dir": detect_home_dir(),
+                    "xdg_dirs": detect_xdg_dirs(),
+                    "shell": detect_shell(),
+                    "locale": detect_locale(),
+                    "session_type": detect_session_type(),
+                },
             },
         })
         .to_string()
@@ -1520,6 +1571,21 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         sequence,
         done,
     })
+}
+
+/// The user/device identity fields of `builtin_sys_props`, resolved once from
+/// either the connecting client's self-reported context or the daemon-host
+/// fallback. A named struct (rather than a bare tuple) keeps the two resolution
+/// arms and the JSON assembly legible about which value is which (#558).
+struct IdentityFields {
+    /// Where the fields came from: `"client"` or `"daemon_host_fallback"`.
+    source: &'static str,
+    real_name: Option<String>,
+    username: Option<String>,
+    home_dir: Option<String>,
+    hostname: Option<String>,
+    os: Option<String>,
+    timezone: Option<String>,
 }
 
 fn detect_username() -> Option<String> {
