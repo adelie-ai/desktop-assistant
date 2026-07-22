@@ -19,20 +19,52 @@ use tokio::net::UnixStream;
 /// The OS identity of a connected peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerIdentity {
+    /// Kernel-attested UID of the connecting peer.
     pub uid: u32,
+    /// The peer's login name (`pw_name`), resolved from the UID.
     pub username: String,
+    /// The peer's real / display name from the GECOS field (`pw_gecos`), when
+    /// the passwd entry carries one. Best-effort display hint (#558): it lets a
+    /// local UDS client that could not report its own client context (e.g. the
+    /// KDE FFI client) still ground the prompt with the user's name. `None` when
+    /// the entry has no GECOS name.
+    pub real_name: Option<String>,
+    /// The peer's home directory (`pw_dir`), when the passwd entry carries one.
+    /// Best-effort display hint (#558), same use as `real_name`.
+    pub home_dir: Option<String>,
 }
 
-/// Read the kernel-attested peer credentials from `stream` and resolve
-/// the UID to a username via `getpwuid_r`.
+/// Read the kernel-attested peer credentials from `stream` and resolve the UID
+/// to its passwd entry (login name plus best-effort GECOS name / home dir) via
+/// `getpwuid_r`.
 pub fn extract_peer_identity(stream: &UnixStream) -> anyhow::Result<PeerIdentity> {
     let cred = stream
         .peer_cred()
         .context("failed to read SO_PEERCRED from peer socket")?;
     let uid = cred.uid();
-    let username =
-        username_for_uid(uid)?.ok_or_else(|| anyhow!("no passwd entry for uid {uid}"))?;
-    Ok(PeerIdentity { uid, username })
+    let info = passwd_for_uid(uid)?.ok_or_else(|| anyhow!("no passwd entry for uid {uid}"))?;
+    Ok(PeerIdentity {
+        uid,
+        username: info.username,
+        real_name: info.real_name,
+        home_dir: info.home_dir,
+    })
+}
+
+/// The subset of a passwd entry a [`PeerIdentity`] carries.
+struct PasswdInfo {
+    username: String,
+    real_name: Option<String>,
+    home_dir: Option<String>,
+}
+
+/// The real / display-name component of a GECOS string: its first comma-
+/// separated field, trimmed, or `None` when that field is blank. GECOS is a
+/// comma-separated list (full name, office, phones); the first field is the
+/// display name. Pure so it is unit-tested without touching the passwd db.
+fn real_name_from_gecos(gecos: &str) -> Option<String> {
+    let name = gecos.split(',').next().unwrap_or_default().trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Look up the username for `uid` via `getpwuid_r`.
@@ -40,6 +72,19 @@ pub fn extract_peer_identity(stream: &UnixStream) -> anyhow::Result<PeerIdentity
 /// Returns `Ok(None)` when the UID has no matching entry rather than an
 /// error so callers can distinguish "system call failed" from "no such user".
 pub fn username_for_uid(uid: u32) -> anyhow::Result<Option<String>> {
+    Ok(passwd_for_uid(uid)?.map(|info| info.username))
+}
+
+/// Look up the passwd entry for `uid` via `getpwuid_r`, extracting the login
+/// name plus the best-effort GECOS real name and home directory.
+///
+/// Returns `Ok(None)` when the UID has no matching entry rather than an error so
+/// callers can distinguish "system call failed" from "no such user". The login
+/// name (`pw_name`) is the identity and must be valid UTF-8, so a non-UTF-8
+/// value is a hard error; the GECOS name (`pw_gecos`) and home dir (`pw_dir`)
+/// are best-effort display hints (#558), so a null / blank / non-UTF-8 value
+/// simply yields `None` for that field rather than failing the lookup.
+fn passwd_for_uid(uid: u32) -> anyhow::Result<Option<PasswdInfo>> {
     // Start with a comfortable buffer and grow on ERANGE.
     let mut buf_size = sysconf_or(libc::_SC_GETPW_R_SIZE_MAX, 1024).max(1024);
     let mut buf: Vec<libc::c_char> = vec![0; buf_size];
@@ -63,14 +108,23 @@ pub fn username_for_uid(uid: u32) -> anyhow::Result<Option<String>> {
             if result.is_null() {
                 return Ok(None);
             }
-            // SAFETY: `pwd.pw_name` is a NUL-terminated C string owned by
-            // `buf` (filled by `getpwuid_r`); we copy it into an owned
-            // `String` before `buf` is dropped.
-            let name = unsafe { CStr::from_ptr(pwd.pw_name) }
+            // SAFETY: on success with a non-null `result`, `getpwuid_r` has
+            // filled `pwd`; `pw_name` is a NUL-terminated C string owned by
+            // `buf`. We copy it into an owned `String` before `buf` is dropped.
+            let username = unsafe { CStr::from_ptr(pwd.pw_name) }
                 .to_str()
                 .context("passwd entry username is not valid UTF-8")?
                 .to_string();
-            return Ok(Some(name));
+            // `pw_gecos` / `pw_dir` are best-effort: they may be null on some
+            // entries and need not be valid UTF-8. SAFETY: when non-null each is
+            // a NUL-terminated C string owned by `buf`, copied out before drop.
+            let real_name = cstr_field(pwd.pw_gecos).and_then(|g| real_name_from_gecos(&g));
+            let home_dir = cstr_field(pwd.pw_dir).filter(|d| !d.is_empty());
+            return Ok(Some(PasswdInfo {
+                username,
+                real_name,
+                home_dir,
+            }));
         }
         if rc == libc::ERANGE {
             buf_size = buf_size.saturating_mul(2);
@@ -85,6 +139,24 @@ pub fn username_for_uid(uid: u32) -> anyhow::Result<Option<String>> {
         return Err(std::io::Error::from_raw_os_error(rc))
             .with_context(|| format!("getpwuid_r({uid}) failed"));
     }
+}
+
+/// Copy a best-effort, NUL-terminated C string passwd field into a trimmed
+/// owned `String`, or `None` when the pointer is null or the value is not valid
+/// UTF-8. Used for the display-only `pw_gecos` / `pw_dir` fields, whose absence
+/// must degrade to `None` rather than fail the lookup.
+///
+/// The caller must only pass a `passwd` field pointer that is either null or a
+/// NUL-terminated C string owned by a buffer live for the duration of the call.
+fn cstr_field(ptr: *const libc::c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is non-null and, per the caller's contract, a
+    // NUL-terminated C string owned by a buffer live across this read; we copy
+    // the bytes into an owned `String` before returning.
+    let value = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?.trim();
+    Some(value.to_string())
 }
 
 /// The UID of the current process.
@@ -137,5 +209,54 @@ mod tests {
             id.username,
             username_for_uid(current_uid()).unwrap().unwrap()
         );
+    }
+
+    #[test]
+    fn real_name_from_gecos_takes_the_first_comma_field() {
+        // GECOS is comma-separated (full name, office, phones); only the first
+        // field is the display name, and it is trimmed.
+        assert_eq!(
+            real_name_from_gecos("Ada Lovelace,Room 1,x1234"),
+            Some("Ada Lovelace".to_string())
+        );
+        assert_eq!(
+            real_name_from_gecos("Ada Lovelace"),
+            Some("Ada Lovelace".to_string())
+        );
+        assert_eq!(
+            real_name_from_gecos("  Grace Hopper  ,office"),
+            Some("Grace Hopper".to_string())
+        );
+    }
+
+    #[test]
+    fn real_name_from_gecos_absent_when_first_field_is_blank() {
+        // A blank or all-comma GECOS has no display name.
+        assert_eq!(real_name_from_gecos(""), None);
+        assert_eq!(real_name_from_gecos(",,,"), None);
+        assert_eq!(real_name_from_gecos("   "), None);
+        assert_eq!(real_name_from_gecos("  ,x"), None);
+    }
+
+    #[tokio::test]
+    async fn peer_identity_carries_home_dir_for_current_user() {
+        // #558: the peer identity now also reports the passwd home dir (and, when
+        // present, the GECOS real name) so a local client that cannot report its
+        // own context still grounds the prompt. The current process's account has
+        // a home dir (pw_dir); real_name is optional (GECOS may be empty), so we
+        // only check it is well-formed when present.
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let id = extract_peer_identity(&a).expect("peer identity");
+        let home = id
+            .home_dir
+            .expect("the current user's passwd entry has a home dir (pw_dir)");
+        assert!(!home.is_empty(), "home_dir must be non-empty when reported");
+        if let Some(name) = id.real_name {
+            assert_eq!(name.trim(), name, "real_name must be pre-trimmed");
+            assert!(
+                !name.is_empty(),
+                "real_name must be non-empty when reported"
+            );
+        }
     }
 }

@@ -476,6 +476,8 @@ mod tests {
             PeerIdentity {
                 uid: 1000,
                 username: username.to_string(),
+                real_name: None,
+                home_dir: None,
             }
         }
 
