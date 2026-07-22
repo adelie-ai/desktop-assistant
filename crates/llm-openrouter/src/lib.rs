@@ -279,10 +279,13 @@ struct UsageAccounting {
 /// connector there is no per-model reasoning gate here: OpenRouter normalizes
 /// (or ignores) the field per routed model, so the connector emits whatever the
 /// daemon's OpenRouter arm resolved.
-fn reasoning_block_for(_reasoning: ReasoningConfig) -> Option<ReasoningBlock> {
-    // TODO(impl): map reasoning_effort -> effort, thinking_budget_tokens ->
-    // max_tokens; omit when empty. Stubbed to establish the failing spec.
-    None
+fn reasoning_block_for(reasoning: ReasoningConfig) -> Option<ReasoningBlock> {
+    let effort = reasoning.reasoning_effort.map(|l| l.as_openai_effort());
+    let max_tokens = reasoning.thinking_budget_tokens.filter(|b| *b > 0);
+    if effort.is_none() && max_tokens.is_none() {
+        return None;
+    }
+    Some(ReasoningBlock { effort, max_tokens })
 }
 
 // ---------------------------------------------------------------------------
@@ -388,9 +391,7 @@ impl OpenRouterClient {
 /// 2. everything else -> [`classify_error`], which handles context overflow,
 ///    `insufficient_quota`, 429 (with `Retry-After`), and 5xx.
 fn classify_openrouter_error(status: StatusCode, headers: &HeaderMap, body: &str) -> CoreError {
-    // TODO(impl): add the HTTP 402 arm before delegating. Stubbed to establish
-    // the failing spec; only the credits-body detection is wired here.
-    if detect_openrouter_insufficient_credits(body) {
+    if status.as_u16() == 402 || detect_openrouter_insufficient_credits(body) {
         return CoreError::QuotaExceeded {
             detail: format!("OpenRouter API error (HTTP {status}): {body}"),
         };
@@ -425,9 +426,55 @@ fn detect_openrouter_insufficient_credits(body: &str) -> bool {
 /// [`merge_curated_with_live`], curated metadata winning on overlap). Slugs are
 /// version-fragile; treat this as a convenience seed, not an authority.
 fn curated_openrouter_models() -> Vec<ModelInfo> {
-    // TODO(impl): seed a small curated vendor/model table with capability flags
-    // and context windows. Stubbed empty to establish the failing spec.
-    Vec::new()
+    let reasoning_caps = ModelCapabilities {
+        reasoning: true,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let chat_caps = ModelCapabilities {
+        reasoning: false,
+        vision: true,
+        tools: true,
+        embedding: false,
+    };
+    let text_caps = ModelCapabilities {
+        reasoning: false,
+        vision: false,
+        tools: true,
+        embedding: false,
+    };
+
+    vec![
+        ModelInfo::new("anthropic/claude-sonnet-4-6")
+            .with_display_name("Claude Sonnet 4.6 (Anthropic)")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("anthropic/claude-opus-4-1")
+            .with_display_name("Claude Opus 4.1 (Anthropic)")
+            .with_context_limit(200_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("openai/gpt-5.4")
+            .with_display_name("GPT-5.4 (OpenAI)")
+            .with_context_limit(400_000)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("openai/gpt-4o")
+            .with_display_name("GPT-4o (OpenAI)")
+            .with_context_limit(128_000)
+            .with_capabilities(chat_caps),
+        ModelInfo::new("google/gemini-2.5-pro")
+            .with_display_name("Gemini 2.5 Pro (Google)")
+            .with_context_limit(1_048_576)
+            .with_capabilities(reasoning_caps),
+        ModelInfo::new("meta-llama/llama-3.3-70b-instruct")
+            .with_display_name("Llama 3.3 70B Instruct (Meta)")
+            .with_context_limit(131_072)
+            .with_capabilities(text_caps),
+        ModelInfo::new("deepseek/deepseek-chat")
+            .with_display_name("DeepSeek Chat")
+            .with_context_limit(64_000)
+            .with_capabilities(text_caps),
+    ]
 }
 
 /// The curated prompt-token window for a `vendor/model` id, if known. Exact-id
