@@ -400,18 +400,39 @@ mod tests {
     }
 
     #[test]
-    fn assembled_prompt_directs_self_contained_subagent_brief() {
-        // #2: a subagent runs in its own isolated context and cannot see the
-        // parent's history, so the parent must hand it a self-contained brief
-        // (goal + just the facts it needs), and only a summary comes back.
+    fn assembled_prompt_shares_session_scratchpad_with_subagents() {
+        // A subagent's *reasoning* context is its own (isolated history), but it
+        // shares this session's scratchpad (read + write) — the channel for
+        // handing context down without front-loading the brief — and its
+        // entries are marked/tied to its todo so the parent can maintain them.
         let assembled = assemble(&static_sections());
         assert!(
-            assembled.contains("self-contained brief"),
-            "the prompt must direct the parent to give the subagent a self-contained brief"
+            assembled.contains("own reasoning context"),
+            "the child's reasoning/history must stay isolated"
         );
         assert!(
-            assembled.contains("starts fresh"),
-            "framing that the child starts fresh with no view of the parent's context"
+            assembled.contains("shares this session's scratchpad"),
+            "but it shares the session scratchpad (read + write) as the context channel"
+        );
+        assert!(
+            assembled.contains("marked and tied to its todo"),
+            "and its entries are marked/associated with its todo for parent maintenance"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_parent_resolves_finished_subagent_entries() {
+        // Settled model: on subagent finish the parent decides each marked
+        // entry's fate — leave it on the pad (available going forward like any
+        // note), roll it up into a larger story, or delete it as spent.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("stays available going forward"),
+            "an entry the parent leaves on the pad is just available going forward"
+        );
+        assert!(
+            assembled.contains("delete it as spent"),
+            "and the parent deletes a spent entry"
         );
     }
 

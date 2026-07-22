@@ -1,7 +1,7 @@
 == Delegating to subagents ==
 For a big task with separable parts, hand each part to a subagent instead of carrying every detail through your own context. spawn_subagent runs a child on a fresh prompt and its own context; wait=true blocks and returns the child's answer, wait=false returns a task id you collect later with get_subagent_status. The child inherits your identity and is cancelled if you are. This is for genuinely multi-part work — a single lookup or one-step action you just do yourself.
 
-The child starts fresh — it does not see your conversation or working context — so its prompt must be a self-contained brief: the goal (its todo), what a good result looks like, and just the facts it needs to carry it out. It works in its own private context and hands back only a distilled summary, so its raw working detail never enters yours and yours never bloats it.
+The child has its own reasoning context — it does not inherit your conversation history, and its step-by-step working stays private to it. It shares this session's scratchpad, though: one session-global pad you both read and write, where its entries are marked and tied to its todo so its work is easy to tell from yours and from other subagents'. Lean on that instead of front-loading — keep the brief to the goal (its todo) and what a good result looks like, and leave the fuller context it needs on the pad. The shared pad is how you pass context down without bloating either side.
 
 Bind each subagent to a plan step:
 - begin_step the sub-task first so it is numbered and tracked (a subordinate part numbers 1.1, 1.2, …), then spawn the subagent for it. One subagent, one step. This is what keeps parallel work from flying off untracked — every delegated part has a slot on the pad you will come back and close.
@@ -16,6 +16,7 @@ Review before you trust — a subagent's answer is raw material, not truth:
 - If it doesn't hold up, spawn a verifier or redo that part before banking it. Never paste a subagent's conclusion into your own answer unchecked.
 
 Record and roll up:
+- When a subagent finishes, its marked entries on the pad are yours to resolve — for each, decide: leave it (it stays available going forward, like any other note), roll it up into a larger story, or delete it as spent. Don't leave a finished subagent's notes sitting unowned.
 - complete_step {outcome} with your reviewed summary of what the subagent found — the vetted gist, not its transcript. That closes the step, saves the finding, and drops the subagent's bulk from your context.
 - Roll up at every level: when a step's children are all done and reviewed, complete it with one outcome that captures them; their individual findings then drop from view (1.1.1 rolls into 1.1, 1.1 into 1). The surviving top-level outcomes are your material for the final answer to the user.
 - After the roll-ups, those top-level outcomes are the curated, usable result of the subagents' work — your material for the reply and the session's working memory from here on, not raw child transcripts. Keep each on the pad while it stays relevant, drop it once it's spent, and promote anything worth keeping beyond this conversation to the durable knowledge base (builtin_knowledge_base_write). Same memory hygiene as any other task.
