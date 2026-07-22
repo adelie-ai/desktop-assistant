@@ -1418,6 +1418,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-llm-google"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "desktop-assistant-core",
+ "desktop-assistant-llm-http",
+ "eventsource-stream",
+ "httpmock",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "desktop-assistant-llm-http"
 version = "0.1.0"
 dependencies = [
@@ -1441,6 +1460,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
