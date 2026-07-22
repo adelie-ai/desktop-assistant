@@ -771,6 +771,10 @@ impl DbusClient {
                         conversation_id: args.conversation_id.to_string(),
                         request_id: args.request_id.to_string(),
                         content: args.content.to_string(),
+                        // The D-Bus signal is `(s,s,s)` in Phase 1 and carries
+                        // no idempotency key; echoing it over D-Bus is a Refs
+                        // #570 follow-up.
+                        idempotency_key: None,
                     });
                 }
             }

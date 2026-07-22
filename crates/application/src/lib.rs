@@ -2310,6 +2310,10 @@ where
         {
             return Ok(());
         }
+        // The raw key echoed back on `UserMessageAdded` (#570) — captured before
+        // the `zip` below MOVES `idempotency_key`, and kept separate from
+        // `idempotency` because the echo must fire even with no store attached.
+        let echo_idempotency_key = idempotency_key.clone();
         // Pair the store with the key (both-or-neither) so the turn body
         // records the reply on completion for a future retry.
         let idempotency = self.idempotency.clone().zip(idempotency_key);
@@ -2333,6 +2337,7 @@ where
                 system_refinement,
                 request_id,
                 idempotency,
+                echo_idempotency_key,
                 sink,
             )
             .await
@@ -2350,6 +2355,7 @@ where
                 system_refinement,
                 request_id,
                 idempotency,
+                echo_idempotency_key,
                 sink,
                 tokio_util::sync::CancellationToken::new(),
                 None,
@@ -2455,6 +2461,10 @@ where
         };
 
         let conversations = Arc::clone(&self.conversations);
+        // The raw key echoed back on `UserMessageAdded` (#570) — captured before
+        // the `zip` below MOVES `idempotency_key`, and separate from
+        // `idempotency` because the echo fires even with no store attached.
+        let echo_idempotency_key = idempotency_key.clone();
         // Pair the store with the key (both-or-neither) so the turn body
         // records the reply on completion for a future retry (#204).
         let idempotency = self.idempotency.clone().zip(idempotency_key);
@@ -2539,6 +2549,7 @@ where
                     system_refinement,
                     request_id_for_body,
                     idempotency,
+                    echo_idempotency_key,
                     turn_sink,
                     ctx.token.clone(),
                     client_tool_port,
@@ -2608,6 +2619,7 @@ where
         system_refinement: String,
         request_id: String,
         idempotency: Option<(Arc<dyn IdempotencyKeyStore>, String)>,
+        echo_idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
     ) -> ApiResult<()> {
         let user_id = desktop_assistant_core::ports::auth::current_user_id();
@@ -2660,6 +2672,7 @@ where
                     system_refinement,
                     request_id_for_body,
                     idempotency,
+                    echo_idempotency_key,
                     sink_for_body,
                     ctx.token.clone(),
                     client_tool_port,
@@ -3018,6 +3031,12 @@ async fn run_send_turn<C>(
     system_refinement: String,
     request_id: String,
     idempotency: Option<(Arc<dyn IdempotencyKeyStore>, String)>,
+    // The client-supplied key echoed back on `UserMessageAdded` (#570), raw and
+    // independent of `idempotency`: the `String` in `idempotency` is present
+    // only when a dedup store is *attached*, whereas the echo must fire on every
+    // keyed send so the initiator can correlate its optimistic bubble even with
+    // no store configured. `None` for keyless sends.
+    echo_idempotency_key: Option<String>,
     sink: Arc<dyn EventSink>,
     cancellation: tokio_util::sync::CancellationToken,
     client_tool_port: Option<Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort>>,
@@ -3049,13 +3068,15 @@ where
     // including ones that did NOT initiate this turn (a voice turn, or a second
     // client on the same account) — so they render the user bubble live rather
     // than only after a reload (#1). Emitted before dispatch so it precedes the
-    // assistant's chunks; the initiating client dedupes on `request_id` (it
-    // already rendered the bubble optimistically).
+    // assistant's chunks; the initiating client dedupes on `request_id`, or on
+    // the echoed `idempotency_key` when it supplied one (#570) — it already
+    // rendered the bubble optimistically.
     let _ = sink
         .emit(api::Event::UserMessageAdded {
             conversation_id: conversation_id.clone(),
             request_id: request_id.clone(),
             content: content.clone(),
+            idempotency_key: echo_idempotency_key,
         })
         .await;
 
@@ -4422,6 +4443,90 @@ mod tests {
         assert!(matches!(evs[1], api::Event::AssistantDelta { .. }));
         assert!(matches!(evs[2], api::Event::AssistantDelta { .. }));
         assert!(matches!(evs[3], api::Event::AssistantCompleted { .. }));
+    }
+
+    /// #570 Phase 1: a keyed `SendMessage` echoes its `idempotency_key` back on
+    /// the opening `UserMessageAdded` so the initiator can correlate its
+    /// optimistic bubble by exact key match. Crucially this handler has NO
+    /// idempotency store attached — the echo must fire regardless, because it is
+    /// a raw round-trip of the client's key, not a function of the dedup store.
+    #[tokio::test]
+    async fn daemon_echoes_idempotency_key_back() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+        // No `.with_idempotency_store(..)` — proves the echo is not gated on it.
+        assert!(h.idempotency.is_none(), "test asserts the store-less path");
+
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let evs = sink.0.lock().await.clone();
+        let echoed = evs.iter().find_map(|e| match e {
+            api::Event::UserMessageAdded {
+                idempotency_key, ..
+            } => Some(idempotency_key.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            echoed,
+            Some(Some("k1".to_string())),
+            "UserMessageAdded must echo the client's idempotency_key: {evs:?}"
+        );
+    }
+
+    /// #570 Phase 1 unhappy path: a keyless send (no `idempotency_key`) still
+    /// opens the turn and echoes a `None` key — no error, backward-compatible
+    /// with the keyless `send_prompt_full` paths.
+    #[tokio::test]
+    async fn daemon_tolerates_absent_idempotency_key() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            None,
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let evs = sink.0.lock().await.clone();
+        let echoed = evs.iter().find_map(|e| match e {
+            api::Event::UserMessageAdded {
+                idempotency_key, ..
+            } => Some(idempotency_key.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            echoed,
+            Some(None),
+            "a keyless send emits UserMessageAdded with a None key: {evs:?}"
+        );
     }
 
     /// #1 live multi-client sync: a turn fans its events to other connections

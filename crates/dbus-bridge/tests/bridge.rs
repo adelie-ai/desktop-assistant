@@ -245,6 +245,7 @@ fn translate_forwards_user_message_added_and_conversation_list_changed() {
             conversation_id: "c".into(),
             request_id: "r".into(),
             content: "hi".into(),
+            idempotency_key: None,
         }),
         ForwardAction::UserMessageAdded { conversation_id, request_id, content }
             if conversation_id == "c" && request_id == "r" && content == "hi"
