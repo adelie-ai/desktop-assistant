@@ -678,6 +678,7 @@ where
         conversation_id: &str,
         idempotency_key: Option<&str>,
         request_id: &str,
+        content: &str,
         sink: &Arc<dyn EventSink>,
     ) -> ApiResult<bool> {
         let (Some(key), Some(store)) = (idempotency_key, self.idempotency.as_ref()) else {
@@ -690,7 +691,17 @@ where
         else {
             return Ok(false);
         };
-        replay_completed_response(sink, conversation_id, request_id, response).await;
+        // Echo the retry's key on the opening `UserMessageAdded` (#570) so the
+        // completed-replay path matches the fresh-turn / re-attach paths.
+        replay_completed_response(
+            sink,
+            conversation_id,
+            request_id,
+            content,
+            Some(key.to_string()),
+            response,
+        )
+        .await;
         Ok(true)
     }
 
@@ -720,12 +731,17 @@ where
     }
 
     /// Spawn a registry task that replays a completed turn's stored reply to
-    /// `sink` (#204 phase 1), keyed by the retry's own `request_id`.
+    /// `sink` (#204 phase 1), keyed by the retry's own `request_id`. The replay
+    /// opens with a `UserMessageAdded` echoing the retry's `idempotency_key`
+    /// (#570) so a retrying client Case-0 dedupes its optimistic bubble.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_completed_replay(
         registry: &BackgroundTaskRegistry,
         user_id: UserId,
         conversation_id: &str,
         request_id: &str,
+        content: String,
+        echo_idempotency_key: Option<String>,
         sink: Arc<dyn EventSink>,
         response: String,
     ) -> api::TaskId {
@@ -736,7 +752,8 @@ where
         let conv = conversation_id.to_string();
         let req = request_id.to_string();
         registry.spawn(user_id, kind, title, move |_ctx| async move {
-            replay_completed_response(&sink, &conv, &req, response).await;
+            replay_completed_response(&sink, &conv, &req, &content, echo_idempotency_key, response)
+                .await;
             Ok(())
         })
     }
@@ -2304,6 +2321,7 @@ where
                 &conversation_id,
                 idempotency_key.as_deref(),
                 &request_id,
+                &content,
                 &sink,
             )
             .await?
@@ -2424,6 +2442,8 @@ where
                         user_id,
                         &conversation_id,
                         &request_id,
+                        content.clone(),
+                        Some(key.to_string()),
                         Arc::clone(&sink),
                         response,
                     );
@@ -2936,16 +2956,29 @@ where
 }
 
 /// Re-emit a stored idempotent reply (#204) as the canonical event
-/// sequence a fresh turn produces — one `AssistantDelta` carrying the full
-/// text, then `AssistantCompleted` — keyed by the *current* `request_id` so
-/// the retrying client correlates it with its pending request. Best-effort:
-/// a dropped sink just means the client went away.
+/// sequence a fresh turn produces — an opening `UserMessageAdded` echoing the
+/// retry's `idempotency_key` (mirrors the fresh-turn emit, #570), then one
+/// `AssistantDelta` carrying the full text, then `AssistantCompleted` — all
+/// keyed by the *current* `request_id` so the retrying client correlates it
+/// with its pending request. The leading `UserMessageAdded` lets a retrying
+/// client with an optimistic bubble Case-0 dedupe rather than double-render.
+/// Best-effort: a dropped sink just means the client went away.
 async fn replay_completed_response(
     sink: &Arc<dyn EventSink>,
     conversation_id: &str,
     request_id: &str,
+    content: &str,
+    echo_idempotency_key: Option<String>,
     response: String,
 ) {
+    let _ = sink
+        .emit(api::Event::UserMessageAdded {
+            conversation_id: conversation_id.to_string(),
+            request_id: request_id.to_string(),
+            content: content.to_string(),
+            idempotency_key: echo_idempotency_key,
+        })
+        .await;
     let _ = sink
         .emit(api::Event::AssistantDelta {
             conversation_id: conversation_id.to_string(),
