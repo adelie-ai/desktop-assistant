@@ -496,6 +496,9 @@ impl DbusClient {
                     role,
                     content,
                     kind: crate::MessageKind::Normal,
+                    // D-Bus transcripts are daemon-sourced, not optimistic
+                    // client bubbles, so they carry no idempotency stamp (#570).
+                    idempotency_key: None,
                 })
                 .collect(),
             model_selection: None,
