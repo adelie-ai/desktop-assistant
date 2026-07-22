@@ -283,10 +283,32 @@ da#552 can enforce `depends_on` later.
 
 ## Triggering
 
+A workflow is the reusable *reaction*; something else decides *when* to fire it. The
+three trigger classes converge on one model -- a trigger starts an agent run that may
+invoke a workflow -- so there is never a second scheduler or a workflow-specific
+trigger engine.
+
 - **On-demand:** the assistant auto-discovers and runs; the user does not name a
   workflow.
 - **Scheduled:** routine sugar. A routine (da#413) whose prompt runs a workflow gives
-  scheduled execution with no second scheduler. Unattended runs are gated (below).
+  scheduled execution.
+- **Event-driven (near-term strategic direction).** A coming project reacts to
+  events -- an email arrives, a chat arrives, a file lands in a watched directory to
+  be read and indexed into the knowledge base. Each is a trigger that starts an agent
+  run, which may run a workflow as its reaction. This generalizes the routines epic
+  from cron-only into trigger/condition/action (da#413 Phase 4). The workflow and
+  skill-library substrate is designed to be that reaction target: an event source
+  fires a run, the run auto-discovers the fit workflow, and the blessing/allowlist
+  gates apply exactly as for a scheduled run.
+
+The **file-watch -> read-and-index-into-KB** case is the natural *safe reference*
+event reaction -- KB-only tools, no external mutation -- the events analog of how KB
+consolidation is the safe first routine. Prove the unattended path on it before
+wiring email/chat reactions, which carry real mutation and injection risk.
+
+Because event-triggered runs act on **attacker-influenced content** (an incoming
+email or chat can carry injection aimed at an agent holding tool access), the two
+safety gates below are load-bearing for this direction, not optional hardening.
 
 ## Safety
 
@@ -352,9 +374,14 @@ runner; blocks only the unattended slice).
 - **Default state of a global skill for a user.** Recommended: available and
   enabled-but-unblessed (surfaces, asks once, remembers), with per-user disable to
   suppress. The alternative is opt-in per user.
-- **Whether unattended execution is wanted at all.** Slice 5 (with its client-UI
-  approval surface and both safety gates) is genuinely its own project; the
-  interactive path covers "I'll be around."
+- **Unattended execution is confirmed in scope** (resolved). It is the on-ramp to the
+  event-driven direction above, so slice 5 -- its client-UI approval surface and both
+  safety gates -- is required, not optional. The remaining question is only
+  sequencing against the events project (below).
+- **Where the unattended/events seam lives.** Slice 5 hands the unattended-run gate
+  (blessing + hash check, park-and-notify) to whoever builds the routine/event
+  runner (da#413). Decide whether the event-source work is a sibling epic that
+  consumes this substrate, or folded into da#413's later phases.
 - **Full indexing of user-scoped client skills** (client ships bodies to the daemon
   for embedding -- user content crosses to the daemon in the container case) vs a
   lighter names-only registration with on-demand fetch. Recommended: full indexing,
