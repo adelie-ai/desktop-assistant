@@ -757,3 +757,132 @@ async fn migration_031_is_idempotent() {
     })
     .await;
 }
+
+// --- #287 slice 4: delete_owner_subtree (cascade primitive) -----------------
+
+/// Write one note with the given key under `owner` on conversation `conv`.
+async fn write_owned(pad: &PgScratchpadStore, conv: &str, owner: &str, key: &str) {
+    with_subagent_scope(sub_scope(owner, "", &[]), async {
+        pad.write(conv, &[note(key, owner)])
+            .await
+            .expect("write_owned");
+    })
+    .await;
+}
+
+fn owner_set(notes: &[desktop_assistant_core::domain::ScratchpadNote]) -> HashSet<String> {
+    notes.iter().map(|n| n.owner_todo.clone()).collect()
+}
+
+#[tokio::test]
+async fn delete_owner_subtree_removes_self_and_descendants() {
+    with_fixture(
+        "delete_owner_subtree_removes_self_and_descendants",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                for owner in ["", "1", "1.1", "1.2.3", "2"] {
+                    write_owned(&pad, "c1", owner, "k").await;
+                }
+                let n = pad.delete_owner_subtree("c1", "1").await.expect("delete");
+                assert_eq!(n, 3, "subtree of '1' = 1, 1.1, 1.2.3");
+                assert_eq!(
+                    owner_set(&pad.list("c1", None, 50).await.expect("list")),
+                    HashSet::from(["".to_string(), "2".to_string()])
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn delete_owner_subtree_is_dot_boundary_safe() {
+    with_fixture(
+        "delete_owner_subtree_is_dot_boundary_safe",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                for owner in ["1", "1.1", "10", "11", "2"] {
+                    write_owned(&pad, "c1", owner, "k").await;
+                }
+                let n = pad.delete_owner_subtree("c1", "1").await.expect("delete");
+                assert_eq!(n, 2, "'1' matches only '1' and '1.1', never '10'/'11'/'2'");
+                assert_eq!(
+                    owner_set(&pad.list("c1", None, 50).await.expect("list")),
+                    HashSet::from(["10".to_string(), "11".to_string(), "2".to_string()])
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn delete_owner_subtree_is_user_and_conversation_scoped_fail_closed() {
+    with_fixture(
+        "delete_owner_subtree_is_user_and_conversation_scoped_fail_closed",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("c1");
+                convs.create(make_conversation("c2")).await.expect("c2");
+                write_owned(&pad, "c1", "1", "k").await;
+                write_owned(&pad, "c2", "1", "k").await;
+            })
+            .await;
+            // Bob owns none of alice's rows: his cascade deletes nothing.
+            with_user_id(UserId::new("bob"), async {
+                let n = pad
+                    .delete_owner_subtree("c1", "1")
+                    .await
+                    .expect("bob delete");
+                assert_eq!(n, 0, "cross-user cascade is fail-closed");
+            })
+            .await;
+            // Alice's cascade on c1 leaves c2 untouched (conversation-scoped).
+            with_user_id(UserId::new("alice"), async {
+                let n = pad
+                    .delete_owner_subtree("c1", "1")
+                    .await
+                    .expect("alice delete");
+                assert_eq!(n, 1);
+                assert_eq!(pad.list("c2", None, 50).await.expect("c2 list").len(), 1);
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn delete_owner_subtree_idempotent() {
+    with_fixture("delete_owner_subtree_idempotent", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            convs.create(make_conversation("c1")).await.expect("conv");
+            write_owned(&pad, "c1", "1", "k").await;
+            write_owned(&pad, "c1", "1.1", "k").await;
+            assert_eq!(pad.delete_owner_subtree("c1", "1").await.expect("del1"), 2);
+            assert_eq!(
+                pad.delete_owner_subtree("c1", "1").await.expect("del2"),
+                0,
+                "second cascade is a no-op"
+            );
+        })
+        .await;
+        fx
+    })
+    .await;
+}

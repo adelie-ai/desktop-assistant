@@ -290,4 +290,27 @@ impl ScratchpadStore for PgScratchpadStore {
         .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(result.rows_affected())
     }
+
+    async fn delete_owner_subtree(
+        &self,
+        conversation_id: &str,
+        owner_todo: &str,
+    ) -> Result<u64, CoreError> {
+        let user_id = current_user_id();
+        // Delete the namespace itself AND every descendant. The dot-delimited
+        // LIKE is a real prefix match ('1' does not match '10'/'11'); owner_todo
+        // is a bound parameter and the migration-031 [0-9.] CHECK guarantees no
+        // LIKE metacharacters. user_id = $1 first keeps the tenant guard.
+        let result = sqlx::query(
+            "DELETE FROM scratchpads WHERE user_id = $1 AND conversation_id = $2 \
+             AND (owner_todo = $3 OR owner_todo LIKE $3 || '.%')",
+        )
+        .bind(user_id.as_str())
+        .bind(conversation_id)
+        .bind(owner_todo)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
 }

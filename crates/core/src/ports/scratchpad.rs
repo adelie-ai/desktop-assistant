@@ -120,6 +120,20 @@ pub trait ScratchpadStore: Send + Sync {
 
     /// Delete every note for a conversation. Returns the number deleted.
     fn clear(&self, conversation_id: &str) -> impl Future<Output = Result<u64, CoreError>> + Send;
+
+    /// Delete an `owner_todo` namespace AND all its descendants (the whole
+    /// subtree), returning the number deleted. User-scoped via the task-local
+    /// `UserId`, fail-closed, and idempotent (a second call returns 0).
+    ///
+    /// Why: the hard-coded roll-up cascade (#287) frees a completed step's
+    /// descendant subagent namespaces in one shot when the enclosing step
+    /// completes. Distinct from [`Self::delete_many`]/[`Self::clear`], which are
+    /// confined to a single namespace; this deliberately spans the subtree.
+    fn delete_owner_subtree(
+        &self,
+        conversation_id: &str,
+        owner_todo: &str,
+    ) -> impl Future<Output = Result<u64, CoreError>> + Send;
 }
 
 /// Boxed async closure for batch-upserting scratchpad notes through
@@ -179,6 +193,16 @@ pub type ScratchpadDeleteManyFn = Arc<
 /// Boxed async closure for clearing all of a conversation's notes.
 pub type ScratchpadClearFn = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>> + Send + Sync,
+>;
+
+/// Boxed async closure for cascade-deleting an `owner_todo` subtree (the
+/// namespace and all its descendants). Args: `(conversation_id, owner_todo)`;
+/// returns the count deleted. Used by the #287 roll-up cascade through
+/// non-generic boundaries.
+pub type ScratchpadDeleteSubtreeFn = Arc<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
+        + Send
+        + Sync,
 >;
 
 #[cfg(test)]
@@ -244,6 +268,14 @@ mod tests {
         }
 
         async fn clear(&self, _conversation_id: &str) -> Result<u64, CoreError> {
+            Ok(0)
+        }
+
+        async fn delete_owner_subtree(
+            &self,
+            _conversation_id: &str,
+            _owner_todo: &str,
+        ) -> Result<u64, CoreError> {
             Ok(0)
         }
     }

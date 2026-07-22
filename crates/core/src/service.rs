@@ -543,6 +543,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .iter()
             .map(|n| planning::RawNote {
                 key: n.key.as_str(),
+                owner_todo: n.owner_todo.as_str(),
                 content: n.content.as_str(),
                 note_type: n.note_type.as_str(),
                 done: n.done,
@@ -578,6 +579,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .iter()
             .map(|n| planning::RawNote {
                 key: n.key.as_str(),
+                owner_todo: n.owner_todo.as_str(),
                 content: n.content.as_str(),
                 note_type: n.note_type.as_str(),
                 done: n.done,
