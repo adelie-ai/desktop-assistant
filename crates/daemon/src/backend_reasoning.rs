@@ -27,7 +27,7 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig,
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
 };
 
 /// Wraps an [`LlmClient`] and substitutes a fixed [`ReasoningConfig`]
@@ -65,6 +65,14 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         self.inner.refresh_models().await
+    }
+
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.inner.list_models_detailed().await
+    }
+
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.inner.refresh_models_detailed().await
     }
 
     async fn stream_completion(

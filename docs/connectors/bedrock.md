@@ -20,6 +20,42 @@ or the standard AWS SDK credential provider chain.
 | Environment | Standard AWS env vars | No |
 | Config file | `daemon.toml` [bedrock] section | No |
 
+## Model Listing
+
+The picker's Bedrock entries come from two control-plane calls, made in
+parallel and merged into one list:
+
+| Call | IAM action | Contributes |
+|------|-----------|-------------|
+| `ListFoundationModels` | `bedrock:ListFoundationModels` | Foundation models that support **on-demand** throughput |
+| `ListInferenceProfiles` | `bedrock:ListInferenceProfiles` | Cross-region inference profiles (`us.anthropic.claude-...`) |
+
+Foundation models without on-demand support are filtered out: their bare ids
+are not callable and selecting one fails at invocation time with a
+`ValidationException`. In a current AWS account that filter removes nearly
+every modern chat model (Claude 4.x, Nova Premier, DeepSeek R1, GLM); those
+are reachable only through an inference profile.
+
+### Degraded listing
+
+If `ListInferenceProfiles` fails, the listing degrades to on-demand
+foundation models rather than failing: many IAM policies grant
+`bedrock:ListFoundationModels` alone. Because of the on-demand filter above,
+what survives is mostly the Titan/Cohere embedding families: a picker that
+looks like it loaded fine and simply has no chat models.
+
+So the connector also reports the degradation as data. `list_models_detailed`
+returns a `ModelListingReport` whose `notices` carry a partial-catalog entry
+naming the missing permission, and the daemon puts it on every
+`ListAvailableModels` row for that connection, so a client can show
+"inference profiles unavailable, showing on-demand models only" next to the
+picker. Notices are cached alongside the models, so a cache hit within the
+one-hour TTL still reports the degradation.
+
+Both calls are re-issued on an explicit refresh, and a refresh always returns
+a report (even when the list is unchanged), so a client can tell a reload
+that found nothing new from one that failed.
+
 ## Prompt Caching
 
 The Bedrock connector uses the

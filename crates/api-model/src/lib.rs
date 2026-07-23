@@ -1416,6 +1416,41 @@ pub struct ModelListing {
     pub connection_id: String,
     pub connection_label: String,
     pub model: ModelInfoView,
+    /// Non-fatal problems the connection reported while enumerating models
+    /// (e.g. Bedrock inference profiles being unavailable), which leaves a
+    /// picker that looks healthy but holds only on-demand models (#648).
+    /// The value is the same on every row belonging to one connection.
+    ///
+    /// Added after `ModelListing` shipped: `#[serde(default)]` keeps older
+    /// daemon payloads parseable, and skipping the empty case keeps the
+    /// happy-path wire format byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<ModelListingNoticeView>,
+}
+
+/// Machine-readable classification of a [`ModelListingNoticeView`]. Mirrors
+/// `desktop_assistant_core::ports::llm::ModelListingNoticeKind`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelListingNoticeKindView {
+    /// The catalog is a subset of what the connection can actually reach:
+    /// part of the enumeration failed. The listing is still usable.
+    PartialCatalog,
+}
+
+/// A non-fatal problem reported while enumerating a connection's models.
+/// Mirrors `desktop_assistant_core::ports::llm::ModelListingNotice`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelListingNoticeView {
+    pub kind: ModelListingNoticeKindView,
+    /// One-line, user-facing summary of what is missing.
+    pub summary: String,
+    /// User-facing cause and remedy; actionable without the summary.
+    pub detail: String,
+    /// Provider permission to grant, when the cause was an authorization
+    /// denial. `None` for any other cause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_permission: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

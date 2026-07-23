@@ -539,20 +539,36 @@ impl ConnectionsService for DaemonConnectionsService {
 
         let mut out: Vec<CoreModelListing> = Vec::new();
         for (id, connector_type, label, client) in targets {
+            // The detailed variant so a connector that had to degrade (e.g.
+            // Bedrock without `bedrock:ListInferenceProfiles`) can say so in
+            // the response rather than only in the daemon log (#648).
             let list_result = if refresh {
-                client.refresh_models().await
+                client.refresh_models_detailed().await
             } else {
-                client.list_models().await
+                client.list_models_detailed().await
             };
             match list_result {
-                Ok(models) => {
+                Ok(report) => {
+                    if report.is_degraded() {
+                        tracing::info!(
+                            connection = %id,
+                            notices = report.notices.len(),
+                            "model listing is incomplete; reporting it to the client"
+                        );
+                    }
+                    // Notices ride each row of the connection (the listing is
+                    // a flat per-model stream). A connection that produced no
+                    // rows at all therefore carries none. Acceptable because
+                    // an empty picker is already unambiguous, unlike the
+                    // deceptive "loaded, embeddings only" case this reports.
                     let merged =
-                        crate::model_defaults::merge_with_defaults(&connector_type, models);
+                        crate::model_defaults::merge_with_defaults(&connector_type, report.models);
                     for m in merged {
                         out.push(CoreModelListing {
                             connection_id: id.as_str().to_string(),
                             connection_label: label.clone(),
                             model: m,
+                            notices: report.notices.clone(),
                         });
                     }
                 }

@@ -16,8 +16,8 @@ use aws_smithy_types::{Document, Number};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage, current_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelListingNotice,
+    ModelListingReport, ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT};
 use std::collections::HashSet;
@@ -45,9 +45,27 @@ impl ModelClock for SystemClock {
     }
 }
 
+/// Upper bound on the characters of provider text relayed in a listing
+/// notice's `detail`.
+///
+/// Why: the detail is rendered by clients and travels the daemon's wire
+/// protocol, so a broken or hostile upstream message must not be relayed
+/// whole. Generous enough for a real AWS `AccessDeniedException`, which
+/// names the principal, the action, and the resource.
+const MAX_NOTICE_DETAIL_CHARS: usize = 600;
+
+/// The IAM action that `ListInferenceProfiles` requires. Named in the
+/// degradation notice so an operator can fix the policy without digging
+/// through daemon logs.
+const LIST_INFERENCE_PROFILES_PERMISSION: &str = "bedrock:ListInferenceProfiles";
+
 #[derive(Default)]
 struct ModelCache {
-    entry: Option<(Instant, Vec<ModelInfo>)>,
+    /// Why the whole report and not just the models: a cache hit that
+    /// dropped the notices would make a degraded listing look healthy again
+    /// for the rest of the TTL: the exact invisibility this reporting
+    /// exists to remove.
+    entry: Option<(Instant, ModelListingReport)>,
 }
 
 /// Amazon Bedrock client using the Converse API.
@@ -79,6 +97,11 @@ pub struct BedrockClient {
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
+    /// Test-only override for the Bedrock control-plane endpoint, so the
+    /// model-listing tests can drive `ListFoundationModels` /
+    /// `ListInferenceProfiles` against a local mock. Always `None` in
+    /// production, where the endpoint is derived from the region.
+    control_endpoint_override: Option<String>,
 }
 
 impl BedrockClient {
@@ -108,6 +131,7 @@ impl BedrockClient {
             connect_timeout: STREAM_CONNECT_TIMEOUT,
             event_timeout: STREAM_EVENT_TIMEOUT,
             context_cap: None,
+            control_endpoint_override: None,
         }
     }
 
@@ -157,14 +181,28 @@ impl BedrockClient {
     pub async fn __set_models_cache_for_test(&self, models: Vec<ModelInfo>) {
         let now = self.clock.now();
         let mut cache = self.model_cache.lock().await;
-        cache.entry = Some((now, models));
+        cache.entry = Some((now, ModelListingReport::complete(models)));
     }
 
     /// Test-only: peek at the cache contents.
     #[doc(hidden)]
     pub async fn __peek_models_cache_for_test(&self) -> Option<Vec<ModelInfo>> {
         let cache = self.model_cache.lock().await;
-        cache.entry.as_ref().map(|(_, v)| v.clone())
+        cache.entry.as_ref().map(|(_, v)| v.models.clone())
+    }
+
+    /// Test-only: point the Bedrock control plane (`ListFoundationModels` /
+    /// `ListInferenceProfiles`) at `url` instead of the regional AWS
+    /// endpoint, so the model-listing behaviour can be exercised against a
+    /// local mock server rather than a live account.
+    ///
+    /// Only the control plane is redirected; the runtime (Converse) client is
+    /// untouched.
+    #[doc(hidden)]
+    pub fn __with_control_endpoint_for_test(mut self, url: impl Into<String>) -> Self {
+        self.control_endpoint_override = Some(url.into());
+        self.control_client = OnceCell::new();
+        self
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -240,7 +278,13 @@ impl BedrockClient {
         self.control_client
             .get_or_try_init(|| async {
                 let shared_config = self.load_shared_config().await;
-                Ok(BedrockControlClient::new(&shared_config))
+                let Some(endpoint) = self.control_endpoint_override.as_ref() else {
+                    return Ok(BedrockControlClient::new(&shared_config));
+                };
+                let config = aws_sdk_bedrock::config::Builder::from(&shared_config)
+                    .endpoint_url(endpoint)
+                    .build();
+                Ok(BedrockControlClient::from_conf(config))
             })
             .await
     }
@@ -996,6 +1040,68 @@ fn inference_profile_to_model_info(
     })
 }
 
+/// Build the degradation notice for a failed `ListInferenceProfiles` call.
+///
+/// `code` / `message` are the service error metadata (both optional: a
+/// transport or timeout failure carries neither). An authorization denial is
+/// reported with the permission to grant; anything else is reported as an
+/// upstream failure without blaming IAM, so the operator is not sent to edit
+/// a policy over a timeout.
+///
+/// The relayed provider text is truncated to [`MAX_NOTICE_DETAIL_CHARS`]:
+/// the notice is user-facing and crosses the daemon's wire protocol.
+fn inference_profiles_notice(code: Option<&str>, message: Option<&str>) -> ModelListingNotice {
+    // Bedrock answers a missing policy with `AccessDeniedException`; the
+    // bare `AccessDenied` shows up from other AWS front ends. Match the
+    // family on the structured error code, never on the message text.
+    let denied = code.is_some_and(|c| c.to_ascii_lowercase().starts_with("accessdenied"));
+    let cause = match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => "no error details were returned".to_string(),
+    };
+
+    let detail = if denied {
+        format!(
+            "AWS refused ListInferenceProfiles for this connection. Grant \
+             {LIST_INFERENCE_PROFILES_PERMISSION} to surface inference-profile models \
+             (Claude 4.x, Nova Premier, DeepSeek R1 and similar), which are not callable \
+             by their bare foundation-model id. AWS said - {}",
+            truncate_chars(&cause, MAX_NOTICE_DETAIL_CHARS / 2)
+        )
+    } else {
+        format!(
+            "ListInferenceProfiles failed, so inference-profile models (Claude 4.x, \
+             Nova Premier, DeepSeek R1 and similar) are missing from the list. Refresh \
+             to try again. AWS said - {}",
+            truncate_chars(&cause, MAX_NOTICE_DETAIL_CHARS / 2)
+        )
+    };
+
+    let notice = ModelListingNotice::partial_catalog(
+        "Bedrock inference profiles unavailable - showing on-demand models only",
+        truncate_chars(&detail, MAX_NOTICE_DETAIL_CHARS),
+    );
+    if denied {
+        notice.with_required_permission(LIST_INFERENCE_PROFILES_PERMISSION)
+    } else {
+        notice
+    }
+}
+
+/// Truncate `text` to at most `max` characters, marking elision with `...`.
+/// Character-based so multi-byte provider text can't be split mid-codepoint.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
 impl BedrockClient {
     /// Call `ListFoundationModels` + `ListInferenceProfiles` and merge into
     /// a single `ModelInfo` list:
@@ -1008,12 +1114,19 @@ impl BedrockClient {
     ///   (`us.anthropic.claude-haiku-4-5-…` etc.) so the model picker
     ///   exposes the IDs that AWS will actually accept on Converse.
     ///
-    /// Both calls go in parallel. `ListInferenceProfiles` failures are
-    /// logged and swallowed: many existing IAM policies grant
+    /// Both calls go in parallel. A `ListInferenceProfiles` failure degrades
+    /// the listing instead of failing it: many existing IAM policies grant
     /// `bedrock:ListFoundationModels` without
-    /// `bedrock:ListInferenceProfiles`, and we'd rather degrade to the
-    /// foundation-model-only list than fail the whole picker.
-    async fn fetch_models_uncached(&self) -> Result<Vec<ModelInfo>, CoreError> {
+    /// `bedrock:ListInferenceProfiles`, and a foundation-model-only picker
+    /// beats no picker at all.
+    ///
+    /// The degradation is reported in the returned
+    /// [`ModelListingReport::notices`] as well as logged. Why both: what
+    /// survives the filter in a current AWS account is mostly the embedding
+    /// families, so a caller that only sees the model list cannot tell a
+    /// degraded listing from an account with nothing but embedding models
+    /// (#648).
+    async fn fetch_models_uncached(&self) -> Result<ModelListingReport, CoreError> {
         let client = self.control_client().await?;
 
         let foundation_fut = client.list_foundation_models().send();
@@ -1029,6 +1142,7 @@ impl BedrockClient {
             .iter()
             .filter_map(summary_to_model_info)
             .collect();
+        let mut notices = Vec::new();
 
         match profiles_res {
             Ok(profile_resp) => {
@@ -1039,12 +1153,14 @@ impl BedrockClient {
                 }
             }
             Err(error) => {
+                use aws_smithy_types::error::metadata::ProvideErrorMetadata;
                 tracing::warn!(
                     "Bedrock ListInferenceProfiles failed; model picker will only show \
                      on-demand foundation models. Grant bedrock:ListInferenceProfiles to \
                      surface inference-profile ids (Claude 4.x, Nova Premier, etc.). \
                      Cause: {error:#}"
                 );
+                notices.push(inference_profiles_notice(error.code(), error.message()));
             }
         }
 
@@ -1053,12 +1169,12 @@ impl BedrockClient {
         // in practice, but keep the merge total just in case.
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
-        Ok(models)
+        Ok(ModelListingReport { models, notices })
     }
 
-    /// Return cached models, refreshing if the TTL elapsed or the cache is
-    /// empty.
-    async fn list_models_cached(&self) -> Result<Vec<ModelInfo>, CoreError> {
+    /// Return the cached listing, refreshing if the TTL elapsed or the cache
+    /// is empty. Notices are cached with the models they describe.
+    async fn list_models_cached(&self) -> Result<ModelListingReport, CoreError> {
         {
             let cache = self.model_cache.lock().await;
             if let Some((fetched_at, entry)) = cache.entry.as_ref() {
@@ -1073,7 +1189,7 @@ impl BedrockClient {
 
     /// Force a refresh: bypass the cache, fetch from Bedrock, and populate
     /// the cache on success.
-    async fn refresh_models_internal(&self) -> Result<Vec<ModelInfo>, CoreError> {
+    async fn refresh_models_internal(&self) -> Result<ModelListingReport, CoreError> {
         let fresh = self.fetch_models_uncached().await?;
         let now = self.clock.now();
         let mut cache = self.model_cache.lock().await;
@@ -1102,10 +1218,18 @@ impl LlmClient for BedrockClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        self.list_models_cached().await
+        Ok(self.list_models_cached().await?.models)
     }
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        Ok(self.refresh_models_internal().await?.models)
+    }
+
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.list_models_cached().await
+    }
+
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
         self.refresh_models_internal().await
     }
 
@@ -1745,6 +1869,8 @@ fn json_to_document(value: serde_json::Value) -> Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_core::ports::llm::ModelListingNoticeKind;
+
     use aws_sdk_bedrockruntime::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
         ConverseStreamOutput, ToolUseBlockDelta, ToolUseBlockStart,
