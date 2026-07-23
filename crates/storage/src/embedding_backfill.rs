@@ -377,3 +377,127 @@ pub async fn backfill_tool_embeddings(
 
     Ok(total)
 }
+
+/// Backfill NULL / stale-model embeddings for `skill_index` rows (#573),
+/// mirroring [`backfill_tool_embeddings`].
+///
+/// The embedded text is `name + description + body` to match the row's `tsv`.
+/// Each row is keyed by `(name, owner_key)` so a global and a user-scoped skill
+/// sharing a name are updated independently. Returns the number of rows updated.
+pub async fn backfill_skill_embeddings(
+    pool: &PgPool,
+    embed_fn: &BackfillEmbedFn,
+    current_model: &str,
+) -> Result<usize, String> {
+    let mut total = 0usize;
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT name, owner_key, \
+                    name || ' ' || description || ' ' || coalesce(body, '') AS text \
+             FROM skill_index \
+             WHERE embedding_model IS NULL \
+                OR embedding_model != $1 \
+             LIMIT $2",
+        )
+        .bind(current_model)
+        .bind(BATCH_SIZE)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        // Chunk all rows and track which chunks belong to which row.
+        let mut all_chunks: Vec<(usize, String)> = Vec::new();
+        for (i, (_, _, text)) in rows.iter().enumerate() {
+            for chunk in chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP) {
+                all_chunks.push((i, chunk));
+            }
+        }
+
+        let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
+        match embed_fn(texts).await {
+            Ok(embeddings) => {
+                consecutive_failures = 0;
+                let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
+                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings) {
+                    row_embeddings[*row_idx].push(Vector::from(emb));
+                }
+
+                for ((name, owner_key, _), vecs) in rows.iter().zip(row_embeddings) {
+                    sqlx::query(
+                        "UPDATE skill_index \
+                         SET embedding = $1::vector[], embedding_model = $2 \
+                         WHERE name = $3 AND owner_key = $4",
+                    )
+                    .bind(&vecs)
+                    .bind(current_model)
+                    .bind(name)
+                    .bind(owner_key)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                total += rows.len();
+            }
+            Err(e) => {
+                tracing::warn!("skill embedding batch failed, retrying individually: {e}");
+                let mut any_succeeded = false;
+                for (name, owner_key, text) in &rows {
+                    let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    match embed_fn(chunks).await {
+                        Ok(embeddings) => {
+                            let vecs: Vec<Vector> =
+                                embeddings.into_iter().map(Vector::from).collect();
+                            sqlx::query(
+                                "UPDATE skill_index \
+                                 SET embedding = $1::vector[], embedding_model = $2 \
+                                 WHERE name = $3 AND owner_key = $4",
+                            )
+                            .bind(&vecs)
+                            .bind(current_model)
+                            .bind(name)
+                            .bind(owner_key)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            total += 1;
+                            any_succeeded = true;
+                        }
+                        Err(e2) => {
+                            tracing::warn!("skipping skill {name}: {e2}");
+                            sqlx::query(
+                                "UPDATE skill_index \
+                                 SET embedding_model = $1 \
+                                 WHERE name = $2 AND owner_key = $3",
+                            )
+                            .bind(current_model)
+                            .bind(name)
+                            .bind(owner_key)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+                if any_succeeded {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        tracing::error!(
+                            "skill embedding backfill aborting after {consecutive_failures} consecutive failures"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total)
+}

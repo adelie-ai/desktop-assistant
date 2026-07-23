@@ -264,11 +264,17 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Host-global skill index (#573): the disk-sourced skill/workflow catalog,
+    // searchable by hybrid vector + full-text, mirroring `tool_definitions`.
+    sqlx::raw_sql(include_str!("../migrations/033_skill_index.sql"))
+        .execute(pool)
+        .await?;
+
     // #570 Phase 1b: nullable `idempotency_key` on messages, carried on USER
     // rows only, so a transcript reload/reconnect surfaces the client's key and
     // clients dedup an echoed UserMessageAdded by exact match.
     sqlx::raw_sql(include_str!(
-        "../migrations/033_message_idempotency_key.sql"
+        "../migrations/034_message_idempotency_key.sql"
     ))
     .execute(pool)
     .await?;
