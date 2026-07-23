@@ -359,6 +359,32 @@ mod tests {
     }
 
     #[test]
+    fn assembled_prompt_urges_adapting_skills_to_their_source() {
+        // The index aggregates skill libraries authored for other agent
+        // harnesses (`default_user_roots` scans the Claude/Codex/Cursor dirs),
+        // so a skill may name tools, commands, or UI that don't exist here. The
+        // prompt must qualify "follow them as authoritative" with where a skill
+        // came from, and direct translation rather than literal replay (#638).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("several different agents and tools"),
+            "the prompt must say the library aggregates skills written for other tools"
+        );
+        assert!(
+            assembled.contains("authoritative on intent, not on mechanics"),
+            "and scope that authority to intent rather than mechanics"
+        );
+        assert!(
+            assembled.contains("Adapt rather than replay"),
+            "and direct adaptation over literal replay"
+        );
+        assert!(
+            assembled.contains("first principles"),
+            "and offer a fallback when a skill is really about another tool's internals"
+        );
+    }
+
+    #[test]
     fn assembled_prompt_urges_specific_facet_tags() {
         // Generic-only tags (just "instruction"/"memory") fragment and
         // over-surface. The KB guidance must push a two-level scheme: a coarse
