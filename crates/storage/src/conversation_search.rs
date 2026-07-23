@@ -102,6 +102,7 @@ impl ConversationSearchStore for PgConversationSearchStore {
                  AND (m.tsv @@ (SELECT query FROM q)
                       OR c.tsv @@ (SELECT query FROM q))
                  AND ($2::text IS NULL OR m.role = $2)
+                 AND NOT ($5 = ANY(c.tags))
              ORDER BY rank DESC, c.updated_at DESC, m.ordinal ASC
              LIMIT $3",
         )
@@ -109,6 +110,8 @@ impl ConversationSearchStore for PgConversationSearchStore {
         .bind(role_db)
         .bind(limit_i64)
         .bind(user_id.as_str())
+        // #609: exclude subagents' private working conversations from search.
+        .bind(desktop_assistant_core::domain::RESERVED_SUBAGENT_TAG)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

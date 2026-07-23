@@ -12,7 +12,9 @@ mod support;
 
 use std::sync::Arc;
 
-use desktop_assistant_core::domain::{Conversation, ConversationId, Message, Role};
+use desktop_assistant_core::domain::{
+    Conversation, ConversationId, Message, RESERVED_SUBAGENT_TAG, Role,
+};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::{PgConversationStore, UserId, run_migrations, with_user_id};
 use sqlx::PgPool;
@@ -265,6 +267,56 @@ async fn list_count_is_user_scoped() {
 
         fx
     })
+    .await;
+}
+
+/// #609: a subagent's private working conversation is tagged
+/// `RESERVED_SUBAGENT_TAG` at creation and must NOT surface in `list` -- it is
+/// an implementation detail, not something the user opened. A normal
+/// conversation alongside it still lists, and the hidden one is still directly
+/// resolvable by id (hidden from the list, not deleted).
+#[tokio::test]
+async fn list_excludes_subagent_tagged_conversations() {
+    with_fixture(
+        "list_excludes_subagent_tagged_conversations",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create(conversation_with_messages("conv-normal", "normal", 1))
+                    .await
+                    .expect("create normal conv");
+                let mut sub = conversation_with_messages("conv-sub", "Subagent: researcher", 1);
+                sub.tags = vec![RESERVED_SUBAGENT_TAG.to_string()];
+                store.create(sub).await.expect("create subagent conv");
+            })
+            .await;
+
+            let list = with_user_id(UserId::new("alice"), async { store.list().await })
+                .await
+                .expect("alice list");
+
+            assert_eq!(list.len(), 1, "only the normal conversation is listed");
+            assert_eq!(list[0].id.0, "conv-normal");
+            assert!(
+                !list.iter().any(|s| s.id.0 == "conv-sub"),
+                "subagent working conversation is hidden from the list"
+            );
+
+            // Still resolvable directly -- hidden from the list, not deleted.
+            let got = with_user_id(UserId::new("alice"), async {
+                store.get(&ConversationId::from("conv-sub")).await
+            })
+            .await;
+            assert!(
+                got.is_ok(),
+                "subagent conversation is still fetchable by id for the running child"
+            );
+
+            fx
+        },
+    )
     .await;
 }
 

@@ -24,6 +24,16 @@ impl From<&str> for ConversationId {
     }
 }
 
+/// Conversation tag marking a subagent's private working conversation (#609).
+///
+/// A subagent runs its turns in a conversation of its own (for history and LLM
+/// context), but that conversation is an implementation detail: it clutters the
+/// user's conversation list and pollutes message search with the subagent's raw
+/// working transcript. Tagging it with this reserved value lets `list` and
+/// conversation search filter it out while `get` still resolves it directly.
+/// The double-underscore namespacing keeps it clear of any user-authored tag.
+pub const RESERVED_SUBAGENT_TAG: &str = "__subagent__";
+
 /// A collapsed range of messages replaced by a summary text.
 ///
 /// Why: the range covered by a summary is recovered at render time from

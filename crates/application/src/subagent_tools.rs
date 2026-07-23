@@ -305,10 +305,16 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
 
         // Create the child conversation. The title doubles as the
         // subagent label so the UI can show it without destructuring
-        // `TaskKind`.
+        // `TaskKind`. It carries the reserved subagent tag (#609) so this
+        // private working conversation is filtered out of the user's
+        // conversation list and message search -- the parent collects the
+        // subagent's result off the pad (#607/#608), not from this transcript.
         let child_conv = self
             .conversations
-            .create_conversation(format!("Subagent: {name}"), vec![])
+            .create_conversation(
+                format!("Subagent: {name}"),
+                vec![desktop_assistant_core::domain::RESERVED_SUBAGENT_TAG.to_string()],
+            )
             .await?;
         let child_conversation_id = child_conv.id.0.clone();
 
