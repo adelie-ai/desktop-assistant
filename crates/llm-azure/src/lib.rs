@@ -1773,4 +1773,60 @@ mod tests {
             "non-secret fields stay visible"
         );
     }
+
+    // --- TTL model cache (issue #620) -----------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// Mock clock: an atomic second-offset from a fixed origin, advanced by the
+    /// tests so TTL behaviour is deterministic (no sleeping, no real network).
+    struct MockClock {
+        origin: Instant,
+        offset_secs: AtomicU64,
+    }
+
+    impl MockClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                offset_secs: AtomicU64::new(0),
+            })
+        }
+        fn advance_secs(&self, secs: u64) {
+            self.offset_secs.fetch_add(secs, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now(&self) -> Instant {
+            self.origin + Duration::from_secs(self.offset_secs.load(Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_serves_curated_through_the_cache() {
+        // Azure has no live listing endpoint yet (deployment enumeration is an
+        // ARM control-plane operation), so the cache always serves the curated
+        // table. Exercise the cached path with an injected clock: the result is
+        // stable within the TTL and rebuilt (identically) once it lapses.
+        let clock = MockClock::new();
+        let expected = merge_curated_with_live(curated_azure_models(), Vec::new());
+        let client = AzureClient::new("k".into())
+            .with_clock(clock.clone())
+            .with_model_cache_ttl(Duration::from_secs(3600));
+
+        assert_eq!(client.list_models().await.unwrap(), expected); // fills cache
+        clock.advance_secs(30 * 60);
+        assert_eq!(client.list_models().await.unwrap(), expected); // within TTL
+        clock.advance_secs(3600);
+        assert_eq!(client.list_models().await.unwrap(), expected); // past TTL, rebuilt
+    }
+
+    #[tokio::test]
+    async fn refresh_models_returns_curated_table() {
+        let client = AzureClient::new("k".into());
+        let expected = merge_curated_with_live(curated_azure_models(), Vec::new());
+        assert_eq!(client.refresh_models().await.unwrap(), expected);
+    }
 }

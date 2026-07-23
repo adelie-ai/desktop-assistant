@@ -1372,4 +1372,140 @@ mod tests {
         assert!(info.capabilities.vision);
         assert!(!info.capabilities.embedding);
     }
+
+    // --- TTL model cache (issue #620) -----------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// Mock clock: an atomic second-offset from a fixed origin, advanced by the
+    /// tests so TTL expiry is deterministic (no sleeping, no real wall clock).
+    struct MockClock {
+        origin: Instant,
+        offset_secs: AtomicU64,
+    }
+
+    impl MockClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                offset_secs: AtomicU64::new(0),
+            })
+        }
+        fn advance_secs(&self, secs: u64) {
+            self.offset_secs.fetch_add(secs, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now(&self) -> Instant {
+            self.origin + Duration::from_secs(self.offset_secs.load(Ordering::SeqCst))
+        }
+    }
+
+    /// A `/models` mock returning one bare live id; returns the handle so a test
+    /// can assert the exact number of upstream calls.
+    fn models_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"data":[{"id":"vendor/live-only","name":"Live Only"}]}"#);
+        })
+    }
+
+    #[tokio::test]
+    async fn list_models_served_from_cache_within_ttl() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server).with_clock(clock.clone());
+
+        let first = client.list_models().await.expect("first fetch");
+        clock.advance_secs(30 * 60); // < 1h TTL
+        let second = client.list_models().await.expect("served from cache");
+
+        assert_eq!(first, second);
+        m.assert_calls(1); // the second call did NOT hit the endpoint
+    }
+
+    #[tokio::test]
+    async fn list_models_refetches_after_ttl_expiry() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server)
+            .with_clock(clock.clone())
+            .with_model_cache_ttl(Duration::from_secs(3600));
+
+        client.list_models().await.expect("first fetch");
+        clock.advance_secs(3601); // past the TTL
+        client.list_models().await.expect("refetch");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn list_models_refetches_at_exact_ttl_boundary() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server)
+            .with_clock(clock.clone())
+            .with_model_cache_ttl(Duration::from_secs(3600));
+
+        client.list_models().await.expect("first fetch");
+        clock.advance_secs(3600); // age == TTL → expired
+        client.list_models().await.expect("refetch at boundary");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn refresh_models_bypasses_cache() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server).with_clock(clock.clone());
+
+        client.list_models().await.expect("prime cache"); // call 1
+        client.refresh_models().await.expect("forced refetch"); // call 2, ignores TTL
+        m.assert_calls(2);
+
+        // refresh re-stored, so a subsequent list within TTL is served warm.
+        client.list_models().await.expect("served from refreshed cache");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn failure_degrades_to_curated_without_poisoning_then_success_caches() {
+        let clock = MockClock::new();
+        let server = MockServer::start();
+        let failing = server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(500).body("boom");
+        });
+        let client = client_for(&server).with_clock(clock.clone());
+
+        // Live failure → degrade to the curated table, and do NOT cache it.
+        let degraded = client.list_models().await.expect("degrade, not error");
+        assert_eq!(degraded, curated_openrouter_models());
+        failing.assert_calls(1);
+        failing.delete();
+
+        // The failure did not poison the cache, so the next call re-fetches —
+        // and a success now populates the cache.
+        let ok = server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"data":[{"id":"vendor/back-online"}]}"#);
+        });
+        let recovered = client.list_models().await.expect("success");
+        assert!(recovered.iter().any(|m| m.id == "vendor/back-online"));
+        ok.assert_calls(1);
+
+        // Now served warm (no clock advance): still exactly one success call.
+        let warm = client.list_models().await.expect("served from cache");
+        assert_eq!(recovered, warm);
+        ok.assert_calls(1);
+    }
 }
