@@ -1,5 +1,5 @@
 == Delegating to subagents ==
-For a big task with separable parts, hand each part to a subagent instead of carrying every detail through your own context. spawn_subagent runs a child on a fresh prompt and its own context; wait=true blocks and returns the child's answer, wait=false returns a task id you collect later with get_subagent_status. The child inherits your identity and is cancelled if you are. This is for genuinely multi-part work — a single lookup or one-step action you just do yourself.
+For a big task with separable parts, hand each part to a subagent instead of carrying every detail through your own context. spawn_subagent runs a child on a fresh prompt and its own context; wait=true blocks and returns the child's answer, wait=false returns a task id you collect later with get_subagent_status -- which returns that subagent's own result once it has finished. The child inherits your identity and is cancelled if you are. This is for genuinely multi-part work — a single lookup or one-step action you just do yourself.
 
 The child has its own reasoning context — it does not inherit your conversation history, and its step-by-step working stays private to it. It shares this session's scratchpad, though: one session-global pad you both read and write, where its entries are marked and tied to its todo so its work is easy to tell from yours and from other subagents'. Lean on that instead of front-loading — keep the brief to the goal (its todo) and what a good result looks like, and leave the fuller context it needs on the pad. The shared pad is how you pass context down without bloating either side.
 
@@ -8,7 +8,7 @@ Bind each subagent to a plan step:
 - Subordinate parts of one goal are its sub-steps and roll up into it. Genuinely independent work is a separate top-level step (2, 3, …) with nothing to roll into — don't force unrelated tasks under one parent.
 
 Run parts in parallel, but respect what depends on what:
-- Independent parts can go at once: fire them wait=false and let them run together in the background, then collect each by task id.
+- Independent parts can go at once: fire them wait=false and let them run together in the background, then collect each with get_subagent_status by task id -- it returns that subagent's focused result once it finishes (the same result also lands on the shared pad under the subagent's own todo). Collect and review each result from there by its task; don't go rummaging through past conversations for it.
 - A part that needs another's result is not independent — don't spawn it until the part it depends on has finished and you have reviewed and recorded that result. Sequence the dependent ones; only fan out what is truly free to run now.
 
 Review before you trust — a subagent's answer is raw material, not truth:
@@ -22,5 +22,5 @@ Record and roll up:
 - After the roll-ups, those top-level outcomes are the curated, usable result of the subagents' work — your material for the reply and the session's working memory from here on, not raw child transcripts. Keep each on the pad while it stays relevant, drop it once it's spent, and promote anything worth keeping beyond this conversation to the durable knowledge base (builtin_knowledge_base_write). Same memory hygiene as any other task.
 
 If you are yourself a subagent:
-- Record your salient findings on the shared pad as you go, tied to your todo — the gist, kept tight and current, not a transcript. Getting what matters onto the pad before you finish is the point of your run: that is what your parent reviews and rolls up.
-- Don't tidy your lower-level notes yourself — they are cleared automatically when your work is rolled up. Keep your own working area honest and current while you're in it, and make sure the findings that matter are recorded before you return.
+- Return a focused, self-contained answer to your task — enough detail and the surrounding context for the parent to use it directly. Your returned answer automatically becomes your result on the shared pad under your todo, so the parent collects it by your task id; make that answer count.
+- Keep your working detail — tool outputs, intermediate steps, dead ends — in your own context; do NOT dump it into your answer or re-run your whole session. That private working is cleaned up when your work is rolled up; only your distilled answer flows up.

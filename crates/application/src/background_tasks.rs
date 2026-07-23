@@ -544,6 +544,40 @@ impl BackgroundTaskRegistry {
         Some(state.view.clone())
     }
 
+    /// Like [`get`](Self::get) but falls back to the persistence store when the
+    /// task is absent from the in-memory map (#608).
+    ///
+    /// A task is evicted from the map the instant it reaches a terminal state
+    /// (#158), so a plain `get` reports `None` for every *completed* subagent --
+    /// precisely the ones a parent calls `get_subagent_status` to collect. The
+    /// store retains the terminal row, so this reads it back and reconstructs
+    /// the [`api::TaskView`].
+    ///
+    /// User scoping is enforced twice: the store's `get_task` filters on the
+    /// caller's `current_user_id()` task-local, and the loaded row's `user_id`
+    /// is re-checked against `user_id` here. A row that fails either check is
+    /// reported as absent -- same existence-hiding contract as `get` (#105).
+    /// Store errors are logged and treated as absent so a transient DB fault
+    /// degrades to `not_found` rather than surfacing as a tool failure.
+    pub async fn get_or_load(&self, user_id: &UserId, id: &api::TaskId) -> Option<api::TaskView> {
+        if let Some(view) = self.get(user_id, id) {
+            return Some(view);
+        }
+        let store = self.inner.store.as_ref()?;
+        let row = match store.get_task(&id.0).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(error = %e, task_id = %id.0, "load background task from store");
+                return None;
+            }
+        };
+        if row.user_id != user_id.as_str() {
+            return None;
+        }
+        row_to_view(&row)
+    }
+
     /// #287: is any of this user's background tasks under the given `owner_todo`
     /// subtree (within `session_conversation_id`) still non-terminal?
     ///
@@ -1232,11 +1266,35 @@ fn api_status_to_db(s: api::TaskStatus) -> BackgroundTaskStatus {
     }
 }
 
-/// Inverse of [`api_status_to_db`]. Currently used by sweep tests and
-/// by callers that observe a `BackgroundTaskRow` (e.g. a future
-/// "list across all daemons" command). Kept alongside the forward
-/// mapping so the two stay symmetric.
-#[allow(dead_code)]
+/// Reconstruct an [`api::TaskView`] from a persisted [`BackgroundTaskRow`]
+/// (#608). Returns `None` if `kind_json` fails to deserialize -- a corrupt or
+/// forward-incompatible row is treated as absent rather than panicking. The
+/// store does not persist the live `children` list, so it comes back empty;
+/// that is correct for the terminal rows this path loads (a finished task has
+/// no live children to report).
+fn row_to_view(row: &BackgroundTaskRow) -> Option<api::TaskView> {
+    let kind: api::TaskKind = serde_json::from_value(row.kind_json.clone())
+        .map_err(|e| warn!(error = %e, task_id = %row.id, "parse kind_json loading task view"))
+        .ok()?;
+    Some(api::TaskView {
+        id: api::TaskId(row.id.clone()),
+        kind,
+        status: db_status_to_api(row.status),
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+        last_error: row.last_error.clone(),
+        parent: row.parent_task_id.clone().map(api::TaskId),
+        children: Vec::new(),
+        title: row.title.clone(),
+        progress_hint: row.progress_hint.clone(),
+        owner_todo: row.owner_todo.clone(),
+        spawn_marker: row.spawn_marker.clone(),
+    })
+}
+
+/// Inverse of [`api_status_to_db`]. Used by [`row_to_view`], the cold-restart
+/// sweep, and sweep tests. Kept alongside the forward mapping so the two stay
+/// symmetric.
 fn db_status_to_api(s: BackgroundTaskStatus) -> api::TaskStatus {
     match s {
         BackgroundTaskStatus::Pending => api::TaskStatus::Pending,

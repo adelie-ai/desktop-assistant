@@ -307,10 +307,13 @@ impl ConversationStore for PgConversationStore {
              LEFT JOIN messages m \
                     ON m.user_id = c.user_id AND m.conversation_id = c.id \
              WHERE c.user_id = $1 \
+               AND NOT ($2 = ANY(c.tags)) \
              GROUP BY c.id, c.title, c.created_at, c.updated_at, c.archived_at, c.tags \
              ORDER BY c.updated_at DESC",
         )
         .bind(user_id.as_str())
+        // #609: hide subagents' private working conversations from the list.
+        .bind(desktop_assistant_core::domain::RESERVED_SUBAGENT_TAG)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

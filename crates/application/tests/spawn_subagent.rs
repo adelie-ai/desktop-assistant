@@ -1748,7 +1748,7 @@ fn empty_slot() -> ConversationSlot {
 
 #[tokio::test]
 async fn wrapper_core_tools_include_subagent_definitions() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let names: Vec<String> = w.core_tools().await.into_iter().map(|d| d.name).collect();
     assert!(
         names.iter().any(|n| n == "inner_tool"),
@@ -1760,7 +1760,7 @@ async fn wrapper_core_tools_include_subagent_definitions() {
 
 #[tokio::test]
 async fn wrapper_tool_definition_resolves_subagent_names_else_inner() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     assert_eq!(
         w.tool_definition(TOOL_SPAWN_SUBAGENT)
             .await
@@ -1778,7 +1778,7 @@ async fn wrapper_tool_definition_resolves_subagent_names_else_inner() {
 
 #[tokio::test]
 async fn wrapper_search_and_namespaces_delegate_to_inner() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let searched: Vec<String> = w
         .search_tools("q")
         .await
@@ -1798,7 +1798,7 @@ async fn wrapper_search_and_namespaces_delegate_to_inner() {
 
 #[tokio::test]
 async fn wrapper_delegates_unknown_tool_to_inner() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let out = w
         .execute_tool("inner_tool", serde_json::json!({}))
         .await
@@ -1808,7 +1808,7 @@ async fn wrapper_delegates_unknown_tool_to_inner() {
 
 #[tokio::test]
 async fn wrapper_execute_before_slot_set_returns_recoverable_error() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let err = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_SPAWN_SUBAGENT,
@@ -1835,7 +1835,7 @@ async fn wrapper_execute_after_service_dropped_returns_recoverable_error() {
     let slot = empty_slot();
     let _ = slot.set(Arc::downgrade(&conv));
     drop(conv); // strong ref gone -> Weak::upgrade fails
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot, None);
     let err = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_SPAWN_SUBAGENT,
@@ -1865,7 +1865,7 @@ async fn wrapper_routes_spawn_subagent_to_subagent_tools() {
     let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
     let slot = empty_slot();
     let _ = slot.set(Arc::downgrade(&conv));
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot, None);
     let out = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_SPAWN_SUBAGENT,
@@ -1891,7 +1891,7 @@ async fn wrapper_routes_get_subagent_status_to_subagent_tools() {
     let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
     let slot = empty_slot();
     let _ = slot.set(Arc::downgrade(&conv));
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot, None);
     let out = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_GET_SUBAGENT_STATUS,
@@ -1936,4 +1936,333 @@ fn wrapper_impls_tool_executor_and_is_send_sync() {
     // Silence unused-import lints if the suite is trimmed.
     let _ = tool_definitions();
     let _ = Weak::<()>::new();
+}
+
+// --------------------------------------------------------------------
+// #607: a subagent's final answer auto-writes to the SESSION pad as a
+// "result" note under the child's owner_todo.
+// --------------------------------------------------------------------
+
+#[tokio::test]
+async fn subagent_completion_writes_result_note_to_session_pad_under_owner_todo() {
+    use desktop_assistant_application::subagent_tools::SubagentScratchpad;
+    use desktop_assistant_core::ports::scratchpad_scope::{
+        SubagentScope, with_pending_child_scope,
+    };
+    use std::sync::Mutex as StdMutex;
+
+    // (conversation_id, note_key, content, owner_todo-at-write) recorded per note.
+    type WriteRec = (String, String, String, String);
+
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let conversations = Arc::new(FakeConversations::new("the answer"));
+
+    // Fake write closure records what each note write saw.
+    let recorded: Arc<StdMutex<Vec<WriteRec>>> = Arc::new(StdMutex::new(Vec::new()));
+    let rec = Arc::clone(&recorded);
+    let write: desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn = Arc::new(
+        move |conv: String,
+              notes: Vec<desktop_assistant_core::ports::scratchpad::NewScratchpadNote>| {
+            let rec = Arc::clone(&rec);
+            Box::pin(async move {
+                // The completion write runs under the child's scope, so the
+                // owner_todo task-local is the child's namespace.
+                let owner = desktop_assistant_core::ports::scratchpad_scope::current_owner_todo()
+                    .unwrap_or_default();
+                let mut out = Vec::new();
+                for (i, n) in notes.iter().enumerate() {
+                    rec.lock().unwrap().push((
+                        conv.clone(),
+                        n.key.clone(),
+                        n.content.clone(),
+                        owner.clone(),
+                    ));
+                    out.push(desktop_assistant_core::domain::ScratchpadNote::new(
+                        format!("id{i}"),
+                        &conv,
+                        &n.key,
+                        &n.content,
+                    ));
+                }
+                Ok(out)
+            })
+        },
+    );
+    let get_many: desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn =
+        Arc::new(|_c, _k, _l| Box::pin(async { Ok(Vec::new()) }));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations))
+        .with_scratchpad(SubagentScratchpad { write, get_many });
+    let user = unique_user("alice");
+
+    let scope = SubagentScope {
+        session_conversation_id: desktop_assistant_core::domain::ConversationId::from("sess-1"),
+        owner_todo: "1.1".to_string(),
+        visible_before: "marker".to_string(),
+        ancestors: vec![String::new()],
+    };
+
+    let user_for_body = user.clone();
+    let tools_for_body = tools.clone();
+    let (_parent_id, result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            let scope = scope.clone();
+            async move {
+                with_user_id(user, async move {
+                    // The dispatch loop installs PENDING_CHILD_SCOPE around the
+                    // spawn call; emulate that so the child adopts the scope.
+                    with_pending_child_scope(scope, async move {
+                        tools
+                            .execute_tool(
+                                TOOL_SPAWN_SUBAGENT,
+                                serde_json::json!({
+                                    "name": "researcher",
+                                    "prompt": "say hello",
+                                    "wait": true,
+                                }),
+                            )
+                            .await
+                    })
+                    .await
+                })
+                .await
+            }
+        })
+        .await;
+
+    assert_eq!(result.expect("tool returned Ok"), "the answer");
+    let notes = recorded.lock().unwrap();
+    let (conv, _key, content, owner) = notes
+        .iter()
+        .find(|(_, key, _, _)| key == "result")
+        .expect("a 'result' note was written to the pad");
+    assert_eq!(conv, "sess-1", "result written to the SESSION conversation");
+    assert_eq!(
+        content, "the answer",
+        "note content is the child's final answer"
+    );
+    assert_eq!(owner, "1.1", "result stamped under the child's owner_todo");
+}
+
+// --------------------------------------------------------------------
+// #608: get_subagent_status returns a completed subagent's result.
+//
+// A completed subagent is evicted from the in-memory registry the instant
+// it finishes (#158), so `status` must (a) fall back to the persistence
+// store to still report "completed", and (b) read the child's "result"
+// note off the session pad (written by #607) under the child's owner_todo.
+// --------------------------------------------------------------------
+
+use desktop_assistant_core::ports::store::{
+    BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStore,
+};
+
+/// Minimal store that only answers `get_task` from a fixed map -- enough to
+/// exercise the registry's `get_or_load` store fallback (#608). No user-scope
+/// filtering here (the real Postgres adapter does that); the registry re-checks
+/// `row.user_id`, which is what these tests assert.
+struct FixedStore {
+    rows: HashMap<String, BackgroundTaskRow>,
+}
+
+#[async_trait::async_trait]
+impl BackgroundTaskStore for FixedStore {
+    async fn create_task(&self, _row: BackgroundTaskRow) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn get_task(&self, id: &str) -> Result<Option<BackgroundTaskRow>, CoreError> {
+        Ok(self.rows.get(id).cloned())
+    }
+    async fn update_task(
+        &self,
+        _id: &str,
+        _status: BackgroundTaskStatus,
+        _last_error: Option<&str>,
+        _progress_hint: Option<&str>,
+        _ended_at: Option<i64>,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn list_tasks_for_user(
+        &self,
+        _user_id: &str,
+        _include_finished: bool,
+        _limit: Option<u32>,
+    ) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(vec![])
+    }
+    async fn scan_non_terminal(&self) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(vec![])
+    }
+}
+
+/// A completed subagent row as it survives in the store after in-memory
+/// eviction. `owner_todo` pins the child's namespace on the session pad.
+fn completed_subagent_row(id: &str, user: &UserId, owner_todo: &str) -> BackgroundTaskRow {
+    let kind = api::TaskKind::Subagent {
+        parent_task_id: api::TaskId("parent-1".to_string()),
+        conversation_id: "child-conv".to_string(),
+        name: "researcher".to_string(),
+        session_conversation_id: "sess-1".to_string(),
+    };
+    BackgroundTaskRow {
+        id: id.to_string(),
+        user_id: user.as_str().to_string(),
+        kind_json: serde_json::to_value(kind).expect("serialize kind"),
+        status: BackgroundTaskStatus::Completed,
+        parent_task_id: Some("parent-1".to_string()),
+        title: "researcher".to_string(),
+        last_error: None,
+        progress_hint: None,
+        started_at: 1,
+        ended_at: Some(2),
+        owner_todo: owner_todo.to_string(),
+        spawn_marker: Some("marker".to_string()),
+    }
+}
+
+/// Build a `get_many` handle returning a fixed set of `(owner_todo, content)`
+/// notes for key "result" (ignoring the conversation/keys/limit args, as the
+/// real store's owner filtering is exercised in the storage crate).
+fn result_notes_get_many(
+    notes: Vec<(String, String)>,
+) -> desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn {
+    Arc::new(move |_conv, _keys, _limit| {
+        let notes = notes.clone();
+        Box::pin(async move {
+            let out = notes
+                .into_iter()
+                .enumerate()
+                .map(|(i, (owner, content))| {
+                    let mut n = desktop_assistant_core::domain::ScratchpadNote::new(
+                        format!("id{i}"),
+                        "sess-1",
+                        "result",
+                        content,
+                    );
+                    n.owner_todo = owner;
+                    n
+                })
+                .collect();
+            Ok(out)
+        })
+    })
+}
+
+/// Assemble `SubagentTools` wired to a store (for the completed-task fallback)
+/// and a get_many returning `notes` (for the result-note read).
+fn status_tools(
+    store: Arc<FixedStore>,
+    notes: Vec<(String, String)>,
+) -> SubagentTools<dyn ConversationService> {
+    use desktop_assistant_application::subagent_tools::SubagentScratchpad;
+    let registry = Arc::new(BackgroundTaskRegistry::new().with_store(store));
+    let conversations: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("unused"));
+    let write: desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn =
+        Arc::new(|_c, _n| Box::pin(async { Ok(Vec::new()) }));
+    SubagentTools::new(registry, conversations).with_scratchpad(SubagentScratchpad {
+        write,
+        get_many: result_notes_get_many(notes),
+    })
+}
+
+/// Call get_subagent_status under a user + session-conversation scope so the
+/// result-note read can locate the session pad, returning parsed JSON.
+async fn run_status(
+    tools: &SubagentTools<dyn ConversationService>,
+    user: UserId,
+    task_id: &str,
+) -> serde_json::Value {
+    use desktop_assistant_core::ports::conversation_ctx::with_conversation_id;
+    let task_id = task_id.to_string();
+    let raw = with_user_id(
+        user,
+        with_conversation_id(ConversationId::from("sess-1"), async {
+            tools
+                .execute_tool(
+                    TOOL_GET_SUBAGENT_STATUS,
+                    serde_json::json!({ "task_id": task_id }),
+                )
+                .await
+        }),
+    )
+    .await
+    .expect("status returned Ok");
+    serde_json::from_str(&raw).expect("status returned JSON")
+}
+
+#[tokio::test]
+async fn get_subagent_status_returns_completed_with_result_from_pad() {
+    let user = unique_user("alice");
+    let mut rows = HashMap::new();
+    rows.insert(
+        "task-9".to_string(),
+        completed_subagent_row("task-9", &user, "1.1"),
+    );
+    let store = Arc::new(FixedStore { rows });
+    // Two "result" notes on the session pad; only the one under owner_todo
+    // "1.1" belongs to this child, so the sibling "1.2" note must be ignored.
+    let tools = status_tools(
+        store,
+        vec![
+            ("1.2".to_string(), "sibling B answer".to_string()),
+            ("1.1".to_string(), "child A answer".to_string()),
+        ],
+    );
+
+    let json = run_status(&tools, user, "task-9").await;
+    assert_eq!(
+        json["status"], "completed",
+        "evicted-but-completed via store"
+    );
+    assert_eq!(
+        json["result"], "child A answer",
+        "surfaces the result note under THIS child's owner_todo, not a sibling's"
+    );
+}
+
+#[tokio::test]
+async fn get_subagent_status_completed_without_result_note_omits_result() {
+    let user = unique_user("alice");
+    let mut rows = HashMap::new();
+    rows.insert(
+        "task-9".to_string(),
+        completed_subagent_row("task-9", &user, "1.1"),
+    );
+    let store = Arc::new(FixedStore { rows });
+    // Pad has no note for this child (only a sibling's).
+    let tools = status_tools(store, vec![("1.2".to_string(), "sibling".to_string())]);
+
+    let json = run_status(&tools, user, "task-9").await;
+    assert_eq!(json["status"], "completed");
+    assert!(
+        json.get("result").is_none(),
+        "no result note for this child -> status stays lifecycle-only, no result key"
+    );
+}
+
+#[tokio::test]
+async fn get_subagent_status_hides_task_owned_by_another_user() {
+    let owner = unique_user("bob");
+    let prober = unique_user("alice");
+    let mut rows = HashMap::new();
+    // Row is Bob's; the mock store does not user-filter, so the registry's
+    // own `row.user_id` re-check is the thing under test.
+    rows.insert(
+        "task-9".to_string(),
+        completed_subagent_row("task-9", &owner, "1.1"),
+    );
+    let store = Arc::new(FixedStore { rows });
+    let tools = status_tools(store, vec![("1.1".to_string(), "bob's secret".to_string())]);
+
+    let json = run_status(&tools, prober, "task-9").await;
+    assert_eq!(
+        json["error"], "not_found",
+        "another user's task is indistinguishable from a missing one (#105)"
+    );
+    assert!(
+        json.get("result").is_none(),
+        "never leak the other user's result content"
+    );
 }

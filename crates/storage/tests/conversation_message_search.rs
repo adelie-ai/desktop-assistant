@@ -15,7 +15,7 @@ mod support;
 
 use std::sync::Arc;
 
-use desktop_assistant_core::domain::{Conversation, Message, Role};
+use desktop_assistant_core::domain::{Conversation, Message, RESERVED_SUBAGENT_TAG, Role};
 use desktop_assistant_core::ports::conversation_search::ConversationSearchStore;
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::{
@@ -236,5 +236,62 @@ async fn search_messages_is_double_user_scoped() {
         );
         fx
     })
+    .await;
+}
+
+/// #609: a subagent's private working conversation is tagged
+/// `RESERVED_SUBAGENT_TAG` and must be excluded from message search -- its raw
+/// working transcript should never pollute the user's results. An identical
+/// message in a normal conversation IS found, proving the exclusion is
+/// tag-driven rather than a broken query.
+#[tokio::test]
+async fn search_excludes_subagent_tagged_conversations() {
+    with_fixture(
+        "search_excludes_subagent_tagged_conversations",
+        |fx| async move {
+            let conv_store = PgConversationStore::new(fx.pool.clone());
+            let search = PgConversationSearchStore::new(fx.pool.clone());
+
+            // A distinctive token present in BOTH conversations' messages.
+            let term = "quokka";
+            with_user_id(UserId::new("alice"), async {
+                conv_store
+                    .create(conversation(
+                        "conv-normal",
+                        "planning",
+                        "notes about the quokka rollout",
+                    ))
+                    .await
+                    .expect("create normal conv");
+                let mut sub = conversation(
+                    "conv-sub",
+                    "Subagent: researcher",
+                    "raw working notes about the quokka rollout",
+                );
+                sub.tags = vec![RESERVED_SUBAGENT_TAG.to_string()];
+                conv_store.create(sub).await.expect("create subagent conv");
+            })
+            .await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                search.search_messages(term, 20, None).await
+            })
+            .await
+            .expect("alice search");
+
+            assert!(
+                hits.iter().any(|h| h.conversation_id == "conv-normal"),
+                "the normal conversation's match is returned; got {:?}",
+                hits.iter().map(|h| &h.conversation_id).collect::<Vec<_>>()
+            );
+            assert!(
+                !hits.iter().any(|h| h.conversation_id == "conv-sub"),
+                "the subagent working conversation must be excluded from search; got {:?}",
+                hits.iter().map(|h| &h.conversation_id).collect::<Vec<_>>()
+            );
+
+            fx
+        },
+    )
     .await;
 }
