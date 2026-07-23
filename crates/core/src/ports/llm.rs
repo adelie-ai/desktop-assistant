@@ -1579,6 +1579,94 @@ mod tests {
         assert!(llm.refresh_models().await.unwrap().is_empty());
     }
 
+    /// A connector that only knows how to list models still answers the
+    /// detailed API, reporting "nothing went wrong" rather than nothing at
+    /// all — otherwise every non-Bedrock connector would look degraded (#648).
+    #[tokio::test]
+    async fn detailed_listing_defaults_to_the_plain_model_list() {
+        struct PlainLlm;
+        #[async_trait::async_trait]
+        impl LlmClient for PlainLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(""))
+            }
+
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+                Ok(vec![ModelInfo::new("only-model")])
+            }
+        }
+
+        let llm = PlainLlm;
+        let listed = llm.list_models_detailed().await.expect("detailed listing");
+        assert_eq!(listed.models, vec![ModelInfo::new("only-model")]);
+        assert!(listed.notices.is_empty());
+        assert!(!listed.is_degraded());
+
+        let refreshed = llm
+            .refresh_models_detailed()
+            .await
+            .expect("detailed refresh");
+        assert_eq!(refreshed.models, listed.models);
+        assert!(refreshed.notices.is_empty());
+    }
+
+    /// The wrappers every client is built through (`Arc`, retry) must not
+    /// swallow notices on the way out — that would re-hide the degradation
+    /// the connector went to the trouble of reporting (#648).
+    #[tokio::test]
+    async fn wrappers_forward_listing_notices() {
+        struct DegradedLlm;
+        #[async_trait::async_trait]
+        impl LlmClient for DegradedLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(""))
+            }
+
+            async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+                Ok(ModelListingReport::complete(vec![ModelInfo::new("m")])
+                    .with_notice(ModelListingNotice::partial_catalog("partial", "detail")))
+            }
+
+            async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+                self.list_models_detailed().await
+            }
+        }
+
+        let arced: Arc<dyn LlmClient> = Arc::new(DegradedLlm);
+        assert_eq!(
+            arced
+                .list_models_detailed()
+                .await
+                .expect("arc forwards")
+                .notices
+                .len(),
+            1
+        );
+
+        let retrying = RetryingLlmClient::new(arced, 0);
+        assert_eq!(
+            retrying
+                .refresh_models_detailed()
+                .await
+                .expect("retry wrapper forwards")
+                .notices
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn default_estimate_tokens_uses_chars_div_4() {
         struct NoopLlm;

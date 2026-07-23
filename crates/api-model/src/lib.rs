@@ -2109,6 +2109,50 @@ mod tests {
         assert_eq!(cmd2, back);
     }
 
+    /// The listing notice (#648) is additive: a payload from a daemon that
+    /// predates it still deserializes, and a notice-free listing does not
+    /// grow the wire format.
+    #[test]
+    fn model_listing_notices_are_backward_compatible() {
+        let legacy = r#"{
+            "connection_id": "bedrock",
+            "connection_label": "bedrock (bedrock)",
+            "model": {"id": "amazon.titan-embed-text-v2:0", "display_name": "Titan"}
+        }"#;
+        let parsed: ModelListing = serde_json::from_str(legacy).expect("legacy payload parses");
+        assert!(parsed.notices.is_empty());
+
+        let re_encoded = serde_json::to_string(&parsed).expect("re-encode");
+        assert!(
+            !re_encoded.contains("notices"),
+            "an empty notice list must not appear on the wire: {re_encoded}"
+        );
+    }
+
+    #[test]
+    fn model_listing_notice_roundtrips() {
+        let listing = ModelListing {
+            connection_id: "bedrock".into(),
+            connection_label: "bedrock (bedrock)".into(),
+            model: ModelInfoView {
+                id: "amazon.titan-embed-text-v2:0".into(),
+                display_name: "Titan".into(),
+                context_limit: None,
+                capabilities: ModelCapabilitiesView::default(),
+            },
+            notices: vec![ModelListingNoticeView {
+                kind: ModelListingNoticeKindView::PartialCatalog,
+                summary: "Inference profiles unavailable".into(),
+                detail: "Grant bedrock:ListInferenceProfiles".into(),
+                required_permission: Some("bedrock:ListInferenceProfiles".into()),
+            }],
+        };
+        let json = serde_json::to_string(&listing).expect("encode");
+        assert!(json.contains(r#""kind":"partial_catalog""#), "{json}");
+        let back: ModelListing = serde_json::from_str(&json).expect("decode");
+        assert_eq!(listing, back);
+    }
+
     #[test]
     fn set_purpose_roundtrip() {
         let cmd = Command::SetPurpose {

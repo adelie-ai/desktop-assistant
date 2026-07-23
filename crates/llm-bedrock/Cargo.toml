@@ -32,6 +32,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Same pinned version the other `llm-*` crates already use, so the
+# control-plane (ListFoundationModels / ListInferenceProfiles) tests can run
+# against a local mock endpoint instead of AWS.
+httpmock = "0.8"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 [lints]
 workspace = true
