@@ -298,6 +298,21 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
     }
 }
 
+/// The scratchpad-derived context surfaces for one round, all rendered from a
+/// single notes read by [`ConversationHandler::render_scratchpad_surfaces`].
+/// The default (no lister wired, or the read failed) surfaces nothing.
+#[derive(Default)]
+struct ScratchpadSurfaces {
+    /// `[Plan]` — the open step tree (#240), or `None` when there are no steps.
+    plan: Option<String>,
+    /// `[Scratchpad]` — the free-form note-key index (#340), or `None` when
+    /// there are no free-form notes. Whether it actually renders is the context
+    /// builder's call; it is gated on context having started to drop.
+    scratchpad_index: Option<String>,
+    /// `[Working state]` — the counts behind the always-on nudge (#598).
+    working_state: planning::WorkingState,
+}
+
 impl<S, L, T> ConversationHandler<S, L, T> {
     pub fn with_tools(
         store: S,
@@ -620,26 +635,36 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         .to_string()
     }
 
-    /// Render the open plan (#240) for per-round surfacing: read the
-    /// conversation's notes and render the step tree with each completed step's
-    /// finding nested under it (findings drop from view once a parent rolls them
-    /// up). Marks the live step. Returns `None` when no lister is wired or there
-    /// are no steps to show.
-    async fn render_current_plan(
+    /// Render every scratchpad-derived surface for one round, from a single
+    /// notes read.
+    ///
+    /// The three surfaces are views of the same set of notes, so they share one
+    /// fetch rather than each paying its own storage round-trip. That is also
+    /// what makes the `[Working state]` counts free: they are counted from
+    /// notes already in hand for `[Plan]` and `[Scratchpad]`.
+    ///
+    /// Reading per round (rather than per turn) means a step the model just
+    /// began or completed, and a note it just wrote, show up on the next round.
+    /// Falls back to empty surfaces when no lister is wired or the read fails -
+    /// a missing reminder degrades the turn, it does not break it.
+    async fn render_scratchpad_surfaces(
         &self,
         conversation_id: &ConversationId,
         current_key: Option<&str>,
-    ) -> Option<String> {
-        let list = self.scratchpad_list.clone()?;
-        // Fetch all notes (todo steps + their outcome notes), a bit beyond the
-        // render cap so a step's finding isn't dropped before the step itself.
-        let notes = list(
-            conversation_id.0.clone(),
-            None,
-            planning::MAX_PLAN_ITEMS.saturating_mul(3),
-        )
-        .await
-        .ok()?;
+    ) -> ScratchpadSurfaces {
+        let Some(list) = self.scratchpad_list.clone() else {
+            return ScratchpadSurfaces::default();
+        };
+        // No type filter: `goal` and `outcome:*` are `note`-typed like any
+        // free-form note, so the carve-out happens by key in
+        // `freeform_note_keys`, not storage-side. Fetch a bit beyond the render
+        // cap so a step's finding isn't dropped before the step itself.
+        let limit = planning::MAX_PLAN_ITEMS
+            .max(planning::MAX_SCRATCHPAD_INDEX_KEYS)
+            .saturating_mul(3);
+        let Ok(notes) = list(conversation_id.0.clone(), None, limit).await else {
+            return ScratchpadSurfaces::default();
+        };
         let raw: Vec<planning::RawNote> = notes
             .iter()
             .map(|n| planning::RawNote {
@@ -650,44 +675,16 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 done: n.done,
             })
             .collect();
-        planning::render_plan_from_notes(&raw, current_key, planning::MAX_PLAN_ITEMS)
-    }
 
-    /// Render the free-form scratchpad index (#340) for per-round surfacing: the
-    /// keys of `note`-typed notes that aren't already shown as `[Current task]`
-    /// (`goal`) or `[Plan]` (`outcome:*` findings and `todo` steps). These notes
-    /// are durable in storage but otherwise invisible once the message that wrote
-    /// them is windowed/compacted away, so the context builder advertises their
-    /// keys (gated on the same "context is dropping" trigger as `[Current task]`)
-    /// to remind the model what it can `builtin_scratchpad_search` for. Returns
-    /// `None` when no lister is wired or there are no free-form notes.
-    async fn render_current_scratchpad_index(
-        &self,
-        conversation_id: &ConversationId,
-    ) -> Option<String> {
-        let list = self.scratchpad_list.clone()?;
-        // No type filter — `goal` and `outcome:*` are also `note`-typed, so the
-        // free-form set is carved out by key in `freeform_note_keys`, not by a
-        // storage-side type filter.
-        let notes = list(
-            conversation_id.0.clone(),
-            None,
-            planning::MAX_SCRATCHPAD_INDEX_KEYS.saturating_mul(3),
-        )
-        .await
-        .ok()?;
-        let raw: Vec<planning::RawNote> = notes
-            .iter()
-            .map(|n| planning::RawNote {
-                key: n.key.as_str(),
-                owner_todo: n.owner_todo.as_str(),
-                content: n.content.as_str(),
-                note_type: n.note_type.as_str(),
-                done: n.done,
-            })
-            .collect();
         let keys = planning::freeform_note_keys(&raw);
-        planning::render_scratchpad_index(&keys, planning::MAX_SCRATCHPAD_INDEX_KEYS)
+        ScratchpadSurfaces {
+            plan: planning::render_plan_from_notes(&raw, current_key, planning::MAX_PLAN_ITEMS),
+            scratchpad_index: planning::render_scratchpad_index(
+                &keys,
+                planning::MAX_SCRATCHPAD_INDEX_KEYS,
+            ),
+            working_state: planning::WorkingState::from_notes(&raw),
+        }
     }
 
     /// Build the per-turn [`StepStack`], seeding its top-level numbering from the
@@ -1162,21 +1159,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             };
             let anchor = goal.as_deref().or(conv.active_task.as_deref());
 
-            // Surface the open plan (#240): read the conversation's `todo`
-            // notes and render them as a compact tree so the plan stays in view
-            // across rounds while the expensive raw work is evicted. Reading per
-            // round means a step the model just began or completed shows up
-            // (with its updated done-mark) on the next round.
+            // Re-read the pad and render its surfaces for this round: the open
+            // plan as a compact tree (#240), the free-form note-key index
+            // (#340), and the working-state counts (#598). One read serves all
+            // three, and reading per round means a step the model just began or
+            // completed - and a note it just wrote - shows up on the next one.
             let current_step = step_stack.current_key().map(str::to_string);
-            let plan = self
-                .render_current_plan(conversation_id, current_step.as_deref())
+            let surfaces = self
+                .render_scratchpad_surfaces(conversation_id, current_step.as_deref())
                 .await;
-
-            // Advertise the free-form scratchpad note keys (#340) so a note the
-            // model stashed earlier survives windowing/compaction as recognition
-            // (it can search for the key) even after the writing message is gone.
-            // Gated context-builder-side on the same trigger as [Current task].
-            let scratchpad_index = self.render_current_scratchpad_index(conversation_id).await;
 
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
@@ -1194,8 +1185,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 },
                 &TurnAnchors {
                     active_task: anchor,
-                    plan: plan.as_deref(),
-                    scratchpad_index: scratchpad_index.as_deref(),
+                    plan: surfaces.plan.as_deref(),
+                    scratchpad_index: surfaces.scratchpad_index.as_deref(),
+                    working_state: surfaces.working_state,
                     tool_rounds_since_anchor,
                 },
                 target_window,
@@ -1848,8 +1840,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             .as_deref()
             .or(conv.active_task.as_deref())
             .map(str::to_string);
-        let wind_down_plan = self.render_current_plan(conversation_id, None).await;
-        let wind_down_index = self.render_current_scratchpad_index(conversation_id).await;
+        // No live step to mark: the wind-down is the turn closing out, not a
+        // step continuing.
+        let wind_down_surfaces = self.render_scratchpad_surfaces(conversation_id, None).await;
 
         // Show the model a transient wrap-up instruction for THIS call only,
         // then drop it so only its closing reply is persisted.
@@ -1870,8 +1863,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 },
                 &TurnAnchors {
                     active_task: wind_down_anchor.as_deref(),
-                    plan: wind_down_plan.as_deref(),
-                    scratchpad_index: wind_down_index.as_deref(),
+                    plan: wind_down_surfaces.plan.as_deref(),
+                    scratchpad_index: wind_down_surfaces.scratchpad_index.as_deref(),
+                    working_state: wind_down_surfaces.working_state,
                     tool_rounds_since_anchor: u32::MAX,
                 },
                 target_window,
@@ -3480,6 +3474,80 @@ mod tests {
             .expect("the open plan must be surfaced once a todo exists");
         assert!(plan_msg.content.contains("map the plan"));
         assert!(plan_msg.content.contains("← you are here"));
+    }
+
+    #[tokio::test]
+    async fn working_state_adds_no_extra_store_read() {
+        // #598: the nudge is affordable because it is free - it counts the notes
+        // the plan and index renderers already read. All three surfaces come off
+        // ONE unfiltered `list` per dispatch round; the only other read is
+        // build_step_stack's type-filtered seed.
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new("b1", "begin_step", r#"{"goal":"map it"}"#)],
+                ),
+                LlmResponse::text("done"),
+            ]),
+            captured: Arc::clone(&captured),
+        };
+
+        let (write, list, sp) = in_memory_scratchpad();
+        // A free-form note on the pad, so the nudge has something to report
+        // that [Plan] doesn't already cover.
+        sp.lock().unwrap().insert(
+            "deploy-target".into(),
+            crate::domain::ScratchpadNote::new("id-dt", "conv", "deploy-target", "prod"),
+        );
+        // Record each read's `note_type` filter so surface reads (unfiltered)
+        // are distinguishable from the step-stack seed (filtered to `todo`).
+        let filters: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&filters);
+        let counting_list: ScratchpadListFn =
+            Arc::new(move |conv, note_type: Option<String>, n| {
+                seen.lock().unwrap().push(note_type.clone());
+                list(conv, note_type, n)
+            });
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(counting_list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let rounds = captured.lock().unwrap();
+        let nudge = rounds
+            .iter()
+            .flatten()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Working state]"))
+            .expect("the working-state nudge must be surfaced once the pad is non-empty");
+        assert_eq!(nudge.content, "[Working state] 1 scratchpad note.");
+
+        let filters = filters.lock().unwrap();
+        let unfiltered = filters.iter().filter(|f| f.is_none()).count();
+        assert_eq!(
+            unfiltered, 2,
+            "two dispatch rounds must read the notes once each, not once per surface: {filters:?}"
+        );
+        assert_eq!(
+            filters.iter().filter(|f| f.is_some()).count(),
+            1,
+            "only build_step_stack reads with a type filter: {filters:?}"
+        );
     }
 
     #[tokio::test]

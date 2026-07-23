@@ -193,6 +193,10 @@ pub(crate) struct TurnAnchors<'a> {
     pub active_task: Option<&'a str>,
     pub plan: Option<&'a str>,
     pub scratchpad_index: Option<&'a str>,
+    /// Counts behind the always-on `[Working state]` nudge (#598), carried as
+    /// counts rather than a rendered line so the block can drop whichever half
+    /// a fuller block covers on this particular turn.
+    pub working_state: crate::planning::WorkingState,
     pub tool_rounds_since_anchor: u32,
 }
 
@@ -837,6 +841,9 @@ fn system_block(
 /// - `[Current task]` — the anchor prompt, re-injected when it has drifted out
 ///   of view (windowed out, or collapsed behind an active summary) or after a
 ///   long agentic loop (`> ACTIVE_TASK_ROUND_THRESHOLD` rounds).
+/// - `[Working state]` — a one-line count of notes and open to-dos, rendered
+///   every turn either count is non-zero, minus whichever half a fuller block
+///   below already covers.
 /// - `[Plan]` — the open todo tree, whenever one exists.
 /// - `[Scratchpad]` — the free-form note-key index, gated on the same
 ///   "context is dropping" signal as `[Current task]`.
@@ -897,18 +904,43 @@ fn surfaced_blocks(
     // Open plan (#240): the dispatch loop renders the conversation's `todo`
     // notes into a compact tree each round, so the plan stays in view cheaply
     // while the verbose work that produced it is evicted from the message log.
-    if let Some(plan) = anchors.plan.filter(|p| !p.is_empty()) {
-        blocks.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
-    }
+    let plan = anchors.plan.filter(|p| !p.is_empty());
 
     // Free-form scratchpad note keys (#340): durable in storage but otherwise
     // invisible once the writing message is windowed/compacted away. The index
     // lists the keys (recognition over recall), gated on the same "context is
     // dropping" condition as `[Current task]` so it doesn't burn tokens while
     // the note content is still live in the window.
-    if let Some(index) = anchors.scratchpad_index.filter(|s| !s.is_empty())
-        && (is_windowed || many_tool_rounds)
-    {
+    let scratchpad_index = anchors
+        .scratchpad_index
+        .filter(|s| !s.is_empty() && (is_windowed || many_tool_rounds));
+
+    // Working-state nudge (#598): the always-on floor beneath the two blocks
+    // above. Neither of them is guaranteed to speak when it matters most - the
+    // index is gated on context dropping, so before that trigger fires a note
+    // stashed earlier is durable but invisible - and one line of counts is
+    // cheap enough to send from turn one regardless. It yields rather than
+    // duplicating: each half drops when the fuller block covering it renders,
+    // and with both present the line disappears entirely.
+    let mut working_state = anchors.working_state;
+    if plan.is_some() {
+        working_state.open_todos = 0;
+    }
+    if scratchpad_index.is_some() {
+        working_state.notes = 0;
+    }
+    if let Some(counts) = working_state.render() {
+        blocks.push(Message::new(
+            Role::System,
+            format!("[Working state] {counts}"),
+        ));
+    }
+
+    if let Some(plan) = plan {
+        blocks.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
+    }
+
+    if let Some(index) = scratchpad_index {
         blocks.push(Message::new(Role::System, format!("[Scratchpad] {index}")));
     }
 
@@ -2809,6 +2841,165 @@ mod tests {
             scratchpad_index_text(&result).is_none(),
             "no scratchpad index when there are no free-form notes"
         );
+    }
+
+    // --- Working state nudge (#598) ---
+
+    fn working_state_text(result: &[Message]) -> Option<&str> {
+        result
+            .iter()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Working state]"))
+            .map(|m| m.content.as_str())
+    }
+
+    #[test]
+    fn working_state_renders_before_windowing() {
+        // The gap the nudge exists to close: a short, unwindowed turn with zero
+        // tool rounds. [Scratchpad] is gated silent here, so a note stashed a
+        // few messages ago is durable but invisible - the counts are all the
+        // model gets, and it must get them.
+        let msgs = vec![
+            Message::new(Role::User, "do a thing"),
+            Message::new(Role::Assistant, "on it"),
+        ];
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): foo, bar.";
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("do a thing"),
+                scratchpad_index: Some(index),
+                working_state: crate::planning::WorkingState {
+                    notes: 2,
+                    open_todos: 0,
+                },
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+        assert!(
+            scratchpad_index_text(&result).is_none(),
+            "precondition: [Scratchpad] is silent on a short, fully-visible turn"
+        );
+        let text = working_state_text(&result)
+            .expect("[Working state] must render from turn one, ungated");
+        assert_eq!(text, "[Working state] 2 scratchpad notes.");
+    }
+
+    #[test]
+    fn working_state_omitted_when_empty() {
+        let msgs = vec![Message::new(Role::User, "hi")];
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
+            None,
+            &default_estimate,
+        );
+        assert!(
+            working_state_text(&result).is_none(),
+            "an empty pad must not burn tokens on a zero-count line"
+        );
+    }
+
+    #[test]
+    fn working_state_yields_to_fuller_blocks() {
+        let msgs = vec![
+            Message::new(Role::User, "trace it"),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
+            Message::tool_result("c1", "result"),
+        ];
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): foo.";
+        let working_state = crate::planning::WorkingState {
+            notes: 2,
+            open_todos: 3,
+        };
+
+        // [Plan] renders (it is ungated), [Scratchpad] does not: the to-do half
+        // is redundant and drops, the note count survives.
+        let with_plan = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("trace it"),
+                plan: Some("- [ ] 1 do the thing"),
+                scratchpad_index: Some(index),
+                working_state,
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+        assert_eq!(
+            working_state_text(&with_plan),
+            Some("[Working state] 2 scratchpad notes."),
+            "the to-do half must drop when [Plan] shows the tree"
+        );
+
+        // Both fuller blocks render (many tool rounds ungates [Scratchpad]) -
+        // nothing is left for the nudge to say.
+        let with_both = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("trace it"),
+                plan: Some("- [ ] 1 do the thing"),
+                scratchpad_index: Some(index),
+                working_state,
+                tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
+            },
+            None,
+            &default_estimate,
+        );
+        assert!(
+            scratchpad_index_text(&with_both).is_some(),
+            "precondition: [Scratchpad] renders after many tool rounds"
+        );
+        assert!(
+            working_state_text(&with_both).is_none(),
+            "the nudge must disappear entirely when both fuller blocks are present"
+        );
+    }
+
+    #[test]
+    fn working_state_precedes_the_plan_block() {
+        let msgs = vec![Message::new(Role::User, "go")];
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                plan: Some("- [ ] 1 do the thing"),
+                working_state: crate::planning::WorkingState {
+                    notes: 1,
+                    open_todos: 1,
+                },
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+        let pos = |prefix: &str| {
+            result
+                .iter()
+                .position(|m| m.role == Role::System && m.content.starts_with(prefix))
+        };
+        assert!(pos("[Working state]") < pos("[Plan]"));
     }
 
     // --- Message summary (collapsing) tests ---
