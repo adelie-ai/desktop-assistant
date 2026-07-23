@@ -38,8 +38,8 @@ use desktop_assistant_core::ports::llm::{
     current_cancellation_token, current_model_override,
 };
 use desktop_assistant_llm_http::{
-    STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, apply_context_cap, bail_for_status,
-    merge_curated_with_live,
+    Clock, ModelCache, STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, apply_context_cap,
+    bail_for_status, merge_curated_with_live,
 };
 use desktop_assistant_llm_openai_compat::{
     ChatMessage, ChatTool, classify_error, consume_chat_stream, to_chat_messages, to_chat_tools,
@@ -145,6 +145,11 @@ pub struct AzureClient {
     api_version: String,
     auth_mode: AuthMode,
     token_provider: Option<Arc<dyn TokenProvider>>,
+    /// TTL cache for `list_models()`. Azure has no live listing endpoint yet
+    /// (deployment enumeration is an ARM control-plane operation), so the cache
+    /// currently holds the curated table; it keeps the connector uniform with
+    /// OpenRouter/Google and is where a future live listing slots in (#620).
+    model_cache: ModelCache,
 }
 
 /// Redacting [`Debug`] so neither the API key nor a bearer token can leak
@@ -173,6 +178,7 @@ impl std::fmt::Debug for AzureClient {
                 "token_provider",
                 &self.token_provider.as_ref().map(|_| "<TokenProvider>"),
             )
+            .field("model_cache", &self.model_cache)
             .finish()
     }
 }
@@ -211,6 +217,7 @@ impl AzureClient {
             api_version: DEFAULT_CLASSIC_API_VERSION.to_string(),
             auth_mode: AuthMode::ApiKey,
             token_provider: None,
+            model_cache: ModelCache::new(),
         }
     }
 
@@ -300,6 +307,20 @@ impl AzureClient {
     /// Inject the [`TokenProvider`] used under [`AuthMode::Entra`].
     pub fn with_token_provider(mut self, provider: Arc<dyn TokenProvider>) -> Self {
         self.token_provider = Some(provider);
+        self
+    }
+
+    /// Override the `list_models()` cache TTL (default: 1h). `Some(0)` disables
+    /// caching (every entry is immediately stale).
+    pub fn with_model_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.model_cache.set_ttl(ttl);
+        self
+    }
+
+    /// Inject a [`Clock`] for deterministic cache-TTL tests. Production uses the
+    /// default [`SystemClock`](desktop_assistant_llm_http::SystemClock).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.model_cache.set_clock(clock);
         self
     }
 
@@ -840,6 +861,22 @@ fn curated_azure_models() -> Vec<ModelInfo> {
     ]
 }
 
+impl AzureClient {
+    /// Build the model listing and cache it. Bypasses the TTL: the shared tail
+    /// of both `list_models` (on a cache miss) and `refresh_models`.
+    ///
+    /// There is no live deployment enumeration yet (an ARM control-plane
+    /// operation, `management.azure.com`), so this resolves to the curated
+    /// table. When it lands it slots in as the resolver's `live` argument
+    /// (curated metadata wins on overlap, unknown deployments appended); the
+    /// caching shape here does not change.
+    async fn fetch_merge_store(&self) -> Vec<ModelInfo> {
+        let merged = merge_curated_with_live(curated_azure_models(), Vec::new());
+        self.model_cache.store(merged.clone());
+        merged
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trait impls
 // ---------------------------------------------------------------------------
@@ -860,13 +897,18 @@ impl LlmClient for AzureClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        // NOTE: live deployment enumeration is an ARM control-plane operation
-        //       (management.azure.com), not a data-plane path, and may be
-        //       unavailable. When it lands it slots in as the resolver's `live`
-        //       argument (curated metadata wins on overlap, unknown deployments
-        //       appended); until then we degrade to the curated table -- the
-        //       Bedrock swallow-and-log posture.
-        Ok(merge_curated_with_live(curated_azure_models(), Vec::new()))
+        // Serve a warm, unexpired listing from the cache; on a miss, (re)build
+        // it and cache the result. See [`Self::fetch_merge_store`] for why this
+        // resolves to the curated table today.
+        if let Some(cached) = self.model_cache.cached() {
+            return Ok(cached);
+        }
+        Ok(self.fetch_merge_store().await)
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        // Force a rebuild, bypassing the TTL, and re-populate the cache.
+        Ok(self.fetch_merge_store().await)
     }
 
     async fn stream_completion(

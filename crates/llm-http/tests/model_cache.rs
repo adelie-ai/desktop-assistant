@@ -109,7 +109,11 @@ fn cached_just_before_ttl_is_a_hit() {
     let m = models(&["fresh"]);
     cache.store(m.clone());
     clock.advance_secs(3599);
-    assert_eq!(cache.cached(), Some(m), "one second before the TTL is a hit");
+    assert_eq!(
+        cache.cached(),
+        Some(m),
+        "one second before the TTL is a hit"
+    );
 }
 
 #[test]
