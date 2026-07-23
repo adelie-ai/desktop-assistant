@@ -155,6 +155,21 @@ impl ConnectionConfig {
         }
     }
 
+    /// This connection's secret-store coordinate, if the connector carries one.
+    ///
+    /// Ollama has no credential, so it always reports `None`.
+    pub fn secret(&self) -> Option<&SecretConfig> {
+        match self {
+            Self::Anthropic(c) => c.secret.as_ref(),
+            Self::OpenAi(c) => c.secret.as_ref(),
+            Self::OpenRouter(c) => c.secret.as_ref(),
+            Self::Azure(c) => c.secret.as_ref(),
+            Self::Google(c) => c.secret.as_ref(),
+            Self::Bedrock(c) => c.secret.as_ref(),
+            Self::Ollama(_) => None,
+        }
+    }
+
     /// Set (or clear, with `None`) this connection's secret-store coordinate.
     ///
     /// Only credential-bearing connectors carry a `secret` field. Ollama talks

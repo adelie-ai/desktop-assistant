@@ -383,11 +383,32 @@ impl ConnectionsService for DaemonConnectionsService {
     ) -> Result<(), CoreError> {
         let id_valid = ConnectionId::new(id.clone())
             .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
-        let new_conn = payload_to_connection(config);
+        let mut new_conn = payload_to_connection(config);
         self.registry.mutate_config(|cfg| {
-            if !cfg.connections.contains_key(id_valid.as_str()) {
+            let Some(existing) = cfg.connections.get(id_valid.as_str()) else {
                 return Err(format!("connection id {:?} does not exist", id_valid));
+            };
+
+            // The payload deliberately carries no credential material, so a
+            // bare replace would drop the connection's secret coordinate and
+            // orphan the credential still sitting in the secret backend —
+            // leaving the connection silently falling back to the provider's
+            // ambient credential chain (#643). Carry the coordinate forward.
+            //
+            // Why only for a matching connector: the stored credential is
+            // connector-shaped (an AWS key pair, a bearer token, …), so
+            // carrying it across a connector switch would leave a value the
+            // new connector cannot interpret. That case drops it, and the
+            // operator re-supplies one via SetConnectionSecret.
+            if existing.connector_type() == new_conn.connector_type()
+                && let Some(secret) = existing.secret().cloned()
+            {
+                new_conn.set_secret(Some(secret)).expect(
+                    "connector types match and the stored connection carried a secret, \
+                     so this variant has a secret field",
+                );
             }
+
             cfg.connections
                 .insert(id_valid.as_str().to_string(), new_conn);
             Ok(())
@@ -1525,8 +1546,9 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
             region,
             base_url,
             // Secrets never cross the non-secret payload boundary; they are set
-            // out-of-band via `set_connection_secret`. A create/update via
-            // payload therefore leaves the secret coordinate cleared.
+            // out-of-band via `set_connection_secret`. Every payload therefore
+            // converts with no coordinate — `update_connection` re-attaches the
+            // stored one afterwards so an edit doesn't orphan the credential.
             secret: None,
             connect_timeout_secs,
             stream_timeout_secs,
@@ -2162,6 +2184,291 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    // --- UpdateConnection must not clobber the secret coordinate -----------
+
+    const SECRET_ACCOUNT: &str = "connection_credential";
+
+    /// The `account` of a connection's stored secret coordinate, if any.
+    fn secret_account(conn: &ConnectionConfig) -> Option<String> {
+        conn.secret().and_then(|s| s.account.clone())
+    }
+
+    fn secret_coordinate() -> Option<crate::config::SecretConfig> {
+        Some(crate::config::SecretConfig {
+            account: Some(SECRET_ACCOUNT.into()),
+            ..crate::config::SecretConfig::default()
+        })
+    }
+
+    fn bedrock_with_secret() -> ConnectionConfig {
+        ConnectionConfig::Bedrock(crate::connections::BedrockConnection {
+            aws_profile: Some("work".into()),
+            region: Some("us-west-2".into()),
+            secret: secret_coordinate(),
+            ..Default::default()
+        })
+    }
+
+    fn bedrock_payload(region: &str) -> ConnectionConfigPayload {
+        ConnectionConfigPayload::Bedrock {
+            aws_profile: Some("work".into()),
+            region: Some(region.into()),
+            base_url: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
+        }
+    }
+
+    /// Every connector carrying a `secret` coordinate, paired with an update
+    /// payload of the same connector type. Exhaustive on purpose: a newly
+    /// added credential-bearing connector should fail this test rather than
+    /// silently skip the carry-forward.
+    fn credential_connectors() -> Vec<(&'static str, ConnectionConfig, ConnectionConfigPayload)> {
+        use crate::connections::{
+            AnthropicConnection, AzureConnection, GoogleConnection, OpenAiConnection,
+            OpenRouterConnection,
+        };
+        vec![
+            (
+                "anthropic",
+                ConnectionConfig::Anthropic(AnthropicConnection {
+                    secret: secret_coordinate(),
+                    ..Default::default()
+                }),
+                ConnectionConfigPayload::Anthropic {
+                    base_url: Some("https://anthropic.example.invalid".into()),
+                    api_key_env: None,
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    max_context_tokens: None,
+                },
+            ),
+            (
+                "openai",
+                ConnectionConfig::OpenAi(OpenAiConnection {
+                    secret: secret_coordinate(),
+                    ..Default::default()
+                }),
+                ConnectionConfigPayload::OpenAi {
+                    base_url: Some("https://openai.example.invalid".into()),
+                    api_key_env: None,
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    max_context_tokens: None,
+                },
+            ),
+            (
+                "openrouter",
+                ConnectionConfig::OpenRouter(OpenRouterConnection {
+                    secret: secret_coordinate(),
+                    ..Default::default()
+                }),
+                ConnectionConfigPayload::OpenRouter {
+                    base_url: Some("https://openrouter.example.invalid".into()),
+                    api_key_env: None,
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    max_context_tokens: None,
+                },
+            ),
+            (
+                "azure",
+                ConnectionConfig::Azure(AzureConnection {
+                    secret: secret_coordinate(),
+                    ..Default::default()
+                }),
+                ConnectionConfigPayload::Azure {
+                    base_url: Some("https://azure.example.invalid".into()),
+                    api_key_env: None,
+                    api_surface: None,
+                    auth_mode: None,
+                    api_version: None,
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    max_context_tokens: None,
+                },
+            ),
+            (
+                "google",
+                ConnectionConfig::Google(GoogleConnection {
+                    secret: secret_coordinate(),
+                    ..Default::default()
+                }),
+                ConnectionConfigPayload::Google {
+                    base_url: Some("https://google.example.invalid".into()),
+                    api_key_env: None,
+                    project: Some("proj".into()),
+                    location: None,
+                    auth_mode: None,
+                    credentials_path: None,
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    max_context_tokens: None,
+                },
+            ),
+            (
+                "bedrock",
+                bedrock_with_secret(),
+                bedrock_payload("eu-west-1"),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn update_connection_preserves_existing_secret_coordinate() {
+        let handle = make_handle_with(config_with_connections(&[("aws", bedrock_with_secret())]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        svc.update_connection("aws".to_string(), bedrock_payload("eu-west-1"))
+            .await
+            .expect("updating an existing connection should succeed");
+
+        let cfg = handle.snapshot_config();
+        let conn = cfg
+            .connections
+            .get("aws")
+            .expect("connection should still exist after update");
+        assert_eq!(
+            secret_account(conn).as_deref(),
+            Some(SECRET_ACCOUNT),
+            "editing an unrelated field must not drop the credential reference"
+        );
+        match conn {
+            ConnectionConfig::Bedrock(c) => assert_eq!(
+                c.region.as_deref(),
+                Some("eu-west-1"),
+                "the requested edit should still apply"
+            ),
+            other => panic!("expected a bedrock connection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_connection_preserves_secret_when_payload_changes_nothing() {
+        let handle = make_handle_with(config_with_connections(&[("aws", bedrock_with_secret())]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        // A no-op save from a settings dialog is the most common way this
+        // path runs, and the least excusable way to lose a credential.
+        svc.update_connection("aws".to_string(), bedrock_payload("us-west-2"))
+            .await
+            .expect("a no-op update should succeed");
+
+        let cfg = handle.snapshot_config();
+        assert_eq!(
+            secret_account(cfg.connections.get("aws").expect("connection should exist")).as_deref(),
+            Some(SECRET_ACCOUNT),
+            "a no-op update must not drop the credential reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_connection_preserves_secret_across_all_credential_connectors() {
+        for (name, stored, payload) in credential_connectors() {
+            let handle = make_handle_with(config_with_connections(&[("conn", stored)]));
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            svc.update_connection("conn".to_string(), payload)
+                .await
+                .unwrap_or_else(|e| panic!("update should succeed for {name}: {e}"));
+
+            let cfg = handle.snapshot_config();
+            assert_eq!(
+                secret_account(
+                    cfg.connections
+                        .get("conn")
+                        .expect("connection should exist")
+                )
+                .as_deref(),
+                Some(SECRET_ACCOUNT),
+                "{name} lost its credential reference on update"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_connection_clears_secret_when_connector_type_changes() {
+        let handle = make_handle_with(config_with_connections(&[("aws", bedrock_with_secret())]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        // A bedrock credential is an AWS key pair; carrying it onto an
+        // OpenAI connection would leave an uninterpretable value in place.
+        svc.update_connection(
+            "aws".to_string(),
+            ConnectionConfigPayload::OpenAi {
+                base_url: Some("https://openai.example.invalid".into()),
+                api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+        )
+        .await
+        .expect("switching connector type should succeed");
+
+        let cfg = handle.snapshot_config();
+        let conn = cfg.connections.get("aws").expect("connection should exist");
+        assert_eq!(conn.connector_type(), "openai", "the switch should apply");
+        assert_eq!(
+            secret_account(conn),
+            None,
+            "a connector switch must not carry the old credential coordinate across"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_connection_leaves_absent_secret_absent() {
+        let handle = make_handle_with(config_with_connections(&[("aws", bedrock_work())]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        svc.update_connection("aws".to_string(), bedrock_payload("eu-west-1"))
+            .await
+            .expect("update should succeed");
+
+        let cfg = handle.snapshot_config();
+        assert_eq!(
+            secret_account(cfg.connections.get("aws").expect("connection should exist")),
+            None,
+            "a connection with no credential must not acquire one"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_connection_never_sets_a_secret() {
+        let handle = make_handle_with(DaemonConfig::default());
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        svc.create_connection("aws".to_string(), bedrock_payload("us-east-1"))
+            .await
+            .expect("create should succeed");
+
+        let cfg = handle.snapshot_config();
+        assert_eq!(
+            secret_account(cfg.connections.get("aws").expect("connection should exist")),
+            None,
+            "creation has nothing to carry forward and must not invent a coordinate"
+        );
+    }
+
+    #[test]
+    fn set_connection_secret_overwrites_a_carried_forward_coordinate() {
+        with_isolated_secret_store(|_| {
+            let handle = make_handle_at(
+                config_with_connections(&[("aws", bedrock_with_secret())]),
+                tmp_config_path(),
+            );
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            run_async(svc.update_connection("aws".into(), bedrock_payload("eu-west-1"))).unwrap();
+            run_async(svc.set_connection_secret("aws".into(), BEDROCK_CRED.into())).unwrap();
+
+            // The explicit credential path still wins over whatever the
+            // update carried forward, and resolves to the stored value.
+            assert_eq!(resolved_api_key(&handle, "aws"), BEDROCK_CRED);
+        });
     }
 
     #[tokio::test]
