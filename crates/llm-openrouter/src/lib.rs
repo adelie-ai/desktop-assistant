@@ -12,7 +12,8 @@
 //! [`desktop_assistant_llm_openai_compat`], and the connect race / stall
 //! constants / model-merge helpers come from `desktop_assistant_llm_http`.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
@@ -26,13 +27,15 @@ use desktop_assistant_llm_http::{
     bail_for_status, merge_curated_with_live,
 };
 use desktop_assistant_llm_openai_compat::{
-    ChatMessage, ChatTool, classify_error, consume_chat_stream, mark_system_cache_breakpoint,
-    to_chat_messages, to_chat_tools,
+    ChatMessage, ChatTool, StreamingDispatchError, classify_error, consume_chat_stream,
+    dispatch_non_streaming, mark_system_cache_breakpoint, send_chat_request, to_chat_messages,
+    to_chat_tools,
 };
 use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 /// Connection-handshake / per-event stall budgets shared with the other
 /// connectors. Kept as local aliases so the streaming loop reads naturally.
@@ -86,6 +89,12 @@ pub struct OpenRouterClient {
     /// TTL cache for `list_models()` so the (large) live `/models` catalogue is
     /// not re-fetched on every model-picker open (#620).
     model_cache: ModelCache,
+    /// Per-model memo of routed backends that reject tool use in streaming
+    /// (#619). A model recorded here skips the stream attempt and goes straight
+    /// to the non-streaming `/chat/completions` path on the next tools turn.
+    /// Populated at runtime from the provider's tools-unsupported-in-streaming
+    /// error; the guard is never held across an `.await`.
+    non_streaming_tools_models: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Redacting `Debug` so the API key can never leak through a `{:?}` render --
@@ -109,6 +118,7 @@ impl std::fmt::Debug for OpenRouterClient {
             .field("event_timeout", &self.event_timeout)
             .field("context_cap", &self.context_cap)
             .field("model_cache", &self.model_cache)
+            .field("non_streaming_tools_models", &"<memo>")
             .finish()
     }
 }
@@ -143,6 +153,7 @@ impl OpenRouterClient {
             event_timeout: OPENROUTER_EVENT_TIMEOUT,
             context_cap: None,
             model_cache: ModelCache::new(),
+            non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -313,37 +324,26 @@ fn reasoning_block_for(reasoning: ReasoningConfig) -> Option<ReasoningBlock> {
 // ---------------------------------------------------------------------------
 
 impl OpenRouterClient {
-    /// POST the request and stream the SSE response into an [`LlmResponse`].
-    ///
-    /// The connect handshake is raced against cancellation and
-    /// [`Self::connect_timeout`] so a stalled connect fails the turn instead of
-    /// hanging. On a non-2xx status the body is classified via
-    /// [`classify_openrouter_error`]; on success the raw byte stream is handed to
-    /// the shared [`consume_chat_stream`], which owns all SSE parsing.
-    async fn send_and_stream(
+    /// Build the `/chat/completions` request: auth + fixed attribution headers,
+    /// the JSON body, and the request-size log. Shared by the streaming and
+    /// non-streaming send paths so the wire shaping lives in one place.
+    fn build_request(
         &self,
         model: &str,
         request_body: &ChatCompletionsRequest,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
+    ) -> reqwest::RequestBuilder {
         let request_json =
             serde_json::to_string(request_body).unwrap_or_else(|_| "<serialization error>".into());
         tracing::info!(
             request_bytes = request_json.len(),
             model = %model,
+            stream = request_body.stream,
             "OpenRouter request payload"
         );
         tracing::debug!(
             "OpenRouter request body (first 2000 chars): {}",
             &request_json[..request_json.len().min(2000)]
         );
-
-        // Cooperative cancellation (issue #109): bail before dialing out, then
-        // race the connect against the token and the connect timeout.
-        let cancellation = current_cancellation_token().unwrap_or_default();
-        if cancellation.is_cancelled() {
-            return Err(CoreError::Cancelled);
-        }
 
         let mut builder = self
             .client
@@ -358,42 +358,73 @@ impl OpenRouterClient {
         if is_valid_attribution(ADELE_TITLE) {
             builder = builder.header("X-Title", ADELE_TITLE);
         }
-        let send_fut = builder.json(request_body).send();
+        builder.json(request_body)
+    }
 
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-            _ = tokio::time::sleep(self.connect_timeout) => {
-                tracing::error!(
-                    timeout_s = self.connect_timeout.as_secs(),
-                    "OpenRouter request send() timed out (no response headers)"
-                );
-                return Err(CoreError::Llm("OpenRouter stream stalled".into()));
+    /// POST the request and stream the SSE response into an [`LlmResponse`].
+    ///
+    /// The connect handshake is raced against cancellation and
+    /// [`Self::connect_timeout`] by the shared [`send_chat_request`]; on a
+    /// non-2xx status the body is classified via [`classify_openrouter_error`].
+    /// A routed backend that rejects tools-in-streaming classifies to
+    /// [`CoreError::ToolsUnsupported`]; that arm hands the (still-unconsumed)
+    /// callback back through [`StreamingDispatchError::ToolsUnsupported`] so the
+    /// caller can retry non-streaming without rebuilding it (#619). On success
+    /// the raw byte stream is handed to the shared [`consume_chat_stream`].
+    async fn send_and_stream(
+        &self,
+        model: &str,
+        request_body: &ChatCompletionsRequest,
+        on_chunk: ChunkCallback,
+        cancellation: &CancellationToken,
+    ) -> Result<LlmResponse, StreamingDispatchError> {
+        let request = self.build_request(model, request_body);
+        let response = match send_chat_request(
+            request,
+            cancellation,
+            self.connect_timeout,
+            "OpenRouter stream stalled",
+            classify_openrouter_error,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(CoreError::ToolsUnsupported { detail }) => {
+                return Err(StreamingDispatchError::ToolsUnsupported { on_chunk, detail });
             }
-            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+            Err(e) => return Err(StreamingDispatchError::Other(e)),
         };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let headers = response.headers().clone();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(classify_openrouter_error(status, &headers, &body));
-        }
-
-        // NOTE (follow-up): a routed backend that rejects tool use while
-        // streaming should be classified to `CoreError::ToolsUnsupported`, with
-        // a non-streaming retry + per-model memo (the Bedrock-proven pattern).
-        // v1 relies on the base classifier's generic `Llm` mapping for that
-        // case; the streaming-only path here does not yet fall back.
         consume_chat_stream(
             response.bytes_stream(),
-            &cancellation,
+            cancellation,
             self.event_timeout,
             on_chunk,
         )
         .await
+        .map_err(StreamingDispatchError::Other)
+    }
+
+    /// POST the request with `stream: false` and parse the single JSON response
+    /// into an [`LlmResponse`] via the shared [`dispatch_non_streaming`]. Used
+    /// as the fallback for a model that rejects tools-in-streaming (#619).
+    async fn send_non_streaming(
+        &self,
+        model: &str,
+        request_body: &ChatCompletionsRequest,
+        on_chunk: ChunkCallback,
+        cancellation: &CancellationToken,
+    ) -> Result<LlmResponse, CoreError> {
+        let request = self.build_request(model, request_body);
+        let response = send_chat_request(
+            request,
+            cancellation,
+            self.connect_timeout,
+            "OpenRouter stream stalled",
+            classify_openrouter_error,
+        )
+        .await?;
+        dispatch_non_streaming(response, cancellation, on_chunk).await
     }
 }
 
@@ -636,27 +667,86 @@ impl LlmClient for OpenRouterClient {
         // Per-turn model override (issue #34): dispatch the user-chosen model
         // instead of the connector's baked-in default when set.
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
+        // Cooperative cancellation (issue #109): acquired once and threaded
+        // through both dispatch paths.
+        let cancellation = current_cancellation_token().unwrap_or_default();
+        let has_tools = !tools.is_empty();
+        // Reasoning block is stable across the (possible) two dispatches.
+        let reasoning_block = reasoning_block_for(reasoning);
 
-        // Shared wire conversion (tool-schema + empty-key sanitization applied
-        // inside these helpers), then mark the system block for caching so
-        // OpenRouter can normalize a breakpoint per routed provider.
-        let mut chat_messages = to_chat_messages(&messages);
-        mark_system_cache_breakpoint(&mut chat_messages);
-        let chat_tools = to_chat_tools(tools);
-
-        let request = ChatCompletionsRequest {
-            model: model.clone(),
-            messages: chat_messages,
-            tools: chat_tools,
-            temperature: self.temperature,
-            top_p: self.top_p,
-            max_tokens: self.max_tokens,
-            stream: true,
-            reasoning: reasoning_block_for(reasoning),
-            usage: UsageAccounting { include: true },
+        // Build a fresh request body for the requested `stream` flag. The shared
+        // wire conversion (tool-schema + empty-key sanitization inside the
+        // helpers) runs per build, then the system block is marked for caching
+        // so OpenRouter can normalize a breakpoint per routed provider. Cheap
+        // relative to the round-trip and only ever built twice on a fallback.
+        let make_request = |stream: bool| -> ChatCompletionsRequest {
+            let mut chat_messages = to_chat_messages(&messages);
+            mark_system_cache_breakpoint(&mut chat_messages);
+            ChatCompletionsRequest {
+                model: model.clone(),
+                messages: chat_messages,
+                tools: to_chat_tools(tools),
+                temperature: self.temperature,
+                top_p: self.top_p,
+                max_tokens: self.max_tokens,
+                stream,
+                reasoning: reasoning_block.clone(),
+                usage: UsageAccounting { include: true },
+            }
         };
 
-        self.send_and_stream(&model, &request, on_chunk).await
+        // Memo (#619): a model known to reject tools-in-streaming skips the
+        // stream attempt entirely when this turn carries tools. A no-tools turn
+        // always streams -- the model is only "bad" *with* tools. The guard is
+        // dropped before any `.await`.
+        let skip_streaming = has_tools && {
+            let memo = self
+                .non_streaming_tools_models
+                .lock()
+                .expect("non_streaming_tools_models mutex poisoned");
+            memo.contains(&model)
+        };
+        if skip_streaming {
+            tracing::debug!(
+                model = %model,
+                "skipping stream: model memoized as tools-in-streaming-unsupported"
+            );
+            let request = make_request(false);
+            return self
+                .send_non_streaming(&model, &request, on_chunk, &cancellation)
+                .await;
+        }
+
+        // Try streaming first; on the tools-in-streaming rejection, memoize the
+        // model and retry once via non-streaming with the handed-back callback.
+        // A non-streaming failure surfaces as-is -- it never loops back to the
+        // stream attempt (#619).
+        let stream_request = make_request(true);
+        match self
+            .send_and_stream(&model, &stream_request, on_chunk, &cancellation)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(StreamingDispatchError::ToolsUnsupported { on_chunk, detail }) => {
+                tracing::warn!(
+                    model = %model,
+                    detail,
+                    "OpenRouter rejected tools in streaming; retrying non-streaming and \
+                     memoizing the model so future turns skip the stream attempt"
+                );
+                {
+                    let mut memo = self
+                        .non_streaming_tools_models
+                        .lock()
+                        .expect("non_streaming_tools_models mutex poisoned");
+                    memo.insert(model.clone());
+                }
+                let request = make_request(false);
+                self.send_non_streaming(&model, &request, on_chunk, &cancellation)
+                    .await
+            }
+            Err(StreamingDispatchError::Other(e)) => Err(e),
+        }
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
@@ -1556,5 +1646,220 @@ mod tests {
         let warm = client.list_models().await.expect("served from cache");
         assert_eq!(recovered, warm);
         ok.assert_calls(1);
+    }
+
+    // --- Non-streaming fallback + per-model memo (#619) ------------------
+
+    /// A provider error body signalling "tools unsupported in streaming".
+    const TOOLS_UNSUPPORTED_BODY: &str = r#"{"error":{"code":"invalid_request_error","type":"invalid_request_error","message":"This model doesn't support tool use in streaming mode. Disable streaming to use tools."}}"#;
+
+    /// A non-streaming `/chat/completions` JSON response with text, a tool call,
+    /// and usage.
+    const NONSTREAMING_TOOL_RESPONSE: &str = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"On it","tool_calls":[{"id":"call_9","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"rust\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":2}}}"#;
+
+    fn a_tool() -> ToolDefinition {
+        ToolDefinition::new(
+            "lookup",
+            "look things up",
+            serde_json::json!({"type":"object"}),
+        )
+    }
+
+    /// Mock the streaming attempt (`"stream":true`) returning the
+    /// tools-unsupported error; returns the handle for call-count assertions.
+    fn streaming_rejects_tools(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":true"#);
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(TOOLS_UNSUPPORTED_BODY);
+        })
+    }
+
+    /// Mock the non-streaming request (`"stream":false`) with `status`/`body`.
+    fn non_streaming_returns<'a>(
+        server: &'a MockServer,
+        status: u16,
+        body: &str,
+    ) -> httpmock::Mock<'a> {
+        let owned = body.to_string();
+        server.mock(move |when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":false"#);
+            then.status(status)
+                .header("content-type", "application/json")
+                .body(&owned);
+        })
+    }
+
+    #[tokio::test]
+    async fn tools_unsupported_streaming_falls_back_to_non_streaming() {
+        let server = MockServer::start();
+        let stream_mock = streaming_rejects_tools(&server);
+        let ns_mock = non_streaming_returns(&server, 200, NONSTREAMING_TOOL_RESPONSE);
+        let client = client_for(&server);
+
+        let received = Arc::new(Mutex::new(String::new()));
+        let rc = Arc::clone(&received);
+        let resp = client
+            .stream_completion(
+                vec![Message::new(Role::User, "find rust")],
+                &[a_tool()],
+                ReasoningConfig::default(),
+                Box::new(move |c| {
+                    rc.lock().expect("lock").push_str(&c);
+                    true
+                }),
+            )
+            .await
+            .expect("non-streaming fallback ok");
+
+        stream_mock.assert_calls(1);
+        ns_mock.assert_calls(1);
+        assert_eq!(resp.text, "On it");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_9");
+        assert_eq!(resp.tool_calls[0].name, "lookup");
+        assert_eq!(resp.tool_calls[0].arguments, r#"{"q":"rust"}"#);
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+        // The full assistant text reached the consumer via on_chunk.
+        assert_eq!(*received.lock().expect("lock"), "On it");
+    }
+
+    #[tokio::test]
+    async fn memo_skips_streaming_on_the_second_call() {
+        let server = MockServer::start();
+        let stream_mock = streaming_rejects_tools(&server);
+        let ns_mock = non_streaming_returns(&server, 200, NONSTREAMING_TOOL_RESPONSE);
+        let client = client_for(&server);
+
+        for _ in 0..2 {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "find rust")],
+                    &[a_tool()],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("ok");
+        }
+
+        // Streaming was attempted only on the first call; the memo routed the
+        // second call straight to non-streaming.
+        stream_mock.assert_calls(1);
+        ns_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn model_without_error_stays_on_streaming() {
+        let server = MockServer::start();
+        let stream_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":true"#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+        // A non-streaming mock that must never be hit.
+        let ns_mock = non_streaming_returns(&server, 200, NONSTREAMING_TOOL_RESPONSE);
+        let client = client_for(&server);
+
+        for _ in 0..2 {
+            let resp = client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[a_tool()],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("stream ok");
+            assert_eq!(resp.text, "Hi");
+        }
+
+        stream_mock.assert_calls(2);
+        ns_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_failure_surfaces_without_looping() {
+        let server = MockServer::start();
+        let stream_mock = streaming_rejects_tools(&server);
+        let ns_mock = non_streaming_returns(&server, 500, "upstream boom");
+        let client = client_for(&server);
+
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[a_tool()],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("non-streaming failure must surface");
+
+        // Streaming attempted exactly once (no re-loop back to streaming), and
+        // the non-streaming error is what surfaces.
+        stream_mock.assert_calls(1);
+        ns_mock.assert_calls(1);
+        assert!(
+            matches!(err, CoreError::RateLimited { .. }),
+            "500 must map to RateLimited; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_honoured_on_non_streaming_path() {
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start();
+        streaming_rejects_tools(&server);
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":false"#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(Duration::from_secs(5))
+                .body(NONSTREAMING_TOOL_RESPONSE);
+        });
+        let client = client_for(&server);
+        let token = CancellationToken::new();
+        let handle = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handle.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[a_tool()],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled on the non-streaming path, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancellation must abort the non-streaming retry promptly; took {elapsed:?}"
+        );
     }
 }

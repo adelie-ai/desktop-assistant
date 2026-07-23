@@ -52,9 +52,13 @@ pub struct ContextOverflowInfo {
 ///    [`CoreError::QuotaExceeded`] (permanent billing; not retried), regardless
 ///    of status -- some providers signal it with HTTP 429, which would
 ///    otherwise look retryable;
-/// 3. HTTP 429 -> [`CoreError::RateLimited`] carrying the `Retry-After` hint;
-/// 4. HTTP 5xx (incl. 503) -> [`CoreError::RateLimited`] (transient overload);
-/// 5. anything else -> a clear [`CoreError::Llm`] message.
+/// 3. streaming-with-tools-unsupported body
+///    ([`detect_streaming_tools_unsupported`]) -> [`CoreError::ToolsUnsupported`],
+///    the signal the connector uses to retry non-streaming and memoize the
+///    model (#619);
+/// 4. HTTP 429 -> [`CoreError::RateLimited`] carrying the `Retry-After` hint;
+/// 5. HTTP 5xx (incl. 503) -> [`CoreError::RateLimited`] (transient overload);
+/// 6. anything else -> a clear [`CoreError::Llm`] message.
 ///
 /// The raw `body` is included in the detail so the failure is diagnosable; a
 /// connector that must scrub a decline body (e.g. `content_filter`, which
@@ -73,6 +77,12 @@ pub fn classify_error(status: StatusCode, headers: &HeaderMap, body: &str) -> Co
 
     if detect_insufficient_quota(body) {
         return CoreError::QuotaExceeded { detail };
+    }
+
+    // A backend that accepts tools only on a non-streaming request (#619). The
+    // connector uses this signal to retry non-streaming and memoize the model.
+    if detect_streaming_tools_unsupported(body) {
+        return CoreError::ToolsUnsupported { detail };
     }
 
     if status.as_u16() == 429 {
@@ -120,6 +130,45 @@ pub fn detect_context_overflow(body: &str) -> Option<ContextOverflowInfo> {
         prompt_tokens,
         max_tokens,
     })
+}
+
+/// Detect the provider error that signals "this backend does not accept tool
+/// use while streaming" (#619).
+///
+/// OpenRouter proxies a long tail of models; some routed backends accept tools
+/// only on a non-streaming request and reject a streaming request that carries
+/// them. This is the sanctioned connector-boundary string match (see
+/// [`detect_context_overflow`] / [`detect_insufficient_quota`]): the providers
+/// give no structured code for it, only prose. It is kept **narrow** so it does
+/// not false-positive on an unrelated failure -- the message must mention *both*
+/// tools *and* streaming *and* a negation ("not support", "unsupported",
+/// "not available", ...). A plain tools-unsupported error that is not
+/// streaming-specific is deliberately excluded: retrying non-streaming would not
+/// help, so it must surface as-is rather than trigger the fallback.
+///
+/// The message is read from the OpenAI error envelope when the body parses as
+/// one, else the raw body is scanned (some aggregators/proxies return a
+/// non-JSON body).
+pub fn detect_streaming_tools_unsupported(body: &str) -> bool {
+    let message = serde_json::from_str::<ErrorEnvelope>(body)
+        .ok()
+        .map(|e| e.error.message)
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| body.to_string());
+    let lc = message.to_ascii_lowercase();
+    let mentions_stream = lc.contains("stream");
+    let mentions_tool = lc.contains("tool");
+    let negated = lc.contains("not support")
+        || lc.contains("doesn't support")
+        || lc.contains("does not support")
+        || lc.contains("unsupported")
+        || lc.contains("not available")
+        || lc.contains("not allowed")
+        || lc.contains("not compatible")
+        || lc.contains("incompatible")
+        || lc.contains("cannot be used")
+        || lc.contains("can't be used");
+    mentions_stream && mentions_tool && negated
 }
 
 /// Detect the permanent `insufficient_quota` billing error in an HTTP error
@@ -230,6 +279,54 @@ mod tests {
         let body = r#"{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"slow down"}}"#;
         assert!(!detect_insufficient_quota(body));
         assert!(!detect_insufficient_quota("not json"));
+    }
+
+    // --- detect_streaming_tools_unsupported -----------------------------
+
+    #[test]
+    fn detect_streaming_tools_unsupported_matches_specific_wordings() {
+        assert!(detect_streaming_tools_unsupported(
+            r#"{"error":{"code":"invalid_request_error","message":"This model doesn't support tool use in streaming mode. Disable streaming to use tools."}}"#
+        ));
+        assert!(detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"tools are not supported when stream is true"}}"#
+        ));
+        // Non-JSON body from an upstream proxy is scanned raw.
+        assert!(detect_streaming_tools_unsupported(
+            "Streaming with tool_calls is not available for this provider"
+        ));
+    }
+
+    #[test]
+    fn detect_streaming_tools_unsupported_rejects_unrelated_errors() {
+        // Rate limit: no tool/stream co-occurrence.
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"Rate limit reached"}}"#
+        ));
+        // Context overflow: mentions neither tools nor streaming.
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#
+        ));
+        // A plain tools-unsupported error that is NOT streaming-specific must
+        // not trip the streaming detector (non-streaming would not help).
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"tools are not supported by this model"}}"#
+        ));
+        // A streaming error unrelated to tools.
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"streaming connection failed midway"}}"#
+        ));
+        assert!(!detect_streaming_tools_unsupported("Bad Gateway"));
+    }
+
+    #[test]
+    fn classify_streaming_tools_unsupported_maps_to_tools_unsupported() {
+        let body = r#"{"error":{"code":"invalid_request_error","type":"invalid_request_error","message":"This model does not support tool use in streaming mode"}}"#;
+        let err = classify_error(StatusCode::BAD_REQUEST, &HeaderMap::new(), body);
+        assert!(
+            matches!(err, CoreError::ToolsUnsupported { .. }),
+            "expected ToolsUnsupported, got {err:?}"
+        );
     }
 
     // --- classify_error -------------------------------------------------

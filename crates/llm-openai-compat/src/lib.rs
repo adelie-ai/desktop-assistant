@@ -27,9 +27,15 @@
 //! - [`mark_system_cache_breakpoint`]: add a `cache_control` marker to the last
 //!   system message via the multi-part content-array form.
 //! - [`classify_error`] plus the [`detect_context_overflow`] /
-//!   [`detect_insufficient_quota`] sub-detectors: the base OpenAI-compatible
-//!   error mapping, which connectors extend (OpenRouter adds 402-credits, Azure
-//!   adds `content_filter`) by wrapping these.
+//!   [`detect_insufficient_quota`] / [`detect_streaming_tools_unsupported`]
+//!   sub-detectors: the base OpenAI-compatible error mapping, which connectors
+//!   extend (OpenRouter adds 402-credits, Azure adds `content_filter`) by
+//!   wrapping these.
+//! - [`send_chat_request`] / [`dispatch_non_streaming`] / [`parse_chat_completion`]
+//!   / [`StreamingDispatchError`]: the non-streaming `/chat/completions` fallback
+//!   a connector retries with when a routed backend rejects tools-in-streaming
+//!   (#619) -- shared connect-race send, single-response parsing, and the
+//!   callback hand-back so the connector can retry without rebuilding it.
 //!
 //! Streaming reuses the shared `llm-http` primitives
 //! ([`next_step`](desktop_assistant_llm_http::next_step),
@@ -40,16 +46,23 @@
 
 mod errors;
 mod messages;
+mod nonstreaming;
 mod streaming;
 mod tools;
 mod usage;
 
 pub use errors::{
     ContextOverflowInfo, classify_error, detect_context_overflow, detect_insufficient_quota,
+    detect_streaming_tools_unsupported,
 };
 pub use messages::{
     CacheControl, ChatContent, ChatContentPart, ChatFunctionCall, ChatMessage, ChatToolCall,
     mark_system_cache_breakpoint, sanitize_tool_arguments, to_chat_messages,
+};
+pub use nonstreaming::{
+    ChatCompletion, ChatCompletionChoice, ChatResponseFunction, ChatResponseMessage,
+    ChatResponseToolCall, StreamingDispatchError, dispatch_non_streaming, parse_chat_completion,
+    send_chat_request,
 };
 pub use streaming::{
     ChatChoice, ChatChunk, ChatDelta, ChatFunctionDelta, ChatToolCallDelta, consume_chat_stream,
