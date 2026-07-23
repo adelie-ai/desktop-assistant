@@ -26,7 +26,7 @@ pub const DEFAULT_SURFACE: &str = "default";
 /// `[surfaces.<name>]` section; a surface with no section inherits
 /// [`DEFAULT_SURFACE`]. Kept here as the single source of truth so admin UIs and
 /// clients agree on the set rather than scattering string literals.
-pub const CLIENT_SURFACES: [&str; 4] = ["gtk", "tui", "kde", "voice"];
+pub const CLIENT_SURFACES: [&str; 5] = ["gtk", "tui", "kde", "voice", "mac"];
 
 /// True when `name` is one of the [`CLIENT_SURFACES`]. The inheritance fallback
 /// [`DEFAULT_SURFACE`] is deliberately not a client surface.
