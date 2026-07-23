@@ -148,6 +148,37 @@ impl StepStack {
         self.frames.pop()
     }
 
+    /// Mint `n` FLAT sibling step keys under the current frame (or under the
+    /// implicit root when the stack is empty), WITHOUT pushing any frames, and
+    /// return their `(dotted_key, sequence)` pairs. Advances the same
+    /// child/root counter [`Self::begin`] uses, so a later `begin` never
+    /// recycles a fanned-out key. `fan_out(0)` is a no-op returning `[]`.
+    ///
+    /// Why: N subagents fan out CONCURRENTLY, but a `StepStack` is a single
+    /// active-path stack that can hold only one open frame chain. Fan-out gives
+    /// each concurrent child its own sibling owner-path anchor (frozen at spawn)
+    /// without any of them occupying the frame stack, so they never serialize;
+    /// the parent later rolls the whole group up by completing the enclosing
+    /// step (#287).
+    // Wired by the dispatch loop in #287 slice 6; primitive landed ahead of its caller.
+    #[allow(dead_code)]
+    pub fn fan_out(&mut self, n: usize) -> Vec<(String, i32)> {
+        (0..n)
+            .map(|_| match self.frames.last_mut() {
+                Some(parent) => {
+                    parent.child_counter += 1;
+                    let seq = i32::try_from(parent.child_counter).unwrap_or(i32::MAX);
+                    (format!("{}.{}", parent.key, parent.child_counter), seq)
+                }
+                None => {
+                    self.root_counter += 1;
+                    let seq = i32::try_from(self.root_counter).unwrap_or(i32::MAX);
+                    (self.root_counter.to_string(), seq)
+                }
+            })
+            .collect()
+    }
+
     /// Drop every frame. Called by the dispatch loop after overflow recovery,
     /// which can drain messages and invalidate the absolute watermarks. The
     /// root counter is intentionally preserved: the todos written before the
@@ -156,6 +187,20 @@ impl StepStack {
     /// existing todo via upsert.
     pub fn clear(&mut self) {
         self.frames.clear();
+    }
+}
+
+/// Compose a child owner-path from a parent's own `owner_todo` and a step key:
+/// `("", "1") -> "1"`, `("9.3", "1") -> "9.3.1"`. Used both to derive a fanned
+/// child's `owner_todo` at spawn and to compute the cascade-delete prefix when
+/// the enclosing step completes (#287).
+// Wired by the dispatch loop in #287 slice 6; primitive landed ahead of its caller.
+#[allow(dead_code)]
+pub(crate) fn owner_subtree_prefix(owner_self: &str, step_key: &str) -> String {
+    if owner_self.is_empty() {
+        step_key.to_string()
+    } else {
+        format!("{owner_self}.{step_key}")
     }
 }
 
@@ -471,6 +516,10 @@ pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option
 /// so the renderer stays decoupled from the storage row type.
 pub(crate) struct RawNote<'a> {
     pub key: &'a str,
+    /// The note's `owner_todo` namespace ("" for the top-level session). The
+    /// roll-up tree keys on `(owner_todo, key)` so fanned-out subagent
+    /// namespaces that each number their own local keys don't collide (#287).
+    pub owner_todo: &'a str,
     pub content: &'a str,
     pub note_type: &'a str,
     pub done: bool,
@@ -493,27 +542,32 @@ pub(crate) fn render_plan_from_notes(
 ) -> Option<String> {
     use std::collections::HashMap;
 
-    let done_by_key: HashMap<&str, bool> = notes
+    // Key the roll-up by (owner_todo, key), not key alone: fanned-out subagent
+    // namespaces each number their own local keys ("1", "1.1"), so a
+    // subtree-inclusive parent read can hold the same key in several namespaces.
+    // Keying by key alone would cross-contaminate done-state and outcome
+    // absorption between sibling namespaces (#287).
+    let done_by_key: HashMap<(&str, &str), bool> = notes
         .iter()
         .filter(|n| n.note_type == STEP_NOTE_TYPE)
-        .map(|n| (n.key, n.done))
+        .map(|n| ((n.owner_todo, n.key), n.done))
         .collect();
     if done_by_key.is_empty() {
         return None;
     }
 
-    // Findings still pending roll-up, keyed by their step. Absorbed (dropped)
-    // once the parent step is done.
-    let outcomes: HashMap<&str, &str> = notes
+    // Findings still pending roll-up, keyed by (owner_todo, step). Absorbed
+    // (dropped) once the parent step in the SAME namespace is done.
+    let outcomes: HashMap<(&str, &str), &str> = notes
         .iter()
         .filter_map(|n| {
             n.key
                 .strip_prefix(OUTCOME_KEY_PREFIX)
-                .map(|step| (step, n.content))
+                .map(|step| ((n.owner_todo, step), n.content))
         })
-        .filter(|(step, _)| {
+        .filter(|((owner, step), _)| {
             step.rsplit_once('.')
-                .map(|(parent, _)| !done_by_key.get(parent).copied().unwrap_or(false))
+                .map(|(parent, _)| !done_by_key.get(&(*owner, parent)).copied().unwrap_or(false))
                 .unwrap_or(true)
         })
         .collect();
@@ -525,7 +579,7 @@ pub(crate) fn render_plan_from_notes(
             key: n.key,
             goal: n.content,
             done: n.done,
-            outcome: outcomes.get(n.key).copied(),
+            outcome: outcomes.get(&(n.owner_todo, n.key)).copied(),
         })
         .collect();
     render_plan(&items, current, max_items)
@@ -991,8 +1045,20 @@ mod tests {
         ty: &'static str,
         done: bool,
     ) -> RawNote<'static> {
+        raw_owned("", key, content, ty, done)
+    }
+
+    /// Like [`raw`] but in an explicit `owner_todo` namespace.
+    fn raw_owned(
+        owner_todo: &'static str,
+        key: &'static str,
+        content: &'static str,
+        ty: &'static str,
+        done: bool,
+    ) -> RawNote<'static> {
         RawNote {
             key,
+            owner_todo,
             content,
             note_type: ty,
             done,
@@ -1127,5 +1193,84 @@ mod tests {
             raw("1", "s", "todo", true),
         ];
         assert!(freeform_note_keys(&notes).is_empty());
+    }
+
+    // --- #287 slice 4: fan-out + owner-path + cross-namespace roll-up --------
+
+    #[test]
+    fn fan_out_mints_flat_siblings_without_pushing() {
+        let mut s = StepStack::new();
+        s.begin("parent", 0); // "1"
+        assert_eq!(s.depth(), 1);
+        let sibs = s.fan_out(3);
+        assert_eq!(
+            sibs,
+            vec![
+                ("1.1".to_string(), 1),
+                ("1.2".to_string(), 2),
+                ("1.3".to_string(), 3),
+            ]
+        );
+        assert_eq!(s.depth(), 1, "fan_out pushes no frames");
+    }
+
+    #[test]
+    fn fan_out_advances_counter_so_later_begin_never_reuses() {
+        let mut s = StepStack::new();
+        s.begin("parent", 0); // "1"
+        s.fan_out(2); // "1.1", "1.2"
+        let (k, _) = s.begin("next", 0);
+        assert_eq!(k, "1.3", "begin after fan_out continues the shared counter");
+    }
+
+    #[test]
+    fn fan_out_on_empty_stack_mints_top_level_siblings() {
+        let mut s = StepStack::new();
+        let sibs = s.fan_out(2);
+        assert_eq!(sibs, vec![("1".to_string(), 1), ("2".to_string(), 2)]);
+        assert_eq!(s.depth(), 0);
+    }
+
+    #[test]
+    fn fan_out_zero_returns_empty_and_is_noop() {
+        let mut s = StepStack::new();
+        s.begin("p", 0);
+        assert!(s.fan_out(0).is_empty());
+        // The counter did not advance: the next child is still "1.1".
+        let (k, _) = s.begin("c", 0);
+        assert_eq!(k, "1.1");
+    }
+
+    #[test]
+    fn owner_subtree_prefix_composes_root_and_nested() {
+        assert_eq!(owner_subtree_prefix("", "1"), "1");
+        assert_eq!(owner_subtree_prefix("9.3", "1"), "9.3.1");
+        assert_eq!(owner_subtree_prefix("1.1", "2"), "1.1.2");
+    }
+
+    #[test]
+    fn render_plan_disambiguates_cross_namespace_local_keys() {
+        // Two fanned-out namespaces each number their own local steps "1"/"1.1"
+        // and record an outcome for "1.1". In namespace "1.1" the parent step
+        // "1" is DONE (its child outcome is absorbed); in namespace "1.2" it is
+        // NOT done (its outcome stays visible). Keying by (owner_todo, key)
+        // keeps the identical local keys from cross-contaminating.
+        let notes = vec![
+            raw_owned("1.1", "1", "parent A", "todo", true),
+            raw_owned("1.1", "1.1", "child A", "todo", true),
+            raw_owned("1.1", "outcome:1.1", "A-FINDING", "note", false),
+            raw_owned("1.2", "1", "parent B", "todo", false),
+            raw_owned("1.2", "1.1", "child B", "todo", true),
+            raw_owned("1.2", "outcome:1.1", "B-FINDING", "note", false),
+        ];
+        let rendered = render_plan_from_notes(&notes, None, 50).expect("plan");
+        assert!(
+            rendered.contains("B-FINDING"),
+            "namespace 1.2's outcome (parent not done) stays visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("A-FINDING"),
+            "namespace 1.1's outcome is absorbed, not cross-contaminated: {rendered}"
+        );
     }
 }

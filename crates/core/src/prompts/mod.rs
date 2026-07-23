@@ -9,6 +9,11 @@ pub enum PromptSectionKind {
     Database,
     Learning,
     ToolUse,
+    /// Delegation to subagents (#550): when and how to hand separable parts of
+    /// a big task to a child agent, bind each to a plan step, review its output
+    /// before trusting it, and roll results up level-by-level. Leans on the
+    /// [`Self::Scratchpad`] step machinery rather than reinventing roll-up.
+    Subagents,
     // Dynamic (built per-turn):
     /// Configurable disposition blurb (issue #226). Rendered from the active
     /// [`Personality`] and injected before [`Self::ToolAvailability`] and the
@@ -266,6 +271,7 @@ const SECTION_SCRATCHPAD: &str = include_str!("sections/scratchpad.txt");
 const SECTION_DATABASE: &str = include_str!("sections/database.txt");
 const SECTION_LEARNING: &str = include_str!("sections/learning.txt");
 const SECTION_TOOL_USE: &str = include_str!("sections/tool_use.txt");
+const SECTION_SUBAGENTS: &str = include_str!("sections/subagents.txt");
 
 /// Return the static (file-based) prompt sections in order.
 pub fn static_sections() -> Vec<PromptSection> {
@@ -280,6 +286,7 @@ pub fn static_sections() -> Vec<PromptSection> {
         PromptSection::new(PromptSectionKind::Database, SECTION_DATABASE),
         PromptSection::new(PromptSectionKind::Learning, SECTION_LEARNING),
         PromptSection::new(PromptSectionKind::ToolUse, SECTION_TOOL_USE),
+        PromptSection::new(PromptSectionKind::Subagents, SECTION_SUBAGENTS),
     ]
 }
 
@@ -310,7 +317,7 @@ mod tests {
 
     #[test]
     fn static_sections_count() {
-        assert_eq!(static_sections().len(), 7);
+        assert_eq!(static_sections().len(), 8);
     }
 
     #[test]
@@ -323,6 +330,7 @@ mod tests {
         assert_eq!(sections[4].kind, PromptSectionKind::Database);
         assert_eq!(sections[5].kind, PromptSectionKind::Learning);
         assert_eq!(sections[6].kind, PromptSectionKind::ToolUse);
+        assert_eq!(sections[7].kind, PromptSectionKind::Subagents);
     }
 
     #[test]
@@ -398,6 +406,145 @@ mod tests {
         assert!(
             assembled.contains("Re-summarize"),
             "the finishing pass must re-summarize the pad, keeping relevant detail"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_guides_subagent_delegation() {
+        // The prompt must teach Adele that she can delegate separable parts of a
+        // big task to subagents, and name the tools so she knows they exist
+        // (#550, completing the Phase 0 subagent slice with #134/#287).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("== Delegating to subagents =="),
+            "the prompt must advertise subagent delegation"
+        );
+        assert!(
+            assembled.contains("spawn_subagent"),
+            "and name the spawn tool"
+        );
+        assert!(
+            assembled.contains("get_subagent_status"),
+            "and the poll/collect tool for wait=false children"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_urges_reviewing_subagent_output() {
+        // A subagent's answer must be reviewed before it is trusted — the core
+        // discipline the user asked for. Never bank a conclusion unchecked.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("Review before you trust"),
+            "the prompt must direct Adele to review subagent output before trusting it"
+        );
+        assert!(
+            assembled.contains("raw material"),
+            "framing a subagent's answer as raw material, not truth"
+        );
+        assert!(
+            assembled.contains("verifier"),
+            "and offer spawning a verifier / redoing the part when it doesn't hold up"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_ties_subagents_to_plan_steps() {
+        // Each subagent binds to a plan step and rolls up through the existing
+        // begin_step/complete_step machinery — the section must lean on it, not
+        // reinvent roll-up.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("Bind each subagent to a plan step"),
+            "the prompt must tie a subagent to a begin_step-tracked sub-task"
+        );
+        assert!(
+            assembled.contains("Roll up at every level"),
+            "and direct level-by-level roll-up of reviewed outcomes"
+        );
+        assert!(
+            assembled.contains("1.1.1 rolls into 1.1"),
+            "with a concrete nested roll-up example"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_curates_subagent_results_into_memory() {
+        // End-state of the roll-up: the surviving top-level outcomes are the
+        // curated, usable result for the session — kept on the pad while
+        // salient, and promoted to the durable KB when worth keeping beyond the
+        // conversation (the user's stated terminal behavior).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("curated"),
+            "the prompt must frame rolled-up subagent outcomes as curated, usable session memory"
+        );
+        assert!(
+            assembled.contains("builtin_knowledge_base_write"),
+            "and direct promoting lasting subagent findings to the knowledge base"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_shares_session_scratchpad_with_subagents() {
+        // A subagent's *reasoning* context is its own (isolated history), but it
+        // shares this session's scratchpad (read + write) — the channel for
+        // handing context down without front-loading the brief — and its
+        // entries are marked/tied to its todo so the parent can maintain them.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("own reasoning context"),
+            "the child's reasoning/history must stay isolated"
+        );
+        assert!(
+            assembled.contains("shares this session's scratchpad"),
+            "but it shares the session scratchpad (read + write) as the context channel"
+        );
+        assert!(
+            assembled.contains("marked and tied to its todo"),
+            "and its entries are marked/associated with its todo for parent maintenance"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_cleanup_of_lower_levels_is_automatic() {
+        // Cleanup is mechanism, not discipline: completing a step unwinds its
+        // descendants' todos/entries automatically (stack-frame semantics), so
+        // the parent carries up what matters rather than hand-deleting.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("Carry up what matters"),
+            "the parent must carry salient findings up into the outcome / KB"
+        );
+        assert!(
+            assembled.contains("unwinds them automatically"),
+            "and lower-level notes are cleaned up automatically on completion, not by hand"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_privileges_scratchpad_maintenance() {
+        // Todo/scratchpad tools + their ongoing upkeep must sit at a privileged
+        // position, and the pad kept to only what's currently relevant.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("first-class part of the task"),
+            "scratchpad upkeep must be framed as first-class, not optional"
+        );
+        assert!(
+            assembled.contains("only what's relevant to the task right now"),
+            "and the pad kept to only what's currently relevant, pruned as you go"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_directs_subagent_scratchpad_upkeep() {
+        // A subagent must record salient findings on the shared pad tied to its
+        // todo, and know its lower-level notes are cleaned up for it.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("If you are yourself a subagent"),
+            "the prompt must give subagent-facing scratchpad guidance"
         );
     }
 
