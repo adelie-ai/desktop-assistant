@@ -772,6 +772,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_prompt_idempotent_ack_returns_both_correlation_ids() {
+        // #138: the ack variant surfaces the `task_id` (the background-task
+        // handle Cancel acts on) alongside the `request_id`, which the
+        // `request_id`-only `send_prompt_idempotent` intentionally drops.
+        let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+        });
+
+        let ack = client
+            .send_prompt_idempotent_ack(
+                "conv-1",
+                "hello",
+                None,
+                String::new(),
+                Some("turn-key-1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ack.request_id, "req-1");
+        assert_eq!(ack.task_id, "task-1");
+        // Same wire shape as the request_id-only variant: a keyed SendMessage.
+        match client.last() {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                idempotency_key,
+                ..
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(content, "hello");
+                assert_eq!(idempotency_key.as_deref(), Some("turn-key-1"));
+            }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_prompt_idempotent_ack_surfaces_empty_ids_on_legacy_ack() {
+        // A legacy / pre-#114 daemon replies with a bare `Ack` carrying no
+        // correlation ids. The ack variant surfaces empty strings for both, so
+        // such a client can't offer Cancel (no task id) but doesn't error.
+        let client = RecordingClient::new(api::CommandResult::Ack);
+
+        let ack = client
+            .send_prompt_idempotent_ack("conv-1", "hello", None, String::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(ack.request_id, "");
+        assert_eq!(ack.task_id, "");
+    }
+
+    #[tokio::test]
+    async fn send_prompt_idempotent_still_returns_only_request_id() {
+        // The request_id-only variant is unchanged: it delegates to the ack
+        // variant and keeps just the `request_id` (what streamed events carry),
+        // so its existing callers are byte-for-byte unaffected (#138).
+        let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-9".to_string(),
+            task_id: "task-9".to_string(),
+        });
+
+        let returned = client
+            .send_prompt_idempotent("conv-1", "hello", None, String::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(returned, "req-9");
+    }
+
+    #[tokio::test]
     async fn send_prompt_full_stays_idempotency_key_free() {
         // Non-breaking: the existing entry point must keep emitting a key-less
         // SendMessage so callers that don't opt into idempotency are unchanged.
