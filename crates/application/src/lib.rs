@@ -7,6 +7,7 @@ pub mod background_tasks;
 pub mod client_tools;
 pub mod conversation_subs;
 mod inflight;
+pub mod subagent_executor;
 pub mod subagent_tools;
 
 use std::sync::Arc;
@@ -2220,6 +2221,9 @@ where
                         // protocol level — only `spawn_subagent` (#112)
                         // wires a sink to pull the final text back.
                         result_sink: None,
+                        // A standalone agent is not a subagent: no session-pad
+                        // scope; its scratchpad ops stay on its own conversation.
+                        subagent_scope: None,
                     },
                     move |conversation_id| api::TaskKind::Standalone {
                         name: name_for_kind,
@@ -2885,6 +2889,12 @@ pub(crate) struct AgentConversationSpec {
     /// task; `SpawnStandaloneAgent` (#113) leaves it `None` because the
     /// agent run is fire-and-forget at the protocol level.
     pub result_sink: Option<AgentResultSink>,
+    /// The session-pad scope (#287) a subagent run adopts: the child works in
+    /// its own conversation for reasoning/history, but its scratchpad reads and
+    /// writes target the session pad under `owner_todo`, snapshot-bounded by the
+    /// spawn marker. `Some` for `spawn_subagent`; `None` for `SpawnStandaloneAgent`
+    /// and any pre-#287 caller, leaving pad ops on the run's own conversation.
+    pub subagent_scope: Option<desktop_assistant_core::ports::scratchpad_scope::SubagentScope>,
 }
 
 /// Build a [`ToolObserver`] that mirrors the core loop's tool/MCP calls into a
@@ -2951,7 +2961,7 @@ pub(crate) fn spawn_agent_conversation<C>(
     kind_factory: impl FnOnce(String) -> api::TaskKind,
 ) -> api::TaskId
 where
-    C: ConversationService + Send + Sync + 'static,
+    C: ?Sized + ConversationService + Send + Sync + 'static,
 {
     let AgentConversationSpec {
         user_id,
@@ -2962,103 +2972,136 @@ where
         tools,
         conversation_id,
         result_sink,
+        subagent_scope,
     } = spec;
 
     let kind = kind_factory(conversation_id.clone());
     let agent_name = name;
 
-    registry.spawn(user_id.clone(), kind, title, move |ctx| async move {
-        ctx.logs.append(
-            api::LogLevel::Info,
-            api::LogCategory::Status,
-            format!("agent '{agent_name}' starting prompt"),
-            None,
-        );
+    // #287: pin the child's owner_todo namespace + spawn snapshot marker onto
+    // the task row from the scope the dispatch loop minted. Standalone agents
+    // (no subagent_scope) get the root default, leaving their row unchanged.
+    let spawn_meta = subagent_scope
+        .as_ref()
+        .map(|s| crate::background_tasks::SpawnMeta {
+            owner_todo: s.owner_todo.clone(),
+            spawn_marker: Some(s.visible_before.clone()),
+        })
+        .unwrap_or_default();
 
-        let override_for_core = override_selection.map(|o| PromptSelectionOverride {
-            connection_id: o.connection_id,
-            model_id: o.model_id,
-            effort: o.effort,
-        });
+    registry.spawn_with_meta(
+        user_id.clone(),
+        kind,
+        title,
+        spawn_meta,
+        move |ctx| async move {
+            ctx.logs.append(
+                api::LogLevel::Info,
+                api::LogCategory::Status,
+                format!("agent '{agent_name}' starting prompt"),
+                None,
+            );
 
-        // Drop the chunk callback — standalone / subagent runs emit their
-        // final text through the registry, not the streaming `SendMessage`
-        // chunk path. The status callback, however, drives the task's
-        // `progress_hint` so the task list shows what the agent is doing right
-        // now (e.g. the current tool/MCP call) instead of just its title.
-        let on_chunk: desktop_assistant_core::ports::llm::ChunkCallback = Box::new(|_chunk| true);
-        let progress_ctx = ctx.clone();
-        let on_status: desktop_assistant_core::ports::llm::StatusCallback = Box::new(move |msg| {
-            progress_ctx.set_progress_hint(Some(msg));
-        });
+            let override_for_core = override_selection.map(|o| PromptSelectionOverride {
+                connection_id: o.connection_id,
+                model_id: o.model_id,
+                effort: o.effort,
+            });
 
-        // Install the tool allowlist (if any) and the requesting user's
-        // identity so the inner `send_prompt_with_override` call (and
-        // any storage queries it triggers) observe the same scope the
-        // foreground send path uses.
-        let conv_id_for_send = conversation_id.clone();
-        let token = ctx.token.clone();
-        // Mirror this agent's tool/MCP calls into its task log so the panel
-        // shows what the agent is doing, same as the foreground send path
-        // (shared observer install — #256).
-        let inner = with_task_observer(Some(ctx), async move {
-            conversations
-                .send_prompt_with_override(
-                    &desktop_assistant_core::domain::ConversationId::from(
-                        conv_id_for_send.as_str(),
-                    ),
-                    initial_prompt,
-                    override_for_core,
-                    // Agent runs (standalone / subagent) carry no per-request
-                    // system-prompt refinement — that's a foreground voice/chat
-                    // concern, not an agent one.
-                    String::new(),
-                    on_chunk,
-                    on_status,
-                    token,
-                )
-                .await
-        });
-        let result = if let Some(tools) = tools {
-            desktop_assistant_core::ports::auth::with_user_id(
-                user_id.clone(),
-                desktop_assistant_core::ports::llm::with_tool_allowlist(tools, inner),
-            )
-            .await
-        } else {
-            desktop_assistant_core::ports::auth::with_user_id(user_id.clone(), inner).await
-        };
+            // Drop the chunk callback — standalone / subagent runs emit their
+            // final text through the registry, not the streaming `SendMessage`
+            // chunk path. The status callback, however, drives the task's
+            // `progress_hint` so the task list shows what the agent is doing right
+            // now (e.g. the current tool/MCP call) instead of just its title.
+            let on_chunk: desktop_assistant_core::ports::llm::ChunkCallback =
+                Box::new(|_chunk| true);
+            let progress_ctx = ctx.clone();
+            let on_status: desktop_assistant_core::ports::llm::StatusCallback =
+                Box::new(move |msg| {
+                    progress_ctx.set_progress_hint(Some(msg));
+                });
 
-        // The "currently doing" hint is cleared by the registry's panic-safe
-        // `finalize` (#254/#256), so a finished/failed agent never shows a
-        // stale tool action — no in-body clear needed here.
-
-        match result {
-            Ok(outcome) => {
-                if let Some(sink) = result_sink {
-                    *sink.lock().await = Some(Ok(outcome.response));
+            // Install the tool allowlist (if any) and the requesting user's
+            // identity so the inner `send_prompt_with_override` call (and
+            // any storage queries it triggers) observe the same scope the
+            // foreground send path uses.
+            let conv_id_for_send = conversation_id.clone();
+            let token = ctx.token.clone();
+            // Mirror this agent's tool/MCP calls into its task log so the panel
+            // shows what the agent is doing, same as the foreground send path
+            // (shared observer install — #256).
+            let inner = with_task_observer(Some(ctx), async move {
+                conversations
+                    .send_prompt_with_override(
+                        &desktop_assistant_core::domain::ConversationId::from(
+                            conv_id_for_send.as_str(),
+                        ),
+                        initial_prompt,
+                        override_for_core,
+                        // Agent runs (standalone / subagent) carry no per-request
+                        // system-prompt refinement — that's a foreground voice/chat
+                        // concern, not an agent one.
+                        String::new(),
+                        on_chunk,
+                        on_status,
+                        token,
+                    )
+                    .await
+            });
+            // Compose the run's task-local scopes around `inner`, awaiting in each
+            // arm so their differing future types unify at the `Result`. The #287
+            // subagent scope (session pad + owner_todo + snapshot marker) is
+            // installed INSIDE `with_user_id` so scratchpad ops observe the tenant
+            // guard, and re-established here in the spawned body -- never read across
+            // the registry's `tokio::spawn`.
+            use desktop_assistant_core::ports::auth::with_user_id;
+            use desktop_assistant_core::ports::llm::with_tool_allowlist;
+            use desktop_assistant_core::ports::scratchpad_scope::with_subagent_scope;
+            let uid = user_id.clone();
+            let result = match (tools, subagent_scope) {
+                (Some(tools), Some(scope)) => {
+                    with_user_id(
+                        uid,
+                        with_tool_allowlist(tools, with_subagent_scope(scope, inner)),
+                    )
+                    .await
                 }
-                Ok(())
-            }
-            // `Cancelled` propagated up from the cooperative core path
-            // — let the registry record this as `Cancelled` via the
-            // token state rather than tacking on a misleading "failed"
-            // string.
-            Err(desktop_assistant_core::CoreError::Cancelled) => {
-                if let Some(sink) = result_sink {
-                    *sink.lock().await = Some(Err("cancelled".to_string()));
+                (Some(tools), None) => with_user_id(uid, with_tool_allowlist(tools, inner)).await,
+                (None, Some(scope)) => with_user_id(uid, with_subagent_scope(scope, inner)).await,
+                (None, None) => with_user_id(uid, inner).await,
+            };
+
+            // The "currently doing" hint is cleared by the registry's panic-safe
+            // `finalize` (#254/#256), so a finished/failed agent never shows a
+            // stale tool action — no in-body clear needed here.
+
+            match result {
+                Ok(outcome) => {
+                    if let Some(sink) = result_sink {
+                        *sink.lock().await = Some(Ok(outcome.response));
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            Err(other) => {
-                let detail = other.to_string();
-                if let Some(sink) = result_sink {
-                    *sink.lock().await = Some(Err(detail.clone()));
+                // `Cancelled` propagated up from the cooperative core path
+                // — let the registry record this as `Cancelled` via the
+                // token state rather than tacking on a misleading "failed"
+                // string.
+                Err(desktop_assistant_core::CoreError::Cancelled) => {
+                    if let Some(sink) = result_sink {
+                        *sink.lock().await = Some(Err("cancelled".to_string()));
+                    }
+                    Ok(())
                 }
-                Err(anyhow::Error::new(other))
+                Err(other) => {
+                    let detail = other.to_string();
+                    if let Some(sink) = result_sink {
+                        *sink.lock().await = Some(Err(detail.clone()));
+                    }
+                    Err(anyhow::Error::new(other))
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 /// Re-emit a stored idempotent reply (#204) as the canonical event
@@ -3187,7 +3230,7 @@ async fn run_send_turn<C>(
     task_ctx: Option<TaskContext>,
 ) -> Result<(), desktop_assistant_core::CoreError>
 where
-    C: ConversationService + Send + Sync + 'static,
+    C: ?Sized + ConversationService + Send + Sync + 'static,
 {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<api::Event>(STREAM_EVENT_BUFFER);
     // Cloned before `tx` is moved into the chunk callback below; used by the

@@ -150,6 +150,63 @@ pub struct DaemonConfig {
     /// D-Bus surface share one schema.
     #[serde(default)]
     pub personality: Personality,
+    /// `[skills]` — the on-disk skill library the daemon indexes at startup
+    /// (#573). Absent section => defaults (enabled, platform-default roots).
+    #[serde(default, skip_serializing_if = "SkillsConfig::is_default")]
+    pub skills: SkillsConfig,
+}
+
+/// `[skills]` configuration: whether to index on-disk skills, and which global
+/// roots to scan. Global skills are host-global (owner-less); user-scoped skills
+/// arrive via client registration in a later slice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SkillsConfig {
+    /// Whether the daemon scans + indexes on-disk skills at startup. When no
+    /// configured root resolves, the feature degrades off regardless.
+    #[serde(default = "default_skills_enabled")]
+    pub enabled: bool,
+    /// Global skill roots to scan (`<root>/<name>/SKILL.md`). A configurable
+    /// list so a distro, Homebrew, or container image can point at the right
+    /// location without a code change.
+    #[serde(default = "default_skill_roots")]
+    pub roots: Vec<PathBuf>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_skills_enabled(),
+            roots: default_skill_roots(),
+        }
+    }
+}
+
+impl SkillsConfig {
+    /// Whether this equals the default section, so a default `[skills]` is not
+    /// serialized (keeping migrated `daemon.toml` output stable).
+    fn is_default(&self) -> bool {
+        self.enabled == default_skills_enabled() && self.roots == default_skill_roots()
+    }
+}
+
+fn default_skills_enabled() -> bool {
+    true
+}
+
+/// Platform-appropriate default global skill root(s).
+///
+/// Linux: the FHS read-only data location. macOS/Homebrew: under the brew
+/// prefix (`$HOMEBREW_PREFIX`, else `/opt/homebrew`). A container image bakes
+/// skills into whichever root it configures.
+#[cfg(target_os = "macos")]
+fn default_skill_roots() -> Vec<PathBuf> {
+    let prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".to_string());
+    vec![PathBuf::from(prefix).join("share/adelie/skills")]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_skill_roots() -> Vec<PathBuf> {
+    vec![PathBuf::from("/usr/share/adelie/skills")]
 }
 
 // Reuse the canonical core type rather than duplicating the trait set in the
@@ -1071,6 +1128,35 @@ uds_socket = "/tmp/adelie.sock"
     fn default_path_points_to_daemon_toml() {
         let path = default_daemon_config_path();
         assert!(path.ends_with("desktop-assistant/daemon.toml"));
+    }
+
+    #[test]
+    fn skills_config_defaults_are_enabled_with_a_root() {
+        let cfg = SkillsConfig::default();
+        assert!(cfg.enabled);
+        assert!(!cfg.roots.is_empty(), "a platform-default root is set");
+        // Absent `[skills]` section => the same defaults.
+        let parsed: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(parsed.skills.enabled);
+        assert_eq!(parsed.skills.roots, cfg.roots);
+    }
+
+    #[test]
+    fn skills_config_overrides_from_toml() {
+        let parsed: DaemonConfig = toml::from_str(
+            r#"
+            [skills]
+            enabled = false
+            roots = ["/opt/custom/skills", "/srv/skills"]
+            "#,
+        )
+        .expect("parse [skills]");
+        assert!(!parsed.skills.enabled);
+        assert_eq!(parsed.skills.roots.len(), 2);
+        assert_eq!(
+            parsed.skills.roots[0],
+            std::path::PathBuf::from("/opt/custom/skills")
+        );
     }
 
     #[test]

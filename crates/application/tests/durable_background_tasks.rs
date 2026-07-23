@@ -647,6 +647,7 @@ async fn parent_child_links_preserved_across_restart() {
         parent_task_id: parent_id.clone(),
         conversation_id: "conv-c".into(),
         name: "child".into(),
+        session_conversation_id: "conv-session".into(),
     };
     let child_id = registry.spawn(
         user.clone(),
@@ -764,6 +765,8 @@ async fn concurrent_spawn_and_restart_does_not_corrupt_state() {
             progress_hint: None,
             started_at: 1_700_000_000,
             ended_at: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         })
         .await
         .unwrap();
@@ -1007,6 +1010,8 @@ fn running_row(id: &str, user: &str, kind: &api::TaskKind) -> BackgroundTaskRow 
         progress_hint: None,
         started_at: 1_700_000_000,
         ended_at: None,
+        owner_todo: String::new(),
+        spawn_marker: None,
     }
 }
 

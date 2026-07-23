@@ -82,12 +82,12 @@ pub const MAX_SUBAGENT_DEPTH: usize = 8;
 /// Generic-over-`ConversationService` wrapper that publishes the two
 /// builtin tools and dispatches them. Cheap to `Clone` — only holds
 /// `Arc`s.
-pub struct SubagentTools<C: ConversationService> {
+pub struct SubagentTools<C: ?Sized + ConversationService> {
     registry: Arc<BackgroundTaskRegistry>,
     conversations: Arc<C>,
 }
 
-impl<C: ConversationService> Clone for SubagentTools<C> {
+impl<C: ?Sized + ConversationService> Clone for SubagentTools<C> {
     fn clone(&self) -> Self {
         Self {
             registry: Arc::clone(&self.registry),
@@ -175,7 +175,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
-impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
+impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
     /// Build a fresh `SubagentTools` over the given registry and
     /// conversation service. The daemon wires its full routing handler
     /// in; tests use a lightweight fake.
@@ -300,6 +300,18 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
 
         let parent_for_kind = parent_task_id.clone();
         let name_for_kind = name.clone();
+        // #287: adopt the child scope the dispatch loop minted (session pad +
+        // owner_todo + snapshot marker). `None` outside that loop path (e.g. a
+        // unit test), leaving the child on its own conversation's pad.
+        let pending_scope =
+            desktop_assistant_core::ports::scratchpad_scope::current_pending_child_scope();
+        // The session (top-level) conversation the child shares its pad with,
+        // recorded durably on the task kind; falls back to the child's own
+        // conversation when no scope is installed.
+        let session_conv_for_kind = pending_scope
+            .as_ref()
+            .map(|s| s.session_conversation_id.as_str().to_string())
+            .unwrap_or_else(|| child_conversation_id.clone());
         let spec = AgentConversationSpec {
             user_id: user_id.clone(),
             name: name.clone(),
@@ -313,6 +325,7 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
             },
             conversation_id: child_conversation_id.clone(),
             result_sink: Some(Arc::clone(&result_slot)),
+            subagent_scope: pending_scope,
         };
 
         let child_task_id = spawn_agent_conversation(
@@ -323,6 +336,7 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
                 parent_task_id: parent_for_kind,
                 conversation_id: conv_id,
                 name: name_for_kind,
+                session_conversation_id: session_conv_for_kind,
             },
         );
 

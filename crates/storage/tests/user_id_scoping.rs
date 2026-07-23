@@ -713,6 +713,8 @@ fn task_row(id: &str, user_id: &str, status: BackgroundTaskStatus) -> Background
         progress_hint: None,
         started_at: 1_700_000_000,
         ended_at: None,
+        owner_todo: String::new(),
+        spawn_marker: None,
     }
 }
 
@@ -943,5 +945,113 @@ async fn background_task_parent_link_persists_through_postgres() {
             fx
         },
     )
+    .await;
+}
+
+// --- #287: owner_todo + spawn_marker columns on background tasks ------------
+
+#[tokio::test]
+async fn owner_todo_and_marker_round_trip_pg() {
+    with_fixture("owner_todo_and_marker_round_trip_pg", |fx| async move {
+        let store = PgBackgroundTaskStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            let mut r = task_row("t1", "alice", BackgroundTaskStatus::Running);
+            r.owner_todo = "1.1".into();
+            r.spawn_marker = Some("marker-abc".into());
+            store.create_task(r).await.expect("create");
+            let got = store.get_task("t1").await.unwrap().expect("present");
+            assert_eq!(got.owner_todo, "1.1");
+            assert_eq!(got.spawn_marker.as_deref(), Some("marker-abc"));
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn legacy_row_defaults_to_empty_owner_todo_and_none_marker_pg() {
+    // task_row omits the new fields (pre-#287 caller shape) -> '' / None.
+    with_fixture(
+        "legacy_row_defaults_to_empty_owner_todo_and_none_marker_pg",
+        |fx| async move {
+            let store = PgBackgroundTaskStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .create_task(task_row("t1", "alice", BackgroundTaskStatus::Running))
+                    .await
+                    .expect("create");
+                let got = store.get_task("t1").await.unwrap().unwrap();
+                assert_eq!(got.owner_todo, "");
+                assert_eq!(got.spawn_marker, None);
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn update_task_leaves_owner_todo_and_marker_unchanged_pg() {
+    with_fixture(
+        "update_task_leaves_owner_todo_and_marker_unchanged_pg",
+        |fx| async move {
+            let store = PgBackgroundTaskStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                let mut r = task_row("t1", "alice", BackgroundTaskStatus::Running);
+                r.owner_todo = "1.1".into();
+                r.spawn_marker = Some("marker-abc".into());
+                store.create_task(r).await.expect("create");
+                store
+                    .update_task("t1", BackgroundTaskStatus::Completed, None, None, Some(200))
+                    .await
+                    .expect("update");
+                let got = store.get_task("t1").await.unwrap().unwrap();
+                assert_eq!(
+                    got.owner_todo, "1.1",
+                    "update_task must not touch owner_todo"
+                );
+                assert_eq!(
+                    got.spawn_marker.as_deref(),
+                    Some("marker-abc"),
+                    "update_task must not touch spawn_marker"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn list_and_scan_select_new_columns_pg() {
+    // Guards against a column omitted from a widened SELECT: list + scan must
+    // both surface owner_todo/spawn_marker, not just get_task.
+    with_fixture("list_and_scan_select_new_columns_pg", |fx| async move {
+        let store = PgBackgroundTaskStore::new(fx.pool.clone());
+        with_user_id(UserId::new("alice"), async {
+            let mut r = task_row("t1", "alice", BackgroundTaskStatus::Running);
+            r.owner_todo = "1.1".into();
+            r.spawn_marker = Some("marker-abc".into());
+            store.create_task(r).await.expect("create");
+
+            let listed = store
+                .list_tasks_for_user("alice", true, None)
+                .await
+                .expect("list");
+            let l = listed.iter().find(|r| r.id == "t1").expect("row in list");
+            assert_eq!(l.owner_todo, "1.1");
+            assert_eq!(l.spawn_marker.as_deref(), Some("marker-abc"));
+
+            let scanned = store.scan_non_terminal().await.expect("scan");
+            let s = scanned.iter().find(|r| r.id == "t1").expect("row in scan");
+            assert_eq!(s.owner_todo, "1.1");
+            assert_eq!(s.spawn_marker.as_deref(), Some("marker-abc"));
+        })
+        .await;
+        fx
+    })
     .await;
 }

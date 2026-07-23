@@ -2279,16 +2279,8 @@ mod tests {
             serde_json::json!({"type": "object", "description": "z".repeat(20_000)}),
         );
 
-        // The base system prompt dominates (~13.7k chars); size the budget so
-        // its threshold (0.85 * budget) clears the full tiny-schema turn but
-        // not the fat-schema one (+20k schema chars).
-        let budget = ContextBudget {
-            max_input_tokens: 22_000,
-            source: BudgetSource::ConnectorTable,
-        };
         let one_per_char = |s: &str| s.chars().count() as u64;
-
-        let assemble = |tool: &ToolDefinition| {
+        let assemble = |tool: &ToolDefinition, budget: ContextBudget| {
             assemble_for_test(
                 &ConversationView {
                     messages: &msgs,
@@ -2304,8 +2296,33 @@ mod tests {
             )
         };
 
-        let with_tiny = assemble(&tiny);
-        let with_fat = assemble(&fat);
+        // Self-calibrating budget so this stays robust to base-prompt drift (a
+        // new prompt section must not silently break it): measure the natural,
+        // unshrunk assembly of the tiny turn, then size the budget so its
+        // threshold (0.85 * budget) sits ~10k chars above that -- clearing the
+        // full tiny-schema turn but well under the fat turn's +20k schema, so
+        // only the fat schema forces a message-window shrink.
+        let huge = ContextBudget {
+            max_input_tokens: 10_000_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        // `assemble` returns the message window, so measure the CHAR size of the
+        // natural (unshrunk) tiny turn -- the base system message plus its full
+        // message window -- and size the budget so its 0.85 threshold sits ~5k
+        // chars above it: comfortably clear of the tiny turn (whose schema cost
+        // is a handful of chars) yet far below the fat turn's +20k schema, so
+        // only the fat schema forces a message-window shrink.
+        let natural: u64 = assemble(&tiny, huge)
+            .iter()
+            .map(|m| m.content.chars().count() as u64)
+            .sum();
+        let budget = ContextBudget {
+            max_input_tokens: (natural + 5_000) * 100 / 85 + 1,
+            source: BudgetSource::ConnectorTable,
+        };
+
+        let with_tiny = assemble(&tiny, budget);
+        let with_fat = assemble(&fat, budget);
 
         assert!(
             with_fat.len() < with_tiny.len(),

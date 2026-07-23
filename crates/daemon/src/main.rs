@@ -28,6 +28,7 @@ mod purposes;
 mod registry;
 mod routing_llm;
 mod settings_service;
+mod skill_scanner;
 mod store;
 mod tls;
 mod transports;
@@ -1272,6 +1273,41 @@ async fn main() -> Result<()> {
         ))
     });
 
+    let skill_index_store = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgSkillIndexStore::new(
+            pool.clone(),
+        ))
+    });
+
+    // Index on-disk skills at startup (#573): scan the configured global roots
+    // and replace the global catalog. Capability-off when disabled or when no
+    // configured root resolves; embeddings are filled by the backfill loop.
+    if let Some(store) = &skill_index_store {
+        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        let skills_cfg = daemon_config
+            .as_ref()
+            .map(|c| c.skills.clone())
+            .unwrap_or_default();
+        if skills_cfg.enabled {
+            let roots: Vec<_> = skills_cfg
+                .roots
+                .iter()
+                .filter(|r| r.is_dir())
+                .cloned()
+                .collect();
+            if roots.is_empty() {
+                tracing::info!("skill library disabled: no configured skill root is present");
+            } else {
+                let skills = crate::skill_scanner::scan_global_roots(&roots);
+                let count = skills.len();
+                match store.reindex_global(skills).await {
+                    Ok(()) => tracing::info!(indexed = count, "skill library indexed"),
+                    Err(e) => tracing::warn!("skill index reindex failed: {e}"),
+                }
+            }
+        }
+    }
+
     // Load MCP server configuration and secrets
     let mcp_config_path = mcp_config::default_config_path();
     let mcp_configs = mcp_config::load_mcp_configs(&mcp_config_path).unwrap_or_else(|e| {
@@ -1391,6 +1427,13 @@ async fn main() -> Result<()> {
     let mut scratchpad_list_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadListFn,
     > = None;
+    // #287: the complete_step cascade's subtree-delete + the descendant-task
+    // lifecycle probe. Populated alongside the scratchpad wiring below.
+    let mut scratchpad_delete_subtree_fn: Option<
+        desktop_assistant_core::ports::scratchpad::ScratchpadDeleteSubtreeFn,
+    > = None;
+    let mut descendant_task_probe: Option<desktop_assistant_core::service::DescendantTaskProbe> =
+        None;
 
     // Per-conversation scratchpad command closures (#190) for the API handler,
     // populated alongside the builtin-tool wiring below. The same emit-wrapped
@@ -1511,6 +1554,34 @@ async fn main() -> Result<()> {
             Arc::clone(&clear_fn),
         );
 
+        // #287: subtree-delete (for the complete_step cascade) + the
+        // descendant-task lifecycle probe (so the cascade defers while a
+        // wait=false subagent under the step is still running). Both read the
+        // per-turn current_user_id(), like the mutating closures above.
+        let sp_ds = Arc::clone(&sp_store);
+        let reg_ds = Arc::clone(&background_task_registry);
+        let delete_subtree_fn: desktop_assistant_core::ports::scratchpad::ScratchpadDeleteSubtreeFn =
+            Arc::new(move |conv: String, owner: String| {
+                let store = Arc::clone(&sp_ds);
+                let reg = Arc::clone(&reg_ds);
+                Box::pin(async move {
+                    let deleted = store.delete_owner_subtree(&conv, &owner).await?;
+                    reg.notify_scratchpad_changed(&current_user_id(), conv);
+                    Ok(deleted)
+                })
+            });
+        scratchpad_delete_subtree_fn = Some(delete_subtree_fn);
+
+        let reg_probe = Arc::clone(&background_task_registry);
+        let probe: desktop_assistant_core::service::DescendantTaskProbe =
+            Arc::new(move |session: String, prefix: String| {
+                let reg = Arc::clone(&reg_probe);
+                Box::pin(async move {
+                    reg.any_non_terminal_under_owner_prefix(&current_user_id(), &session, &prefix)
+                })
+            });
+        descendant_task_probe = Some(probe);
+
         // Capture the same event-emitting write + list closures for the
         // conversation handler's planning/compaction tools (#240) before they
         // are moved into the API-handler tuple below.
@@ -1545,6 +1616,23 @@ async fn main() -> Result<()> {
             Arc::new(move |name| {
                 let store = Arc::clone(&tr_d);
                 Box::pin(async move { store.tool_definition(&name).await })
+            }),
+        );
+    }
+
+    if let Some(si) = &skill_index_store {
+        tracing::info!("wiring skill index into builtin tools");
+        let si_search = Arc::clone(si);
+        let si_get = Arc::clone(si);
+        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        builtin_tools = builtin_tools.with_skills(
+            Arc::new(move |query, embedding, limit| {
+                let store = Arc::clone(&si_search);
+                Box::pin(async move { store.search(&query, embedding, limit).await })
+            }),
+            Arc::new(move |name, owner| {
+                let store = Arc::clone(&si_get);
+                Box::pin(async move { store.get(&name, owner.as_deref()).await })
             }),
         );
     }
@@ -1716,6 +1804,16 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => tracing::info!("backfilled {n} knowledge embedding(s)"),
                     Ok(_) => tracing::debug!("no knowledge embeddings to backfill"),
                     Err(e) => tracing::warn!("knowledge embedding backfill failed: {e}"),
+                }
+
+                match desktop_assistant_storage::embedding_backfill::backfill_skill_embeddings(
+                    &pool, &embed_fn, &model,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::info!("backfilled {n} skill embedding(s)"),
+                    Ok(_) => tracing::debug!("no skill embeddings to backfill"),
+                    Err(e) => tracing::warn!("skill embedding backfill failed: {e}"),
                 }
 
                 tokio::select! {
@@ -2057,10 +2155,20 @@ async fn main() -> Result<()> {
         profiling.log_path.as_deref(),
         profiling.full_content,
     ));
+    // #287 slice 7: late-set slot letting the subagent tool executor reach the
+    // conversation service. Set (below) to a Weak downgrade of the routing
+    // handler the instant it exists; a Weak (not Arc) keeps the executor ->
+    // conversation -> handler -> executor cycle non-owning so nothing leaks.
+    let conversation_slot: desktop_assistant_application::subagent_executor::ConversationSlot =
+        Arc::new(std::sync::OnceLock::new());
     let mut handler = ConversationHandler::with_tools(
         conversation_store.clone(),
         llm,
-        tool_executor,
+        desktop_assistant_application::subagent_executor::SubagentAwareToolExecutor::new(
+            tool_executor,
+            Arc::clone(&background_task_registry),
+            Arc::clone(&conversation_slot),
+        ),
         Box::new(|| uuid::Uuid::now_v7().to_string()),
     )
     // Server-side tool localities (#243) are labelled with the daemon's host
@@ -2205,6 +2313,13 @@ async fn main() -> Result<()> {
     if let Some(list_fn) = scratchpad_list_fn {
         handler = handler.with_scratchpad_list(list_fn);
     }
+    // #287: the complete_step cascade (subtree-delete) + its lifecycle gate.
+    if let Some(delete_subtree_fn) = scratchpad_delete_subtree_fn {
+        handler = handler.with_scratchpad_delete_subtree(delete_subtree_fn);
+    }
+    if let Some(probe) = descendant_task_probe {
+        handler = handler.with_descendant_task_probe(probe);
+    }
 
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters
     // can call `send_prompt_with_override` and have the override/stored-
@@ -2226,6 +2341,14 @@ async fn main() -> Result<()> {
         routing_conv = routing_conv.with_window_store(window_store);
     }
     let conversation_service = Arc::new(routing_conv);
+    // #287 slice 7: publish the conversation service to the subagent executor's
+    // slot as a Weak, as the first statement after it exists (no `?` between the
+    // create and the set). The executor upgrades it per spawn_subagent call.
+    {
+        let conv_dyn: Arc<dyn desktop_assistant_core::ports::inbound::ConversationService> =
+            conversation_service.clone();
+        let _ = conversation_slot.set(Arc::downgrade(&conv_dyn));
+    }
 
     let connections_service = Arc::new(api_surface::DaemonConnectionsService::new(Arc::clone(
         &registry_handle,

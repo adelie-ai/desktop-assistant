@@ -146,6 +146,8 @@ fn task_row(id: &str, user_id: &str, status: BackgroundTaskStatus) -> Background
         progress_hint: None,
         started_at: 1_700_000_000,
         ended_at: None,
+        owner_todo: String::new(),
+        spawn_marker: None,
     }
 }
 

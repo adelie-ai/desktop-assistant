@@ -14,6 +14,7 @@ pub mod knowledge;
 pub mod migrate_json;
 pub mod pool;
 pub mod scratchpad;
+pub mod skill_index;
 pub mod tag_normalize;
 pub mod tag_registry;
 pub mod tool_registry;
@@ -40,6 +41,7 @@ pub use migrate_json::{
 };
 pub use pool::{create_pool, run_migrations};
 pub use scratchpad::PgScratchpadStore;
+pub use skill_index::PgSkillIndexStore;
 /// Re-exported so daemon-side consumers can name the pool type (e.g. the
 /// knowledge-maintenance service) without taking a direct `sqlx` dependency.
 pub use sqlx::PgPool;

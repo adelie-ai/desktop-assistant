@@ -38,6 +38,8 @@ type TaskTuple = (
     Option<String>,
     i64,
     Option<i64>,
+    String,
+    Option<String>,
 );
 
 // Argument count matches the column list; folding into a struct would just move
@@ -54,6 +56,8 @@ fn row_from_db(
     progress_hint: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
+    owner_todo: String,
+    spawn_marker: Option<String>,
 ) -> Result<BackgroundTaskRow, CoreError> {
     let status = BackgroundTaskStatus::from_key(&status_key).ok_or_else(|| {
         CoreError::Storage(format!(
@@ -71,11 +75,13 @@ fn row_from_db(
         progress_hint,
         started_at,
         ended_at,
+        owner_todo,
+        spawn_marker,
     })
 }
 
 fn row_from_tuple(t: TaskTuple) -> Result<BackgroundTaskRow, CoreError> {
-    row_from_db(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)
+    row_from_db(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10, t.11)
 }
 
 #[async_trait]
@@ -84,8 +90,8 @@ impl BackgroundTaskStore for SqliteBackgroundTaskStore {
         let result = sqlx::query(
             "INSERT INTO background_tasks (\
                 id, user_id, kind_json, task_status, parent_task_id, title, \
-                last_error, progress_hint, started_at, ended_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                last_error, progress_hint, started_at, ended_at, owner_todo, spawn_marker) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -97,6 +103,8 @@ impl BackgroundTaskStore for SqliteBackgroundTaskStore {
         .bind(row.progress_hint.as_deref())
         .bind(row.started_at)
         .bind(row.ended_at)
+        .bind(&row.owner_todo)
+        .bind(row.spawn_marker.as_deref())
         .execute(&self.pool)
         .await;
         match result {
@@ -112,7 +120,8 @@ impl BackgroundTaskStore for SqliteBackgroundTaskStore {
         let user_id = current_user_id();
         let row: Option<TaskTuple> = sqlx::query_as(
             "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                    title, last_error, progress_hint, started_at, ended_at \
+                    title, last_error, progress_hint, started_at, ended_at, \
+                    owner_todo, spawn_marker \
              FROM background_tasks WHERE user_id = ? AND id = ?",
         )
         .bind(user_id.as_str())
@@ -171,7 +180,8 @@ impl BackgroundTaskStore for SqliteBackgroundTaskStore {
         let rows: Vec<TaskTuple> = if include_finished {
             sqlx::query_as(
                 "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                        title, last_error, progress_hint, started_at, ended_at \
+                        title, last_error, progress_hint, started_at, ended_at, \
+                        owner_todo, spawn_marker \
                  FROM background_tasks WHERE user_id = ? \
                  ORDER BY started_at DESC LIMIT ?",
             )
@@ -183,7 +193,8 @@ impl BackgroundTaskStore for SqliteBackgroundTaskStore {
         } else {
             sqlx::query_as(
                 "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                        title, last_error, progress_hint, started_at, ended_at \
+                        title, last_error, progress_hint, started_at, ended_at, \
+                        owner_todo, spawn_marker \
                  FROM background_tasks \
                  WHERE user_id = ? AND task_status IN ('pending', 'running') \
                  ORDER BY started_at DESC LIMIT ?",
@@ -201,7 +212,8 @@ impl BackgroundTaskStore for SqliteBackgroundTaskStore {
         // No user_id filter — see method doc on the trait.
         let rows: Vec<TaskTuple> = sqlx::query_as(
             "SELECT id, user_id, kind_json, task_status, parent_task_id, \
-                    title, last_error, progress_hint, started_at, ended_at \
+                    title, last_error, progress_hint, started_at, ended_at, \
+                    owner_todo, spawn_marker \
              FROM background_tasks \
              WHERE task_status NOT IN ('completed', 'failed', 'cancelled')",
         )

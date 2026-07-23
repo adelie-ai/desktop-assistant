@@ -1085,6 +1085,8 @@ mod tests {
             children: vec![api::TaskId("t-2".into()), api::TaskId("t-3".into())],
             title: "Researcher: pricing data".into(),
             progress_hint: Some("step 1".into()),
+            owner_todo: String::new(),
+            spawn_marker: None,
         }
     }
 

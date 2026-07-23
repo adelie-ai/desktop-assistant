@@ -28,6 +28,9 @@ pub mod scratchpad;
 /// Tool registry store port — outbound trait for tool definition persistence and search.
 pub mod tool_registry;
 
+/// Skill index store port — outbound trait for the disk-sourced skill catalog.
+pub mod skill_index;
+
 /// Database query port — closure type for read-only SQL queries.
 pub mod database;
 
@@ -54,6 +57,10 @@ pub mod transport;
 /// Request-scoped conversation context — task-local `ConversationId` so tool
 /// executors can scope per-conversation side state (e.g. the scratchpad).
 pub mod conversation_ctx;
+
+/// Per-subagent-turn scratchpad scope task-locals (#287): the session-pad
+/// redirect, `owner_todo` namespace, spawn snapshot cut, and ancestor chain.
+pub mod scratchpad_scope;
 
 /// Bundle of the request-scoped task-locals that must cross a `tokio::spawn`
 /// boundary ([`request_scope::RequestScope`]) — captured before the spawn and
@@ -88,5 +95,6 @@ mod tests {
         fn _assert_knowledge_exists<T: super::knowledge::KnowledgeBaseStore>() {}
         fn _assert_scratchpad_exists<T: super::scratchpad::ScratchpadStore>() {}
         fn _assert_tool_registry_exists<T: super::tool_registry::ToolRegistryStore>() {}
+        fn _assert_skill_index_exists<T: super::skill_index::SkillIndexStore>() {}
     }
 }

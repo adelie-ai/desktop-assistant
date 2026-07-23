@@ -66,6 +66,51 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(include_str!("../migrations/001_relational_schema.sql"))
         .execute(pool)
         .await?;
+    // #287: additive upgrade for dev DBs created before these columns landed in
+    // the baseline (the CREATE TABLE IF NOT EXISTS above is a no-op against an
+    // existing table). SQLite has no ADD COLUMN IF NOT EXISTS and this runner
+    // re-executes every boot, so each ALTER is guarded on PRAGMA table_info to
+    // stay idempotent. A fresh DB already has the columns from 001, so these are
+    // no-ops there.
+    ensure_column(
+        pool,
+        "background_tasks",
+        "owner_todo",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    ensure_column(pool, "background_tasks", "spawn_marker", "TEXT").await?;
+    // Skill index (#594): relational + FTS5 (the repo's first FTS5 table).
+    sqlx::raw_sql(include_str!("../migrations/002_skill_index.sql"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Add `column` (declared as `type_decl`) to `table` if it is not already
+/// present. Idempotent: safe to call on every startup. SQLite lacks
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so this checks `PRAGMA
+/// table_info` first. `table`/`column`/`type_decl` are internal string
+/// constants (never external input), so the interpolation is injection-safe.
+async fn ensure_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    type_decl: &str,
+) -> Result<(), sqlx::Error> {
+    let cols: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT name FROM pragma_table_info('{table}')"
+    )))
+    .fetch_all(pool)
+    .await?;
+    if cols.iter().any(|(name,)| name == column) {
+        return Ok(());
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {type_decl}"
+    )))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
