@@ -1870,4 +1870,36 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "real");
     }
+
+    /// #570 Phase 1b: outside a `with_idempotency_key` scope the current key is
+    /// `None`, so callers that don't route through the foreground dispatch
+    /// wrapper (agent runs, dreaming jobs, tests) persist no key.
+    #[tokio::test]
+    async fn current_idempotency_key_is_none_outside_scope() {
+        assert_eq!(
+            current_idempotency_key(),
+            None,
+            "no key is installed outside the dispatch scope"
+        );
+    }
+
+    /// Inside the scope the installed key is observable; a `None` scope reads
+    /// back as `None` (a keyless send wrapped by the dispatcher), and the value
+    /// does not leak past the scope boundary.
+    #[tokio::test]
+    async fn current_idempotency_key_observes_installed_scope() {
+        let observed =
+            with_idempotency_key(Some("k1".to_string()), async { current_idempotency_key() })
+                .await;
+        assert_eq!(observed, Some("k1".to_string()), "installed key is observed");
+
+        let keyless = with_idempotency_key(None, async { current_idempotency_key() }).await;
+        assert_eq!(keyless, None, "a None scope reads back as None");
+
+        assert_eq!(
+            current_idempotency_key(),
+            None,
+            "the key must not leak past the scope boundary"
+        );
+    }
 }

@@ -121,12 +121,32 @@ mod tests {
             id: "m1".into(),
             role: "assistant".into(),
             content: "hi".into(),
+            idempotency_key: None,
         });
         assert_eq!(m.kind, MessageKind::Normal);
         assert_eq!(m.content, "hi");
         assert!(
             m.idempotency_key.is_none(),
             "a daemon-sourced message never carries a client idempotency stamp"
+        );
+    }
+
+    /// #570 Phase 1b: a persisted idempotency key on the wire `MessageView` is
+    /// carried onto the `ChatMessage` on reload, so a reconnecting client can
+    /// dedupe an echoed `UserMessageAdded` by exact key match instead of a
+    /// content compare (the Phase 1 limitation this slice removes).
+    #[test]
+    fn persisted_idempotency_key_surfaces_on_reload() {
+        let m = ChatMessage::from(api::MessageView {
+            id: "m1".into(),
+            role: "user".into(),
+            content: "hi".into(),
+            idempotency_key: Some("k1".into()),
+        });
+        assert_eq!(
+            m.idempotency_key.as_deref(),
+            Some("k1"),
+            "a persisted key must pass through From<MessageView> onto the ChatMessage"
         );
     }
 }

@@ -436,6 +436,142 @@ async fn update_round_trips_tool_calls_and_tool_results() {
     .await;
 }
 
+/// Direct read of the `idempotency_key` column in ordinal order, so an
+/// assertion can distinguish a persisted SQL `NULL` from a loaded `None`.
+async fn idempotency_key_column(pool: &PgPool, conversation_id: &str) -> Vec<Option<String>> {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT idempotency_key FROM messages WHERE conversation_id = $1 ORDER BY ordinal",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .expect("fetch idempotency keys");
+    rows.into_iter().map(|(k,)| k).collect()
+}
+
+// --- #570 Phase 1b: idempotency-key persistence + load-surfacing ------------
+
+/// A user message stamped with an idempotency key persists it, and `get`
+/// surfaces the key back onto the domain `Message` so a reconnecting client can
+/// dedupe by exact match instead of a content compare.
+#[tokio::test]
+async fn user_message_idempotency_key_round_trips_through_get() {
+    with_fixture(
+        "user_message_idempotency_key_round_trips_through_get",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
+            let mut conv = conversation_with_messages("conv-idem", 0);
+            let mut user_msg = Message::new(Role::User, "remember me");
+            user_msg.idempotency_key = Some("idem-key-1".to_string());
+            conv.messages.push(user_msg);
+
+            with_user_id(UserId::new("u1"), async {
+                store.create(conv.clone()).await.expect("create");
+                let loaded = store
+                    .get(&ConversationId::from("conv-idem"))
+                    .await
+                    .expect("get");
+                assert_eq!(loaded.messages.len(), 1);
+                assert_eq!(
+                    loaded.messages[0].idempotency_key.as_deref(),
+                    Some("idem-key-1"),
+                    "the persisted user idempotency_key must round-trip through get"
+                );
+            })
+            .await;
+
+            assert_eq!(
+                idempotency_key_column(&fx.pool, "conv-idem").await,
+                vec![Some("idem-key-1".to_string())],
+                "the key must be stored in the idempotency_key column"
+            );
+
+            fx
+        },
+    )
+    .await;
+}
+
+/// Assistant rows never carry an idempotency key: only the user row that
+/// initiated the turn does. The assistant row's column is a real SQL `NULL`.
+#[tokio::test]
+async fn assistant_message_idempotency_key_persists_null() {
+    with_fixture(
+        "assistant_message_idempotency_key_persists_null",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
+            let mut conv = conversation_with_messages("conv-idem-asst", 0);
+            let mut user_msg = Message::new(Role::User, "hello");
+            user_msg.idempotency_key = Some("k-user".to_string());
+            conv.messages.push(user_msg);
+            // Assistant reply pushed later in a real turn — never keyed.
+            conv.messages
+                .push(Message::new(Role::Assistant, "hi back"));
+
+            with_user_id(UserId::new("u1"), async {
+                store.create(conv.clone()).await.expect("create");
+                let loaded = store
+                    .get(&ConversationId::from("conv-idem-asst"))
+                    .await
+                    .expect("get");
+                assert_eq!(
+                    loaded.messages[0].idempotency_key.as_deref(),
+                    Some("k-user")
+                );
+                assert_eq!(
+                    loaded.messages[1].idempotency_key, None,
+                    "assistant rows never carry a client idempotency key"
+                );
+            })
+            .await;
+
+            assert_eq!(
+                idempotency_key_column(&fx.pool, "conv-idem-asst").await,
+                vec![Some("k-user".to_string()), None],
+                "the assistant row's idempotency_key column must be SQL NULL"
+            );
+
+            fx
+        },
+    )
+    .await;
+}
+
+/// A keyless user message (the pre-1b send path) persists no key and loads with
+/// `idempotency_key == None`, so the column is backward-compatible.
+#[tokio::test]
+async fn user_message_without_key_loads_as_none() {
+    with_fixture("user_message_without_key_loads_as_none", |fx| async move {
+        let store = PgConversationStore::new(fx.pool.clone());
+        let mut conv = conversation_with_messages("conv-idem-keyless", 0);
+        // A plain user message: `idempotency_key` defaults to None.
+        conv.messages
+            .push(Message::new(Role::User, "no key here"));
+
+        with_user_id(UserId::new("u1"), async {
+            store.create(conv.clone()).await.expect("create");
+            let loaded = store
+                .get(&ConversationId::from("conv-idem-keyless"))
+                .await
+                .expect("get");
+            assert_eq!(
+                loaded.messages[0].idempotency_key, None,
+                "a keyless user message loads with a None idempotency_key"
+            );
+        })
+        .await;
+
+        assert_eq!(
+            idempotency_key_column(&fx.pool, "conv-idem-keyless").await,
+            vec![None],
+            "a keyless user message stores SQL NULL"
+        );
+
+        fx
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn cross_user_update_is_not_found_and_writes_nothing() {
     with_fixture(

@@ -4562,6 +4562,160 @@ mod tests {
         );
     }
 
+    /// A conversation service that records the task-local `current_idempotency_key`
+    /// observed at `send_prompt` time, so a test can prove which dispatch paths
+    /// install the key (#570 Phase 1b).
+    struct RecordKeyConversations(Arc<Mutex<Vec<Option<String>>>>);
+    #[async_trait::async_trait]
+    impl ConversationService for RecordKeyConversations {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("c1", title))
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(desktop_assistant_core::ports::llm::current_idempotency_key());
+            on_chunk("ok".into());
+            Ok("ok".into())
+        }
+    }
+
+    /// #570 Phase 1b wiring: the FOREGROUND send path installs the client's
+    /// idempotency key as the `with_idempotency_key` task-local around the core
+    /// dispatch, so `send_prompt` (the sole user-message persist site) can stamp
+    /// it onto the user row. A keyed send observes the key; a keyless one
+    /// observes `None`.
+    #[tokio::test]
+    async fn foreground_send_installs_idempotency_key_for_persist() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(RecordKeyConversations(Arc::clone(&seen))),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            Some("k1".into()),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![Some("k1".to_string())],
+            "the foreground dispatch must install the client's idempotency key"
+        );
+
+        // A keyless send installs no key: the persist site stamps None.
+        seen.lock().unwrap().clear();
+        let sink2 = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "hi".into(),
+            None,
+            String::new(),
+            "r2".into(),
+            None,
+            sink2.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![None],
+            "a keyless foreground send installs no idempotency key"
+        );
+    }
+
+    /// #570 Phase 1b wiring: an AGENT run (standalone / subagent) dispatches
+    /// through `send_prompt_with_override` WITHOUT the idempotency wrap, so its
+    /// user row persists a `None` key — a background agent turn is never a
+    /// client-retryable send.
+    #[tokio::test]
+    async fn agent_run_persists_no_idempotency_key() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let conversations = Arc::new(RecordKeyConversations(Arc::clone(&seen)));
+        let registry = Arc::new(crate::background_tasks::BackgroundTaskRegistry::new());
+
+        let task_id = spawn_agent_conversation(
+            Arc::clone(&registry),
+            conversations,
+            AgentConversationSpec {
+                user_id: UserId::new("alice"),
+                name: "agent".into(),
+                title: "Standalone: agent".into(),
+                initial_prompt: "do the thing".into(),
+                override_selection: None,
+                tools: None,
+                conversation_id: "conv-agent".into(),
+                result_sink: None,
+            },
+            move |conversation_id| api::TaskKind::Standalone {
+                name: "agent".into(),
+                conversation_id,
+            },
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), registry.wait(&task_id))
+            .await
+            .expect("agent turn finishes");
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![None],
+            "an agent run must not install an idempotency key on its persist site"
+        );
+    }
+
     /// #1 live multi-client sync: a turn fans its events to other connections
     /// viewing the conversation, and excludes the originating connection (which
     /// gets them through its own request stream).

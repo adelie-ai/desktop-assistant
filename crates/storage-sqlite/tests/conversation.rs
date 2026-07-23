@@ -323,6 +323,65 @@ async fn personality_override_set_and_get() {
     );
 }
 
+// --- #570 Phase 1b: idempotency-key persistence + load-surfacing ------------
+
+/// A user message stamped with an idempotency key persists it, and `get`
+/// surfaces the key back onto the domain `Message` (mirrors the Postgres store).
+#[tokio::test]
+async fn user_message_idempotency_key_round_trips_through_get() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    let mut user_msg = Message::new(Role::User, "remember me");
+    user_msg.idempotency_key = Some("idem-key-1".to_string());
+    conv.messages.push(user_msg);
+
+    s.create(conv).await.expect("create");
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(got.messages.len(), 1);
+    assert_eq!(
+        got.messages[0].idempotency_key.as_deref(),
+        Some("idem-key-1"),
+        "the persisted user idempotency_key must round-trip through get"
+    );
+}
+
+/// Assistant rows never carry an idempotency key; the user row that opened the
+/// turn does.
+#[tokio::test]
+async fn assistant_message_idempotency_key_persists_null() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    let mut user_msg = Message::new(Role::User, "hello");
+    user_msg.idempotency_key = Some("k-user".to_string());
+    conv.messages.push(user_msg);
+    conv.messages
+        .push(Message::new(Role::Assistant, "hi back"));
+
+    s.create(conv).await.expect("create");
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(got.messages[0].idempotency_key.as_deref(), Some("k-user"));
+    assert_eq!(
+        got.messages[1].idempotency_key, None,
+        "assistant rows never carry a client idempotency key"
+    );
+}
+
+/// A keyless user message loads with `idempotency_key == None`.
+#[tokio::test]
+async fn user_message_without_key_loads_as_none() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    conv.messages
+        .push(Message::new(Role::User, "no key here"));
+
+    s.create(conv).await.expect("create");
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(
+        got.messages[0].idempotency_key, None,
+        "a keyless user message loads with a None idempotency_key"
+    );
+}
+
 #[tokio::test]
 async fn get_conversation_tags_reads_stored_tags() {
     let s = store().await;
