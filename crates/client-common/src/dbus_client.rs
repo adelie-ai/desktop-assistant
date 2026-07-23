@@ -496,6 +496,9 @@ impl DbusClient {
                     role,
                     content,
                     kind: crate::MessageKind::Normal,
+                    // D-Bus transcripts are daemon-sourced, not optimistic
+                    // client bubbles, so they carry no idempotency stamp (#570).
+                    idempotency_key: None,
                 })
                 .collect(),
             model_selection: None,
@@ -771,6 +774,10 @@ impl DbusClient {
                         conversation_id: args.conversation_id.to_string(),
                         request_id: args.request_id.to_string(),
                         content: args.content.to_string(),
+                        // The D-Bus signal is `(s,s,s)` in Phase 1 and carries
+                        // no idempotency key; echoing it over D-Bus is a Refs
+                        // #570 follow-up.
+                        idempotency_key: None,
                     });
                 }
             }

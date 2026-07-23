@@ -247,6 +247,10 @@ pub fn translate(event: SignalEvent) -> ForwardAction {
             conversation_id,
             request_id,
             content,
+            // The D-Bus `UserMessageAdded` signal stays `(s,s,s)` in Phase 1;
+            // echoing the idempotency key over D-Bus is a Refs #570 follow-up
+            // (it would widen the signal signature and introspection surface).
+            idempotency_key: _,
         } => ForwardAction::UserMessageAdded {
             conversation_id,
             request_id,
