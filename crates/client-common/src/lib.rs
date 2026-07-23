@@ -22,7 +22,7 @@ pub mod ws_client;
 #[cfg(feature = "clap")]
 pub use cli::TransportArgs;
 pub use client_context::resolve_client_context;
-pub use commands::AssistantCommands;
+pub use commands::{AssistantCommands, SendAck};
 pub use config::{ConnectionConfig, TransportMode, default_desktop_socket_path};
 pub use connector::Connector;
 pub use signal::SignalEvent;
