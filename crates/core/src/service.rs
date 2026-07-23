@@ -790,6 +790,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // re-injected in `assemble_turn` when conditions indicate
         // the original message has drifted out of the model's view.
         conv.active_task = Some(prompt.clone());
+        // Persist the user prompt eagerly, before any cancellable work (#585).
+        // Otherwise the prompt lives only in memory until the terminal
+        // `store.update`, and every cancellation checkpoint returns
+        // `Err(Cancelled)` without saving — so a cancel/crash mid-turn would
+        // lose the user's message. Writing it now — inside the turn-lock, so no
+        // read-modify-write race (#282) — guarantees the prompt survives even if
+        // the turn is abandoned; the eventual terminal update overwrites this
+        // row with the full turn (prompt + reply). The clone is the cost of
+        // keeping `conv` for the rest of the turn (one extra write per turn).
+        self.store.update(conv.clone()).await?;
 
         // Effective window size for this turn. May shrink further if the
         // provider reports input-token usage above COMPACTION_TOKEN_RATIO.
