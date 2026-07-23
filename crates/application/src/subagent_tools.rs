@@ -478,8 +478,12 @@ fn effective_prompt(prompt: String, system_prompt: Option<String>, name: &str) -
     // subagent knows its role.
     let prefix = system_prompt.unwrap_or_else(|| {
         format!(
-            "You are a helper subagent named '{name}'. Carry out the parent task's \
-             request crisply and return your final answer as plain text."
+            "You are a helper subagent named '{name}'. Do the parent task's request in \
+             your own working context, then return a focused, self-contained answer to \
+             your task -- enough detail and the surrounding context for the parent to \
+             use it directly, but NOT your tool outputs, intermediate steps, or a re-run \
+             of your work (that working detail stays here and is cleaned up). Your \
+             returned answer IS the result the parent receives."
         )
     });
     format!("{prefix}\n\n{prompt}")
