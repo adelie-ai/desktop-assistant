@@ -3068,6 +3068,8 @@ mod tests {
                 attachments: vec!["scripts/run.sh".to_string()],
                 body: "# body\n\n## Steps\n1. go".to_string(),
                 metadata: serde_json::Value::Null,
+                present_on_disk: true,
+                last_seen_at: None,
             }
         }
 

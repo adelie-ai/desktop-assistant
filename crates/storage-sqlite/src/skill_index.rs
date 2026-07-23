@@ -95,6 +95,8 @@ fn row_from_tuple(t: SkillTuple) -> IndexedSkill {
         attachments: json_to_string_vec(&t.10),
         body: t.11,
         metadata: serde_json::from_str(&t.12).unwrap_or(serde_json::Value::Null),
+        present_on_disk: true,
+        last_seen_at: None,
     }
 }
 

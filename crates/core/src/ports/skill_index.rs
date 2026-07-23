@@ -131,6 +131,8 @@ mod tests {
             attachments: vec![],
             body: String::new(),
             metadata: serde_json::Value::Null,
+            present_on_disk: true,
+            last_seen_at: None,
         }
     }
 

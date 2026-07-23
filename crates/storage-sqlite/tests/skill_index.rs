@@ -31,6 +31,8 @@ fn skill(name: &str, description: &str, body: &str) -> IndexedSkill {
         attachments: vec!["scripts/run.sh".to_string()],
         body: body.to_string(),
         metadata: serde_json::json!({"author": "test"}),
+        present_on_disk: true,
+        last_seen_at: None,
     }
 }
 
@@ -62,7 +64,11 @@ async fn reindex_get_and_list_roundtrip() {
 }
 
 #[tokio::test]
-async fn reindex_prunes_removed_skills() {
+async fn skill_removed_from_disk_survives_reindex() {
+    // The catalog is cumulative: the database is the authoritative copy, not a
+    // shadow of the last scan. A skill vanishing from disk keeps its body (the
+    // procedure is still good) and is marked not-present (its attachments and
+    // disk_path no longer resolve).
     let s = store().await;
     s.reindex_global(vec![skill("a", "first", "x"), skill("b", "second", "y")])
         .await
@@ -70,16 +76,51 @@ async fn reindex_prunes_removed_skills() {
     s.reindex_global(vec![skill("a", "first", "x")])
         .await
         .unwrap();
-    assert!(s.get("a", None).await.unwrap().is_some());
-    assert!(s.get("b", None).await.unwrap().is_none());
+
+    let survivor = s
+        .get("b", None)
+        .await
+        .expect("get b")
+        .expect("a skill absent from disk is retained, not deleted");
+    assert_eq!(survivor.body, "y", "its body is still readable from the DB");
+    assert!(
+        !survivor.present_on_disk,
+        "but it is flagged as no longer present on disk"
+    );
+    assert!(
+        s.get("a", None)
+            .await
+            .unwrap()
+            .expect("a is still indexed")
+            .present_on_disk,
+        "the skill the scan did see stays present"
+    );
 }
 
 #[tokio::test]
-async fn empty_reindex_clears_catalog() {
+async fn empty_scan_preserves_the_catalog() {
+    // The unhappy path that motivated this: a root that is momentarily
+    // unreadable must never be able to empty the catalog.
     let s = store().await;
     s.reindex_global(vec![skill("a", "x", "y")]).await.unwrap();
     s.reindex_global(vec![]).await.unwrap();
-    assert!(s.list(None).await.unwrap().is_empty());
+
+    let rows = s.list(None).await.unwrap();
+    assert_eq!(rows.len(), 1, "an empty scan deletes nothing");
+    assert!(!rows[0].present_on_disk, "everything is marked absent");
+}
+
+#[tokio::test]
+async fn rescan_restores_presence_when_skill_returns() {
+    let s = store().await;
+    s.reindex_global(vec![skill("a", "x", "y")]).await.unwrap();
+    s.reindex_global(vec![]).await.unwrap();
+    s.reindex_global(vec![skill("a", "x", "y")]).await.unwrap();
+
+    assert!(
+        s.get("a", None).await.unwrap().unwrap().present_on_disk,
+        "a returning skill is present again"
+    );
 }
 
 #[tokio::test]
@@ -143,7 +184,7 @@ fn owned(name: &str, owner: &str, description: &str) -> IndexedSkill {
 }
 
 #[tokio::test]
-async fn reindex_for_owner_replaces_only_that_owner() {
+async fn reindex_for_owner_leaves_other_scopes_untouched() {
     let s = store().await;
     s.reindex_global(vec![skill("shared", "global", "x")])
         .await
@@ -155,13 +196,32 @@ async fn reindex_for_owner_replaces_only_that_owner() {
         .await
         .unwrap();
 
-    // Rescan alice: her old row is replaced; global and bob's are untouched.
+    // Rescan alice with a different skill: hers accumulate, and no other scope
+    // is touched -- including its presence flag.
     s.reindex_for_owner("alice", vec![owned("new", "alice", "a2")])
         .await
         .unwrap();
 
-    assert!(s.get("old", Some("alice")).await.unwrap().is_none());
+    let old = s
+        .get("old", Some("alice"))
+        .await
+        .unwrap()
+        .expect("alice's earlier skill is retained");
+    assert!(!old.present_on_disk, "but flagged absent from her scan");
     assert!(s.get("new", Some("alice")).await.unwrap().is_some());
-    assert!(s.get("shared", None).await.unwrap().is_some());
-    assert!(s.get("bob-only", Some("bob")).await.unwrap().is_some());
+
+    let global = s.get("shared", None).await.unwrap().expect("global intact");
+    assert!(
+        global.present_on_disk,
+        "an owner scan must not mark global skills absent"
+    );
+    let bob = s
+        .get("bob-only", Some("bob"))
+        .await
+        .unwrap()
+        .expect("bob intact");
+    assert!(
+        bob.present_on_disk,
+        "nor another owner's -- presence is per-scope"
+    );
 }

@@ -12,6 +12,7 @@
 //! the blessing must be invalidated if any of them changes. Hashing only
 //! `SKILL.md` would let a swapped `scripts/run.sh` keep a stale blessing valid.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -348,6 +349,30 @@ pub struct IndexedSkill {
     /// Extra frontmatter preserved verbatim.
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Whether the skill's files were on disk at the last scan of its scope.
+    ///
+    /// `false` means the indexed copy is all that survives: the body still
+    /// reads, but `disk_path` and [`Self::attachments`] no longer resolve, so
+    /// bundled scripts cannot be run.
+    ///
+    /// Why a flag and not a delete: the catalog is cumulative, so a skill
+    /// disappearing from disk is never a reason to forget the procedure. This
+    /// is index state rather than scan output -- a reconcile pass sets it, and
+    /// whatever a scanner puts here is ignored on write.
+    #[serde(default = "present_on_disk_default")]
+    pub present_on_disk: bool,
+    /// When a scan last saw this skill on disk; `None` for a row no
+    /// presence-tracking scan has covered yet. Index state, like
+    /// [`Self::present_on_disk`].
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+/// A row with no recorded presence predates presence tracking, and the skill it
+/// describes was on disk when it was indexed -- so absent evidence means
+/// present, not missing.
+fn present_on_disk_default() -> bool {
+    true
 }
 
 #[cfg(test)]

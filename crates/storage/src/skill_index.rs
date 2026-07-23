@@ -305,6 +305,8 @@ impl SkillRow {
             attachments: json_to_string_vec(self.attachments),
             body: self.body,
             metadata: self.metadata,
+            present_on_disk: true,
+            last_seen_at: None,
         }
     }
 }

@@ -116,6 +116,10 @@ fn scan_skill_dir(
         attachments,
         body: parsed.body,
         metadata: parsed.frontmatter.metadata,
+        // Presence is index state the reconcile pass stamps; a scanner only
+        // ever reports what it just read off disk.
+        present_on_disk: true,
+        last_seen_at: None,
     })
 }
 

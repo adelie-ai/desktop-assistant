@@ -116,6 +116,8 @@ fn skill(name: &str, description: &str, hash: &str, body: &str) -> IndexedSkill 
         attachments: vec![],
         body: body.to_string(),
         metadata: serde_json::json!({"author": "test"}),
+        present_on_disk: true,
+        last_seen_at: None,
     }
 }
 
@@ -162,8 +164,12 @@ async fn reindex_inserts_and_get_list_return_global_skills() {
 }
 
 #[tokio::test]
-async fn reindex_prunes_skills_removed_from_disk() {
-    with_fixture("reindex_prunes", |fx| async move {
+async fn skill_removed_from_disk_survives_reindex() {
+    // The catalog is cumulative: the database is the authoritative copy, not a
+    // shadow of the last scan. A skill vanishing from disk keeps its body (the
+    // procedure is still good) and is marked not-present (its attachments and
+    // disk_path no longer resolve).
+    with_fixture("removed_skill_survives", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
         store
             .reindex_global(vec![
@@ -179,23 +185,68 @@ async fn reindex_prunes_skills_removed_from_disk() {
             .await
             .expect("reindex 2");
 
-        assert!(store.get("a", None).await.unwrap().is_some());
-        assert!(store.get("b", None).await.unwrap().is_none());
+        let survivor = store
+            .get("b", None)
+            .await
+            .expect("get b")
+            .expect("a skill absent from disk is retained, not deleted");
+        assert_eq!(survivor.body, "y", "its body is still readable from the DB");
+        assert!(
+            !survivor.present_on_disk,
+            "but it is flagged as no longer present on disk"
+        );
+        assert!(
+            store
+                .get("a", None)
+                .await
+                .unwrap()
+                .expect("a is still indexed")
+                .present_on_disk,
+            "the skill the scan did see stays present"
+        );
         fx
     })
     .await;
 }
 
 #[tokio::test]
-async fn empty_reindex_clears_global_catalog() {
-    with_fixture("empty_reindex", |fx| async move {
+async fn empty_scan_preserves_the_catalog() {
+    // The unhappy path that motivated this: a root that is momentarily
+    // unreadable must never be able to empty the catalog.
+    with_fixture("empty_scan_preserves", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
         store
             .reindex_global(vec![skill("a", "x", "h", "y")])
             .await
             .unwrap();
         store.reindex_global(vec![]).await.expect("empty reindex");
-        assert!(store.list(None).await.unwrap().is_empty());
+
+        let rows = store.list(None).await.unwrap();
+        assert_eq!(rows.len(), 1, "an empty scan deletes nothing");
+        assert!(!rows[0].present_on_disk, "everything is marked absent");
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rescan_restores_presence_when_skill_returns() {
+    with_fixture("rescan_restores_presence", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        store
+            .reindex_global(vec![skill("a", "x", "h", "y")])
+            .await
+            .unwrap();
+        store.reindex_global(vec![]).await.unwrap();
+        store
+            .reindex_global(vec![skill("a", "x", "h", "y")])
+            .await
+            .unwrap();
+
+        assert!(
+            store.get("a", None).await.unwrap().unwrap().present_on_disk,
+            "a returning skill is present again"
+        );
         fx
     })
     .await;
@@ -329,7 +380,7 @@ fn owned(name: &str, owner: &str, description: &str) -> IndexedSkill {
 }
 
 #[tokio::test]
-async fn reindex_for_owner_replaces_only_that_owner() {
+async fn reindex_for_owner_leaves_other_scopes_untouched() {
     with_fixture("reindex_for_owner", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
         store
@@ -345,16 +396,39 @@ async fn reindex_for_owner_replaces_only_that_owner() {
             .await
             .unwrap();
 
-        // Rescan alice: her old row is replaced; global and bob's are untouched.
+        // Rescan alice with a different skill: hers accumulate, and no other
+        // scope is touched -- including its presence flag.
         store
             .reindex_for_owner("alice", vec![owned("new", "alice", "a2")])
             .await
             .unwrap();
 
-        assert!(store.get("old", Some("alice")).await.unwrap().is_none());
+        let old = store
+            .get("old", Some("alice"))
+            .await
+            .unwrap()
+            .expect("alice's earlier skill is retained");
+        assert!(!old.present_on_disk, "but flagged absent from her scan");
         assert!(store.get("new", Some("alice")).await.unwrap().is_some());
-        assert!(store.get("shared", None).await.unwrap().is_some());
-        assert!(store.get("bob-only", Some("bob")).await.unwrap().is_some());
+
+        let global = store
+            .get("shared", None)
+            .await
+            .unwrap()
+            .expect("global intact");
+        assert!(
+            global.present_on_disk,
+            "an owner scan must not mark global skills absent"
+        );
+        let bob = store
+            .get("bob-only", Some("bob"))
+            .await
+            .unwrap()
+            .expect("bob intact");
+        assert!(
+            bob.present_on_disk,
+            "nor another owner's -- presence is per-scope"
+        );
         fx
     })
     .await;
