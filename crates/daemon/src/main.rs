@@ -1055,6 +1055,33 @@ async fn main() -> Result<()> {
                         .with_base_url(resolved_emb.base_url.clone()),
                 )
             }
+            "azure" => {
+                // Azure serves embeddings on `/openai/v1/embeddings` (or the
+                // classic deployments path). The legacy `[embeddings]` block
+                // carries no surface/auth extras, so this uses the connector's
+                // defaults (v1 GA, api-key auth); the deployment is the model.
+                tracing::info!("using Azure embedding backend");
+                Arc::new(
+                    desktop_assistant_llm_azure::AzureClient::new(resolved_emb.api_key.clone())
+                        .with_model(resolved_emb.model.clone())
+                        .with_base_url(resolved_emb.base_url.clone()),
+                )
+            }
+            "google" => {
+                // Google embeddings target Vertex `:predict` or the Gemini API
+                // `:embedContent`. The legacy `[embeddings]` block carries no
+                // project/location/auth extras, so this uses the connector's
+                // defaults; set the host only when explicitly configured so the
+                // client can compose the Vertex host from its default location.
+                tracing::info!("using Google embedding backend");
+                let mut client =
+                    desktop_assistant_llm_google::GoogleClient::new(resolved_emb.api_key.clone())
+                        .with_model(resolved_emb.model.clone());
+                if !resolved_emb.base_url.trim().is_empty() {
+                    client = client.with_base_url(resolved_emb.base_url.clone());
+                }
+                Arc::new(client)
+            }
             _ => {
                 tracing::info!("using OpenAI-compatible embedding backend");
                 // `resolved_emb.api_key` is now resolved by

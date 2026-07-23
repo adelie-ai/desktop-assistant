@@ -603,6 +603,44 @@ impl Default for SecretConfig {
     }
 }
 
+/// Provider-specific configuration that has nowhere to live on the flat
+/// [`ResolvedLlmConfig`] shared by every connector.
+///
+/// The factory ([`crate::registry::build_llm_client`]) reads this to thread the
+/// Azure / Google surface + auth + endpoint knobs into the connector builders.
+/// Connectors that need no extras resolve to [`ConnectorExtras::None`]. Adding a
+/// new arm keeps the shared struct flat instead of accreting a growing list of
+/// `Option<..>` fields that only one connector ever reads.
+#[derive(Debug, Clone, Default)]
+pub enum ConnectorExtras {
+    /// No provider-specific config (Ollama, Anthropic, Bedrock, OpenAI,
+    /// OpenRouter).
+    #[default]
+    None,
+    /// Azure OpenAI surface/auth/version knobs. Strings are the raw config
+    /// values; the factory parses them into the connector's typed enums
+    /// (`ApiSurface`, `AuthMode`) so an invalid value fails loudly there.
+    Azure {
+        /// `v1` (GA, default) or `classic` (legacy deployments path).
+        api_surface: Option<String>,
+        /// `api_key` (default) or `entra`.
+        auth_mode: Option<String>,
+        /// `api-version` for the classic surface; ignored on `v1`.
+        api_version: Option<String>,
+    },
+    /// Google Vertex / Gemini project/region/auth knobs.
+    Google {
+        /// GCP project id (Vertex).
+        project: Option<String>,
+        /// Vertex region (e.g. `us-central1`), or the composed host source.
+        location: Option<String>,
+        /// `vertex` (default) or `api_key` (AI Studio).
+        auth_mode: Option<String>,
+        /// Path to a service-account JSON key file (Vertex).
+        credentials_path: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedLlmConfig {
     pub connector: String,
@@ -632,6 +670,10 @@ pub struct ResolvedLlmConfig {
     /// [`crate::connections::OllamaConnection::max_context_tokens`] and the
     /// connector's `max_context_tokens()` for how this folds together.
     pub max_context_tokens: Option<u64>,
+    /// Provider-specific config the flat struct can't hold (Azure surface/auth,
+    /// Google project/location/auth). [`ConnectorExtras::None`] for connectors
+    /// that need none.
+    pub extras: ConnectorExtras,
 }
 
 #[derive(Debug, Clone)]

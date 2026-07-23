@@ -430,6 +430,39 @@ pub enum ConnectionConfigPayload {
         stream_timeout_secs: Option<u64>,
         max_context_tokens: Option<u64>,
     },
+    /// OpenRouter carries the same non-secret fields as [`Self::OpenAi`].
+    OpenRouter {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+        connect_timeout_secs: Option<u64>,
+        stream_timeout_secs: Option<u64>,
+        max_context_tokens: Option<u64>,
+    },
+    /// Azure OpenAI: OpenAI-compatible fields plus surface/auth/version knobs.
+    /// Never carries a raw secret value.
+    Azure {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+        api_surface: Option<String>,
+        auth_mode: Option<String>,
+        api_version: Option<String>,
+        connect_timeout_secs: Option<u64>,
+        stream_timeout_secs: Option<u64>,
+        max_context_tokens: Option<u64>,
+    },
+    /// Google Vertex / Gemini: project/region/auth knobs. Never carries a raw
+    /// secret value.
+    Google {
+        base_url: Option<String>,
+        api_key_env: Option<String>,
+        project: Option<String>,
+        location: Option<String>,
+        auth_mode: Option<String>,
+        credentials_path: Option<String>,
+        connect_timeout_secs: Option<u64>,
+        stream_timeout_secs: Option<u64>,
+        max_context_tokens: Option<u64>,
+    },
     Bedrock {
         aws_profile: Option<String>,
         region: Option<String>,
@@ -452,6 +485,9 @@ impl ConnectionConfigPayload {
         match self {
             Self::Anthropic { .. } => "anthropic",
             Self::OpenAi { .. } => "openai",
+            Self::OpenRouter { .. } => "openrouter",
+            Self::Azure { .. } => "azure",
+            Self::Google { .. } => "google",
             Self::Bedrock { .. } => "bedrock",
             Self::Ollama { .. } => "ollama",
         }

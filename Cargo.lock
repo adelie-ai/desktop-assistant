@@ -1367,9 +1367,12 @@ dependencies = [
  "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
  "desktop-assistant-llm-anthropic",
+ "desktop-assistant-llm-azure",
  "desktop-assistant-llm-bedrock",
+ "desktop-assistant-llm-google",
  "desktop-assistant-llm-ollama",
  "desktop-assistant-llm-openai",
+ "desktop-assistant-llm-openrouter",
  "desktop-assistant-mcp-client",
  "desktop-assistant-storage",
  "desktop-assistant-uds",
@@ -1453,6 +1456,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-llm-azure"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "desktop-assistant-core",
+ "desktop-assistant-llm-http",
+ "desktop-assistant-llm-openai-compat",
+ "httpmock",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "desktop-assistant-llm-bedrock"
 version = "0.1.0"
 dependencies = [
@@ -1467,6 +1487,25 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "desktop-assistant-llm-google"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "desktop-assistant-core",
+ "desktop-assistant-llm-http",
+ "eventsource-stream",
+ "httpmock",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
 ]
@@ -1516,6 +1555,40 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "desktop-assistant-llm-openai-compat"
+version = "0.1.0"
+dependencies = [
+ "desktop-assistant-core",
+ "desktop-assistant-llm-http",
+ "eventsource-stream",
+ "httpmock",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "desktop-assistant-llm-openrouter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "desktop-assistant-core",
+ "desktop-assistant-llm-http",
+ "desktop-assistant-llm-openai-compat",
+ "httpmock",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
  "tokio-util",
  "tracing",
 ]
