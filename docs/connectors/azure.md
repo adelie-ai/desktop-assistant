@@ -92,6 +92,18 @@ usage-include option so the final chunk carries `usage` with
 role in place of `system`; the compat module maps `system` appropriately per
 model.
 
+## Streaming-with-tools-unsupported fallback
+
+Shared with OpenRouter via the compat module (#619). A deployment that rejects
+tool use in streaming returns the provider error that
+`detect_streaming_tools_unsupported` classifies to `CoreError::ToolsUnsupported`;
+`stream_completion` then retries once via a non-streaming `/chat/completions`
+request (`stream: false`, and `stream_options` dropped since the API rejects it
+when not streaming) and records the deployment in a per-connection memo so the
+next tools turn skips the stream attempt. A non-streaming failure surfaces and
+never loops back to streaming. See `openrouter.md` (Robustness) for the full
+contract.
+
 ## Prompt caching
 
 Automatic server-side caching; no request annotations. Read

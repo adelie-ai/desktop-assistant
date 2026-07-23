@@ -108,9 +108,17 @@ worth it in v1, drop the `max_tokens` mapping and support `effort` only.
   backends, so this is not optional.
 - **Empty-key tool input `{"":{}}`**: normalize on the history path; gpt-oss (which
   OpenRouter routes) emits it, and re-sending it 400s every subsequent turn.
-- **Streaming-with-tools-unsupported**: classify to `CoreError::ToolsUnsupported`
-  when a routed backend rejects tool use in streaming; a non-streaming fallback +
-  per-model memo (Bedrock pattern) is the ideal.
+- **Streaming-with-tools-unsupported** (#619): some routed backends accept tools
+  only on a non-streaming request. `detect_streaming_tools_unsupported` (a narrow
+  connector-boundary match requiring *tools* + *streaming* + a negation, so it
+  does not false-positive on an unrelated error) classifies that provider error
+  to `CoreError::ToolsUnsupported`. On it, `stream_completion` retries once via a
+  non-streaming `/chat/completions` dispatch (`stream: false`, parsed by
+  `parse_chat_completion`, full text emitted through `on_chunk` once) and records
+  the model in a per-connection memo so the next tools turn skips the stream
+  attempt. A plain tools-unsupported error (not streaming-specific) is excluded -
+  non-streaming would not help, so it surfaces. A non-streaming failure surfaces
+  as-is and never loops back to streaming. Mirrors the Bedrock pattern (#67).
 
 ## Error mapping
 
@@ -142,6 +150,12 @@ client against `/embeddings`.
 - Reasoning: `effort` and `max_tokens` mapping; omitted when empty.
 - Error paths (httpmock): 400 overflow, 402 credits, 429 + retry, 5xx,
   tools-unsupported.
+- Streaming-with-tools-unsupported fallback (#619): the provider error is
+  classified to `ToolsUnsupported`; the non-streaming retry returns the tool
+  calls + usage + text-via-`on_chunk`; the memo skips streaming on the second
+  call (the streaming endpoint is not hit again); a model that does not error
+  stays on streaming; a non-streaming failure surfaces without looping;
+  cancellation is honoured on the non-streaming path.
 - `MODEL_OVERRIDE` routes the body `model`.
 - Redacting `Debug`; cancellation mid-stream; malformed-SSE tolerance;
   callback-abort preserves accumulated tool calls and usage.

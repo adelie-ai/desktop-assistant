@@ -27,7 +27,8 @@
 //! Credentials travel in headers only -- never in a URL, log, or error message
 //! -- and the client renders a redacting [`Debug`].
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
@@ -42,11 +43,13 @@ use desktop_assistant_llm_http::{
     bail_for_status, merge_curated_with_live,
 };
 use desktop_assistant_llm_openai_compat::{
-    ChatMessage, ChatTool, classify_error, consume_chat_stream, to_chat_messages, to_chat_tools,
+    ChatMessage, ChatTool, StreamingDispatchError, classify_error, consume_chat_stream,
+    dispatch_non_streaming, send_chat_request, to_chat_messages, to_chat_tools,
 };
 use reqwest::header::HeaderMap;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 /// Default `api-version` for the legacy ([`ApiSurface::Classic`]) surface. A GA
 /// value; the operator overrides it via [`AzureClient::with_api_version`] when
@@ -150,6 +153,12 @@ pub struct AzureClient {
     /// currently holds the curated table; it keeps the connector uniform with
     /// OpenRouter/Google and is where a future live listing slots in (#620).
     model_cache: ModelCache,
+    /// Per-deployment memo of backends that reject tool use in streaming (#619).
+    /// A deployment recorded here skips the stream attempt and goes straight to
+    /// the non-streaming `/chat/completions` path on the next tools turn.
+    /// Populated at runtime from the provider's tools-unsupported-in-streaming
+    /// error; the guard is never held across an `.await`.
+    non_streaming_tools_models: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Redacting [`Debug`] so neither the API key nor a bearer token can leak
@@ -179,6 +188,7 @@ impl std::fmt::Debug for AzureClient {
                 &self.token_provider.as_ref().map(|_| "<TokenProvider>"),
             )
             .field("model_cache", &self.model_cache)
+            .field("non_streaming_tools_models", &"<memo>")
             .finish()
     }
 }
@@ -218,6 +228,7 @@ impl AzureClient {
             auth_mode: AuthMode::ApiKey,
             token_provider: None,
             model_cache: ModelCache::new(),
+            non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -430,21 +441,29 @@ impl AzureClient {
             max_completion_tokens,
             reasoning_effort: reasoning_for(deployment, reasoning),
             stream: true,
-            stream_options: StreamOptions {
+            stream_options: Some(StreamOptions {
                 include_usage: true,
-            },
+            }),
         }
     }
 
-    /// POST the request (with a bounded connect race) and consume the SSE
-    /// stream into an [`LlmResponse`], mapping any HTTP error via
-    /// [`Self::classify_azure_error`].
-    async fn send_and_stream(
+    /// Flip a streaming request envelope to its non-streaming form: `stream`
+    /// off and `stream_options` dropped (invalid when not streaming). Used for
+    /// the tools-in-streaming fallback (#619).
+    fn to_non_streaming(mut request: ChatRequest) -> ChatRequest {
+        request.stream = false;
+        request.stream_options = None;
+        request
+    }
+
+    /// Build the `/chat/completions` request: the field-aware preflight, the
+    /// request-size log, the URL for the configured surface, and the auth
+    /// header. Shared by the streaming and non-streaming send paths.
+    async fn build_request(
         &self,
         deployment: &str,
         request_body: &ChatRequest,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
+    ) -> Result<RequestBuilder, CoreError> {
         // Field-aware preflight ("no silent failures"): surface the missing
         // piece by name instead of a malformed-URL 404 on the first turn.
         if self.base().is_empty() {
@@ -466,6 +485,7 @@ impl AzureClient {
         tracing::info!(
             request_bytes = request_json.len(),
             deployment = %deployment,
+            stream = request_body.stream,
             "Azure LLM request payload"
         );
         tracing::debug!(
@@ -473,51 +493,80 @@ impl AzureClient {
             &request_json[..request_json.len().min(2000)]
         );
 
-        let cancellation = current_cancellation_token().unwrap_or_default();
-        if cancellation.is_cancelled() {
-            return Err(CoreError::Cancelled);
-        }
-
         let url = self.chat_completions_url(deployment);
         let rb = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(request_body);
-        let rb = self.apply_auth(rb).await?;
-        let send_fut = rb.send();
+        self.apply_auth(rb).await
+    }
 
-        // Bound the connection handshake so a stalled connect fails the turn
-        // rather than hanging forever.
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-            _ = tokio::time::sleep(self.connect_timeout) => {
-                tracing::error!(
-                    timeout_s = self.connect_timeout.as_secs(),
-                    "Azure request send() timed out (no response headers)"
-                );
-                return Err(CoreError::Llm("Azure stream stalled".into()));
-            }
-            r = send_fut => r.map_err(|e| CoreError::Llm(format!("Azure HTTP request failed: {e}")))?,
+    /// POST the request (with a bounded connect race via the shared
+    /// [`send_chat_request`]) and consume the SSE stream into an
+    /// [`LlmResponse`], mapping any HTTP error via [`Self::classify_azure_error`].
+    ///
+    /// A deployment that rejects tools-in-streaming classifies to
+    /// [`CoreError::ToolsUnsupported`]; that arm hands the (still-unconsumed)
+    /// callback back through [`StreamingDispatchError::ToolsUnsupported`] so the
+    /// caller can retry non-streaming without rebuilding it (#619).
+    async fn send_and_stream(
+        &self,
+        deployment: &str,
+        request_body: &ChatRequest,
+        on_chunk: ChunkCallback,
+        cancellation: &CancellationToken,
+    ) -> Result<LlmResponse, StreamingDispatchError> {
+        let request = match self.build_request(deployment, request_body).await {
+            Ok(rb) => rb,
+            Err(e) => return Err(StreamingDispatchError::Other(e)),
         };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let headers = response.headers().clone();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unable to read body".into());
-            return Err(self.classify_azure_error(status, &headers, &body));
-        }
+        let response = match send_chat_request(
+            request,
+            cancellation,
+            self.connect_timeout,
+            "Azure stream stalled",
+            |status, headers, body| self.classify_azure_error(status, headers, body),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(CoreError::ToolsUnsupported { detail }) => {
+                return Err(StreamingDispatchError::ToolsUnsupported { on_chunk, detail });
+            }
+            Err(e) => return Err(StreamingDispatchError::Other(e)),
+        };
 
         consume_chat_stream(
             response.bytes_stream(),
-            &cancellation,
+            cancellation,
             self.event_timeout,
             on_chunk,
         )
         .await
+        .map_err(StreamingDispatchError::Other)
+    }
+
+    /// POST the request with `stream: false` and parse the single JSON response
+    /// into an [`LlmResponse`] via the shared [`dispatch_non_streaming`]. Used
+    /// as the fallback for a deployment that rejects tools-in-streaming (#619).
+    async fn send_non_streaming(
+        &self,
+        deployment: &str,
+        request_body: &ChatRequest,
+        on_chunk: ChunkCallback,
+        cancellation: &CancellationToken,
+    ) -> Result<LlmResponse, CoreError> {
+        let request = self.build_request(deployment, request_body).await?;
+        let response = send_chat_request(
+            request,
+            cancellation,
+            self.connect_timeout,
+            "Azure stream stalled",
+            |status, headers, body| self.classify_azure_error(status, headers, body),
+        )
+        .await?;
+        dispatch_non_streaming(response, cancellation, on_chunk).await
     }
 
     /// Map an HTTP error to a [`CoreError`], adding Azure specifics on top of
@@ -634,7 +683,12 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
     stream: bool,
-    stream_options: StreamOptions,
+    /// Only valid while streaming: asks Azure to append the final `usage`
+    /// chunk. Omitted on the non-streaming path -- the API rejects
+    /// `stream_options` when `stream` is `false` (usage is returned inline
+    /// there anyway).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
 }
 
 /// `stream_options` -- asks Azure to append the final `usage` chunk.
@@ -922,8 +976,70 @@ impl LlmClient for AzureClient {
         // deployment via MODEL_OVERRIDE; reasoning gating and URL shaping key on
         // the dispatched deployment, not the baked-in default.
         let deployment = current_model_override().unwrap_or_else(|| self.model.clone());
-        let request = self.build_request_body(&deployment, &messages, tools, reasoning);
-        self.send_and_stream(&deployment, &request, on_chunk).await
+        let cancellation = current_cancellation_token().unwrap_or_default();
+        let has_tools = !tools.is_empty();
+
+        // Memo (#619): a deployment known to reject tools-in-streaming skips the
+        // stream attempt when this turn carries tools. A no-tools turn always
+        // streams. The guard is dropped before any `.await`.
+        let skip_streaming = has_tools && {
+            let memo = self
+                .non_streaming_tools_models
+                .lock()
+                .expect("non_streaming_tools_models mutex poisoned");
+            memo.contains(&deployment)
+        };
+        if skip_streaming {
+            tracing::debug!(
+                deployment = %deployment,
+                "skipping stream: deployment memoized as tools-in-streaming-unsupported"
+            );
+            let request = Self::to_non_streaming(self.build_request_body(
+                &deployment,
+                &messages,
+                tools,
+                reasoning,
+            ));
+            return self
+                .send_non_streaming(&deployment, &request, on_chunk, &cancellation)
+                .await;
+        }
+
+        // Try streaming first; on the tools-in-streaming rejection, memoize the
+        // deployment and retry once via non-streaming with the handed-back
+        // callback. A non-streaming failure surfaces as-is -- it never loops
+        // back to the stream attempt (#619).
+        let stream_request = self.build_request_body(&deployment, &messages, tools, reasoning);
+        match self
+            .send_and_stream(&deployment, &stream_request, on_chunk, &cancellation)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(StreamingDispatchError::ToolsUnsupported { on_chunk, detail }) => {
+                tracing::warn!(
+                    deployment = %deployment,
+                    detail,
+                    "Azure rejected tools in streaming; retrying non-streaming and memoizing \
+                     the deployment so future turns skip the stream attempt"
+                );
+                {
+                    let mut memo = self
+                        .non_streaming_tools_models
+                        .lock()
+                        .expect("non_streaming_tools_models mutex poisoned");
+                    memo.insert(deployment.clone());
+                }
+                let request = Self::to_non_streaming(self.build_request_body(
+                    &deployment,
+                    &messages,
+                    tools,
+                    reasoning,
+                ));
+                self.send_non_streaming(&deployment, &request, on_chunk, &cancellation)
+                    .await
+            }
+            Err(StreamingDispatchError::Other(e)) => Err(e),
+        }
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
@@ -1879,7 +1995,11 @@ mod tests {
     const NONSTREAMING_TOOL_RESPONSE: &str = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"On it","tool_calls":[{"id":"call_9","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"rust\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":2}}}"#;
 
     fn a_tool() -> ToolDefinition {
-        ToolDefinition::new("lookup", "look things up", serde_json::json!({"type":"object"}))
+        ToolDefinition::new(
+            "lookup",
+            "look things up",
+            serde_json::json!({"type":"object"}),
+        )
     }
 
     fn streaming_rejects_tools(server: &MockServer) -> httpmock::Mock<'_> {
