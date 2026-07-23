@@ -1557,4 +1557,215 @@ mod tests {
         assert_eq!(recovered, warm);
         ok.assert_calls(1);
     }
+
+    // --- Non-streaming fallback + per-model memo (#619) ------------------
+
+    /// A provider error body signalling "tools unsupported in streaming".
+    const TOOLS_UNSUPPORTED_BODY: &str = r#"{"error":{"code":"invalid_request_error","type":"invalid_request_error","message":"This model doesn't support tool use in streaming mode. Disable streaming to use tools."}}"#;
+
+    /// A non-streaming `/chat/completions` JSON response with text, a tool call,
+    /// and usage.
+    const NONSTREAMING_TOOL_RESPONSE: &str = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"On it","tool_calls":[{"id":"call_9","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"rust\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":2}}}"#;
+
+    fn a_tool() -> ToolDefinition {
+        ToolDefinition::new("lookup", "look things up", serde_json::json!({"type":"object"}))
+    }
+
+    /// Mock the streaming attempt (`"stream":true`) returning the
+    /// tools-unsupported error; returns the handle for call-count assertions.
+    fn streaming_rejects_tools(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":true"#);
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(TOOLS_UNSUPPORTED_BODY);
+        })
+    }
+
+    /// Mock the non-streaming request (`"stream":false`) with `status`/`body`.
+    fn non_streaming_returns<'a>(
+        server: &'a MockServer,
+        status: u16,
+        body: &str,
+    ) -> httpmock::Mock<'a> {
+        let owned = body.to_string();
+        server.mock(move |when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":false"#);
+            then.status(status)
+                .header("content-type", "application/json")
+                .body(&owned);
+        })
+    }
+
+    #[tokio::test]
+    async fn tools_unsupported_streaming_falls_back_to_non_streaming() {
+        let server = MockServer::start();
+        let stream_mock = streaming_rejects_tools(&server);
+        let ns_mock = non_streaming_returns(&server, 200, NONSTREAMING_TOOL_RESPONSE);
+        let client = client_for(&server);
+
+        let received = Arc::new(Mutex::new(String::new()));
+        let rc = Arc::clone(&received);
+        let resp = client
+            .stream_completion(
+                vec![Message::new(Role::User, "find rust")],
+                &[a_tool()],
+                ReasoningConfig::default(),
+                Box::new(move |c| {
+                    rc.lock().expect("lock").push_str(&c);
+                    true
+                }),
+            )
+            .await
+            .expect("non-streaming fallback ok");
+
+        stream_mock.assert_calls(1);
+        ns_mock.assert_calls(1);
+        assert_eq!(resp.text, "On it");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_9");
+        assert_eq!(resp.tool_calls[0].name, "lookup");
+        assert_eq!(resp.tool_calls[0].arguments, r#"{"q":"rust"}"#);
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+        // The full assistant text reached the consumer via on_chunk.
+        assert_eq!(*received.lock().expect("lock"), "On it");
+    }
+
+    #[tokio::test]
+    async fn memo_skips_streaming_on_the_second_call() {
+        let server = MockServer::start();
+        let stream_mock = streaming_rejects_tools(&server);
+        let ns_mock = non_streaming_returns(&server, 200, NONSTREAMING_TOOL_RESPONSE);
+        let client = client_for(&server);
+
+        for _ in 0..2 {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "find rust")],
+                    &[a_tool()],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("ok");
+        }
+
+        // Streaming was attempted only on the first call; the memo routed the
+        // second call straight to non-streaming.
+        stream_mock.assert_calls(1);
+        ns_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn model_without_error_stays_on_streaming() {
+        let server = MockServer::start();
+        let stream_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":true"#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+        // A non-streaming mock that must never be hit.
+        let ns_mock = non_streaming_returns(&server, 200, NONSTREAMING_TOOL_RESPONSE);
+        let client = client_for(&server);
+
+        for _ in 0..2 {
+            let resp = client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[a_tool()],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("stream ok");
+            assert_eq!(resp.text, "Hi");
+        }
+
+        stream_mock.assert_calls(2);
+        ns_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_failure_surfaces_without_looping() {
+        let server = MockServer::start();
+        let stream_mock = streaming_rejects_tools(&server);
+        let ns_mock = non_streaming_returns(&server, 500, "upstream boom");
+        let client = client_for(&server);
+
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[a_tool()],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("non-streaming failure must surface");
+
+        // Streaming attempted exactly once (no re-loop back to streaming), and
+        // the non-streaming error is what surfaces.
+        stream_mock.assert_calls(1);
+        ns_mock.assert_calls(1);
+        assert!(
+            matches!(err, CoreError::RateLimited { .. }),
+            "500 must map to RateLimited; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_honoured_on_non_streaming_path() {
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start();
+        streaming_rejects_tools(&server);
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":false"#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(Duration::from_secs(5))
+                .body(NONSTREAMING_TOOL_RESPONSE);
+        });
+        let client = client_for(&server);
+        let token = CancellationToken::new();
+        let handle = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handle.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = with_cancellation_token(token, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[a_tool()],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "expected Cancelled on the non-streaming path, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancellation must abort the non-streaming retry promptly; took {elapsed:?}"
+        );
+    }
 }
