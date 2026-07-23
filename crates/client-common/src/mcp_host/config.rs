@@ -26,7 +26,7 @@ pub const DEFAULT_SURFACE: &str = "default";
 /// `[surfaces.<name>]` section; a surface with no section inherits
 /// [`DEFAULT_SURFACE`]. Kept here as the single source of truth so admin UIs and
 /// clients agree on the set rather than scattering string literals.
-pub const CLIENT_SURFACES: [&str; 4] = ["gtk", "tui", "kde", "voice"];
+pub const CLIENT_SURFACES: [&str; 5] = ["gtk", "tui", "kde", "voice", "mac"];
 
 /// True when `name` is one of the [`CLIENT_SURFACES`]. The inheritance fallback
 /// [`DEFAULT_SURFACE`] is deliberately not a client surface.
@@ -538,11 +538,14 @@ command = "b"
 
     #[test]
     fn client_surfaces_helper_recognizes_known() {
-        assert_eq!(CLIENT_SURFACES.len(), 4);
+        assert_eq!(CLIENT_SURFACES.len(), 5);
         assert!(is_client_surface("gtk"));
         assert!(is_client_surface("tui"));
         assert!(is_client_surface("kde"));
         assert!(is_client_surface("voice"));
+        // adele-mac is its own surface: it shares the ffi cdylib with kde but
+        // must select its own servers rather than inheriting kde's list.
+        assert!(is_client_surface("mac"));
         // `default` is the inheritance fallback, not a client surface.
         assert!(!is_client_surface(DEFAULT_SURFACE));
         assert!(!is_client_surface("bogus"));
