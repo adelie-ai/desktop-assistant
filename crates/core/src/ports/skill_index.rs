@@ -57,6 +57,21 @@ pub trait SkillIndexStore: Send + Sync {
     /// fill later.
     async fn reindex_global(&self, skills: Vec<IndexedSkill>) -> Result<(), CoreError>;
 
+    /// Atomically replace the set of skills **owned by `owner`** with the
+    /// supplied scan output, in one transaction, leaving global and other users'
+    /// rows untouched.
+    ///
+    /// This is the user-scoped counterpart of [`reindex_global`](Self::reindex_global):
+    /// on a co-located single-user daemon the scanner walks the user's home skill
+    /// roots and stamps each skill with that user as `owner`, then calls this to
+    /// replace exactly that user's catalog. Callers pass skills whose
+    /// `owner_user_id` is `Some(owner)`; the store keys the replace on `owner`.
+    async fn reindex_for_owner(
+        &self,
+        owner: &str,
+        skills: Vec<IndexedSkill>,
+    ) -> Result<(), CoreError>;
+
     /// Search the catalog, returning up to `limit` skills best matching
     /// `query`.
     ///
@@ -128,6 +143,18 @@ mod tests {
             Ok(())
         }
 
+        async fn reindex_for_owner(
+            &self,
+            owner: &str,
+            skills: Vec<IndexedSkill>,
+        ) -> Result<(), CoreError> {
+            let mut rows = self.rows.lock().expect("lock");
+            // Keep global rows and other users' rows; replace only this owner's.
+            rows.retain(|r| r.owner_user_id.as_deref() != Some(owner));
+            rows.extend(skills);
+            Ok(())
+        }
+
         async fn search(
             &self,
             query: &str,
@@ -189,6 +216,35 @@ mod tests {
         assert!(store.get("old-global", None).await.unwrap().is_none());
         assert!(store.get("new-global", None).await.unwrap().is_some());
         assert!(store.get("mine", Some("user-a")).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn reindex_for_owner_replaces_only_that_owner() {
+        let store = InMemorySkillIndex::default();
+        store
+            .reindex_global(vec![skill("shared", None, "global")])
+            .await
+            .unwrap();
+        store
+            .reindex_for_owner("alice", vec![skill("old", Some("alice"), "a1")])
+            .await
+            .unwrap();
+        store
+            .rows
+            .lock()
+            .unwrap()
+            .push(skill("bob-only", Some("bob"), "b"));
+
+        // Rescan alice: her old skill is replaced; global and bob's are untouched.
+        store
+            .reindex_for_owner("alice", vec![skill("new", Some("alice"), "a2")])
+            .await
+            .unwrap();
+
+        assert!(store.get("old", Some("alice")).await.unwrap().is_none());
+        assert!(store.get("new", Some("alice")).await.unwrap().is_some());
+        assert!(store.get("shared", None).await.unwrap().is_some());
+        assert!(store.get("bob-only", Some("bob")).await.unwrap().is_some());
     }
 
     #[tokio::test]

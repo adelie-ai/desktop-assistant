@@ -320,3 +320,42 @@ async fn backfill_embeds_null_model_rows() {
     })
     .await;
 }
+
+fn owned(name: &str, owner: &str, description: &str) -> IndexedSkill {
+    let mut s = skill(name, description, "h", "prose");
+    s.owner_user_id = Some(owner.to_string());
+    s.locality = Locality::Client;
+    s
+}
+
+#[tokio::test]
+async fn reindex_for_owner_replaces_only_that_owner() {
+    with_fixture("reindex_for_owner", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        store
+            .reindex_global(vec![skill("shared", "global", "h", "x")])
+            .await
+            .unwrap();
+        store
+            .reindex_for_owner("alice", vec![owned("old", "alice", "a1")])
+            .await
+            .unwrap();
+        store
+            .reindex_for_owner("bob", vec![owned("bob-only", "bob", "b1")])
+            .await
+            .unwrap();
+
+        // Rescan alice: her old row is replaced; global and bob's are untouched.
+        store
+            .reindex_for_owner("alice", vec![owned("new", "alice", "a2")])
+            .await
+            .unwrap();
+
+        assert!(store.get("old", Some("alice")).await.unwrap().is_none());
+        assert!(store.get("new", Some("alice")).await.unwrap().is_some());
+        assert!(store.get("shared", None).await.unwrap().is_some());
+        assert!(store.get("bob-only", Some("bob")).await.unwrap().is_some());
+        fx
+    })
+    .await;
+}

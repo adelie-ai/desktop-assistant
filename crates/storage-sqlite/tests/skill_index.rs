@@ -134,3 +134,34 @@ async fn get_is_owner_scoped() {
     assert!(s.get("deploy", None).await.unwrap().is_some());
     assert!(s.get("deploy", Some("nobody")).await.unwrap().is_none());
 }
+
+fn owned(name: &str, owner: &str, description: &str) -> IndexedSkill {
+    let mut s = skill(name, description, "prose");
+    s.owner_user_id = Some(owner.to_string());
+    s.locality = Locality::Client;
+    s
+}
+
+#[tokio::test]
+async fn reindex_for_owner_replaces_only_that_owner() {
+    let s = store().await;
+    s.reindex_global(vec![skill("shared", "global", "x")])
+        .await
+        .unwrap();
+    s.reindex_for_owner("alice", vec![owned("old", "alice", "a1")])
+        .await
+        .unwrap();
+    s.reindex_for_owner("bob", vec![owned("bob-only", "bob", "b1")])
+        .await
+        .unwrap();
+
+    // Rescan alice: her old row is replaced; global and bob's are untouched.
+    s.reindex_for_owner("alice", vec![owned("new", "alice", "a2")])
+        .await
+        .unwrap();
+
+    assert!(s.get("old", Some("alice")).await.unwrap().is_none());
+    assert!(s.get("new", Some("alice")).await.unwrap().is_some());
+    assert!(s.get("shared", None).await.unwrap().is_some());
+    assert!(s.get("bob-only", Some("bob")).await.unwrap().is_some());
+}
