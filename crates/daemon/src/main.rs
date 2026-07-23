@@ -1262,6 +1262,7 @@ async fn main() -> Result<()> {
             .map(|c| c.skills.clone())
             .unwrap_or_default();
         if skills_cfg.enabled {
+            // Global roots -> host-global (owner-less) skills.
             let roots: Vec<_> = skills_cfg
                 .roots
                 .iter()
@@ -1269,13 +1270,47 @@ async fn main() -> Result<()> {
                 .cloned()
                 .collect();
             if roots.is_empty() {
-                tracing::info!("skill library disabled: no configured skill root is present");
+                tracing::info!("skill library: no configured global skill root is present");
             } else {
                 let skills = crate::skill_scanner::scan_global_roots(&roots);
                 let count = skills.len();
                 match store.reindex_global(skills).await {
-                    Ok(()) => tracing::info!(indexed = count, "skill library indexed"),
-                    Err(e) => tracing::warn!("skill index reindex failed: {e}"),
+                    Ok(()) => tracing::info!(indexed = count, "global skills indexed"),
+                    Err(e) => tracing::warn!("global skill reindex failed: {e}"),
+                }
+            }
+
+            // User home roots -> skills owned by the OS user the daemon runs as
+            // (co-located single-user). The owner is resolved via the same
+            // uid->username path as peer-cred auth, so it matches the user_id of
+            // the user's local connections. Absent on a split/remote deployment
+            // (no user home roots configured/present).
+            let user_roots: Vec<_> = skills_cfg
+                .user_roots
+                .iter()
+                .filter(|r| r.is_dir())
+                .cloned()
+                .collect();
+            if !user_roots.is_empty() {
+                let uid = desktop_assistant_peer_cred::current_uid();
+                match desktop_assistant_peer_cred::username_for_uid(uid) {
+                    Ok(Some(owner)) => {
+                        let skills = crate::skill_scanner::scan_user_roots(&user_roots, &owner);
+                        let count = skills.len();
+                        match store.reindex_for_owner(&owner, skills).await {
+                            Ok(()) => {
+                                tracing::info!(owner = %owner, indexed = count, "user skills indexed")
+                            }
+                            Err(e) => tracing::warn!("user skill reindex failed: {e}"),
+                        }
+                    }
+                    Ok(None) => tracing::warn!(
+                        uid,
+                        "skill library: no passwd entry for the daemon's uid; skipping user home skills"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "skill library: username lookup failed ({e}); skipping user home skills"
+                    ),
                 }
             }
         }

@@ -20,15 +20,29 @@ use desktop_assistant_core::domain::{AttachmentDigest, IndexedSkill, Locality};
 
 const SKILL_FILE: &str = "SKILL.md";
 
-/// Scan the configured global roots into the deduplicated set of global skills
-/// (owner-less, `Locality::Daemon`), ready for `reindex_global`. Earlier roots
-/// win on a name collision; malformed skills are skipped with a warning.
+/// Scan the configured **global** roots into the deduplicated set of global
+/// skills (owner-less, `Locality::Daemon`), ready for `reindex_global`. Earlier
+/// roots win on a name collision; malformed skills are skipped with a warning.
 pub fn scan_global_roots(roots: &[PathBuf]) -> Vec<IndexedSkill> {
+    scan_roots(roots, None, Locality::Daemon)
+}
+
+/// Scan the configured **user home** roots into the deduplicated set of skills
+/// owned by `owner` (`Locality::Client`), ready for `reindex_for_owner`. Used on
+/// a co-located single-user daemon so the user's `~/.agents/skills` etc. are
+/// indexed as theirs.
+pub fn scan_user_roots(roots: &[PathBuf], owner: &str) -> Vec<IndexedSkill> {
+    scan_roots(roots, Some(owner), Locality::Client)
+}
+
+/// Shared scan: walk each root, stamping every skill with `owner`/`locality`,
+/// deduplicating by name (earlier roots win).
+fn scan_roots(roots: &[PathBuf], owner: Option<&str>, locality: Locality) -> Vec<IndexedSkill> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for root in roots {
         let lock = load_lock_source_types(root);
-        for skill in scan_root(root, &lock) {
+        for skill in scan_root(root, &lock, owner, locality) {
             if seen.insert(skill.name.clone()) {
                 out.push(skill);
             }
@@ -39,7 +53,12 @@ pub fn scan_global_roots(roots: &[PathBuf]) -> Vec<IndexedSkill> {
 
 /// Scan one root (`<root>/<name>/SKILL.md`). An unreadable root yields nothing
 /// (capability-off; the caller logs when no root resolved at all).
-fn scan_root(root: &Path, lock: &HashMap<String, String>) -> Vec<IndexedSkill> {
+fn scan_root(
+    root: &Path,
+    lock: &HashMap<String, String>,
+    owner: Option<&str>,
+    locality: Locality,
+) -> Vec<IndexedSkill> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -52,7 +71,14 @@ fn scan_root(root: &Path, lock: &HashMap<String, String>) -> Vec<IndexedSkill> {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
             continue;
         };
-        match scan_skill_dir(&dir, &name, lock.get(&name).map(String::as_str), root) {
+        match scan_skill_dir(
+            &dir,
+            &name,
+            lock.get(&name).map(String::as_str),
+            root,
+            owner,
+            locality,
+        ) {
             Ok(skill) => skills.push(skill),
             Err(e) => tracing::warn!(skill = %name, error = %e, "skipping malformed skill"),
         }
@@ -61,12 +87,15 @@ fn scan_root(root: &Path, lock: &HashMap<String, String>) -> Vec<IndexedSkill> {
     skills
 }
 
-/// Parse and digest a single skill directory into an [`IndexedSkill`].
+/// Parse and digest a single skill directory into an [`IndexedSkill`], stamped
+/// with the given `owner` and `locality`.
 fn scan_skill_dir(
     dir: &Path,
     name: &str,
     source_type: Option<&str>,
     root: &Path,
+    owner: Option<&str>,
+    locality: Locality,
 ) -> anyhow::Result<IndexedSkill> {
     validate_skill_name(name).map_err(|e| anyhow::anyhow!("invalid skill name: {e}"))?;
     let md_path = dir.join(SKILL_FILE);
@@ -78,8 +107,8 @@ fn scan_skill_dir(
         description: parsed.frontmatter.description,
         kind: detect_kind(&parsed.body),
         disk_path: md_path.to_string_lossy().into_owned(),
-        owner_user_id: None,
-        locality: Locality::Daemon,
+        owner_user_id: owner.map(str::to_string),
+        locality,
         content_hash: skill_content_hash(raw.as_bytes(), &digests),
         trust_tier: trust_tier_from_source_type(source_type),
         source: Some(root.to_string_lossy().into_owned()),
@@ -281,5 +310,22 @@ mod tests {
 
         let skills = scan_global_roots(&[root]);
         assert_eq!(skills[0].trust_tier, TrustTier::Github);
+    }
+
+    #[test]
+    fn scan_user_roots_stamps_owner_and_client_locality() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_skill(root, "mine", "# mine\n\nprose");
+        write_attachment(root, "mine", "scripts/run.sh", "echo hi");
+
+        let skills = scan_user_roots(&[root.to_path_buf()], "dave");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "mine");
+        assert_eq!(skills[0].owner_user_id.as_deref(), Some("dave"));
+        assert_eq!(skills[0].locality, Locality::Client);
+        // The attachment-covering hash is computed the same way regardless of scope.
+        assert_eq!(skills[0].content_hash.len(), 64);
+        assert_eq!(skills[0].attachments, vec!["scripts/run.sh"]);
     }
 }
