@@ -18,8 +18,12 @@ use crate::ports::llm::{
     current_context_budget, current_tool_allowlist,
 };
 use crate::ports::scratchpad::{
-    MAX_NOTE_BYTES, NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn, ScratchpadListFn,
-    ScratchpadWriteFn,
+    MAX_NOTE_BYTES, NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadDeleteSubtreeFn,
+    ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
+};
+use crate::ports::scratchpad_scope::{
+    SPAWN_SUBAGENT_TOOL, SubagentScope, current_ancestors, current_owner_todo,
+    current_scratchpad_scope, with_pending_child_scope,
 };
 use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
@@ -175,6 +179,16 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
 
 /// Core service implementing conversation management.
 /// Generic over store, LLM, and tool executor backends for testability.
+/// Lifecycle probe for the `complete_step` cascade (#287): given the session
+/// conversation id and an `owner_todo` prefix, returns whether any of the
+/// current user's background tasks under that subtree is still non-terminal.
+/// A boxed async closure so `core` needs no dependency on the task registry.
+pub type DescendantTaskProbe = std::sync::Arc<
+    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     store: S,
     llm: L,
@@ -221,6 +235,18 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// as a compact `[Plan]` system message so it stays in view while raw work
     /// is evicted. `None` disables per-round plan surfacing.
     scratchpad_list: Option<ScratchpadListFn>,
+    /// Optional subtree-delete for the hard-coded `complete_step` cascade
+    /// (#287): when a completed step fanned out subagents, their `owner_todo`
+    /// subtree is deleted from the session pad so a finished branch's notes
+    /// don't linger. `None` disables the cascade (tests / pre-#287 path). Wire
+    /// the daemon's event-emitting delete so reclaimed notes reach clients.
+    scratchpad_delete_subtree: Option<ScratchpadDeleteSubtreeFn>,
+    /// Optional lifecycle probe (#287) answering "is any of this user's
+    /// background tasks under this `owner_todo` subtree (in this session) still
+    /// non-terminal?" The cascade DEFERS while it returns true, so a running
+    /// `wait=false` subagent's pad-borne result is never deleted mid-flight.
+    /// `None` means no probe (cascade unconditionally when the delete is set).
+    descendant_task_probe: Option<DescendantTaskProbe>,
     /// Maximum byte length a single tool result may occupy before it is
     /// truncated at ingestion (issue #174). Defaults to
     /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
@@ -263,6 +289,8 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             scratchpad_goal_read: None,
             scratchpad_write: None,
             scratchpad_list: None,
+            scratchpad_delete_subtree: None,
+            descendant_task_probe: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             turn_locks: std::sync::Mutex::new(HashMap::new()),
@@ -288,6 +316,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             scratchpad_goal_read: None,
             scratchpad_write: None,
             scratchpad_list: None,
+            scratchpad_delete_subtree: None,
+            descendant_task_probe: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             turn_locks: std::sync::Mutex::new(HashMap::new()),
@@ -333,6 +363,22 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// open plan (the conversation's `todo` notes) as a `[Plan]` system message.
     pub fn with_scratchpad_list(mut self, list: ScratchpadListFn) -> Self {
         self.scratchpad_list = Some(list);
+        self
+    }
+
+    /// Wire the subtree-delete used by the `complete_step` cascade (#287). When
+    /// set (alongside `scratchpad_write`), completing a step that fanned out
+    /// subagents deletes their `owner_todo` subtree from the session pad.
+    pub fn with_scratchpad_delete_subtree(mut self, delete: ScratchpadDeleteSubtreeFn) -> Self {
+        self.scratchpad_delete_subtree = Some(delete);
+        self
+    }
+
+    /// Wire the descendant-task lifecycle probe (#287) so the `complete_step`
+    /// cascade DEFERS while a `wait=false` subagent under the step is still
+    /// running (deleting its subtree mid-flight would destroy its result).
+    pub fn with_descendant_task_probe(mut self, probe: DescendantTaskProbe) -> Self {
+        self.descendant_task_probe = Some(probe);
         self
     }
 
@@ -514,6 +560,53 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             "completed step — compacted scope to scratchpad"
         );
 
+        // #287 hard-coded cleanup: a completed step that fanned out subagents
+        // cascade-deletes their owner_todo subtree from the SESSION pad, so a
+        // finished branch's working notes don't linger (extends the raw-result
+        // evict above from hide to delete). DEFER while any descendant subagent
+        // task is still non-terminal -- deleting mid-flight would destroy the
+        // child's pad-borne result (its notes ARE how it reports back).
+        // child_counter>0 means the step minted children; a step with only
+        // single-session child steps matches no rows (those live at the base),
+        // so this is a no-op there.
+        let mut cascade_note: Option<String> = None;
+        if frame.child_counter > 0 {
+            let base = current_owner_todo().unwrap_or_default();
+            let prefix = planning::owner_subtree_prefix(&base, &frame.key);
+            // Never cascade the root namespace.
+            if !prefix.is_empty() {
+                let session = current_scratchpad_scope()
+                    .map(|c| c.as_str().to_string())
+                    .unwrap_or_else(|| conversation_id.as_str().to_string());
+                let children_running = match &self.descendant_task_probe {
+                    Some(probe) => probe(session.clone(), prefix.clone()).await,
+                    None => false,
+                };
+                if children_running {
+                    cascade_note = Some(
+                        "subagents under this step are still running; their notes are \
+                         retained and reclaimed once they finish"
+                            .to_string(),
+                    );
+                } else if let Some(delete) = &self.scratchpad_delete_subtree {
+                    match delete(session, prefix.clone()).await {
+                        Ok(reclaimed) => tracing::info!(
+                            step = %frame.key,
+                            owner_subtree = %prefix,
+                            reclaimed,
+                            "cascade-deleted completed step's subagent subtree"
+                        ),
+                        Err(e) => tracing::warn!(
+                            step = %frame.key,
+                            owner_subtree = %prefix,
+                            error = %e,
+                            "cascade subtree delete failed"
+                        ),
+                    }
+                }
+            }
+        }
+
         serde_json::json!({
             "ok": true,
             "action": "complete_step",
@@ -522,6 +615,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             "evicted_results": evicted,
             "freed_bytes": freed,
             "outcome_note": note_keys.first(),
+            "note": cascade_note,
         })
         .to_string()
     }
@@ -550,6 +644,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .iter()
             .map(|n| planning::RawNote {
                 key: n.key.as_str(),
+                owner_todo: n.owner_todo.as_str(),
                 content: n.content.as_str(),
                 note_type: n.note_type.as_str(),
                 done: n.done,
@@ -585,6 +680,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .iter()
             .map(|n| planning::RawNote {
                 key: n.key.as_str(),
+                owner_todo: n.owner_todo.as_str(),
                 content: n.content.as_str(),
                 note_type: n.note_type.as_str(),
                 done: n.done,
@@ -1437,6 +1533,43 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     continue;
                 }
 
+                // Subagent spawn (#287): mint the child's session-pad scope HERE,
+                // in the loop that owns `step_stack`, because `spawn_subagent`
+                // runs through the `ToolExecutor` with no `StepStack` handle. The
+                // child's namespace is the current agent's base composed with a
+                // fresh fanned-out step key, so (a) it is globally unique and (b)
+                // completing the enclosing step can later cascade-clean it. We do
+                // NOT `continue`: the scope is installed around the tool's own
+                // execution below, and `spawn_subagent` runs normally. Gated on
+                // the same condition that advertises the planning tools.
+                let mut pending_child_scope: Option<SubagentScope> = None;
+                if self.scratchpad_write.is_some() && tool_call.name == SPAWN_SUBAGENT_TOOL {
+                    let base = current_owner_todo().unwrap_or_default();
+                    let (fanned_key, _seq) = step_stack
+                        .fan_out(1)
+                        .into_iter()
+                        .next()
+                        .expect("fan_out(1) always yields exactly one key");
+                    let child_owner = planning::owner_subtree_prefix(&base, &fanned_key);
+                    // Ancestors the child may read pre-marker: the running agent's
+                    // ancestor chain plus its own base (root "" for a top-level
+                    // parent). Concurrent siblings/cousins are excluded.
+                    let mut ancestors = current_ancestors().unwrap_or_else(|| vec![String::new()]);
+                    if !ancestors.iter().any(|a| a == &base) {
+                        ancestors.push(base.clone());
+                    }
+                    // The child shares this session's pad. For a top-level parent
+                    // (no scope installed) that is the current conversation.
+                    let session =
+                        current_scratchpad_scope().unwrap_or_else(|| conversation_id.clone());
+                    pending_child_scope = Some(SubagentScope {
+                        session_conversation_id: session,
+                        owner_todo: child_owner,
+                        visible_before: uuid::Uuid::now_v7().to_string(),
+                        ancestors,
+                    });
+                }
+
                 // Tool allowlist enforcement (issues #291 / #133). A subagent
                 // (or any caller) may install a `TOOL_ALLOWLIST` task-local
                 // restricting which tools it can invoke. The allowlist is also
@@ -1536,7 +1669,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     // scratchpad) can resolve which pad they operate on without
                     // the `ToolExecutor` port growing a conversation parameter.
                     let exec = self.tools.execute_tool(&tool_call.name, arguments);
-                    let exec = with_conversation_id(conversation_id.clone(), exec);
+                    let scoped = with_conversation_id(conversation_id.clone(), exec);
+                    // For `spawn_subagent`, install the child scope minted above so
+                    // the spawn-tool body adopts it for the child (#287); every other
+                    // tool runs with no pending child scope. Fold both arms into one
+                    // future so the keepalive loop below drives a single type.
+                    let exec = async move {
+                        match pending_child_scope {
+                            Some(scope) => with_pending_child_scope(scope, scoped).await,
+                            None => scoped.await,
+                        }
+                    };
                     // Keepalive during long server-side tool execution (#584): a
                     // tool — or a subagent, which runs as a tool — can execute
                     // silently for longer than the client's 90s stall watchdog,
@@ -2966,6 +3109,118 @@ mod tests {
         assert!(todo.done, "the step todo must be checked off");
         let outcome = notes.get("outcome:1").expect("outcome note must exist");
         assert_eq!(outcome.content, "Cary NC 7-day: highs low-80s, rain Tue");
+    }
+
+    // #287 slice 6: the hard-coded complete_step cascade + its lifecycle gate.
+    /// Shared record of `(conversation, owner_todo)` args the fake cascade
+    /// delete was called with.
+    type SubtreeCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+    fn capturing_delete_subtree() -> (SubtreeCalls, ScratchpadDeleteSubtreeFn) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_c = std::sync::Arc::clone(&calls);
+        let del: ScratchpadDeleteSubtreeFn = std::sync::Arc::new(move |conv, owner| {
+            calls_c.lock().unwrap().push((conv, owner));
+            Box::pin(async { Ok(0u64) })
+        });
+        (calls, del)
+    }
+
+    fn nested_step_then_complete_both() -> Vec<LlmResponse> {
+        // outer step 1, inner step 1.1 (makes outer.child_counter>0), complete
+        // inner (a leaf), complete outer (has a child), then finish.
+        vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("b1", "begin_step", r#"{"goal":"outer"}"#)],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("b2", "begin_step", r#"{"goal":"inner"}"#)],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c2",
+                    "complete_step",
+                    r#"{"outcome":"inner done"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "complete_step",
+                    r#"{"outcome":"outer done"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn complete_step_cascades_parent_subtree_but_not_leaf() {
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (calls, delete) = capturing_delete_subtree();
+        // No descendant task is running, so the cascade proceeds.
+        let probe: DescendantTaskProbe = std::sync::Arc::new(|_s, _p| Box::pin(async { false }));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(nested_step_then_complete_both()),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_delete_subtree(delete)
+        .with_descendant_task_probe(probe);
+
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // Exactly one cascade: completing the outer step "1" (child_counter>0)
+        // deletes owner_subtree_prefix("", "1") = "1" on the session conv. The
+        // inner leaf step "1.1" (no children) never cascades.
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got, vec![(conv.id.0.clone(), "1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn complete_step_defers_cascade_while_a_descendant_task_runs() {
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (calls, delete) = capturing_delete_subtree();
+        // A descendant subagent task is still non-terminal -> DEFER (never delete
+        // its subtree mid-flight; its notes are how it reports its result).
+        let probe: DescendantTaskProbe = std::sync::Arc::new(|_s, _p| Box::pin(async { true }));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(nested_step_then_complete_both()),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_delete_subtree(delete)
+        .with_descendant_task_probe(probe);
+
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "cascade must be deferred (no delete) while a descendant task is non-terminal"
+        );
     }
 
     #[tokio::test]

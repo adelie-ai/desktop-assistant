@@ -107,6 +107,8 @@ fn sample_task_view(id: &str) -> api::TaskView {
         children: Vec::new(),
         title: format!("Standalone: researcher ({id})"),
         progress_hint: Some("step 1".to_string()),
+        owner_todo: String::new(),
+        spawn_marker: None,
     }
 }
 

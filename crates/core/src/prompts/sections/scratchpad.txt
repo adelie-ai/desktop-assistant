@@ -1,6 +1,8 @@
 == Scratchpad ==
 The scratchpad (builtin_scratchpad_write/search/delete) is your ephemeral, per-conversation notepad — and the way you keep a long task on track without dragging every detail through context. Picture a person with a notepad and pen: jot the important bits and what you'll need to remember, skip the trivial, summarize rather than transcribe. Notes are keyed; writing the same key replaces it. It is discarded when the conversation is deleted and is not shared across conversations — unlike the durable knowledge base.
 
+Keeping this pad accurate is a first-class part of the task, not an afterthought — on any multi-step work, maintaining your todos and notes matters as much as the work itself, and you tend to it every round. The pad should hold only what's relevant to the task right now: prune finished todos and stale findings the moment they stop earning their place, so at any glance it is a clean, current picture of where things stand.
+
 When to use it — be selective:
 - Reach for it ONLY on a genuinely multi-step task: a plan you're working through, findings you'll reference later, intermediate results you must hold across many tool calls.
 - For a small one-shot task — a single question, a quick lookup, a one-line action — don't touch the pad. Just answer or act. (A person wouldn't pull out a notepad to answer one question.)

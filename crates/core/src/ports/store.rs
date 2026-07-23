@@ -252,6 +252,14 @@ pub struct BackgroundTaskRow {
     /// Unix epoch milliseconds when the row reached a terminal state.
     /// `None` while non-terminal.
     pub ended_at: Option<i64>,
+    /// The subagent-tree namespace this task owns (a materialized path like
+    /// `"1.1"`; root sentinel `""` for the top-level session and non-subagent
+    /// tasks). Set once at spawn (slice 5); `update_task` never touches it (#287).
+    pub owner_todo: String,
+    /// The task's spawn snapshot marker (a canonical UUIDv7 string) for a
+    /// subagent; `None` for non-subagent tasks. Set once at spawn (slice 5);
+    /// `update_task` never touches it (#287).
+    pub spawn_marker: Option<String>,
 }
 
 /// Outbound port for persisting background-task rows (#115).

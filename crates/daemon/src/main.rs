@@ -1364,6 +1364,13 @@ async fn main() -> Result<()> {
     let mut scratchpad_list_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadListFn,
     > = None;
+    // #287: the complete_step cascade's subtree-delete + the descendant-task
+    // lifecycle probe. Populated alongside the scratchpad wiring below.
+    let mut scratchpad_delete_subtree_fn: Option<
+        desktop_assistant_core::ports::scratchpad::ScratchpadDeleteSubtreeFn,
+    > = None;
+    let mut descendant_task_probe: Option<desktop_assistant_core::service::DescendantTaskProbe> =
+        None;
 
     // Per-conversation scratchpad command closures (#190) for the API handler,
     // populated alongside the builtin-tool wiring below. The same emit-wrapped
@@ -1483,6 +1490,34 @@ async fn main() -> Result<()> {
             Arc::clone(&delete_many_fn),
             Arc::clone(&clear_fn),
         );
+
+        // #287: subtree-delete (for the complete_step cascade) + the
+        // descendant-task lifecycle probe (so the cascade defers while a
+        // wait=false subagent under the step is still running). Both read the
+        // per-turn current_user_id(), like the mutating closures above.
+        let sp_ds = Arc::clone(&sp_store);
+        let reg_ds = Arc::clone(&background_task_registry);
+        let delete_subtree_fn: desktop_assistant_core::ports::scratchpad::ScratchpadDeleteSubtreeFn =
+            Arc::new(move |conv: String, owner: String| {
+                let store = Arc::clone(&sp_ds);
+                let reg = Arc::clone(&reg_ds);
+                Box::pin(async move {
+                    let deleted = store.delete_owner_subtree(&conv, &owner).await?;
+                    reg.notify_scratchpad_changed(&current_user_id(), conv);
+                    Ok(deleted)
+                })
+            });
+        scratchpad_delete_subtree_fn = Some(delete_subtree_fn);
+
+        let reg_probe = Arc::clone(&background_task_registry);
+        let probe: desktop_assistant_core::service::DescendantTaskProbe =
+            Arc::new(move |session: String, prefix: String| {
+                let reg = Arc::clone(&reg_probe);
+                Box::pin(async move {
+                    reg.any_non_terminal_under_owner_prefix(&current_user_id(), &session, &prefix)
+                })
+            });
+        descendant_task_probe = Some(probe);
 
         // Capture the same event-emitting write + list closures for the
         // conversation handler's planning/compaction tools (#240) before they
@@ -2030,10 +2065,20 @@ async fn main() -> Result<()> {
         profiling.log_path.as_deref(),
         profiling.full_content,
     ));
+    // #287 slice 7: late-set slot letting the subagent tool executor reach the
+    // conversation service. Set (below) to a Weak downgrade of the routing
+    // handler the instant it exists; a Weak (not Arc) keeps the executor ->
+    // conversation -> handler -> executor cycle non-owning so nothing leaks.
+    let conversation_slot: desktop_assistant_application::subagent_executor::ConversationSlot =
+        Arc::new(std::sync::OnceLock::new());
     let mut handler = ConversationHandler::with_tools(
         conversation_store.clone(),
         llm,
-        tool_executor,
+        desktop_assistant_application::subagent_executor::SubagentAwareToolExecutor::new(
+            tool_executor,
+            Arc::clone(&background_task_registry),
+            Arc::clone(&conversation_slot),
+        ),
         Box::new(|| uuid::Uuid::now_v7().to_string()),
     )
     // Server-side tool localities (#243) are labelled with the daemon's host
@@ -2178,6 +2223,13 @@ async fn main() -> Result<()> {
     if let Some(list_fn) = scratchpad_list_fn {
         handler = handler.with_scratchpad_list(list_fn);
     }
+    // #287: the complete_step cascade (subtree-delete) + its lifecycle gate.
+    if let Some(delete_subtree_fn) = scratchpad_delete_subtree_fn {
+        handler = handler.with_scratchpad_delete_subtree(delete_subtree_fn);
+    }
+    if let Some(probe) = descendant_task_probe {
+        handler = handler.with_descendant_task_probe(probe);
+    }
 
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters
     // can call `send_prompt_with_override` and have the override/stored-
@@ -2199,6 +2251,14 @@ async fn main() -> Result<()> {
         routing_conv = routing_conv.with_window_store(window_store);
     }
     let conversation_service = Arc::new(routing_conv);
+    // #287 slice 7: publish the conversation service to the subagent executor's
+    // slot as a Weak, as the first statement after it exists (no `?` between the
+    // create and the set). The executor upgrades it per spawn_subagent call.
+    {
+        let conv_dyn: Arc<dyn desktop_assistant_core::ports::inbound::ConversationService> =
+            conversation_service.clone();
+        let _ = conversation_slot.set(Arc::downgrade(&conv_dyn));
+    }
 
     let connections_service = Arc::new(api_surface::DaemonConnectionsService::new(Arc::clone(
         &registry_handle,
