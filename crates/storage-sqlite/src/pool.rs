@@ -84,6 +84,16 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(include_str!("../migrations/002_skill_index.sql"))
         .execute(pool)
         .await?;
+    // #639: presence columns for the cumulative catalog. A fresh DB gets them
+    // from 002 above; these ALTERs upgrade a dev DB created before they landed.
+    ensure_column(
+        pool,
+        "skill_index",
+        "present_on_disk",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    .await?;
+    ensure_column(pool, "skill_index", "last_seen_at", "TEXT").await?;
     Ok(())
 }
 

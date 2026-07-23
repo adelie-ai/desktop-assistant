@@ -1,16 +1,47 @@
-//! Contract tests for [`SqliteSkillIndexStore`] (#594) — the FTS5-backed SQLite
-//! mirror of the Postgres skill index. Verifies reindex upsert/prune, full-text
-//! search (ignoring the query embedding), owner-scoped `get`, and `list`.
+//! Contract tests for [`SqliteSkillIndexStore`] (#594, #639).
+//!
+//! Catalog semantics come from the shared `SkillIndexStore` contract in
+//! `core::ports::skill_index::conformance`, run here against a fresh in-memory
+//! database -- one test per case, so a failure names the broken guarantee and
+//! not just this adapter. The tests below the contract block cover what is
+//! genuinely local to SQLite: FTS5 search behavior (the Postgres adapter ranks
+//! hybrid vector + full-text instead) and the text-JSON column encoding.
 #![cfg(feature = "sqlite")]
 
-use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
-use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use desktop_assistant_core::ports::skill_index::{SkillIndexStore, conformance};
+use desktop_assistant_core::skill_catalog::reconcile_scan;
 use desktop_assistant_storage_sqlite::{SqliteSkillIndexStore, create_memory_pool};
 
 async fn store() -> SqliteSkillIndexStore {
     let pool = create_memory_pool().await.expect("pool");
     SqliteSkillIndexStore::new(pool)
 }
+
+/// One test per contract case, each against a fresh database.
+macro_rules! conformance_tests {
+    ($($case:ident),+ $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $case() {
+                conformance::$case(&store().await).await;
+            }
+        )+
+    };
+}
+
+conformance_tests!(
+    removed_skill_survives_reconcile,
+    empty_scan_preserves_the_catalog,
+    unseen_skill_keeps_its_last_seen_at,
+    rescan_restores_presence_when_skill_returns,
+    reconcile_leaves_other_scopes_untouched,
+    absent_skills_are_still_searchable,
+    reconcile_is_idempotent,
+    upsert_ignores_caller_supplied_presence,
+    get_is_scope_addressed,
+    set_presence_tolerates_unknown_and_empty,
+);
 
 fn skill(name: &str, description: &str, body: &str) -> IndexedSkill {
     IndexedSkill {
@@ -36,15 +67,30 @@ fn skill(name: &str, description: &str, body: &str) -> IndexedSkill {
     }
 }
 
-#[tokio::test]
-async fn reindex_get_and_list_roundtrip() {
-    let s = store().await;
-    s.reindex_global(vec![
-        skill("invoice-run", "generate monthly invoices", "prose"),
-        skill("deploy-blog", "publish the blog", "## Steps\n1. go"),
-    ])
+async fn seed(store: &SqliteSkillIndexStore, skills: Vec<IndexedSkill>) {
+    reconcile_scan(
+        store,
+        &SkillScope::Global,
+        skills,
+        conformance::first_scan_at(),
+    )
     .await
-    .expect("reindex");
+    .expect("seed scan");
+}
+
+#[tokio::test]
+async fn json_columns_and_kind_round_trip() {
+    // tags/attachments/metadata are TEXT here (JSONB on Postgres), so the
+    // encode/decode path is this adapter's own and worth pinning.
+    let s = store().await;
+    seed(
+        &s,
+        vec![
+            skill("invoice-run", "generate monthly invoices", "prose"),
+            skill("deploy-blog", "publish the blog", "## Steps\n1. go"),
+        ],
+    )
+    .await;
 
     let got = s
         .get("invoice-run", None)
@@ -64,74 +110,16 @@ async fn reindex_get_and_list_roundtrip() {
 }
 
 #[tokio::test]
-async fn skill_removed_from_disk_survives_reindex() {
-    // The catalog is cumulative: the database is the authoritative copy, not a
-    // shadow of the last scan. A skill vanishing from disk keeps its body (the
-    // procedure is still good) and is marked not-present (its attachments and
-    // disk_path no longer resolve).
-    let s = store().await;
-    s.reindex_global(vec![skill("a", "first", "x"), skill("b", "second", "y")])
-        .await
-        .unwrap();
-    s.reindex_global(vec![skill("a", "first", "x")])
-        .await
-        .unwrap();
-
-    let survivor = s
-        .get("b", None)
-        .await
-        .expect("get b")
-        .expect("a skill absent from disk is retained, not deleted");
-    assert_eq!(survivor.body, "y", "its body is still readable from the DB");
-    assert!(
-        !survivor.present_on_disk,
-        "but it is flagged as no longer present on disk"
-    );
-    assert!(
-        s.get("a", None)
-            .await
-            .unwrap()
-            .expect("a is still indexed")
-            .present_on_disk,
-        "the skill the scan did see stays present"
-    );
-}
-
-#[tokio::test]
-async fn empty_scan_preserves_the_catalog() {
-    // The unhappy path that motivated this: a root that is momentarily
-    // unreadable must never be able to empty the catalog.
-    let s = store().await;
-    s.reindex_global(vec![skill("a", "x", "y")]).await.unwrap();
-    s.reindex_global(vec![]).await.unwrap();
-
-    let rows = s.list(None).await.unwrap();
-    assert_eq!(rows.len(), 1, "an empty scan deletes nothing");
-    assert!(!rows[0].present_on_disk, "everything is marked absent");
-}
-
-#[tokio::test]
-async fn rescan_restores_presence_when_skill_returns() {
-    let s = store().await;
-    s.reindex_global(vec![skill("a", "x", "y")]).await.unwrap();
-    s.reindex_global(vec![]).await.unwrap();
-    s.reindex_global(vec![skill("a", "x", "y")]).await.unwrap();
-
-    assert!(
-        s.get("a", None).await.unwrap().unwrap().present_on_disk,
-        "a returning skill is present again"
-    );
-}
-
-#[tokio::test]
 async fn fts_search_finds_by_keyword_ignoring_embedding() {
     let s = store().await;
-    s.reindex_global(vec![
-        skill("invoice-run", "generate monthly invoices", "billing prose"),
-        skill("deploy-blog", "publish the blog", "static site"),
-    ])
-    .await
-    .unwrap();
+    seed(
+        &s,
+        vec![
+            skill("invoice-run", "generate monthly invoices", "billing prose"),
+            skill("deploy-blog", "publish the blog", "static site"),
+        ],
+    )
+    .await;
 
     // A non-empty embedding is ignored on SQLite; FTS matches by keyword, and
     // porter stemming means "invoice" matches "invoices".
@@ -151,9 +139,7 @@ async fn fts_search_finds_by_keyword_ignoring_embedding() {
 #[tokio::test]
 async fn search_returns_empty_for_no_match_or_blank_query() {
     let s = store().await;
-    s.reindex_global(vec![skill("a", "alpha", "body")])
-        .await
-        .unwrap();
+    seed(&s, vec![skill("a", "alpha", "body")]).await;
     assert!(
         s.search("zzzznotaword", vec![], 10)
             .await
@@ -166,62 +152,24 @@ async fn search_returns_empty_for_no_match_or_blank_query() {
 }
 
 #[tokio::test]
-async fn get_is_owner_scoped() {
+async fn upsert_keeps_the_fts_index_in_sync() {
+    // The upsert path updates in place, so FTS sync rides on the AFTER UPDATE
+    // trigger rather than insert/delete. A stale index would keep answering for
+    // the old description.
     let s = store().await;
-    s.reindex_global(vec![skill("deploy", "global", "x")])
-        .await
-        .unwrap();
-    // The global skill is addressed by owner = None; a user-scoped get misses.
-    assert!(s.get("deploy", None).await.unwrap().is_some());
-    assert!(s.get("deploy", Some("nobody")).await.unwrap().is_none());
-}
+    seed(&s, vec![skill("runbook", "old description", "body")]).await;
+    seed(&s, vec![skill("runbook", "renewed description", "body")]).await;
 
-fn owned(name: &str, owner: &str, description: &str) -> IndexedSkill {
-    let mut s = skill(name, description, "prose");
-    s.owner_user_id = Some(owner.to_string());
-    s.locality = Locality::Client;
-    s
-}
-
-#[tokio::test]
-async fn reindex_for_owner_leaves_other_scopes_untouched() {
-    let s = store().await;
-    s.reindex_global(vec![skill("shared", "global", "x")])
-        .await
-        .unwrap();
-    s.reindex_for_owner("alice", vec![owned("old", "alice", "a1")])
-        .await
-        .unwrap();
-    s.reindex_for_owner("bob", vec![owned("bob-only", "bob", "b1")])
-        .await
-        .unwrap();
-
-    // Rescan alice with a different skill: hers accumulate, and no other scope
-    // is touched -- including its presence flag.
-    s.reindex_for_owner("alice", vec![owned("new", "alice", "a2")])
-        .await
-        .unwrap();
-
-    let old = s
-        .get("old", Some("alice"))
-        .await
-        .unwrap()
-        .expect("alice's earlier skill is retained");
-    assert!(!old.present_on_disk, "but flagged absent from her scan");
-    assert!(s.get("new", Some("alice")).await.unwrap().is_some());
-
-    let global = s.get("shared", None).await.unwrap().expect("global intact");
     assert!(
-        global.present_on_disk,
-        "an owner scan must not mark global skills absent"
+        s.search("renewed", vec![], 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.name == "runbook"),
+        "the updated description is searchable"
     );
-    let bob = s
-        .get("bob-only", Some("bob"))
-        .await
-        .unwrap()
-        .expect("bob intact");
     assert!(
-        bob.present_on_disk,
-        "nor another owner's -- presence is per-scope"
+        s.search("old", vec![], 10).await.unwrap().is_empty(),
+        "and the superseded one is gone from the index"
     );
 }

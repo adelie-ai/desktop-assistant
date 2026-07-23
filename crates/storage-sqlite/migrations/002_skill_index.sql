@@ -29,7 +29,12 @@ CREATE TABLE IF NOT EXISTS skill_index (
     attachments   TEXT NOT NULL DEFAULT '[]',
     body          TEXT NOT NULL DEFAULT '',
     metadata      TEXT NOT NULL DEFAULT '{}',
-    indexed_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    indexed_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Cumulative catalog (#639): a skill a scan no longer sees is marked absent
+    -- rather than deleted. Defaults are "present" because a row that predates
+    -- presence tracking was on disk when it was indexed.
+    present_on_disk INTEGER NOT NULL DEFAULT 1,
+    last_seen_at    TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_index_name_owner

@@ -1,7 +1,12 @@
 //! Integration coverage for `PgSkillIndexStore` and `backfill_skill_embeddings`
-//! (#573). Verifies reindex upsert/prune, embedding preservation across an
-//! unchanged rescan, owner-scoped `get`, full-text search, and that the backfill
-//! embeds NULL-model rows.
+//! (#573, #639).
+//!
+//! Catalog semantics come from the shared `SkillIndexStore` contract in
+//! `core::ports::skill_index::conformance`, run here against a real Postgres --
+//! one test per case, so a failure names the broken guarantee and not just this
+//! adapter. The tests below the contract block cover what is genuinely local to
+//! Postgres: embedding preservation across an unchanged-hash rescan (SQLite has
+//! no vector column), hybrid/full-text search, and the embedding backfill.
 //!
 //! When `TEST_DATABASE_URL` is unset every test pass-skips (loudly, via
 //! `support`).
@@ -10,8 +15,9 @@ mod support;
 
 use std::sync::Arc;
 
-use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
-use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use desktop_assistant_core::ports::skill_index::{SkillIndexStore, conformance};
+use desktop_assistant_core::skill_catalog::reconcile_scan;
 use desktop_assistant_storage::embedding_backfill::{BackfillEmbedFn, backfill_skill_embeddings};
 use desktop_assistant_storage::{PgSkillIndexStore, run_migrations};
 use sqlx::PgPool;
@@ -128,138 +134,54 @@ fn fake_embed_fn() -> BackfillEmbedFn {
     })
 }
 
-#[tokio::test]
-async fn reindex_inserts_and_get_list_return_global_skills() {
-    with_fixture("reindex_inserts", |fx| async move {
-        let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![
-                skill("invoice-run", "generate monthly invoices", "h1", "prose"),
-                skill("deploy-blog", "publish the blog", "h2", "## Steps\n1. go"),
-            ])
-            .await
-            .expect("reindex");
-
-        let got = store
-            .get("invoice-run", None)
-            .await
-            .expect("get")
-            .expect("present");
-        assert_eq!(got.description, "generate monthly invoices");
-        assert_eq!(got.tags, vec!["ops"]);
-        assert_eq!(got.source.as_deref(), Some("system"));
-
-        let workflow = store
-            .get("deploy-blog", None)
-            .await
-            .expect("get")
-            .expect("present");
-        assert_eq!(workflow.kind, SkillKind::Workflow);
-
-        let all = store.list(None).await.expect("list");
-        assert_eq!(all.len(), 2);
-        fx
-    })
-    .await;
+/// Seed a global scan through the reconcile pass, at the contract's fixed
+/// instant, so adapter-specific tests exercise the same write path production
+/// uses.
+async fn seed(store: &PgSkillIndexStore, skills: Vec<IndexedSkill>) {
+    reconcile_scan(
+        store,
+        &SkillScope::Global,
+        skills,
+        conformance::first_scan_at(),
+    )
+    .await
+    .expect("seed scan");
 }
 
-#[tokio::test]
-async fn skill_removed_from_disk_survives_reindex() {
-    // The catalog is cumulative: the database is the authoritative copy, not a
-    // shadow of the last scan. A skill vanishing from disk keeps its body (the
-    // procedure is still good) and is marked not-present (its attachments and
-    // disk_path no longer resolve).
-    with_fixture("removed_skill_survives", |fx| async move {
-        let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![
-                skill("a", "first", "h", "x"),
-                skill("b", "second", "h", "y"),
-            ])
-            .await
-            .expect("reindex 1");
-
-        // Second scan no longer contains `b`.
-        store
-            .reindex_global(vec![skill("a", "first", "h", "x")])
-            .await
-            .expect("reindex 2");
-
-        let survivor = store
-            .get("b", None)
-            .await
-            .expect("get b")
-            .expect("a skill absent from disk is retained, not deleted");
-        assert_eq!(survivor.body, "y", "its body is still readable from the DB");
-        assert!(
-            !survivor.present_on_disk,
-            "but it is flagged as no longer present on disk"
-        );
-        assert!(
-            store
-                .get("a", None)
-                .await
-                .unwrap()
-                .expect("a is still indexed")
-                .present_on_disk,
-            "the skill the scan did see stays present"
-        );
-        fx
-    })
-    .await;
+/// One test per contract case, each against its own throwaway schema.
+macro_rules! conformance_tests {
+    ($($case:ident),+ $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $case() {
+                with_fixture(stringify!($case), |fx| async move {
+                    conformance::$case(&PgSkillIndexStore::new(fx.pool.clone())).await;
+                    fx
+                })
+                .await;
+            }
+        )+
+    };
 }
 
-#[tokio::test]
-async fn empty_scan_preserves_the_catalog() {
-    // The unhappy path that motivated this: a root that is momentarily
-    // unreadable must never be able to empty the catalog.
-    with_fixture("empty_scan_preserves", |fx| async move {
-        let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![skill("a", "x", "h", "y")])
-            .await
-            .unwrap();
-        store.reindex_global(vec![]).await.expect("empty reindex");
-
-        let rows = store.list(None).await.unwrap();
-        assert_eq!(rows.len(), 1, "an empty scan deletes nothing");
-        assert!(!rows[0].present_on_disk, "everything is marked absent");
-        fx
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn rescan_restores_presence_when_skill_returns() {
-    with_fixture("rescan_restores_presence", |fx| async move {
-        let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![skill("a", "x", "h", "y")])
-            .await
-            .unwrap();
-        store.reindex_global(vec![]).await.unwrap();
-        store
-            .reindex_global(vec![skill("a", "x", "h", "y")])
-            .await
-            .unwrap();
-
-        assert!(
-            store.get("a", None).await.unwrap().unwrap().present_on_disk,
-            "a returning skill is present again"
-        );
-        fx
-    })
-    .await;
-}
+conformance_tests!(
+    removed_skill_survives_reconcile,
+    empty_scan_preserves_the_catalog,
+    unseen_skill_keeps_its_last_seen_at,
+    rescan_restores_presence_when_skill_returns,
+    reconcile_leaves_other_scopes_untouched,
+    absent_skills_are_still_searchable,
+    reconcile_is_idempotent,
+    upsert_ignores_caller_supplied_presence,
+    get_is_scope_addressed,
+    set_presence_tolerates_unknown_and_empty,
+);
 
 #[tokio::test]
 async fn reindex_preserves_embedding_when_hash_unchanged_and_nulls_it_on_change() {
     with_fixture("reindex_preserves_embedding", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![skill("a", "desc", "hash-1", "body")])
-            .await
-            .unwrap();
+        seed(&store, vec![skill("a", "desc", "hash-1", "body")]).await;
 
         // Simulate the backfill having embedded the row.
         sqlx::query(
@@ -271,10 +193,7 @@ async fn reindex_preserves_embedding_when_hash_unchanged_and_nulls_it_on_change(
         .unwrap();
 
         // Rescan with the SAME hash: embedding is preserved.
-        store
-            .reindex_global(vec![skill("a", "desc updated", "hash-1", "body")])
-            .await
-            .unwrap();
+        seed(&store, vec![skill("a", "desc updated", "hash-1", "body")]).await;
         let model: Option<String> =
             sqlx::query_scalar("SELECT embedding_model FROM skill_index WHERE name = 'a'")
                 .fetch_one(&fx.pool)
@@ -287,10 +206,7 @@ async fn reindex_preserves_embedding_when_hash_unchanged_and_nulls_it_on_change(
         );
 
         // Rescan with a CHANGED hash: embedding is nulled for re-embedding.
-        store
-            .reindex_global(vec![skill("a", "desc", "hash-2", "body")])
-            .await
-            .unwrap();
+        seed(&store, vec![skill("a", "desc", "hash-2", "body")]).await;
         let model: Option<String> =
             sqlx::query_scalar("SELECT embedding_model FROM skill_index WHERE name = 'a'")
                 .fetch_one(&fx.pool)
@@ -306,8 +222,9 @@ async fn reindex_preserves_embedding_when_hash_unchanged_and_nulls_it_on_change(
 async fn fts_search_finds_by_keyword_and_get_is_owner_scoped() {
     with_fixture("fts_search", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![
+        seed(
+            &store,
+            vec![
                 skill(
                     "invoice-run",
                     "generate monthly invoices",
@@ -315,9 +232,9 @@ async fn fts_search_finds_by_keyword_and_get_is_owner_scoped() {
                     "billing prose",
                 ),
                 skill("deploy-blog", "publish the blog", "h2", "static site"),
-            ])
-            .await
-            .unwrap();
+            ],
+        )
+        .await;
 
         // Empty embedding -> FTS-only path.
         let hits = store.search("invoice", vec![], 10).await.expect("search");
@@ -341,13 +258,14 @@ async fn fts_search_finds_by_keyword_and_get_is_owner_scoped() {
 async fn backfill_embeds_null_model_rows() {
     with_fixture("backfill", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![
+        seed(
+            &store,
+            vec![
                 skill("a", "alpha skill", "h1", "body a"),
                 skill("b", "beta skill", "h2", "body b"),
-            ])
-            .await
-            .unwrap();
+            ],
+        )
+        .await;
 
         let updated = backfill_skill_embeddings(&fx.pool, &fake_embed_fn(), "test-model")
             .await
@@ -367,68 +285,6 @@ async fn backfill_embeds_null_model_rows() {
             .await
             .unwrap();
         assert_eq!(again, 0);
-        fx
-    })
-    .await;
-}
-
-fn owned(name: &str, owner: &str, description: &str) -> IndexedSkill {
-    let mut s = skill(name, description, "h", "prose");
-    s.owner_user_id = Some(owner.to_string());
-    s.locality = Locality::Client;
-    s
-}
-
-#[tokio::test]
-async fn reindex_for_owner_leaves_other_scopes_untouched() {
-    with_fixture("reindex_for_owner", |fx| async move {
-        let store = PgSkillIndexStore::new(fx.pool.clone());
-        store
-            .reindex_global(vec![skill("shared", "global", "h", "x")])
-            .await
-            .unwrap();
-        store
-            .reindex_for_owner("alice", vec![owned("old", "alice", "a1")])
-            .await
-            .unwrap();
-        store
-            .reindex_for_owner("bob", vec![owned("bob-only", "bob", "b1")])
-            .await
-            .unwrap();
-
-        // Rescan alice with a different skill: hers accumulate, and no other
-        // scope is touched -- including its presence flag.
-        store
-            .reindex_for_owner("alice", vec![owned("new", "alice", "a2")])
-            .await
-            .unwrap();
-
-        let old = store
-            .get("old", Some("alice"))
-            .await
-            .unwrap()
-            .expect("alice's earlier skill is retained");
-        assert!(!old.present_on_disk, "but flagged absent from her scan");
-        assert!(store.get("new", Some("alice")).await.unwrap().is_some());
-
-        let global = store
-            .get("shared", None)
-            .await
-            .unwrap()
-            .expect("global intact");
-        assert!(
-            global.present_on_disk,
-            "an owner scan must not mark global skills absent"
-        );
-        let bob = store
-            .get("bob-only", Some("bob"))
-            .await
-            .unwrap()
-            .expect("bob intact");
-        assert!(
-            bob.present_on_disk,
-            "nor another owner's -- presence is per-scope"
-        );
         fx
     })
     .await;

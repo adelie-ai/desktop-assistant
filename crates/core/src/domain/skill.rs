@@ -313,6 +313,41 @@ fn update_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+/// The catalog partition an operation addresses: the host-global skills, or one
+/// user's own.
+///
+/// Why a type rather than a bare `Option<&str>` owner: every catalog write is
+/// scoped, and `None` reads ambiguously as either "the global scope" or "no
+/// filter" -- a dangerous ambiguity for an operation that marks rows absent.
+/// One value names the partition for presence updates, scope listing, and the
+/// reconcile pass, which is also what keeps those from re-growing into a pair
+/// of near-identical `*_global` / `*_for_owner` verbs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillScope {
+    /// Host-global, owner-less skills scanned from system roots.
+    Global,
+    /// Skills owned by a single user.
+    Owner(String),
+}
+
+impl SkillScope {
+    /// The owner id this scope addresses; `None` for [`SkillScope::Global`].
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            SkillScope::Global => None,
+            SkillScope::Owner(owner) => Some(owner.as_str()),
+        }
+    }
+
+    /// The scope a skill belongs to, derived from its `owner_user_id`.
+    pub fn of(skill: &IndexedSkill) -> Self {
+        match &skill.owner_user_id {
+            None => SkillScope::Global,
+            Some(owner) => SkillScope::Owner(owner.clone()),
+        }
+    }
+}
+
 /// The indexed representation of a skill: the currency of the `SkillIndexStore`
 /// port and what search/get return. Storage-only concerns (embeddings) are not
 /// part of this domain type.

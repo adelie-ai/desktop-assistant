@@ -4,18 +4,21 @@
 //! over a host-global table with no `user_id`/RLS. Two deliberate differences
 //! from the tool registry's `reindex_source`:
 //!
-//! - **Reindex upserts and prunes** rather than delete-all-then-insert, so a
-//!   skill unchanged since the last scan keeps its embedding instead of being
-//!   re-embedded on every daemon boot (the scanner runs at startup).
+//! - **Nothing here deletes.** The catalog is cumulative (#639): this adapter
+//!   implements storage primitives, and what accretes or is marked absent is
+//!   decided once in `core`'s reconcile pass, not in SQL here.
 //! - **Embeddings are preserved across a rescan iff the content hash is
 //!   unchanged**; a content change (including any attachment) nulls the vector
 //!   so [`crate::embedding_backfill::backfill_skill_embeddings`] re-embeds it.
+//!   This is the one behavior genuinely local to this adapter -- SQLite has no
+//!   vector column -- so it is tested here rather than in the shared contract.
 //!
 //! All SQL is static with bound parameters (no dynamic string building); the
 //! only "search input" is the bound `$query` text and `$embedding` vector.
 
+use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::skill_index::SkillIndexStore;
 use pgvector::Vector;
@@ -34,12 +37,21 @@ impl PgSkillIndexStore {
 
     /// Upsert one skill, preserving the row's embedding when its content hash is
     /// unchanged and nulling it (for re-embedding) when the content changed.
-    async fn upsert(conn: &mut sqlx::PgConnection, skill: &IndexedSkill) -> Result<(), CoreError> {
+    ///
+    /// `seen_at` stamps `last_seen_at` and marks the row present: presence is
+    /// index state derived from the scan that produced `skill`, never read off
+    /// the argument.
+    async fn upsert_row(
+        conn: &mut sqlx::PgConnection,
+        skill: &IndexedSkill,
+        seen_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
         sqlx::query(
             "INSERT INTO skill_index \
                 (name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                 trust_tier, source, tags, attachments, body, metadata, embedding, embedding_model) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NULL, NULL) \
+                 trust_tier, source, tags, attachments, body, metadata, embedding, embedding_model, \
+                 present_on_disk, last_seen_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NULL, NULL, TRUE, $14) \
              ON CONFLICT (name, owner_key) DO UPDATE SET \
                 description = EXCLUDED.description, \
                 kind = EXCLUDED.kind, \
@@ -58,6 +70,8 @@ impl PgSkillIndexStore {
                 embedding_model = CASE \
                     WHEN skill_index.content_hash IS DISTINCT FROM EXCLUDED.content_hash \
                     THEN NULL ELSE skill_index.embedding_model END, \
+                present_on_disk = TRUE, \
+                last_seen_at = EXCLUDED.last_seen_at, \
                 indexed_at = NOW()",
         )
         .bind(&skill.name)
@@ -73,6 +87,7 @@ impl PgSkillIndexStore {
         .bind(serde_json::json!(skill.attachments))
         .bind(&skill.body)
         .bind(&skill.metadata)
+        .bind(seen_at)
         .execute(&mut *conn)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -87,7 +102,7 @@ impl PgSkillIndexStore {
         let user = current_user_id();
         let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                    trust_tier, source, tags, attachments, body, metadata \
+                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, last_seen_at \
              FROM skill_index \
              WHERE (owner_user_id IS NULL OR owner_user_id = $1) \
                AND tsv @@ plainto_tsquery('english', $2) \
@@ -142,7 +157,7 @@ impl PgSkillIndexStore {
              ) \
              SELECT s.name, s.owner_user_id, s.description, s.kind, s.disk_path, s.locality, \
                     s.content_hash, s.trust_tier, s.source, s.tags, s.attachments, s.body, \
-                    s.metadata \
+                    s.metadata, s.present_on_disk, s.last_seen_at \
              FROM fused f JOIN scope s ON s.name = f.name AND s.owner_key = f.owner_key \
              ORDER BY f.score DESC LIMIT $5",
         )
@@ -160,60 +175,55 @@ impl PgSkillIndexStore {
 
 #[async_trait::async_trait]
 impl SkillIndexStore for PgSkillIndexStore {
-    async fn reindex_global(&self, skills: Vec<IndexedSkill>) -> Result<(), CoreError> {
-        let mut tx = self
+    async fn upsert(&self, skill: &IndexedSkill, seen_at: DateTime<Utc>) -> Result<(), CoreError> {
+        let mut conn = self
             .pool
-            .begin()
+            .acquire()
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        for skill in &skills {
-            Self::upsert(&mut tx, skill).await?;
-        }
-
-        // Prune global rows no longer present on disk. An empty scan clears the
-        // whole global catalog (every name fails `<> ALL('{}')` -> nothing kept).
-        let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
-        sqlx::query("DELETE FROM skill_index WHERE owner_user_id IS NULL AND name <> ALL($1)")
-            .bind(&names)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(())
+        Self::upsert_row(&mut conn, skill, seen_at).await
     }
 
-    async fn reindex_for_owner(
+    async fn list_scope(&self, scope: &SkillScope) -> Result<Vec<IndexedSkill>, CoreError> {
+        // Unfiltered by the calling user by design: the reconcile pass runs at
+        // startup with no request scope and must see the whole partition it is
+        // about to update. `owner_key` is the generated NULL -> '' mirror, so one
+        // bound parameter addresses either scope.
+        let rows: Vec<SkillRow> = sqlx::query_as(
+            "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
+                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
+                    last_seen_at \
+             FROM skill_index WHERE owner_key = $1 ORDER BY name",
+        )
+        .bind(scope.owner().unwrap_or(""))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(SkillRow::into_domain).collect())
+    }
+
+    async fn set_presence(
         &self,
-        owner: &str,
-        skills: Vec<IndexedSkill>,
+        scope: &SkillScope,
+        names: &[String],
+        present: bool,
     ) -> Result<(), CoreError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        for skill in &skills {
-            Self::upsert(&mut tx, skill).await?;
+        if names.is_empty() {
+            return Ok(());
         }
-
-        // Prune this owner's rows no longer present on disk (global and other
-        // users' rows are untouched). An empty scan clears the owner's catalog.
-        let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
-        sqlx::query("DELETE FROM skill_index WHERE owner_user_id = $1 AND name <> ALL($2)")
-            .bind(owner)
-            .bind(&names)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        // Names absent from the scope simply match nothing -- a concurrent
+        // removal must not fail a reconcile. Nothing else on the row is touched,
+        // `last_seen_at` included: it records when the skill was last on disk.
+        sqlx::query(
+            "UPDATE skill_index SET present_on_disk = $3 \
+             WHERE owner_key = $1 AND name = ANY($2)",
+        )
+        .bind(scope.owner().unwrap_or(""))
+        .bind(names)
+        .bind(present)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -241,7 +251,7 @@ impl SkillIndexStore for PgSkillIndexStore {
     ) -> Result<Option<IndexedSkill>, CoreError> {
         let row: Option<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                    trust_tier, source, tags, attachments, body, metadata \
+                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, last_seen_at \
              FROM skill_index \
              WHERE name = $1 AND owner_key = COALESCE($2, '')",
         )
@@ -257,7 +267,7 @@ impl SkillIndexStore for PgSkillIndexStore {
         let user = current_user_id();
         let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                    trust_tier, source, tags, attachments, body, metadata \
+                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, last_seen_at \
              FROM skill_index \
              WHERE (owner_user_id IS NULL OR owner_user_id = $1) \
              ORDER BY indexed_at DESC LIMIT $2",
@@ -287,6 +297,8 @@ struct SkillRow {
     attachments: serde_json::Value,
     body: String,
     metadata: serde_json::Value,
+    present_on_disk: bool,
+    last_seen_at: Option<DateTime<Utc>>,
 }
 
 impl SkillRow {
@@ -305,8 +317,8 @@ impl SkillRow {
             attachments: json_to_string_vec(self.attachments),
             body: self.body,
             metadata: self.metadata,
-            present_on_disk: true,
-            last_seen_at: None,
+            present_on_disk: self.present_on_disk,
+            last_seen_at: self.last_seen_at,
         }
     }
 }

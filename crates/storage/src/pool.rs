@@ -279,6 +279,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // #639: the skill catalog is cumulative -- a skill a scan no longer sees is
+    // marked absent rather than deleted, so presence needs somewhere to live.
+    sqlx::raw_sql(include_str!("../migrations/035_skill_presence.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 

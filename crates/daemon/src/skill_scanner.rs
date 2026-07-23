@@ -3,7 +3,7 @@
 //! Walks the configured global skill roots (`<root>/<name>/SKILL.md`), parses
 //! each skill with the pure `core::domain::skill` helpers, digests its
 //! attachments into the integrity hash a blessing pins to, and produces the
-//! [`IndexedSkill`] rows the daemon hands to `PgSkillIndexStore::reindex_global`.
+//! [`IndexedSkill`] rows the daemon hands to `core::skill_catalog::reconcile_scan`.
 //!
 //! Unreadable or malformed skills are skipped with a warning — a bad skill must
 //! never fail the whole scan (or block daemon startup). Earlier roots take
@@ -21,14 +21,16 @@ use desktop_assistant_core::domain::{AttachmentDigest, IndexedSkill, Locality};
 const SKILL_FILE: &str = "SKILL.md";
 
 /// Scan the configured **global** roots into the deduplicated set of global
-/// skills (owner-less, `Locality::Daemon`), ready for `reindex_global`. Earlier
+/// skills (owner-less, `Locality::Daemon`), ready to reconcile against
+/// [`SkillScope::Global`](desktop_assistant_core::domain::SkillScope). Earlier
 /// roots win on a name collision; malformed skills are skipped with a warning.
 pub fn scan_global_roots(roots: &[PathBuf]) -> Vec<IndexedSkill> {
     scan_roots(roots, None, Locality::Daemon)
 }
 
 /// Scan the configured **user home** roots into the deduplicated set of skills
-/// owned by `owner` (`Locality::Client`), ready for `reindex_for_owner`. Used on
+/// owned by `owner` (`Locality::Client`), ready to reconcile against that
+/// owner's scope. Used on
 /// a co-located single-user daemon so the user's `~/.agents/skills` etc. are
 /// indexed as theirs.
 pub fn scan_user_roots(roots: &[PathBuf], owner: &str) -> Vec<IndexedSkill> {

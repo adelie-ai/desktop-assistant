@@ -22,6 +22,12 @@ tokio = { workspace = true, features = ["time"] }
 tokio-util.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
 
+[features]
+# Exposes `ports::skill_index::conformance`, the executable contract every
+# `SkillIndexStore` implementation must satisfy. Enabled by the storage crates'
+# dev-dependencies so each adapter's test suite runs the same cases.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 
