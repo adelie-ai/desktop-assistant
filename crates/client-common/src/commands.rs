@@ -23,6 +23,26 @@ use crate::types::{ConversationDetail, ConversationSummary};
 /// `WsFrame::Error` or a connection-level failure.
 pub type PendingResult = Result<api::CommandResult, String>;
 
+/// Both correlation ids the daemon returns for an accepted `SendMessage`
+/// (issue #138).
+///
+/// A streaming client usually needs only `request_id` (see
+/// [`AssistantCommands::send_prompt_idempotent`], which returns just that). A
+/// client that wants to offer **Cancel** for the in-flight turn also needs
+/// `task_id` — the background-task handle `CancelBackgroundTask { id: task_id }`
+/// acts on — so [`AssistantCommands::send_prompt_idempotent_ack`] surfaces both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendAck {
+    /// The turn correlation id every streamed `AssistantDelta` /
+    /// `AssistantCompleted` / `AssistantError` event is stamped with (voice#49).
+    /// Empty when a legacy daemon replied with a bare `Ack`.
+    pub request_id: String,
+    /// The registered background-task id, used to drive Cancel
+    /// (`CancelBackgroundTask { id: task_id }`) and correlate `Task*` events.
+    /// Empty when a legacy daemon replied with a bare `Ack` (no Cancel possible).
+    pub task_id: String,
+}
+
 #[async_trait]
 pub trait AssistantCommands: Send + Sync {
     /// Serialize `command` as a `WsRequest`, send it over the transport, and
@@ -234,6 +254,40 @@ pub trait AssistantCommands: Send + Sync {
         system_refinement: String,
         idempotency_key: Option<String>,
     ) -> Result<String> {
+        // Delegate to the ack variant and keep only the correlation
+        // `request_id` — the id every streamed `AssistantDelta` /
+        // `AssistantCompleted` / `AssistantError` event for this turn is
+        // stamped with, so a streaming client can correlate the response back to
+        // its send (voice#49). The `task_id` (the background-task handle used to
+        // drive Cancel) is dropped here on purpose; a caller that needs it uses
+        // [`send_prompt_idempotent_ack`](Self::send_prompt_idempotent_ack).
+        self.send_prompt_idempotent_ack(
+            conversation_id,
+            prompt,
+            override_selection,
+            system_refinement,
+            idempotency_key,
+        )
+        .await
+        .map(|ack| ack.request_id)
+    }
+
+    /// Like [`send_prompt_idempotent`](Self::send_prompt_idempotent) but returns
+    /// **both** correlation ids as a [`SendAck`] — including the `task_id` a
+    /// client needs to offer **Cancel** for the in-flight turn
+    /// (`CancelBackgroundTask { id: task_id }`, issue #138), which the
+    /// `request_id`-only variant intentionally drops.
+    ///
+    /// This is the single chokepoint every `send_prompt*` method routes through,
+    /// so the ack-handling and wire shape live in one place.
+    async fn send_prompt_idempotent_ack(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
+        idempotency_key: Option<String>,
+    ) -> Result<SendAck> {
         let result = self
             .send_command(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),
@@ -247,20 +301,25 @@ pub trait AssistantCommands: Send + Sync {
                 idempotency_key,
             })
             .await?;
-        // The daemon replies with `SendMessageAck { request_id, task_id }`. We
-        // return the `request_id` — the id every streamed `AssistantDelta` /
-        // `AssistantCompleted` / `AssistantError` event for this turn is
-        // stamped with — so a streaming client can correlate the response back
-        // to its send (voice#49). The `task_id` (background-task id, used to
-        // correlate `Task*` events / drive Cancel) is not what a response
-        // stream is keyed on, so it is intentionally not the return value here.
+        // The daemon replies with `SendMessageAck { request_id, task_id }`:
+        // `request_id` correlates the streamed reply (voice#49); `task_id` is the
+        // background-task handle Cancel acts on (#138).
         //
-        // A legacy / pre-#114 daemon that still replies with a bare `Ack`
-        // carries no correlation id; we surface an empty string as before
-        // (such a client falls back to matching events loosely).
+        // A legacy / pre-#114 daemon that still replies with a bare `Ack` carries
+        // no correlation ids; we surface empty strings (such a client falls back
+        // to matching events loosely and simply cannot offer Cancel).
         match result {
-            api::CommandResult::SendMessageAck { request_id, .. } => Ok(request_id),
-            api::CommandResult::Ack => Ok(String::new()),
+            api::CommandResult::SendMessageAck {
+                request_id,
+                task_id,
+            } => Ok(SendAck {
+                request_id,
+                task_id,
+            }),
+            api::CommandResult::Ack => Ok(SendAck {
+                request_id: String::new(),
+                task_id: String::new(),
+            }),
             other => Err(anyhow!("unexpected response for send_prompt: {other:?}")),
         }
     }
@@ -769,6 +828,79 @@ mod tests {
             }
             other => panic!("expected Command::SendMessage, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_prompt_idempotent_ack_returns_both_correlation_ids() {
+        // #138: the ack variant surfaces the `task_id` (the background-task
+        // handle Cancel acts on) alongside the `request_id`, which the
+        // `request_id`-only `send_prompt_idempotent` intentionally drops.
+        let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+        });
+
+        let ack = client
+            .send_prompt_idempotent_ack(
+                "conv-1",
+                "hello",
+                None,
+                String::new(),
+                Some("turn-key-1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ack.request_id, "req-1");
+        assert_eq!(ack.task_id, "task-1");
+        // Same wire shape as the request_id-only variant: a keyed SendMessage.
+        match client.last() {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                idempotency_key,
+                ..
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(content, "hello");
+                assert_eq!(idempotency_key.as_deref(), Some("turn-key-1"));
+            }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_prompt_idempotent_ack_surfaces_empty_ids_on_legacy_ack() {
+        // A legacy / pre-#114 daemon replies with a bare `Ack` carrying no
+        // correlation ids. The ack variant surfaces empty strings for both, so
+        // such a client can't offer Cancel (no task id) but doesn't error.
+        let client = RecordingClient::new(api::CommandResult::Ack);
+
+        let ack = client
+            .send_prompt_idempotent_ack("conv-1", "hello", None, String::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(ack.request_id, "");
+        assert_eq!(ack.task_id, "");
+    }
+
+    #[tokio::test]
+    async fn send_prompt_idempotent_still_returns_only_request_id() {
+        // The request_id-only variant is unchanged: it delegates to the ack
+        // variant and keeps just the `request_id` (what streamed events carry),
+        // so its existing callers are byte-for-byte unaffected (#138).
+        let client = RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-9".to_string(),
+            task_id: "task-9".to_string(),
+        });
+
+        let returned = client
+            .send_prompt_idempotent("conv-1", "hello", None, String::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(returned, "req-9");
     }
 
     #[tokio::test]
