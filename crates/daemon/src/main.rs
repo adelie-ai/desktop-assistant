@@ -1593,6 +1593,23 @@ async fn main() -> Result<()> {
         );
     }
 
+    if let Some(si) = &skill_index_store {
+        tracing::info!("wiring skill index into builtin tools");
+        let si_search = Arc::clone(si);
+        let si_get = Arc::clone(si);
+        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        builtin_tools = builtin_tools.with_skills(
+            Arc::new(move |query, embedding, limit| {
+                let store = Arc::clone(&si_search);
+                Box::pin(async move { store.search(&query, embedding, limit).await })
+            }),
+            Arc::new(move |name, owner| {
+                let store = Arc::clone(&si_get);
+                Box::pin(async move { store.get(&name, owner.as_deref()).await })
+            }),
+        );
+    }
+
     // Persist remote-MCP OAuth tokens in the system Secret Service (#455). The
     // store degrades to a no-op when there's no Secret Service (headless), so
     // it's safe to always inject; the executor only touches it for OAuth

@@ -11,8 +11,35 @@
 //! this trait: [`SkillIndexStore::search`] takes a pre-computed query embedding
 //! (empty ⇒ full-text only) exactly as the knowledge-base search does.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use crate::CoreError;
 use crate::domain::IndexedSkill;
+
+/// Boxed-closure boundary for skill search, wired by the daemon over a
+/// [`SkillIndexStore`]. Args: `(query, query_embedding, limit)`.
+pub type SkillSearchFn = Arc<
+    dyn Fn(
+            String,
+            Vec<f32>,
+            usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedSkill>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Boxed-closure boundary for fetching one skill. Args: `(name, owner)`, where
+/// `owner = None` addresses the global skill.
+pub type SkillGetFn = Arc<
+    dyn Fn(
+            String,
+            Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<IndexedSkill>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Outbound port for persisting and searching the on-disk skill catalog.
 ///
