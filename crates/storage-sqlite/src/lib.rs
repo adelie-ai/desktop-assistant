@@ -17,8 +17,11 @@
 //! - [`SqliteLearnedWindowStore`] — [`desktop_assistant_core::ports::store::LearnedWindowStore`]
 //! - [`SqliteIdempotencyKeyStore`] — [`desktop_assistant_core::ports::store::IdempotencyKeyStore`]
 //!
-//! Vector search (sqlite-vec), FTS5, dreaming, `db_query`, and daemon wiring
-//! are deferred to later increments (see `DESIGN.md`).
+//! Vector search (sqlite-vec), dreaming, `db_query`, and daemon wiring are
+//! deferred to later increments (see `DESIGN.md`). The [`SqliteSkillIndexStore`]
+//! (#594) is the first FTS5 store here — full-text only, since the vector half
+//! still awaits sqlite-vec; the KB / scratchpad / conversation FTS stores remain
+//! deferred.
 //!
 //! ## Feature gate
 //!
@@ -27,8 +30,9 @@
 //! the sqlite C library. Build/test the real adapter with `--features sqlite`.
 
 // TODO(sqlite inc2): add the vector stores (KnowledgeBaseStore,
-// ToolRegistryStore) on sqlite-vec and the FTS5 stores (ScratchpadStore search,
-// ConversationSearchStore). See DESIGN.md for the fixed-dimension-vs-per-model
+// ToolRegistryStore) on sqlite-vec and the remaining FTS5 stores (ScratchpadStore
+// search, ConversationSearchStore). The FTS5 pattern is now established by
+// SqliteSkillIndexStore (#594); see DESIGN.md for the fixed-dimension-vs-per-model
 // `vector[]` risk that gates the vector half.
 // TODO(sqlite inc3): port the dreaming/consolidation passes and the
 // `execute_database_query` (db_query) tool.
@@ -45,6 +49,8 @@ mod idempotency_keys;
 #[cfg(feature = "sqlite")]
 mod pool;
 #[cfg(feature = "sqlite")]
+mod skill_index;
+#[cfg(feature = "sqlite")]
 mod turn_state;
 
 #[cfg(feature = "sqlite")]
@@ -59,6 +65,8 @@ pub use error_classifications::SqliteErrorClassificationStore;
 pub use idempotency_keys::SqliteIdempotencyKeyStore;
 #[cfg(feature = "sqlite")]
 pub use pool::{create_memory_pool, create_pool, run_migrations};
+#[cfg(feature = "sqlite")]
+pub use skill_index::SqliteSkillIndexStore;
 #[cfg(feature = "sqlite")]
 pub use turn_state::SqliteTurnStateStore;
 
