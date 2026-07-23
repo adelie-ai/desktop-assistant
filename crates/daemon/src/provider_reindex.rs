@@ -291,19 +291,27 @@ mod tests {
             }
         }
 
-        // One synthetic provider row per group present, and every default group
-        // (knowledge/scratchpad/database/recall/system/tool-meta) is represented,
-        // each source-qualified as builtin:<group>.
+        // Exactly one synthetic provider row per group that has advertised member
+        // tools — and only those. A group whose tools are all capability-gated
+        // (e.g. `skills`, absent until a skill index is wired) legitimately has
+        // no synthetic row, so the expected set is derived from the members
+        // present rather than the full `PROVIDER_GROUPS` constant.
         let synthetic_providers: std::collections::BTreeSet<String> = batches
             .iter()
             .flat_map(|b| b.tools.iter())
             .filter(|t| t.name.starts_with("provider:"))
             .map(|t| t.name.strip_prefix("provider:").unwrap().to_string())
             .collect();
+        let member_groups: std::collections::BTreeSet<String> = batches
+            .iter()
+            .flat_map(|b| b.tools.iter())
+            .filter(|t| t.name.starts_with("builtin_"))
+            .filter_map(|t| BuiltinToolService::provider_group(&t.name))
+            .map(|g| format!("builtin:{g}"))
+            .collect();
         assert_eq!(
-            synthetic_providers,
-            expected_groups.into_iter().collect(),
-            "every builtin group must get exactly one synthetic provider row"
+            synthetic_providers, member_groups,
+            "each group with member tools gets exactly one synthetic provider row"
         );
     }
 

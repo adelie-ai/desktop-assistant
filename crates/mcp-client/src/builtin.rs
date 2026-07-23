@@ -18,6 +18,7 @@ use desktop_assistant_core::ports::scratchpad::{
     RESPONSE_BYTE_BUDGET, ScratchpadClearFn, ScratchpadDeleteManyFn, ScratchpadGetManyFn,
     ScratchpadListFn, ScratchpadSearchFn, ScratchpadWriteFn,
 };
+use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
 use desktop_assistant_core::ports::transport::current_client_context;
 
@@ -36,6 +37,8 @@ const TOOL_CONV_SEARCH: &str = "builtin_conversation_search";
 const TOOL_SCRATCHPAD_WRITE: &str = "builtin_scratchpad_write";
 const TOOL_SCRATCHPAD_SEARCH: &str = "builtin_scratchpad_search";
 const TOOL_SCRATCHPAD_DELETE: &str = "builtin_scratchpad_delete";
+const TOOL_SKILL_SEARCH: &str = "builtin_skill_search";
+const TOOL_SKILL_GET: &str = "builtin_skill_get";
 
 /// Hard cap on how long an embedding call may block a real-time request. A
 /// slow/wedged embedding backend (e.g. a stuck Ollama) must not hang the turn:
@@ -64,6 +67,8 @@ pub struct BuiltinToolService {
     scratchpad_delete_many_fn: Option<ScratchpadDeleteManyFn>,
     scratchpad_clear_fn: Option<ScratchpadClearFn>,
     notify_fn: Option<NotifyFn>,
+    skill_search_fn: Option<SkillSearchFn>,
+    skill_get_fn: Option<SkillGetFn>,
 }
 
 impl Default for BuiltinToolService {
@@ -95,6 +100,8 @@ impl BuiltinToolService {
             scratchpad_delete_many_fn: None,
             scratchpad_clear_fn: None,
             notify_fn: None,
+            skill_search_fn: None,
+            skill_get_fn: None,
         }
     }
 
@@ -111,6 +118,15 @@ impl BuiltinToolService {
     /// headless host rather than failing at call time.
     pub fn with_notify(mut self, notify_fn: NotifyFn) -> Self {
         self.notify_fn = Some(notify_fn);
+        self
+    }
+
+    /// Configure the skill-library closures (`builtin_skill_search` /
+    /// `builtin_skill_get`). Wired only when a skill index is available, so the
+    /// tools are simply absent otherwise (capability-gated like `builtin_notify`).
+    pub fn with_skills(mut self, search_fn: SkillSearchFn, get_fn: SkillGetFn) -> Self {
+        self.skill_search_fn = Some(search_fn);
+        self.skill_get_fn = Some(get_fn);
         self
     }
 
@@ -602,6 +618,48 @@ impl BuiltinToolService {
             ));
         }
 
+        // Capability-gated: only advertise the skill tools when a skill index
+        // was wired (a Postgres pool + configured roots).
+        if self.skill_search_fn.is_some() {
+            defs.push(ToolDefinition::new(
+                TOOL_SKILL_SEARCH,
+                "Search the on-disk skill library — reusable how-to playbooks and workflows — by \
+                 meaning. Call this before a recurring or procedural task to check whether an \
+                 established skill already covers it, then read the full body with \
+                 builtin_skill_get before following one.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What you are trying to do."},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["skill", "workflow"],
+                            "description": "Optional filter: only plain skills or only workflows."
+                        },
+                        "limit": {"type": "integer", "description": "Max results (default 5)."}
+                    },
+                    "required": ["query"]
+                }),
+            ));
+            defs.push(ToolDefinition::new(
+                TOOL_SKILL_GET,
+                "Fetch one skill by name: its full markdown body, on-disk path, attachment \
+                 filenames, kind, and trust tier. Use after builtin_skill_search to read a skill \
+                 before following it.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The skill name."},
+                        "owner": {
+                            "type": "string",
+                            "description": "Omit for a global skill; a user id for a user-scoped one."
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            ));
+        }
+
         defs
     }
 
@@ -621,6 +679,8 @@ impl BuiltinToolService {
                 | TOOL_SCRATCHPAD_WRITE
                 | TOOL_SCRATCHPAD_SEARCH
                 | TOOL_SCRATCHPAD_DELETE
+                | TOOL_SKILL_SEARCH
+                | TOOL_SKILL_GET
         )
     }
 
@@ -662,6 +722,11 @@ impl BuiltinToolService {
             "Discover additional tools by description and manage the MCP servers that \
              provide them (status/start/stop/restart).",
         ),
+        (
+            "skills",
+            "Reusable how-to playbooks and workflows on disk: find an established skill \
+             for a recurring or procedural task and read its steps before acting.",
+        ),
     ];
 
     /// Every builtin tool name, including the capability-gated `builtin_notify`
@@ -681,6 +746,8 @@ impl BuiltinToolService {
         TOOL_SCRATCHPAD_WRITE,
         TOOL_SCRATCHPAD_SEARCH,
         TOOL_SCRATCHPAD_DELETE,
+        TOOL_SKILL_SEARCH,
+        TOOL_SKILL_GET,
     ];
 
     /// Classify a builtin tool name into its provider group, or `None` when the
@@ -698,6 +765,7 @@ impl BuiltinToolService {
             TOOL_CONV_SEARCH => Some("recall"),
             TOOL_SYS_PROPS | TOOL_NOTIFY => Some("system"),
             TOOL_SEARCH | TOOL_MCP_CONTROL => Some("tool-meta"),
+            TOOL_SKILL_SEARCH | TOOL_SKILL_GET => Some("skills"),
             _ => None,
         }
     }
@@ -729,6 +797,8 @@ impl BuiltinToolService {
             TOOL_SCRATCHPAD_WRITE => self.scratchpad_write(arguments).await,
             TOOL_SCRATCHPAD_SEARCH => self.scratchpad_search(arguments).await,
             TOOL_SCRATCHPAD_DELETE => self.scratchpad_delete(arguments).await,
+            TOOL_SKILL_SEARCH => self.skill_search(arguments).await,
+            TOOL_SKILL_GET => self.skill_get(arguments).await,
             _ => Err(CoreError::ToolExecution(format!(
                 "unknown built-in tool: {name}"
             ))),
@@ -967,6 +1037,86 @@ impl BuiltinToolService {
             "results": items,
         })
         .to_string())
+    }
+
+    async fn skill_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let search_fn = self
+            .skill_search_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("skill library not configured".to_string()))?;
+
+        let query = required_string(&arguments, "query")?;
+        let kind_filter = arguments
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let limit = arguments
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(5) as usize;
+
+        tracing::info!(query = %query, ?kind_filter, limit, "skill search");
+
+        let query_embedding = self.embed_text(&query).await.unwrap_or_default();
+        // Over-fetch when filtering by kind, then trim to the requested limit.
+        let fetch = if kind_filter.is_some() {
+            limit.saturating_mul(3)
+        } else {
+            limit
+        };
+        let mut results = search_fn(query, query_embedding, fetch).await?;
+        if let Some(kind) = &kind_filter {
+            results.retain(|s| s.kind.as_str() == kind);
+        }
+        results.truncate(limit);
+
+        let items: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "kind": s.kind.as_str(),
+                    "trust_tier": s.trust_tier.as_str(),
+                    "disk_path": s.disk_path,
+                    "attachments": s.attachments,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({ "ok": true, "results": items }).to_string())
+    }
+
+    async fn skill_get(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let get_fn = self
+            .skill_get_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("skill library not configured".to_string()))?;
+
+        let name = required_string(&arguments, "name")?;
+        let owner = arguments
+            .get("owner")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        match get_fn(name.clone(), owner).await? {
+            Some(s) => Ok(serde_json::json!({
+                "ok": true,
+                "name": s.name,
+                "description": s.description,
+                "kind": s.kind.as_str(),
+                "trust_tier": s.trust_tier.as_str(),
+                "disk_path": s.disk_path,
+                "attachments": s.attachments,
+                "tags": s.tags,
+                "body": s.body,
+            })
+            .to_string()),
+            None => Ok(
+                serde_json::json!({ "ok": false, "reason": format!("no skill named {name}") })
+                    .to_string(),
+            ),
+        }
     }
 
     async fn conversation_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -2895,6 +3045,78 @@ mod tests {
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "jira__create_issue");
+    }
+
+    #[tokio::test]
+    async fn skill_search_and_get_with_closures() {
+        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        fn sample(name: &str, kind: SkillKind) -> IndexedSkill {
+            IndexedSkill {
+                name: name.to_string(),
+                description: format!("does {name}"),
+                kind,
+                disk_path: format!("/skills/{name}/SKILL.md"),
+                owner_user_id: None,
+                locality: Locality::Daemon,
+                content_hash: "h".to_string(),
+                trust_tier: TrustTier::Local,
+                source: None,
+                tags: vec!["ops".to_string()],
+                attachments: vec!["scripts/run.sh".to_string()],
+                body: "# body\n\n## Steps\n1. go".to_string(),
+                metadata: serde_json::Value::Null,
+            }
+        }
+
+        let search_fn: SkillSearchFn = Arc::new(|_q, _emb, _limit| {
+            Box::pin(async {
+                Ok(vec![
+                    sample("invoicing", SkillKind::Workflow),
+                    sample("notes", SkillKind::Skill),
+                ])
+            })
+        });
+        let get_fn: SkillGetFn = Arc::new(|name, _owner| {
+            Box::pin(async move {
+                Ok((name == "invoicing").then(|| sample("invoicing", SkillKind::Workflow)))
+            })
+        });
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        // The `kind` filter keeps only workflows.
+        let out = service
+            .execute_tool(
+                TOOL_SKILL_SEARCH,
+                serde_json::json!({"query": "invoice", "kind": "workflow"}),
+            )
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true);
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["name"], "invoicing");
+        assert_eq!(results[0]["kind"], "workflow");
+
+        // `get` returns the full body for a hit and `ok:false` for a miss.
+        let hit = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "invoicing"}))
+            .await
+            .unwrap();
+        let hit_json: serde_json::Value = serde_json::from_str(&hit).unwrap();
+        assert_eq!(hit_json["ok"], true);
+        assert!(hit_json["body"].as_str().unwrap().contains("## Steps"));
+        assert_eq!(hit_json["attachments"][0], "scripts/run.sh");
+
+        let miss = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "nope"}))
+            .await
+            .unwrap();
+        let miss_json: serde_json::Value = serde_json::from_str(&miss).unwrap();
+        assert_eq!(miss_json["ok"], false);
     }
 
     #[test]

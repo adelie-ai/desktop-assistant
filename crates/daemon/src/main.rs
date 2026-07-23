@@ -28,6 +28,7 @@ mod purposes;
 mod registry;
 mod routing_llm;
 mod settings_service;
+mod skill_scanner;
 mod store;
 mod tls;
 mod transports;
@@ -1245,6 +1246,41 @@ async fn main() -> Result<()> {
         ))
     });
 
+    let skill_index_store = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgSkillIndexStore::new(
+            pool.clone(),
+        ))
+    });
+
+    // Index on-disk skills at startup (#573): scan the configured global roots
+    // and replace the global catalog. Capability-off when disabled or when no
+    // configured root resolves; embeddings are filled by the backfill loop.
+    if let Some(store) = &skill_index_store {
+        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        let skills_cfg = daemon_config
+            .as_ref()
+            .map(|c| c.skills.clone())
+            .unwrap_or_default();
+        if skills_cfg.enabled {
+            let roots: Vec<_> = skills_cfg
+                .roots
+                .iter()
+                .filter(|r| r.is_dir())
+                .cloned()
+                .collect();
+            if roots.is_empty() {
+                tracing::info!("skill library disabled: no configured skill root is present");
+            } else {
+                let skills = crate::skill_scanner::scan_global_roots(&roots);
+                let count = skills.len();
+                match store.reindex_global(skills).await {
+                    Ok(()) => tracing::info!(indexed = count, "skill library indexed"),
+                    Err(e) => tracing::warn!("skill index reindex failed: {e}"),
+                }
+            }
+        }
+    }
+
     // Load MCP server configuration and secrets
     let mcp_config_path = mcp_config::default_config_path();
     let mcp_configs = mcp_config::load_mcp_configs(&mcp_config_path).unwrap_or_else(|e| {
@@ -1557,6 +1593,23 @@ async fn main() -> Result<()> {
         );
     }
 
+    if let Some(si) = &skill_index_store {
+        tracing::info!("wiring skill index into builtin tools");
+        let si_search = Arc::clone(si);
+        let si_get = Arc::clone(si);
+        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        builtin_tools = builtin_tools.with_skills(
+            Arc::new(move |query, embedding, limit| {
+                let store = Arc::clone(&si_search);
+                Box::pin(async move { store.search(&query, embedding, limit).await })
+            }),
+            Arc::new(move |name, owner| {
+                let store = Arc::clone(&si_get);
+                Box::pin(async move { store.get(&name, owner.as_deref()).await })
+            }),
+        );
+    }
+
     // Persist remote-MCP OAuth tokens in the system Secret Service (#455). The
     // store degrades to a no-op when there's no Secret Service (headless), so
     // it's safe to always inject; the executor only touches it for OAuth
@@ -1724,6 +1777,16 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => tracing::info!("backfilled {n} knowledge embedding(s)"),
                     Ok(_) => tracing::debug!("no knowledge embeddings to backfill"),
                     Err(e) => tracing::warn!("knowledge embedding backfill failed: {e}"),
+                }
+
+                match desktop_assistant_storage::embedding_backfill::backfill_skill_embeddings(
+                    &pool, &embed_fn, &model,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::info!("backfilled {n} skill embedding(s)"),
+                    Ok(_) => tracing::debug!("no skill embeddings to backfill"),
+                    Err(e) => tracing::warn!("skill embedding backfill failed: {e}"),
                 }
 
                 tokio::select! {

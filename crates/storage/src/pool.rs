@@ -264,6 +264,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Host-global skill index (#573): the disk-sourced skill/workflow catalog,
+    // searchable by hybrid vector + full-text, mirroring `tool_definitions`.
+    sqlx::raw_sql(include_str!("../migrations/033_skill_index.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 
