@@ -1229,23 +1229,41 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // empty config, matching the pre-issue-18 behaviour.
             let reasoning = crate::ports::llm::current_reasoning_config();
 
-            let response = match if use_hosted_search
-                && !namespaces.is_empty()
-                && !hosted_search_demoted
-            {
-                self.llm
-                    .stream_completion_with_namespaces(
+            // #611: keep the turn alive during the LLM round. The client's
+            // per-turn stall watchdog aborts a turn that stays silent past its
+            // budget; a long prefill / time-to-first-token (e.g. the final round
+            // after a subagent inflated the context) can exceed it before the
+            // first token, so the connector would synthesize a stall error and
+            // the real completion would be dropped (reappearing only on a
+            // re-select). Emit a periodic heartbeat so an active round is never
+            // silent too long. Once tokens stream, the AssistantDelta chunks
+            // keep the stall alive on their own; this covers the pre-first-token
+            // window. Mirrors the tool-exec keepalive (#584). Cancellation is
+            // unaffected: the call still resolves and breaks the loop.
+            let mut llm_call =
+                if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
+                    self.llm.stream_completion_with_namespaces(
                         llm_messages,
                         &tool_defs,
                         &namespaces,
                         reasoning,
                         filtered_chunk_callback,
                     )
-                    .await
-            } else {
-                self.llm
-                    .stream_completion(llm_messages, &tool_defs, reasoning, filtered_chunk_callback)
-                    .await
+                } else {
+                    self.llm.stream_completion(
+                        llm_messages,
+                        &tool_defs,
+                        reasoning,
+                        filtered_chunk_callback,
+                    )
+                };
+            let response = match loop {
+                tokio::select! {
+                    r = &mut llm_call => break r,
+                    _ = tokio::time::sleep(SERVER_TOOL_KEEPALIVE_INTERVAL) => {
+                        on_status("Thinking...".to_string());
+                    }
+                }
             } {
                 Ok(r) => r,
                 Err(CoreError::ContextOverflow {
@@ -2039,6 +2057,27 @@ mod tests {
         }
     }
 
+    /// An LLM whose `stream_completion` stays silent for `delay` before
+    /// returning a final response (no chunks) -- models a long prefill /
+    /// time-to-first-token round with no events on the wire (#611).
+    struct SlowLlm {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for SlowLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(LlmResponse::text("done".to_string()))
+        }
+    }
+
     fn make_handler(chunks: Vec<&str>) -> ConversationHandler<MockStore, MockLlm> {
         use std::sync::atomic::{AtomicU64, Ordering};
         let counter = Arc::new(AtomicU64::new(0));
@@ -2524,6 +2563,43 @@ mod tests {
         assert!(
             keepalives >= 2,
             "a long server tool must emit periodic keepalive statuses; got: {statuses:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_llm_round_emits_keepalive_status_within_stall_window() {
+        // #611: a parent LLM round (e.g. a long prefill / time-to-first-token
+        // after a subagent inflated the context) that stays silent past the
+        // keepalive interval must still emit periodic status, or the client's
+        // stall watchdog false-abandons the turn and the reducer permanently
+        // drops the real completion. Mirrors the #584 tool-keepalive test.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            SlowLlm {
+                // Longer than several keepalive intervals.
+                delay: SERVER_TOOL_KEEPALIVE_INTERVAL * 3 + std::time::Duration::from_secs(1),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("c".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+        let statuses = status_log.lock().unwrap();
+        let keepalives = statuses.iter().filter(|s| s.contains("Thinking")).count();
+        assert!(
+            keepalives >= 2,
+            "a long LLM round must emit periodic keepalive statuses; got: {statuses:?}"
         );
     }
 
