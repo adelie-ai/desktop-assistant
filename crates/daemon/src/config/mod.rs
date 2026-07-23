@@ -1102,6 +1102,51 @@ pub(crate) fn xdg_data_home_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod tests {
+    // --- save_daemon_config must not leave a config world-readable ---------
+
+    #[cfg(unix)]
+    #[test]
+    fn save_daemon_config_tightens_permissions_on_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The path that matters: a seeded config lands 0644 (the k8s init
+        // container writes it), and every daemon-authored rewrite kept those
+        // permissions, because OpenOptions::mode applies only on create.
+        let mut path = std::env::temp_dir();
+        path.push(format!("da-perm-{}.toml", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, "# seeded\n").expect("seed the file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make it world-readable");
+
+        super::save_daemon_config(&path, &super::DaemonConfig::default()).expect("save");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            mode, 0o600,
+            "the config carries credential coordinates; a rewrite must tighten \
+             an existing loose file, not inherit its mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_daemon_config_creates_with_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "da-perm-new-{}.toml",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        super::save_daemon_config(&path, &super::DaemonConfig::default()).expect("save");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        std::fs::remove_file(&path).ok();
+        assert_eq!(mode, 0o600, "the create path must stay restrictive");
+    }
+
     use super::*;
     use std::sync::{Mutex, OnceLock};
 

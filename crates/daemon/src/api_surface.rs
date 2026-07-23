@@ -2559,6 +2559,57 @@ mod tests {
         assert!(format!("{err}").contains("interactive"));
     }
 
+    // --- reload must not build a registry it throws away -------------------
+
+    #[test]
+    fn no_op_reload_does_not_build_a_registry() {
+        let cfg = config_with_connections(&[("local", ollama_local())]);
+        let path = tmp_config_path();
+        crate::config::save_daemon_config(&path, &cfg).expect("seed config on disk");
+        let handle = make_handle_at(cfg, path.clone());
+
+        // Reloading a config identical to the running one is the common case:
+        // every daemon-authored write trips the on-disk watcher, which then
+        // finds nothing to do. It must not cost a full set of LLM clients.
+        crate::registry::reset_build_registry_calls();
+        let plan = handle.apply_reload().expect("reload succeeds");
+
+        assert!(plan.is_empty(), "precondition: nothing changed");
+        assert_eq!(
+            crate::registry::build_registry_calls(),
+            0,
+            "a reload with no effective changes must not construct clients"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn effective_reload_still_rebuilds_and_swaps() {
+        let running = config_with_connections(&[("local", ollama_local())]);
+        let path = tmp_config_path();
+        let handle = make_handle_at(running, path.clone());
+
+        // A real [connections] change must still hot-apply.
+        let changed =
+            config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
+        crate::config::save_daemon_config(&path, &changed).expect("write changed config");
+
+        crate::registry::reset_build_registry_calls();
+        let plan = handle.apply_reload().expect("reload succeeds");
+
+        assert!(plan.rebuild_registry, "a connections edit hot-applies");
+        assert_eq!(
+            crate::registry::build_registry_calls(),
+            1,
+            "exactly one build for a real change — not zero, and not two"
+        );
+        assert!(
+            handle.snapshot_config().connections.contains_key("aws"),
+            "the new connection should be live"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     #[tokio::test]
     async fn get_purposes_returns_current_config() {
         let mut cfg = config_with_connections(&[("local", ollama_local())]);
