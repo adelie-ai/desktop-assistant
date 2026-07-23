@@ -80,6 +80,10 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .await?;
     ensure_column(pool, "background_tasks", "spawn_marker", "TEXT").await?;
+    // Skill index (#594): relational + FTS5 (the repo's first FTS5 table).
+    sqlx::raw_sql(include_str!("../migrations/002_skill_index.sql"))
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
