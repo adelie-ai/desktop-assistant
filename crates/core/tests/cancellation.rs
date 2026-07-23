@@ -518,3 +518,76 @@ async fn cancellation_during_tool_dispatch_aborts_before_next_llm_call() {
          got {calls_after} calls"
     );
 }
+
+#[tokio::test]
+async fn cancel_mid_stream_preserves_user_prompt_in_store() {
+    // #585 (da#583 ask #1): a turn cancelled mid-stream must still persist the
+    // user's prompt so it is not lost — the user can see it and retry. Today the
+    // cancel path returns `Err(Cancelled)` without any `store.update` (the user
+    // message is only persisted at the terminal update), so the prompt vanishes.
+    use desktop_assistant_core::tools::NoopToolExecutor;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let llm = SlowStreamLlm {
+        chunks: vec!["a".into(); 50],
+        chunk_delay: Duration::from_millis(50),
+        aborted_mid_stream: aborted.clone(),
+    };
+    let counter = Arc::new(AtomicU64::new(0));
+    let handler = ConversationHandler::with_tools(
+        MemStore::new(),
+        llm,
+        NoopToolExecutor,
+        Box::new(move || {
+            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            format!("conv-{n}")
+        }),
+    );
+    let conv = handler
+        .create_conversation("c".into(), vec![])
+        .await
+        .unwrap();
+
+    let token = CancellationToken::new();
+    let cancel_handle = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cancel_handle.cancel();
+    });
+
+    let result = handler
+        .send_prompt_with_override(
+            &conv.id,
+            "remember: buy milk".into(),
+            None,
+            String::new(),
+            noop_chunk(),
+            noop_status(),
+            token,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(CoreError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+
+    // The user's prompt must survive the cancel.
+    let reloaded = handler
+        .get_conversation(&conv.id)
+        .await
+        .expect("conversation still exists after a cancelled turn");
+    assert!(
+        reloaded
+            .messages
+            .iter()
+            .any(|m| m.content == "remember: buy milk"),
+        "a cancelled turn must still persist the user's prompt; stored contents: {:?}",
+        reloaded
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+    );
+}
