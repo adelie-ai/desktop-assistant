@@ -106,6 +106,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                        MIN(chunk <=> $1) AS min_distance
                 FROM knowledge_base, unnest(embedding) AS chunk
                 WHERE user_id = $6
+                  AND deleted_at IS NULL
                   AND ($2::text[] IS NULL OR tags && $2)
                   AND ($7::text[] IS NULL OR NOT (tags && $7))
                   AND embedding IS NOT NULL
@@ -122,6 +123,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
                 FROM knowledge_base, plainto_tsquery('english', $4) query
                 WHERE user_id = $6
+                  AND deleted_at IS NULL
                   AND ($2::text[] IS NULL OR tags && $2)
                   AND ($7::text[] IS NULL OR NOT (tags && $7))
                   AND tsv @@ query
@@ -180,6 +182,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
             "SELECT id, content, tags, metadata, created_at, updated_at, source
              FROM knowledge_base
              WHERE user_id = $4
+               AND deleted_at IS NULL
                AND ($1::text[] IS NULL OR tags && $1)
              ORDER BY updated_at DESC, id
              LIMIT $2 OFFSET $3",
@@ -210,7 +213,8 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         let user_id = current_user_id();
         let row: Option<KbRow> = sqlx::query_as(
             "SELECT id, content, tags, metadata, created_at, updated_at, source
-             FROM knowledge_base WHERE user_id = $1 AND id = $2",
+             FROM knowledge_base \
+             WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL",
         )
         .bind(user_id.as_str())
         .bind(id)
@@ -245,6 +249,7 @@ impl PgKnowledgeBaseStore {
              SELECT id, content, tags, metadata, created_at, updated_at, source
              FROM knowledge_base
              WHERE user_id = $4
+               AND deleted_at IS NULL
                AND tsv @@ (SELECT query FROM q)
                AND ($2::text[] IS NULL OR tags && $2)
                AND ($5::text[] IS NULL OR NOT (tags && $5))
@@ -302,6 +307,7 @@ impl PgKnowledgeBaseStore {
                 "SELECT id, content, tags, metadata, created_at, updated_at, source
                  FROM knowledge_base
                  WHERE user_id = $1
+                   AND deleted_at IS NULL
                    AND ($2::text[] IS NULL OR tags && $2)
                    AND ($3::text[] IS NULL OR NOT (tags && $3))
                    AND ($4::text IS NULL OR source = $4)
@@ -314,6 +320,7 @@ impl PgKnowledgeBaseStore {
                 "SELECT id, content, tags, metadata, created_at, updated_at, source
                  FROM knowledge_base
                  WHERE user_id = $1
+                   AND deleted_at IS NULL
                    AND ($2::text[] IS NULL OR tags && $2)
                    AND ($3::text[] IS NULL OR NOT (tags && $3))
                    AND ($4::text IS NULL OR source = $4)
