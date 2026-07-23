@@ -512,6 +512,75 @@ pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option
     Some(out)
 }
 
+/// How much durable working state a conversation is carrying, for the per-turn
+/// `[Working state]` nudge (#598).
+///
+/// Why counts and nothing else: `[Plan]` and `[Scratchpad]` can both be silent
+/// exactly when they are needed. The index in particular is gated on context
+/// having started to drop (#340), so before that trigger fires a note stashed
+/// ten messages ago is durable in storage and completely invisible. One
+/// ungated line of counts closes that window. Carrying any content - keys,
+/// titles, previews - would forfeit the affordability that justifies sending
+/// it every single turn, so it stays counts-only by design.
+///
+/// The counts are taken from the same bounded notes read that feeds the fuller
+/// blocks, so a pad holding more notes than that read returns under-reports.
+/// That bound is far above any realistic pad, and under-reporting a nudge is
+/// harmless where a second storage round-trip per turn would not be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WorkingState {
+    /// Free-form notes, counted with the same carve-out (and key de-duplication)
+    /// [`render_scratchpad_index`] applies, so the count never disagrees with
+    /// the list the fuller block would show.
+    pub notes: usize,
+    /// Steps still open. Done steps are excluded: the point is what is left to
+    /// do, not how much has been done.
+    pub open_todos: usize,
+}
+
+impl WorkingState {
+    /// Count the working state carried by a conversation's notes.
+    pub fn from_notes(notes: &[RawNote<'_>]) -> Self {
+        let mut keys = freeform_note_keys(notes);
+        keys.sort_unstable();
+        keys.dedup();
+        Self {
+            notes: keys.len(),
+            open_todos: notes
+                .iter()
+                .filter(|n| n.note_type == STEP_NOTE_TYPE && !n.done)
+                .count(),
+        }
+    }
+
+    /// Render the one-line nudge, or `None` when there is nothing left to
+    /// report. Callers zero out whichever half a fuller block already covers
+    /// this turn, so the line yields to the richer surface rather than
+    /// duplicating it - and vanishes entirely once both cover their half.
+    pub fn render(self) -> Option<String> {
+        fn plural(n: usize) -> &'static str {
+            if n == 1 { "" } else { "s" }
+        }
+
+        let mut parts: Vec<String> = Vec::with_capacity(2);
+        if self.notes > 0 {
+            parts.push(format!(
+                "{} scratchpad note{}",
+                self.notes,
+                plural(self.notes)
+            ));
+        }
+        if self.open_todos > 0 {
+            parts.push(format!(
+                "{} open to-do{}",
+                self.open_todos,
+                plural(self.open_todos)
+            ));
+        }
+        (!parts.is_empty()).then(|| format!("{}.", parts.join(", ")))
+    }
+}
+
 /// A scratchpad note as the plan renderer needs it — just the fields it reads,
 /// so the renderer stays decoupled from the storage row type.
 pub(crate) struct RawNote<'a> {

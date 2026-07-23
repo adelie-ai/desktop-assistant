@@ -193,6 +193,10 @@ pub(crate) struct TurnAnchors<'a> {
     pub active_task: Option<&'a str>,
     pub plan: Option<&'a str>,
     pub scratchpad_index: Option<&'a str>,
+    /// Counts behind the always-on `[Working state]` nudge (#598), carried as
+    /// counts rather than a rendered line so the block can drop whichever half
+    /// a fuller block covers on this particular turn.
+    pub working_state: crate::planning::WorkingState,
     pub tool_rounds_since_anchor: u32,
 }
 
@@ -837,6 +841,9 @@ fn system_block(
 /// - `[Current task]` — the anchor prompt, re-injected when it has drifted out
 ///   of view (windowed out, or collapsed behind an active summary) or after a
 ///   long agentic loop (`> ACTIVE_TASK_ROUND_THRESHOLD` rounds).
+/// - `[Working state]` — a one-line count of notes and open to-dos, rendered
+///   every turn either count is non-zero, minus whichever half a fuller block
+///   below already covers.
 /// - `[Plan]` — the open todo tree, whenever one exists.
 /// - `[Scratchpad]` — the free-form note-key index, gated on the same
 ///   "context is dropping" signal as `[Current task]`.
@@ -897,18 +904,43 @@ fn surfaced_blocks(
     // Open plan (#240): the dispatch loop renders the conversation's `todo`
     // notes into a compact tree each round, so the plan stays in view cheaply
     // while the verbose work that produced it is evicted from the message log.
-    if let Some(plan) = anchors.plan.filter(|p| !p.is_empty()) {
-        blocks.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
-    }
+    let plan = anchors.plan.filter(|p| !p.is_empty());
 
     // Free-form scratchpad note keys (#340): durable in storage but otherwise
     // invisible once the writing message is windowed/compacted away. The index
     // lists the keys (recognition over recall), gated on the same "context is
     // dropping" condition as `[Current task]` so it doesn't burn tokens while
     // the note content is still live in the window.
-    if let Some(index) = anchors.scratchpad_index.filter(|s| !s.is_empty())
-        && (is_windowed || many_tool_rounds)
-    {
+    let scratchpad_index = anchors
+        .scratchpad_index
+        .filter(|s| !s.is_empty() && (is_windowed || many_tool_rounds));
+
+    // Working-state nudge (#598): the always-on floor beneath the two blocks
+    // above. Neither of them is guaranteed to speak when it matters most - the
+    // index is gated on context dropping, so before that trigger fires a note
+    // stashed earlier is durable but invisible - and one line of counts is
+    // cheap enough to send from turn one regardless. It yields rather than
+    // duplicating: each half drops when the fuller block covering it renders,
+    // and with both present the line disappears entirely.
+    let mut working_state = anchors.working_state;
+    if plan.is_some() {
+        working_state.open_todos = 0;
+    }
+    if scratchpad_index.is_some() {
+        working_state.notes = 0;
+    }
+    if let Some(counts) = working_state.render() {
+        blocks.push(Message::new(
+            Role::System,
+            format!("[Working state] {counts}"),
+        ));
+    }
+
+    if let Some(plan) = plan {
+        blocks.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
+    }
+
+    if let Some(index) = scratchpad_index {
         blocks.push(Message::new(Role::System, format!("[Scratchpad] {index}")));
     }
 
@@ -2928,7 +2960,6 @@ mod tests {
                 scratchpad_index: Some(index),
                 working_state,
                 tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
-                ..Default::default()
             },
             None,
             &default_estimate,
