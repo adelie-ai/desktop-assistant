@@ -383,11 +383,32 @@ impl ConnectionsService for DaemonConnectionsService {
     ) -> Result<(), CoreError> {
         let id_valid = ConnectionId::new(id.clone())
             .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
-        let new_conn = payload_to_connection(config);
+        let mut new_conn = payload_to_connection(config);
         self.registry.mutate_config(|cfg| {
-            if !cfg.connections.contains_key(id_valid.as_str()) {
+            let Some(existing) = cfg.connections.get(id_valid.as_str()) else {
                 return Err(format!("connection id {:?} does not exist", id_valid));
+            };
+
+            // The payload deliberately carries no credential material, so a
+            // bare replace would drop the connection's secret coordinate and
+            // orphan the credential still sitting in the secret backend —
+            // leaving the connection silently falling back to the provider's
+            // ambient credential chain (#643). Carry the coordinate forward.
+            //
+            // Why only for a matching connector: the stored credential is
+            // connector-shaped (an AWS key pair, a bearer token, …), so
+            // carrying it across a connector switch would leave a value the
+            // new connector cannot interpret. That case drops it, and the
+            // operator re-supplies one via SetConnectionSecret.
+            if existing.connector_type() == new_conn.connector_type()
+                && let Some(secret) = existing.secret().cloned()
+            {
+                new_conn.set_secret(Some(secret)).expect(
+                    "connector types match and the stored connection carried a secret, \
+                     so this variant has a secret field",
+                );
             }
+
             cfg.connections
                 .insert(id_valid.as_str().to_string(), new_conn);
             Ok(())
@@ -1525,8 +1546,9 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
             region,
             base_url,
             // Secrets never cross the non-secret payload boundary; they are set
-            // out-of-band via `set_connection_secret`. A create/update via
-            // payload therefore leaves the secret coordinate cleared.
+            // out-of-band via `set_connection_secret`. Every payload therefore
+            // converts with no coordinate — `update_connection` re-attaches the
+            // stored one afterwards so an edit doesn't orphan the credential.
             secret: None,
             connect_timeout_secs,
             stream_timeout_secs,
@@ -2287,7 +2309,11 @@ mod tests {
                     max_context_tokens: None,
                 },
             ),
-            ("bedrock", bedrock_with_secret(), bedrock_payload("eu-west-1")),
+            (
+                "bedrock",
+                bedrock_with_secret(),
+                bedrock_payload("eu-west-1"),
+            ),
         ]
     }
 
@@ -2351,8 +2377,12 @@ mod tests {
 
             let cfg = handle.snapshot_config();
             assert_eq!(
-                secret_account(cfg.connections.get("conn").expect("connection should exist"))
-                    .as_deref(),
+                secret_account(
+                    cfg.connections
+                        .get("conn")
+                        .expect("connection should exist")
+                )
+                .as_deref(),
                 Some(SECRET_ACCOUNT),
                 "{name} lost its credential reference on update"
             );
