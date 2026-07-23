@@ -342,6 +342,16 @@ pub enum Command {
     DeleteKnowledgeEntry {
         id: String,
     },
+    /// How many of the calling user's knowledge entries are soft-deleted and
+    /// waiting to be reaped ("in the trash"). Retired entries are hidden from
+    /// every other read path, so this is the only way to see them (#657).
+    GetKnowledgeTrashCount,
+    /// Permanently delete every soft-deleted knowledge entry belonging to the
+    /// calling user, ignoring the retention window. Scoped to that user: it
+    /// never reaps another's trash. Replies
+    /// [`CommandResult::KnowledgeTrashEmptied`]; an empty trash is a
+    /// successful `0`, not an error (#657).
+    EmptyKnowledgeTrash,
     /// Trigger an on-demand knowledge-maintenance run (issue: dream-cycle
     /// controls). Runs as a tracked, cancellable background task; the daemon
     /// replies `MaintenanceTaskStarted { task_id }` immediately and the work
@@ -600,6 +610,17 @@ pub enum CommandResult {
     KnowledgeEntries(Vec<KnowledgeEntryView>),
     KnowledgeEntry(Option<KnowledgeEntryView>),
     KnowledgeEntryWritten(KnowledgeEntryView),
+
+    /// Response to `GetKnowledgeTrashCount`: soft-deleted entries awaiting
+    /// reaping for the calling user (#657).
+    KnowledgeTrashCount {
+        count: u32,
+    },
+    /// Response to `EmptyKnowledgeTrash`: how many entries were permanently
+    /// removed. `0` when the trash was already empty (#657).
+    KnowledgeTrashEmptied {
+        deleted_count: u32,
+    },
 
     /// Response to `GetConversationScratchpad` / `SetScratchpadNote` — the
     /// requested (or just-saved) scratchpad notes for the conversation.

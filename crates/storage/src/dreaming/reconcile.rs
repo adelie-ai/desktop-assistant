@@ -180,7 +180,7 @@ pub async fn apply_ops(
     pool: &PgPool,
     buffer: &OpBuffer,
     synthesized: &[SynthesizedMerge],
-    soft_delete_ttl_days: i32,
+    soft_delete_retention_days: u32,
 ) -> Result<ConsolidationStats, CoreError> {
     let user_id = current_user_id();
     let mut stats = ConsolidationStats::default();
@@ -190,21 +190,13 @@ pub async fn apply_ops(
         .await
         .map_err(|e| CoreError::Storage(format!("dreaming: begin tx failed: {e}")))?;
 
-    // First, reap any soft-deleted entries past their TTL. Cheap, and
-    // happens in the same tx so a single cycle stays atomic. Scoped to
-    // the current user — TTL reaping for other users happens when
-    // their own consolidation cycles run.
-    sqlx::query(
-        "DELETE FROM knowledge_base \
-         WHERE user_id = $2 \
-           AND deleted_at IS NOT NULL \
-           AND deleted_at < NOW() - make_interval(days => $1)",
-    )
-    .bind(soft_delete_ttl_days)
-    .bind(user_id.as_str())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| CoreError::Storage(format!("dreaming: TTL reap failed: {e}")))?;
+    // First, reap any soft-deleted entries past their retention window. Cheap,
+    // and happens in the same tx so a single cycle stays atomic. Scoped to the
+    // current user. This is a convenience trigger, not the only one: the
+    // daemon's periodic sweep (`dreaming::sweep_expired_trash`) reaps
+    // regardless of whether consolidation is enabled at all.
+    super::trash::reap_expired_for_user(&mut *tx, user_id.as_str(), soft_delete_retention_days)
+        .await?;
 
     // Apply merges: update canonical row, soft-delete cluster members. The
     // canonical row's embedding is left stale (not regenerated here) — the

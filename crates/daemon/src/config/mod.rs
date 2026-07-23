@@ -455,6 +455,29 @@ pub struct BackendTasksConfig {
     /// a cheap/local model while consolidation uses a stronger one.
     #[serde(default)]
     pub consolidation_llm: Option<LlmConfig>,
+    /// How long a soft-deleted ("trashed") knowledge entry is retained before
+    /// the periodic sweep frees it permanently, in days. `0` = do not retain,
+    /// reap on the next sweep. Users can always empty the trash on demand.
+    #[serde(default = "default_knowledge_trash_retention_days")]
+    pub knowledge_trash_retention_days: u32,
+    /// How often the trash sweep runs (0 = disabled). The sweep is a cheap,
+    /// deterministic DELETE with no LLM involvement, so it runs frequently and
+    /// — unlike the reap that also happens inside a consolidation cycle —
+    /// independently of whether dreaming is enabled at all.
+    #[serde(default = "default_knowledge_trash_sweep_interval_secs")]
+    pub knowledge_trash_sweep_interval_secs: u64,
+}
+
+impl BackendTasksConfig {
+    /// Whether the periodic knowledge-trash sweep should run.
+    ///
+    /// Deliberately independent of `dreaming_enabled`: the reap used to live
+    /// only inside the consolidation transaction, so an instance with dreaming
+    /// off accumulated tombstones forever — invisible to every read path, but
+    /// never freed. Its own interval is the only switch.
+    pub fn trash_sweep_enabled(&self) -> bool {
+        self.knowledge_trash_sweep_interval_secs > 0
+    }
 }
 
 impl Default for BackendTasksConfig {
@@ -467,8 +490,23 @@ impl Default for BackendTasksConfig {
             embedding_backfill_interval_secs: default_embedding_backfill_interval_secs(),
             consolidation_interval_secs: default_consolidation_interval_secs(),
             consolidation_llm: None,
+            knowledge_trash_retention_days: default_knowledge_trash_retention_days(),
+            knowledge_trash_sweep_interval_secs: default_knowledge_trash_sweep_interval_secs(),
         }
     }
+}
+
+/// Retention default: the historical `SOFT_DELETE_TTL_DAYS` const, promoted to
+/// a configurable knob without changing behaviour for existing instances.
+pub(super) fn default_knowledge_trash_retention_days() -> u32 {
+    desktop_assistant_storage::dreaming::SOFT_DELETE_TTL_DAYS
+}
+
+/// Sweep cadence default: hourly. The sweep is a single indexed DELETE per user
+/// with a tombstone, so a short cadence costs nothing and keeps a `0`-retention
+/// instance honest.
+pub(super) fn default_knowledge_trash_sweep_interval_secs() -> u64 {
+    3600
 }
 
 pub(super) fn default_archive_after_days() -> u32 {
@@ -1921,7 +1959,10 @@ type = "openai"
         let loaded = load_daemon_config(&path).unwrap().unwrap();
 
         assert_eq!(loaded.backend_tasks.knowledge_trash_retention_days, 3);
-        assert_eq!(loaded.backend_tasks.knowledge_trash_sweep_interval_secs, 900);
+        assert_eq!(
+            loaded.backend_tasks.knowledge_trash_sweep_interval_secs,
+            900
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

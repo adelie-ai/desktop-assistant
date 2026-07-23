@@ -1800,6 +1800,31 @@ where
                 self.notify_knowledge_changed();
                 Ok(api::CommandResult::Ack)
             }
+            api::Command::GetKnowledgeTrashCount => {
+                let count = self
+                    .knowledge
+                    .trash_count()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::KnowledgeTrashCount {
+                    count: count.min(u32::MAX as usize) as u32,
+                })
+            }
+            api::Command::EmptyKnowledgeTrash => {
+                let deleted = self
+                    .knowledge
+                    .empty_trash()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                // Only a reap that freed something is worth a refetch; an empty
+                // trash is a no-op and must not churn every connected panel.
+                if deleted > 0 {
+                    self.notify_knowledge_changed();
+                }
+                Ok(api::CommandResult::KnowledgeTrashEmptied {
+                    deleted_count: deleted.min(u32::MAX as usize) as u32,
+                })
+            }
             api::Command::StartKnowledgeMaintenance { op } => {
                 // Run the requested pass as a tracked, cancellable background
                 // task via the registry, returning its id immediately — never
@@ -3540,6 +3565,12 @@ mod tests {
         }
         async fn delete_entry(&self, _id: String) -> Result<(), CoreError> {
             Ok(())
+        }
+        async fn trash_count(&self) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        async fn empty_trash(&self) -> Result<usize, CoreError> {
+            Ok(0)
         }
     }
 

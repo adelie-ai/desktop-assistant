@@ -1,13 +1,14 @@
 # Knowledge maintenance (the "dream cycle") + live panel sync
 
-The knowledge base is maintained by three background passes. Historically they
+The knowledge base is maintained by four background passes. Historically they
 ran only on daemon timers; they can now also be **triggered on demand** from the
 knowledge panels in every GUI (GTK, TUI, KDE KCM), and the panels **update live**
-as entries change. This page documents the passes, the on-demand trigger path,
-the event-broadcast chain that drives live refresh, the concurrency model, and
-the cancellation story — so none of it has to be re-derived from the code.
+as entries change. This page documents the passes, the trash lifecycle, the
+on-demand trigger path, the event-broadcast chain that drives live refresh, the
+concurrency model, and the cancellation story — so none of it has to be
+re-derived from the code.
 
-## The three passes
+## The four passes
 
 All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backfill.rs`:
 
@@ -16,12 +17,44 @@ All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backf
 | **Extraction** | `run_dreaming_scan` | Scans conversations past their watermark, asks an LLM to extract durable facts, writes them (+ archival of long-quiet conversations). | frequent (hourly) |
 | **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (prune / merge / tighten) with a stronger model, applied transactionally with soft-delete. | slow (daily) |
 | **Embedding recompute** | `backfill_knowledge_embeddings` | Re-embeds rows. The periodic backfill only touches NULL/stale/model-mismatched rows; the **force** path (`invalidate_all_knowledge_embeddings` → backfill) re-embeds everything. | periodic + on-demand |
+| **Trash sweep** | `sweep_expired_trash` | Frees soft-deleted entries past their retention window. No LLM, no embeddings — a single indexed DELETE per user. | frequent (hourly) |
 
 Embedding model changes are handled automatically: each row stamps its
 `embedding_model`, and the periodic backfill re-embeds rows whose stamp ≠ the
 current model (`invalidate_stale_embeddings`). The **Recalculate Embeddings**
 button is the force escape hatch for out-of-band cases (rows edited by raw SQL,
 corrupted vectors).
+
+## The trash: soft delete, retention, reaping
+
+Consolidation retires an entry by stamping `deleted_at`, not by deleting the
+row. A retired entry is excluded from every read path — search, list, get, the
+embedding pipeline — so the tombstone behaves as if it were gone while staying
+recoverable and auditable. What happens next is a three-step lifecycle, all in
+`crates/storage/src/dreaming/trash.rs`:
+
+1. **Retention.** `[backend_tasks] knowledge_trash_retention_days` (default 30,
+   the historical `SOFT_DELETE_TTL_DAYS`) is how long a tombstone is kept. `0`
+   means "do not retain" — reap on the next sweep.
+2. **Automatic reap.** The daemon's trash-sweep loop calls
+   `sweep_expired_trash` every `knowledge_trash_sweep_interval_secs` (default
+   3600; `0` disables the sweep). It iterates the users who hold tombstones and
+   reaps each user's expired rows under that user's scope. A consolidation
+   cycle *also* reaps inside its apply transaction, using the same configured
+   retention — but that is a convenience trigger, not the only one. Before this
+   split the reap lived only inside consolidation, so an instance with dreaming
+   disabled accumulated tombstones forever: invisible to every read, never
+   freed.
+3. **Empty on demand.** `Command::EmptyKnowledgeTrash` reaps every tombstone the
+   calling user owns immediately, ignoring the retention window, and replies
+   with the number of rows freed (`0` for an already-empty trash — a normal
+   outcome, not an error). `Command::GetKnowledgeTrashCount` reports how much is
+   in the trash, since no other read path can see it.
+
+Every one of these is scoped to a single `user_id`: one user's sweep, empty, or
+count never touches another's rows. The only cross-user statement is the
+sweep's "which users hold tombstones" scan, which installs a per-user scope
+before deleting anything.
 
 ## On-demand trigger path
 
@@ -87,10 +120,12 @@ is a broader, cross-cutting change tracked separately.
 
 | Concern | File |
 | ------- | ---- |
-| Command / op enum / result / event | `crates/api-model/src/lib.rs` (`StartKnowledgeMaintenance`, `MaintenanceOp`, `MaintenanceTaskStarted`, `Event::KnowledgeChanged`, `TaskKind::Maintenance`) |
+| Command / op enum / result / event | `crates/api-model/src/lib.rs` (`StartKnowledgeMaintenance`, `MaintenanceOp`, `MaintenanceTaskStarted`, `Event::KnowledgeChanged`, `TaskKind::Maintenance`, `GetKnowledgeTrashCount`, `EmptyKnowledgeTrash`) |
 | Signal projection | `crates/api-model/src/signal.rs` (`SignalEvent::KnowledgeChanged`) |
 | Port | `crates/core/src/ports/inbound.rs` (`KnowledgeMaintenanceService`) |
 | Scans + force-recalc | `crates/storage/src/dreaming/`, `crates/storage/src/embedding_backfill.rs` |
+| Trash lifecycle (count / empty / reap / sweep) | `crates/storage/src/dreaming/trash.rs`, sweep loop in `crates/daemon/src/main.rs` |
+| Retention + sweep cadence config | `crates/daemon/src/config/mod.rs` (`BackendTasksConfig::knowledge_trash_retention_days`, `knowledge_trash_sweep_interval_secs`, `trash_sweep_enabled`) |
 | Handler arm + `notify_knowledge_changed` | `crates/application/src/lib.rs`, `crates/application/src/background_tasks.rs` |
 | Daemon service + timer wiring | `crates/daemon/src/maintenance_service.rs`, `crates/daemon/src/main.rs` |
 | D-Bus method + signal | `crates/dbus-bridge/src/adapter/knowledge.rs`, `crates/dbus-bridge/src/adapter/event_forwarder.rs` |

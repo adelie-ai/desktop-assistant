@@ -13,19 +13,26 @@
 //!    active KB and recomputes it holistically (prune / merge / tighten),
 //!    applying explicit operations in one transaction with soft-delete. Run on
 //!    its own slower cadence by [`run_consolidation_scan`].
+//! 4. **Trash sweep** (frequent, cheap, no LLM) — frees soft-deleted entries
+//!    past their retention window. Deliberately independent of the passes
+//!    above: see [`trash`] and [`sweep_expired_trash`].
 
 mod archival;
 mod common;
 mod consolidation;
 mod extraction;
 mod reconcile;
+mod trash;
 mod types;
 
 use desktop_assistant_core::CoreError;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-pub use types::{BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn};
+pub use trash::{empty_trash, reap_expired_trash, sweep_expired_trash, trash_count};
+pub use types::{
+    BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, SOFT_DELETE_TTL_DAYS,
+};
 
 /// Surfaced for the DB-gated watermark-scoping integration test (#435). The
 /// `(user_id, conversation_id)` upsert guard on `dreaming_watermarks` (a second
@@ -83,14 +90,25 @@ pub async fn run_dreaming_scan(
 /// `cancellation` is observed between users (and between prompt slices) so an
 /// on-demand run can be stopped via the task registry. `on_change`, when set, is
 /// invoked after each user whose KB changed so connected panels refetch live.
+///
+/// `soft_delete_retention_days` is applied to the opportunistic trash reap
+/// inside each user's apply transaction, so a cycle uses the same retention the
+/// periodic sweep does.
 pub async fn run_consolidation_scan(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
+    soft_delete_retention_days: u32,
     cancellation: &CancellationToken,
     on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<ConsolidationStats, CoreError> {
-    let stats =
-        consolidation::run_consolidation_phase(pool, llm_fn, cancellation, on_change).await?;
+    let stats = consolidation::run_consolidation_phase(
+        pool,
+        llm_fn,
+        soft_delete_retention_days,
+        cancellation,
+        on_change,
+    )
+    .await?;
     if stats.merged_clusters > 0
         || stats.updated > 0
         || stats.soft_deleted > 0
