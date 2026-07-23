@@ -16,7 +16,7 @@
 //! ## Running locally
 //!
 //! ```sh
-//! just test-db -- --test knowledge_soft_delete
+//! just test-db --test knowledge_soft_delete
 //! ```
 //!
 //! When `TEST_DATABASE_URL` is unset every test pass-skips.
@@ -86,11 +86,11 @@ async fn write_entry(store: &PgKnowledgeBaseStore, id: &str, content: &str) {
     .await;
 }
 
-/// Boot a fixture with migrations applied, or pass-skip.
-async fn fixture(name: &str) -> Option<support::DbFixture> {
+/// Boot a fixture in its own schema with migrations applied. `None` when
+/// `TEST_DATABASE_URL` is unset, which is how each test pass-skips.
+async fn fixture() -> Option<support::DbFixture> {
     let fx = support::DbFixture::try_new("kb656").await?;
     run_migrations(&fx.pool).await.expect("run_migrations");
-    let _ = name;
     Some(fx)
 }
 
@@ -106,7 +106,7 @@ fn embed_fn(calls: Arc<AtomicUsize>) -> BackfillEmbedFn {
 
 #[tokio::test]
 async fn semantic_search_excludes_soft_deleted() {
-    let Some(fx) = fixture("semantic_search_excludes_soft_deleted").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -142,7 +142,7 @@ async fn semantic_search_excludes_soft_deleted() {
 
 #[tokio::test]
 async fn text_search_excludes_soft_deleted() {
-    let Some(fx) = fixture("text_search_excludes_soft_deleted").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -169,7 +169,7 @@ async fn text_search_excludes_soft_deleted() {
 
 #[tokio::test]
 async fn hybrid_search_excludes_soft_deleted_matched_by_both_branches() {
-    let Some(fx) = fixture("hybrid_both_branches").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -202,7 +202,7 @@ async fn hybrid_search_excludes_soft_deleted_matched_by_both_branches() {
 
 #[tokio::test]
 async fn soft_deleting_the_only_match_yields_empty_results() {
-    let Some(fx) = fixture("only_match").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -226,7 +226,7 @@ async fn soft_deleting_the_only_match_yields_empty_results() {
 
 #[tokio::test]
 async fn restored_entry_becomes_searchable_again() {
-    let Some(fx) = fixture("restore").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -253,7 +253,7 @@ async fn restored_entry_becomes_searchable_again() {
 
 #[tokio::test]
 async fn list_excludes_soft_deleted() {
-    let Some(fx) = fixture("list").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -277,7 +277,7 @@ async fn list_excludes_soft_deleted() {
 
 #[tokio::test]
 async fn list_page_excludes_soft_deleted() {
-    let Some(fx) = fixture("list_page").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -311,7 +311,7 @@ async fn list_page_excludes_soft_deleted() {
 
 #[tokio::test]
 async fn get_returns_none_for_soft_deleted() {
-    let Some(fx) = fixture("get").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -334,7 +334,7 @@ async fn get_returns_none_for_soft_deleted() {
 
 #[tokio::test]
 async fn stale_invalidation_skips_soft_deleted() {
-    let Some(fx) = fixture("invalidate").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -365,7 +365,7 @@ async fn stale_invalidation_skips_soft_deleted() {
 
 #[tokio::test]
 async fn backfill_skips_soft_deleted() {
-    let Some(fx) = fixture("backfill").await else {
+    let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
@@ -379,14 +379,10 @@ async fn backfill_skips_soft_deleted() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let embed = embed_fn(Arc::clone(&calls));
-    let updated = backfill_knowledge_embeddings(
-        &fx.pool,
-        &embed,
-        "model-A",
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("backfill");
+    let updated =
+        backfill_knowledge_embeddings(&fx.pool, &embed, "model-A", &CancellationToken::new())
+            .await
+            .expect("backfill");
 
     assert_eq!(
         updated, 1,

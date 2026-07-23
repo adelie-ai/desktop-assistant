@@ -43,7 +43,8 @@ pub async fn invalidate_stale_embeddings(
          SET embedding = NULL, embedding_model = NULL
          WHERE embedding IS NOT NULL
            AND embedding_model IS NOT NULL
-           AND embedding_model != $1",
+           AND embedding_model != $1
+           AND deleted_at IS NULL",
     )
     .bind(current_model)
     .execute(pool)
@@ -144,11 +145,15 @@ pub async fn backfill_knowledge_embeddings(
         // makes all four clauses false on the next pass — so a persistently
         // failing row is attempted once per content change, not in a tight loop.
         let rows: Vec<(String, String)> = sqlx::query_as(
+            // The staleness clauses are OR'd, so the soft-delete predicate has
+            // to bracket them — a bare trailing AND would bind to the last OR
+            // arm only and still pick up tombstones.
             "SELECT id, content FROM knowledge_base
-             WHERE embedding_model IS NULL
-                OR embedding_model != $1
-                OR embeddings_updated_at IS NULL
-                OR embeddings_updated_at < updated_at
+             WHERE deleted_at IS NULL
+               AND (embedding_model IS NULL
+                 OR embedding_model != $1
+                 OR embeddings_updated_at IS NULL
+                 OR embeddings_updated_at < updated_at)
              LIMIT $2",
         )
         .bind(current_model)
