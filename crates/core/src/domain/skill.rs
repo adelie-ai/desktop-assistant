@@ -13,6 +13,7 @@
 //! `SKILL.md` would let a swapped `scripts/run.sh` keep a stale blessing valid.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Whether an indexed skill is a plain playbook or a runnable workflow.
 ///
@@ -186,7 +187,38 @@ pub enum SkillError {
 /// required frontmatter fields; unknown keys are preserved in
 /// [`SkillFrontmatter::metadata`].
 pub fn parse_skill_md(raw: &str) -> Result<ParsedSkill, SkillError> {
-    todo!("parse SKILL.md ({} bytes)", raw.len())
+    // Tolerate a leading BOM and any leading whitespace before the fence.
+    let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim_start();
+    let after_open = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
+        .ok_or(SkillError::MissingFrontmatter)?;
+    let (yaml, body) =
+        split_at_close_fence(after_open).ok_or(SkillError::UnterminatedFrontmatter)?;
+    let frontmatter: SkillFrontmatter =
+        serde_yaml_ng::from_str(yaml).map_err(|e| SkillError::InvalidFrontmatter(e.to_string()))?;
+    // Drop the single newline the closing fence leaves at the head of the body.
+    let body = body
+        .strip_prefix("\r\n")
+        .or_else(|| body.strip_prefix('\n'))
+        .unwrap_or(body);
+    Ok(ParsedSkill {
+        frontmatter,
+        body: body.to_string(),
+    })
+}
+
+/// Split the text following the opening fence at the next line that is exactly
+/// `---`, returning `(yaml_before, remainder_after_fence_line)`.
+fn split_at_close_fence(s: &str) -> Option<(&str, &str)> {
+    let mut offset = 0;
+    for line in s.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            return Some((&s[..offset], &s[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// Derive the [`SkillKind`] from a markdown body.
@@ -195,7 +227,14 @@ pub fn parse_skill_md(raw: &str) -> Result<ParsedSkill, SkillError> {
 /// text is exactly `Steps` (case-insensitive), e.g. `## Steps`. A deeper heading
 /// (`### Steps`) or a longer title (`## Steps to reproduce`) does not qualify.
 pub fn detect_kind(body: &str) -> SkillKind {
-    todo!("detect kind from body ({} bytes)", body.len())
+    for line in body.lines() {
+        if let Some(rest) = line.trim().strip_prefix("## ")
+            && rest.trim().eq_ignore_ascii_case("steps")
+        {
+            return SkillKind::Workflow;
+        }
+    }
+    SkillKind::Skill
 }
 
 /// Validate a skill name against path traversal.
@@ -203,19 +242,44 @@ pub fn detect_kind(body: &str) -> SkillKind {
 /// Rejects empty names, `.`/`..`, path separators, and absolute paths so a name
 /// can never escape its root. Mirrors the guard in `skills-mcp`.
 pub fn validate_skill_name(name: &str) -> Result<(), SkillError> {
-    todo!("validate name {name:?}")
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(SkillError::InvalidName(name.to_string()));
+    }
+    Ok(())
 }
 
 /// Map a `.skill-lock.json` `sourceType` to a [`TrustTier`].
 ///
 /// `None` (no lockfile entry) is treated as locally authored.
 pub fn trust_tier_from_source_type(source_type: Option<&str>) -> TrustTier {
-    todo!("trust tier from {source_type:?}")
+    match source_type {
+        None | Some("local") => TrustTier::Local,
+        Some("github") => TrustTier::Github,
+        Some("well-known") => TrustTier::WellKnown,
+        Some(_) => TrustTier::Unknown,
+    }
 }
 
 /// Lowercase hex SHA-256 of an arbitrary byte slice (one attachment's digest).
 pub fn file_sha256_hex(bytes: &[u8]) -> String {
-    todo!("hash {} bytes", bytes.len())
+    to_hex(&Sha256::digest(bytes))
+}
+
+/// Lowercase hex-encode a byte slice.
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// Compute the integrity hash a blessing pins to.
@@ -225,11 +289,27 @@ pub fn file_sha256_hex(bytes: &[u8]) -> String {
 /// is deterministic and independent of the order attachments are supplied in
 /// (they are sorted internally). Returned as lowercase hex.
 pub fn skill_content_hash(skill_md: &[u8], attachments: &[AttachmentDigest]) -> String {
-    todo!(
-        "content hash over {} bytes + {} attachments",
-        skill_md.len(),
-        attachments.len()
-    )
+    let mut sorted: Vec<&AttachmentDigest> = attachments.iter().collect();
+    sorted.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    let mut hasher = Sha256::new();
+    // Domain separator + version so the scheme can evolve without silent clashes.
+    hasher.update(b"adelie-skill-v1\n");
+    update_len_prefixed(&mut hasher, skill_md);
+    hasher.update((sorted.len() as u64).to_be_bytes());
+    for att in sorted {
+        update_len_prefixed(&mut hasher, att.rel_path.as_bytes());
+        update_len_prefixed(&mut hasher, att.sha256_hex.as_bytes());
+        hasher.update(att.mode.to_be_bytes());
+    }
+    to_hex(&hasher.finalize())
+}
+
+/// Feed a length-prefixed field into the hasher so adjacent fields cannot be
+/// ambiguously re-partitioned (which would let two distinct inputs collide).
+fn update_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
 }
 
 /// The indexed representation of a skill: the currency of the `SkillIndexStore`
@@ -341,7 +421,10 @@ mod tests {
 
     #[test]
     fn detect_kind_workflow_on_steps_heading() {
-        assert_eq!(detect_kind("intro\n\n## Steps\n1. do it\n"), SkillKind::Workflow);
+        assert_eq!(
+            detect_kind("intro\n\n## Steps\n1. do it\n"),
+            SkillKind::Workflow
+        );
     }
 
     #[test]
@@ -393,7 +476,10 @@ mod tests {
 
     #[test]
     fn trust_tier_mapping() {
-        assert_eq!(trust_tier_from_source_type(Some("github")), TrustTier::Github);
+        assert_eq!(
+            trust_tier_from_source_type(Some("github")),
+            TrustTier::Github
+        );
         assert_eq!(
             trust_tier_from_source_type(Some("well-known")),
             TrustTier::WellKnown
