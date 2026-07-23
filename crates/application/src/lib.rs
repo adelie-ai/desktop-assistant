@@ -4900,6 +4900,7 @@ mod tests {
                 conversation_id: "conv-agent".into(),
                 result_sink: None,
                 subagent_scope: None,
+                scratchpad_write: None,
             },
             move |conversation_id| api::TaskKind::Standalone {
                 name: "agent".into(),
