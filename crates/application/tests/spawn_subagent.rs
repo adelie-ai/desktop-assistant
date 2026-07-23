@@ -1093,6 +1093,7 @@ async fn spawn_subagent_records_task_kind_subagent_with_correct_link() {
         parent_task_id,
         conversation_id,
         name,
+        ..
     } = &child.kind
     else {
         unreachable!();
@@ -1307,6 +1308,7 @@ where
                 parent_task_id: parent_for_kind,
                 conversation_id: format!("sub-conv-{remaining}"),
                 name: format!("level-{remaining}"),
+                session_conversation_id: format!("sub-conv-{remaining}"),
             },
             format!("level-{remaining}"),
             move |ctx| {

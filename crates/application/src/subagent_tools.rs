@@ -300,6 +300,18 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
 
         let parent_for_kind = parent_task_id.clone();
         let name_for_kind = name.clone();
+        // #287: adopt the child scope the dispatch loop minted (session pad +
+        // owner_todo + snapshot marker). `None` outside that loop path (e.g. a
+        // unit test), leaving the child on its own conversation's pad.
+        let pending_scope =
+            desktop_assistant_core::ports::scratchpad_scope::current_pending_child_scope();
+        // The session (top-level) conversation the child shares its pad with,
+        // recorded durably on the task kind; falls back to the child's own
+        // conversation when no scope is installed.
+        let session_conv_for_kind = pending_scope
+            .as_ref()
+            .map(|s| s.session_conversation_id.as_str().to_string())
+            .unwrap_or_else(|| child_conversation_id.clone());
         let spec = AgentConversationSpec {
             user_id: user_id.clone(),
             name: name.clone(),
@@ -313,11 +325,7 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
             },
             conversation_id: child_conversation_id.clone(),
             result_sink: Some(Arc::clone(&result_slot)),
-            // #287: adopt the child scope the dispatch loop minted (session pad +
-            // owner_todo + snapshot marker). `None` outside that loop path (e.g.
-            // a unit test), leaving the child on its own conversation's pad.
-            subagent_scope:
-                desktop_assistant_core::ports::scratchpad_scope::current_pending_child_scope(),
+            subagent_scope: pending_scope,
         };
 
         let child_task_id = spawn_agent_conversation(
@@ -328,6 +336,7 @@ impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
                 parent_task_id: parent_for_kind,
                 conversation_id: conv_id,
                 name: name_for_kind,
+                session_conversation_id: session_conv_for_kind,
             },
         );
 

@@ -217,6 +217,21 @@ impl TaskContext {
     }
 }
 
+/// Durable subagent metadata pinned onto a task row at spawn (#287).
+///
+/// The materialized `owner_todo` namespace and the UUIDv7 spawn snapshot
+/// marker the subagent reads its scratchpad snapshot against. `default()`
+/// (root `""` / `None`) is the correct value for every non-subagent task, so
+/// [`BackgroundTaskRegistry::spawn`] stays a thin wrapper that passes it.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnMeta {
+    /// The subagent's owner_todo namespace; root `""` for non-subagent tasks.
+    pub owner_todo: String,
+    /// The subagent's spawn snapshot marker (canonical UUIDv7); `None` for
+    /// non-subagent tasks, which never read a pad snapshot.
+    pub spawn_marker: Option<String>,
+}
+
 /// In-memory, user-scoped task registry.
 ///
 /// Cheap to `Clone` (it's `Arc`-wrapped internally) so a single
@@ -305,6 +320,25 @@ impl BackgroundTaskRegistry {
         F: FnOnce(TaskContext) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
+        self.spawn_with_meta(user_id, kind, title, SpawnMeta::default(), body)
+    }
+
+    /// Like [`Self::spawn`] but pins durable subagent metadata onto the task
+    /// row (#287): the `owner_todo` namespace and the UUIDv7 `spawn_marker`
+    /// the subagent's scratchpad snapshot reads against. Non-subagent callers
+    /// use [`Self::spawn`], which passes [`SpawnMeta::default`].
+    pub fn spawn_with_meta<F, Fut>(
+        &self,
+        user_id: UserId,
+        kind: api::TaskKind,
+        title: String,
+        meta: SpawnMeta,
+        body: F,
+    ) -> api::TaskId
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
         let task_id = api::TaskId(uuid::Uuid::new_v4().to_string());
         let parent = parent_task_id(&kind);
         let token = CancellationToken::new();
@@ -321,10 +355,10 @@ impl BackgroundTaskRegistry {
             children: Vec::new(),
             title,
             progress_hint: None,
-            // Placeholders: slice 5 populates these at spawn for subagents via
-            // SpawnMeta; non-subagent tasks stay root '' / None (#287).
-            owner_todo: String::new(),
-            spawn_marker: None,
+            // Durable subagent metadata (#287): populated from SpawnMeta by the
+            // subagent spawn path; root '' / None for every non-subagent task.
+            owner_todo: meta.owner_todo,
+            spawn_marker: meta.spawn_marker,
         };
 
         // Insert state, register child-link with parent (if any), and
@@ -508,6 +542,32 @@ impl BackgroundTaskRegistry {
             return None;
         }
         Some(state.view.clone())
+    }
+
+    /// #287: is any of this user's background tasks under the given `owner_todo`
+    /// subtree (within `session_conversation_id`) still non-terminal?
+    ///
+    /// The `complete_step` cascade uses this to DEFER deleting a subtree whose
+    /// subagents are still running -- their scratchpad notes ARE how they
+    /// report their result, so deleting mid-flight would lose it. Terminal
+    /// tasks are already evicted from the map, so a match here is necessarily
+    /// `Pending`/`Running`.
+    pub fn any_non_terminal_under_owner_prefix(
+        &self,
+        user_id: &UserId,
+        session_conversation_id: &str,
+        owner_prefix: &str,
+    ) -> bool {
+        let tasks = self.inner.tasks.lock().expect("tasks poisoned");
+        tasks.values().any(|state| {
+            &state.owner == user_id
+                && matches!(
+                    state.view.status,
+                    api::TaskStatus::Pending | api::TaskStatus::Running
+                )
+                && task_session_conversation(&state.view.kind) == Some(session_conversation_id)
+                && owner_under_prefix(&state.view.owner_todo, owner_prefix)
+        })
     }
 
     /// Page log entries for `id`. `after_seq` is exclusive: a value of
@@ -908,6 +968,27 @@ fn parent_task_id(kind: &api::TaskKind) -> Option<api::TaskId> {
     }
 }
 
+/// The session conversation a task's kind is scoped to, if it is a subagent
+/// (#287). Non-subagent kinds have no session pad.
+fn task_session_conversation(kind: &api::TaskKind) -> Option<&str> {
+    match kind {
+        api::TaskKind::Subagent {
+            session_conversation_id,
+            ..
+        } => Some(session_conversation_id.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `owner` is `prefix` itself or a dot-delimited descendant of it
+/// (#287): `"1.1"` is under `"1"`, but `"11"` is not.
+fn owner_under_prefix(owner: &str, prefix: &str) -> bool {
+    owner == prefix
+        || (owner.len() > prefix.len()
+            && owner.starts_with(prefix)
+            && owner.as_bytes()[prefix.len()] == b'.')
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -1169,6 +1250,51 @@ fn db_status_to_api(s: BackgroundTaskStatus) -> api::TaskStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawn a Running subagent task (its body is `pending()`, so it never
+    /// completes and stays in the map) with the given session + owner_todo.
+    fn spawn_running_sub(reg: &BackgroundTaskRegistry, user: &UserId, session: &str, owner: &str) {
+        reg.spawn_with_meta(
+            user.clone(),
+            api::TaskKind::Subagent {
+                parent_task_id: api::TaskId("p".into()),
+                conversation_id: "child".into(),
+                name: "n".into(),
+                session_conversation_id: session.into(),
+            },
+            "t".into(),
+            SpawnMeta {
+                owner_todo: owner.into(),
+                spawn_marker: Some("m".into()),
+            },
+            |_ctx| async { std::future::pending::<anyhow::Result<()>>().await },
+        );
+    }
+
+    #[tokio::test]
+    async fn any_non_terminal_under_owner_prefix_scopes_by_subtree_user_and_session() {
+        let reg = BackgroundTaskRegistry::new();
+        let alice = UserId::new("alice");
+        let bob = UserId::new("bob");
+        spawn_running_sub(&reg, &alice, "sess", "1.1");
+        // self + descendant, for the right user + session:
+        assert!(reg.any_non_terminal_under_owner_prefix(&alice, "sess", "1"));
+        assert!(reg.any_non_terminal_under_owner_prefix(&alice, "sess", "1.1"));
+        // wrong user / wrong session / sibling prefix -> no match (fail-closed):
+        assert!(!reg.any_non_terminal_under_owner_prefix(&bob, "sess", "1"));
+        assert!(!reg.any_non_terminal_under_owner_prefix(&alice, "other", "1"));
+        assert!(!reg.any_non_terminal_under_owner_prefix(&alice, "sess", "2"));
+    }
+
+    #[tokio::test]
+    async fn any_non_terminal_under_owner_prefix_respects_dot_boundary() {
+        let reg = BackgroundTaskRegistry::new();
+        let alice = UserId::new("alice");
+        spawn_running_sub(&reg, &alice, "sess", "1.11");
+        assert!(reg.any_non_terminal_under_owner_prefix(&alice, "sess", "1.11"));
+        // "1.11" is a sibling of "1.1", not a descendant (dot boundary):
+        assert!(!reg.any_non_terminal_under_owner_prefix(&alice, "sess", "1.1"));
+    }
 
     #[tokio::test]
     async fn notify_scratchpad_changed_reaches_subscribers() {
@@ -1438,6 +1564,7 @@ mod tests {
                 parent_task_id: parent.clone(),
                 conversation_id: "c-child".into(),
                 name: "sub".into(),
+                session_conversation_id: "c-session".into(),
             },
             "child".into(),
             |_ctx| async move { Ok(()) },

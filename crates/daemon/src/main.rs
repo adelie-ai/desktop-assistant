@@ -1364,6 +1364,13 @@ async fn main() -> Result<()> {
     let mut scratchpad_list_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadListFn,
     > = None;
+    // #287: the complete_step cascade's subtree-delete + the descendant-task
+    // lifecycle probe. Populated alongside the scratchpad wiring below.
+    let mut scratchpad_delete_subtree_fn: Option<
+        desktop_assistant_core::ports::scratchpad::ScratchpadDeleteSubtreeFn,
+    > = None;
+    let mut descendant_task_probe: Option<desktop_assistant_core::service::DescendantTaskProbe> =
+        None;
 
     // Per-conversation scratchpad command closures (#190) for the API handler,
     // populated alongside the builtin-tool wiring below. The same emit-wrapped
@@ -1483,6 +1490,34 @@ async fn main() -> Result<()> {
             Arc::clone(&delete_many_fn),
             Arc::clone(&clear_fn),
         );
+
+        // #287: subtree-delete (for the complete_step cascade) + the
+        // descendant-task lifecycle probe (so the cascade defers while a
+        // wait=false subagent under the step is still running). Both read the
+        // per-turn current_user_id(), like the mutating closures above.
+        let sp_ds = Arc::clone(&sp_store);
+        let reg_ds = Arc::clone(&background_task_registry);
+        let delete_subtree_fn: desktop_assistant_core::ports::scratchpad::ScratchpadDeleteSubtreeFn =
+            Arc::new(move |conv: String, owner: String| {
+                let store = Arc::clone(&sp_ds);
+                let reg = Arc::clone(&reg_ds);
+                Box::pin(async move {
+                    let deleted = store.delete_owner_subtree(&conv, &owner).await?;
+                    reg.notify_scratchpad_changed(&current_user_id(), conv);
+                    Ok(deleted)
+                })
+            });
+        scratchpad_delete_subtree_fn = Some(delete_subtree_fn);
+
+        let reg_probe = Arc::clone(&background_task_registry);
+        let probe: desktop_assistant_core::service::DescendantTaskProbe =
+            Arc::new(move |session: String, prefix: String| {
+                let reg = Arc::clone(&reg_probe);
+                Box::pin(async move {
+                    reg.any_non_terminal_under_owner_prefix(&current_user_id(), &session, &prefix)
+                })
+            });
+        descendant_task_probe = Some(probe);
 
         // Capture the same event-emitting write + list closures for the
         // conversation handler's planning/compaction tools (#240) before they
@@ -2177,6 +2212,13 @@ async fn main() -> Result<()> {
     }
     if let Some(list_fn) = scratchpad_list_fn {
         handler = handler.with_scratchpad_list(list_fn);
+    }
+    // #287: the complete_step cascade (subtree-delete) + its lifecycle gate.
+    if let Some(delete_subtree_fn) = scratchpad_delete_subtree_fn {
+        handler = handler.with_scratchpad_delete_subtree(delete_subtree_fn);
+    }
+    if let Some(probe) = descendant_task_probe {
+        handler = handler.with_descendant_task_probe(probe);
     }
 
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters

@@ -1522,6 +1522,12 @@ pub enum TaskKind {
         parent_task_id: TaskId,
         conversation_id: String,
         name: String,
+        /// The session (top-level) conversation whose scratchpad this subagent
+        /// shares (#287). Distinct from `conversation_id` (the child's own
+        /// conversation for history/LLM). `#[serde(default)]` so kind_json rows
+        /// persisted before this field deserialize as the root sentinel "".
+        #[serde(default)]
+        session_conversation_id: String,
     },
     /// A user-initiated standalone background agent (no waiting parent).
     Standalone {
@@ -2118,6 +2124,7 @@ mod tests {
                 parent_task_id: TaskId("parent".into()),
                 conversation_id: "conv-9".into(),
                 name: "researcher".into(),
+                session_conversation_id: "session-9".into(),
             },
             status: TaskStatus::Running,
             started_at: 1_700_000_000,
@@ -2191,6 +2198,7 @@ mod tests {
                 parent_task_id: TaskId("p1".into()),
                 conversation_id: "c2".into(),
                 name: "child".into(),
+                session_conversation_id: "s2".into(),
             },
             TaskKind::Standalone {
                 name: "agent".into(),
@@ -3122,5 +3130,50 @@ mod tests {
         assert!(json.contains("conversation_personality"), "json: {json}");
         let back: ConversationView = serde_json::from_str(&json).unwrap();
         assert_eq!(view, back);
+    }
+
+    fn remove_key_recursive(v: &mut serde_json::Value, key: &str) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.remove(key);
+                for val in map.values_mut() {
+                    remove_key_recursive(val, key);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for val in arr.iter_mut() {
+                    remove_key_recursive(val, key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn subagent_kind_session_conversation_id_round_trips_and_defaults() {
+        let k = TaskKind::Subagent {
+            parent_task_id: TaskId("p".into()),
+            conversation_id: "child".into(),
+            name: "researcher".into(),
+            session_conversation_id: "sess".into(),
+        };
+        // Round-trips with the field set (#287).
+        let json = serde_json::to_string(&k).unwrap();
+        assert!(json.contains("session_conversation_id"), "json: {json}");
+        let back: TaskKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, k);
+
+        // Backcompat: a kind_json persisted before this field (session key
+        // absent) deserializes with the root sentinel "".
+        let mut v = serde_json::to_value(&k).unwrap();
+        remove_key_recursive(&mut v, "session_conversation_id");
+        let legacy: TaskKind = serde_json::from_value(v).unwrap();
+        match legacy {
+            TaskKind::Subagent {
+                session_conversation_id,
+                ..
+            } => assert_eq!(session_conversation_id, ""),
+            other => panic!("expected Subagent, got {other:?}"),
+        }
     }
 }
