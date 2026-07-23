@@ -1,14 +1,17 @@
 //! Ollama connector implementing the core `LlmClient` and `EmbeddingClient` ports.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::llm::{
     BudgetSource, ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo,
-    ReasoningConfig, TokenUsage, current_context_budget, current_model_override,
+    ReasoningConfig, TokenUsage, current_cancellation_token, current_context_budget,
+    current_model_override,
 };
 use desktop_assistant_llm_http::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
@@ -22,6 +25,192 @@ use tokio::sync::OnceCell;
 /// reads naturally.
 const OLLAMA_CONNECT_TIMEOUT: std::time::Duration = STREAM_CONNECT_TIMEOUT;
 const OLLAMA_EVENT_TIMEOUT: std::time::Duration = STREAM_EVENT_TIMEOUT;
+
+/// PRESENCE-phase budget: how long to wait for `/api/tags` to tell us whether
+/// the model is installed. Presence is a cheap metadata lookup, so this is
+/// short by design — a stalled probe should fail fast rather than block the
+/// turn. Overridable via [`OllamaClient::with_presence_timeout`] (#560).
+const OLLAMA_PRESENCE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// PULL-phase budget: how long a single streamed `/api/pull` chunk may stall
+/// before we give up. A first pull of a multi-GB GGUF legitimately runs for
+/// many minutes, so this is deliberately generous — it only fires when the
+/// download goes *silent* (each received progress line resets the clock, like
+/// the generation stall window). Effectively "unbounded" for a healthy pull.
+/// Overridable via [`OllamaClient::with_pull_timeout`] (#560).
+const OLLAMA_PULL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// LOAD-phase budget: how long to wait for a cold model to become resident in
+/// memory (`/api/generate` warm-up) before failing with
+/// [`OllamaError::ModelLoadTimedOut`]. A cold GGUF load — especially on CPU —
+/// runs tens of seconds to minutes, which is precisely why loading must NOT be
+/// charged to the 30s generation connect budget (#560): doing so surfaces a
+/// legitimate slow load as a spurious "stream stalled". Minute-scale and
+/// overridable via [`OllamaClient::with_load_timeout`].
+const OLLAMA_LOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Interactive status sink: a cheap, `Clone`-able callback the connector uses
+/// to narrate long lifecycle phases (PULL/LOAD) back to the chat (#560).
+/// `Arc<dyn Fn>` (the same shape as core's `ContextUsageSink`) so it can live
+/// in a task-local slot and be called from any concurrent turn.
+pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
+
+tokio::task_local! {
+    /// Per-turn status sink used to narrate long lifecycle phases (PULL/LOAD)
+    /// back to the chat as transient progress hints (#560). Installed by the
+    /// transport/dispatch layer via [`with_status_sink`] for *interactive*
+    /// turns only; read by the connector via [`emit_status`].
+    ///
+    /// Unset outside an interactive scope (dreaming jobs, tests that don't opt
+    /// in), where [`emit_status`] is a silent no-op — so background work never
+    /// spams a UI that isn't listening.
+    static STATUS_SINK: StatusSink;
+}
+
+/// Install `sink` as the interactive status sink for the duration of `fut`.
+/// The Ollama connector calls it while a model is downloading or loading so a
+/// waiting user sees "Downloading model ..." / "Loading model ..." instead of
+/// a silent multi-minute pause (#560).
+pub async fn with_status_sink<F, T>(sink: StatusSink, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    STATUS_SINK.scope(sink, fut).await
+}
+
+/// Emit a transient status line to the installed [`STATUS_SINK`], if any. A
+/// no-op when no sink is installed (non-interactive turns) — status is
+/// best-effort narration, never load-bearing for the turn's outcome.
+fn emit_status(msg: impl Into<String>) {
+    let _ = STATUS_SINK.try_with(|sink| sink(msg.into()));
+}
+
+/// Lifecycle phase of an Ollama turn, carried on every [`OllamaError`] so a
+/// failure names *where* it happened (#560). Presence -> Pull -> Load ->
+/// Generate run strictly in order; each has its own budget and its own failure
+/// shape, so a slow cold load can never be misreported as a stalled stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Checking whether the model is installed (`/api/tags`).
+    Presence,
+    /// Downloading a missing model (`/api/pull`, streamed).
+    Pull,
+    /// Making a present model resident in memory (`/api/generate` warm-up).
+    Load,
+    /// Streaming the completion (`/api/chat`).
+    Generate,
+}
+
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Phase::Presence => "presence",
+            Phase::Pull => "pull",
+            Phase::Load => "load",
+            Phase::Generate => "generate",
+        }
+    }
+}
+
+/// Structured, per-phase failure for the Ollama connector (#560).
+///
+/// Each variant names the [`Phase`] it belongs to, so callers (and the
+/// [`CoreError`] mapping at the boundary) can tell a download failure from a
+/// load timeout from a mid-generation stall — replacing the old undifferentiated
+/// `"Ollama stream stalled"` string that lumped a minutes-long cold load in with
+/// a genuinely wedged response stream. `Display` carries the phase and enough
+/// context to debug; Ollama exposes no secrets, so nothing here is redacted.
+#[derive(Debug, thiserror::Error)]
+pub enum OllamaError {
+    /// PRESENCE probe failed (transport error, non-success, or its own
+    /// timeout). Distinct from "model absent", which is a normal branch, not
+    /// an error.
+    #[error("[{}] presence check failed for model '{model}': {detail}", Phase::Presence.as_str())]
+    PresenceCheckFailed { model: String, detail: String },
+
+    /// PULL failed: the streamed `/api/pull` reported an error, returned a
+    /// non-success status, or the download went silent past the pull budget.
+    #[error("[{}] model pull failed for '{model}': {detail}", Phase::Pull.as_str())]
+    ModelPullFailed { model: String, detail: String },
+
+    /// LOAD exceeded its (minute-scale) budget while making the model resident.
+    /// Explicitly NOT a "stream stalled": the generation stream never opened.
+    #[error("[{}] model '{model}' load timed out after {timeout_secs}s", Phase::Load.as_str())]
+    ModelLoadTimedOut { model: String, timeout_secs: u64 },
+
+    /// LOAD failed for a non-timeout reason (transport error or non-success
+    /// warm-up response).
+    #[error("[{}] model load failed for '{model}': {detail}", Phase::Load.as_str())]
+    ModelLoadFailed { model: String, detail: String },
+
+    /// GENERATE stalled: either the connection handshake produced no response
+    /// headers, or the response stream went silent mid-completion, within the
+    /// respective budget. Covers ONLY generation now that load is its own phase.
+    #[error("[{}] generation stalled: {detail}", Phase::Generate.as_str())]
+    GenerationStalled { detail: String },
+
+    /// The caller's cancellation token tripped during a lifecycle phase.
+    /// Mapped to [`CoreError::Cancelled`] at the boundary.
+    #[error("operation cancelled")]
+    Cancelled,
+}
+
+impl OllamaError {
+    /// The lifecycle [`Phase`] this failure occurred in. `None` for
+    /// [`Self::Cancelled`], which is not tied to a single phase.
+    pub fn phase(&self) -> Option<Phase> {
+        match self {
+            OllamaError::PresenceCheckFailed { .. } => Some(Phase::Presence),
+            OllamaError::ModelPullFailed { .. } => Some(Phase::Pull),
+            OllamaError::ModelLoadTimedOut { .. } | OllamaError::ModelLoadFailed { .. } => {
+                Some(Phase::Load)
+            }
+            OllamaError::GenerationStalled { .. } => Some(Phase::Generate),
+            OllamaError::Cancelled => None,
+        }
+    }
+}
+
+impl From<OllamaError> for CoreError {
+    /// Map a per-phase [`OllamaError`] onto the crate boundary's [`CoreError`].
+    /// Cancellation surfaces as [`CoreError::Cancelled`]; every other phase
+    /// failure becomes a [`CoreError::Llm`] whose message names the phase
+    /// (via `Display`), so the boundary type stays `CoreError` while the phase
+    /// is still legible downstream (#560).
+    fn from(e: OllamaError) -> Self {
+        match e {
+            OllamaError::Cancelled => CoreError::Cancelled,
+            other => CoreError::Llm(other.to_string()),
+        }
+    }
+}
+
+/// Result of the PRESENCE phase: whether the configured model is installed on
+/// the Ollama server. Present/absent is a normal branch — only a failed *probe*
+/// is an [`OllamaError`] (#560).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPresence {
+    Present,
+    Absent,
+}
+
+/// A single NDJSON progress line from a streamed `POST /api/pull` (#560).
+///
+/// Ollama emits one JSON object per line: `{"status":"pulling manifest"}`,
+/// `{"status":"downloading","digest":..,"total":N,"completed":M}`, ...,
+/// `{"status":"success"}`, or `{"error":".."}` on failure. Every field is
+/// optional across the different line shapes, so all are `Option`.
+#[derive(Deserialize)]
+struct PullProgress {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    completed: Option<u64>,
+}
 
 /// `keep_alive` window requested when pre-loading / keeping a model warm.
 /// Longer than Ollama's 5-minute default so an interactive model survives
@@ -96,11 +285,25 @@ pub struct OllamaClient {
     /// *down*, so a hardware/billing limit always binds — even over a larger
     /// per-turn purpose override. See [`Self::with_max_context_tokens`].
     context_cap: Option<u64>,
-    /// First-response (connect) stall budget. Defaults to
+    /// PRESENCE-phase budget (`/api/tags`). Defaults to
+    /// [`OLLAMA_PRESENCE_TIMEOUT`]; overridable via
+    /// [`Self::with_presence_timeout`] (#560).
+    presence_timeout: Duration,
+    /// PULL-phase per-chunk stall budget (streamed `/api/pull`). Defaults to
+    /// the generous [`OLLAMA_PULL_TIMEOUT`]; overridable via
+    /// [`Self::with_pull_timeout`] (#560).
+    pull_timeout: Duration,
+    /// LOAD-phase budget (`/api/generate` warm-up). Defaults to the
+    /// minute-scale [`OLLAMA_LOAD_TIMEOUT`]; overridable via
+    /// [`Self::with_load_timeout`]. Covers a cold GGUF load so it is never
+    /// charged to the generation connect budget (#560).
+    load_timeout: Duration,
+    /// GENERATE first-response (connect) stall budget. Defaults to
     /// [`OLLAMA_CONNECT_TIMEOUT`]; overridable per-connection so a slow local
-    /// model on CPU isn't killed mid prompt-eval.
+    /// model on CPU isn't killed mid prompt-eval. Covers ONLY generation now
+    /// that LOAD is a distinct pre-phase (#560).
     connect_timeout: std::time::Duration,
-    /// Per-chunk stall budget. Defaults to [`OLLAMA_EVENT_TIMEOUT`].
+    /// GENERATE per-chunk stall budget. Defaults to [`OLLAMA_EVENT_TIMEOUT`].
     event_timeout: std::time::Duration,
     /// Per-model cache of `/api/show`-derived *architecture ceiling* context
     /// lengths. `None` values are cached too (when `/api/show` declines to
@@ -129,6 +332,9 @@ impl OllamaClient {
             max_tokens: None,
             num_ctx: None,
             context_cap: None,
+            presence_timeout: OLLAMA_PRESENCE_TIMEOUT,
+            pull_timeout: OLLAMA_PULL_TIMEOUT,
+            load_timeout: OLLAMA_LOAD_TIMEOUT,
             connect_timeout: OLLAMA_CONNECT_TIMEOUT,
             event_timeout: OLLAMA_EVENT_TIMEOUT,
             context_length_cache: Mutex::new(HashMap::new()),
@@ -184,8 +390,36 @@ impl OllamaClient {
         self
     }
 
-    /// Override the first-response (connect) stall budget. `None`/`Some(0)`
-    /// keeps the [`OLLAMA_CONNECT_TIMEOUT`] default. Seconds.
+    /// Override the PRESENCE-phase budget (`/api/tags`). `None`/`Some(0)`
+    /// keeps the [`OLLAMA_PRESENCE_TIMEOUT`] default. Seconds (#560).
+    pub fn with_presence_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.presence_timeout = Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the PULL-phase per-chunk stall budget (streamed `/api/pull`).
+    /// `None`/`Some(0)` keeps the generous [`OLLAMA_PULL_TIMEOUT`] default.
+    /// Seconds (#560).
+    pub fn with_pull_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.pull_timeout = Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the LOAD-phase budget (`/api/generate` warm-up). `None`/`Some(0)`
+    /// keeps the minute-scale [`OLLAMA_LOAD_TIMEOUT`] default. Seconds (#560).
+    pub fn with_load_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.load_timeout = Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the GENERATE first-response (connect) stall budget.
+    /// `None`/`Some(0)` keeps the [`OLLAMA_CONNECT_TIMEOUT`] default. Seconds.
     pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.connect_timeout = std::time::Duration::from_secs(s);
@@ -207,78 +441,193 @@ impl OllamaClient {
             .get_or_try_init(|| async { self.ensure_model_available_impl().await })
             .await
             .map(|_| ())
+            .map_err(CoreError::from)
     }
 
-    async fn ensure_model_available_impl(&self) -> Result<(), CoreError> {
-        let base_url = self.base_url.trim_end_matches('/');
-        let tags_url = format!("{base_url}/api/tags");
+    // --- Lifecycle phases (#560) ------------------------------------------
+    // PRESENCE -> PULL -> LOAD -> GENERATE, each an explicit step with its own
+    // budget and its own failure shape, so a slow cold load can never be
+    // misreported as a stalled generation stream.
 
-        let tags_response = self
-            .client
-            .get(&tags_url)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("failed to check Ollama models: {e}")))?;
+    /// PRESENCE phase: is `model` installed on the server?
+    ///
+    /// A cheap `GET /api/tags` lookup bounded by its own short budget
+    /// ([`Self::presence_timeout`]). Present/absent is a NORMAL branch —
+    /// only a failed *probe* (transport error, non-success, timeout, or
+    /// cancellation) is an [`OllamaError`].
+    async fn check_presence(&self, model: &str) -> Result<ModelPresence, OllamaError> {
+        let cancellation = current_cancellation_token().unwrap_or_default();
+        let tags_url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
 
-        let tags_response = desktop_assistant_llm_http::bail_for_status(
-            tags_response,
-            "Ollama model list API error",
-        )
-        .await?;
+        let send = self.client.get(&tags_url).send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(OllamaError::Cancelled),
+            r = tokio::time::timeout(self.presence_timeout, send) => match r {
+                Err(_elapsed) => {
+                    return Err(OllamaError::PresenceCheckFailed {
+                        model: model.to_string(),
+                        detail: format!(
+                            "no response from /api/tags within {}s",
+                            self.presence_timeout.as_secs()
+                        ),
+                    });
+                }
+                Ok(Err(e)) => {
+                    return Err(OllamaError::PresenceCheckFailed {
+                        model: model.to_string(),
+                        detail: format!("request failed: {e}"),
+                    });
+                }
+                Ok(Ok(resp)) => resp,
+            },
+        };
 
-        let tags: OllamaTagsResponse = tags_response
-            .json()
-            .await
-            .map_err(|e| CoreError::Llm(format!("failed to parse Ollama model list: {e}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(OllamaError::PresenceCheckFailed {
+                model: model.to_string(),
+                detail: format!("HTTP {status}: {body}"),
+            });
+        }
+
+        let tags: OllamaTagsResponse =
+            response
+                .json()
+                .await
+                .map_err(|e| OllamaError::PresenceCheckFailed {
+                    model: model.to_string(),
+                    detail: format!("failed to parse /api/tags: {e}"),
+                })?;
 
         if tags
             .models
             .iter()
-            .any(|installed| model_matches(&self.model, installed))
+            .any(|installed| model_matches(model, installed))
         {
-            return Ok(());
+            Ok(ModelPresence::Present)
+        } else {
+            Ok(ModelPresence::Absent)
         }
+    }
 
-        tracing::info!(model = %self.model, "ollama model missing locally; pulling");
+    /// PULL phase: download a missing `model` via a **streamed**
+    /// `POST /api/pull` (`stream:true`), parsing the NDJSON progress and
+    /// narrating it to an interactive chat.
+    ///
+    /// Streaming is the whole point (#560): a non-streamed pull of a multi-GB
+    /// model returns nothing until it finishes and can trip a transport
+    /// timeout with no progress shown. The budget is per-*chunk*
+    /// ([`Self::pull_timeout`], generous) and resets on every progress line,
+    /// so a healthy long download never times out while a genuinely silent one
+    /// still fails with [`OllamaError::ModelPullFailed`].
+    async fn pull_model(&self, model: &str) -> Result<(), OllamaError> {
+        let cancellation = current_cancellation_token().unwrap_or_default();
+        let pull_url = format!("{}/api/pull", self.base_url.trim_end_matches('/'));
 
-        let pull_url = format!("{base_url}/api/pull");
-        let pull_response = self
+        // Seed the dedup state with the opening hint so a subsequent bare
+        // "downloading" line (no byte counts) doesn't repeat it verbatim.
+        let opening = format!("Downloading model {model}...");
+        emit_status(opening.clone());
+
+        let send = self
             .client
             .post(&pull_url)
             .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "model": self.model,
-                "stream": false,
-            }))
-            .send()
-            .await
-            .map_err(|e| {
-                CoreError::Llm(format!("failed to pull Ollama model '{}': {e}", self.model))
-            })?;
+            .json(&serde_json::json!({ "model": model, "stream": true }))
+            .send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(OllamaError::Cancelled),
+            r = send => r.map_err(|e| OllamaError::ModelPullFailed {
+                model: model.to_string(),
+                detail: format!("request failed: {e}"),
+            })?,
+        };
 
-        let _ = desktop_assistant_llm_http::bail_for_status(
-            pull_response,
-            &format!("Ollama model pull API error for '{}'", self.model),
-        )
-        .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            return Err(OllamaError::ModelPullFailed {
+                model: model.to_string(),
+                detail: format!("HTTP {status}: {body}"),
+            });
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut last_status: Option<String> = Some(opening);
+
+        loop {
+            let chunk = match next_step(&mut stream, &cancellation, self.pull_timeout).await {
+                StreamStep::Item(c) => c,
+                StreamStep::Done => break,
+                StreamStep::Cancelled => {
+                    drop(stream);
+                    return Err(OllamaError::Cancelled);
+                }
+                StreamStep::Stalled => {
+                    drop(stream);
+                    return Err(OllamaError::ModelPullFailed {
+                        model: model.to_string(),
+                        detail: format!(
+                            "download went silent for {}s",
+                            self.pull_timeout.as_secs()
+                        ),
+                    });
+                }
+            };
+            let bytes = chunk.map_err(|e| OllamaError::ModelPullFailed {
+                model: model.to_string(),
+                detail: format!("stream read error: {e}"),
+            })?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer[..newline_pos].trim().to_string();
+                buffer = buffer[newline_pos + 1..].to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                handle_pull_line(model, &line, &mut last_status)?;
+            }
+        }
+
+        // A final line may arrive without a trailing newline.
+        let remaining = buffer.trim();
+        if !remaining.is_empty() {
+            handle_pull_line(model, remaining, &mut last_status)?;
+        }
 
         Ok(())
     }
 
-    /// Pre-load `model` into Ollama's memory by POSTing an empty-prompt
-    /// `/api/generate` with a [`OLLAMA_KEEP_ALIVE`] window. Ollama loads the
-    /// weights (a cold load of a large GGUF — especially on CPU — can take
-    /// tens of seconds to minutes) and returns once resident.
+    /// LOAD phase: make `model` resident in memory via an empty-prompt
+    /// `POST /api/generate` with a [`OLLAMA_KEEP_ALIVE`] window, bounded by the
+    /// minute-scale [`Self::load_timeout`].
     ///
-    /// Best-effort and side-effect-only: transport errors and non-success
-    /// responses are logged at debug and swallowed so callers can fall through
-    /// to the real request, which surfaces any genuine failure. Used both as
-    /// the pre-request warm-up in [`Self::stream_completion`] (so the stall
-    /// timeouts cover generation, not loading) and by the daemon's interactive
-    /// keep-warm loop.
-    pub async fn warm_model(&self, model: &str) {
+    /// Called explicitly BEFORE the chat stream (#560) so a cold GGUF load —
+    /// which can run tens of seconds to minutes — is never charged to the 30s
+    /// generation connect budget. A slow load fails cleanly as
+    /// [`OllamaError::ModelLoadTimedOut`] (NOT a "stream stalled"), and unlike
+    /// the old best-effort `warm_model`, load errors PROPAGATE to the caller
+    /// instead of being swallowed.
+    pub async fn load_model(&self, model: &str) -> Result<(), OllamaError> {
+        let cancellation = current_cancellation_token().unwrap_or_default();
         let url = format!("{}/api/generate", self.base_url.trim_end_matches('/'));
-        let result = self
+
+        // Narrate the load only when interactive (a sink is installed). On a
+        // cold model this is the multi-minute pause worth explaining; on a warm
+        // model the request returns near-instantly and the hint is a harmless
+        // flash the first streamed token replaces.
+        emit_status(format!("Loading model {model}..."));
+
+        let send = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -288,19 +637,64 @@ impl OllamaClient {
                 "stream": false,
                 "keep_alive": OLLAMA_KEEP_ALIVE,
             }))
-            .send()
-            .await;
-        match result {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(model, "ollama model warmed (resident in memory)");
+            .send();
+
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(OllamaError::Cancelled),
+            _ = tokio::time::sleep(self.load_timeout) => {
+                return Err(OllamaError::ModelLoadTimedOut {
+                    model: model.to_string(),
+                    timeout_secs: self.load_timeout.as_secs(),
+                });
             }
-            Ok(resp) => {
-                let status = resp.status();
-                tracing::debug!(model, %status, "ollama warm-up non-success; proceeding");
+            r = send => r.map_err(|e| OllamaError::ModelLoadFailed {
+                model: model.to_string(),
+                detail: format!("request failed: {e}"),
+            })?,
+        };
+
+        if response.status().is_success() {
+            tracing::debug!(model, "ollama model loaded (resident in memory)");
+            Ok(())
+        } else {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read body".into());
+            Err(OllamaError::ModelLoadFailed {
+                model: model.to_string(),
+                detail: format!("HTTP {status}: {body}"),
+            })
+        }
+    }
+
+    /// PRESENCE -> PULL, memoized once per connection via [`Self::model_ready`]
+    /// (#560). Runs the cheap presence probe first and only pulls when the
+    /// model is genuinely absent — so a present model costs a single `/api/tags`
+    /// round-trip and never re-pulls on subsequent turns.
+    async fn ensure_model_available_impl(&self) -> Result<(), OllamaError> {
+        match self.check_presence(&self.model).await? {
+            ModelPresence::Present => Ok(()),
+            ModelPresence::Absent => {
+                tracing::info!(model = %self.model, "ollama model missing locally; pulling");
+                self.pull_model(&self.model).await
             }
-            Err(e) => {
-                tracing::debug!(model, error = %e, "ollama warm-up request failed; proceeding");
-            }
+        }
+    }
+
+    /// Best-effort keep-warm wrapper around the LOAD phase ([`Self::load_model`])
+    /// for the daemon's background keep-warm loop.
+    ///
+    /// Infallible by design: a transient failure in a periodic keep-warm tick
+    /// must not crash the loop, so the error is logged at debug and swallowed.
+    /// The interactive request path deliberately does NOT use this — it calls
+    /// [`Self::load_model`] directly, which propagates load errors and reports a
+    /// slow load as [`OllamaError::ModelLoadTimedOut`] rather than letting the
+    /// turn fall through to a spurious generation stall (#560).
+    pub async fn warm_model(&self, model: &str) {
+        if let Err(e) = self.load_model(model).await {
+            tracing::debug!(model, error = %e, "ollama warm-up failed; proceeding");
         }
     }
 
@@ -826,13 +1220,33 @@ impl LlmClient for OllamaClient {
         // it isn't pulled.
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
 
-        // Pre-load the model into memory BEFORE the streaming request so the
-        // connect/stall budgets below cover generation latency only — not a
-        // (potentially minutes-long) cold load on CPU. Raced against
-        // cancellation so a wedged load stays interruptible.
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-            () = self.warm_model(&model) => {}
+        // LOAD phase (#560): make the model resident BEFORE opening the chat
+        // stream, as a distinct step with its own minute-scale budget. Doing
+        // this here means a cold GGUF load is never charged to the generation
+        // connect budget below (which would surface a slow load as a spurious
+        // "stream stalled"). `load_model` observes the cancellation token
+        // internally, so a wedged load stays interruptible.
+        if let Err(e) = self.load_model(&model).await {
+            match e {
+                // The bug this phase exists to fix: a load that exceeds its
+                // (minute-scale) budget must surface honestly, not be relabelled
+                // a generation stall by the connect timeout below.
+                OllamaError::ModelLoadTimedOut { .. } => return Err(e.into()),
+                // Cancellation propagates unchanged.
+                OllamaError::Cancelled => return Err(CoreError::Cancelled),
+                // A non-timeout warm-up failure is best-effort: log and fall
+                // through to the real `/api/chat` request, which surfaces AND
+                // richly classifies any genuine model problem (model-loading,
+                // tools-unsupported, context-overflow, ...) via the HTTP-error
+                // handling below — strictly better than a raw load error here.
+                other => {
+                    tracing::debug!(
+                        model = %model,
+                        error = %other,
+                        "ollama warm-up did not confirm resident; proceeding to generation"
+                    );
+                }
+            }
         }
 
         let chat_tools: Vec<ChatTool> = tools.iter().map(ChatTool::from).collect();
@@ -889,9 +1303,15 @@ impl LlmClient for OllamaClient {
             _ = tokio::time::sleep(self.connect_timeout) => {
                 tracing::error!(
                     timeout_s = self.connect_timeout.as_secs(),
-                    "Ollama request send() timed out (no response headers)"
+                    "Ollama generation connect timed out (no response headers)"
                 );
-                return Err(CoreError::Llm("Ollama stream stalled".into()));
+                return Err(OllamaError::GenerationStalled {
+                    detail: format!(
+                        "no response headers within {}s (connect)",
+                        self.connect_timeout.as_secs()
+                    ),
+                }
+                .into());
             }
             r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
         };
@@ -965,10 +1385,16 @@ impl LlmClient for OllamaClient {
                 StreamStep::Stalled => {
                     tracing::error!(
                         timeout_s = self.event_timeout.as_secs(),
-                        "Ollama stream stalled — no further chunk"
+                        "Ollama generation stalled — no further chunk"
                     );
                     drop(stream);
-                    return Err(CoreError::Llm("Ollama stream stalled".into()));
+                    return Err(OllamaError::GenerationStalled {
+                        detail: format!(
+                            "no further chunk within {}s (mid-stream)",
+                            self.event_timeout.as_secs()
+                        ),
+                    }
+                    .into());
                 }
             };
             let bytes = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
@@ -1136,6 +1562,52 @@ fn detect_ollama_model_loading(body: &str) -> bool {
 /// downstream.
 fn detect_ollama_tools_unsupported(body: &str) -> bool {
     body.to_ascii_lowercase().contains("does not support tools")
+}
+
+/// Handle one NDJSON line from a streamed `/api/pull` (#560).
+///
+/// Surfaces an `{"error":..}` line as [`OllamaError::ModelPullFailed`], and
+/// otherwise narrates download progress as a throttled status line — deduped
+/// against `last_status` so identical percentages (Ollama repeats them) don't
+/// spam the chat. Unparseable lines are logged and skipped, not fatal.
+fn handle_pull_line(
+    model: &str,
+    line: &str,
+    last_status: &mut Option<String>,
+) -> Result<(), OllamaError> {
+    let progress: PullProgress = match serde_json::from_str(line) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failed to parse pull progress line: {e}; line: {line}");
+            return Ok(());
+        }
+    };
+    if let Some(err) = progress.error {
+        return Err(OllamaError::ModelPullFailed {
+            model: model.to_string(),
+            detail: err,
+        });
+    }
+    // A byte-count line yields a percentage; a coarse "downloading ..." status
+    // line without counts yields a bare note. Everything else (manifest,
+    // verify, success) is silent.
+    let msg = match (progress.total, progress.completed) {
+        (Some(total), Some(completed)) if total > 0 => {
+            let pct = completed.saturating_mul(100) / total;
+            Some(format!("Downloading model {model}... {pct}%"))
+        }
+        _ => progress
+            .status
+            .filter(|s| s.to_ascii_lowercase().contains("download"))
+            .map(|_| format!("Downloading model {model}...")),
+    };
+    if let Some(msg) = msg
+        && last_status.as_deref() != Some(msg.as_str())
+    {
+        emit_status(msg.clone());
+        *last_status = Some(msg);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2330,6 +2802,306 @@ mod tests {
                 .expect("dispatch must succeed");
         })
         .await;
+        chat.assert_calls(1);
+    }
+
+    // --- Lifecycle state machine (issue #560) ----------------------------
+
+    /// A status sink that records every emitted line, for asserting on the
+    /// interactive PULL/LOAD narration.
+    fn recording_sink() -> (StatusSink, Arc<std::sync::Mutex<Vec<String>>>) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_sink = Arc::clone(&log);
+        let sink: StatusSink = Arc::new(move |m: String| log_for_sink.lock().unwrap().push(m));
+        (sink, log)
+    }
+
+    #[test]
+    fn ollama_timeouts_are_configurable() {
+        // Defaults: every phase budget has a named, non-magic default.
+        let d = OllamaClient::new("http://localhost:11434", "m");
+        assert_eq!(d.presence_timeout, OLLAMA_PRESENCE_TIMEOUT);
+        assert_eq!(d.pull_timeout, OLLAMA_PULL_TIMEOUT);
+        assert_eq!(d.load_timeout, OLLAMA_LOAD_TIMEOUT);
+        assert_eq!(d.connect_timeout, OLLAMA_CONNECT_TIMEOUT);
+        assert_eq!(d.event_timeout, OLLAMA_EVENT_TIMEOUT);
+
+        // Every phase budget is overridable via its builder.
+        let c = OllamaClient::new("http://localhost:11434", "m")
+            .with_presence_timeout(Some(3))
+            .with_pull_timeout(Some(7200))
+            .with_load_timeout(Some(120))
+            .with_connect_timeout(Some(45))
+            .with_event_timeout(Some(90));
+        assert_eq!(c.presence_timeout, Duration::from_secs(3));
+        assert_eq!(c.pull_timeout, Duration::from_secs(7200));
+        assert_eq!(c.load_timeout, Duration::from_secs(120));
+        assert_eq!(c.connect_timeout, Duration::from_secs(45));
+        assert_eq!(c.event_timeout, Duration::from_secs(90));
+
+        // `None`/`Some(0)` keep the default — no accidental zero-budget footgun.
+        let z = OllamaClient::new("http://localhost:11434", "m")
+            .with_load_timeout(Some(0))
+            .with_pull_timeout(None)
+            .with_presence_timeout(Some(0));
+        assert_eq!(z.load_timeout, OLLAMA_LOAD_TIMEOUT);
+        assert_eq!(z.pull_timeout, OLLAMA_PULL_TIMEOUT);
+        assert_eq!(z.presence_timeout, OLLAMA_PRESENCE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn ollama_phase_failures_carry_distinct_error_variants() {
+        // PRESENCE: a failed probe (HTTP 500) is PresenceCheckFailed — distinct
+        // from "model absent", which is a normal Ok branch, not an error.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(500).body("boom");
+        });
+        let client = OllamaClient::new(server.url(""), "mystery");
+        let err = client
+            .check_presence("mystery")
+            .await
+            .expect_err("a 500 presence probe must fail");
+        assert!(
+            matches!(err, OllamaError::PresenceCheckFailed { .. }),
+            "expected PresenceCheckFailed, got {err:?}"
+        );
+        assert_eq!(err.phase(), Some(Phase::Presence));
+
+        // PULL: an error line in the streamed pull is ModelPullFailed.
+        let pull_server = MockServer::start();
+        pull_server.mock(|when, then| {
+            when.method(POST).path("/api/pull");
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"error\":\"pull access denied\"}\n");
+        });
+        let pull_client = OllamaClient::new(pull_server.url(""), "gated");
+        let perr = pull_client
+            .pull_model("gated")
+            .await
+            .expect_err("a pull error line must fail the pull");
+        assert!(
+            matches!(perr, OllamaError::ModelPullFailed { .. }),
+            "expected ModelPullFailed, got {perr:?}"
+        );
+        assert_eq!(perr.phase(), Some(Phase::Pull));
+
+        // LOAD: a load that exceeds its (sub-turn) budget is ModelLoadTimedOut
+        // — explicitly NOT a stream stall.
+        let load_server = MockServer::start();
+        load_server.mock(|when, then| {
+            when.method(POST).path("/api/generate");
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(Duration::from_millis(1200))
+                .body("{\"done\":true}");
+        });
+        let load_client = OllamaClient::new(load_server.url(""), "slow").with_load_timeout(Some(1));
+        let lerr = load_client
+            .load_model("slow")
+            .await
+            .expect_err("a load past its budget must time out");
+        assert!(
+            matches!(lerr, OllamaError::ModelLoadTimedOut { .. }),
+            "expected ModelLoadTimedOut, got {lerr:?}"
+        );
+        assert_eq!(lerr.phase(), Some(Phase::Load));
+
+        // Boundary mapping keeps CoreError but carries the phase — and a load
+        // timeout must never read as a generation "stream stalled".
+        let core: CoreError = OllamaError::ModelLoadTimedOut {
+            model: "m".into(),
+            timeout_secs: 300,
+        }
+        .into();
+        let msg = core.to_string();
+        assert!(
+            msg.contains("load timed out"),
+            "phase-tagged message: {msg}"
+        );
+        assert!(
+            !msg.contains("stream stalled"),
+            "a load timeout must not read as a stream stall: {msg}"
+        );
+
+        // GENERATE stall maps to a distinct, phase-tagged CoreError::Llm.
+        let gen_err: CoreError = OllamaError::GenerationStalled {
+            detail: "no response headers".into(),
+        }
+        .into();
+        assert!(matches!(gen_err, CoreError::Llm(_)));
+        assert!(
+            gen_err.to_string().contains("generation stalled"),
+            "generation phase must be legible: {gen_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_warm_model_propagates_load_errors() {
+        // The explicit LOAD phase must PROPAGATE a load failure — the old
+        // warm_model swallowed it and let the turn fall through to a spurious
+        // "stream stalled".
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/generate");
+            then.status(500).body("cannot load model: out of memory");
+        });
+        let client = OllamaClient::new(server.url(""), "big");
+        let err = client
+            .load_model("big")
+            .await
+            .expect_err("a load failure must propagate, not be swallowed");
+        assert!(
+            matches!(err, OllamaError::ModelLoadFailed { .. }),
+            "expected ModelLoadFailed, got {err:?}"
+        );
+
+        // The best-effort keep-warm wrapper stays infallible so a transient
+        // failure can't crash the daemon's background keep-warm loop.
+        client.warm_model("big").await; // must not panic
+    }
+
+    #[tokio::test]
+    async fn ollama_pull_streams_progress_and_does_not_time_out() {
+        let server = MockServer::start();
+        // Assert we STREAM the pull (`stream:true`) — the crux of the fix: a
+        // non-streamed pull of a big model returns no progress and can trip a
+        // transport timeout.
+        let pull = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/pull")
+                .body_includes("\"stream\":true");
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body(concat!(
+                    "{\"status\":\"pulling manifest\"}\n",
+                    "{\"status\":\"downloading\",\"digest\":\"sha256:a\",\"total\":100,\"completed\":50}\n",
+                    "{\"status\":\"downloading\",\"digest\":\"sha256:a\",\"total\":100,\"completed\":100}\n",
+                    "{\"status\":\"success\"}\n",
+                ));
+        });
+        let (sink, log) = recording_sink();
+        let client = OllamaClient::new(server.url(""), "big");
+        with_status_sink(sink, async {
+            client
+                .pull_model("big")
+                .await
+                .expect("a healthy streamed pull must succeed well within budget");
+        })
+        .await;
+        pull.assert_calls(1);
+        let msgs = log.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("Downloading model")),
+            "a download status is expected: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains('%')),
+            "streamed progress percent is expected: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_emits_downloading_and_loading_status_to_chat() {
+        let server = MockServer::start();
+        // Model absent -> PULL, then LOAD, then GENERATE.
+        server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"other:latest"}]}"#);
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/api/pull");
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"status\":\"downloading\",\"total\":10,\"completed\":10}\n{\"status\":\"success\"}\n");
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/api/generate");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("{\"done\":true}");
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+        let (sink, log) = recording_sink();
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        with_status_sink(sink, async {
+            client
+                .stream_completion(
+                    vec![Message::new(Role::User, "hi")],
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+                .expect("turn must succeed");
+        })
+        .await;
+        let msgs = log.lock().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.starts_with("Downloading model llama3.2")),
+            "expected a Downloading status: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.starts_with("Loading model llama3.2")),
+            "expected a Loading status: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_load_is_an_explicit_phase_not_charged_to_connect_timeout() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"llama3.2:latest"}]}"#);
+        });
+        // LOAD is slow (1.1s) — LONGER than the tiny 1s generation connect
+        // budget below. It has its own (default, minute-scale) load budget.
+        server.mock(|when, then| {
+            when.method(POST).path("/api/generate");
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(Duration::from_millis(1100))
+                .body("{\"done\":true}");
+        });
+        // GENERATE responds immediately once the (already-loaded) stream opens.
+        let chat = server.mock(|when, then| {
+            when.method(POST).path("/api/chat");
+            then.status(200)
+                .header("content-type", "application/x-ndjson")
+                .body("{\"message\":{\"content\":\"ok\"},\"done\":true}\n");
+        });
+        // Generation connect budget is deliberately SHORTER than the cold load.
+        // If loading were charged to it (the pre-#560 bug), the turn would fail
+        // with a spurious stall. It must succeed.
+        let client = OllamaClient::new(server.url(""), "llama3.2").with_connect_timeout(Some(1));
+        let start = std::time::Instant::now();
+        let resp = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect("a load slower than the connect budget must still succeed");
+        let elapsed = start.elapsed();
+        assert_eq!(resp.text, "ok");
+        assert!(
+            elapsed >= Duration::from_millis(1000),
+            "the load must run as its own phase, not be cut by the connect budget (took {elapsed:?})"
+        );
         chat.assert_calls(1);
     }
 }

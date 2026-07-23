@@ -1216,6 +1216,7 @@ dependencies = [
 name = "desktop-assistant-api-model"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "desktop-assistant-protocol",
  "serde",
  "serde_json",
@@ -1265,6 +1266,8 @@ dependencies = [
  "desktop-assistant-mcp-client",
  "desktop-assistant-uds",
  "futures",
+ "iana-time-zone",
+ "libc",
  "mcp-core",
  "rcgen",
  "reqwest",
@@ -1438,6 +1441,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1498,6 +1502,7 @@ name = "desktop-assistant-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

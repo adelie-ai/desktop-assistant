@@ -1051,7 +1051,8 @@ async fn ws_send_message_ack_then_streaming_events() {
             conversation_id: "c1".into(),
             content: "hello".into(),
             system_refinement: String::new(),
-            idempotency_key: None,
+            client_context: None,
+            idempotency_key: Some("idem-1".into()),
         },
     };
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1096,6 +1097,7 @@ async fn ws_send_message_ack_then_streaming_events() {
                     conversation_id,
                     request_id,
                     content,
+                    idempotency_key,
                 },
         } => {
             assert_eq!(conversation_id, "c1");
@@ -1103,6 +1105,14 @@ async fn ws_send_message_ack_then_streaming_events() {
             assert_eq!(
                 request_id, ack_request_id,
                 "UserMessageAdded request_id must match the SendMessageAck request_id"
+            );
+            // #570 Phase 1: the client-supplied idempotency_key is echoed back
+            // unchanged so the initiator can correlate its optimistic bubble by
+            // exact key match, round-tripping over the real WS transport.
+            assert_eq!(
+                idempotency_key,
+                Some("idem-1".to_string()),
+                "UserMessageAdded must echo the SendMessage idempotency_key"
             );
         }
         other => panic!("expected UserMessageAdded, got {other:?}"),
@@ -1207,6 +1217,7 @@ async fn ws_send_message_cancels_when_client_disconnects() {
             conversation_id: "c1".into(),
             content: "cancel-me".into(),
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         },
     };

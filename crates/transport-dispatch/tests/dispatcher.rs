@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink};
+use desktop_assistant_core::ports::request_scope::RequestScope;
+use desktop_assistant_core::ports::transport::{ClientContext, current_client_context};
 use desktop_assistant_transport_dispatch::{AuthContext, WsFrame, WsRequest, dispatch_loop};
 use futures::channel::mpsc;
 use futures::stream;
@@ -99,6 +101,7 @@ async fn dispatcher_streams_send_message_ack_then_events() {
             content: "hello".into(),
             override_selection: None,
             system_refinement: String::new(),
+            client_context: None,
             idempotency_key: None,
         },
     };
@@ -350,4 +353,183 @@ async fn lagged_event_subscription_emits_resync_error_frame() {
     );
 
     dispatch.abort();
+}
+
+// --- Per-turn client context (#557, epic #549) -----------------------------
+//
+// The browser-multiplexed web BFF shares ONE daemon connection across many
+// browsers, so it cannot ground each user's system prompt through the
+// per-connection handshake. Instead it supplies a per-turn `client_context` on
+// `SendMessage` that REPLACES the connection context for that turn. These tests
+// pin the daemon-side behavior end-to-end through `dispatch_loop`: the value the
+// turn body observes is what `current_client_context()` returns when the prompt
+// is assembled.
+
+/// Records the [`ClientContext`] the spawned turn body observes.
+///
+/// Mirrors the real registry send path (`send_message_via_registry`): it
+/// captures the request scope while the dispatcher's task-locals are still
+/// installed, then re-installs the bundle inside a fresh `tokio::spawn` and
+/// reads `current_client_context()` there — exactly the #549/#261
+/// spawn-crossing path a per-turn context must ride to reach prompt assembly.
+struct ContextRecordingHandler {
+    observed: Arc<std::sync::Mutex<Option<Option<ClientContext>>>>,
+}
+
+#[async_trait::async_trait]
+impl AssistantApiHandler for ContextRecordingHandler {
+    async fn handle_command(&self, _cmd: api::Command) -> ApiResult<api::CommandResult> {
+        Err(ApiError::Unsupported)
+    }
+
+    // Required by the trait but never reached: `SendMessage` is routed through
+    // `start_send_message` below, which registers a task id and returns `Some`.
+    async fn handle_send_message(
+        &self,
+        _conversation_id: String,
+        _content: String,
+        _request_id: String,
+        _sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        Ok(())
+    }
+
+    async fn start_send_message(
+        &self,
+        conversation_id: String,
+        _content: String,
+        _override_selection: Option<api::SendPromptOverride>,
+        _system_refinement: String,
+        request_id: String,
+        _idempotency_key: Option<String>,
+        sink: Arc<dyn EventSink>,
+    ) -> ApiResult<Option<api::TaskId>> {
+        // Capture BEFORE the spawn, while the dispatcher's `with_client_context`
+        // scope (the connection value, or the per-turn override) is installed.
+        let scope = RequestScope::capture();
+        let observed = Arc::clone(&self.observed);
+        tokio::spawn(async move {
+            // Re-install across the spawn boundary exactly like the real turn
+            // body, then record what the prompt assembler would read.
+            let ctx = scope.scope(async { current_client_context() }).await;
+            *observed.lock().unwrap() = Some(ctx);
+            // Signal completion AFTER recording so the test's await is ordered.
+            sink.emit(api::Event::AssistantCompleted {
+                conversation_id,
+                request_id,
+                full_response: String::new(),
+            })
+            .await;
+        });
+        Ok(Some(api::TaskId("t-1".into())))
+    }
+}
+
+/// Drive one `SendMessage` carrying `per_turn` through `dispatch_loop` on a
+/// connection whose `AuthContext` carries `auth`, and return the context the
+/// turn body observed.
+async fn observe_turn_context(
+    auth: AuthContext,
+    per_turn: Option<ClientContext>,
+) -> Option<ClientContext> {
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(ContextRecordingHandler {
+        observed: Arc::clone(&observed),
+    });
+    let req = WsRequest {
+        id: "send-1".into(),
+        command: api::Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hello".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            client_context: per_turn,
+            idempotency_key: None,
+        },
+    };
+    let inbound = stream::iter(vec![Ok::<_, anyhow::Error>(req)]);
+    let (out_tx, mut out_rx) = mpsc::channel::<WsFrame>(16);
+    let dispatch = tokio::spawn(dispatch_loop(handler, auth, inbound, out_tx));
+
+    use futures::StreamExt;
+    // Drain frames until the turn completes (ack first, then completion). The
+    // handler records the observed context before emitting completion.
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.next())
+            .await
+            .expect("dispatcher produced no frame")
+            .expect("outbound channel closed before completion");
+        if let WsFrame::Event {
+            event: api::Event::AssistantCompleted { .. },
+        } = frame
+        {
+            break;
+        }
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), dispatch).await;
+
+    let recorded = observed.lock().unwrap().clone();
+    recorded.expect("the turn body must have recorded a context")
+}
+
+fn ctx(real_name: &str) -> ClientContext {
+    ClientContext {
+        real_name: Some(real_name.to_string()),
+        ..ClientContext::default()
+    }
+}
+
+#[tokio::test]
+async fn per_turn_client_context_overrides_connection_in_the_turn_body() {
+    // A present, non-empty per-turn context REPLACES the connection context for
+    // this turn.
+    let auth = AuthContext::anonymous().with_client_context(Some(ctx("Connection User")));
+    let per_turn = ctx("BFF User");
+    let observed = observe_turn_context(auth, Some(per_turn.clone())).await;
+    assert_eq!(
+        observed,
+        Some(per_turn),
+        "the per-turn client_context must override the connection context for the turn"
+    );
+}
+
+#[tokio::test]
+async fn per_turn_client_context_used_when_connection_has_none() {
+    // The web BFF case: one shared daemon connection with NO handshake context;
+    // the real user's context arrives per turn and must ground the prompt.
+    let auth = AuthContext::anonymous();
+    let per_turn = ctx("BFF User");
+    let observed = observe_turn_context(auth, Some(per_turn.clone())).await;
+    assert_eq!(
+        observed,
+        Some(per_turn),
+        "with no connection context, the per-turn context must be what the turn sees"
+    );
+}
+
+#[tokio::test]
+async fn absent_per_turn_client_context_keeps_connection_context() {
+    // No per-turn override → the connection's handshake context stays in effect.
+    let connection = ctx("Connection User");
+    let auth = AuthContext::anonymous().with_client_context(Some(connection.clone()));
+    let observed = observe_turn_context(auth, None).await;
+    assert_eq!(
+        observed,
+        Some(connection),
+        "an absent per-turn context must leave the connection context in effect"
+    );
+}
+
+#[tokio::test]
+async fn empty_per_turn_client_context_keeps_connection_context() {
+    // An all-absent per-turn context must NOT wipe the connection context — it
+    // is treated the same as absent (fail-closed to the connection value).
+    let connection = ctx("Connection User");
+    let auth = AuthContext::anonymous().with_client_context(Some(connection.clone()));
+    let observed = observe_turn_context(auth, Some(ClientContext::default())).await;
+    assert_eq!(
+        observed,
+        Some(connection),
+        "an empty per-turn context must fall back to the connection context"
+    );
 }

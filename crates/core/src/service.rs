@@ -66,6 +66,13 @@ fn cancellation_token_or_default() -> CancellationToken {
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
 
+/// How often to emit a keepalive status while a server-side tool (or a subagent,
+/// which runs as a tool) executes silently, so the client's stall watchdog
+/// (90s, `EVENT_STALL_TIMEOUT`) does not false-abandon a turn the daemon is
+/// actively servicing (#584). Comfortably under the stall window, leaving margin
+/// for several resets.
+const SERVER_TOOL_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Transient instruction shown to the model for the #453 wind-down completion
 /// only (never persisted): the tool budget is spent, so it must close out in
 /// prose rather than request more tools.
@@ -886,6 +893,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // re-injected in `assemble_turn` when conditions indicate
         // the original message has drifted out of the model's view.
         conv.active_task = Some(prompt.clone());
+        // Persist the user prompt eagerly, before any cancellable work (#585).
+        // Otherwise the prompt lives only in memory until the terminal
+        // `store.update`, and every cancellation checkpoint returns
+        // `Err(Cancelled)` without saving — so a cancel/crash mid-turn would
+        // lose the user's message. Writing it now — inside the turn-lock, so no
+        // read-modify-write race (#282) — guarantees the prompt survives even if
+        // the turn is abandoned; the eventual terminal update overwrites this
+        // row with the full turn (prompt + reply). The clone is the cost of
+        // keeping `conv` for the rest of the turn (one extra write per turn).
+        self.store.update(conv.clone()).await?;
 
         // Effective window size for this turn. May shrink further if the
         // provider reports input-token usage above COMPACTION_TOKEN_RATIO.
@@ -1654,12 +1671,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     let exec = self.tools.execute_tool(&tool_call.name, arguments);
                     let scoped = with_conversation_id(conversation_id.clone(), exec);
                     // For `spawn_subagent`, install the child scope minted above so
-                    // the spawn-tool body adopts it for the child; every other tool
-                    // runs with no pending child scope. Both arms await to the same
-                    // `Result`, unifying their differing future types.
-                    let outcome = match pending_child_scope {
-                        Some(scope) => with_pending_child_scope(scope, scoped).await,
-                        None => scoped.await,
+                    // the spawn-tool body adopts it for the child (#287); every other
+                    // tool runs with no pending child scope. Fold both arms into one
+                    // future so the keepalive loop below drives a single type.
+                    let exec = async move {
+                        match pending_child_scope {
+                            Some(scope) => with_pending_child_scope(scope, scoped).await,
+                            None => scoped.await,
+                        }
+                    };
+                    // Keepalive during long server-side tool execution (#584): a
+                    // tool — or a subagent, which runs as a tool — can execute
+                    // silently for longer than the client's 90s stall watchdog,
+                    // which would then false-abandon a turn the daemon is still
+                    // servicing. Emit a periodic status so the client's watchdog
+                    // keeps resetting. Client tools don't need this (their
+                    // suspension parks the watchdog via the `ClientToolCall`
+                    // event). Cancellation is unaffected: the pinned `exec` future
+                    // still resolves `Cancelled` and breaks the loop.
+                    tokio::pin!(exec);
+                    let outcome = loop {
+                        tokio::select! {
+                            r = &mut exec => break r,
+                            _ = tokio::time::sleep(SERVER_TOOL_KEEPALIVE_INTERVAL) => {
+                                on_status(format!("Still working on {}", tool_call.name));
+                            }
+                        }
                     };
                     match outcome {
                         Ok(output) => {
@@ -2408,6 +2445,86 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| CoreError::ToolExecution(format!("unknown tool: {name}")))
         }
+    }
+
+    // #584: a tool executor that sleeps a configurable duration, to test the
+    // keepalive emitted during long server-side tool execution.
+    struct SlowToolExecutor {
+        tools: Vec<ToolDefinition>,
+        result: String,
+        delay: std::time::Duration,
+    }
+
+    impl ToolExecutor for SlowToolExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(self.result.clone())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_server_tool_emits_keepalive_status_within_stall_window() {
+        // #584: a server-side tool that runs longer than the keepalive interval
+        // must emit periodic status keepalives so the client's 90s stall watchdog
+        // does not false-abandon a turn the daemon is still servicing. (Subagents
+        // run as a tool, so this also covers "actively working in the background".)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let tools = vec![ToolDefinition::new(
+            "slow",
+            "slow tool",
+            serde_json::json!({"type": "object"}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "slow", "{}")]),
+            LlmResponse::text("done"),
+        ];
+        let executor = SlowToolExecutor {
+            tools,
+            result: "ok".to_string(),
+            // Longer than several keepalive intervals.
+            delay: std::time::Duration::from_secs(120),
+        };
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            executor,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("c".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+        let statuses = status_log.lock().unwrap();
+        let keepalives = statuses
+            .iter()
+            .filter(|s| s.contains("Still working"))
+            .count();
+        assert!(
+            keepalives >= 2,
+            "a long server tool must emit periodic keepalive statuses; got: {statuses:?}"
+        );
     }
 
     fn make_tool_handler(

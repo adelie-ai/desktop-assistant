@@ -60,6 +60,31 @@ pub struct AnthropicClient {
     context_cap: Option<u64>,
 }
 
+/// Redacting `Debug` so the API key can never leak through a `{:?}` render —
+/// e.g. if a future caller embeds the client in a `#[derive(Debug)]` struct or
+/// an error context. The key field renders as `<redacted; len=N>` — only its
+/// length is exposed, matching the daemon's `redacted_secret_audit` posture
+/// (carry enough for debugging without exposing the value).
+impl std::fmt::Debug for AnthropicClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicClient")
+            .field(
+                "api_key",
+                &format_args!("<redacted; len={}>", self.api_key.len()),
+            )
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("hosted_tool_search", &self.hosted_tool_search)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("event_timeout", &self.event_timeout)
+            .field("context_cap", &self.context_cap)
+            .finish()
+    }
+}
+
 impl AnthropicClient {
     pub fn get_default_model() -> Option<&'static str> {
         Some("claude-sonnet-4-6-20260227")
@@ -552,11 +577,18 @@ impl AnthropicClient {
                     detail: format!("Anthropic API error (HTTP {status}): {body}"),
                 });
             }
-            // HTTP 429 (rate limited) and 529 (Anthropic's "overloaded"
-            // status) are transient throttling signals. Map both to
-            // `CoreError::RateLimited` so the retry decorator backs off
-            // and downstream classifiers don't have to substring-match.
-            if status.as_u16() == 429 || status.as_u16() == 529 {
+            // Transient, retryable signals -> `CoreError::RateLimited` so the
+            // retry decorator backs off and downstream classifiers don't have
+            // to substring-match:
+            //   - 429 rate_limit_error (throttling),
+            //   - every 5xx: Anthropic documents 500 `api_error` and 529
+            //     `overloaded_error` as retryable, and an intervening
+            //     proxy/load-balancer can surface 502/503/504. A terminal
+            //     `CoreError::Llm` here would dead-end the turn on a blip the
+            //     next attempt would clear. Mirrors the sibling OpenAI
+            //     connector, which maps 503 the same way. Genuine 4xx client
+            //     errors (400/401/403/404) fall through to the generic arm.
+            if status.as_u16() == 429 || status.is_server_error() {
                 return Err(CoreError::RateLimited {
                     retry_after,
                     detail: format!("Anthropic API error (HTTP {status}): {body}"),
@@ -1917,5 +1949,266 @@ mod tests {
         );
         // Only the first chunk made it through before the callback aborted.
         assert_eq!(resp.text, "hello");
+    }
+
+    // --- Transient server-error classification (#561) --------------------
+    //
+    // Anthropic documents HTTP 500 (`api_error`) and 529 (`overloaded_error`)
+    // as transient/retryable, and an intervening proxy/load-balancer can emit
+    // 503. All of them must surface as `CoreError::RateLimited` so the retry
+    // decorator backs off, exactly like the already-handled 529 and the
+    // sibling OpenAI connector's 503 handling — not as a terminal
+    // `CoreError::Llm` that dead-ends the turn.
+
+    #[tokio::test]
+    async fn http_500_server_error_emits_rate_limited() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(500)
+                .header("content-type", "application/json")
+                .body(r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("500 must fail");
+
+        match err {
+            CoreError::RateLimited { detail, .. } => {
+                assert!(detail.contains("api_error"), "detail: {detail}");
+            }
+            other => panic!("expected RateLimited for transient 500, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_503_service_unavailable_emits_rate_limited() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(503)
+                .header("content-type", "text/plain")
+                .header("retry-after", "12")
+                .body("upstream unavailable");
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("503 must fail");
+
+        match err {
+            CoreError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(12)));
+            }
+            other => panic!("expected RateLimited for transient 503, got {other:?}"),
+        }
+    }
+
+    /// A generic 5xx with no `Retry-After` header still classifies as
+    /// retryable, with `retry_after: None` (the backoff falls back to its own
+    /// schedule).
+    #[tokio::test]
+    async fn http_502_bad_gateway_emits_rate_limited_without_hint() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(502).body("bad gateway");
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("502 must fail");
+
+        assert!(
+            matches!(
+                err,
+                CoreError::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "expected RateLimited with no hint, got {err:?}"
+        );
+    }
+
+    // --- Configurable connect/stall timeout (#214/#220/#561) --------------
+
+    #[test]
+    fn with_connect_timeout_overrides_default_but_ignores_zero_and_none() {
+        let base = AnthropicClient::new("k".into());
+        assert_eq!(base.connect_timeout, ANTHROPIC_CONNECT_TIMEOUT);
+
+        let overridden = AnthropicClient::new("k".into()).with_connect_timeout(Some(3));
+        assert_eq!(
+            overridden.connect_timeout,
+            std::time::Duration::from_secs(3)
+        );
+
+        // Zero and None must keep the default rather than setting a 0s budget
+        // that would fire instantly and fail every request.
+        let zeroed = AnthropicClient::new("k".into()).with_connect_timeout(Some(0));
+        assert_eq!(zeroed.connect_timeout, ANTHROPIC_CONNECT_TIMEOUT);
+        let noned = AnthropicClient::new("k".into()).with_connect_timeout(None);
+        assert_eq!(noned.connect_timeout, ANTHROPIC_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn with_event_timeout_overrides_default_but_ignores_zero_and_none() {
+        let base = AnthropicClient::new("k".into());
+        assert_eq!(base.event_timeout, ANTHROPIC_EVENT_TIMEOUT);
+
+        let overridden = AnthropicClient::new("k".into()).with_event_timeout(Some(7));
+        assert_eq!(overridden.event_timeout, std::time::Duration::from_secs(7));
+
+        let zeroed = AnthropicClient::new("k".into()).with_event_timeout(Some(0));
+        assert_eq!(zeroed.event_timeout, ANTHROPIC_EVENT_TIMEOUT);
+        let noned = AnthropicClient::new("k".into()).with_event_timeout(None);
+        assert_eq!(noned.event_timeout, ANTHROPIC_EVENT_TIMEOUT);
+    }
+
+    /// A stalled connect (server never sends response headers within the
+    /// budget) fails the turn promptly at the *configured* connect timeout
+    /// rather than hanging. Overriding the 30s default to 1s proves the knob
+    /// is honored end-to-end (#220/#561).
+    #[tokio::test]
+    async fn anthropic_stream_stall_times_out_configurably() {
+        use std::time::Duration;
+
+        let server = httpmock::MockServer::start();
+        // Server holds the connection ~5s before responding. With a 1s connect
+        // budget the turn must fail well before that.
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .delay(Duration::from_secs(5))
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = AnthropicClient::new("key".into())
+            .with_base_url(server.url(""))
+            .with_connect_timeout(Some(1));
+
+        let start = std::time::Instant::now();
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("stalled connect must fail the turn");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, CoreError::Llm(ref m) if m.contains("stalled")),
+            "expected a stall error, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should have fired the 1s connect budget, not waited for the 5s server delay; took {elapsed:?}"
+        );
+    }
+
+    // --- Malformed / partial SSE robustness (#561) -----------------------
+
+    /// A malformed `data:` frame in the middle of the stream must not abort
+    /// the turn: it is logged and skipped, and valid deltas before and after
+    /// it are still assembled into the response. Mirrors the connector's
+    /// "warn and continue" arm on `serde_json` parse failure.
+    #[tokio::test]
+    async fn anthropic_stream_tolerates_malformed_sse_event() {
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"x\",\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"foo\"}}\n\n",
+            // Garbage frame: not valid JSON for SseEvent. Must be skipped.
+            "data: {not valid json at all]\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"bar\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/messages");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_body);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let resp = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect("malformed middle frame must not fail the turn");
+
+        assert_eq!(
+            resp.text, "foobar",
+            "valid deltas around the garbage frame must survive"
+        );
+    }
+
+    // --- API-key redaction (#561) ----------------------------------------
+
+    /// The client must never leak its raw API key through `Debug`. Secrets
+    /// in logs/traces are a hard finding; a redacting `Debug` impl keeps the
+    /// key out of any `{:?}` rendering (defense in depth for future callers
+    /// that place the client inside a `#[derive(Debug)]` struct or an error
+    /// context).
+    #[test]
+    fn anthropic_api_key_redacted() {
+        let secret = "sk-ant-supersecret-DO-NOT-LEAK-0123456789";
+        let client = AnthropicClient::new(secret.into())
+            .with_model("claude-sonnet-4-6")
+            .with_base_url("https://api.anthropic.com");
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains(secret),
+            "raw API key leaked in Debug output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("supersecret"),
+            "a substring of the API key leaked in Debug output: {rendered}"
+        );
+        // Non-secret fields remain visible for debuggability.
+        assert!(
+            rendered.contains("claude-sonnet-4-6"),
+            "model should still be visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "the key field should be present but redacted: {rendered}"
+        );
     }
 }

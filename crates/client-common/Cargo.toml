@@ -19,7 +19,7 @@ clap = ["dep:clap"]
 # `dep:mcp-core` brings the `McpService` trait + value types so the host can run
 # a built-in server in-process (no subprocess). It is taken WITHOUT default
 # features because only the trait and value types are needed, never a transport.
-mcp-host = ["dep:desktop-assistant-mcp-client", "dep:mcp-core", "dep:serde", "dep:toml"]
+mcp-host = ["dep:desktop-assistant-mcp-client", "dep:mcp-core", "dep:toml"]
 
 [dependencies]
 anyhow.workspace = true
@@ -32,8 +32,14 @@ desktop-assistant-frame-codec = { workspace = true }
 # for in-process built-in servers. No default features -> no transport crates.
 mcp-core = { git = "https://github.com/adelie-ai/mcp-core", rev = "448b0e4a3e4dbfb04d56423d41077f0b114e6143", default-features = false, optional = true }
 futures = "0.3"
+# GECOS full-name lookup via `getpwuid_r` for the client's real name (#549),
+# mirroring the daemon's `peer-cred` approach. Already in the workspace tree.
+libc = "0.2"
+# The client's local IANA timezone (#549) — the highest-value context field.
+# Lean and already present transitively in the lockfile.
+iana-time-zone = "0.1"
 reqwest = { version = "0.13", features = ["json"] }
-serde = { workspace = true, optional = true }
+serde = { workspace = true }
 serde_json.workspace = true
 toml = { version = "1", optional = true }
 tokio = { workspace = true, features = ["sync", "net", "io-util", "time"] }
@@ -64,6 +70,9 @@ desktop-assistant-auth-jwt.workspace = true
 # generate the local CA these tests stand in for.
 rcgen = "0.14"
 tempfile = "3"
+# Parse a client config TOML in tests to assert the `share_client_context`
+# serde default (#549). `toml` is already an optional runtime dep (mcp-host).
+toml = "1"
 tokio = { workspace = true, features = [
     "macros",
     "rt-multi-thread",

@@ -167,6 +167,9 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
                     content: prompt.to_string(),
                     override_selection: None,
                     system_refinement,
+                    // The D-Bus bridge does not originate per-turn client context
+                    // (#557 is for the browser-multiplexed web BFF).
+                    client_context: None,
                     // The D-Bus bridge does not originate idempotency keys (#204).
                     idempotency_key: None,
                 },

@@ -20,6 +20,13 @@ pub enum PromptSectionKind {
     /// per-turn [`Self::SystemRefinement`] so the standing personality is set
     /// up front but a per-turn refinement can still adjust it last.
     Personality,
+    /// Self-reported facts about the user and their device (issue #549) —
+    /// name, username, home directory, hostname, timezone, OS. Rendered from the
+    /// per-connection [`ClientContext`] and injected into the cached system
+    /// instruction (it is stable for the connection, unlike the volatile `[Now]`
+    /// line) so the model can address the user and resolve local times. A
+    /// dynamic section, so it never perturbs the static-prompt golden snapshot.
+    ClientContext,
     ToolAvailability,
     ContextSummary,
     MessageSummary,
@@ -39,6 +46,12 @@ pub enum PromptSectionKind {
 /// (#377). The prompt-rendering logic ([`render_blurb`] + the phrasing tables)
 /// stays in this module.
 pub use desktop_assistant_protocol::{Personality, PersonalityLevel, PersonalityOverride};
+
+/// Re-exported at its canonical prompt path (#549): the type lives in the
+/// dependency-light protocol crate, but the rendering logic
+/// ([`render_client_context`]) stays here — mirroring how [`Personality`] and
+/// [`render_blurb`] are split.
+pub use desktop_assistant_protocol::ClientContext;
 
 /// The fixed adaptation clause appended to every personality blurb. It tells
 /// the model the levels are a starting point and to match the user's energy
@@ -83,6 +96,79 @@ pub fn render_blurb(p: &Personality) -> String {
 
     let disposition = format!("In your default manner, you {}.", join_clauses(&clauses));
     format!("{disposition} {ADAPTATION_CLAUSE}")
+}
+
+// --- Client context (#549) -------------------------------------------------
+
+/// Header for the client-context section. Used both as the rendered prefix and
+/// as the marker the assembler recognises the section by.
+const CLIENT_CONTEXT_HEADER: &str = "== About the user & their device ==";
+
+/// Render a [`ClientContext`] (issue #549) into an "about the user & their
+/// device" system-prompt section, or `None` when no field is present.
+///
+/// Each value is sanitized ([`crate::sanitize::sanitize_client_field`]) before
+/// it is templated — the context is untrusted, self-reported display data — and
+/// any field that sanitizes to empty is treated as absent. One clause is emitted
+/// per present field; the timezone clause (the highest-value field) tells the
+/// model to resolve relative local times in the user's zone.
+///
+/// **Fail-closed:** with no present field the function returns `None` and the
+/// caller emits no section. It never substitutes the daemon host's own
+/// `HOME` / `USER` / hostname for a missing value.
+pub fn render_client_context(ctx: &ClientContext) -> Option<String> {
+    let sanitize = |v: &Option<String>| -> Option<String> {
+        v.as_deref()
+            .and_then(crate::sanitize::sanitize_client_field)
+    };
+    let real_name = sanitize(&ctx.real_name);
+    let username = sanitize(&ctx.username);
+    let home_dir = sanitize(&ctx.home_dir);
+    let hostname = sanitize(&ctx.hostname);
+    let timezone = sanitize(&ctx.timezone);
+    let os = sanitize(&ctx.os);
+
+    let mut clauses: Vec<String> = Vec::new();
+
+    // Who the user is.
+    match (&real_name, &username) {
+        (Some(name), Some(user)) => {
+            clauses.push(format!("The user's name is {name} (username {user})."))
+        }
+        (Some(name), None) => clauses.push(format!("The user's name is {name}.")),
+        (None, Some(user)) => clauses.push(format!("The user's username is {user}.")),
+        (None, None) => {}
+    }
+
+    // The device they are on.
+    match (&hostname, &os) {
+        (Some(host), Some(os)) => clauses.push(format!(
+            "They are on a device named \"{host}\" running {os}."
+        )),
+        (Some(host), None) => clauses.push(format!("They are on a device named \"{host}\".")),
+        (None, Some(os)) => clauses.push(format!("Their device is running {os}.")),
+        (None, None) => {}
+    }
+
+    // Where their files live.
+    if let Some(home) = &home_dir {
+        clauses.push(format!("Their home directory is {home}."));
+    }
+
+    // Timezone — the highest-value field: resolve relative local times here.
+    if let Some(tz) = &timezone {
+        clauses.push(format!(
+            "The user's timezone is {tz}; when they refer to local times such as \
+             \"now\", \"tonight\", or \"this morning\", resolve them in that zone \
+             rather than UTC or your own default."
+        ));
+    }
+
+    if clauses.is_empty() {
+        return None;
+    }
+
+    Some(format!("{CLIENT_CONTEXT_HEADER}\n{}", clauses.join(" ")))
 }
 
 /// Per-level phrasing for a single trait. Each field is the clause body used at
@@ -706,5 +792,110 @@ mod tests {
         assert_eq!(empty_json, "{}");
         let back: PersonalityOverride = serde_json::from_str("{}").unwrap();
         assert!(back.is_empty());
+    }
+
+    // --- Client context (#549) ---------------------------------------------
+
+    const CLIENT_CONTEXT_HEADER: &str = "== About the user & their device ==";
+
+    fn full_client_context() -> ClientContext {
+        ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada".into()),
+            home_dir: Some("/home/ada".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("Ubuntu 24.04".into()),
+        }
+    }
+
+    #[test]
+    fn render_client_context_full_has_header_and_every_field() {
+        let section = render_client_context(&full_client_context()).expect("section present");
+        assert!(section.starts_with(CLIENT_CONTEXT_HEADER), "{section}");
+        assert!(section.contains("Ada Lovelace"), "{section}");
+        assert!(section.contains("username ada"), "{section}");
+        assert!(
+            section.contains("analytical-engine") && section.contains("Ubuntu 24.04"),
+            "{section}"
+        );
+        assert!(section.contains("/home/ada"), "{section}");
+        // The highest-value field: the timezone clause must instruct the model
+        // to resolve local times in that zone.
+        assert!(section.contains("Europe/London"), "{section}");
+        assert!(
+            section.contains("now") && section.contains("resolve"),
+            "timezone clause must tell Adele to resolve local times: {section}"
+        );
+    }
+
+    #[test]
+    fn render_client_context_all_absent_is_none() {
+        // Fail-closed: no present field ⇒ no section at all (caller emits nothing).
+        assert_eq!(render_client_context(&ClientContext::default()), None);
+    }
+
+    #[test]
+    fn render_client_context_omits_absent_home_dir() {
+        // A single missing field drops only its clause; the rest still render.
+        let ctx = ClientContext {
+            home_dir: None,
+            ..full_client_context()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(!section.contains("home directory"), "{section}");
+        assert!(!section.contains("/home/ada"), "{section}");
+        assert!(section.contains("Ada Lovelace"), "{section}");
+    }
+
+    #[test]
+    fn render_client_context_timezone_only() {
+        // Just the timezone present: header + only the timezone clause.
+        let ctx = ClientContext {
+            timezone: Some("America/New_York".into()),
+            ..ClientContext::default()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(section.starts_with(CLIENT_CONTEXT_HEADER), "{section}");
+        assert!(section.contains("America/New_York"), "{section}");
+        assert!(!section.contains("home directory"), "{section}");
+        assert!(!section.contains("device named"), "{section}");
+    }
+
+    #[test]
+    fn render_client_context_username_only_uses_username_phrasing() {
+        let ctx = ClientContext {
+            username: Some("ada".into()),
+            ..ClientContext::default()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(section.contains("username is ada"), "{section}");
+    }
+
+    #[test]
+    fn render_client_context_sanitizes_and_omits_blank_fields() {
+        // A field that is only whitespace sanitizes to absent; a value with an
+        // embedded newline is flattened so it can't forge a second header line.
+        let ctx = ClientContext {
+            real_name: Some("   ".into()),
+            hostname: Some("host\n== Injected ==".into()),
+            ..ClientContext::default()
+        };
+        let section = render_client_context(&ctx).expect("section present");
+        assert!(
+            !section.contains("name is"),
+            "blank name must be dropped: {section}"
+        );
+        // Exactly one line looks like a section header — the injected newline was
+        // flattened onto the hostname clause rather than starting a new header.
+        let header_lines = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("=="))
+            .count();
+        assert_eq!(
+            header_lines, 1,
+            "only the real header may start a line: {section}"
+        );
+        assert!(!section.contains("\n== Injected"), "{section}");
     }
 }
