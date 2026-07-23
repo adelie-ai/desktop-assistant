@@ -21,6 +21,10 @@ use crate::ports::scratchpad::{
     MAX_NOTE_BYTES, NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadGetManyFn, ScratchpadListFn,
     ScratchpadWriteFn,
 };
+use crate::ports::scratchpad_scope::{
+    SPAWN_SUBAGENT_TOOL, SubagentScope, current_ancestors, current_owner_todo,
+    current_scratchpad_scope, with_pending_child_scope,
+};
 use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
@@ -1422,6 +1426,43 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     continue;
                 }
 
+                // Subagent spawn (#287): mint the child's session-pad scope HERE,
+                // in the loop that owns `step_stack`, because `spawn_subagent`
+                // runs through the `ToolExecutor` with no `StepStack` handle. The
+                // child's namespace is the current agent's base composed with a
+                // fresh fanned-out step key, so (a) it is globally unique and (b)
+                // completing the enclosing step can later cascade-clean it. We do
+                // NOT `continue`: the scope is installed around the tool's own
+                // execution below, and `spawn_subagent` runs normally. Gated on
+                // the same condition that advertises the planning tools.
+                let mut pending_child_scope: Option<SubagentScope> = None;
+                if self.scratchpad_write.is_some() && tool_call.name == SPAWN_SUBAGENT_TOOL {
+                    let base = current_owner_todo().unwrap_or_default();
+                    let (fanned_key, _seq) = step_stack
+                        .fan_out(1)
+                        .into_iter()
+                        .next()
+                        .expect("fan_out(1) always yields exactly one key");
+                    let child_owner = planning::owner_subtree_prefix(&base, &fanned_key);
+                    // Ancestors the child may read pre-marker: the running agent's
+                    // ancestor chain plus its own base (root "" for a top-level
+                    // parent). Concurrent siblings/cousins are excluded.
+                    let mut ancestors = current_ancestors().unwrap_or_else(|| vec![String::new()]);
+                    if !ancestors.iter().any(|a| a == &base) {
+                        ancestors.push(base.clone());
+                    }
+                    // The child shares this session's pad. For a top-level parent
+                    // (no scope installed) that is the current conversation.
+                    let session =
+                        current_scratchpad_scope().unwrap_or_else(|| conversation_id.clone());
+                    pending_child_scope = Some(SubagentScope {
+                        session_conversation_id: session,
+                        owner_todo: child_owner,
+                        visible_before: uuid::Uuid::now_v7().to_string(),
+                        ancestors,
+                    });
+                }
+
                 // Tool allowlist enforcement (issues #291 / #133). A subagent
                 // (or any caller) may install a `TOOL_ALLOWLIST` task-local
                 // restricting which tools it can invoke. The allowlist is also
@@ -1521,7 +1562,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     // scratchpad) can resolve which pad they operate on without
                     // the `ToolExecutor` port growing a conversation parameter.
                     let exec = self.tools.execute_tool(&tool_call.name, arguments);
-                    match with_conversation_id(conversation_id.clone(), exec).await {
+                    let scoped = with_conversation_id(conversation_id.clone(), exec);
+                    // For `spawn_subagent`, install the child scope minted above so
+                    // the spawn-tool body adopts it for the child; every other tool
+                    // runs with no pending child scope. Both arms await to the same
+                    // `Result`, unifying their differing future types.
+                    let outcome = match pending_child_scope {
+                        Some(scope) => with_pending_child_scope(scope, scoped).await,
+                        None => scoped.await,
+                    };
+                    match outcome {
                         Ok(output) => {
                             tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
                             (output, true)

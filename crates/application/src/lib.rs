@@ -2097,6 +2097,9 @@ where
                         // protocol level — only `spawn_subagent` (#112)
                         // wires a sink to pull the final text back.
                         result_sink: None,
+                        // A standalone agent is not a subagent: no session-pad
+                        // scope; its scratchpad ops stay on its own conversation.
+                        subagent_scope: None,
                     },
                     move |conversation_id| api::TaskKind::Standalone {
                         name: name_for_kind,
@@ -2746,6 +2749,12 @@ pub(crate) struct AgentConversationSpec {
     /// task; `SpawnStandaloneAgent` (#113) leaves it `None` because the
     /// agent run is fire-and-forget at the protocol level.
     pub result_sink: Option<AgentResultSink>,
+    /// The session-pad scope (#287) a subagent run adopts: the child works in
+    /// its own conversation for reasoning/history, but its scratchpad reads and
+    /// writes target the session pad under `owner_todo`, snapshot-bounded by the
+    /// spawn marker. `Some` for `spawn_subagent`; `None` for `SpawnStandaloneAgent`
+    /// and any pre-#287 caller, leaving pad ops on the run's own conversation.
+    pub subagent_scope: Option<desktop_assistant_core::ports::scratchpad_scope::SubagentScope>,
 }
 
 /// Build a [`ToolObserver`] that mirrors the core loop's tool/MCP calls into a
@@ -2823,6 +2832,7 @@ where
         tools,
         conversation_id,
         result_sink,
+        subagent_scope,
     } = spec;
 
     let kind = kind_factory(conversation_id.clone());
@@ -2880,14 +2890,27 @@ where
                 )
                 .await
         });
-        let result = if let Some(tools) = tools {
-            desktop_assistant_core::ports::auth::with_user_id(
-                user_id.clone(),
-                desktop_assistant_core::ports::llm::with_tool_allowlist(tools, inner),
-            )
-            .await
-        } else {
-            desktop_assistant_core::ports::auth::with_user_id(user_id.clone(), inner).await
+        // Compose the run's task-local scopes around `inner`, awaiting in each
+        // arm so their differing future types unify at the `Result`. The #287
+        // subagent scope (session pad + owner_todo + snapshot marker) is
+        // installed INSIDE `with_user_id` so scratchpad ops observe the tenant
+        // guard, and re-established here in the spawned body -- never read across
+        // the registry's `tokio::spawn`.
+        use desktop_assistant_core::ports::auth::with_user_id;
+        use desktop_assistant_core::ports::llm::with_tool_allowlist;
+        use desktop_assistant_core::ports::scratchpad_scope::with_subagent_scope;
+        let uid = user_id.clone();
+        let result = match (tools, subagent_scope) {
+            (Some(tools), Some(scope)) => {
+                with_user_id(
+                    uid,
+                    with_tool_allowlist(tools, with_subagent_scope(scope, inner)),
+                )
+                .await
+            }
+            (Some(tools), None) => with_user_id(uid, with_tool_allowlist(tools, inner)).await,
+            (None, Some(scope)) => with_user_id(uid, with_subagent_scope(scope, inner)).await,
+            (None, None) => with_user_id(uid, inner).await,
         };
 
         // The "currently doing" hint is cleared by the registry's panic-safe

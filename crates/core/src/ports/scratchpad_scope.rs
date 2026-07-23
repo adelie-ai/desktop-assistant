@@ -108,6 +108,47 @@ pub fn current_ancestors() -> Option<Vec<String>> {
     SCRATCHPAD_ANCESTORS.try_with(|a| a.clone()).ok()
 }
 
+/// LLM-visible tool name for spawning a subagent.
+///
+/// Defined here in `core` -- not in the `application` crate that *implements*
+/// the tool -- so the `core::service` dispatch loop can intercept the call by
+/// name to mint the child's [`SubagentScope`] from the loop-owned `StepStack`,
+/// without `core` depending on `application` (which would invert the layering).
+/// `application::subagent_tools` re-exports this as its public tool name.
+pub const SPAWN_SUBAGENT_TOOL: &str = "spawn_subagent";
+
+tokio::task_local! {
+    /// The scope the dispatch loop has computed for the subagent that a
+    /// `spawn_subagent` call is about to create. Installed by the loop AROUND
+    /// that tool's execution (via [`with_pending_child_scope`]) and read once by
+    /// the spawn-tool body (via [`current_pending_child_scope`]) to build the
+    /// child's [`SubagentScope`].
+    ///
+    /// Distinct from [`SCRATCHPAD_SCOPE`]/[`SCRATCHPAD_OWNER_TODO`] etc., which
+    /// describe the RUNNING agent's own scope; this describes the CHILD-to-be's.
+    /// The loop owns the `StepStack` (so it can `fan_out` a fresh, cascade-
+    /// anchored namespace key) but the spawn tool runs inside the `ToolExecutor`
+    /// with no `StepStack` handle -- this task-local bridges the two.
+    static PENDING_CHILD_SCOPE: SubagentScope;
+}
+
+/// Run `fut` (a `spawn_subagent` tool execution) with `scope` installed as the
+/// scope its child should adopt. See [`PENDING_CHILD_SCOPE`].
+pub async fn with_pending_child_scope<F, T>(scope: SubagentScope, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    PENDING_CHILD_SCOPE.scope(scope, fut).await
+}
+
+/// The child scope the dispatch loop computed for the in-flight
+/// `spawn_subagent` call, or `None` when spawning outside that loop path (e.g.
+/// `SpawnStandaloneAgent` or a unit test), in which case the spawn falls back
+/// to its pre-#287 behavior.
+pub fn current_pending_child_scope() -> Option<SubagentScope> {
+    PENDING_CHILD_SCOPE.try_with(|s| s.clone()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

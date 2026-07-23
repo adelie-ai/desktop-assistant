@@ -1603,3 +1603,90 @@ async fn one_failed_subagent_does_not_cancel_siblings() {
         "the last sibling completed despite the middle one failing"
     );
 }
+
+// --------------------------------------------------------------------
+// #287 slice 5: a subagent adopts the child scope the dispatch loop
+// installs (session pad + owner_todo + snapshot marker), carried across
+// the registry's tokio::spawn as data and re-installed in the child body.
+// --------------------------------------------------------------------
+
+#[tokio::test]
+async fn subagent_body_runs_under_installed_child_scope() {
+    use desktop_assistant_core::ports::scratchpad_scope::{
+        SubagentScope, current_owner_todo, current_scratchpad_scope, with_pending_child_scope,
+    };
+
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    // The child body records the scope it observes; the first conversation the
+    // spawn creates is "conv-0".
+    let observed: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    let obs = Arc::clone(&observed);
+    let conversations = Arc::new(FakeConversations::new("hi").with_behaviour(
+        "conv-0",
+        move |_cid, _prompt| {
+            let obs = Arc::clone(&obs);
+            async move {
+                let owner = current_owner_todo().unwrap_or_default();
+                let scope_conv = current_scratchpad_scope()
+                    .map(|c| c.as_str().to_string())
+                    .unwrap_or_default();
+                *obs.lock().unwrap() = Some((owner, scope_conv));
+                Ok("hi".to_string())
+            }
+        },
+    ));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    let scope = SubagentScope {
+        session_conversation_id: ConversationId::from("session-1"),
+        owner_todo: "1.1".to_string(),
+        visible_before: "marker".to_string(),
+        ancestors: vec![String::new()],
+    };
+
+    let tools_for_body = tools.clone();
+    let user_for_body = user.clone();
+    let scope_for_body = scope.clone();
+    let (_pid, result) = under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+        let tools = tools_for_body;
+        let user = user_for_body;
+        let scope = scope_for_body;
+        async move {
+            // Mirror the dispatch loop: install the pending child scope
+            // around the spawn tool's execution.
+            with_user_id(
+                user,
+                with_pending_child_scope(scope, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "researcher",
+                                "prompt": "go",
+                                "wait": true,
+                            }),
+                        )
+                        .await
+                }),
+            )
+            .await
+        }
+    })
+    .await;
+
+    result.expect("spawn returned Ok");
+    let (owner, scope_conv) = observed
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("child body ran and recorded its scope");
+    assert_eq!(
+        owner, "1.1",
+        "child body runs under the installed owner_todo"
+    );
+    assert_eq!(
+        scope_conv, "session-1",
+        "child scratchpad ops target the session pad, not the child conversation"
+    );
+}
