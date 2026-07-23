@@ -50,21 +50,28 @@ pub struct SubagentAwareToolExecutor<T: ToolExecutor> {
     inner: T,
     registry: Arc<BackgroundTaskRegistry>,
     conversations: ConversationSlot,
+    /// Session-scratchpad handles for the subagent result-handoff (#607/#608);
+    /// threaded onto each `SubagentTools` built per dispatch. `None` leaves the
+    /// pad round-trip inert.
+    scratchpad: Option<crate::subagent_tools::SubagentScratchpad>,
 }
 
 impl<T: ToolExecutor> SubagentAwareToolExecutor<T> {
     /// Wrap `inner`. `conversations` starts empty; the daemon must `set` a
     /// `Weak` downgrade of the conversation service before any turn runs, or
-    /// subagent tool calls fail closed with a recoverable error.
+    /// subagent tool calls fail closed with a recoverable error. `scratchpad`
+    /// carries the session-pad result-handoff handles (#607/#608).
     pub fn new(
         inner: T,
         registry: Arc<BackgroundTaskRegistry>,
         conversations: ConversationSlot,
+        scratchpad: Option<crate::subagent_tools::SubagentScratchpad>,
     ) -> Self {
         Self {
             inner,
             registry,
             conversations,
+            scratchpad,
         }
     }
 
@@ -82,7 +89,13 @@ impl<T: ToolExecutor> SubagentAwareToolExecutor<T> {
                 ))
             }
             Some(weak) => match weak.upgrade() {
-                Some(conv) => Ok(SubagentTools::new(Arc::clone(&self.registry), conv)),
+                Some(conv) => {
+                    let mut tools = SubagentTools::new(Arc::clone(&self.registry), conv);
+                    if let Some(sp) = &self.scratchpad {
+                        tools = tools.with_scratchpad(sp.clone());
+                    }
+                    Ok(tools)
+                }
                 None => {
                     tracing::warn!("conversation service dropped; rejecting subagent tool call");
                     Err(CoreError::ToolExecution(

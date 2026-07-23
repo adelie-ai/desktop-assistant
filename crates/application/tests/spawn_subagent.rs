@@ -1748,7 +1748,7 @@ fn empty_slot() -> ConversationSlot {
 
 #[tokio::test]
 async fn wrapper_core_tools_include_subagent_definitions() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let names: Vec<String> = w.core_tools().await.into_iter().map(|d| d.name).collect();
     assert!(
         names.iter().any(|n| n == "inner_tool"),
@@ -1760,7 +1760,7 @@ async fn wrapper_core_tools_include_subagent_definitions() {
 
 #[tokio::test]
 async fn wrapper_tool_definition_resolves_subagent_names_else_inner() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     assert_eq!(
         w.tool_definition(TOOL_SPAWN_SUBAGENT)
             .await
@@ -1778,7 +1778,7 @@ async fn wrapper_tool_definition_resolves_subagent_names_else_inner() {
 
 #[tokio::test]
 async fn wrapper_search_and_namespaces_delegate_to_inner() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let searched: Vec<String> = w
         .search_tools("q")
         .await
@@ -1798,7 +1798,7 @@ async fn wrapper_search_and_namespaces_delegate_to_inner() {
 
 #[tokio::test]
 async fn wrapper_delegates_unknown_tool_to_inner() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let out = w
         .execute_tool("inner_tool", serde_json::json!({}))
         .await
@@ -1808,7 +1808,7 @@ async fn wrapper_delegates_unknown_tool_to_inner() {
 
 #[tokio::test]
 async fn wrapper_execute_before_slot_set_returns_recoverable_error() {
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot(), None);
     let err = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_SPAWN_SUBAGENT,
@@ -1835,7 +1835,7 @@ async fn wrapper_execute_after_service_dropped_returns_recoverable_error() {
     let slot = empty_slot();
     let _ = slot.set(Arc::downgrade(&conv));
     drop(conv); // strong ref gone -> Weak::upgrade fails
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot, None);
     let err = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_SPAWN_SUBAGENT,
@@ -1865,7 +1865,7 @@ async fn wrapper_routes_spawn_subagent_to_subagent_tools() {
     let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
     let slot = empty_slot();
     let _ = slot.set(Arc::downgrade(&conv));
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot, None);
     let out = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_SPAWN_SUBAGENT,
@@ -1891,7 +1891,7 @@ async fn wrapper_routes_get_subagent_status_to_subagent_tools() {
     let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
     let slot = empty_slot();
     let _ = slot.set(Arc::downgrade(&conv));
-    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot, None);
     let out = with_user_id(UserId::new("alice"), async {
         w.execute_tool(
             TOOL_GET_SUBAGENT_STATUS,
@@ -1936,4 +1936,111 @@ fn wrapper_impls_tool_executor_and_is_send_sync() {
     // Silence unused-import lints if the suite is trimmed.
     let _ = tool_definitions();
     let _ = Weak::<()>::new();
+}
+
+// --------------------------------------------------------------------
+// #607: a subagent's final answer auto-writes to the SESSION pad as a
+// "result" note under the child's owner_todo.
+// --------------------------------------------------------------------
+
+#[tokio::test]
+async fn subagent_completion_writes_result_note_to_session_pad_under_owner_todo() {
+    use desktop_assistant_application::subagent_tools::SubagentScratchpad;
+    use desktop_assistant_core::ports::scratchpad_scope::{
+        SubagentScope, with_pending_child_scope,
+    };
+    use std::sync::Mutex as StdMutex;
+
+    // (conversation_id, note_key, content, owner_todo-at-write) recorded per note.
+    type WriteRec = (String, String, String, String);
+
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let conversations = Arc::new(FakeConversations::new("the answer"));
+
+    // Fake write closure records what each note write saw.
+    let recorded: Arc<StdMutex<Vec<WriteRec>>> = Arc::new(StdMutex::new(Vec::new()));
+    let rec = Arc::clone(&recorded);
+    let write: desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn = Arc::new(
+        move |conv: String,
+              notes: Vec<desktop_assistant_core::ports::scratchpad::NewScratchpadNote>| {
+            let rec = Arc::clone(&rec);
+            Box::pin(async move {
+                // The completion write runs under the child's scope, so the
+                // owner_todo task-local is the child's namespace.
+                let owner = desktop_assistant_core::ports::scratchpad_scope::current_owner_todo()
+                    .unwrap_or_default();
+                let mut out = Vec::new();
+                for (i, n) in notes.iter().enumerate() {
+                    rec.lock().unwrap().push((
+                        conv.clone(),
+                        n.key.clone(),
+                        n.content.clone(),
+                        owner.clone(),
+                    ));
+                    out.push(desktop_assistant_core::domain::ScratchpadNote::new(
+                        format!("id{i}"),
+                        &conv,
+                        &n.key,
+                        &n.content,
+                    ));
+                }
+                Ok(out)
+            })
+        },
+    );
+    let get_many: desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn =
+        Arc::new(|_c, _k, _l| Box::pin(async { Ok(Vec::new()) }));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations))
+        .with_scratchpad(SubagentScratchpad { write, get_many });
+    let user = unique_user("alice");
+
+    let scope = SubagentScope {
+        session_conversation_id: desktop_assistant_core::domain::ConversationId::from("sess-1"),
+        owner_todo: "1.1".to_string(),
+        visible_before: "marker".to_string(),
+        ancestors: vec![String::new()],
+    };
+
+    let user_for_body = user.clone();
+    let tools_for_body = tools.clone();
+    let (_parent_id, result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            let scope = scope.clone();
+            async move {
+                with_user_id(user, async move {
+                    // The dispatch loop installs PENDING_CHILD_SCOPE around the
+                    // spawn call; emulate that so the child adopts the scope.
+                    with_pending_child_scope(scope, async move {
+                        tools
+                            .execute_tool(
+                                TOOL_SPAWN_SUBAGENT,
+                                serde_json::json!({
+                                    "name": "researcher",
+                                    "prompt": "say hello",
+                                    "wait": true,
+                                }),
+                            )
+                            .await
+                    })
+                    .await
+                })
+                .await
+            }
+        })
+        .await;
+
+    assert_eq!(result.expect("tool returned Ok"), "the answer");
+    let notes = recorded.lock().unwrap();
+    let (conv, _key, content, owner) = notes
+        .iter()
+        .find(|(_, key, _, _)| key == "result")
+        .expect("a 'result' note was written to the pad");
+    assert_eq!(conv, "sess-1", "result written to the SESSION conversation");
+    assert_eq!(
+        content, "the answer",
+        "note content is the child's final answer"
+    );
+    assert_eq!(owner, "1.1", "result stamped under the child's owner_todo");
 }

@@ -85,6 +85,27 @@ pub const MAX_SUBAGENT_DEPTH: usize = 8;
 pub struct SubagentTools<C: ?Sized + ConversationService> {
     registry: Arc<BackgroundTaskRegistry>,
     conversations: Arc<C>,
+    /// Session-scratchpad handles so a subagent's final answer is written to
+    /// the session pad on completion (#607, `write`) and read back by
+    /// `get_subagent_status` (#608, `get_many`). `None` in tests / when the
+    /// daemon has no scratchpad store, in which case the pad-handoff is simply
+    /// inert (spawn/status still work, just without the pad round-trip).
+    scratchpad: Option<SubagentScratchpad>,
+}
+
+/// Boxed session-scratchpad handles for the subagent result-handoff. Boxed
+/// closures (not `Arc<dyn ScratchpadStore>`) because `ScratchpadStore` is a
+/// static-dispatch trait and not object-safe; the daemon already builds these
+/// same closures for the builtin scratchpad tools.
+#[derive(Clone)]
+pub struct SubagentScratchpad {
+    /// Upsert notes into a conversation's pad (stamps owner_todo from the
+    /// task-local scope; the completion path installs the child's scope so the
+    /// result lands under the child's namespace in the session conversation).
+    pub write: desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn,
+    /// Read notes by key from a conversation's pad (used by status to fetch the
+    /// child's "result" note, filtered to the child's exact owner_todo).
+    pub get_many: desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn,
 }
 
 impl<C: ?Sized + ConversationService> Clone for SubagentTools<C> {
@@ -92,6 +113,7 @@ impl<C: ?Sized + ConversationService> Clone for SubagentTools<C> {
         Self {
             registry: Arc::clone(&self.registry),
             conversations: Arc::clone(&self.conversations),
+            scratchpad: self.scratchpad.clone(),
         }
     }
 }
@@ -183,7 +205,15 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
         Self {
             registry,
             conversations,
+            scratchpad: None,
         }
+    }
+
+    /// Attach the session-scratchpad handles that carry a subagent's result
+    /// through the pad (#607/#608). Without them the pad-handoff is inert.
+    pub fn with_scratchpad(mut self, scratchpad: SubagentScratchpad) -> Self {
+        self.scratchpad = Some(scratchpad);
+        self
     }
 
     /// Dispatch one of the tools by name. The LLM's tool-call handler
@@ -326,6 +356,10 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
             conversation_id: child_conversation_id.clone(),
             result_sink: Some(Arc::clone(&result_slot)),
             subagent_scope: pending_scope,
+            // #607: on completion, mirror the child's final answer to the
+            // session pad under the child's owner_todo so the parent can
+            // collect it by task without re-deriving from conversations.
+            scratchpad_write: self.scratchpad.as_ref().map(|sp| sp.write.clone()),
         };
 
         let child_task_id = spawn_agent_conversation(

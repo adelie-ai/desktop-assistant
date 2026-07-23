@@ -1424,6 +1424,13 @@ async fn main() -> Result<()> {
     let mut scratchpad_write_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn,
     > = None;
+    // Session-scratchpad handles for the subagent result-handoff (#607/#608):
+    // a subagent's final answer is auto-written to the session pad on
+    // completion and read back by get_subagent_status. Threaded into the
+    // subagent-aware executor below; None without a Postgres pool.
+    let mut subagent_scratchpad: Option<
+        desktop_assistant_application::subagent_tools::SubagentScratchpad,
+    > = None;
     let mut scratchpad_list_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadListFn,
     > = None;
@@ -1587,6 +1594,17 @@ async fn main() -> Result<()> {
         // are moved into the API-handler tuple below.
         scratchpad_write_fn = Some(Arc::clone(&write_fn));
         scratchpad_list_fn = Some(Arc::clone(&list_fn));
+
+        // #607/#608: the subagent result-handoff reuses the same emit-wrapped
+        // write closure (so a written result reaches clients via
+        // ScratchpadChanged) plus the get_many reader. Cloned before `write_fn`
+        // is moved into the API-handler tuple below.
+        subagent_scratchpad = Some(
+            desktop_assistant_application::subagent_tools::SubagentScratchpad {
+                write: Arc::clone(&write_fn),
+                get_many: Arc::clone(&get_many_fn),
+            },
+        );
 
         // Hand the same (emit-wrapped) closures to the API handler so clients
         // can read/write/delete the scratchpad over the command channel (#190).
@@ -2168,6 +2186,7 @@ async fn main() -> Result<()> {
             tool_executor,
             Arc::clone(&background_task_registry),
             Arc::clone(&conversation_slot),
+            subagent_scratchpad,
         ),
         Box::new(|| uuid::Uuid::now_v7().to_string()),
     )

@@ -2226,6 +2226,7 @@ where
                         // A standalone agent is not a subagent: no session-pad
                         // scope; its scratchpad ops stay on its own conversation.
                         subagent_scope: None,
+                        scratchpad_write: None,
                     },
                     move |conversation_id| api::TaskKind::Standalone {
                         name: name_for_kind,
@@ -2897,6 +2898,11 @@ pub(crate) struct AgentConversationSpec {
     /// spawn marker. `Some` for `spawn_subagent`; `None` for `SpawnStandaloneAgent`
     /// and any pre-#287 caller, leaving pad ops on the run's own conversation.
     pub subagent_scope: Option<desktop_assistant_core::ports::scratchpad_scope::SubagentScope>,
+    /// Session-pad write handle (#607): when set together with `subagent_scope`,
+    /// the run's final answer is written to the session pad as a `"result"` note
+    /// under the child's `owner_todo`, so the parent collects it by task id.
+    /// `None` for standalone runs and when the daemon has no scratchpad store.
+    pub scratchpad_write: Option<ScratchpadWriteFn>,
 }
 
 /// Build a [`ToolObserver`] that mirrors the core loop's tool/MCP calls into a
@@ -2975,7 +2981,12 @@ where
         conversation_id,
         result_sink,
         subagent_scope,
+        scratchpad_write,
     } = spec;
+
+    // #607: keep a copy of the child scope for the post-run result write (the
+    // match below consumes `subagent_scope` into the run-body task-local nest).
+    let scope_for_result = subagent_scope.clone();
 
     let kind = kind_factory(conversation_id.clone());
     let agent_name = name;
@@ -3079,6 +3090,25 @@ where
 
             match result {
                 Ok(outcome) => {
+                    // #607: mirror the final answer to the SESSION pad as this
+                    // child's "result" note under its owner_todo, so the parent
+                    // collects it by task (get_subagent_status) without
+                    // re-deriving from conversations. Run under the child's scope
+                    // + user id so the store stamps owner_todo and targets the
+                    // session conversation. Best-effort: a pad-write failure is
+                    // logged, never fatal -- the sink still carries the text.
+                    if let (Some(write), Some(scope)) = (&scratchpad_write, &scope_for_result) {
+                        let note =
+                            desktop_assistant_core::ports::scratchpad::NewScratchpadNote::new(
+                                "result",
+                                outcome.response.clone(),
+                            );
+                        let session = scope.session_conversation_id.as_str().to_string();
+                        let scoped = with_subagent_scope(scope.clone(), write(session, vec![note]));
+                        if let Err(e) = with_user_id(user_id.clone(), scoped).await {
+                            tracing::warn!(error = %e, "subagent result pad-write failed");
+                        }
+                    }
                     if let Some(sink) = result_sink {
                         *sink.lock().await = Some(Ok(outcome.response));
                     }
