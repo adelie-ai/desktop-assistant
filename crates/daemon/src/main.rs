@@ -2065,10 +2065,20 @@ async fn main() -> Result<()> {
         profiling.log_path.as_deref(),
         profiling.full_content,
     ));
+    // #287 slice 7: late-set slot letting the subagent tool executor reach the
+    // conversation service. Set (below) to a Weak downgrade of the routing
+    // handler the instant it exists; a Weak (not Arc) keeps the executor ->
+    // conversation -> handler -> executor cycle non-owning so nothing leaks.
+    let conversation_slot: desktop_assistant_application::subagent_executor::ConversationSlot =
+        Arc::new(std::sync::OnceLock::new());
     let mut handler = ConversationHandler::with_tools(
         conversation_store.clone(),
         llm,
-        tool_executor,
+        desktop_assistant_application::subagent_executor::SubagentAwareToolExecutor::new(
+            tool_executor,
+            Arc::clone(&background_task_registry),
+            Arc::clone(&conversation_slot),
+        ),
         Box::new(|| uuid::Uuid::now_v7().to_string()),
     )
     // Server-side tool localities (#243) are labelled with the daemon's host
@@ -2241,6 +2251,14 @@ async fn main() -> Result<()> {
         routing_conv = routing_conv.with_window_store(window_store);
     }
     let conversation_service = Arc::new(routing_conv);
+    // #287 slice 7: publish the conversation service to the subagent executor's
+    // slot as a Weak, as the first statement after it exists (no `?` between the
+    // create and the set). The executor upgrades it per spawn_subagent call.
+    {
+        let conv_dyn: Arc<dyn desktop_assistant_core::ports::inbound::ConversationService> =
+            conversation_service.clone();
+        let _ = conversation_slot.set(Arc::downgrade(&conv_dyn));
+    }
 
     let connections_service = Arc::new(api_surface::DaemonConnectionsService::new(Arc::clone(
         &registry_handle,

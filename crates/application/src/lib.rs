@@ -7,6 +7,7 @@ pub mod background_tasks;
 pub mod client_tools;
 pub mod conversation_subs;
 mod inflight;
+pub mod subagent_executor;
 pub mod subagent_tools;
 
 use std::sync::Arc;
@@ -2821,7 +2822,7 @@ pub(crate) fn spawn_agent_conversation<C>(
     kind_factory: impl FnOnce(String) -> api::TaskKind,
 ) -> api::TaskId
 where
-    C: ConversationService + Send + Sync + 'static,
+    C: ?Sized + ConversationService + Send + Sync + 'static,
 {
     let AgentConversationSpec {
         user_id,
@@ -3071,7 +3072,7 @@ async fn run_send_turn<C>(
     task_ctx: Option<TaskContext>,
 ) -> Result<(), desktop_assistant_core::CoreError>
 where
-    C: ConversationService + Send + Sync + 'static,
+    C: ?Sized + ConversationService + Send + Sync + 'static,
 {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<api::Event>(STREAM_EVENT_BUFFER);
     // Cloned before `tx` is moved into the chunk callback below; used by the

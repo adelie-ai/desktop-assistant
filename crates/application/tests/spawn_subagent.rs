@@ -7,22 +7,28 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::UserId;
 use desktop_assistant_application::background_tasks::{BackgroundTaskRegistry, current_task_id};
+use desktop_assistant_application::subagent_executor::{
+    ConversationSlot, SubagentAwareToolExecutor,
+};
 use desktop_assistant_application::subagent_tools::{
     SubagentTools, TOOL_GET_SUBAGENT_STATUS, TOOL_SPAWN_SUBAGENT, tool_definitions,
 };
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{Conversation, ConversationId, ConversationSummary, Message};
+use desktop_assistant_core::domain::{
+    Conversation, ConversationId, ConversationSummary, Message, ToolDefinition, ToolNamespace,
+};
 use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::inbound::{
     ConversationService, PromptDispatchOutcome, PromptSelectionOverride,
 };
 use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
+use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -1691,4 +1697,243 @@ async fn subagent_body_runs_under_installed_child_scope() {
         scope_conv, "session-1",
         "child scratchpad ops target the session pad, not the child conversation"
     );
+}
+
+// --- #287 slice 7: SubagentAwareToolExecutor wrapper (#134) -----------------
+
+/// Minimal inner executor whose outputs are tagged so delegation is provable.
+struct FakeInner;
+
+impl ToolExecutor for FakeInner {
+    async fn core_tools(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(
+            "inner_tool",
+            "an inner tool",
+            serde_json::json!({"type": "object"}),
+        )]
+    }
+    async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+        Ok(vec![ToolDefinition::new(
+            "searched",
+            "from inner search",
+            serde_json::json!({}),
+        )])
+    }
+    async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+        Ok(self.core_tools().await.into_iter().find(|d| d.name == name))
+    }
+    async fn tool_namespaces(&self) -> Vec<ToolNamespace> {
+        vec![ToolNamespace {
+            name: "inner_ns".to_string(),
+            description: "from inner".to_string(),
+            tools: vec![],
+        }]
+    }
+    async fn execute_tool(
+        &self,
+        name: &str,
+        _arguments: serde_json::Value,
+    ) -> Result<String, CoreError> {
+        Ok(format!("inner:{name}"))
+    }
+}
+
+fn wrapper_registry() -> Arc<BackgroundTaskRegistry> {
+    Arc::new(BackgroundTaskRegistry::new())
+}
+
+fn empty_slot() -> ConversationSlot {
+    Arc::new(OnceLock::new())
+}
+
+#[tokio::test]
+async fn wrapper_core_tools_include_subagent_definitions() {
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let names: Vec<String> = w.core_tools().await.into_iter().map(|d| d.name).collect();
+    assert!(
+        names.iter().any(|n| n == "inner_tool"),
+        "inner tools preserved"
+    );
+    assert!(names.iter().any(|n| n == TOOL_SPAWN_SUBAGENT));
+    assert!(names.iter().any(|n| n == TOOL_GET_SUBAGENT_STATUS));
+}
+
+#[tokio::test]
+async fn wrapper_tool_definition_resolves_subagent_names_else_inner() {
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    assert_eq!(
+        w.tool_definition(TOOL_SPAWN_SUBAGENT)
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        TOOL_SPAWN_SUBAGENT
+    );
+    assert_eq!(
+        w.tool_definition("inner_tool").await.unwrap().unwrap().name,
+        "inner_tool"
+    );
+    assert!(w.tool_definition("nope").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn wrapper_search_and_namespaces_delegate_to_inner() {
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let searched: Vec<String> = w
+        .search_tools("q")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(searched, vec!["searched".to_string()]);
+    let ns: Vec<String> = w
+        .tool_namespaces()
+        .await
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(ns, vec!["inner_ns".to_string()]);
+}
+
+#[tokio::test]
+async fn wrapper_delegates_unknown_tool_to_inner() {
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let out = w
+        .execute_tool("inner_tool", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(out, "inner:inner_tool");
+}
+
+#[tokio::test]
+async fn wrapper_execute_before_slot_set_returns_recoverable_error() {
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), empty_slot());
+    let err = with_user_id(UserId::new("alice"), async {
+        w.execute_tool(
+            TOOL_SPAWN_SUBAGENT,
+            serde_json::json!({"name":"x","prompt":"y"}),
+        )
+        .await
+    })
+    .await
+    .unwrap_err();
+    match err {
+        CoreError::ToolExecution(m) => {
+            assert!(
+                m.contains("not wired") || m.contains("not available"),
+                "got {m}"
+            )
+        }
+        other => panic!("expected recoverable ToolExecution, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wrapper_execute_after_service_dropped_returns_recoverable_error() {
+    let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
+    let slot = empty_slot();
+    let _ = slot.set(Arc::downgrade(&conv));
+    drop(conv); // strong ref gone -> Weak::upgrade fails
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let err = with_user_id(UserId::new("alice"), async {
+        w.execute_tool(
+            TOOL_SPAWN_SUBAGENT,
+            serde_json::json!({"name":"x","prompt":"y"}),
+        )
+        .await
+    })
+    .await
+    .unwrap_err();
+    match err {
+        CoreError::ToolExecution(m) => {
+            assert!(
+                m.contains("shut down") || m.contains("unavailable"),
+                "got {m}"
+            )
+        }
+        other => panic!("expected recoverable ToolExecution, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wrapper_routes_spawn_subagent_to_subagent_tools() {
+    // A live conv in the slot -> spawn_subagent routes to SubagentTools, not
+    // inner. Called outside any registered task, SubagentTools refuses with its
+    // own recoverable error, which proves the route (inner would return
+    // "inner:spawn_subagent").
+    let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
+    let slot = empty_slot();
+    let _ = slot.set(Arc::downgrade(&conv));
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let out = with_user_id(UserId::new("alice"), async {
+        w.execute_tool(
+            TOOL_SPAWN_SUBAGENT,
+            serde_json::json!({"name":"x","prompt":"y"}),
+        )
+        .await
+    })
+    .await;
+    let _keep = conv;
+    match out {
+        Err(CoreError::ToolExecution(m)) => {
+            assert!(
+                m.contains("registered background task"),
+                "routed to SubagentTools; got {m}"
+            );
+        }
+        other => panic!("expected SubagentTools refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wrapper_routes_get_subagent_status_to_subagent_tools() {
+    let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
+    let slot = empty_slot();
+    let _ = slot.set(Arc::downgrade(&conv));
+    let w = SubagentAwareToolExecutor::new(FakeInner, wrapper_registry(), slot);
+    let out = with_user_id(UserId::new("alice"), async {
+        w.execute_tool(
+            TOOL_GET_SUBAGENT_STATUS,
+            serde_json::json!({"task_id":"missing"}),
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    let _keep = conv;
+    assert!(
+        out.contains("not_found"),
+        "routed to SubagentTools status; got {out}"
+    );
+    assert!(!out.starts_with("inner:"));
+}
+
+#[tokio::test]
+async fn subagent_tools_construct_and_dispatch_over_dyn_conversation_service() {
+    // Guards the ?Sized relaxation: SubagentTools<dyn ConversationService> is
+    // representable and dispatchable.
+    let conv: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("done"));
+    let tools: SubagentTools<dyn ConversationService> =
+        SubagentTools::new(wrapper_registry(), conv);
+    let out = with_user_id(UserId::new("alice"), async {
+        tools
+            .execute_tool(
+                TOOL_GET_SUBAGENT_STATUS,
+                serde_json::json!({"task_id":"missing"}),
+            )
+            .await
+    })
+    .await
+    .unwrap();
+    assert!(out.contains("not_found"));
+}
+
+#[test]
+fn wrapper_impls_tool_executor_and_is_send_sync() {
+    fn assert_tool_executor<T: ToolExecutor + Send + Sync + 'static>() {}
+    assert_tool_executor::<SubagentAwareToolExecutor<FakeInner>>();
+    // Silence unused-import lints if the suite is trimmed.
+    let _ = tool_definitions();
+    let _ = Weak::<()>::new();
 }

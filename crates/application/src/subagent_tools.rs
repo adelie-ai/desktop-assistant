@@ -82,12 +82,12 @@ pub const MAX_SUBAGENT_DEPTH: usize = 8;
 /// Generic-over-`ConversationService` wrapper that publishes the two
 /// builtin tools and dispatches them. Cheap to `Clone` — only holds
 /// `Arc`s.
-pub struct SubagentTools<C: ConversationService> {
+pub struct SubagentTools<C: ?Sized + ConversationService> {
     registry: Arc<BackgroundTaskRegistry>,
     conversations: Arc<C>,
 }
 
-impl<C: ConversationService> Clone for SubagentTools<C> {
+impl<C: ?Sized + ConversationService> Clone for SubagentTools<C> {
     fn clone(&self) -> Self {
         Self {
             registry: Arc::clone(&self.registry),
@@ -175,7 +175,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
-impl<C: ConversationService + Send + Sync + 'static> SubagentTools<C> {
+impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
     /// Build a fresh `SubagentTools` over the given registry and
     /// conversation service. The daemon wires its full routing handler
     /// in; tests use a lightweight fake.
