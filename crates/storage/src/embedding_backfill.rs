@@ -33,10 +33,66 @@ const BATCH_SIZE: i64 = 32;
 /// is NULL (e.g. from a previous interrupted invalidation or failed backfill).
 ///
 /// Returns `(knowledge_count, tool_count)` of invalidated rows.
+///
+/// # Staleness is decided on the digest
+///
+/// The stamp is a fingerprint of the form `<name>@<digest>`. Comparing it as a
+/// whole string makes a purely cosmetic rename (`nomic-embed-text:latest` ->
+/// `nomic-embed-text`, same model, same digest) look like a model change and
+/// discard every vector to recompute an identical one. So rows whose digest
+/// already matches are *restamped* to the new spelling rather than
+/// invalidated, which also makes the comparison converge instead of
+/// re-evaluating on every boot.
+///
+/// When either side carries no digest — an older row stamped with a bare name,
+/// or a connector that could not resolve one this boot — there is no proof of
+/// sameness, so the conservative whole-string comparison still applies and the
+/// row is invalidated.
 pub async fn invalidate_stale_embeddings(
     pool: &PgPool,
     current_model: &str,
 ) -> Result<(u64, u64), String> {
+    // Adopt the current spelling wherever the digest already matches. Must run
+    // BEFORE the invalidation below, which would otherwise clear these rows.
+    // `split_part(x, '@', 2)` yields '' when there is no '@', so the non-empty
+    // test doubles as "both sides carry a digest".
+    let kb_restamped = sqlx::query(
+        "UPDATE knowledge_base
+         SET embedding_model = $1
+         WHERE embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND embedding_model <> $1
+           AND deleted_at IS NULL
+           AND split_part($1, '@', 2) <> ''
+           AND split_part(embedding_model, '@', 2) = split_part($1, '@', 2)",
+    )
+    .bind(current_model)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let tool_restamped = sqlx::query(
+        "UPDATE tool_definitions
+         SET embedding_model = $1
+         WHERE embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND embedding_model <> $1
+           AND split_part($1, '@', 2) <> ''
+           AND split_part(embedding_model, '@', 2) = split_part($1, '@', 2)",
+    )
+    .bind(current_model)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let restamped = kb_restamped.rows_affected() + tool_restamped.rows_affected();
+    if restamped > 0 {
+        tracing::info!(
+            "embedding model renamed to {current_model} with an unchanged digest; \
+             restamped {restamped} row(s) instead of re-embedding them"
+        );
+    }
+
     // Invalidate stale model embeddings (model mismatch).
     let kb_stale = sqlx::query(
         "UPDATE knowledge_base
