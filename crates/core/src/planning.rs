@@ -1195,6 +1195,96 @@ mod tests {
         assert!(freeform_note_keys(&notes).is_empty());
     }
 
+    // --- #598 [Working state] nudge -----------------------------------------
+
+    #[test]
+    fn working_state_counts_open_todos_only() {
+        let notes = vec![
+            raw("1", "open step", "todo", false),
+            raw("2", "another open step", "todo", false),
+            raw("3", "finished step", "todo", true),
+        ];
+        assert_eq!(WorkingState::from_notes(&notes).open_todos, 2);
+    }
+
+    #[test]
+    fn working_state_excludes_goal_and_outcome_notes() {
+        // Same carve-out as `freeform_note_keys`: `goal` is the [Current task]
+        // anchor and `outcome:*` findings render under [Plan], so neither is
+        // something the model would have to go looking for.
+        let notes = vec![
+            raw("goal", "the goal", "note", false),
+            raw("outcome:1", "finding", "note", false),
+            raw("1", "a step", "todo", false),
+            raw("deploy-target", "prod", "note", false),
+            raw("api-quirks", "rate limits", "note", false),
+        ];
+        assert_eq!(WorkingState::from_notes(&notes).notes, 2);
+    }
+
+    #[test]
+    fn working_state_suppressed_when_empty() {
+        assert!(WorkingState::default().render().is_none());
+        // A pad holding only already-surfaced notes counts as empty too.
+        let notes = vec![raw("goal", "g", "note", false), raw("1", "s", "todo", true)];
+        assert!(WorkingState::from_notes(&notes).render().is_none());
+    }
+
+    #[test]
+    fn working_state_renders_both_counts_with_plurals() {
+        let one = WorkingState {
+            notes: 1,
+            open_todos: 1,
+        }
+        .render()
+        .expect("non-zero counts must render");
+        assert_eq!(one, "1 scratchpad note, 1 open to-do.");
+
+        let many = WorkingState {
+            notes: 4,
+            open_todos: 2,
+        }
+        .render()
+        .expect("non-zero counts must render");
+        assert_eq!(many, "4 scratchpad notes, 2 open to-dos.");
+    }
+
+    #[test]
+    fn working_state_renders_only_the_non_zero_half() {
+        let notes_only = WorkingState {
+            notes: 3,
+            open_todos: 0,
+        }
+        .render()
+        .expect("a non-zero half must render");
+        assert_eq!(notes_only, "3 scratchpad notes.");
+
+        let todos_only = WorkingState {
+            notes: 0,
+            open_todos: 5,
+        }
+        .render()
+        .expect("a non-zero half must render");
+        assert_eq!(todos_only, "5 open to-dos.");
+    }
+
+    #[test]
+    fn working_state_note_count_matches_the_scratchpad_index() {
+        // The nudge is the floor under [Scratchpad]; a count that disagrees
+        // with the list the fuller block shows would be worse than no count.
+        // Duplicate keys across owner namespaces collapse in both.
+        let notes = vec![
+            raw("deploy-target", "prod", "note", false),
+            raw_owned("1", "deploy-target", "prod", "note", false),
+            raw("api-quirks", "rate limits", "note", false),
+        ];
+        let keys = freeform_note_keys(&notes);
+        let index = render_scratchpad_index(&keys, MAX_SCRATCHPAD_INDEX_KEYS)
+            .expect("free-form notes must produce an index");
+        let listed = index.matches(", ").count() + 1;
+        assert_eq!(WorkingState::from_notes(&notes).notes, listed);
+    }
+
     // --- #287 slice 4: fan-out + owner-path + cross-namespace roll-up --------
 
     #[test]

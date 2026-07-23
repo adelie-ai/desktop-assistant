@@ -3483,6 +3483,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn working_state_adds_no_extra_store_read() {
+        // #598: the nudge is affordable because it is free - it counts the notes
+        // the plan and index renderers already read. All three surfaces come off
+        // ONE unfiltered `list` per dispatch round; the only other read is
+        // build_step_stack's type-filtered seed.
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new("b1", "begin_step", r#"{"goal":"map it"}"#)],
+                ),
+                LlmResponse::text("done"),
+            ]),
+            captured: Arc::clone(&captured),
+        };
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        // Record each read's `note_type` filter so surface reads (unfiltered)
+        // are distinguishable from the step-stack seed (filtered to `todo`).
+        let filters: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&filters);
+        let counting_list: ScratchpadListFn = Arc::new(move |conv, note_type: Option<String>, n| {
+            seen.lock().unwrap().push(note_type.clone());
+            list(conv, note_type, n)
+        });
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(counting_list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let rounds = captured.lock().unwrap();
+        let nudge = rounds
+            .iter()
+            .flatten()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Working state]"))
+            .expect("the working-state nudge must be surfaced once the pad is non-empty");
+        assert!(nudge.content.contains("open to-do"), "{:?}", nudge.content);
+
+        let filters = filters.lock().unwrap();
+        let unfiltered = filters.iter().filter(|f| f.is_none()).count();
+        assert_eq!(
+            unfiltered, 2,
+            "two dispatch rounds must read the notes once each, not once per surface: {filters:?}"
+        );
+        assert_eq!(
+            filters.iter().filter(|f| f.is_some()).count(),
+            1,
+            "only build_step_stack reads with a type filter: {filters:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_calls_without_steps_emit_no_status() {
         // New narration model: no turn-start filler and no per-tool chatter. A
         // turn that calls tools but declares no plan steps narrates nothing —
