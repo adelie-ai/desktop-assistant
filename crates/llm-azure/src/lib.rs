@@ -310,7 +310,7 @@ impl AzureClient {
         self
     }
 
-    /// Override the `list_models()` cache TTL (default: 1h). `Some(0)` disables
+    /// Override the `list_models()` cache TTL (default: 1h). `Duration::ZERO` disables
     /// caching (every entry is immediately stale).
     pub fn with_model_cache_ttl(mut self, ttl: Duration) -> Self {
         self.model_cache.set_ttl(ttl);
