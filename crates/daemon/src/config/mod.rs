@@ -1037,14 +1037,28 @@ pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)
             .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
+
+        // `OpenOptions::mode` applies only when the file is *created*, so a
+        // config that already exists keeps whatever mode it had — which is how
+        // a 0644 seeded file stayed world-readable through every rewrite.
+        // Tighten explicitly, before any content is written.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to restrict permissions on daemon config at {}",
+                    path.display()
+                )
+            })?;
+
+        let mut file = file;
         file.write_all(content.as_bytes())
             .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
         Ok(())
