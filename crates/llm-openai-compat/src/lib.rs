@@ -40,13 +40,16 @@
 
 mod errors;
 mod messages;
+mod nonstreaming;
 mod streaming;
 mod tools;
 mod usage;
 
 pub use errors::{
     ContextOverflowInfo, classify_error, detect_context_overflow, detect_insufficient_quota,
+    detect_streaming_tools_unsupported,
 };
+pub use nonstreaming::{dispatch_non_streaming, parse_chat_completion};
 pub use messages::{
     CacheControl, ChatContent, ChatContentPart, ChatFunctionCall, ChatMessage, ChatToolCall,
     mark_system_cache_breakpoint, sanitize_tool_arguments, to_chat_messages,

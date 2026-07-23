@@ -122,6 +122,15 @@ pub fn detect_context_overflow(body: &str) -> Option<ContextOverflowInfo> {
     })
 }
 
+/// Detect the provider error that signals "this backend does not accept tool
+/// use while streaming" (#619).
+///
+/// NOTE: stub — the real detector lands in the follow-up commit (this commit is
+/// the failing spec).
+pub fn detect_streaming_tools_unsupported(_body: &str) -> bool {
+    false
+}
+
 /// Detect the permanent `insufficient_quota` billing error in an HTTP error
 /// body. True when the envelope's `error.code` or `error.type` is
 /// `insufficient_quota`.
@@ -230,6 +239,54 @@ mod tests {
         let body = r#"{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"slow down"}}"#;
         assert!(!detect_insufficient_quota(body));
         assert!(!detect_insufficient_quota("not json"));
+    }
+
+    // --- detect_streaming_tools_unsupported -----------------------------
+
+    #[test]
+    fn detect_streaming_tools_unsupported_matches_specific_wordings() {
+        assert!(detect_streaming_tools_unsupported(
+            r#"{"error":{"code":"invalid_request_error","message":"This model doesn't support tool use in streaming mode. Disable streaming to use tools."}}"#
+        ));
+        assert!(detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"tools are not supported when stream is true"}}"#
+        ));
+        // Non-JSON body from an upstream proxy is scanned raw.
+        assert!(detect_streaming_tools_unsupported(
+            "Streaming with tool_calls is not available for this provider"
+        ));
+    }
+
+    #[test]
+    fn detect_streaming_tools_unsupported_rejects_unrelated_errors() {
+        // Rate limit: no tool/stream co-occurrence.
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"Rate limit reached"}}"#
+        ));
+        // Context overflow: mentions neither tools nor streaming.
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#
+        ));
+        // A plain tools-unsupported error that is NOT streaming-specific must
+        // not trip the streaming detector (non-streaming would not help).
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"tools are not supported by this model"}}"#
+        ));
+        // A streaming error unrelated to tools.
+        assert!(!detect_streaming_tools_unsupported(
+            r#"{"error":{"message":"streaming connection failed midway"}}"#
+        ));
+        assert!(!detect_streaming_tools_unsupported("Bad Gateway"));
+    }
+
+    #[test]
+    fn classify_streaming_tools_unsupported_maps_to_tools_unsupported() {
+        let body = r#"{"error":{"code":"invalid_request_error","type":"invalid_request_error","message":"This model does not support tool use in streaming mode"}}"#;
+        let err = classify_error(StatusCode::BAD_REQUEST, &HeaderMap::new(), body);
+        assert!(
+            matches!(err, CoreError::ToolsUnsupported { .. }),
+            "expected ToolsUnsupported, got {err:?}"
+        );
     }
 
     // --- classify_error -------------------------------------------------
