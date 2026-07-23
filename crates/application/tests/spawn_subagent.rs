@@ -2044,3 +2044,225 @@ async fn subagent_completion_writes_result_note_to_session_pad_under_owner_todo(
     );
     assert_eq!(owner, "1.1", "result stamped under the child's owner_todo");
 }
+
+// --------------------------------------------------------------------
+// #608: get_subagent_status returns a completed subagent's result.
+//
+// A completed subagent is evicted from the in-memory registry the instant
+// it finishes (#158), so `status` must (a) fall back to the persistence
+// store to still report "completed", and (b) read the child's "result"
+// note off the session pad (written by #607) under the child's owner_todo.
+// --------------------------------------------------------------------
+
+use desktop_assistant_core::ports::store::{
+    BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStore,
+};
+
+/// Minimal store that only answers `get_task` from a fixed map -- enough to
+/// exercise the registry's `get_or_load` store fallback (#608). No user-scope
+/// filtering here (the real Postgres adapter does that); the registry re-checks
+/// `row.user_id`, which is what these tests assert.
+struct FixedStore {
+    rows: HashMap<String, BackgroundTaskRow>,
+}
+
+#[async_trait::async_trait]
+impl BackgroundTaskStore for FixedStore {
+    async fn create_task(&self, _row: BackgroundTaskRow) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn get_task(&self, id: &str) -> Result<Option<BackgroundTaskRow>, CoreError> {
+        Ok(self.rows.get(id).cloned())
+    }
+    async fn update_task(
+        &self,
+        _id: &str,
+        _status: BackgroundTaskStatus,
+        _last_error: Option<&str>,
+        _progress_hint: Option<&str>,
+        _ended_at: Option<i64>,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn list_tasks_for_user(
+        &self,
+        _user_id: &str,
+        _include_finished: bool,
+        _limit: Option<u32>,
+    ) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(vec![])
+    }
+    async fn scan_non_terminal(&self) -> Result<Vec<BackgroundTaskRow>, CoreError> {
+        Ok(vec![])
+    }
+}
+
+/// A completed subagent row as it survives in the store after in-memory
+/// eviction. `owner_todo` pins the child's namespace on the session pad.
+fn completed_subagent_row(id: &str, user: &UserId, owner_todo: &str) -> BackgroundTaskRow {
+    let kind = api::TaskKind::Subagent {
+        parent_task_id: api::TaskId("parent-1".to_string()),
+        conversation_id: "child-conv".to_string(),
+        name: "researcher".to_string(),
+        session_conversation_id: "sess-1".to_string(),
+    };
+    BackgroundTaskRow {
+        id: id.to_string(),
+        user_id: user.as_str().to_string(),
+        kind_json: serde_json::to_value(kind).expect("serialize kind"),
+        status: BackgroundTaskStatus::Completed,
+        parent_task_id: Some("parent-1".to_string()),
+        title: "researcher".to_string(),
+        last_error: None,
+        progress_hint: None,
+        started_at: 1,
+        ended_at: Some(2),
+        owner_todo: owner_todo.to_string(),
+        spawn_marker: Some("marker".to_string()),
+    }
+}
+
+/// Build a `get_many` handle returning a fixed set of `(owner_todo, content)`
+/// notes for key "result" (ignoring the conversation/keys/limit args, as the
+/// real store's owner filtering is exercised in the storage crate).
+fn result_notes_get_many(
+    notes: Vec<(String, String)>,
+) -> desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn {
+    Arc::new(move |_conv, _keys, _limit| {
+        let notes = notes.clone();
+        Box::pin(async move {
+            let out = notes
+                .into_iter()
+                .enumerate()
+                .map(|(i, (owner, content))| {
+                    let mut n = desktop_assistant_core::domain::ScratchpadNote::new(
+                        format!("id{i}"),
+                        "sess-1",
+                        "result",
+                        content,
+                    );
+                    n.owner_todo = owner;
+                    n
+                })
+                .collect();
+            Ok(out)
+        })
+    })
+}
+
+/// Assemble `SubagentTools` wired to a store (for the completed-task fallback)
+/// and a get_many returning `notes` (for the result-note read).
+fn status_tools(
+    store: Arc<FixedStore>,
+    notes: Vec<(String, String)>,
+) -> SubagentTools<dyn ConversationService> {
+    use desktop_assistant_application::subagent_tools::SubagentScratchpad;
+    let registry = Arc::new(BackgroundTaskRegistry::new().with_store(store));
+    let conversations: Arc<dyn ConversationService> = Arc::new(FakeConversations::new("unused"));
+    let write: desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn =
+        Arc::new(|_c, _n| Box::pin(async { Ok(Vec::new()) }));
+    SubagentTools::new(registry, conversations).with_scratchpad(SubagentScratchpad {
+        write,
+        get_many: result_notes_get_many(notes),
+    })
+}
+
+/// Call get_subagent_status under a user + session-conversation scope so the
+/// result-note read can locate the session pad, returning parsed JSON.
+async fn run_status(
+    tools: &SubagentTools<dyn ConversationService>,
+    user: UserId,
+    task_id: &str,
+) -> serde_json::Value {
+    use desktop_assistant_core::ports::conversation_ctx::with_conversation_id;
+    let task_id = task_id.to_string();
+    let raw = with_user_id(
+        user,
+        with_conversation_id(ConversationId::from("sess-1"), async {
+            tools
+                .execute_tool(
+                    TOOL_GET_SUBAGENT_STATUS,
+                    serde_json::json!({ "task_id": task_id }),
+                )
+                .await
+        }),
+    )
+    .await
+    .expect("status returned Ok");
+    serde_json::from_str(&raw).expect("status returned JSON")
+}
+
+#[tokio::test]
+async fn get_subagent_status_returns_completed_with_result_from_pad() {
+    let user = unique_user("alice");
+    let mut rows = HashMap::new();
+    rows.insert(
+        "task-9".to_string(),
+        completed_subagent_row("task-9", &user, "1.1"),
+    );
+    let store = Arc::new(FixedStore { rows });
+    // Two "result" notes on the session pad; only the one under owner_todo
+    // "1.1" belongs to this child, so the sibling "1.2" note must be ignored.
+    let tools = status_tools(
+        store,
+        vec![
+            ("1.2".to_string(), "sibling B answer".to_string()),
+            ("1.1".to_string(), "child A answer".to_string()),
+        ],
+    );
+
+    let json = run_status(&tools, user, "task-9").await;
+    assert_eq!(
+        json["status"], "completed",
+        "evicted-but-completed via store"
+    );
+    assert_eq!(
+        json["result"], "child A answer",
+        "surfaces the result note under THIS child's owner_todo, not a sibling's"
+    );
+}
+
+#[tokio::test]
+async fn get_subagent_status_completed_without_result_note_omits_result() {
+    let user = unique_user("alice");
+    let mut rows = HashMap::new();
+    rows.insert(
+        "task-9".to_string(),
+        completed_subagent_row("task-9", &user, "1.1"),
+    );
+    let store = Arc::new(FixedStore { rows });
+    // Pad has no note for this child (only a sibling's).
+    let tools = status_tools(store, vec![("1.2".to_string(), "sibling".to_string())]);
+
+    let json = run_status(&tools, user, "task-9").await;
+    assert_eq!(json["status"], "completed");
+    assert!(
+        json.get("result").is_none(),
+        "no result note for this child -> status stays lifecycle-only, no result key"
+    );
+}
+
+#[tokio::test]
+async fn get_subagent_status_hides_task_owned_by_another_user() {
+    let owner = unique_user("bob");
+    let prober = unique_user("alice");
+    let mut rows = HashMap::new();
+    // Row is Bob's; the mock store does not user-filter, so the registry's
+    // own `row.user_id` re-check is the thing under test.
+    rows.insert(
+        "task-9".to_string(),
+        completed_subagent_row("task-9", &owner, "1.1"),
+    );
+    let store = Arc::new(FixedStore { rows });
+    let tools = status_tools(store, vec![("1.1".to_string(), "bob's secret".to_string())]);
+
+    let json = run_status(&tools, prober, "task-9").await;
+    assert_eq!(
+        json["error"], "not_found",
+        "another user's task is indistinguishable from a missing one (#105)"
+    );
+    assert!(
+        json.get("result").is_none(),
+        "never leak the other user's result content"
+    );
+}

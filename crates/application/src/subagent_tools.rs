@@ -56,8 +56,10 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolDefinition;
 use desktop_assistant_core::ports::auth::current_user_id;
+use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::inbound::ConversationService;
 use desktop_assistant_core::ports::llm::current_cancellation_token;
+use desktop_assistant_core::ports::scratchpad_scope::current_scratchpad_scope;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
@@ -447,15 +449,50 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
         }
     }
 
+    /// Read a finished subagent's "result" note off the session pad (#608).
+    ///
+    /// The completion path writes the child's answer as a `result` note under
+    /// the child's `owner_todo` (#607). We fetch every `result` note in the
+    /// session conversation and keep the one whose `owner_todo` matches this
+    /// child exactly -- a top-level parent reads with no snapshot restriction
+    /// so `get_many` returns siblings' `result` notes too, and the owner_todo
+    /// filter is what pins it to the right child.
+    ///
+    /// Best-effort: any missing handle, unlocatable session, read error, or
+    /// absent note yields `None` so `status` degrades to lifecycle-only rather
+    /// than failing the tool call.
+    async fn load_result_note(&self, owner_todo: &str) -> Option<String> {
+        let scratchpad = self.scratchpad.as_ref()?;
+        // The session pad lives on the root session conversation. A subagent
+        // parent reads it via its own scope's `session_conversation_id`; the
+        // top-level parent is that conversation, so fall back to the current
+        // conversation id.
+        let session = current_scratchpad_scope()
+            .or_else(current_conversation_id)
+            .map(|c| c.as_str().to_string())?;
+        let notes = (scratchpad.get_many)(session, vec!["result".to_string()], 64)
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "read subagent result note"))
+            .ok()?;
+        notes
+            .into_iter()
+            .find(|n| n.owner_todo == owner_todo)
+            .map(|n| n.content)
+    }
+
     async fn status(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let task_id_str = required_string(&arguments, "task_id")?;
         let user_id = current_user_id();
         let task_id = api::TaskId(task_id_str.clone());
 
-        let Some(view) = self.registry.get(&user_id, &task_id) else {
-            // Existence-hiding: a task that doesn't exist and a task
-            // that belongs to another user surface identically. #105's
-            // contract — don't leak existence to a probing LLM.
+        // `get_or_load` falls back to the persistence store: a *completed*
+        // subagent is evicted from the in-memory registry the instant it
+        // finishes (#158), so a plain in-memory `get` would report
+        // `not_found` for exactly the subagents the parent most wants to
+        // collect (#608). The store read is scoped to the current user, so
+        // existence-hiding is preserved: a task that doesn't exist and one
+        // owned by another user surface identically (#105).
+        let Some(view) = self.registry.get_or_load(&user_id, &task_id).await else {
             return Ok(serde_json::json!({
                 "error": "not_found",
                 "task_id": task_id_str,
@@ -471,17 +508,21 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
             api::TaskStatus::Cancelled => "cancelled",
         };
 
-        // For completed subagents we surface the recorded last error
-        // (if any). The child's final assistant text is captured at
-        // spawn time via the helper's result sink and returned through
-        // `spawn_subagent { wait: true }`; the registry doesn't store
-        // it out-of-band so `status` is intentionally lifecycle-only.
         let mut payload = serde_json::json!({
             "task_id": task_id_str,
             "status": status_str,
         });
         if let Some(err) = view.last_error.as_ref() {
             payload["error"] = serde_json::Value::String(err.clone());
+        }
+        // For a completed subagent, surface its final answer: the completion
+        // path writes it to the session pad as a "result" note under the
+        // child's own owner_todo (#607), so `status` returns it directly and
+        // the parent never has to reconstruct it from past conversations.
+        if view.status == api::TaskStatus::Completed
+            && let Some(result) = self.load_result_note(&view.owner_todo).await
+        {
+            payload["result"] = serde_json::Value::String(result);
         }
         Ok(payload.to_string())
     }
