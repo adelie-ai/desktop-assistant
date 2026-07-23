@@ -995,6 +995,13 @@ pub struct MessageView {
     pub id: String,
     pub role: String,
     pub content: String,
+    /// The client-supplied idempotency key persisted on a USER message (#570
+    /// Phase 1b). Surfaced on load so a reconnecting client dedups an echoed
+    /// `UserMessageAdded` by exact match rather than a content compare. `None`
+    /// for assistant/tool rows, keyless sends, and older peers that don't send
+    /// it (`serde(default)`).
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

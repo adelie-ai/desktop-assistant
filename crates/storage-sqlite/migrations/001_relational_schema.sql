@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_call_id    TEXT,
     -- ON DELETE SET NULL: deleting a summary auto-expands its messages.
     summary_id      TEXT REFERENCES message_summaries(id) ON DELETE SET NULL,
+    -- #570 Phase 1b: client idempotency key, carried on USER rows only so a
+    -- reload/reconnect surfaces it; NULL for assistant/tool rows and keyless
+    -- sends.
+    idempotency_key TEXT,
     UNIQUE (conversation_id, ordinal)
 );
 

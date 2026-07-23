@@ -85,9 +85,11 @@ impl From<api::MessageView> for ChatMessage {
             // Daemon-sourced messages are always ordinary; clients tag the lines
             // they generate locally (voice#126).
             kind: MessageKind::Normal,
-            // A daemon-sourced message carries a real `id`; the idempotency key
-            // is a client-local stamp on optimistic bubbles only (#570).
-            idempotency_key: None,
+            // Surface the persisted idempotency key (#570 Phase 1b): a USER row
+            // carries the client's key, so a transcript reload/reconnect dedups
+            // an echoed `UserMessageAdded` by exact match rather than a
+            // content compare. `None` for assistant/tool rows and keyless sends.
+            idempotency_key: value.idempotency_key,
         }
     }
 }

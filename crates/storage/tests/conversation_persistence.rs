@@ -505,8 +505,7 @@ async fn assistant_message_idempotency_key_persists_null() {
             user_msg.idempotency_key = Some("k-user".to_string());
             conv.messages.push(user_msg);
             // Assistant reply pushed later in a real turn — never keyed.
-            conv.messages
-                .push(Message::new(Role::Assistant, "hi back"));
+            conv.messages.push(Message::new(Role::Assistant, "hi back"));
 
             with_user_id(UserId::new("u1"), async {
                 store.create(conv.clone()).await.expect("create");
@@ -545,8 +544,7 @@ async fn user_message_without_key_loads_as_none() {
         let store = PgConversationStore::new(fx.pool.clone());
         let mut conv = conversation_with_messages("conv-idem-keyless", 0);
         // A plain user message: `idempotency_key` defaults to None.
-        conv.messages
-            .push(Message::new(Role::User, "no key here"));
+        conv.messages.push(Message::new(Role::User, "no key here"));
 
         with_user_id(UserId::new("u1"), async {
             store.create(conv.clone()).await.expect("create");

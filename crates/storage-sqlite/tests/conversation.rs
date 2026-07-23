@@ -354,8 +354,7 @@ async fn assistant_message_idempotency_key_persists_null() {
     let mut user_msg = Message::new(Role::User, "hello");
     user_msg.idempotency_key = Some("k-user".to_string());
     conv.messages.push(user_msg);
-    conv.messages
-        .push(Message::new(Role::Assistant, "hi back"));
+    conv.messages.push(Message::new(Role::Assistant, "hi back"));
 
     s.create(conv).await.expect("create");
     let got = s.get(&ConversationId::from("c1")).await.expect("get");
@@ -371,8 +370,7 @@ async fn assistant_message_idempotency_key_persists_null() {
 async fn user_message_without_key_loads_as_none() {
     let s = store().await;
     let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
-    conv.messages
-        .push(Message::new(Role::User, "no key here"));
+    conv.messages.push(Message::new(Role::User, "no key here"));
 
     s.create(conv).await.expect("create");
     let got = s.get(&ConversationId::from("c1")).await.expect("get");

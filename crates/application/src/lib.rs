@@ -1285,6 +1285,7 @@ where
                             id: m.id,
                             role: format!("{:?}", m.role).to_lowercase(),
                             content: m.content,
+                            idempotency_key: m.idempotency_key,
                         })
                         .collect(),
                     warnings: Vec::new(),
@@ -1313,6 +1314,7 @@ where
                         id: m.id,
                         role: format!("{:?}", m.role).to_lowercase(),
                         content: m.content,
+                        idempotency_key: m.idempotency_key,
                     })
                     .collect();
                 Ok(api::CommandResult::Messages(window_messages(
@@ -3104,6 +3106,11 @@ where
     // assistant's chunks; the initiating client dedupes on `request_id`, or on
     // the echoed `idempotency_key` when it supplied one (#570) — it already
     // rendered the bubble optimistically.
+    //
+    // Captured before the echo emit MOVES `echo_idempotency_key`, and used to
+    // install the persist-side task-local (#570 Phase 1b) around the FOREGROUND
+    // dispatch so `send_prompt` stamps the key onto the user row.
+    let persist_idempotency_key = echo_idempotency_key.clone();
     let _ = sink
         .emit(api::Event::UserMessageAdded {
             conversation_id: conversation_id.clone(),
@@ -3163,14 +3170,20 @@ where
 
     let core_conv_id =
         desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str());
-    let dispatch = conversations.send_prompt_with_override(
-        &core_conv_id,
-        content,
-        override_for_core,
-        system_refinement,
-        callback,
-        on_status,
-        cancellation,
+    // Install the client's idempotency key (#570 Phase 1b) for the persist site
+    // in `send_prompt` — FOREGROUND path only. Agent runs dispatch without this
+    // wrap (see `spawn_agent_conversation`), so their user rows persist `None`.
+    let dispatch = desktop_assistant_core::ports::llm::with_idempotency_key(
+        persist_idempotency_key,
+        conversations.send_prompt_with_override(
+            &core_conv_id,
+            content,
+            override_for_core,
+            system_refinement,
+            callback,
+            on_status,
+            cancellation,
+        ),
     );
 
     // Layer the per-turn task-locals around the dispatch. Innermost: the
@@ -3210,7 +3223,16 @@ where
     // (#256 — shared with the agent path). The companion `progress_hint` clear
     // lives in the registry's panic-safe `finalize` (#254), so there is no
     // in-body clear here.
-    let outcome = with_task_observer(task_ctx.clone(), dispatched).await;
+    //
+    // Box the composed task-local chain onto the heap before awaiting it: this
+    // future is deeply nested (idempotency-key / client-tools / context-usage /
+    // task-observer scopes around `send_prompt_with_override`) and `run_send_turn`
+    // itself runs on a spawned registry task with a bounded worker stack. Keeping
+    // the composition off `run_send_turn`'s own stack frame preserves the thin
+    // spawned-future invariant (#205/#206) so an extra scope layer can't overflow
+    // the 2 MB worker stack.
+    let dispatched = with_task_observer(task_ctx.clone(), dispatched);
+    let outcome = Box::pin(dispatched).await;
 
     if let Err(e) = forwarder.await {
         warn!("stream forwarder task failed: {e}");
@@ -4779,6 +4801,7 @@ mod tests {
             id: id.into(),
             role: role.into(),
             content: content.into(),
+            idempotency_key: None,
         }
     }
 

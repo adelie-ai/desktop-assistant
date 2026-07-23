@@ -218,6 +218,30 @@ tokio::task_local! {
     /// request-scoped, never persisted, threaded via a task-local so the
     /// `send_prompt` and `LlmClient` signatures stay unchanged.
     static NOW_CONTEXT: String;
+
+    /// The client-supplied idempotency key for the FOREGROUND send in progress
+    /// (#570 Phase 1b).
+    ///
+    /// Installed by the application layer's foreground dispatch wrapper via
+    /// [`with_idempotency_key`] from the request's echoed key, and read by
+    /// `send_prompt` via [`current_idempotency_key`] at the single
+    /// user-message persist site so the key is stamped onto the USER row. It is
+    /// then surfaced back on load so a reconnecting client dedups an echoed
+    /// `UserMessageAdded` by exact match rather than a content compare.
+    ///
+    /// Deliberately installed on the FOREGROUND path only: agent runs
+    /// (standalone / subagent) dispatch through `send_prompt_with_override`
+    /// without this wrap, so their user rows persist `None` — a background agent
+    /// turn is never a client-retryable send. Unset outside the wrap — which
+    /// [`current_idempotency_key`] returns as `None` — so tests, dreaming jobs,
+    /// and agent runs persist no key. The stored value is itself an `Option` so
+    /// a keyless foreground send (installed as `None`) is distinguishable in
+    /// contract from "no wrap at all", though both read back as `None`.
+    ///
+    /// Why a task-local: mirrors the other per-turn task-locals in this module
+    /// so the value threads to `send_prompt` without changing the
+    /// `ConversationService`/`LlmClient` signatures.
+    static IDEMPOTENCY_KEY: Option<String>;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -292,6 +316,27 @@ where
 /// the message list is unchanged. Safe to call from any async context.
 pub fn current_now_context() -> String {
     NOW_CONTEXT.try_with(|n| n.clone()).unwrap_or_default()
+}
+
+/// Run `fut` with `key` installed as the current foreground send's client
+/// idempotency key. `send_prompt` reads it via [`current_idempotency_key`] and
+/// stamps it onto the USER message row it persists. See [`IDEMPOTENCY_KEY`].
+///
+/// The application layer wraps ONLY the foreground dispatch with this; agent
+/// runs deliberately do not, so their user rows persist `None`.
+pub async fn with_idempotency_key<F, T>(key: Option<String>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    IDEMPOTENCY_KEY.scope(key, fut).await
+}
+
+/// The current foreground send's client idempotency key, or `None` when no
+/// [`with_idempotency_key`] scope is installed (agent runs, dreaming jobs,
+/// tests) or when the installed key is itself `None` (a keyless foreground
+/// send). Safe to call from any async context.
+pub fn current_idempotency_key() -> Option<String> {
+    IDEMPOTENCY_KEY.try_with(|k| k.clone()).ok().flatten()
 }
 
 /// Run `fut` with `model` installed as the current turn's model override.
@@ -1889,9 +1934,12 @@ mod tests {
     #[tokio::test]
     async fn current_idempotency_key_observes_installed_scope() {
         let observed =
-            with_idempotency_key(Some("k1".to_string()), async { current_idempotency_key() })
-                .await;
-        assert_eq!(observed, Some("k1".to_string()), "installed key is observed");
+            with_idempotency_key(Some("k1".to_string()), async { current_idempotency_key() }).await;
+        assert_eq!(
+            observed,
+            Some("k1".to_string()),
+            "installed key is observed"
+        );
 
         let keyless = with_idempotency_key(None, async { current_idempotency_key() }).await;
         assert_eq!(keyless, None, "a None scope reads back as None");
