@@ -985,6 +985,25 @@ async fn main() -> Result<()> {
     // and ignore the user's choice. Using the same helper for primary
     // and background-task purposes keeps the model-override logic in
     // one place.
+    // A config written before mixed pairs were refused (or edited by hand)
+    // still loads — refusing to boot would strand the operator with no way to
+    // reach the settings UI and fix it. Say so loudly instead: the purpose
+    // resolves as if it were fully named, which is rarely what was meant.
+    if let Some(cfg) = daemon_config.as_ref() {
+        for (kind, purpose) in cfg.purposes.iter() {
+            if purpose.inheritance_is_mixed() {
+                tracing::warn!(
+                    "purpose \"{}\" mixes a named binding with the \"primary\" inherit sentinel \
+                     (connection \"{}\", model \"{}\"); half-inheritance has no meaning — set both \
+                     to \"primary\" to inherit from interactive, or name both",
+                    kind.as_key(),
+                    purpose.connection,
+                    purpose.model,
+                );
+            }
+        }
+    }
+
     let primary_resolved = config::resolve_purpose_llm_config(
         daemon_config.as_ref(),
         purposes::PurposeKind::Interactive,

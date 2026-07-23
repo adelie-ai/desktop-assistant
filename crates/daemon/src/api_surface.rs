@@ -628,6 +628,21 @@ impl ConnectionsService for DaemonConnectionsService {
             }
         }
 
+        // Half-inheritance is meaningless: a real connection cannot resolve a
+        // model borrowed from a different one. Refusing it here is what keeps
+        // a client that cannot populate its model dropdown from quietly
+        // retiring a working binding (#659).
+        if new_cfg.inheritance_is_mixed() {
+            return Err(CoreError::Llm(format!(
+                "purpose \"{}\": connection \"{}\" and model \"{}\" mix a named binding with the \
+                 \"primary\" inherit sentinel — use \"primary\" for both to inherit from \
+                 interactive, or name both",
+                purpose_kind.as_key(),
+                new_cfg.connection,
+                new_cfg.model,
+            )));
+        }
+
         self.registry.mutate_config(|cfg| {
             cfg.purposes.set(purpose_kind, Some(new_cfg));
             cfg.purposes.validate().map_err(|e| format!("{e}"))
