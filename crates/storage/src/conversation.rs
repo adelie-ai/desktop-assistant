@@ -588,8 +588,8 @@ async fn insert_message(
     .bind(&msg.tool_call_id)
     .bind(&msg.summary_id)
     // #570 Phase 1b: carried on USER rows only (the persist site stamps it);
-    // NULL for assistant/tool rows and keyless sends. `update_message` does not
-    // touch this column, so the key is stable once written.
+    // NULL for assistant/tool rows and keyless sends. `update_message` rebinds
+    // it so the key follows its message across an ordinal shift (#570).
     .bind(&msg.idempotency_key)
     .execute(&mut **tx)
     .await
@@ -602,6 +602,15 @@ async fn insert_message(
 /// preserving its row id (and so its primary-key identity). Only called when
 /// the slot's content differs from what's persisted, so the regenerated
 /// tsvector cost is paid only for genuinely changed rows.
+///
+/// `idempotency_key` is bound alongside the content so the key travels with its
+/// message (#570). Reconciliation is by ordinal SLOT, so an overflow trim
+/// (`recover_from_overflow` -> `trim_tool_pairs`) can shift a keyed user row
+/// into a slot the prior occupant held; without rebinding the key here that row
+/// would inherit the prior occupant's key column — losing the user's key and
+/// stranding a stale one on a non-user row (the USER-rows-only invariant in
+/// migration 031). This runs only when the slot's content already differs, so
+/// stable slots take no extra write.
 async fn update_message(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: &str,
@@ -614,7 +623,7 @@ async fn update_message(
     sqlx::query(
         "UPDATE messages \
          SET role = $4, content = $5, tool_calls = $6, \
-             tool_call_id = $7, summary_id = $8 \
+             tool_call_id = $7, summary_id = $8, idempotency_key = $9 \
          WHERE user_id = $1 AND conversation_id = $2 AND ordinal = $3",
     )
     .bind(user_id)
@@ -625,6 +634,7 @@ async fn update_message(
     .bind(tool_calls_json)
     .bind(&msg.tool_call_id)
     .bind(&msg.summary_id)
+    .bind(&msg.idempotency_key)
     .execute(&mut **tx)
     .await
     .map_err(|e| CoreError::Storage(e.to_string()))?;
