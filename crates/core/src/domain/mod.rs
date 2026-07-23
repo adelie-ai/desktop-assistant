@@ -13,6 +13,6 @@ pub use message::{Message, Role};
 pub use scratchpad::{DEFAULT_NOTE_TYPE, ScratchpadNote};
 pub use skill::{
     AttachmentDigest, IndexedSkill, Locality, ParsedSkill, SkillError, SkillFrontmatter, SkillKind,
-    TrustTier,
+    SkillScope, TrustTier,
 };
 pub use tool::{ToolCall, ToolDefinition, ToolLocality, ToolNamespace, ToolResult, TransportKind};

@@ -34,6 +34,9 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 # then invoke it through `BuiltinToolService::execute_tool` so the
 # end-to-end LLM-driven path is exercised verbatim.
 desktop-assistant-mcp-client.workspace = true
+# The executable `SkillIndexStore` contract, run against this adapter so the
+# stores cannot diverge on catalog semantics.
+desktop-assistant-core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

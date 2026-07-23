@@ -1279,11 +1279,15 @@ async fn main() -> Result<()> {
         ))
     });
 
-    // Index on-disk skills at startup (#573): scan the configured global roots
-    // and replace the global catalog. Capability-off when disabled or when no
-    // configured root resolves; embeddings are filled by the backfill loop.
+    // Index on-disk skills at startup (#573): scan the configured roots and
+    // reconcile each scope against the catalog (#639) -- skills accrete, and one
+    // a scan no longer sees is marked absent rather than deleted. Capability-off
+    // when disabled or when no configured root resolves; embeddings are filled
+    // by the backfill loop.
     if let Some(store) = &skill_index_store {
-        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        use desktop_assistant_core::domain::SkillScope;
+        use desktop_assistant_core::skill_catalog::reconcile_scan;
+        let scanned_at = chrono::Utc::now();
         let skills_cfg = daemon_config
             .as_ref()
             .map(|c| c.skills.clone())
@@ -1297,13 +1301,23 @@ async fn main() -> Result<()> {
                 .cloned()
                 .collect();
             if roots.is_empty() {
+                // Skip the pass entirely rather than reconciling an empty scan:
+                // with no root to read, the daemon has no evidence either way,
+                // and marking the whole scope absent would be a claim it cannot
+                // support. Nothing is deleted either way -- this is about not
+                // asserting a skill is gone when we simply never looked.
                 tracing::info!("skill library: no configured global skill root is present");
             } else {
                 let skills = crate::skill_scanner::scan_global_roots(&roots);
-                let count = skills.len();
-                match store.reindex_global(skills).await {
-                    Ok(()) => tracing::info!(indexed = count, "global skills indexed"),
-                    Err(e) => tracing::warn!("global skill reindex failed: {e}"),
+                match reconcile_scan(store.as_ref(), &SkillScope::Global, skills, scanned_at).await
+                {
+                    Ok(outcome) => tracing::info!(
+                        indexed = outcome.upserted,
+                        marked_absent = outcome.marked_absent,
+                        restored = outcome.restored,
+                        "global skills indexed"
+                    ),
+                    Err(e) => tracing::warn!("global skill reconcile failed: {e}"),
                 }
             }
 
@@ -1323,12 +1337,16 @@ async fn main() -> Result<()> {
                 match desktop_assistant_peer_cred::username_for_uid(uid) {
                     Ok(Some(owner)) => {
                         let skills = crate::skill_scanner::scan_user_roots(&user_roots, &owner);
-                        let count = skills.len();
-                        match store.reindex_for_owner(&owner, skills).await {
-                            Ok(()) => {
-                                tracing::info!(owner = %owner, indexed = count, "user skills indexed")
-                            }
-                            Err(e) => tracing::warn!("user skill reindex failed: {e}"),
+                        let scope = SkillScope::Owner(owner.clone());
+                        match reconcile_scan(store.as_ref(), &scope, skills, scanned_at).await {
+                            Ok(outcome) => tracing::info!(
+                                owner = %owner,
+                                indexed = outcome.upserted,
+                                marked_absent = outcome.marked_absent,
+                                restored = outcome.restored,
+                                "user skills indexed"
+                            ),
+                            Err(e) => tracing::warn!("user skill reconcile failed: {e}"),
                         }
                     }
                     Ok(None) => tracing::warn!(

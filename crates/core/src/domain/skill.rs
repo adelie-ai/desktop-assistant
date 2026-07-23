@@ -12,6 +12,7 @@
 //! the blessing must be invalidated if any of them changes. Hashing only
 //! `SKILL.md` would let a swapped `scripts/run.sh` keep a stale blessing valid.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -312,6 +313,41 @@ fn update_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+/// The catalog partition an operation addresses: the host-global skills, or one
+/// user's own.
+///
+/// Why a type rather than a bare `Option<&str>` owner: every catalog write is
+/// scoped, and `None` reads ambiguously as either "the global scope" or "no
+/// filter" -- a dangerous ambiguity for an operation that marks rows absent.
+/// One value names the partition for presence updates, scope listing, and the
+/// reconcile pass, which is also what keeps those from re-growing into a pair
+/// of near-identical `*_global` / `*_for_owner` verbs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillScope {
+    /// Host-global, owner-less skills scanned from system roots.
+    Global,
+    /// Skills owned by a single user.
+    Owner(String),
+}
+
+impl SkillScope {
+    /// The owner id this scope addresses; `None` for [`SkillScope::Global`].
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            SkillScope::Global => None,
+            SkillScope::Owner(owner) => Some(owner.as_str()),
+        }
+    }
+
+    /// The scope a skill belongs to, derived from its `owner_user_id`.
+    pub fn of(skill: &IndexedSkill) -> Self {
+        match &skill.owner_user_id {
+            None => SkillScope::Global,
+            Some(owner) => SkillScope::Owner(owner.clone()),
+        }
+    }
+}
+
 /// The indexed representation of a skill: the currency of the `SkillIndexStore`
 /// port and what search/get return. Storage-only concerns (embeddings) are not
 /// part of this domain type.
@@ -348,6 +384,30 @@ pub struct IndexedSkill {
     /// Extra frontmatter preserved verbatim.
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Whether the skill's files were on disk at the last scan of its scope.
+    ///
+    /// `false` means the indexed copy is all that survives: the body still
+    /// reads, but `disk_path` and [`Self::attachments`] no longer resolve, so
+    /// bundled scripts cannot be run.
+    ///
+    /// Why a flag and not a delete: the catalog is cumulative, so a skill
+    /// disappearing from disk is never a reason to forget the procedure. This
+    /// is index state rather than scan output -- a reconcile pass sets it, and
+    /// whatever a scanner puts here is ignored on write.
+    #[serde(default = "present_on_disk_default")]
+    pub present_on_disk: bool,
+    /// When a scan last saw this skill on disk; `None` for a row no
+    /// presence-tracking scan has covered yet. Index state, like
+    /// [`Self::present_on_disk`].
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+/// A row with no recorded presence predates presence tracking, and the skill it
+/// describes was on disk when it was indexed -- so absent evidence means
+/// present, not missing.
+fn present_on_disk_default() -> bool {
+    true
 }
 
 #[cfg(test)]

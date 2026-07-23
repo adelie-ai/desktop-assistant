@@ -15,10 +15,18 @@ serde.workspace = true
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
-chrono.workspace = true
+# `serde`: `IndexedSkill::last_seen_at` is a `DateTime<Utc>` on a serialized
+# domain type. No new dependency -- chrono is already a workspace dep.
+chrono = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["time"] }
 tokio-util.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
+
+[features]
+# Exposes `ports::skill_index::conformance`, the executable contract every
+# `SkillIndexStore` implementation must satisfy. Enabled by the storage crates'
+# dev-dependencies so each adapter's test suite runs the same cases.
+test-support = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

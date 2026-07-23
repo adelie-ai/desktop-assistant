@@ -644,8 +644,11 @@ impl BuiltinToolService {
             defs.push(ToolDefinition::new(
                 TOOL_SKILL_GET,
                 "Fetch one skill by name: its full markdown body, on-disk path, attachment \
-                 filenames, kind, and trust tier. Use after builtin_skill_search to read a skill \
-                 before following it.",
+                 filenames, kind, trust tier, and whether its files are still present on disk. \
+                 Use after builtin_skill_search to read a skill before following it. When \
+                 present_on_disk is false the procedure is still good, but the skill's files are \
+                 gone: its path and attachments no longer resolve, so don't try to run its \
+                 bundled scripts.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1080,6 +1083,7 @@ impl BuiltinToolService {
                     "trust_tier": s.trust_tier.as_str(),
                     "disk_path": s.disk_path,
                     "attachments": s.attachments,
+                    "present_on_disk": s.present_on_disk,
                 })
             })
             .collect();
@@ -1108,6 +1112,8 @@ impl BuiltinToolService {
                 "trust_tier": s.trust_tier.as_str(),
                 "disk_path": s.disk_path,
                 "attachments": s.attachments,
+                "present_on_disk": s.present_on_disk,
+                "last_seen_at": s.last_seen_at.map(|ts| ts.to_rfc3339()),
                 "tags": s.tags,
                 "body": s.body,
             })
@@ -3068,6 +3074,8 @@ mod tests {
                 attachments: vec!["scripts/run.sh".to_string()],
                 body: "# body\n\n## Steps\n1. go".to_string(),
                 metadata: serde_json::Value::Null,
+                present_on_disk: true,
+                last_seen_at: None,
             }
         }
 
