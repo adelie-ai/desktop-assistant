@@ -1374,6 +1374,7 @@ dependencies = [
  "desktop-assistant-llm-openai",
  "desktop-assistant-llm-openrouter",
  "desktop-assistant-mcp-client",
+ "desktop-assistant-peer-cred",
  "desktop-assistant-storage",
  "desktop-assistant-uds",
  "desktop-assistant-ws",

@@ -29,6 +29,37 @@ impl SqliteSkillIndexStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    /// Insert one skill row (the FTS triggers keep `skill_index_fts` in sync).
+    /// JSON columns store `tags`/`attachments`/`metadata` as text.
+    async fn insert_one(
+        conn: &mut sqlx::SqliteConnection,
+        skill: &IndexedSkill,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "INSERT INTO skill_index \
+                (name, owner_user_id, description, kind, disk_path, locality, content_hash, \
+                 trust_tier, source, tags, attachments, body, metadata) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&skill.name)
+        .bind(&skill.owner_user_id)
+        .bind(&skill.description)
+        .bind(skill.kind.as_str())
+        .bind(&skill.disk_path)
+        .bind(skill.locality.as_str())
+        .bind(&skill.content_hash)
+        .bind(skill.trust_tier.as_str())
+        .bind(&skill.source)
+        .bind(serde_json::to_string(&skill.tags).unwrap_or_else(|_| "[]".into()))
+        .bind(serde_json::to_string(&skill.attachments).unwrap_or_else(|_| "[]".into()))
+        .bind(&skill.body)
+        .bind(serde_json::to_string(&skill.metadata).unwrap_or_else(|_| "{}".into()))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// A `skill_index` row decoded as a positional tuple (SQLite adapters map into
@@ -110,28 +141,35 @@ impl SkillIndexStore for SqliteSkillIndexStore {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         for skill in &skills {
-            sqlx::query(
-                "INSERT INTO skill_index \
-                    (name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                     trust_tier, source, tags, attachments, body, metadata) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&skill.name)
-            .bind(&skill.owner_user_id)
-            .bind(&skill.description)
-            .bind(skill.kind.as_str())
-            .bind(&skill.disk_path)
-            .bind(skill.locality.as_str())
-            .bind(&skill.content_hash)
-            .bind(skill.trust_tier.as_str())
-            .bind(&skill.source)
-            .bind(serde_json::to_string(&skill.tags).unwrap_or_else(|_| "[]".into()))
-            .bind(serde_json::to_string(&skill.attachments).unwrap_or_else(|_| "[]".into()))
-            .bind(&skill.body)
-            .bind(serde_json::to_string(&skill.metadata).unwrap_or_else(|_| "{}".into()))
+            Self::insert_one(&mut tx, skill).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn reindex_for_owner(
+        &self,
+        owner: &str,
+        skills: Vec<IndexedSkill>,
+    ) -> Result<(), CoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        // Replace only this owner's rows; global and other users' rows untouched.
+        sqlx::query("DELETE FROM skill_index WHERE owner_user_id = ?")
+            .bind(owner)
             .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        for skill in &skills {
+            Self::insert_one(&mut tx, skill).await?;
         }
 
         tx.commit()

@@ -186,6 +186,37 @@ impl SkillIndexStore for PgSkillIndexStore {
         Ok(())
     }
 
+    async fn reindex_for_owner(
+        &self,
+        owner: &str,
+        skills: Vec<IndexedSkill>,
+    ) -> Result<(), CoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        for skill in &skills {
+            Self::upsert(&mut tx, skill).await?;
+        }
+
+        // Prune this owner's rows no longer present on disk (global and other
+        // users' rows are untouched). An empty scan clears the owner's catalog.
+        let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+        sqlx::query("DELETE FROM skill_index WHERE owner_user_id = $1 AND name <> ALL($2)")
+            .bind(owner)
+            .bind(&names)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     async fn search(
         &self,
         query: &str,

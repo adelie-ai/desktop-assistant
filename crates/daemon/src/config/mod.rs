@@ -167,9 +167,16 @@ pub struct SkillsConfig {
     pub enabled: bool,
     /// Global skill roots to scan (`<root>/<name>/SKILL.md`). A configurable
     /// list so a distro, Homebrew, or container image can point at the right
-    /// location without a code change.
+    /// location without a code change. Skills here are host-global (owner-less).
     #[serde(default = "default_skill_roots")]
     pub roots: Vec<PathBuf>,
+    /// User home skill roots to scan on a co-located single-user daemon. Skills
+    /// here are indexed as **owned by the OS user the daemon runs as**
+    /// (user-scoped), so a personal box with skills only in `~/.agents/skills`
+    /// gets them indexed without the remote client-registration path. Empty on a
+    /// split/remote deployment (the daemon can't see the user's home).
+    #[serde(default = "default_user_roots")]
+    pub user_roots: Vec<PathBuf>,
 }
 
 impl Default for SkillsConfig {
@@ -177,6 +184,7 @@ impl Default for SkillsConfig {
         Self {
             enabled: default_skills_enabled(),
             roots: default_skill_roots(),
+            user_roots: default_user_roots(),
         }
     }
 }
@@ -185,12 +193,29 @@ impl SkillsConfig {
     /// Whether this equals the default section, so a default `[skills]` is not
     /// serialized (keeping migrated `daemon.toml` output stable).
     fn is_default(&self) -> bool {
-        self.enabled == default_skills_enabled() && self.roots == default_skill_roots()
+        self.enabled == default_skills_enabled()
+            && self.roots == default_skill_roots()
+            && self.user_roots == default_user_roots()
     }
 }
 
 fn default_skills_enabled() -> bool {
     true
+}
+
+/// Default user home skill roots (the shared cross-product agent dirs). Resolved
+/// from `$HOME`; empty when `$HOME` is unset (e.g. a headless/split deployment),
+/// which cleanly disables user-scoped home scanning.
+fn default_user_roots() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    vec![
+        home.join(".agents/skills"),
+        home.join(".claude/skills"),
+        home.join(".codex/skills"),
+        home.join(".cursor/skills-cursor"),
+    ]
 }
 
 /// Platform-appropriate default global skill root(s).
@@ -1139,6 +1164,14 @@ uds_socket = "/tmp/adelie.sock"
         let parsed: DaemonConfig = toml::from_str("").expect("empty config parses");
         assert!(parsed.skills.enabled);
         assert_eq!(parsed.skills.roots, cfg.roots);
+        assert_eq!(parsed.skills.user_roots, cfg.user_roots);
+        // With $HOME set (as in the test env) the user home roots are populated.
+        if std::env::var_os("HOME").is_some() {
+            assert!(
+                cfg.user_roots.iter().any(|p| p.ends_with(".agents/skills")),
+                "default user_roots include ~/.agents/skills"
+            );
+        }
     }
 
     #[test]
@@ -1148,6 +1181,7 @@ uds_socket = "/tmp/adelie.sock"
             [skills]
             enabled = false
             roots = ["/opt/custom/skills", "/srv/skills"]
+            user_roots = ["/home/x/.agents/skills"]
             "#,
         )
         .expect("parse [skills]");
@@ -1156,6 +1190,10 @@ uds_socket = "/tmp/adelie.sock"
         assert_eq!(
             parsed.skills.roots[0],
             std::path::PathBuf::from("/opt/custom/skills")
+        );
+        assert_eq!(
+            parsed.skills.user_roots,
+            vec![std::path::PathBuf::from("/home/x/.agents/skills")]
         );
     }
 
