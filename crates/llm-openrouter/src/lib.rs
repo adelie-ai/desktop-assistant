@@ -12,6 +12,7 @@
 //! [`desktop_assistant_llm_openai_compat`], and the connect race / stall
 //! constants / model-merge helpers come from `desktop_assistant_llm_http`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
@@ -21,8 +22,8 @@ use desktop_assistant_core::ports::llm::{
     current_cancellation_token, current_model_override,
 };
 use desktop_assistant_llm_http::{
-    STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, apply_context_cap, bail_for_status,
-    merge_curated_with_live,
+    Clock, ModelCache, STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, apply_context_cap,
+    bail_for_status, merge_curated_with_live,
 };
 use desktop_assistant_llm_openai_compat::{
     ChatMessage, ChatTool, classify_error, consume_chat_stream, mark_system_cache_breakpoint,
@@ -82,6 +83,9 @@ pub struct OpenRouterClient {
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
+    /// TTL cache for `list_models()` so the (large) live `/models` catalogue is
+    /// not re-fetched on every model-picker open (#620).
+    model_cache: ModelCache,
 }
 
 /// Redacting `Debug` so the API key can never leak through a `{:?}` render --
@@ -104,6 +108,7 @@ impl std::fmt::Debug for OpenRouterClient {
             .field("connect_timeout", &self.connect_timeout)
             .field("event_timeout", &self.event_timeout)
             .field("context_cap", &self.context_cap)
+            .field("model_cache", &self.model_cache)
             .finish()
     }
 }
@@ -137,6 +142,7 @@ impl OpenRouterClient {
             connect_timeout: OPENROUTER_CONNECT_TIMEOUT,
             event_timeout: OPENROUTER_EVENT_TIMEOUT,
             context_cap: None,
+            model_cache: ModelCache::new(),
         }
     }
 
@@ -194,6 +200,20 @@ impl OpenRouterClient {
     /// spend. See [`desktop_assistant_llm_http::apply_context_cap`].
     pub fn with_max_context_tokens(mut self, max: Option<u64>) -> Self {
         self.context_cap = max.filter(|m| *m > 0);
+        self
+    }
+
+    /// Override the `list_models()` cache TTL (default: 1h). `Duration::ZERO` disables
+    /// caching (every entry is immediately stale).
+    pub fn with_model_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.model_cache.set_ttl(ttl);
+        self
+    }
+
+    /// Inject a [`Clock`] for deterministic cache-TTL tests. Production uses the
+    /// default [`SystemClock`](desktop_assistant_llm_http::SystemClock).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.model_cache.set_clock(clock);
         self
     }
 
@@ -566,6 +586,27 @@ impl OpenRouterClient {
             .map_err(|e| CoreError::Llm(format!("failed to parse OpenRouter models: {e}")))?;
         Ok(parsed.data.into_iter().map(live_model_to_info).collect())
     }
+
+    /// Fetch the live catalogue, merge it over the curated table, and cache the
+    /// result. On a live-fetch failure, degrade to the curated table and leave
+    /// the cache untouched (so the next call retries the live fetch rather than
+    /// serving a poisoned empty listing). Bypasses the TTL: this is the shared
+    /// tail of both `list_models` (on a cache miss) and `refresh_models`.
+    async fn fetch_merge_store(&self) -> Vec<ModelInfo> {
+        match self.fetch_live_models().await {
+            Ok(live) => {
+                let merged = merge_curated_with_live(curated_openrouter_models(), live);
+                self.model_cache.store(merged.clone());
+                merged
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "OpenRouter live /models fetch failed, using curated table only: {e}"
+                );
+                merge_curated_with_live(curated_openrouter_models(), Vec::new())
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -626,13 +667,18 @@ impl LlmClient for OpenRouterClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        // Always degrade to the curated table rather than surfacing an error to
-        // the picker when the live listing is unavailable.
-        let live = self.fetch_live_models().await.unwrap_or_else(|e| {
-            tracing::warn!("OpenRouter live /models fetch failed, using curated table only: {e}");
-            Vec::new()
-        });
-        Ok(merge_curated_with_live(curated_openrouter_models(), live))
+        // Serve a warm, unexpired listing straight from the cache; on a miss,
+        // fetch live (degrading to curated on failure) and cache the result.
+        // A live-listing failure never surfaces an error to the picker.
+        if let Some(cached) = self.model_cache.cached() {
+            return Ok(cached);
+        }
+        Ok(self.fetch_merge_store().await)
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        // Force a live fetch, bypassing the TTL, and re-populate the cache.
+        Ok(self.fetch_merge_store().await)
     }
 }
 
@@ -1371,5 +1417,144 @@ mod tests {
         assert!(info.capabilities.reasoning);
         assert!(info.capabilities.vision);
         assert!(!info.capabilities.embedding);
+    }
+
+    // --- TTL model cache (issue #620) -----------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// Mock clock: an atomic second-offset from a fixed origin, advanced by the
+    /// tests so TTL expiry is deterministic (no sleeping, no real wall clock).
+    struct MockClock {
+        origin: Instant,
+        offset_secs: AtomicU64,
+    }
+
+    impl MockClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                offset_secs: AtomicU64::new(0),
+            })
+        }
+        fn advance_secs(&self, secs: u64) {
+            self.offset_secs.fetch_add(secs, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now(&self) -> Instant {
+            self.origin + Duration::from_secs(self.offset_secs.load(Ordering::SeqCst))
+        }
+    }
+
+    /// A `/models` mock returning one bare live id; returns the handle so a test
+    /// can assert the exact number of upstream calls.
+    fn models_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"data":[{"id":"vendor/live-only","name":"Live Only"}]}"#);
+        })
+    }
+
+    #[tokio::test]
+    async fn list_models_served_from_cache_within_ttl() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server).with_clock(clock.clone());
+
+        let first = client.list_models().await.expect("first fetch");
+        clock.advance_secs(30 * 60); // < 1h TTL
+        let second = client.list_models().await.expect("served from cache");
+
+        assert_eq!(first, second);
+        m.assert_calls(1); // the second call did NOT hit the endpoint
+    }
+
+    #[tokio::test]
+    async fn list_models_refetches_after_ttl_expiry() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server)
+            .with_clock(clock.clone())
+            .with_model_cache_ttl(Duration::from_secs(3600));
+
+        client.list_models().await.expect("first fetch");
+        clock.advance_secs(3601); // past the TTL
+        client.list_models().await.expect("refetch");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn list_models_refetches_at_exact_ttl_boundary() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server)
+            .with_clock(clock.clone())
+            .with_model_cache_ttl(Duration::from_secs(3600));
+
+        client.list_models().await.expect("first fetch");
+        clock.advance_secs(3600); // age == TTL → expired
+        client.list_models().await.expect("refetch at boundary");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn refresh_models_bypasses_cache() {
+        let server = MockServer::start();
+        let m = models_mock(&server);
+        let clock = MockClock::new();
+        let client = client_for(&server).with_clock(clock.clone());
+
+        client.list_models().await.expect("prime cache"); // call 1
+        client.refresh_models().await.expect("forced refetch"); // call 2, ignores TTL
+        m.assert_calls(2);
+
+        // refresh re-stored, so a subsequent list within TTL is served warm.
+        client
+            .list_models()
+            .await
+            .expect("served from refreshed cache");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn failure_degrades_to_curated_without_poisoning_then_success_caches() {
+        let clock = MockClock::new();
+        let server = MockServer::start();
+        let mut failing = server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(500).body("boom");
+        });
+        let client = client_for(&server).with_clock(clock.clone());
+
+        // Live failure → degrade to the curated table, and do NOT cache it.
+        let degraded = client.list_models().await.expect("degrade, not error");
+        assert_eq!(degraded, curated_openrouter_models());
+        failing.assert_calls(1);
+        failing.delete();
+
+        // The failure did not poison the cache, so the next call re-fetches —
+        // and a success now populates the cache.
+        let ok = server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"data":[{"id":"vendor/back-online"}]}"#);
+        });
+        let recovered = client.list_models().await.expect("success");
+        assert!(recovered.iter().any(|m| m.id == "vendor/back-online"));
+        ok.assert_calls(1);
+
+        // Now served warm (no clock advance): still exactly one success call.
+        let warm = client.list_models().await.expect("served from cache");
+        assert_eq!(recovered, warm);
+        ok.assert_calls(1);
     }
 }

@@ -12,9 +12,11 @@
 //! (`ContextOverflow`, `RateLimited`, `QuotaExceeded`, `ModelLoading`,
 //! `ToolsUnsupported`) and aren't worth shoehorning into one helper.
 
+mod cache;
 mod models;
 pub mod streaming;
 
+pub use cache::{Clock, DEFAULT_MODEL_CACHE_TTL, ModelCache, SystemClock};
 pub use models::{apply_context_cap, merge_curated_with_live};
 pub use streaming::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,

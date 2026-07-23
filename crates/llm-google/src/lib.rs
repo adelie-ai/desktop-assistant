@@ -30,7 +30,7 @@ pub use token::{
 };
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition};
@@ -40,12 +40,11 @@ use desktop_assistant_core::ports::llm::{
     ToolCallAccumulator, current_cancellation_token, current_model_override,
 };
 use desktop_assistant_llm_http::{
-    STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, apply_context_cap, bail_for_status,
-    build_response, merge_curated_with_live, next_step,
+    Clock, ModelCache, STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, apply_context_cap,
+    bail_for_status, build_response, merge_curated_with_live, next_step,
 };
 use eventsource_stream::Eventsource;
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
 /// Built-in default chat model.
 const DEFAULT_MODEL: &str = "gemini-2.5-pro";
@@ -70,9 +69,6 @@ const VERTEX_API_VERSION: &str = "v1";
 /// Gemini API (AI Studio) version; this surface uses the `v1beta` prefix, which
 /// is where AI Studio exposes `thinkingConfig`.
 const GEMINI_API_VERSION: &str = "v1beta";
-
-/// Default TTL for the `list_models()` cache (mirrors the Bedrock connector).
-const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Which surface (and therefore host + auth) this client targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,27 +100,6 @@ impl AuthMode {
     }
 }
 
-/// Abstraction over `Instant::now()` so the model-cache TTL test can advance
-/// time without sleeping. Mirrors `llm-bedrock::ModelClock`.
-pub trait ModelClock: Send + Sync {
-    fn now(&self) -> Instant;
-}
-
-/// Default clock reading the monotonic OS clock.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
-
-impl ModelClock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
-#[derive(Default)]
-struct ModelCache {
-    entry: Option<(Instant, Vec<ModelInfo>)>,
-}
-
 /// Vertex AI / Gemini connector.
 pub struct GoogleClient {
     http: reqwest::Client,
@@ -145,9 +120,9 @@ pub struct GoogleClient {
     connect_timeout: Duration,
     event_timeout: Duration,
     context_cap: Option<u64>,
-    model_cache: Arc<Mutex<ModelCache>>,
-    model_cache_ttl: Duration,
-    clock: Arc<dyn ModelClock>,
+    /// TTL cache for `list_models()` so the live listing is not re-fetched on
+    /// every model-picker open (#620).
+    model_cache: ModelCache,
 }
 
 /// Redacting `Debug`: the API key renders as its length only, and the token
@@ -173,7 +148,7 @@ impl std::fmt::Debug for GoogleClient {
             .field("connect_timeout", &self.connect_timeout)
             .field("event_timeout", &self.event_timeout)
             .field("context_cap", &self.context_cap)
-            .field("model_cache_ttl", &self.model_cache_ttl)
+            .field("model_cache", &self.model_cache)
             .finish()
     }
 }
@@ -219,9 +194,7 @@ impl GoogleClient {
             connect_timeout: STREAM_CONNECT_TIMEOUT,
             event_timeout: STREAM_EVENT_TIMEOUT,
             context_cap: None,
-            model_cache: Arc::new(Mutex::new(ModelCache::default())),
-            model_cache_ttl: DEFAULT_MODEL_CACHE_TTL,
-            clock: Arc::new(SystemClock),
+            model_cache: ModelCache::new(),
         }
     }
 
@@ -321,15 +294,17 @@ impl GoogleClient {
         self
     }
 
-    /// Override the `list_models()` cache TTL (default 1h).
+    /// Override the `list_models()` cache TTL (default 1h). `Duration::ZERO` disables
+    /// caching (every entry is immediately stale).
     pub fn with_model_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.model_cache_ttl = ttl;
+        self.model_cache.set_ttl(ttl);
         self
     }
 
-    /// Inject a custom clock for deterministic cache-TTL tests.
-    pub fn with_clock(mut self, clock: Arc<dyn ModelClock>) -> Self {
-        self.clock = clock;
+    /// Inject a [`Clock`] for deterministic cache-TTL tests. Production uses the
+    /// default [`SystemClock`](desktop_assistant_llm_http::SystemClock).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.model_cache.set_clock(clock);
         self
     }
 
@@ -589,36 +564,35 @@ impl GoogleClient {
     // --- Model listing --------------------------------------------------
 
     async fn list_models_cached(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        {
-            let cache = self.model_cache.lock().await;
-            if let Some((fetched_at, entry)) = cache.entry.as_ref()
-                && self.clock.now().saturating_duration_since(*fetched_at) < self.model_cache_ttl
-            {
-                return Ok(entry.clone());
-            }
+        // Serve a warm, unexpired listing from the cache; on a miss, fetch live
+        // (degrading to curated on failure) and cache the result.
+        if let Some(cached) = self.model_cache.cached() {
+            return Ok(cached);
         }
-        self.refresh_models_internal().await
+        Ok(self.fetch_merge_store().await)
     }
 
     async fn refresh_models_internal(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        let fresh = self.fetch_models().await;
-        let now = self.clock.now();
-        let mut cache = self.model_cache.lock().await;
-        cache.entry = Some((now, fresh.clone()));
-        Ok(fresh)
+        // Force a live fetch, bypassing the TTL, and re-populate the cache.
+        Ok(self.fetch_merge_store().await)
     }
 
-    /// Curated table merged with a best-effort live listing. A live-listing
-    /// failure degrades to the curated table rather than surfacing an error.
-    async fn fetch_models(&self) -> Vec<ModelInfo> {
-        let live = match self.fetch_live_models().await {
-            Ok(live) => live,
+    /// Fetch the live listing, merge it over the curated table, and cache the
+    /// result. On a live-listing failure, degrade to the curated table and
+    /// leave the cache untouched, so the next call retries the live fetch
+    /// rather than serving a poisoned curated-only listing for a full TTL.
+    async fn fetch_merge_store(&self) -> Vec<ModelInfo> {
+        match self.fetch_live_models().await {
+            Ok(live) => {
+                let merged = merge_curated_with_live(curated_gemini_models(), live);
+                self.model_cache.store(merged.clone());
+                merged
+            }
             Err(e) => {
                 tracing::debug!("Google live model listing failed; using curated table: {e}");
-                Vec::new()
+                merge_curated_with_live(curated_gemini_models(), Vec::new())
             }
-        };
-        merge_curated_with_live(curated_gemini_models(), live)
+        }
     }
 
     async fn fetch_live_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -988,5 +962,154 @@ mod tests {
         assert!(!rendered.contains(secret), "api key leaked: {rendered}");
         assert!(rendered.contains("redacted"));
         assert!(rendered.contains("gemini-2.5-pro"));
+    }
+
+    // --- TTL model cache (issue #620) -----------------------------------
+
+    use httpmock::Method::GET;
+    use httpmock::MockServer;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// Mock clock: an atomic second-offset from a fixed origin, advanced by the
+    /// tests so TTL expiry is deterministic (no sleeping, no real wall clock).
+    struct MockClock {
+        origin: Instant,
+        offset_secs: AtomicU64,
+    }
+
+    impl MockClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                offset_secs: AtomicU64::new(0),
+            })
+        }
+        fn advance_secs(&self, secs: u64) {
+            self.offset_secs.fetch_add(secs, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now(&self) -> Instant {
+            self.origin + Duration::from_secs(self.offset_secs.load(Ordering::SeqCst))
+        }
+    }
+
+    /// A Gemini-API (AI Studio) client pointed at a mock server; the api-key
+    /// surface lists models at `{base}/v1beta/models` and needs no project.
+    fn api_key_client(server: &MockServer, clock: Arc<MockClock>) -> GoogleClient {
+        GoogleClient::new("k".into())
+            .with_auth_mode(AuthMode::ApiKey)
+            .with_base_url(server.url(""))
+            .with_clock(clock)
+    }
+
+    /// A `/v1beta/models` mock returning one bare live id; returns the handle so
+    /// a test can assert the exact number of upstream calls.
+    fn live_models_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET).path("/v1beta/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"models/gemini-live-xyz"}]}"#);
+        })
+    }
+
+    #[tokio::test]
+    async fn list_models_served_from_cache_within_ttl() {
+        let server = MockServer::start();
+        let m = live_models_mock(&server);
+        let clock = MockClock::new();
+        let client = api_key_client(&server, clock.clone());
+
+        let first = client.list_models().await.expect("first fetch");
+        clock.advance_secs(30 * 60); // < 1h TTL
+        let second = client.list_models().await.expect("served from cache");
+
+        assert_eq!(first, second);
+        assert!(first.iter().any(|m| m.id == "gemini-live-xyz"));
+        m.assert_calls(1); // the second call did NOT hit the endpoint
+    }
+
+    #[tokio::test]
+    async fn list_models_refetches_after_ttl_expiry() {
+        let server = MockServer::start();
+        let m = live_models_mock(&server);
+        let clock = MockClock::new();
+        let client =
+            api_key_client(&server, clock.clone()).with_model_cache_ttl(Duration::from_secs(3600));
+
+        client.list_models().await.expect("first fetch");
+        clock.advance_secs(3601); // past the TTL
+        client.list_models().await.expect("refetch");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn list_models_refetches_at_exact_ttl_boundary() {
+        let server = MockServer::start();
+        let m = live_models_mock(&server);
+        let clock = MockClock::new();
+        let client =
+            api_key_client(&server, clock.clone()).with_model_cache_ttl(Duration::from_secs(3600));
+
+        client.list_models().await.expect("first fetch");
+        clock.advance_secs(3600); // age == TTL → expired
+        client.list_models().await.expect("refetch at boundary");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn refresh_models_bypasses_cache() {
+        let server = MockServer::start();
+        let m = live_models_mock(&server);
+        let clock = MockClock::new();
+        let client = api_key_client(&server, clock.clone());
+
+        client.list_models().await.expect("prime cache"); // call 1
+        client.refresh_models().await.expect("forced refetch"); // call 2, ignores TTL
+        m.assert_calls(2);
+
+        // refresh re-stored, so a subsequent list within TTL is served warm.
+        client
+            .list_models()
+            .await
+            .expect("served from refreshed cache");
+        m.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn failure_degrades_to_curated_without_poisoning_then_success_caches() {
+        let clock = MockClock::new();
+        let server = MockServer::start();
+        let mut failing = server.mock(|when, then| {
+            when.method(GET).path("/v1beta/models");
+            then.status(500).body("boom");
+        });
+        let client = api_key_client(&server, clock.clone());
+
+        // Live failure → degrade to the curated table, and do NOT cache it.
+        let degraded = client.list_models().await.expect("degrade, not error");
+        assert_eq!(degraded, curated_gemini_models());
+        failing.assert_calls(1);
+        failing.delete();
+
+        // The failure did not poison the cache, so the next call re-fetches —
+        // and a success now populates the cache.
+        let ok = server.mock(|when, then| {
+            when.method(GET).path("/v1beta/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"models":[{"name":"models/gemini-back"}]}"#);
+        });
+        let recovered = client.list_models().await.expect("success");
+        assert!(recovered.iter().any(|m| m.id == "gemini-back"));
+        ok.assert_calls(1);
+
+        // Now served warm (no clock advance): still exactly one success call.
+        let warm = client.list_models().await.expect("served from cache");
+        assert_eq!(recovered, warm);
+        ok.assert_calls(1);
     }
 }
