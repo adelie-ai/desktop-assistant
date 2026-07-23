@@ -2559,6 +2559,121 @@ mod tests {
         assert!(format!("{err}").contains("interactive"));
     }
 
+    // --- SetPurpose must reject a mixed inherit pair -----------------------
+
+    /// A purposes config with interactive bound, so a non-interactive write
+    /// under test is the only thing that can fail validation.
+    fn handle_with_interactive() -> Arc<RegistryHandle> {
+        let mut cfg = config_with_connections(&[("local", ollama_local())]);
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        make_handle_with(cfg)
+    }
+
+    fn payload(connection: &str, model: &str) -> PurposeConfigPayload {
+        PurposeConfigPayload {
+            connection: connection.into(),
+            model: model.into(),
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejects_real_connection_with_primary_model() {
+        // The exact shape a client wrote to production: a real connection
+        // paired with the inherit sentinel, which retired a live binding.
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        let err = svc
+            .set_purpose(PurposeKind::Embedding, payload("local", "primary"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("primary"),
+            "rejection should name the sentinel; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejects_primary_connection_with_real_model() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        let err = svc
+            .set_purpose(PurposeKind::Dreaming, payload("primary", "llama3"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("primary"));
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejection_names_the_purpose_and_the_pair() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        let err = svc
+            .set_purpose(PurposeKind::Embedding, payload("local", "primary"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("embedding") && msg.contains("local"),
+            "an operator must be able to tell which purpose and which pair was \
+             refused without reading the source; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejection_leaves_the_stored_binding_untouched() {
+        let handle = handle_with_interactive();
+        handle
+            .mutate_config(|cfg| {
+                cfg.purposes.set(
+                    PurposeKind::Embedding,
+                    Some(PurposeConfig {
+                        connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                        model: ModelRef::Named("nomic-embed-text".into()),
+                        effort: None,
+                        max_context_tokens: None,
+                    }),
+                );
+                Ok(())
+            })
+            .expect("seed a good binding");
+
+        let svc = DaemonConnectionsService::new(handle.clone());
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "primary"))
+            .await
+            .expect_err("mixed pair must be refused");
+
+        let stored = handle.snapshot_config();
+        let embedding = stored
+            .purposes
+            .get(PurposeKind::Embedding)
+            .expect("binding should survive a refused write");
+        assert_eq!(embedding.model, ModelRef::Named("nomic-embed-text".into()));
+    }
+
+    #[tokio::test]
+    async fn set_purpose_accepts_a_full_primary_pair_for_non_interactive() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        svc.set_purpose(PurposeKind::Dreaming, payload("primary", "primary"))
+            .await
+            .expect("inheriting from interactive is the whole point of the sentinel");
+    }
+
+    #[tokio::test]
+    async fn set_purpose_accepts_two_real_ids() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "nomic-embed-text"))
+            .await
+            .expect("a fully-specified binding is always valid");
+    }
+
     #[tokio::test]
     async fn get_purposes_returns_current_config() {
         let mut cfg = config_with_connections(&[("local", ollama_local())]);
