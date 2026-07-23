@@ -873,6 +873,7 @@ mod tests {
                     id: String::new(),
                     role: role.to_string(),
                     content: content.to_string(),
+                    idempotency_key: None,
                 })
                 .collect(),
             warnings: Vec::new(),
@@ -1072,6 +1073,7 @@ mod tests {
                     id: String::new(),
                     role: role.to_string(),
                     content: content.to_string(),
+                    idempotency_key: None,
                 })
                 .collect(),
         })

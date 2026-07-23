@@ -219,7 +219,8 @@ impl ConversationStore for SqliteConversationStore {
         let row = row.ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))?;
 
         let msg_rows: Vec<MsgRow> = sqlx::query_as(
-            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id \
+            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id, \
+                    idempotency_key \
              FROM messages \
              WHERE user_id = ? AND conversation_id = ? \
              ORDER BY ordinal",
@@ -595,8 +596,8 @@ async fn insert_message(
     sqlx::query(
         "INSERT INTO messages \
             (id, user_id, conversation_id, ordinal, role, content, \
-             tool_calls, tool_call_id, summary_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             tool_calls, tool_call_id, summary_id, idempotency_key) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     // Persist the message's own monotonic UUIDv7 (assigned at creation) so the
     // id is a single source of truth from creation through storage (#1).
@@ -609,12 +610,20 @@ async fn insert_message(
     .bind(tool_calls_json(msg))
     .bind(&msg.tool_call_id)
     .bind(&msg.summary_id)
+    // #570 Phase 1b: carried on USER rows only; NULL otherwise.
+    .bind(&msg.idempotency_key)
     .execute(&mut **tx)
     .await
     .map_err(|e| CoreError::Storage(e.to_string()))?;
     Ok(())
 }
 
+/// In-place UPDATE of the message in `(conversation_id, ordinal)`. `idempotency_key`
+/// is rebound alongside the content so the key follows its message across an
+/// ordinal shift (#570): reconciliation is by SLOT, so a keyed user row shifted
+/// into a slot the prior occupant held would otherwise inherit that occupant's
+/// key. Only runs when the slot's content already differs, so stable slots take
+/// no extra write. Mirrors the Postgres store.
 async fn update_message(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user_id: &str,
@@ -624,7 +633,8 @@ async fn update_message(
 ) -> Result<(), CoreError> {
     sqlx::query(
         "UPDATE messages \
-         SET role = ?, content = ?, tool_calls = ?, tool_call_id = ?, summary_id = ? \
+         SET role = ?, content = ?, tool_calls = ?, tool_call_id = ?, \
+             summary_id = ?, idempotency_key = ? \
          WHERE user_id = ? AND conversation_id = ? AND ordinal = ?",
     )
     .bind(role_to_str(&msg.role))
@@ -632,6 +642,7 @@ async fn update_message(
     .bind(tool_calls_json(msg))
     .bind(&msg.tool_call_id)
     .bind(&msg.summary_id)
+    .bind(&msg.idempotency_key)
     .bind(user_id)
     .bind(conversation_id)
     .bind(ordinal as i64)
@@ -653,6 +664,9 @@ fn msg_from_row(r: MsgRow) -> Message {
     }
     msg.tool_call_id = r.tool_call_id;
     msg.summary_id = r.summary_id;
+    // Surface the persisted key (#570 Phase 1b) so a reconnecting client dedups
+    // by exact match rather than a content compare.
+    msg.idempotency_key = r.idempotency_key;
     msg
 }
 
@@ -691,6 +705,9 @@ struct MsgRow {
     tool_calls: Option<serde_json::Value>,
     tool_call_id: Option<String>,
     summary_id: Option<String>,
+    /// The client idempotency key (#570 Phase 1b); carried onto the domain
+    /// `Message` on load. Populated on USER rows only, else NULL.
+    idempotency_key: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

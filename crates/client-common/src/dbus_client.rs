@@ -529,6 +529,9 @@ impl DbusClient {
                     id: String::new(),
                     role,
                     content,
+                    // The legacy D-Bus get_messages path predates persisted
+                    // idempotency keys (#570) and returns only (role, content).
+                    idempotency_key: None,
                 })
                 .collect(),
         })

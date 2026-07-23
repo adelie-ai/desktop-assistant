@@ -270,6 +270,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // #570 Phase 1b: nullable `idempotency_key` on messages, carried on USER
+    // rows only, so a transcript reload/reconnect surfaces the client's key and
+    // clients dedup an echoed UserMessageAdded by exact match.
+    sqlx::raw_sql(include_str!(
+        "../migrations/034_message_idempotency_key.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

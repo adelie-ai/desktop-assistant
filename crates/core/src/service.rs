@@ -888,7 +888,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
         let mut conv = self.store.get(conversation_id).await?;
         let is_first_message = conv.messages.is_empty();
-        conv.messages.push(Message::new(Role::User, &prompt));
+        // Stamp the client's idempotency key (#570 Phase 1b) onto this — the
+        // single user-message persist site. Read from the task-local the
+        // foreground dispatch wrapper installs; `None` for agent runs and any
+        // caller not routing through that wrapper. Assistant rows pushed later
+        // in this turn stay `None`.
+        let mut user_msg = Message::new(Role::User, &prompt);
+        user_msg.idempotency_key = crate::ports::llm::current_idempotency_key();
+        conv.messages.push(user_msg);
         // Capture the prompt as the active-task anchor for this turn. It is
         // re-injected in `assemble_turn` when conditions indicate
         // the original message has drifted out of the model's view.

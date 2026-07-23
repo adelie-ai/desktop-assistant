@@ -664,6 +664,12 @@ const GLOBAL_TABLES: &[&str] = &[
     // capacity knowledge, not personal data (migrations 025/028, likewise
     // documented as deliberately global).
     "context_window_observations",
+    // Host-global skill/workflow catalog, disk-sourced and keyed by skill
+    // identity — a shared catalog mirroring `tool_definitions`, not personal
+    // data (#573, migration 033_skill_index). Added here because #601 landed the
+    // table without the required GLOBAL_TABLES entry (its DB-gated guard test
+    // was skipped without a container), leaving this guard red on main.
+    "skill_index",
 ];
 
 /// Every base table is either user-scoped (has a `user_id` column) or

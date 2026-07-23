@@ -323,6 +323,130 @@ async fn personality_override_set_and_get() {
     );
 }
 
+// --- #570 Phase 1b: idempotency-key persistence + load-surfacing ------------
+
+/// A user message stamped with an idempotency key persists it, and `get`
+/// surfaces the key back onto the domain `Message` (mirrors the Postgres store).
+#[tokio::test]
+async fn user_message_idempotency_key_round_trips_through_get() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    let mut user_msg = Message::new(Role::User, "remember me");
+    user_msg.idempotency_key = Some("idem-key-1".to_string());
+    conv.messages.push(user_msg);
+
+    s.create(conv).await.expect("create");
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(got.messages.len(), 1);
+    assert_eq!(
+        got.messages[0].idempotency_key.as_deref(),
+        Some("idem-key-1"),
+        "the persisted user idempotency_key must round-trip through get"
+    );
+}
+
+/// Assistant rows never carry an idempotency key; the user row that opened the
+/// turn does.
+#[tokio::test]
+async fn assistant_message_idempotency_key_persists_null() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    let mut user_msg = Message::new(Role::User, "hello");
+    user_msg.idempotency_key = Some("k-user".to_string());
+    conv.messages.push(user_msg);
+    conv.messages.push(Message::new(Role::Assistant, "hi back"));
+
+    s.create(conv).await.expect("create");
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(got.messages[0].idempotency_key.as_deref(), Some("k-user"));
+    assert_eq!(
+        got.messages[1].idempotency_key, None,
+        "assistant rows never carry a client idempotency key"
+    );
+}
+
+/// A keyless user message loads with `idempotency_key == None`.
+#[tokio::test]
+async fn user_message_without_key_loads_as_none() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    conv.messages.push(Message::new(Role::User, "no key here"));
+
+    s.create(conv).await.expect("create");
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(
+        got.messages[0].idempotency_key, None,
+        "a keyless user message loads with a None idempotency_key"
+    );
+}
+
+/// Mirror of the Postgres `shifted_user_key_travels_with_its_message`: `update`
+/// reconciles by ordinal SLOT, so a keyed user row that shifts down one ordinal
+/// (an earlier message removed, the overflow-trim shape) must keep its own key
+/// and strand none on the row that takes over its old slot.
+#[tokio::test]
+async fn shifted_user_key_travels_with_its_message() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    conv.messages.push(Message::new(Role::Assistant, "a0"));
+    conv.messages.push(Message::new(Role::Assistant, "a1"));
+    let mut user_msg = Message::new(Role::User, "u2");
+    user_msg.idempotency_key = Some("k-user".to_string());
+    conv.messages.push(user_msg);
+    conv.messages.push(Message::new(Role::Assistant, "a3"));
+    s.create(conv.clone()).await.expect("create");
+
+    // Drop the oldest message: the keyed user row shifts down one ordinal, so
+    // both its new slot and its old slot take the UPDATE path.
+    conv.messages.remove(0);
+    s.update(conv).await.expect("update");
+
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(got.messages.len(), 3);
+    assert_eq!(got.messages[1].role, Role::User);
+    assert_eq!(got.messages[1].content, "u2");
+    assert_eq!(
+        got.messages[1].idempotency_key.as_deref(),
+        Some("k-user"),
+        "the shifted user row keeps its own key"
+    );
+    assert_eq!(got.messages[2].role, Role::Assistant);
+    assert_eq!(got.messages[2].content, "a3");
+    assert_eq!(
+        got.messages[2].idempotency_key, None,
+        "the row now occupying the user row's old slot carries no stray key"
+    );
+}
+
+/// The review's save -> get -> save guard: re-saving an unchanged keyed
+/// conversation leaves the user row's key intact (the structural diff writes
+/// nothing for identical rows).
+#[tokio::test]
+async fn user_key_survives_a_resave_unchanged() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    let mut user_msg = Message::new(Role::User, "keep my key");
+    user_msg.idempotency_key = Some("k-stable".to_string());
+    conv.messages.push(user_msg);
+    conv.messages.push(Message::new(Role::Assistant, "ok"));
+    s.create(conv).await.expect("create");
+
+    // Re-save exactly what get() returned, unchanged.
+    let reloaded = s.get(&ConversationId::from("c1")).await.expect("get");
+    s.update(reloaded).await.expect("re-save");
+
+    let got = s.get(&ConversationId::from("c1")).await.expect("get again");
+    assert_eq!(
+        got.messages[0].idempotency_key.as_deref(),
+        Some("k-stable"),
+        "the user key must survive a re-save unchanged"
+    );
+    assert_eq!(
+        got.messages[1].idempotency_key, None,
+        "the assistant row stays keyless across a re-save"
+    );
+}
+
 #[tokio::test]
 async fn get_conversation_tags_reads_stored_tags() {
     let s = store().await;

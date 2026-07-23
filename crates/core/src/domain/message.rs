@@ -60,6 +60,21 @@ pub struct Message {
     /// If set, this message is collapsed behind a `MessageSummary` with this ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_id: Option<String>,
+    /// The client-supplied idempotency key for this message (#570 Phase 1b).
+    ///
+    /// Carried on USER rows only — the message that initiated a
+    /// client-retryable send — so a transcript reload or reconnect returns the
+    /// key and clients dedup an echoed `UserMessageAdded` by exact match rather
+    /// than a content compare. `None` for assistant/tool rows and for keyless
+    /// sends. Stamped at the single user-message persist site in `send_prompt`
+    /// from the [`crate::ports::llm::current_idempotency_key`] task-local.
+    ///
+    /// Deliberately excluded from [`PartialEq`]/[`Eq`] (like `id`): it is
+    /// carried-through metadata, not content, so the storage structural diff
+    /// (`ExistingMsgRow::matches`) stays unaffected and a re-diff on load causes
+    /// no update churn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 impl Message {
@@ -71,6 +86,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             summary_id: None,
+            idempotency_key: None,
         }
     }
 
@@ -83,6 +99,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             summary_id: None,
+            idempotency_key: None,
         }
     }
 
@@ -95,14 +112,18 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             summary_id: None,
+            idempotency_key: None,
         }
     }
 }
 
-/// Equality compares message *content*, deliberately excluding `id`: a fresh
-/// monotonic id is minted on every construction, so two `Message::new` calls
-/// with the same content must still compare equal for the storage structural
-/// diff (`ExistingMsgRow::matches`) and the many value-comparison tests.
+/// Equality compares message *content*, deliberately excluding `id` AND
+/// `idempotency_key`: a fresh monotonic id is minted on every construction, and
+/// the idempotency key is carried-through metadata (not content), so two
+/// `Message::new` calls with the same content must still compare equal for the
+/// storage structural diff (`ExistingMsgRow::matches`) and the many
+/// value-comparison tests. Excluding the key also keeps a re-diff on load equal,
+/// so surfacing the persisted key causes no update churn.
 impl PartialEq for Message {
     fn eq(&self, other: &Self) -> bool {
         self.role == other.role

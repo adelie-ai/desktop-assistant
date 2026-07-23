@@ -85,9 +85,11 @@ impl From<api::MessageView> for ChatMessage {
             // Daemon-sourced messages are always ordinary; clients tag the lines
             // they generate locally (voice#126).
             kind: MessageKind::Normal,
-            // A daemon-sourced message carries a real `id`; the idempotency key
-            // is a client-local stamp on optimistic bubbles only (#570).
-            idempotency_key: None,
+            // Surface the persisted idempotency key (#570 Phase 1b): a USER row
+            // carries the client's key, so a transcript reload/reconnect dedups
+            // an echoed `UserMessageAdded` by exact match rather than a
+            // content compare. `None` for assistant/tool rows and keyless sends.
+            idempotency_key: value.idempotency_key,
         }
     }
 }
@@ -121,12 +123,32 @@ mod tests {
             id: "m1".into(),
             role: "assistant".into(),
             content: "hi".into(),
+            idempotency_key: None,
         });
         assert_eq!(m.kind, MessageKind::Normal);
         assert_eq!(m.content, "hi");
         assert!(
             m.idempotency_key.is_none(),
             "a daemon-sourced message never carries a client idempotency stamp"
+        );
+    }
+
+    /// #570 Phase 1b: a persisted idempotency key on the wire `MessageView` is
+    /// carried onto the `ChatMessage` on reload, so a reconnecting client can
+    /// dedupe an echoed `UserMessageAdded` by exact key match instead of a
+    /// content compare (the Phase 1 limitation this slice removes).
+    #[test]
+    fn persisted_idempotency_key_surfaces_on_reload() {
+        let m = ChatMessage::from(api::MessageView {
+            id: "m1".into(),
+            role: "user".into(),
+            content: "hi".into(),
+            idempotency_key: Some("k1".into()),
+        });
+        assert_eq!(
+            m.idempotency_key.as_deref(),
+            Some("k1"),
+            "a persisted key must pass through From<MessageView> onto the ChatMessage"
         );
     }
 }
