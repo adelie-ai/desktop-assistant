@@ -484,6 +484,11 @@ mod foreground_send {
     };
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 
+    /// Soft-deleted entries the fake store reports as "in the trash".
+    const FAKE_TRASH_COUNT: u32 = 7;
+    /// Entries the fake store reports as permanently removed by an empty-trash.
+    const FAKE_TRASH_EMPTIED: u32 = 3;
+
     struct FakeKnowledge;
     impl KnowledgeService for FakeKnowledge {
         async fn list_entries(
@@ -531,6 +536,12 @@ mod foreground_send {
         }
         async fn delete_entry(&self, _id: String) -> Result<(), CoreError> {
             Ok(())
+        }
+        async fn trash_count(&self) -> Result<usize, CoreError> {
+            Ok(FAKE_TRASH_COUNT as usize)
+        }
+        async fn empty_trash(&self) -> Result<usize, CoreError> {
+            Ok(FAKE_TRASH_EMPTIED as usize)
         }
     }
 
@@ -1028,6 +1039,55 @@ mod foreground_send {
         let (status, _) = wait_for_completion(&mut alice_events, &task_id).await;
         assert_eq!(status, api::TaskStatus::Cancelled);
         assert!(registry.get(&alice, &task_id).is_none());
+    }
+
+    // --- knowledge-base trash commands (#657) -------------------------
+    //
+    // The trash needs an explicit control surface: a count so a panel can show
+    // what is in it, and an empty-trash that reaps it now rather than waiting
+    // out the retention window. Both are ordinary commands on the knowledge
+    // service, dispatched like every other knowledge command.
+
+    #[tokio::test]
+    async fn get_knowledge_trash_count_command_returns_the_count() {
+        let registry = Arc::new(BackgroundTaskRegistry::new());
+        let release = Arc::new(Notify::new());
+        let convs = Arc::new(ControllableConversations::new(release));
+        let handler = make_handler_with_registry(convs, registry);
+
+        let res = handler
+            .handle_command(api::Command::GetKnowledgeTrashCount)
+            .await
+            .expect("trash count command");
+
+        assert_eq!(
+            res,
+            api::CommandResult::KnowledgeTrashCount {
+                count: FAKE_TRASH_COUNT
+            },
+            "the command must surface the store's soft-deleted count"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_knowledge_trash_command_returns_the_deleted_count() {
+        let registry = Arc::new(BackgroundTaskRegistry::new());
+        let release = Arc::new(Notify::new());
+        let convs = Arc::new(ControllableConversations::new(release));
+        let handler = make_handler_with_registry(convs, registry);
+
+        let res = handler
+            .handle_command(api::Command::EmptyKnowledgeTrash)
+            .await
+            .expect("empty trash command");
+
+        assert_eq!(
+            res,
+            api::CommandResult::KnowledgeTrashEmptied {
+                deleted_count: FAKE_TRASH_EMPTIED
+            },
+            "the command must report how many entries were permanently removed"
+        );
     }
 }
 

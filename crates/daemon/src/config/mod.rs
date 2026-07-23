@@ -1865,6 +1865,67 @@ type = "openai"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // --- knowledge-base trash lifecycle (#657) ----------------------------
+
+    #[test]
+    fn trash_retention_defaults_to_thirty_days() {
+        let cfg = BackendTasksConfig::default();
+        assert_eq!(
+            cfg.knowledge_trash_retention_days,
+            desktop_assistant_storage::dreaming::SOFT_DELETE_TTL_DAYS,
+            "the historical soft-delete TTL const stays the default retention"
+        );
+    }
+
+    #[test]
+    fn trash_sweep_runs_when_consolidation_is_disabled() {
+        // The reap must not be coupled to the consolidation cycle: an instance
+        // with dreaming off accumulated tombstones forever, invisible to every
+        // read path but never freed.
+        let cfg = BackendTasksConfig {
+            dreaming_enabled: false,
+            consolidation_interval_secs: 0,
+            ..Default::default()
+        };
+        assert!(
+            cfg.trash_sweep_enabled(),
+            "the trash sweep must be gated on its own interval, not on dreaming"
+        );
+    }
+
+    #[test]
+    fn trash_sweep_is_disabled_by_a_zero_interval() {
+        let cfg = BackendTasksConfig {
+            dreaming_enabled: true,
+            knowledge_trash_sweep_interval_secs: 0,
+            ..Default::default()
+        };
+        assert!(
+            !cfg.trash_sweep_enabled(),
+            "a zero interval is the documented off switch for the sweep"
+        );
+    }
+
+    #[test]
+    fn configured_trash_retention_is_read_from_backend_tasks() {
+        let dir = unique_test_dir("da-test-trash-retention");
+        let path = dir.join("daemon.toml");
+        std::fs::write(
+            &path,
+            "[backend_tasks]\n\
+             knowledge_trash_retention_days = 3\n\
+             knowledge_trash_sweep_interval_secs = 900\n",
+        )
+        .unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.backend_tasks.knowledge_trash_retention_days, 3);
+        assert_eq!(loaded.backend_tasks.knowledge_trash_sweep_interval_secs, 900);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn load_migrates_legacy_for_connector(connector: &str, extra_fields: &str) {
         let dir = unique_test_dir(&format!("da-test-mig-{connector}"));
         let path = dir.join("daemon.toml");
