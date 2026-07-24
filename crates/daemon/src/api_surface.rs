@@ -548,20 +548,36 @@ impl ConnectionsService for DaemonConnectionsService {
 
         let mut out: Vec<CoreModelListing> = Vec::new();
         for (id, connector_type, label, client) in targets {
+            // The detailed variant so a connector that had to degrade (e.g.
+            // Bedrock without `bedrock:ListInferenceProfiles`) can say so in
+            // the response rather than only in the daemon log (#648).
             let list_result = if refresh {
-                client.refresh_models().await
+                client.refresh_models_detailed().await
             } else {
-                client.list_models().await
+                client.list_models_detailed().await
             };
             match list_result {
-                Ok(models) => {
+                Ok(report) => {
+                    if report.is_degraded() {
+                        tracing::info!(
+                            connection = %id,
+                            notices = report.notices.len(),
+                            "model listing is incomplete; reporting it to the client"
+                        );
+                    }
+                    // Notices ride each row of the connection (the listing is
+                    // a flat per-model stream). A connection that produced no
+                    // rows at all therefore carries none. Acceptable because
+                    // an empty picker is already unambiguous, unlike the
+                    // deceptive "loaded, embeddings only" case this reports.
                     let merged =
-                        crate::model_defaults::merge_with_defaults(&connector_type, models);
+                        crate::model_defaults::merge_with_defaults(&connector_type, report.models);
                     for m in merged {
                         out.push(CoreModelListing {
                             connection_id: id.as_str().to_string(),
                             connection_label: label.clone(),
                             model: m,
+                            notices: report.notices.clone(),
                         });
                     }
                 }
@@ -635,6 +651,21 @@ impl ConnectionsService for DaemonConnectionsService {
                         .to_string(),
                 ));
             }
+        }
+
+        // Half-inheritance is meaningless: a real connection cannot resolve a
+        // model borrowed from a different one. Refusing it here is what keeps
+        // a client that cannot populate its model dropdown from quietly
+        // retiring a working binding (#659).
+        if new_cfg.inheritance_is_mixed() {
+            return Err(CoreError::Llm(format!(
+                "purpose \"{}\": connection \"{}\" and model \"{}\" mix a named binding with the \
+                 \"primary\" inherit sentinel — use \"primary\" for both to inherit from \
+                 interactive, or name both",
+                purpose_kind.as_key(),
+                new_cfg.connection,
+                new_cfg.model,
+            )));
         }
 
         self.registry.mutate_config(|cfg| {
@@ -2623,6 +2654,121 @@ mod tests {
             "the new connection should be live"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- SetPurpose must reject a mixed inherit pair -----------------------
+
+    /// A purposes config with interactive bound, so a non-interactive write
+    /// under test is the only thing that can fail validation.
+    fn handle_with_interactive() -> Arc<RegistryHandle> {
+        let mut cfg = config_with_connections(&[("local", ollama_local())]);
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        make_handle_with(cfg)
+    }
+
+    fn payload(connection: &str, model: &str) -> PurposeConfigPayload {
+        PurposeConfigPayload {
+            connection: connection.into(),
+            model: model.into(),
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejects_real_connection_with_primary_model() {
+        // The exact shape a client wrote to production: a real connection
+        // paired with the inherit sentinel, which retired a live binding.
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        let err = svc
+            .set_purpose(PurposeKind::Embedding, payload("local", "primary"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("primary"),
+            "rejection should name the sentinel; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejects_primary_connection_with_real_model() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        let err = svc
+            .set_purpose(PurposeKind::Dreaming, payload("primary", "llama3"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("primary"));
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejection_names_the_purpose_and_the_pair() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        let err = svc
+            .set_purpose(PurposeKind::Embedding, payload("local", "primary"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("embedding") && msg.contains("local"),
+            "an operator must be able to tell which purpose and which pair was \
+             refused without reading the source; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejection_leaves_the_stored_binding_untouched() {
+        let handle = handle_with_interactive();
+        handle
+            .mutate_config(|cfg| {
+                cfg.purposes.set(
+                    PurposeKind::Embedding,
+                    Some(PurposeConfig {
+                        connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                        model: ModelRef::Named("nomic-embed-text".into()),
+                        effort: None,
+                        max_context_tokens: None,
+                    }),
+                );
+                Ok(())
+            })
+            .expect("seed a good binding");
+
+        let svc = DaemonConnectionsService::new(handle.clone());
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "primary"))
+            .await
+            .expect_err("mixed pair must be refused");
+
+        let stored = handle.snapshot_config();
+        let embedding = stored
+            .purposes
+            .get(PurposeKind::Embedding)
+            .expect("binding should survive a refused write");
+        assert_eq!(embedding.model, ModelRef::Named("nomic-embed-text".into()));
+    }
+
+    #[tokio::test]
+    async fn set_purpose_accepts_a_full_primary_pair_for_non_interactive() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        svc.set_purpose(PurposeKind::Dreaming, payload("primary", "primary"))
+            .await
+            .expect("inheriting from interactive is the whole point of the sentinel");
+    }
+
+    #[tokio::test]
+    async fn set_purpose_accepts_two_real_ids() {
+        let svc = DaemonConnectionsService::new(handle_with_interactive());
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "nomic-embed-text"))
+            .await
+            .expect("a fully-specified binding is always valid");
     }
 
     #[tokio::test]

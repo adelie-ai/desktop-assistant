@@ -1485,6 +1485,7 @@ dependencies = [
  "aws-smithy-types",
  "desktop-assistant-core",
  "desktop-assistant-llm-http",
+ "httpmock",
  "serde",
  "serde_json",
  "tokio",

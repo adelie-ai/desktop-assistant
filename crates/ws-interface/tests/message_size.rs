@@ -98,6 +98,12 @@ impl KnowledgeService for FakeKnowledge {
     async fn delete_entry(&self, _id: String) -> Result<(), CoreError> {
         Ok(())
     }
+    async fn trash_count(&self) -> Result<usize, CoreError> {
+        Ok(0)
+    }
+    async fn empty_trash(&self) -> Result<usize, CoreError> {
+        Ok(0)
+    }
 }
 
 struct FakeConnections;

@@ -110,6 +110,14 @@ where
     async fn delete_entry(&self, id: String) -> Result<(), CoreError> {
         self.store.delete(&id).await
     }
+
+    async fn trash_count(&self) -> Result<usize, CoreError> {
+        self.store.trash_count().await
+    }
+
+    async fn empty_trash(&self) -> Result<usize, CoreError> {
+        self.store.empty_trash().await
+    }
 }
 
 /// Runtime dispatch wrapper. The `KnowledgeService` trait uses `impl
@@ -191,6 +199,20 @@ where
             Self::Unconfigured(s) => s.delete_entry(id).await,
         }
     }
+
+    async fn trash_count(&self) -> Result<usize, CoreError> {
+        match self {
+            Self::Configured(s) => s.trash_count().await,
+            Self::Unconfigured(s) => s.trash_count().await,
+        }
+    }
+
+    async fn empty_trash(&self) -> Result<usize, CoreError> {
+        match self {
+            Self::Configured(s) => s.empty_trash().await,
+            Self::Unconfigured(s) => s.empty_trash().await,
+        }
+    }
 }
 
 /// No-op [`KnowledgeService`] used when no Postgres pool is configured.
@@ -243,6 +265,14 @@ impl KnowledgeService for UnconfiguredKnowledgeService {
     }
 
     async fn delete_entry(&self, _id: String) -> Result<(), CoreError> {
+        Err(CoreError::Storage(UNCONFIGURED_MSG.to_string()))
+    }
+
+    async fn trash_count(&self) -> Result<usize, CoreError> {
+        Err(CoreError::Storage(UNCONFIGURED_MSG.to_string()))
+    }
+
+    async fn empty_trash(&self) -> Result<usize, CoreError> {
         Err(CoreError::Storage(UNCONFIGURED_MSG.to_string()))
     }
 }
@@ -313,6 +343,16 @@ mod tests {
         async fn get(&self, id: &str) -> Result<Option<KnowledgeEntry>, CoreError> {
             let guard = self.entries.lock().unwrap();
             Ok(guard.iter().find(|e| e.id == id).cloned())
+        }
+
+        // The in-memory double has no soft-delete state: entries are removed
+        // outright, so nothing is ever "in the trash".
+        async fn trash_count(&self) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+
+        async fn empty_trash(&self) -> Result<usize, CoreError> {
+            Ok(0)
         }
     }
 
@@ -387,6 +427,17 @@ mod tests {
     async fn unconfigured_service_returns_storage_error() {
         let svc = UnconfiguredKnowledgeService;
         let err = svc.list_entries(10, 0, None).await.unwrap_err();
+        assert!(matches!(err, CoreError::Storage(msg) if msg.contains("not configured")));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_service_rejects_trash_operations() {
+        // Without a database there is no trash to report or empty; say so
+        // rather than answering a confident "0".
+        let svc = UnconfiguredKnowledgeService;
+        let err = svc.trash_count().await.unwrap_err();
+        assert!(matches!(err, CoreError::Storage(msg) if msg.contains("not configured")));
+        let err = svc.empty_trash().await.unwrap_err();
         assert!(matches!(err, CoreError::Storage(msg) if msg.contains("not configured")));
     }
 }

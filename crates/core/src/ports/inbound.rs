@@ -1,6 +1,8 @@
 use crate::CoreError;
 use crate::domain::{Conversation, ConversationId, ConversationSummary, KnowledgeEntry};
-use crate::ports::llm::{ChunkCallback, ModelInfo, StatusCallback, with_cancellation_token};
+use crate::ports::llm::{
+    ChunkCallback, ModelInfo, ModelListingNotice, StatusCallback, with_cancellation_token,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -517,6 +519,15 @@ pub struct ModelListing {
     pub connection_id: String,
     pub connection_label: String,
     pub model: ModelInfo,
+    /// Non-fatal problems the connection reported while enumerating its
+    /// models, so a client can flag an incomplete picker instead of
+    /// presenting a short list as the whole truth (#648).
+    ///
+    /// Why it rides every row rather than the response: the listing is a
+    /// flat per-model stream that already repeats `connection_label`, and
+    /// keeping the shape flat let this land without a wire break. The value
+    /// is the same for every row of one connection.
+    pub notices: Vec<ModelListingNotice>,
 }
 
 /// Purpose kind identifiers (`Interactive`/`Dreaming`/`Embedding`/`Titling`).
@@ -902,6 +913,16 @@ pub trait KnowledgeService: Send + Sync {
         &self,
         id: String,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// How many soft-deleted ("trashed") entries the calling user has. Retired
+    /// entries are hidden from every other read path, so a panel needs this to
+    /// show what is in the trash.
+    fn trash_count(&self) -> impl std::future::Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Permanently delete every soft-deleted entry belonging to the calling
+    /// user, ignoring the retention window; returns how many were freed.
+    /// Emptying an already-empty trash returns `0`, not an error.
+    fn empty_trash(&self) -> impl std::future::Future<Output = Result<usize, CoreError>> + Send;
 }
 
 /// On-demand knowledge-maintenance passes, triggered from the knowledge panels

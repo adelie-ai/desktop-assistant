@@ -100,6 +100,24 @@ pub struct PurposeConfig {
     pub max_context_tokens: Option<u64>,
 }
 
+impl PurposeConfig {
+    /// True when exactly one of `connection` / `model` is the `primary`
+    /// inherit sentinel.
+    ///
+    /// Why this is invalid: `primary` means "take this from the interactive
+    /// purpose", and inheriting only half a binding has no meaning — a real
+    /// connection cannot resolve a model borrowed from a different one. The
+    /// pair is either both inherited or both named.
+    ///
+    /// Kept separate from [`Purposes::validate`] on purpose: `validate` gates
+    /// whether a config may *load*, and an instance that already has a mixed
+    /// pair on disk must still boot so an operator can fix it. This is the
+    /// predicate for refusing a *write* and for warning at startup.
+    pub fn inheritance_is_mixed(&self) -> bool {
+        matches!(self.connection, ConnectionRef::Primary) != matches!(self.model, ModelRef::Primary)
+    }
+}
+
 /// All purpose configs, keyed by [`PurposeKind`].
 ///
 /// TOML shape:
@@ -651,6 +669,63 @@ mystery = "x"
     }
 
     // --- Validation -------------------------------------------------------
+
+    fn mixed_pair(connection: ConnectionRef, model: ModelRef) -> PurposeConfig {
+        PurposeConfig {
+            connection,
+            model,
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn mixed_inheritance_is_detected_in_both_directions() {
+        let named_conn = ConnectionRef::Named(ConnectionId::new("local").unwrap());
+        assert!(
+            mixed_pair(named_conn.clone(), ModelRef::Primary).inheritance_is_mixed(),
+            "a real connection with an inherited model is half a binding"
+        );
+        assert!(
+            mixed_pair(ConnectionRef::Primary, ModelRef::Named("llama3".into()))
+                .inheritance_is_mixed(),
+            "an inherited connection with a real model is half a binding"
+        );
+    }
+
+    #[test]
+    fn matched_pairs_are_not_mixed() {
+        let named_conn = ConnectionRef::Named(ConnectionId::new("local").unwrap());
+        assert!(!mixed_pair(named_conn, ModelRef::Named("llama3".into())).inheritance_is_mixed());
+        assert!(!mixed_pair(ConnectionRef::Primary, ModelRef::Primary).inheritance_is_mixed());
+    }
+
+    #[test]
+    fn validate_still_allows_a_mixed_pair_so_an_existing_config_boots() {
+        // Deliberate: refusing to load would strand an operator whose config
+        // already carries a mixed pair, with no way to reach the settings UI
+        // and fix it. The write path refuses; startup warns.
+        let p = Purposes::from_pairs([
+            (
+                PurposeKind::Interactive,
+                mixed_pair(
+                    ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    ModelRef::Named("llama3".into()),
+                ),
+            ),
+            (
+                PurposeKind::Embedding,
+                mixed_pair(
+                    ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                    ModelRef::Primary,
+                ),
+            ),
+        ]);
+        assert!(
+            p.validate().is_ok(),
+            "a mixed pair must not block the daemon from starting"
+        );
+    }
 
     #[test]
     fn validate_empty_is_ok() {

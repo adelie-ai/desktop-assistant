@@ -24,7 +24,8 @@ use std::sync::Arc;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig, with_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
+    with_model_override,
 };
 
 use crate::api_surface::RegistryHandle;
@@ -250,6 +251,20 @@ impl LlmClient for RoutingLlmClient {
         match &self.fallback {
             FallbackMode::Static { .. } => self.resolve_static().refresh_models().await,
             FallbackMode::DynamicPurpose { .. } => Ok(Vec::new()),
+        }
+    }
+
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        match &self.fallback {
+            FallbackMode::Static { .. } => self.resolve_static().list_models_detailed().await,
+            FallbackMode::DynamicPurpose { .. } => Ok(ModelListingReport::default()),
+        }
+    }
+
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        match &self.fallback {
+            FallbackMode::Static { .. } => self.resolve_static().refresh_models_detailed().await,
+            FallbackMode::DynamicPurpose { .. } => Ok(ModelListingReport::default()),
         }
     }
 

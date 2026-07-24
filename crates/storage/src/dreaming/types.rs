@@ -38,8 +38,10 @@ pub const MAX_CONVERSATIONS_PER_SCAN: i64 = 10;
 /// prevent review loops.
 pub const MAX_REVIEW_GENERATION: i16 = 2;
 
-/// Soft-delete TTL. Entries with `deleted_at` older than this are reaped.
-pub const SOFT_DELETE_TTL_DAYS: i32 = 30;
+/// Default soft-delete retention, in days: entries whose `deleted_at` is older
+/// than this are reaped. Instances override it via
+/// `[backend_tasks] knowledge_trash_retention_days`; this stays the default.
+pub const SOFT_DELETE_TTL_DAYS: u32 = 30;
 
 /// Character budget for one holistic-consolidation prompt. A user's active KB
 /// is recomputed in a single LLM call when it fits under this; otherwise it is
