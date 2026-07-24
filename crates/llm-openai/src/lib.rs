@@ -5,8 +5,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolCall;
 use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage, current_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
+    ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
@@ -857,19 +857,19 @@ fn curated_openai_models() -> Vec<ModelInfo> {
         reasoning: false,
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     };
     let reasoning_caps = ModelCapabilities {
         reasoning: true,
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     };
     let embedding_caps = ModelCapabilities {
         reasoning: false,
         vision: false,
         tools: false,
-        embedding: true,
+        kind: ModelKind::Embedding,
     };
 
     vec![
@@ -1473,7 +1473,7 @@ mod tests {
         let gpt5 = models.iter().find(|m| m.id == "gpt-5").unwrap();
         assert!(gpt5.capabilities.reasoning);
         assert!(gpt5.capabilities.tools);
-        assert!(!gpt5.capabilities.embedding);
+        assert_eq!(gpt5.capabilities.kind, ModelKind::Generative);
         assert_eq!(gpt5.context_limit, Some(400_000));
 
         // o-series reasoning flag.
@@ -1485,7 +1485,7 @@ mod tests {
             .iter()
             .find(|m| m.id == "text-embedding-3-large")
             .unwrap();
-        assert!(embed.capabilities.embedding);
+        assert_eq!(embed.capabilities.kind, ModelKind::Embedding);
         assert!(!embed.capabilities.reasoning);
         assert!(!embed.capabilities.tools);
         assert!(!embed.capabilities.vision);

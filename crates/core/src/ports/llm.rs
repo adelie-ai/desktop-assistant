@@ -585,7 +585,39 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
+/// What kind of model this is -- the axis that decides which purposes may bind
+/// it. Distinct from the `reasoning` / `vision` / `tools` feature flags, which
+/// describe a *generative* model's abilities; `kind` answers the prior question
+/// of whether the model is a chat/completion model at all or an embedding model.
+///
+/// Three states, not two, on purpose (#647): a connector pointed at an arbitrary
+/// OpenAI-compatible endpoint may genuinely not know what a model is, and an
+/// `Unknown` must not lock an operator out of a working configuration. The
+/// daemon enforces `Generative` / `Embedding` on the write path but always
+/// allows `Unknown` (with a warning) -- the capability-degradation posture in
+/// `AGENTS.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// A chat/completion model that generates text (and may call tools, take
+    /// images, or expose reasoning traces -- see the feature flags).
+    Generative,
+    /// A vector-embedding model. Usable only for the embedding purpose.
+    Embedding,
+    /// The connector could not positively classify this model. Allowed with a
+    /// warning rather than blocked, so an unrecognized custom id or a listing
+    /// that failed transiently never blocks a config edit.
+    #[default]
+    Unknown,
+}
+
 /// Capability flags describing what an LLM model supports.
+///
+/// `kind` is the single source of truth for whether a model is generative or an
+/// embedding model; there is deliberately no separate `embedding: bool` field
+/// that could drift from it. Read it through [`Self::is_embedding`]. The
+/// `reasoning` / `vision` / `tools` flags are a different axis: abilities of a
+/// *generative* model, meaningful only when `kind` is [`ModelKind::Generative`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelCapabilities {
     /// Model supports extended-thinking / reasoning traces.
@@ -597,9 +629,20 @@ pub struct ModelCapabilities {
     /// Model supports tool/function calling.
     #[serde(default)]
     pub tools: bool,
-    /// Model is an embedding model (not a chat/completion model).
+    /// What kind of model this is. Defaults to [`ModelKind::Unknown`] so an old
+    /// serialized payload (or a connector that hasn't classified) deserializes
+    /// to the degrade-with-a-warning state rather than a wrong guess.
     #[serde(default)]
-    pub embedding: bool,
+    pub kind: ModelKind,
+}
+
+impl ModelCapabilities {
+    /// Whether this is an embedding model. The one and only reading of the
+    /// embedding/generative distinction -- derived from [`Self::kind`] so it can
+    /// never disagree with it.
+    pub fn is_embedding(&self) -> bool {
+        matches!(self.kind, ModelKind::Embedding)
+    }
 }
 
 /// Description of a single model exposed by an `LlmClient`.
@@ -1629,7 +1672,7 @@ mod tests {
             reasoning: true,
             vision: true,
             tools: true,
-            embedding: false,
+            kind: ModelKind::Generative,
         };
         let info = ModelInfo::new("gpt-5")
             .with_display_name("GPT-5")
@@ -1640,7 +1683,7 @@ mod tests {
         assert!(info.capabilities.reasoning);
         assert!(info.capabilities.vision);
         assert!(info.capabilities.tools);
-        assert!(!info.capabilities.embedding);
+        assert!(!info.capabilities.is_embedding());
     }
 
     #[test]
@@ -1653,7 +1696,7 @@ mod tests {
                 reasoning: true,
                 vision: true,
                 tools: true,
-                embedding: false,
+                kind: ModelKind::Generative,
             },
         };
         let json = serde_json::to_string(&info).unwrap();
@@ -1677,13 +1720,51 @@ mod tests {
     #[test]
     fn model_capabilities_embedding_flag_isolated() {
         let caps = ModelCapabilities {
-            embedding: true,
+            kind: ModelKind::Embedding,
             ..Default::default()
         };
-        assert!(caps.embedding);
+        assert!(caps.is_embedding());
         assert!(!caps.reasoning);
         assert!(!caps.tools);
         assert!(!caps.vision);
+    }
+
+    #[test]
+    fn model_kind_is_the_single_source_of_truth_for_embedding() {
+        // `is_embedding()` is derived from `kind` and cannot drift from it.
+        assert!(
+            ModelCapabilities {
+                kind: ModelKind::Embedding,
+                ..Default::default()
+            }
+            .is_embedding()
+        );
+        assert!(
+            !ModelCapabilities {
+                kind: ModelKind::Generative,
+                ..Default::default()
+            }
+            .is_embedding()
+        );
+        // An unclassified model is not treated as an embedding model.
+        assert!(!ModelCapabilities::default().is_embedding());
+    }
+
+    #[test]
+    fn model_capabilities_default_kind_is_unknown() {
+        // The degrade-with-a-warning state, so an old payload or an
+        // unclassified connector never presents a wrong guess.
+        assert_eq!(ModelCapabilities::default().kind, ModelKind::Unknown);
+    }
+
+    #[test]
+    fn model_kind_missing_from_json_deserializes_as_unknown() {
+        // Additive wire change: a payload written before `kind` existed must
+        // still deserialize, landing on `Unknown` rather than failing.
+        let caps: ModelCapabilities =
+            serde_json::from_str(r#"{"reasoning":true,"vision":false,"tools":true}"#).unwrap();
+        assert_eq!(caps.kind, ModelKind::Unknown);
+        assert!(caps.reasoning);
     }
 
     #[tokio::test]

@@ -72,7 +72,7 @@ pub fn merge_curated_with_live(curated: Vec<ModelInfo>, live: Vec<ModelInfo>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use desktop_assistant_core::ports::llm::{ModelCapabilities, ModelInfo};
+    use desktop_assistant_core::ports::llm::{ModelCapabilities, ModelInfo, ModelKind};
 
     #[test]
     fn apply_context_cap_folds_cap_and_reported() {
@@ -95,7 +95,7 @@ mod tests {
                 reasoning,
                 vision: true,
                 tools: true,
-                embedding: false,
+                kind: ModelKind::Generative,
             })
     }
 

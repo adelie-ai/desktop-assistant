@@ -35,8 +35,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition};
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    current_cancellation_token, current_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
+    ReasoningConfig, current_cancellation_token, current_model_override,
 };
 use desktop_assistant_llm_http::{
     Clock, ModelCache, STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, apply_context_cap,
@@ -860,19 +860,19 @@ fn curated_azure_models() -> Vec<ModelInfo> {
         reasoning: false,
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     };
     let reasoning = ModelCapabilities {
         reasoning: true,
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     };
     let embedding = ModelCapabilities {
         reasoning: false,
         vision: false,
         tools: false,
-        embedding: true,
+        kind: ModelKind::Embedding,
     };
 
     vec![
@@ -1372,11 +1372,12 @@ mod tests {
         let gpt4o = models.iter().find(|m| m.id == "gpt-4o").unwrap();
         assert!(!gpt4o.capabilities.reasoning);
         assert!(gpt4o.capabilities.tools);
+        assert_eq!(gpt4o.capabilities.kind, ModelKind::Generative);
         let embed = models
             .iter()
             .find(|m| m.id == "text-embedding-3-large")
             .unwrap();
-        assert!(embed.capabilities.embedding);
+        assert_eq!(embed.capabilities.kind, ModelKind::Embedding);
         assert!(!embed.capabilities.tools);
     }
 

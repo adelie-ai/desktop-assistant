@@ -9,7 +9,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::llm::{
-    BudgetSource, ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo,
+    BudgetSource, ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
     ReasoningConfig, TokenUsage, current_cancellation_token, current_context_budget,
     current_model_override,
 };
@@ -1013,7 +1013,11 @@ impl OllamaClient {
                 reasoning: false,
                 vision: false,
                 tools: !is_embedding,
-                embedding: is_embedding,
+                kind: if is_embedding {
+                    ModelKind::Embedding
+                } else {
+                    ModelKind::Generative
+                },
             };
 
             models.push(ModelInfo {
@@ -1986,6 +1990,42 @@ mod tests {
         tags_mock.assert_calls(1);
         show_llama.assert_calls(1);
         show_embed.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn ollama_derives_kind_from_model_capabilities() {
+        // Ollama already recognises embedding models by the `embed` token in
+        // the id; that same signal drives the normalized `kind` (#647): an
+        // `*-embed*` model is `Embedding`, everything else `Generative`.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/tags");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"models":[
+                        {"name":"llama3.2:latest","model":"llama3.2:latest","digest":"sha256:aaa"},
+                        {"name":"nomic-embed-text:latest","model":"nomic-embed-text:latest","digest":"sha256:bbb"}
+                    ]}"#,
+                );
+        });
+        // /api/show is best-effort context enrichment; a 500 keeps the test
+        // focused on classification without depending on the show payload.
+        server.mock(|when, then| {
+            when.method(POST).path("/api/show");
+            then.status(500).body("boom");
+        });
+
+        let client = OllamaClient::new(server.url(""), "llama3.2");
+        let models = client.list_models().await.unwrap();
+
+        let chat = models.iter().find(|m| m.id == "llama3.2:latest").unwrap();
+        assert_eq!(chat.capabilities.kind, ModelKind::Generative);
+        let embed = models
+            .iter()
+            .find(|m| m.id == "nomic-embed-text:latest")
+            .unwrap();
+        assert_eq!(embed.capabilities.kind, ModelKind::Embedding);
     }
 
     #[tokio::test]

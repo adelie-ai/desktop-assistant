@@ -7,7 +7,7 @@
 //! [`merge_curated_with_live`](desktop_assistant_llm_http::merge_curated_with_live):
 //! curated metadata wins on id overlap, unknown live ids are appended.
 
-use desktop_assistant_core::ports::llm::{ModelCapabilities, ModelInfo};
+use desktop_assistant_core::ports::llm::{ModelCapabilities, ModelInfo, ModelKind};
 
 /// Gemini 2.5 / 2.0 models ship a ~1M-token input window.
 const CONTEXT_1M: u64 = 1_048_576;
@@ -43,7 +43,7 @@ pub fn infer_capabilities(id: &str) -> ModelCapabilities {
             reasoning: false,
             vision: false,
             tools: false,
-            embedding: true,
+            kind: ModelKind::Embedding,
         };
     }
     ModelCapabilities {
@@ -51,7 +51,7 @@ pub fn infer_capabilities(id: &str) -> ModelCapabilities {
         // Every current Gemini chat model accepts image input.
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     }
 }
 
@@ -145,7 +145,7 @@ mod tests {
         assert!(pro.capabilities.reasoning, "2.5 pro is a reasoning model");
         assert!(pro.capabilities.tools);
         assert!(pro.capabilities.vision);
-        assert!(!pro.capabilities.embedding);
+        assert_eq!(pro.capabilities.kind, ModelKind::Generative);
         assert_eq!(pro.context_limit, Some(CONTEXT_1M));
     }
 
@@ -154,8 +154,9 @@ mod tests {
         let models = curated_gemini_models();
         let embed = models
             .iter()
-            .find(|m| m.capabilities.embedding)
+            .find(|m| m.capabilities.is_embedding())
             .expect("curated table includes an embedding model");
+        assert_eq!(embed.capabilities.kind, ModelKind::Embedding);
         assert!(!embed.capabilities.tools);
         assert!(!embed.capabilities.reasoning);
     }
@@ -163,7 +164,7 @@ mod tests {
     #[test]
     fn infer_capabilities_marks_embedding_models() {
         let caps = infer_capabilities("text-embedding-004");
-        assert!(caps.embedding);
+        assert_eq!(caps.kind, ModelKind::Embedding);
         assert!(!caps.tools);
     }
 
@@ -173,6 +174,6 @@ mod tests {
         assert!(caps.reasoning);
         assert!(caps.tools);
         assert!(caps.vision);
-        assert!(!caps.embedding);
+        assert_eq!(caps.kind, ModelKind::Generative);
     }
 }

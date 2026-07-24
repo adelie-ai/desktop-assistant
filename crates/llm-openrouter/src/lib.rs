@@ -19,8 +19,8 @@ use std::time::Duration;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    current_cancellation_token, current_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
+    ReasoningConfig, current_cancellation_token, current_model_override,
 };
 use desktop_assistant_llm_http::{
     Clock, ModelCache, STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, apply_context_cap,
@@ -481,19 +481,19 @@ fn curated_openrouter_models() -> Vec<ModelInfo> {
         reasoning: true,
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     };
     let chat_caps = ModelCapabilities {
         reasoning: false,
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     };
     let text_caps = ModelCapabilities {
         reasoning: false,
         vision: false,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Generative,
     };
 
     vec![
@@ -586,7 +586,9 @@ fn live_model_to_info(m: LiveModel) -> ModelInfo {
             .supported_parameters
             .iter()
             .any(|p| p == "tools" || p == "tool_choice"),
-        embedding: false,
+        // OpenRouter's embedding coverage is excluded from this connector in
+        // v1, so every model it surfaces is generative.
+        kind: ModelKind::Generative,
     };
     let mut info = ModelInfo::new(m.id);
     if let Some(name) = m.name {
@@ -1506,7 +1508,7 @@ mod tests {
         assert!(info.capabilities.tools);
         assert!(info.capabilities.reasoning);
         assert!(info.capabilities.vision);
-        assert!(!info.capabilities.embedding);
+        assert_eq!(info.capabilities.kind, ModelKind::Generative);
     }
 
     // --- TTL model cache (issue #620) -----------------------------------
