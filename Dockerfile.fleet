@@ -19,7 +19,7 @@
 # repos as SIBLINGS (each builds from its own source). See deploy/mcp/README.md.
 
 # ---- Builder ----------------------------------------------------------------
-FROM rust:1-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 
 # libpam0g-dev is only needed by the daemon (WS local-system auth), but a single
 # builder keeps the toolchain + cargo registry/git cache shared across the fleet.
