@@ -725,7 +725,7 @@ fn curated_anthropic_models() -> Vec<ModelInfo> {
         reasoning: false,
         vision: true,
         tools: true,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Generative,
     };
     let claude_reasoning_caps = ModelCapabilities {
         reasoning: true,

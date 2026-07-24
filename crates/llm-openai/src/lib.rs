@@ -857,19 +857,19 @@ fn curated_openai_models() -> Vec<ModelInfo> {
         reasoning: false,
         vision: true,
         tools: true,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Generative,
     };
     let reasoning_caps = ModelCapabilities {
         reasoning: true,
         vision: true,
         tools: true,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Generative,
     };
     let embedding_caps = ModelCapabilities {
         reasoning: false,
         vision: false,
         tools: false,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Embedding,
     };
 
     vec![

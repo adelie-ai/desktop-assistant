@@ -39,8 +39,9 @@ use desktop_assistant_core::ports::inbound::{
     PromptSelectionOverride, PurposeConfigPayload, PurposesView as CorePurposesView,
 };
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, ReasoningConfig, ReasoningLevel, StatusCallback, with_context_budget,
-    with_model_override, with_personality, with_reasoning_config, with_system_refinement,
+    ChunkCallback, LlmClient, ModelKind, ReasoningConfig, ReasoningLevel, StatusCallback,
+    with_context_budget, with_model_override, with_personality, with_reasoning_config,
+    with_system_refinement,
 };
 use desktop_assistant_core::ports::store::LearnedWindowStore;
 use desktop_assistant_core::prompts::{Personality, PersonalityOverride};
@@ -149,6 +150,54 @@ impl RegistryHandle {
         };
         let models = client.list_models().await?;
         Ok(models.iter().any(|m| m.id == model_id))
+    }
+
+    /// Resolve the [`ModelKind`] the `(connection, model)` pair advertises, for
+    /// the SetPurpose write-time guard (#647).
+    ///
+    /// Returns [`ModelKind::Unknown`] -- and logs a `warn!` -- for every case the
+    /// guard must NOT block on: the connection has no live client, listing its
+    /// models failed (down / transient network fault), or the model id is not in
+    /// the connection's listing (an unrecognized custom id). A definite
+    /// `Generative` / `Embedding` is returned only when the connector positively
+    /// classified the bound model. This is the capability-degradation posture in
+    /// `AGENTS.md`: never turn a config edit into a failure over something the
+    /// daemon merely could not verify.
+    ///
+    /// The client `Arc` is cloned out under `client_for`'s brief read lock and
+    /// awaited unlocked -- the same pattern as `connection_lists_model` and
+    /// `list_available_models` -- so no registry lock is held across `.await`.
+    async fn resolve_model_kind(&self, conn_id: &ConnectionId, model_id: &str) -> ModelKind {
+        let Some(client) = self.client_for(conn_id) else {
+            tracing::warn!(
+                connection = %conn_id,
+                model = model_id,
+                "cannot verify model kind: connection has no live client; allowing the binding"
+            );
+            return ModelKind::Unknown;
+        };
+        let models = match client.list_models().await {
+            Ok(models) => models,
+            Err(e) => {
+                tracing::warn!(
+                    connection = %conn_id,
+                    model = model_id,
+                    "cannot verify model kind: listing models failed ({e}); allowing the binding"
+                );
+                return ModelKind::Unknown;
+            }
+        };
+        match models.iter().find(|m| m.id == model_id) {
+            Some(m) => m.capabilities.kind,
+            None => {
+                tracing::warn!(
+                    connection = %conn_id,
+                    model = model_id,
+                    "cannot verify model kind: model not in the connection's listing; allowing the binding"
+                );
+                ModelKind::Unknown
+            }
+        }
     }
 
     /// Fetch the live client handle for a connection id, if any. The
@@ -668,10 +717,64 @@ impl ConnectionsService for DaemonConnectionsService {
             )));
         }
 
+        // Reject a binding whose model KIND contradicts the purpose (#647): a
+        // generative model can't serve the embedding purpose, and an embedding
+        // model can't serve a generative one. Only a fully-named binding (real
+        // connection + real model) is checked here; the "primary" inherit case
+        // is validated for consistency above, and resolving THROUGH inheritance
+        // to the interactive model's kind is a separate follow-up.
+        //
+        // A kind that can't be verified (Unknown, model not listed, or the
+        // connection is down) is allowed with a warning inside
+        // `resolve_model_kind` — a config edit must never fail on something the
+        // daemon merely could not check.
+        if let (ConnectionRef::Named(conn_id), ModelRef::Named(model_id)) =
+            (&new_cfg.connection, &new_cfg.model)
+        {
+            let expected = expected_kind_for_purpose(purpose_kind);
+            let found = self.registry.resolve_model_kind(conn_id, model_id).await;
+            if found != ModelKind::Unknown && found != expected {
+                return Err(CoreError::Llm(format!(
+                    "purpose \"{purpose}\": model \"{model}\" on connection \"{conn}\" is \
+                     {found}, but the {purpose} purpose requires {expected} — choose a model \
+                     whose kind is {expected}",
+                    purpose = purpose_kind.as_key(),
+                    model = model_id,
+                    conn = conn_id,
+                    found = kind_word(found),
+                    expected = kind_word(expected),
+                )));
+            }
+        }
+
         self.registry.mutate_config(|cfg| {
             cfg.purposes.set(purpose_kind, Some(new_cfg));
             cfg.purposes.validate().map_err(|e| format!("{e}"))
         })
+    }
+}
+
+/// The [`ModelKind`] a purpose requires of a bound model (#647). Embedding is
+/// the only purpose that needs an embedding model; every other purpose runs a
+/// generative model. Exhaustive so a new [`PurposeKind`] cannot be added
+/// without deciding what kind of model it binds.
+fn expected_kind_for_purpose(purpose: PurposeKind) -> ModelKind {
+    match purpose {
+        PurposeKind::Embedding => ModelKind::Embedding,
+        PurposeKind::Interactive
+        | PurposeKind::Dreaming
+        | PurposeKind::Consolidation
+        | PurposeKind::Titling
+        | PurposeKind::Voice => ModelKind::Generative,
+    }
+}
+
+/// Human word for a [`ModelKind`] used in the SetPurpose rejection message.
+fn kind_word(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::Generative => "generative",
+        ModelKind::Embedding => "embedding",
+        ModelKind::Unknown => "unknown",
     }
 }
 

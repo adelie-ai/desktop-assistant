@@ -43,7 +43,7 @@ pub fn infer_capabilities(id: &str) -> ModelCapabilities {
             reasoning: false,
             vision: false,
             tools: false,
-            kind: ModelKind::Unknown,
+            kind: ModelKind::Embedding,
         };
     }
     ModelCapabilities {
@@ -51,7 +51,7 @@ pub fn infer_capabilities(id: &str) -> ModelCapabilities {
         // Every current Gemini chat model accepts image input.
         vision: true,
         tools: true,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Generative,
     }
 }
 

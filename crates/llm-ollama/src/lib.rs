@@ -1013,7 +1013,11 @@ impl OllamaClient {
                 reasoning: false,
                 vision: false,
                 tools: !is_embedding,
-                kind: ModelKind::Unknown,
+                kind: if is_embedding {
+                    ModelKind::Embedding
+                } else {
+                    ModelKind::Generative
+                },
             };
 
             models.push(ModelInfo {

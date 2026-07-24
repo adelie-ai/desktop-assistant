@@ -481,19 +481,19 @@ fn curated_openrouter_models() -> Vec<ModelInfo> {
         reasoning: true,
         vision: true,
         tools: true,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Generative,
     };
     let chat_caps = ModelCapabilities {
         reasoning: false,
         vision: true,
         tools: true,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Generative,
     };
     let text_caps = ModelCapabilities {
         reasoning: false,
         vision: false,
         tools: true,
-        kind: ModelKind::Unknown,
+        kind: ModelKind::Generative,
     };
 
     vec![
@@ -586,7 +586,9 @@ fn live_model_to_info(m: LiveModel) -> ModelInfo {
             .supported_parameters
             .iter()
             .any(|p| p == "tools" || p == "tool_choice"),
-        kind: ModelKind::Unknown,
+        // OpenRouter's embedding coverage is excluded from this connector in
+        // v1, so every model it surfaces is generative.
+        kind: ModelKind::Generative,
     };
     let mut info = ModelInfo::new(m.id);
     if let Some(name) = m.name {

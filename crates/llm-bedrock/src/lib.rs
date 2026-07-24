@@ -852,7 +852,16 @@ fn infer_capabilities_from_id(
         reasoning,
         vision,
         tools: tools && !is_embedding,
-        kind: ModelKind::Unknown,
+        // `is_embedding` is computed from the provider's real output-modality
+        // metadata for foundation models (see `summary_to_model_info`); the
+        // inference-profile path passes `false` because profiles only ever
+        // cover chat models. Either way the kind follows the modality, not the
+        // id (#647).
+        kind: if is_embedding {
+            ModelKind::Embedding
+        } else {
+            ModelKind::Generative
+        },
     }
 }
 
