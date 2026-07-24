@@ -902,6 +902,16 @@ pub trait KnowledgeService: Send + Sync {
         &self,
         id: String,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
+    /// How many soft-deleted ("trashed") entries the calling user has. Retired
+    /// entries are hidden from every other read path, so a panel needs this to
+    /// show what is in the trash.
+    fn trash_count(&self) -> impl std::future::Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Permanently delete every soft-deleted entry belonging to the calling
+    /// user, ignoring the retention window; returns how many were freed.
+    /// Emptying an already-empty trash returns `0`, not an error.
+    fn empty_trash(&self) -> impl std::future::Future<Output = Result<usize, CoreError>> + Send;
 }
 
 /// On-demand knowledge-maintenance passes, triggered from the knowledge panels

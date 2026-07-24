@@ -50,6 +50,10 @@ pub struct DaemonKnowledgeMaintenanceService {
     embed_client: Arc<dyn EmbeddingClient>,
     embedding_model: String,
     archive_after_days: u32,
+    /// Retention applied to the opportunistic trash reap inside a consolidation
+    /// cycle, so a manual or timed consolidation uses the same window the
+    /// periodic sweep does.
+    soft_delete_retention_days: u32,
     on_change: KnowledgeChangeFn,
     // Per-op mutual exclusion. A manual trigger that collides with an already
     // running pass of the same op (timer- or manually-driven) is rejected rather
@@ -71,6 +75,7 @@ impl DaemonKnowledgeMaintenanceService {
         embed_client: Arc<dyn EmbeddingClient>,
         embedding_model: String,
         archive_after_days: u32,
+        soft_delete_retention_days: u32,
         on_change: KnowledgeChangeFn,
     ) -> Self {
         Self {
@@ -82,6 +87,7 @@ impl DaemonKnowledgeMaintenanceService {
             embed_client,
             embedding_model,
             archive_after_days,
+            soft_delete_retention_days,
             on_change,
             extraction_lock: Mutex::new(()),
             consolidation_lock: Mutex::new(()),
@@ -178,9 +184,14 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
             self.consolidation_reasoning,
             cancellation.clone(),
         );
-        let stats =
-            run_consolidation_scan(&self.pool, &llm_fn, &cancellation, Some(&self.on_change))
-                .await?;
+        let stats = run_consolidation_scan(
+            &self.pool,
+            &llm_fn,
+            self.soft_delete_retention_days,
+            &cancellation,
+            Some(&self.on_change),
+        )
+        .await?;
         // Collapse the per-op-kind stats into a single "changes" count for the
         // task log; the live panel refresh is driven by `on_change` per user.
         Ok(stats.updated + stats.merged_clusters + stats.soft_deleted + stats.scope_added)

@@ -61,6 +61,17 @@ pub trait KnowledgeBaseStore: Send + Sync {
         &self,
         id: &str,
     ) -> impl Future<Output = Result<Option<KnowledgeEntry>, CoreError>> + Send;
+
+    /// How many soft-deleted ("trashed") entries the current user has.
+    ///
+    /// Retired entries are hidden from every other read path, so this is the
+    /// only way to see what is waiting to be reaped.
+    fn trash_count(&self) -> impl Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Permanently delete every soft-deleted entry belonging to the current
+    /// user, ignoring the retention window, and return how many rows were
+    /// freed. An already-empty trash is a successful `0`, not an error.
+    fn empty_trash(&self) -> impl Future<Output = Result<usize, CoreError>> + Send;
 }
 
 /// Boxed async closure for writing knowledge entries through non-generic
@@ -204,6 +215,14 @@ mod tests {
 
         async fn get(&self, _id: &str) -> Result<Option<KnowledgeEntry>, CoreError> {
             Ok(None)
+        }
+
+        async fn trash_count(&self) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+
+        async fn empty_trash(&self) -> Result<usize, CoreError> {
+            Ok(0)
         }
     }
 

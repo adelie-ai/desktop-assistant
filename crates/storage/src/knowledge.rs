@@ -224,6 +224,18 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
 
         Ok(row.map(|r| r.into_entry()))
     }
+
+    // Both delegate to `dreaming::trash`, which owns the whole soft-delete
+    // lifecycle — the retention reap, the periodic sweep, and these two
+    // on-demand controls — so the user-facing action and the automatic one can
+    // never drift apart on what "trash" means.
+    async fn trash_count(&self) -> Result<usize, CoreError> {
+        crate::dreaming::trash_count(&self.pool).await
+    }
+
+    async fn empty_trash(&self) -> Result<usize, CoreError> {
+        crate::dreaming::empty_trash(&self.pool).await
+    }
 }
 
 /// Inherent helpers used by the builtin KB tools (wired as closures in the

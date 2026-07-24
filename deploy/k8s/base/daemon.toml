@@ -26,6 +26,10 @@ dreaming_interval_secs = 3600
 archive_after_days = 7
 embedding_backfill_interval_secs = 300
 consolidation_interval_secs = 86400
+# Soft-deleted knowledge entries are reaped on their own cadence, independent
+# of dreaming — otherwise an instance with dreaming off keeps every tombstone.
+knowledge_trash_retention_days = 30
+knowledge_trash_sweep_interval_secs = 3600
 
 [purposes.interactive]
 connection = "default"

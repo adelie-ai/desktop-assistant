@@ -31,7 +31,8 @@
 mod support;
 
 use desktop_assistant_storage::dreaming::{
-    BackfillEmbedFn, DreamingLlmFn, run_consolidation_scan, run_dreaming_scan, update_watermark,
+    BackfillEmbedFn, DreamingLlmFn, SOFT_DELETE_TTL_DAYS, run_consolidation_scan,
+    run_dreaming_scan, update_watermark,
 };
 use desktop_assistant_storage::{UserId, with_user_id};
 use sqlx::PgPool;
@@ -225,9 +226,15 @@ async fn apply_ops_soft_deletes_members_and_updates_canonical() {
     let llm = llm_returning(
         r#"{"operations":[{"op":"merge","ids":["kb-aaa","kb-bbb"],"content":"UNIFIED","scope":null}]}"#,
     );
-    let stats = run_consolidation_scan(pool, &llm, &CancellationToken::new(), None)
-        .await
-        .expect("consolidation scan succeeds");
+    let stats = run_consolidation_scan(
+        pool,
+        &llm,
+        SOFT_DELETE_TTL_DAYS,
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("consolidation scan succeeds");
 
     assert_eq!(stats.merged_clusters, 1, "one merge cluster applied");
     assert_eq!(stats.soft_deleted, 1, "one cluster member soft-deleted");
@@ -279,9 +286,15 @@ async fn apply_ops_never_touches_other_users_kb() {
     let llm = llm_returning(
         r#"{"operations":[{"op":"merge","ids":["u1-a","u1-b"],"content":"MERGED","scope":null}]}"#,
     );
-    run_consolidation_scan(pool, &llm, &CancellationToken::new(), None)
-        .await
-        .expect("consolidation scan succeeds");
+    run_consolidation_scan(
+        pool,
+        &llm,
+        SOFT_DELETE_TTL_DAYS,
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("consolidation scan succeeds");
 
     // Sanity: user1's merge landed.
     assert!(
@@ -323,9 +336,15 @@ async fn consolidation_respects_max_delete_fraction() {
     let llm = llm_returning(
         r#"{"operations":[{"op":"delete","ids":["kb-1","kb-2","kb-3","kb-4"],"reason":"trivial"}]}"#,
     );
-    let stats = run_consolidation_scan(pool, &llm, &CancellationToken::new(), None)
-        .await
-        .expect("consolidation scan succeeds");
+    let stats = run_consolidation_scan(
+        pool,
+        &llm,
+        SOFT_DELETE_TTL_DAYS,
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("consolidation scan succeeds");
 
     // Central assertion: the delete plan is clamped to the cap. Removing the
     // `delete_ops.truncate(cap)` line lets all 4 through.
@@ -353,9 +372,15 @@ async fn consolidate_user_is_tenant_isolated() {
     // (valid) entry, so it is ignored — each `consolidate_user` pass runs inside
     // its own `with_user_id` scope and only sees/touches its own partition.
     let llm = llm_returning(r#"{"operations":[{"op":"delete","ids":["u1-x"],"reason":"x"}]}"#);
-    run_consolidation_scan(pool, &llm, &CancellationToken::new(), None)
-        .await
-        .expect("consolidation scan succeeds");
+    run_consolidation_scan(
+        pool,
+        &llm,
+        SOFT_DELETE_TTL_DAYS,
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("consolidation scan succeeds");
 
     // Central assertion: user1's own pass loaded its entry (via the user-scoped
     // load) and applied the delete. Scoping the load to a wrong user makes this
@@ -393,9 +418,15 @@ async fn review_generation_saturates_at_max() {
         .expect("set review_generation to the cap");
 
     let llm = llm_returning(r#"{"operations":[{"op":"edit","id":"kb-x","content":"REWRITTEN"}]}"#);
-    run_consolidation_scan(pool, &llm, &CancellationToken::new(), None)
-        .await
-        .expect("consolidation scan succeeds");
+    run_consolidation_scan(
+        pool,
+        &llm,
+        SOFT_DELETE_TTL_DAYS,
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("consolidation scan succeeds");
 
     assert_eq!(
         kb_content(pool, "kb-x").await.as_deref(),

@@ -1901,6 +1901,79 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Spawn the knowledge-trash sweep. Consolidation retires an entry by
+    // stamping `deleted_at`; the row then sits invisible to every read path
+    // until its retention window elapses. That reap used to happen ONLY inside
+    // a consolidation transaction, so an instance with dreaming disabled
+    // accumulated tombstones forever. This loop owns the reap instead: no LLM,
+    // no embeddings, gated only on its own interval — a pool is all it needs.
+    let backend_tasks_cfg = daemon_config
+        .as_ref()
+        .map(|c| c.backend_tasks.clone())
+        .unwrap_or_default();
+    let trash_sweep_interval_secs = backend_tasks_cfg.knowledge_trash_sweep_interval_secs;
+    let trash_retention_days = backend_tasks_cfg.knowledge_trash_retention_days;
+    let (trash_sweep_shutdown_tx, trash_sweep_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let trash_sweep_task = match (&pg_pool, backend_tasks_cfg.trash_sweep_enabled()) {
+        (Some(pool), true) => {
+            let pool = pool.clone();
+            tracing::info!(
+                "knowledge-trash sweep enabled: retention {trash_retention_days}d, every {trash_sweep_interval_secs}s"
+            );
+            Some(tokio::spawn(async move {
+                let mut shutdown_rx = trash_sweep_shutdown_rx;
+                // Let startup settle before the first sweep.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = &mut shutdown_rx => {
+                        tracing::info!("knowledge-trash sweep cancelled before first pass");
+                        return;
+                    }
+                }
+
+                loop {
+                    match desktop_assistant_storage::dreaming::sweep_expired_trash(
+                        &pool,
+                        trash_retention_days,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(
+                                "knowledge-trash sweep reaped {n} expired entr{}",
+                                if n == 1 { "y" } else { "ies" }
+                            )
+                        }
+                        Ok(_) => tracing::debug!("knowledge-trash sweep: nothing expired"),
+                        Err(e) => tracing::warn!("knowledge-trash sweep failed: {e}"),
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(trash_sweep_interval_secs)) => {}
+                        _ = &mut shutdown_rx => {
+                            tracing::info!("knowledge-trash sweep: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+            }))
+        }
+        (None, true) => {
+            tracing::debug!("knowledge-trash sweep skipped: no database configured");
+            drop(trash_sweep_shutdown_rx);
+            None
+        }
+        (_, false) => {
+            tracing::info!(
+                "knowledge-trash sweep disabled (knowledge_trash_sweep_interval_secs = 0); \
+                 soft-deleted entries are only reaped by a consolidation cycle or an explicit \
+                 empty-trash"
+            );
+            drop(trash_sweep_shutdown_rx);
+            None
+        }
+    };
+
     // Spawn background dreaming (periodic fact extraction) task
     let dreaming_enabled = daemon_config
         .as_ref()
@@ -1993,6 +2066,7 @@ async fn main() -> Result<()> {
                     Arc::clone(emb_client),
                     embedding_model_id.clone(),
                     archive_after_days,
+                    trash_retention_days,
                     on_change,
                 ),
             ))
@@ -2771,6 +2845,13 @@ async fn main() -> Result<()> {
         && let Err(e) = task.await
     {
         tracing::warn!("backfill task join error during shutdown: {e}");
+    }
+
+    let _ = trash_sweep_shutdown_tx.send(());
+    if let Some(task) = trash_sweep_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("knowledge-trash sweep join error during shutdown: {e}");
     }
 
     let _ = dreaming_shutdown_tx.send(());

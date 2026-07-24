@@ -25,7 +25,7 @@ use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
     ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_FRACTION,
-    MAX_HOLISTIC_PROMPT_CHARS, SOFT_DELETE_TTL_DAYS,
+    MAX_HOLISTIC_PROMPT_CHARS,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 
@@ -44,6 +44,7 @@ struct KbEntry {
 pub async fn run_consolidation_phase(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
+    soft_delete_retention_days: u32,
     cancellation: &CancellationToken,
     on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<ConsolidationStats, CoreError> {
@@ -68,7 +69,7 @@ pub async fn run_consolidation_phase(
             break;
         }
         let result = with_user_id(UserId::new(user_id_str.clone()), async {
-            consolidate_user(pool, llm_fn, cancellation).await
+            consolidate_user(pool, llm_fn, soft_delete_retention_days, cancellation).await
         })
         .await;
 
@@ -114,6 +115,7 @@ pub async fn run_consolidation_phase(
 async fn consolidate_user(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
+    soft_delete_retention_days: u32,
     cancellation: &CancellationToken,
 ) -> Result<ConsolidationStats, CoreError> {
     let entries = load_active_entries(pool).await?;
@@ -296,7 +298,7 @@ async fn consolidate_user(
         delete_ops.len(),
     );
 
-    apply_ops(pool, &buffer, &synthesized, SOFT_DELETE_TTL_DAYS).await
+    apply_ops(pool, &buffer, &synthesized, soft_delete_retention_days).await
 }
 
 /// Distinct users that have at least one non-deleted KB entry. Audit-allowlisted
