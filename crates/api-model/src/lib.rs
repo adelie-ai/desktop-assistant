@@ -1484,6 +1484,23 @@ pub struct ModelInfoView {
     pub capabilities: ModelCapabilitiesView,
 }
 
+/// What kind of model this is, on the wire. Mirrors
+/// `desktop_assistant_core::ports::llm::ModelKind` (#647); `api-model` does not
+/// depend on `core`, so the daemon's mapper translates between them.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKindView {
+    /// A chat/completion model.
+    Generative,
+    /// A vector-embedding model.
+    Embedding,
+    /// Not positively classified. The catch-all so an old payload (written
+    /// before `kind` existed) and an unrecognized custom model both land here
+    /// instead of failing to deserialize.
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCapabilitiesView {
     #[serde(default)]
@@ -1492,8 +1509,16 @@ pub struct ModelCapabilitiesView {
     pub vision: bool,
     #[serde(default)]
     pub tools: bool,
+    /// Whether this is an embedding model. Retained for clients that read it
+    /// today; it is derived on the daemon from [`Self::kind`], the source of
+    /// truth, and never set independently.
     #[serde(default)]
     pub embedding: bool,
+    /// The normalized model-kind axis (#647). Additive: `#[serde(default)]` so
+    /// payloads written before this field existed deserialize to
+    /// [`ModelKindView::Unknown`].
+    #[serde(default)]
+    pub kind: ModelKindView,
 }
 
 // --- Purpose views (#10 + #11) --------------------------------------------

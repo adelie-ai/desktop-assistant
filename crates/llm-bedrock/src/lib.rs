@@ -16,8 +16,8 @@ use aws_smithy_types::{Document, Number};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelListingNotice,
-    ModelListingReport, ReasoningConfig, TokenUsage, current_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
+    ModelListingNotice, ModelListingReport, ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT};
 use std::collections::HashSet;
@@ -852,7 +852,7 @@ fn infer_capabilities_from_id(
         reasoning,
         vision,
         tools: tools && !is_embedding,
-        embedding: is_embedding,
+        kind: ModelKind::Unknown,
     }
 }
 
@@ -2489,7 +2489,7 @@ mod tests {
         assert!(info.capabilities.tools);
         assert!(info.capabilities.vision);
         assert!(info.capabilities.reasoning);
-        assert!(!info.capabilities.embedding);
+        assert_eq!(info.capabilities.kind, ModelKind::Generative);
     }
 
     #[test]
@@ -2501,9 +2501,49 @@ mod tests {
             vec![ModelModality::Text],
         );
         let info = summary_to_model_info(&model).expect("keep embedding model");
-        assert!(info.capabilities.embedding);
+        assert_eq!(info.capabilities.kind, ModelKind::Embedding);
         assert!(!info.capabilities.tools);
         assert!(!info.capabilities.reasoning);
+    }
+
+    #[test]
+    fn bedrock_derives_kind_from_output_modalities() {
+        // The classification must come from the provider's real modality
+        // metadata, not from a substring of the id (#647). Prove it with an
+        // id that carries no "embed" token but whose OUTPUT modality is
+        // EMBEDDING: modality wins and the model is classified `Embedding`.
+        let embed = make_summary(
+            "amazon.titan-text-v2:0",
+            FoundationModelLifecycleStatus::Active,
+            ModelModality::Embedding,
+            vec![ModelModality::Text],
+        );
+        let embed_info = summary_to_model_info(&embed).expect("kept");
+        assert_eq!(
+            embed_info.capabilities.kind,
+            ModelKind::Embedding,
+            "an EMBEDDING output modality classifies the model as an embedding model"
+        );
+
+        // A TEXT output modality is a generative model.
+        let text = make_summary(
+            "anthropic.claude-sonnet-4-6",
+            FoundationModelLifecycleStatus::Active,
+            ModelModality::Text,
+            vec![ModelModality::Text],
+        );
+        let text_info = summary_to_model_info(&text).expect("kept");
+        assert_eq!(text_info.capabilities.kind, ModelKind::Generative);
+
+        // Inference profiles cover chat models only; they merge from a known
+        // foundation family and are always generative.
+        let profile = make_profile(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "Claude Haiku 4.5 (US)",
+            InferenceProfileStatus::Active,
+        );
+        let profile_info = inference_profile_to_model_info(&profile).expect("kept");
+        assert_eq!(profile_info.capabilities.kind, ModelKind::Generative);
     }
 
     #[test]
@@ -2723,7 +2763,7 @@ mod tests {
         assert!(info.capabilities.tools);
         assert!(info.capabilities.reasoning);
         assert!(info.capabilities.vision);
-        assert!(!info.capabilities.embedding);
+        assert_eq!(info.capabilities.kind, ModelKind::Generative);
     }
 
     #[test]
@@ -2738,7 +2778,7 @@ mod tests {
         assert!(info.capabilities.tools, "Nova supports tool use");
         assert!(info.capabilities.vision, "Nova Premier is multimodal");
         assert!(!info.capabilities.reasoning);
-        assert!(!info.capabilities.embedding);
+        assert_eq!(info.capabilities.kind, ModelKind::Generative);
     }
 
     #[test]

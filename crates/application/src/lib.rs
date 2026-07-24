@@ -1204,7 +1204,10 @@ fn core_model_listing_to_api(
                 reasoning: l.model.capabilities.reasoning,
                 vision: l.model.capabilities.vision,
                 tools: l.model.capabilities.tools,
-                embedding: l.model.capabilities.embedding,
+                // `embedding` is derived from `kind` (the single source of
+                // truth) and kept on the wire for clients that read it today.
+                embedding: l.model.capabilities.is_embedding(),
+                kind: core_model_kind_to_api(l.model.capabilities.kind),
             },
         },
     }
@@ -1212,6 +1215,18 @@ fn core_model_listing_to_api(
 
 /// Map a connector's model-listing notice onto its wire mirror so a partial
 /// listing stays visible to clients instead of dying at the daemon boundary.
+/// Map the core model-kind axis onto its wire mirror (#647). `api-model`
+/// deliberately does not depend on `core`, so the wire carries its own
+/// [`api::ModelKindView`] and this is the one translation point.
+fn core_model_kind_to_api(k: desktop_assistant_core::ports::llm::ModelKind) -> api::ModelKindView {
+    use desktop_assistant_core::ports::llm::ModelKind;
+    match k {
+        ModelKind::Generative => api::ModelKindView::Generative,
+        ModelKind::Embedding => api::ModelKindView::Embedding,
+        ModelKind::Unknown => api::ModelKindView::Unknown,
+    }
+}
+
 fn core_model_listing_notice_to_api(
     n: desktop_assistant_core::ports::llm::ModelListingNotice,
 ) -> api::ModelListingNoticeView {

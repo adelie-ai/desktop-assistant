@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use desktop_assistant_core::ports::llm::{ModelCapabilities, ModelInfo};
+use desktop_assistant_core::ports::llm::{ModelCapabilities, ModelInfo, ModelKind};
 use serde::Deserialize;
 
 const DEFAULTS_TOML: &str = include_str!("../data/model_defaults.toml");
@@ -67,7 +67,14 @@ impl From<DefaultEntry> for ModelInfo {
             reasoning: entry.capabilities.reasoning,
             vision: entry.capabilities.vision,
             tools: entry.capabilities.tools,
-            embedding: entry.capabilities.embedding,
+            // The curated defaults are hand-authored and always known: an
+            // `embedding = true` entry is an embedding model, everything else
+            // is generative. There is no `Unknown` in this table.
+            kind: if entry.capabilities.embedding {
+                ModelKind::Embedding
+            } else {
+                ModelKind::Generative
+            },
         })
     }
 }
@@ -125,7 +132,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|m| m.id == "mxbai-embed-large:335m" && m.capabilities.embedding),
+                .any(|m| m.id == "mxbai-embed-large:335m" && m.capabilities.is_embedding()),
             "embedding default missing or mis-tagged"
         );
     }
@@ -169,8 +176,88 @@ mod tests {
         assert!(
             defaults_for("azure")
                 .iter()
-                .any(|m| m.id == "text-embedding-3-small" && m.capabilities.embedding),
+                .any(|m| m.id == "text-embedding-3-small" && m.capabilities.is_embedding()),
             "azure embedding default missing or mis-tagged"
         );
+    }
+
+    #[tokio::test]
+    async fn every_connector_reports_a_model_kind() {
+        use crate::connections::Connector;
+        use desktop_assistant_core::ports::llm::{LlmClient, ModelKind};
+
+        // Exhaustive over every connector: the `match` has no wildcard, so a new
+        // `Connector` variant cannot compile until it is handled here, forcing
+        // the author to decide how it classifies models (#647).
+        //
+        // The catalog is fetched the cheapest offline way per connector: the
+        // two curated-only HTTP connectors list from their in-memory table;
+        // the rest fall back to their bundled defaults. Bedrock classifies from
+        // live AWS output-modality metadata, which cannot be reached offline --
+        // that path is proven by `bedrock_derives_kind_from_output_modalities`
+        // in `llm-bedrock`, so its arm has no offline catalog to assert.
+        for connector in [
+            Connector::Ollama,
+            Connector::Anthropic,
+            Connector::Bedrock,
+            Connector::OpenAi,
+            Connector::OpenRouter,
+            Connector::Azure,
+            Connector::Google,
+        ] {
+            let catalog: Vec<ModelInfo> = match connector {
+                Connector::OpenAi => desktop_assistant_llm_openai::OpenAiClient::new("k".into())
+                    .list_models()
+                    .await
+                    .unwrap_or_default(),
+                Connector::Anthropic => {
+                    desktop_assistant_llm_anthropic::AnthropicClient::new("k".into())
+                        .list_models()
+                        .await
+                        .unwrap_or_default()
+                }
+                Connector::Ollama => defaults_for("ollama"),
+                Connector::OpenRouter => defaults_for("openrouter"),
+                Connector::Azure => defaults_for("azure"),
+                Connector::Google => defaults_for("google"),
+                Connector::Bedrock => Vec::new(),
+            };
+
+            // No connector may surface a model it left `Unknown`.
+            for m in &catalog {
+                assert_ne!(
+                    m.capabilities.kind,
+                    ModelKind::Unknown,
+                    "{connector:?} left {} classified Unknown",
+                    m.id
+                );
+                // Where the id follows the near-universal embed convention, the
+                // classified kind must agree.
+                if m.id.to_ascii_lowercase().contains("embed") {
+                    assert_eq!(
+                        m.capabilities.kind,
+                        ModelKind::Embedding,
+                        "{connector:?} model {} looks like an embedding model but wasn't classified one",
+                        m.id
+                    );
+                }
+            }
+
+            // The connectors with an offline catalog must actually classify
+            // something -- a generative model at minimum -- so the arm proves
+            // real classification rather than passing vacuously.
+            if !matches!(connector, Connector::Bedrock) {
+                assert!(
+                    !catalog.is_empty(),
+                    "{connector:?} should expose a classifiable catalog offline"
+                );
+                assert!(
+                    catalog
+                        .iter()
+                        .any(|m| m.capabilities.kind == ModelKind::Generative),
+                    "{connector:?} should classify at least one generative model"
+                );
+            }
+        }
     }
 }

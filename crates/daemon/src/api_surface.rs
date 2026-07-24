@@ -2771,6 +2771,235 @@ mod tests {
             .expect("a fully-specified binding is always valid");
     }
 
+    // --- SetPurpose must reject a model whose kind contradicts the purpose ---
+    // (#647). These use an injected client with a fixed model catalog so the
+    // resolved kind is deterministic and no network is touched.
+
+    use desktop_assistant_core::ports::llm::{
+        LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
+    };
+
+    /// A minimal `LlmClient` whose only real behaviour is a fixed model list,
+    /// so `set_purpose` enforcement can resolve a known [`ModelKind`]. `fail`
+    /// makes `list_models` error, exercising the connection-down degradation.
+    struct FakeModelList {
+        models: Vec<ModelInfo>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for FakeModelList {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<desktop_assistant_core::domain::Message>,
+            _tools: &[desktop_assistant_core::domain::ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse::text(""))
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+            if self.fail {
+                Err(CoreError::Llm("connection down".into()))
+            } else {
+                Ok(self.models.clone())
+            }
+        }
+    }
+
+    fn model_of(id: &str, kind: ModelKind) -> ModelInfo {
+        ModelInfo::new(id).with_capabilities(ModelCapabilities {
+            kind,
+            ..Default::default()
+        })
+    }
+
+    /// Build a handle whose `conn` connection is a [`FakeModelList`] returning
+    /// `models`, with interactive already bound (so a non-interactive write is
+    /// the only thing that can fail validation).
+    fn handle_with_model_catalog(
+        conn: &str,
+        models: Vec<ModelInfo>,
+        fail: bool,
+    ) -> Arc<RegistryHandle> {
+        let mut cfg = config_with_connections(&[(conn, ollama_local())]);
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new(conn).unwrap()),
+                model: ModelRef::Named("interactive-model".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        let id = ConnectionId::new(conn).unwrap();
+        let client: Arc<dyn LlmClient> = Arc::new(FakeModelList { models, fail });
+        let registry =
+            ConnectionRegistry::from_test_clients(vec![(id, "ollama".to_string(), client)]);
+        Arc::new(RegistryHandle::new(cfg, registry).with_config_path(tmp_config_path()))
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejects_generative_model_for_embedding_purpose() {
+        // The production failure: a text-generation model bound to embedding.
+        let handle = handle_with_model_catalog(
+            "local",
+            vec![model_of("zai.glm-5", ModelKind::Generative)],
+            false,
+        );
+        let svc = DaemonConnectionsService::new(handle);
+        let err = svc
+            .set_purpose(PurposeKind::Embedding, payload("local", "zai.glm-5"))
+            .await
+            .expect_err("a generative model cannot serve the embedding purpose");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("zai.glm-5") && msg.contains("embedding"),
+            "rejection must name the model and the purpose; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejects_embedding_model_for_generative_purpose() {
+        // The mirror case: an embedding model bound to a generative purpose.
+        let handle = handle_with_model_catalog(
+            "local",
+            vec![model_of("nomic-embed-text", ModelKind::Embedding)],
+            false,
+        );
+        let svc = DaemonConnectionsService::new(handle);
+        let err = svc
+            .set_purpose(PurposeKind::Dreaming, payload("local", "nomic-embed-text"))
+            .await
+            .expect_err("an embedding model cannot serve a generative purpose");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nomic-embed-text") && msg.contains("dreaming"),
+            "rejection must name the model and the purpose; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_purpose_rejection_names_the_model_and_purpose() {
+        // The error must be actionable without reading the source: model id,
+        // purpose, and the expected-vs-found kinds.
+        let handle = handle_with_model_catalog(
+            "local",
+            vec![model_of("zai.glm-5", ModelKind::Generative)],
+            false,
+        );
+        let svc = DaemonConnectionsService::new(handle);
+        let err = svc
+            .set_purpose(PurposeKind::Embedding, payload("local", "zai.glm-5"))
+            .await
+            .expect_err("contradiction must be refused");
+        let msg = format!("{err}").to_ascii_lowercase();
+        assert!(msg.contains("zai.glm-5"), "names the model; got {msg}");
+        assert!(msg.contains("embedding"), "names the purpose; got {msg}");
+        assert!(
+            msg.contains("generative"),
+            "names the kind that was found; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_purpose_allows_unknown_kind_with_a_warning() {
+        // An `Unknown` kind degrades to allow-with-a-warning; it must never
+        // block a config edit.
+        let handle = handle_with_model_catalog(
+            "local",
+            vec![model_of("mystery-model", ModelKind::Unknown)],
+            false,
+        );
+        let svc = DaemonConnectionsService::new(handle);
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "mystery-model"))
+            .await
+            .expect("an unknown kind must not block the write");
+    }
+
+    #[tokio::test]
+    async fn set_purpose_allows_model_missing_from_the_catalog() {
+        // A custom id the connector never listed cannot be classified, so the
+        // write is allowed with a warning rather than blocked.
+        let handle = handle_with_model_catalog(
+            "local",
+            vec![model_of("some-other-model", ModelKind::Generative)],
+            false,
+        );
+        let svc = DaemonConnectionsService::new(handle);
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "not-in-the-list"))
+            .await
+            .expect("a model the connector didn't list must not block the write");
+    }
+
+    #[tokio::test]
+    async fn set_purpose_allows_when_listing_fails() {
+        // A connection that is down (list_models errors) must not turn a config
+        // edit into a failure — a transient network fault is not a rules
+        // violation.
+        let handle = handle_with_model_catalog("local", vec![], true);
+        let svc = DaemonConnectionsService::new(handle);
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "anything"))
+            .await
+            .expect("a listing failure must degrade to allow-with-a-warning");
+    }
+
+    #[tokio::test]
+    async fn set_purpose_accepts_a_kind_matching_binding() {
+        // The positive path: an embedding model for the embedding purpose is
+        // accepted, proving enforcement doesn't reject valid bindings.
+        let handle = handle_with_model_catalog(
+            "local",
+            vec![model_of("nomic-embed-text", ModelKind::Embedding)],
+            false,
+        );
+        let svc = DaemonConnectionsService::new(handle);
+        svc.set_purpose(PurposeKind::Embedding, payload("local", "nomic-embed-text"))
+            .await
+            .expect("an embedding model is valid for the embedding purpose");
+    }
+
+    #[test]
+    fn existing_contradictory_config_loads_with_a_warning() {
+        // Enforcement lives on the write path only. An already-stored
+        // contradictory binding (embedding purpose -> a generative model, the
+        // exact prod shape) must still BOOT: `load_daemon_config` does not check
+        // kinds, so it returns Ok rather than crashing the daemon on startup.
+        let mut cfg = config_with_connections(&[("local", ollama_local())]);
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        // The contradiction: a generative chat model bound to embedding.
+        cfg.purposes.set(
+            PurposeKind::Embedding,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(ConnectionId::new("local").unwrap()),
+                model: ModelRef::Named("llama3".into()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+
+        let path = tmp_config_path();
+        crate::config::save_daemon_config(&path, &cfg).expect("seed contradictory config on disk");
+        let loaded = crate::config::load_daemon_config(&path)
+            .expect("a stored contradictory binding must still load, not crash the daemon")
+            .expect("config is present");
+        let embedding = loaded
+            .purposes
+            .get(PurposeKind::Embedding)
+            .expect("the contradictory embedding binding is preserved as-is");
+        assert_eq!(embedding.model, ModelRef::Named("llama3".into()));
+        std::fs::remove_file(&path).ok();
+    }
+
     #[tokio::test]
     async fn get_purposes_returns_current_config() {
         let mut cfg = config_with_connections(&[("local", ollama_local())]);

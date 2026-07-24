@@ -87,6 +87,40 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Test-only: build a registry from explicit `(id, connector_type, client)`
+    /// tuples, each marked healthy. Lets unit tests inject a controlled
+    /// `Arc<dyn LlmClient>` (e.g. one whose `list_models` returns a fixed
+    /// catalog) without standing up a real connector or hitting the network.
+    /// The first entry becomes the active connection, matching
+    /// [`build_registry`]'s declaration-order rule.
+    #[cfg(test)]
+    pub(crate) fn from_test_clients(
+        entries: Vec<(ConnectionId, String, Arc<dyn LlmClient>)>,
+    ) -> Self {
+        let mut clients: IndexMap<ConnectionId, Arc<dyn LlmClient>> = IndexMap::new();
+        let mut status: IndexMap<ConnectionId, ConnectionStatus> = IndexMap::new();
+        let mut active = None;
+        for (id, connector_type, client) in entries {
+            if active.is_none() {
+                active = Some(id.clone());
+            }
+            clients.insert(id.clone(), client);
+            status.insert(
+                id.clone(),
+                ConnectionStatus {
+                    id,
+                    connector_type,
+                    health: ConnectionHealth::Ok,
+                },
+            );
+        }
+        Self {
+            clients,
+            status,
+            active,
+        }
+    }
+
     /// Look up a live client by connection id. Returns `None` for unknown ids
     /// and for ids whose client failed to build.
     ///

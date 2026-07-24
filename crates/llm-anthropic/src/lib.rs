@@ -5,8 +5,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolCall;
 use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage, current_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
+    ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
@@ -725,7 +725,7 @@ fn curated_anthropic_models() -> Vec<ModelInfo> {
         reasoning: false,
         vision: true,
         tools: true,
-        embedding: false,
+        kind: ModelKind::Unknown,
     };
     let claude_reasoning_caps = ModelCapabilities {
         reasoning: true,
@@ -1512,7 +1512,7 @@ mod tests {
             );
             assert!(model.capabilities.tools);
             assert!(model.capabilities.vision);
-            assert!(!model.capabilities.embedding);
+            assert_eq!(model.capabilities.kind, ModelKind::Generative);
             assert!(!model.display_name.is_empty());
         }
 

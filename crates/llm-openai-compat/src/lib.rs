@@ -46,6 +46,7 @@
 
 mod errors;
 mod messages;
+mod models;
 mod nonstreaming;
 mod streaming;
 mod tools;
@@ -59,6 +60,7 @@ pub use messages::{
     CacheControl, ChatContent, ChatContentPart, ChatFunctionCall, ChatMessage, ChatToolCall,
     mark_system_cache_breakpoint, sanitize_tool_arguments, to_chat_messages,
 };
+pub use models::classify_model_kind;
 pub use nonstreaming::{
     ChatCompletion, ChatCompletionChoice, ChatResponseFunction, ChatResponseMessage,
     ChatResponseToolCall, StreamingDispatchError, dispatch_non_streaming, parse_chat_completion,
