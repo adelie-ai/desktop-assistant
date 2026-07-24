@@ -295,12 +295,11 @@ impl RegistryHandle {
             }
         };
 
-        // 2. Build the candidate registry off the lock. `build_registry` is
-        //    infallible (bad connections become `Unavailable` rows rather than
-        //    aborting), but we refuse a config that yields *zero* usable
-        //    connections when the running one had at least one — that would
-        //    silently break every new turn. The running registry stays put.
-        let new_registry = build_registry(&new_config);
+        // 2. Decide whether there is anything to do BEFORE building anything.
+        //    Every daemon-authored write trips the on-disk watcher, so this
+        //    path runs constantly with nothing to apply; building a registry
+        //    first meant constructing a live client per connection and
+        //    discarding them on each of those passes.
         {
             let state = self.state.read();
             let plan = crate::config::plan_reload(&state.config, &new_config);
@@ -308,6 +307,16 @@ impl RegistryHandle {
                 tracing::info!("config reload: no effective changes; nothing to apply");
                 return Ok(plan);
             }
+        }
+
+        // 3. Build the candidate registry off the lock. `build_registry` is
+        //    infallible (bad connections become `Unavailable` rows rather than
+        //    aborting), but we refuse a config that yields *zero* usable
+        //    connections when the running one had at least one — that would
+        //    silently break every new turn. The running registry stays put.
+        let new_registry = build_registry(&new_config);
+        {
+            let state = self.state.read();
             if state.registry.live_count() > 0 && new_registry.live_count() == 0 {
                 tracing::error!(
                     "config reload refused: the new config has no usable LLM connection \
@@ -317,7 +326,7 @@ impl RegistryHandle {
             }
         }
 
-        // 3. Re-diff and swap under the write lock. Re-reading `state.config`
+        // 4. Re-diff and swap under the write lock. Re-reading `state.config`
         //    here (rather than trusting the read-lock snapshot above) keeps the
         //    plan consistent if a concurrent `mutate_config` slipped in.
         let mut state = self.state.write();
@@ -2588,6 +2597,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("interactive"));
+    }
+
+    // --- reload must not build a registry it throws away -------------------
+
+    #[test]
+    fn no_op_reload_does_not_build_a_registry() {
+        let cfg = config_with_connections(&[("local", ollama_local())]);
+        let path = tmp_config_path();
+        crate::config::save_daemon_config(&path, &cfg).expect("seed config on disk");
+        // Run from the config as it round-trips through TOML, so "unchanged on
+        // disk" really is unchanged — serialization materializes defaults that
+        // the in-memory value does not carry.
+        let loaded = crate::config::load_daemon_config(&path)
+            .expect("load succeeds")
+            .expect("config is present");
+        let handle = make_handle_at(loaded, path.clone());
+
+        // Reloading a config identical to the running one is the common case:
+        // every daemon-authored write trips the on-disk watcher, which then
+        // finds nothing to do. It must not cost a full set of LLM clients.
+        crate::registry::reset_build_registry_calls();
+        let plan = handle.apply_reload().expect("reload succeeds");
+
+        assert!(plan.is_empty(), "precondition: nothing changed");
+        assert_eq!(
+            crate::registry::build_registry_calls(),
+            0,
+            "a reload with no effective changes must not construct clients"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn effective_reload_still_rebuilds_and_swaps() {
+        let running = config_with_connections(&[("local", ollama_local())]);
+        let path = tmp_config_path();
+        let handle = make_handle_at(running, path.clone());
+
+        // A real [connections] change must still hot-apply.
+        let changed =
+            config_with_connections(&[("local", ollama_local()), ("aws", bedrock_work())]);
+        crate::config::save_daemon_config(&path, &changed).expect("write changed config");
+
+        crate::registry::reset_build_registry_calls();
+        let plan = handle.apply_reload().expect("reload succeeds");
+
+        assert!(plan.rebuild_registry, "a connections edit hot-applies");
+        assert_eq!(
+            crate::registry::build_registry_calls(),
+            1,
+            "exactly one build for a real change — not zero, and not two"
+        );
+        assert!(
+            handle.snapshot_config().connections.contains_key("aws"),
+            "the new connection should be live"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     // --- SetPurpose must reject a mixed inherit pair -----------------------

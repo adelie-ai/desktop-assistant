@@ -540,6 +540,33 @@ fn build_one(
     )
 }
 
+// Test-only, per-thread counter of `build_registry` calls.
+//
+// Building a registry constructs a live client per connection, so doing it
+// speculatively is real work — but "computed the plan first" and "built it
+// then threw it away" are otherwise indistinguishable from the outside, so
+// the reload path's laziness is pinned with this counter.
+//
+// Why thread-local rather than a global: libtest runs each test on its own
+// thread, and a process-wide counter is bumped by every other test that
+// builds a registry concurrently, which makes the assertion flap.
+#[cfg(test)]
+thread_local! {
+    static BUILD_REGISTRY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset this thread's [`build_registry`] call count.
+#[cfg(test)]
+pub(crate) fn reset_build_registry_calls() {
+    BUILD_REGISTRY_CALLS.with(|c| c.set(0));
+}
+
+/// How many times this thread has called [`build_registry`] since the last reset.
+#[cfg(test)]
+pub(crate) fn build_registry_calls() -> usize {
+    BUILD_REGISTRY_CALLS.with(|c| c.get())
+}
+
 /// Build a [`ConnectionRegistry`] from a loaded [`DaemonConfig`].
 ///
 /// Each connection is built independently. A failure on one connection is
@@ -548,6 +575,9 @@ fn build_one(
 /// registry is built from the top-level `[llm]` block under a synthetic id
 /// `default` so existing installs keep working until migration completes.
 pub fn build_registry(config: &DaemonConfig) -> ConnectionRegistry {
+    #[cfg(test)]
+    BUILD_REGISTRY_CALLS.with(|c| c.set(c.get() + 1));
+
     let mut clients: IndexMap<ConnectionId, Arc<dyn LlmClient>> = IndexMap::new();
     let mut status: IndexMap<ConnectionId, ConnectionStatus> = IndexMap::new();
 
