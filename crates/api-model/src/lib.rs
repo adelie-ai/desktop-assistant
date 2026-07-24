@@ -1437,6 +1437,41 @@ pub struct ModelListing {
     pub connection_id: String,
     pub connection_label: String,
     pub model: ModelInfoView,
+    /// Non-fatal problems the connection reported while enumerating models
+    /// (e.g. Bedrock inference profiles being unavailable), which leaves a
+    /// picker that looks healthy but holds only on-demand models (#648).
+    /// The value is the same on every row belonging to one connection.
+    ///
+    /// Added after `ModelListing` shipped: `#[serde(default)]` keeps older
+    /// daemon payloads parseable, and skipping the empty case keeps the
+    /// happy-path wire format byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<ModelListingNoticeView>,
+}
+
+/// Machine-readable classification of a [`ModelListingNoticeView`]. Mirrors
+/// `desktop_assistant_core::ports::llm::ModelListingNoticeKind`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelListingNoticeKindView {
+    /// The catalog is a subset of what the connection can actually reach:
+    /// part of the enumeration failed. The listing is still usable.
+    PartialCatalog,
+}
+
+/// A non-fatal problem reported while enumerating a connection's models.
+/// Mirrors `desktop_assistant_core::ports::llm::ModelListingNotice`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelListingNoticeView {
+    pub kind: ModelListingNoticeKindView,
+    /// One-line, user-facing summary of what is missing.
+    pub summary: String,
+    /// User-facing cause and remedy; actionable without the summary.
+    pub detail: String,
+    /// Provider permission to grant, when the cause was an authorization
+    /// denial. `None` for any other cause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_permission: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2128,6 +2163,50 @@ mod tests {
         let json = serde_json::to_string(&cmd2).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd2, back);
+    }
+
+    /// The listing notice (#648) is additive: a payload from a daemon that
+    /// predates it still deserializes, and a notice-free listing does not
+    /// grow the wire format.
+    #[test]
+    fn model_listing_notices_are_backward_compatible() {
+        let legacy = r#"{
+            "connection_id": "bedrock",
+            "connection_label": "bedrock (bedrock)",
+            "model": {"id": "amazon.titan-embed-text-v2:0", "display_name": "Titan"}
+        }"#;
+        let parsed: ModelListing = serde_json::from_str(legacy).expect("legacy payload parses");
+        assert!(parsed.notices.is_empty());
+
+        let re_encoded = serde_json::to_string(&parsed).expect("re-encode");
+        assert!(
+            !re_encoded.contains("notices"),
+            "an empty notice list must not appear on the wire: {re_encoded}"
+        );
+    }
+
+    #[test]
+    fn model_listing_notice_roundtrips() {
+        let listing = ModelListing {
+            connection_id: "bedrock".into(),
+            connection_label: "bedrock (bedrock)".into(),
+            model: ModelInfoView {
+                id: "amazon.titan-embed-text-v2:0".into(),
+                display_name: "Titan".into(),
+                context_limit: None,
+                capabilities: ModelCapabilitiesView::default(),
+            },
+            notices: vec![ModelListingNoticeView {
+                kind: ModelListingNoticeKindView::PartialCatalog,
+                summary: "Inference profiles unavailable".into(),
+                detail: "Grant bedrock:ListInferenceProfiles".into(),
+                required_permission: Some("bedrock:ListInferenceProfiles".into()),
+            }],
+        };
+        let json = serde_json::to_string(&listing).expect("encode");
+        assert!(json.contains(r#""kind":"partial_catalog""#), "{json}");
+        let back: ModelListing = serde_json::from_str(&json).expect("decode");
+        assert_eq!(listing, back);
     }
 
     #[test]

@@ -16,8 +16,8 @@ use aws_smithy_types::{Document, Number};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role, ToolCall, ToolDefinition};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ReasoningConfig,
-    TokenUsage, current_model_override,
+    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelListingNotice,
+    ModelListingReport, ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT};
 use std::collections::HashSet;
@@ -45,9 +45,27 @@ impl ModelClock for SystemClock {
     }
 }
 
+/// Upper bound on the characters of provider text relayed in a listing
+/// notice's `detail`.
+///
+/// Why: the detail is rendered by clients and travels the daemon's wire
+/// protocol, so a broken or hostile upstream message must not be relayed
+/// whole. Generous enough for a real AWS `AccessDeniedException`, which
+/// names the principal, the action, and the resource.
+const MAX_NOTICE_DETAIL_CHARS: usize = 600;
+
+/// The IAM action that `ListInferenceProfiles` requires. Named in the
+/// degradation notice so an operator can fix the policy without digging
+/// through daemon logs.
+const LIST_INFERENCE_PROFILES_PERMISSION: &str = "bedrock:ListInferenceProfiles";
+
 #[derive(Default)]
 struct ModelCache {
-    entry: Option<(Instant, Vec<ModelInfo>)>,
+    /// Why the whole report and not just the models: a cache hit that
+    /// dropped the notices would make a degraded listing look healthy again
+    /// for the rest of the TTL: the exact invisibility this reporting
+    /// exists to remove.
+    entry: Option<(Instant, ModelListingReport)>,
 }
 
 /// Amazon Bedrock client using the Converse API.
@@ -79,6 +97,11 @@ pub struct BedrockClient {
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
+    /// Test-only override for the Bedrock control-plane endpoint, so the
+    /// model-listing tests can drive `ListFoundationModels` /
+    /// `ListInferenceProfiles` against a local mock. Always `None` in
+    /// production, where the endpoint is derived from the region.
+    control_endpoint_override: Option<String>,
 }
 
 impl BedrockClient {
@@ -108,6 +131,7 @@ impl BedrockClient {
             connect_timeout: STREAM_CONNECT_TIMEOUT,
             event_timeout: STREAM_EVENT_TIMEOUT,
             context_cap: None,
+            control_endpoint_override: None,
         }
     }
 
@@ -157,14 +181,28 @@ impl BedrockClient {
     pub async fn __set_models_cache_for_test(&self, models: Vec<ModelInfo>) {
         let now = self.clock.now();
         let mut cache = self.model_cache.lock().await;
-        cache.entry = Some((now, models));
+        cache.entry = Some((now, ModelListingReport::complete(models)));
     }
 
     /// Test-only: peek at the cache contents.
     #[doc(hidden)]
     pub async fn __peek_models_cache_for_test(&self) -> Option<Vec<ModelInfo>> {
         let cache = self.model_cache.lock().await;
-        cache.entry.as_ref().map(|(_, v)| v.clone())
+        cache.entry.as_ref().map(|(_, v)| v.models.clone())
+    }
+
+    /// Test-only: point the Bedrock control plane (`ListFoundationModels` /
+    /// `ListInferenceProfiles`) at `url` instead of the regional AWS
+    /// endpoint, so the model-listing behaviour can be exercised against a
+    /// local mock server rather than a live account.
+    ///
+    /// Only the control plane is redirected; the runtime (Converse) client is
+    /// untouched.
+    #[doc(hidden)]
+    pub fn __with_control_endpoint_for_test(mut self, url: impl Into<String>) -> Self {
+        self.control_endpoint_override = Some(url.into());
+        self.control_client = OnceCell::new();
+        self
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -240,7 +278,13 @@ impl BedrockClient {
         self.control_client
             .get_or_try_init(|| async {
                 let shared_config = self.load_shared_config().await;
-                Ok(BedrockControlClient::new(&shared_config))
+                let Some(endpoint) = self.control_endpoint_override.as_ref() else {
+                    return Ok(BedrockControlClient::new(&shared_config));
+                };
+                let config = aws_sdk_bedrock::config::Builder::from(&shared_config)
+                    .endpoint_url(endpoint)
+                    .build();
+                Ok(BedrockControlClient::from_conf(config))
             })
             .await
     }
@@ -996,6 +1040,68 @@ fn inference_profile_to_model_info(
     })
 }
 
+/// Build the degradation notice for a failed `ListInferenceProfiles` call.
+///
+/// `code` / `message` are the service error metadata (both optional: a
+/// transport or timeout failure carries neither). An authorization denial is
+/// reported with the permission to grant; anything else is reported as an
+/// upstream failure without blaming IAM, so the operator is not sent to edit
+/// a policy over a timeout.
+///
+/// The relayed provider text is truncated to [`MAX_NOTICE_DETAIL_CHARS`]:
+/// the notice is user-facing and crosses the daemon's wire protocol.
+fn inference_profiles_notice(code: Option<&str>, message: Option<&str>) -> ModelListingNotice {
+    // Bedrock answers a missing policy with `AccessDeniedException`; the
+    // bare `AccessDenied` shows up from other AWS front ends. Match the
+    // family on the structured error code, never on the message text.
+    let denied = code.is_some_and(|c| c.to_ascii_lowercase().starts_with("accessdenied"));
+    let cause = match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => "no error details were returned".to_string(),
+    };
+
+    let detail = if denied {
+        format!(
+            "AWS refused ListInferenceProfiles for this connection. Grant \
+             {LIST_INFERENCE_PROFILES_PERMISSION} to surface inference-profile models \
+             (Claude 4.x, Nova Premier, DeepSeek R1 and similar), which are not callable \
+             by their bare foundation-model id. AWS said - {}",
+            truncate_chars(&cause, MAX_NOTICE_DETAIL_CHARS / 2)
+        )
+    } else {
+        format!(
+            "ListInferenceProfiles failed, so inference-profile models (Claude 4.x, \
+             Nova Premier, DeepSeek R1 and similar) are missing from the list. Refresh \
+             to try again. AWS said - {}",
+            truncate_chars(&cause, MAX_NOTICE_DETAIL_CHARS / 2)
+        )
+    };
+
+    let notice = ModelListingNotice::partial_catalog(
+        "Bedrock inference profiles unavailable - showing on-demand models only",
+        truncate_chars(&detail, MAX_NOTICE_DETAIL_CHARS),
+    );
+    if denied {
+        notice.with_required_permission(LIST_INFERENCE_PROFILES_PERMISSION)
+    } else {
+        notice
+    }
+}
+
+/// Truncate `text` to at most `max` characters, marking elision with `...`.
+/// Character-based so multi-byte provider text can't be split mid-codepoint.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
 impl BedrockClient {
     /// Call `ListFoundationModels` + `ListInferenceProfiles` and merge into
     /// a single `ModelInfo` list:
@@ -1008,12 +1114,19 @@ impl BedrockClient {
     ///   (`us.anthropic.claude-haiku-4-5-…` etc.) so the model picker
     ///   exposes the IDs that AWS will actually accept on Converse.
     ///
-    /// Both calls go in parallel. `ListInferenceProfiles` failures are
-    /// logged and swallowed: many existing IAM policies grant
+    /// Both calls go in parallel. A `ListInferenceProfiles` failure degrades
+    /// the listing instead of failing it: many existing IAM policies grant
     /// `bedrock:ListFoundationModels` without
-    /// `bedrock:ListInferenceProfiles`, and we'd rather degrade to the
-    /// foundation-model-only list than fail the whole picker.
-    async fn fetch_models_uncached(&self) -> Result<Vec<ModelInfo>, CoreError> {
+    /// `bedrock:ListInferenceProfiles`, and a foundation-model-only picker
+    /// beats no picker at all.
+    ///
+    /// The degradation is reported in the returned
+    /// [`ModelListingReport::notices`] as well as logged. Why both: what
+    /// survives the filter in a current AWS account is mostly the embedding
+    /// families, so a caller that only sees the model list cannot tell a
+    /// degraded listing from an account with nothing but embedding models
+    /// (#648).
+    async fn fetch_models_uncached(&self) -> Result<ModelListingReport, CoreError> {
         let client = self.control_client().await?;
 
         let foundation_fut = client.list_foundation_models().send();
@@ -1029,6 +1142,7 @@ impl BedrockClient {
             .iter()
             .filter_map(summary_to_model_info)
             .collect();
+        let mut notices = Vec::new();
 
         match profiles_res {
             Ok(profile_resp) => {
@@ -1039,12 +1153,14 @@ impl BedrockClient {
                 }
             }
             Err(error) => {
+                use aws_smithy_types::error::metadata::ProvideErrorMetadata;
                 tracing::warn!(
                     "Bedrock ListInferenceProfiles failed; model picker will only show \
                      on-demand foundation models. Grant bedrock:ListInferenceProfiles to \
                      surface inference-profile ids (Claude 4.x, Nova Premier, etc.). \
                      Cause: {error:#}"
                 );
+                notices.push(inference_profiles_notice(error.code(), error.message()));
             }
         }
 
@@ -1053,12 +1169,12 @@ impl BedrockClient {
         // in practice, but keep the merge total just in case.
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
-        Ok(models)
+        Ok(ModelListingReport { models, notices })
     }
 
-    /// Return cached models, refreshing if the TTL elapsed or the cache is
-    /// empty.
-    async fn list_models_cached(&self) -> Result<Vec<ModelInfo>, CoreError> {
+    /// Return the cached listing, refreshing if the TTL elapsed or the cache
+    /// is empty. Notices are cached with the models they describe.
+    async fn list_models_cached(&self) -> Result<ModelListingReport, CoreError> {
         {
             let cache = self.model_cache.lock().await;
             if let Some((fetched_at, entry)) = cache.entry.as_ref() {
@@ -1073,7 +1189,7 @@ impl BedrockClient {
 
     /// Force a refresh: bypass the cache, fetch from Bedrock, and populate
     /// the cache on success.
-    async fn refresh_models_internal(&self) -> Result<Vec<ModelInfo>, CoreError> {
+    async fn refresh_models_internal(&self) -> Result<ModelListingReport, CoreError> {
         let fresh = self.fetch_models_uncached().await?;
         let now = self.clock.now();
         let mut cache = self.model_cache.lock().await;
@@ -1102,10 +1218,18 @@ impl LlmClient for BedrockClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        self.list_models_cached().await
+        Ok(self.list_models_cached().await?.models)
     }
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+        Ok(self.refresh_models_internal().await?.models)
+    }
+
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.list_models_cached().await
+    }
+
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
         self.refresh_models_internal().await
     }
 
@@ -1745,6 +1869,8 @@ fn json_to_document(value: serde_json::Value) -> Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_core::ports::llm::ModelListingNoticeKind;
+
     use aws_sdk_bedrockruntime::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
         ConverseStreamOutput, ToolUseBlockDelta, ToolUseBlockStart,
@@ -2638,6 +2764,396 @@ mod tests {
         );
         let info = inference_profile_to_model_info(&profile).expect("kept");
         assert_eq!(info.display_name, "us.anthropic.claude-sonnet-4-6");
+    }
+
+    // --- Partial-failure reporting for the model listing (#648) ---
+    //
+    // `ListInferenceProfiles` failing must degrade the listing (on-demand
+    // foundation models only) AND say so in the returned data. In a current
+    // AWS account the surviving on-demand set is almost entirely embedding
+    // models, so a silent degradation looks to the operator like "Bedrock
+    // only has embedding models" rather than "a permission is missing".
+
+    /// `ListFoundationModels` payload shaped like a current account: an
+    /// on-demand embedding model plus one legacy on-demand chat model.
+    /// Modern chat models (Claude 4.x, Nova Premier, ...) are absent from the
+    /// on-demand set entirely - they are reachable only via inference
+    /// profiles, which is exactly why losing the profile call is so visible.
+    const FOUNDATION_MODELS_BODY: &str = r#"{
+      "modelSummaries": [
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0",
+          "modelId": "amazon.titan-embed-text-v2:0",
+          "modelName": "Titan Text Embeddings V2",
+          "providerName": "Amazon",
+          "inputModalities": ["TEXT"],
+          "outputModalities": ["EMBEDDING"],
+          "inferenceTypesSupported": ["ON_DEMAND"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
+          "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
+          "modelName": "Claude 3 Haiku",
+          "providerName": "Anthropic",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["ON_DEMAND"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        }
+      ]
+    }"#;
+
+    /// `ListInferenceProfiles` payload with a single active system profile.
+    const INFERENCE_PROFILES_BODY: &str = r#"{
+      "inferenceProfileSummaries": [
+        {
+          "inferenceProfileName": "US Anthropic Claude Sonnet 4.6",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.anthropic.claude-sonnet-4-6",
+          "inferenceProfileId": "us.anthropic.claude-sonnet-4-6",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        }
+      ]
+    }"#;
+
+    /// The IAM denial an account without `bedrock:ListInferenceProfiles`
+    /// actually gets back. `111122223333` is AWS's documentation account id.
+    const ACCESS_DENIED_BODY: &str = r#"{"message":"User: arn:aws:iam::111122223333:user/adele is not authorized to perform: bedrock:ListInferenceProfiles on resource: arn:aws:bedrock:us-east-1:111122223333:inference-profile/*"}"#;
+
+    /// Fake secret used by the control-plane test client. Asserted absent
+    /// from user-facing notices so a signing credential can never ride out
+    /// on a degradation message.
+    const TEST_SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMIxK7MDENGxbPxRfiCYEXAMPLEKEY";
+
+    /// A `BedrockClient` whose control-plane calls are pointed at `server`.
+    ///
+    /// Static credentials parsed from the api-key keep the AWS credential
+    /// chain (profile files, IMDS) out of the unit test; the region is taken
+    /// from `base_url`, so nothing here depends on the machine's AWS setup.
+    fn control_plane_client(server: &httpmock::MockServer) -> BedrockClient {
+        BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
+            .with_base_url("us-east-1")
+            .__with_control_endpoint_for_test(server.url(""))
+    }
+
+    /// Mock `ListFoundationModels` returning [`FOUNDATION_MODELS_BODY`].
+    fn mock_foundation_models(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/foundation-models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(FOUNDATION_MODELS_BODY);
+        })
+    }
+
+    /// Mock `ListInferenceProfiles` failing with `status` / `error_type`.
+    fn mock_inference_profiles_error<'a>(
+        server: &'a httpmock::MockServer,
+        status: u16,
+        error_type: &str,
+        body: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles");
+            then.status(status)
+                .header("content-type", "application/json")
+                .header("x-amzn-errortype", error_type)
+                .body(body);
+        })
+    }
+
+    /// Both control-plane calls succeed.
+    fn mock_healthy_control_plane(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(INFERENCE_PROFILES_BODY);
+        });
+        mock_foundation_models(server)
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_partial_failure_when_profiles_call_fails() {
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_error(&server, 403, "AccessDeniedException", ACCESS_DENIED_BODY);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("a profiles failure degrades the listing, it does not fail it");
+
+        let notice = report
+            .notices
+            .first()
+            .expect("the partial failure must leave the connector as data, not only a log line");
+        assert_eq!(notice.kind, ModelListingNoticeKind::PartialCatalog);
+        assert!(
+            notice.summary.to_lowercase().contains("inference profile"),
+            "the summary must name what is missing, got {:?}",
+            notice.summary
+        );
+        assert!(
+            report.is_degraded(),
+            "a report carrying a notice is a degraded report"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_still_returns_on_demand_models_when_profiles_fail() {
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_error(&server, 403, "AccessDeniedException", ACCESS_DENIED_BODY);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("degradation must not become a hard error");
+
+        let ids: Vec<&str> = report.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.contains(&"amazon.titan-embed-text-v2:0"),
+            "on-demand embedding models survive, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"anthropic.claude-3-haiku-20240307-v1:0"),
+            "on-demand chat models survive, got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_failure_names_the_missing_permission() {
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_error(&server, 403, "AccessDeniedException", ACCESS_DENIED_BODY);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("degraded listing");
+
+        let notice = report.notices.first().expect("notice present");
+        assert_eq!(
+            notice.required_permission.as_deref(),
+            Some("bedrock:ListInferenceProfiles"),
+            "an authorization failure must name the permission to grant"
+        );
+        assert!(
+            notice.detail.contains("bedrock:ListInferenceProfiles"),
+            "the human-readable detail must be actionable on its own, got {:?}",
+            notice.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_success_cleanly_when_both_calls_succeed() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        assert!(
+            report.notices.is_empty(),
+            "the happy path must not manufacture a warning, got {:?}",
+            report.notices
+        );
+        assert!(!report.is_degraded());
+        let ids: Vec<&str> = report.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.contains(&"us.anthropic.claude-sonnet-4-6"),
+            "inference profiles are merged into the listing, got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_refresh_reports_a_result_even_when_the_list_is_unchanged() {
+        let server = httpmock::MockServer::start();
+        let foundation = mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+
+        let first = client
+            .refresh_models_detailed()
+            .await
+            .expect("first refresh reports a result");
+        let second = client
+            .refresh_models_detailed()
+            .await
+            .expect("an unchanged refresh still reports a result");
+
+        assert_eq!(
+            first.models, second.models,
+            "same account contents means the same list"
+        );
+        assert!(
+            !second.models.is_empty(),
+            "a refresh that changes nothing must still report what it found, \
+             otherwise the client cannot tell it happened"
+        );
+        assert!(second.notices.is_empty());
+        foundation.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn cached_listing_repeats_the_partial_failure_notice() {
+        // A cache hit must not quietly drop the degradation: the picker would
+        // look healthy again for the whole TTL while still being incomplete.
+        let server = httpmock::MockServer::start();
+        let foundation = mock_foundation_models(&server);
+        mock_inference_profiles_error(&server, 403, "AccessDeniedException", ACCESS_DENIED_BODY);
+
+        let client = control_plane_client(&server).with_model_cache_ttl(Duration::from_secs(3600));
+        let first = client.list_models_detailed().await.expect("first listing");
+        let second = client
+            .list_models_detailed()
+            .await
+            .expect("second listing served from cache");
+
+        foundation.assert_calls(1);
+        assert!(!second.notices.is_empty(), "cache hit dropped the notice");
+        assert_eq!(first.notices, second.notices);
+    }
+
+    #[tokio::test]
+    async fn partial_failure_from_a_non_permission_error_does_not_blame_iam() {
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_error(
+            &server,
+            400,
+            "ValidationException",
+            r#"{"message":"1 validation error detected"}"#,
+        );
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("degraded listing");
+
+        let notice = report.notices.first().expect("notice present");
+        assert!(
+            notice.required_permission.is_none(),
+            "only an authorization failure implicates IAM, got {:?}",
+            notice.required_permission
+        );
+        assert!(
+            notice.detail.contains("ValidationException"),
+            "the real cause must survive into the detail, got {:?}",
+            notice.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_failure_notice_never_carries_the_signing_secret() {
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_error(&server, 403, "AccessDeniedException", ACCESS_DENIED_BODY);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("degraded listing");
+
+        let notice = report.notices.first().expect("notice present");
+        let rendered = format!(
+            "{} {} {:?}",
+            notice.summary, notice.detail, notice.required_permission
+        );
+        assert!(
+            !rendered.contains(TEST_SECRET_ACCESS_KEY),
+            "a user-facing notice must never carry the signing secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_failure_detail_is_bounded_for_an_oversized_service_message() {
+        // Defensive: the detail is rendered by clients and travels the wire,
+        // so an abusive/broken upstream message must not be relayed whole.
+        let huge = "x".repeat(10_000);
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_error(
+            &server,
+            403,
+            "AccessDeniedException",
+            &format!(r#"{{"message":"{huge}"}}"#),
+        );
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("degraded listing");
+
+        let notice = report.notices.first().expect("notice present");
+        assert!(
+            notice.detail.chars().count() <= MAX_NOTICE_DETAIL_CHARS,
+            "detail must be truncated, got {} chars",
+            notice.detail.chars().count()
+        );
+        assert!(
+            notice.detail.contains("bedrock:ListInferenceProfiles"),
+            "truncation must keep the actionable part, got {:?}",
+            notice.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_fails_hard_when_the_foundation_models_call_fails() {
+        // Losing BOTH listings leaves nothing to degrade to: that is a real
+        // failure and must surface as one rather than as an empty picker.
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/foundation-models");
+            then.status(403)
+                .header("content-type", "application/json")
+                .header("x-amzn-errortype", "AccessDeniedException")
+                .body(r#"{"message":"not authorized to perform: bedrock:ListFoundationModels"}"#);
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(INFERENCE_PROFILES_BODY);
+        });
+
+        let err = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect_err("a foundation-models failure is not a degradation");
+        match err {
+            CoreError::Llm(msg) => assert!(
+                msg.contains("ListFoundationModels"),
+                "error must name the failing call, got {msg:?}"
+            ),
+            other => panic!("expected CoreError::Llm, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_list_models_still_returns_just_the_models() {
+        // The narrow `list_models` contract is unchanged for callers that
+        // don't care about notices.
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+
+        let models = control_plane_client(&server)
+            .list_models()
+            .await
+            .expect("healthy listing");
+        let detailed_ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
+        assert!(detailed_ids.contains(&"us.anthropic.claude-sonnet-4-6".to_string()));
     }
 
     #[test]

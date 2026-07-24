@@ -37,8 +37,9 @@ use desktop_assistant_core::error_classify::{
     derive_input_ceiling, extract_overflow_fields,
 };
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig, current_context_budget,
-    current_model_override, is_classification_in_progress, with_classification_in_progress,
+    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
+    current_context_budget, current_model_override, is_classification_in_progress,
+    with_classification_in_progress,
 };
 use desktop_assistant_core::ports::store::{ErrorClassificationStore, LearnedWindowStore};
 use desktop_assistant_core::sanitize::redact_secrets;
@@ -525,6 +526,14 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         self.inner.refresh_models().await
+    }
+
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.inner.list_models_detailed().await
+    }
+
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.inner.refresh_models_detailed().await
     }
 
     async fn warmup(&self) {

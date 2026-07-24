@@ -1191,6 +1191,11 @@ fn core_model_listing_to_api(
     api::ModelListing {
         connection_id: l.connection_id,
         connection_label: l.connection_label,
+        notices: l
+            .notices
+            .into_iter()
+            .map(core_model_listing_notice_to_api)
+            .collect(),
         model: api::ModelInfoView {
             id: l.model.id,
             display_name: l.model.display_name,
@@ -1202,6 +1207,24 @@ fn core_model_listing_to_api(
                 embedding: l.model.capabilities.embedding,
             },
         },
+    }
+}
+
+/// Map a connector's model-listing notice onto its wire mirror so a partial
+/// listing stays visible to clients instead of dying at the daemon boundary.
+fn core_model_listing_notice_to_api(
+    n: desktop_assistant_core::ports::llm::ModelListingNotice,
+) -> api::ModelListingNoticeView {
+    use desktop_assistant_core::ports::llm::ModelListingNoticeKind;
+    api::ModelListingNoticeView {
+        kind: match n.kind {
+            ModelListingNoticeKind::PartialCatalog => {
+                api::ModelListingNoticeKindView::PartialCatalog
+            }
+        },
+        summary: n.summary,
+        detail: n.detail,
+        required_permission: n.required_permission,
     }
 }
 
@@ -5615,6 +5638,37 @@ mod tests {
     }
 
     // ---- RequestContext tests (issue #105) -----------------------------
+
+    /// A connector's model-listing notice has to survive the domain -> wire
+    /// mapping, otherwise the degradation is carried all the way to the
+    /// daemon boundary and dropped one step before the client sees it (#648).
+    #[test]
+    fn model_listing_notices_survive_the_wire_mapping() {
+        use desktop_assistant_core::ports::llm::{ModelInfo, ModelListingNotice};
+
+        let listing = CoreModelListing {
+            connection_id: "bedrock".into(),
+            connection_label: "bedrock (bedrock)".into(),
+            model: ModelInfo::new("amazon.titan-embed-text-v2:0"),
+            notices: vec![
+                ModelListingNotice::partial_catalog(
+                    "Inference profiles unavailable",
+                    "Grant bedrock:ListInferenceProfiles",
+                )
+                .with_required_permission("bedrock:ListInferenceProfiles"),
+            ],
+        };
+
+        let wire = core_model_listing_to_api(listing);
+        let notice = wire.notices.first().expect("notice mapped to the wire");
+        assert_eq!(notice.kind, api::ModelListingNoticeKindView::PartialCatalog);
+        assert_eq!(notice.summary, "Inference profiles unavailable");
+        assert_eq!(notice.detail, "Grant bedrock:ListInferenceProfiles");
+        assert_eq!(
+            notice.required_permission.as_deref(),
+            Some("bedrock:ListInferenceProfiles")
+        );
+    }
 
     #[test]
     fn request_context_default_resolves_to_sentinel_user() {

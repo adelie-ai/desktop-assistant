@@ -652,6 +652,93 @@ impl ModelInfo {
     }
 }
 
+/// Why a model listing came back incomplete.
+///
+/// Why an enum for a single case: the value is machine-readable and travels
+/// to clients, which branch on it to decide how to render the notice. A
+/// free-form string would make that branch a substring match, and adding the
+/// discriminator later would be a wire change rather than a new variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelListingNoticeKind {
+    /// Part of the catalog could not be enumerated, so the returned models
+    /// are a subset of what the account can actually reach. The listing is
+    /// still usable: this is a degradation, not a failure.
+    PartialCatalog,
+}
+
+/// A non-fatal problem a connector hit while enumerating models.
+///
+/// Why this exists: a connector that degrades silently is indistinguishable
+/// from one that has nothing to offer. Bedrock is the motivating case: when
+/// `ListInferenceProfiles` is denied, what survives is the on-demand
+/// foundation models, which in a current AWS account is mostly the embedding
+/// families. Carrying the reason as data lets a client say "inference
+/// profiles unavailable, showing on-demand models only" instead of leaving
+/// the operator to read daemon logs (#648).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelListingNotice {
+    /// Machine-readable classification of the problem.
+    pub kind: ModelListingNoticeKind,
+    /// One-line, user-facing summary of what is missing.
+    pub summary: String,
+    /// User-facing cause and remedy. Must be actionable on its own, since a
+    /// client may render it without the summary.
+    pub detail: String,
+    /// The provider permission that most likely needs granting, when the
+    /// failure was an authorization denial. `None` for other causes, so a
+    /// client never blames IAM for a timeout or a malformed request.
+    pub required_permission: Option<String>,
+}
+
+impl ModelListingNotice {
+    /// Build a [`ModelListingNoticeKind::PartialCatalog`] notice.
+    pub fn partial_catalog(summary: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            kind: ModelListingNoticeKind::PartialCatalog,
+            summary: summary.into(),
+            detail: detail.into(),
+            required_permission: None,
+        }
+    }
+
+    /// Name the provider permission whose absence explains this notice.
+    pub fn with_required_permission(mut self, permission: impl Into<String>) -> Self {
+        self.required_permission = Some(permission.into());
+        self
+    }
+}
+
+/// The result of enumerating a connector's models: the models themselves,
+/// plus any non-fatal problems hit while collecting them.
+///
+/// Why a report instead of a bare `Vec<ModelInfo>`: connectors assemble the
+/// list from several provider calls, and losing one of them changes what the
+/// list *means* without changing its type. The extra channel keeps partial
+/// failures visible to callers while preserving the degradation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelListingReport {
+    /// Models the caller can select, in the connector's stable order.
+    pub models: Vec<ModelInfo>,
+    /// Non-fatal problems encountered while listing. Empty on a clean run:
+    /// connectors must not manufacture a notice for the happy path.
+    pub notices: Vec<ModelListingNotice>,
+}
+
+impl ModelListingReport {
+    /// A report for a listing that completed with nothing to report.
+    pub fn complete(models: Vec<ModelInfo>) -> Self {
+        Self {
+            models,
+            notices: Vec::new(),
+        }
+    }
+
+    /// Whether the listing is known to be incomplete.
+    pub fn is_degraded(&self) -> bool {
+        !self.notices.is_empty()
+    }
+}
+
 /// Response from the LLM, which may contain text, tool calls, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmResponse {
@@ -790,6 +877,30 @@ pub trait LlmClient: Send + Sync {
         self.list_models().await
     }
 
+    /// Enumerate models *and* report any non-fatal problems hit on the way.
+    ///
+    /// Why a second method rather than changing [`list_models`]: only
+    /// connectors that assemble the catalog from several provider calls can
+    /// degrade, and every other caller and connector keeps the simpler
+    /// contract. The default wraps [`list_models`] in a clean report, so a
+    /// connector that cannot degrade never has to think about notices.
+    ///
+    /// [`list_models`]: LlmClient::list_models
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        Ok(ModelListingReport::complete(self.list_models().await?))
+    }
+
+    /// Cache-bypassing counterpart of [`list_models_detailed`].
+    ///
+    /// A refresh always reports an outcome, even when the list is byte-for-byte
+    /// what it was before: a reload that returns nothing is indistinguishable
+    /// from one that failed.
+    ///
+    /// [`list_models_detailed`]: LlmClient::list_models_detailed
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        Ok(ModelListingReport::complete(self.refresh_models().await?))
+    }
+
     /// Optional one-shot warmup hook called once after registry construction.
     /// Default no-op; Ollama uses it to populate the GGUF context-length
     /// cache so [`max_context_tokens`] returns a real value on first use.
@@ -858,6 +969,14 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         (**self).refresh_models().await
+    }
+
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        (**self).list_models_detailed().await
+    }
+
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        (**self).refresh_models_detailed().await
     }
 
     async fn warmup(&self) {
@@ -1066,6 +1185,14 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         self.inner.refresh_models().await
+    }
+
+    async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.inner.list_models_detailed().await
+    }
+
+    async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+        self.inner.refresh_models_detailed().await
     }
 
     async fn stream_completion(
@@ -1577,6 +1704,96 @@ mod tests {
         let llm = NoopLlm;
         assert!(llm.list_models().await.unwrap().is_empty());
         assert!(llm.refresh_models().await.unwrap().is_empty());
+    }
+
+    /// A connector that only knows how to list models still answers the
+    /// detailed API, reporting "nothing went wrong" rather than nothing at
+    /// all — otherwise every non-Bedrock connector would look degraded (#648).
+    #[tokio::test]
+    async fn detailed_listing_defaults_to_the_plain_model_list() {
+        struct PlainLlm;
+        #[async_trait::async_trait]
+        impl LlmClient for PlainLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(""))
+            }
+
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
+                Ok(vec![ModelInfo::new("only-model")])
+            }
+        }
+
+        let llm = PlainLlm;
+        let listed = llm.list_models_detailed().await.expect("detailed listing");
+        assert_eq!(listed.models, vec![ModelInfo::new("only-model")]);
+        assert!(listed.notices.is_empty());
+        assert!(!listed.is_degraded());
+
+        let refreshed = llm
+            .refresh_models_detailed()
+            .await
+            .expect("detailed refresh");
+        assert_eq!(refreshed.models, listed.models);
+        assert!(refreshed.notices.is_empty());
+    }
+
+    /// The wrappers every client is built through (`Arc`, retry) must not
+    /// swallow notices on the way out — that would re-hide the degradation
+    /// the connector went to the trouble of reporting (#648).
+    #[tokio::test]
+    async fn wrappers_forward_listing_notices() {
+        struct DegradedLlm;
+        #[async_trait::async_trait]
+        impl LlmClient for DegradedLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Ok(LlmResponse::text(""))
+            }
+
+            async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+                Ok(ModelListingReport {
+                    models: vec![ModelInfo::new("m")],
+                    notices: vec![ModelListingNotice::partial_catalog("partial", "detail")],
+                })
+            }
+
+            async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
+                self.list_models_detailed().await
+            }
+        }
+
+        let arced: Arc<dyn LlmClient> = Arc::new(DegradedLlm);
+        assert_eq!(
+            arced
+                .list_models_detailed()
+                .await
+                .expect("arc forwards")
+                .notices
+                .len(),
+            1
+        );
+
+        let retrying = RetryingLlmClient::new(arced, 0);
+        assert_eq!(
+            retrying
+                .refresh_models_detailed()
+                .await
+                .expect("retry wrapper forwards")
+                .notices
+                .len(),
+            1
+        );
     }
 
     #[test]
