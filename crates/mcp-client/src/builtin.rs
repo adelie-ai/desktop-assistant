@@ -2224,6 +2224,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pin_marks_the_note_and_shows_up_in_search() {
+        let (service, store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"key": "deploy-target", "content": "k3s at 192.168.1.2"}),
+                )
+                .await
+                .unwrap();
+            let out = parse(
+                &service
+                    .execute_tool(
+                        TOOL_SCRATCHPAD_PIN,
+                        serde_json::json!({"keys": ["deploy-target"]}),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(out["ok"], true);
+            assert_eq!(out["changed"], 1);
+            assert_eq!(out["pinned"], true, "`pinned` defaults to true");
+            assert!(store.lock().unwrap()[0].pinned);
+
+            // The model must be able to see what it has already pinned.
+            let found = parse(
+                &service
+                    .execute_tool(
+                        TOOL_SCRATCHPAD_SEARCH,
+                        serde_json::json!({"max_results": 10}),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(found["results"][0]["pinned"], true);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unpin_clears_the_flag() {
+        let (service, store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"key": "k", "content": "v"}),
+                )
+                .await
+                .unwrap();
+            service
+                .execute_tool(TOOL_SCRATCHPAD_PIN, serde_json::json!({"keys": ["k"]}))
+                .await
+                .unwrap();
+            let out = parse(
+                &service
+                    .execute_tool(
+                        TOOL_SCRATCHPAD_PIN,
+                        serde_json::json!({"keys": ["k"], "pinned": false}),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(out["changed"], 1);
+            assert!(!store.lock().unwrap()[0].pinned);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_pinned_note_keeps_the_pin() {
+        // The footgun this design exists to avoid: `write` is an upsert, so if
+        // it carried `pinned` an ordinary content update would silently unpin.
+        let (service, store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"key": "k", "content": "first"}),
+                )
+                .await
+                .unwrap();
+            service
+                .execute_tool(TOOL_SCRATCHPAD_PIN, serde_json::json!({"keys": ["k"]}))
+                .await
+                .unwrap();
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"key": "k", "content": "updated"}),
+                )
+                .await
+                .unwrap();
+            let guard = store.lock().unwrap();
+            assert_eq!(guard[0].content, "updated");
+            assert!(guard[0].pinned, "updating a note must not clear its pin");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pin_respects_max_pinned_notes_at_the_tool_boundary() {
+        let (service, store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            for i in 0..=MAX_PINNED_NOTES {
+                service
+                    .execute_tool(
+                        TOOL_SCRATCHPAD_WRITE,
+                        serde_json::json!({"key": format!("k{i}"), "content": "v"}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            for i in 0..MAX_PINNED_NOTES {
+                service
+                    .execute_tool(
+                        TOOL_SCRATCHPAD_PIN,
+                        serde_json::json!({"keys": [format!("k{i}")]}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let over = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_PIN,
+                    serde_json::json!({"keys": [format!("k{MAX_PINNED_NOTES}")]}),
+                )
+                .await;
+            assert!(
+                matches!(&over, Err(CoreError::ToolExecution(m)) if m.contains("at most 5")),
+                "pinning past the cap must be refused, got {over:?}"
+            );
+            // ...and must change nothing.
+            let guard = store.lock().unwrap();
+            assert_eq!(guard.iter().filter(|n| n.pinned).count(), MAX_PINNED_NOTES);
+            assert!(
+                !guard
+                    .iter()
+                    .any(|n| n.key == format!("k{MAX_PINNED_NOTES}") && n.pinned)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pinning_an_unknown_key_is_reported_not_an_error() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            let out = parse(
+                &service
+                    .execute_tool(TOOL_SCRATCHPAD_PIN, serde_json::json!({"keys": ["nope"]}))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(out["ok"], true);
+            assert_eq!(out["changed"], 0);
+            assert_eq!(out["unknown_keys"][0], "nope");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pin_requires_keys() {
+        let (service, _store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            let out = service
+                .execute_tool(TOOL_SCRATCHPAD_PIN, serde_json::json!({}))
+                .await;
+            assert!(
+                matches!(&out, Err(CoreError::ToolExecution(m)) if m.contains("requires `keys")),
+                "got {out:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_pinned_note_takes_the_pin_with_it() {
+        let (service, store) = scratchpad_service();
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"key": "k", "content": "v"}),
+                )
+                .await
+                .unwrap();
+            service
+                .execute_tool(TOOL_SCRATCHPAD_PIN, serde_json::json!({"keys": ["k"]}))
+                .await
+                .unwrap();
+            service
+                .execute_tool(TOOL_SCRATCHPAD_DELETE, serde_json::json!({"keys": ["k"]}))
+                .await
+                .unwrap();
+            assert!(
+                store.lock().unwrap().is_empty(),
+                "the note is gone, so nothing can still be pinned"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pin_tool_is_only_advertised_when_wired() {
+        // Capability gating: an embedder that predates #597 must not see a tool
+        // the service cannot service.
+        let (wired, _store) = scratchpad_service();
+        assert!(
+            wired
+                .tool_definitions()
+                .iter()
+                .any(|d| d.name == TOOL_SCRATCHPAD_PIN),
+            "pin must be advertised once its write is wired"
+        );
+        assert!(
+            !BuiltinToolService::new()
+                .tool_definitions()
+                .iter()
+                .any(|d| d.name == TOOL_SCRATCHPAD_PIN),
+            "pin must not be advertised without a wired write"
+        );
+    }
+
+    #[tokio::test]
     async fn scratchpad_write_search_delete_roundtrip() {
         let (service, _store) = scratchpad_service();
         with_conversation_id(ConversationId::from("c1"), async {

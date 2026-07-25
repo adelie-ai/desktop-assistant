@@ -710,7 +710,20 @@ pub(crate) fn complete_step_tool() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::scratchpad::PINNED_BLOCK_BYTE_BUDGET;
     use crate::domain::{Message, Role, ToolCall};
+
+    /// A pinned `note`-typed note, for the `[Pinned]` block tests (#597).
+    fn raw_pinned<'a>(key: &'a str, content: &'a str) -> RawNote<'a> {
+        RawNote {
+            key,
+            owner_todo: "",
+            content,
+            note_type: OUTCOME_NOTE_TYPE,
+            done: false,
+            pinned: true,
+        }
+    }
 
     #[test]
     fn stack_auto_numbers_roots_and_nested_children() {
@@ -1173,6 +1186,110 @@ mod tests {
     }
 
     // --- Scratchpad index (#340) ---
+
+    // --- #597 [Pinned] block -------------------------------------------------
+
+    #[test]
+    fn render_pinned_is_none_when_nothing_is_pinned() {
+        let notes = vec![raw_owned(
+            "",
+            "deploy-target",
+            "k3s at 192.168.1.2",
+            "note",
+            false,
+        )];
+        assert!(render_pinned(&notes, PINNED_BLOCK_BYTE_BUDGET).is_none());
+        assert!(render_pinned(&[], PINNED_BLOCK_BYTE_BUDGET).is_none());
+    }
+
+    #[test]
+    fn render_pinned_carries_full_content_not_just_keys() {
+        // The whole point of a pin: the content is there, so no search round.
+        let notes = vec![
+            raw_pinned("deploy-target", "k3s at 192.168.1.2, NOT docker-compose"),
+            raw_owned("", "other", "unpinned filler", "note", false),
+        ];
+        let out = render_pinned(&notes, PINNED_BLOCK_BYTE_BUDGET).expect("something is pinned");
+        assert!(out.contains("deploy-target"), "{out}");
+        assert!(
+            out.contains("k3s at 192.168.1.2, NOT docker-compose"),
+            "the note's full content must be present, not just its key: {out}"
+        );
+        assert!(
+            !out.contains("unpinned filler"),
+            "unpinned notes must not be carried: {out}"
+        );
+    }
+
+    #[test]
+    fn render_pinned_orders_by_key_for_a_stable_prompt_prefix() {
+        // Re-emitted every turn, so a reshuffle would defeat prompt caching.
+        let forward = vec![raw_pinned("alpha", "a"), raw_pinned("zeta", "z")];
+        let reversed = vec![raw_pinned("zeta", "z"), raw_pinned("alpha", "a")];
+        assert_eq!(
+            render_pinned(&forward, PINNED_BLOCK_BYTE_BUDGET),
+            render_pinned(&reversed, PINNED_BLOCK_BYTE_BUDGET),
+            "input order must not change the rendered block"
+        );
+    }
+
+    #[test]
+    fn render_pinned_truncates_at_the_byte_budget_with_an_explicit_marker() {
+        let huge = "x".repeat(PINNED_BLOCK_BYTE_BUDGET * 2);
+        let notes = vec![raw_pinned("big", &huge)];
+        let out = render_pinned(&notes, 256).expect("pinned note renders");
+        assert!(
+            out.contains("(truncated)"),
+            "over-long content must be marked, never silently cut: {out}"
+        );
+        assert!(
+            out.len() < huge.len(),
+            "the block must actually shrink to the budget"
+        );
+    }
+
+    #[test]
+    fn render_pinned_reports_notes_that_did_not_fit() {
+        // A dropped pin is the one failure this feature must not have silently.
+        let body = "y".repeat(200);
+        let notes = vec![
+            raw_pinned("a", &body),
+            raw_pinned("b", &body),
+            raw_pinned("c", &body),
+        ];
+        let out = render_pinned(&notes, 260).expect("at least one fits");
+        assert!(
+            out.contains("did not fit"),
+            "notes beyond the budget must be reported: {out}"
+        );
+    }
+
+    #[test]
+    fn scratchpad_index_excludes_pinned_keys() {
+        // A pinned note's content is already in `[Pinned]`; listing its key in
+        // the index too would spend tokens pointing at something already read.
+        let notes = vec![
+            raw_pinned("deploy-target", "k3s"),
+            raw_owned("", "api-quirks", "form-encoded", "note", false),
+        ];
+        let keys = freeform_note_keys(&notes);
+        assert_eq!(
+            keys,
+            vec!["api-quirks"],
+            "pinned keys must not also appear in the [Scratchpad] index"
+        );
+    }
+
+    #[test]
+    fn working_state_note_count_excludes_pinned_notes() {
+        // The count must agree with the list the index would show, or the
+        // nudge points at notes the index does not name.
+        let notes = vec![
+            raw_pinned("deploy-target", "k3s"),
+            raw_owned("", "api-quirks", "form-encoded", "note", false),
+        ];
+        assert_eq!(WorkingState::from_notes(&notes).notes, 1);
+    }
 
     #[test]
     fn render_scratchpad_index_empty_is_none() {

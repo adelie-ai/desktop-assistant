@@ -209,6 +209,61 @@ pub type ScratchpadDeleteSubtreeFn = Arc<
 mod tests {
     use super::*;
 
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pin_respects_max_pinned_notes() {
+        // At the cap, one more pin is refused as a whole and the error names
+        // what is already pinned so the model can choose what to release.
+        let at_cap = keys(&["a", "b", "c", "d", "e"]);
+        assert_eq!(at_cap.len(), MAX_PINNED_NOTES, "precondition: at the cap");
+        let err = plan_pin(&at_cap, &keys(&["f"]), true).expect_err("must refuse past the cap");
+        assert!(err.contains("at most 5"), "{err}");
+        for k in ["a", "b", "c", "d", "e"] {
+            assert!(err.contains(k), "error must name already-pinned {k}: {err}");
+        }
+    }
+
+    #[test]
+    fn pin_below_the_cap_is_allowed() {
+        let planned = plan_pin(&keys(&["a", "b"]), &keys(&["c"]), true).expect("under the cap");
+        assert_eq!(planned, keys(&["c"]));
+    }
+
+    #[test]
+    fn repinning_an_already_pinned_note_is_not_a_cap_error() {
+        // Otherwise a harmless no-op would look like the model overspending.
+        let at_cap = keys(&["a", "b", "c", "d", "e"]);
+        let planned =
+            plan_pin(&at_cap, &keys(&["c"]), true).expect("re-pin is a no-op, not a cap breach");
+        assert_eq!(planned, keys(&["c"]));
+    }
+
+    #[test]
+    fn unpinning_is_always_allowed_even_at_the_cap() {
+        // Unpinning can only free budget, so it must never be blocked.
+        let at_cap = keys(&["a", "b", "c", "d", "e"]);
+        let planned = plan_pin(&at_cap, &keys(&["a"]), false).expect("unpin must be allowed");
+        assert_eq!(planned, keys(&["a"]));
+    }
+
+    #[test]
+    fn pinning_a_whole_batch_past_the_cap_is_refused_atomically() {
+        // Partial application would leave the model unsure what is pinned.
+        let err = plan_pin(&keys(&["a", "b", "c"]), &keys(&["d", "e", "f"]), true)
+            .expect_err("3 + 3 exceeds the cap of 5");
+        assert!(err.contains("at most 5"), "{err}");
+    }
+
+    #[test]
+    fn pinning_from_empty_up_to_the_cap_is_allowed() {
+        let planned = plan_pin(&[], &keys(&["a", "b", "c", "d", "e"]), true)
+            .expect("exactly the cap must fit");
+        assert_eq!(planned.len(), MAX_PINNED_NOTES);
+    }
+
     struct MockScratchpadStore;
 
     impl ScratchpadStore for MockScratchpadStore {
