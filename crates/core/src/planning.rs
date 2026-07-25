@@ -58,7 +58,7 @@ pub(crate) const COMPACTION_MIN_EVICT_BYTES: usize = 512;
 /// Recognisable opening of an eviction pointer. Used to skip results that are
 /// already compacted, so a parent `complete_step` whose scope contains
 /// already-compacted child results does not re-stamp them.
-pub(crate) const COMPACTION_POINTER_PREFIX: &str = "<compacted to scratchpad";
+pub const COMPACTION_POINTER_PREFIX: &str = "<compacted to scratchpad";
 
 /// Maximum plan todos rendered into the per-round `[Plan]` surface. Keeps the
 /// re-sent-every-round plan cheap; deeper plans show a "… and N more" tail.

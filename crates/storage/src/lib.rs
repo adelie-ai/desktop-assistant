@@ -18,6 +18,7 @@ pub mod skill_index;
 pub mod tag_normalize;
 pub mod tag_registry;
 pub mod tool_registry;
+pub mod tool_usage;
 pub mod turn_state;
 
 pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};

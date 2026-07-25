@@ -453,6 +453,10 @@ where
     scratchpad_list: Option<ScratchpadListFn>,
     scratchpad_delete_many: Option<ScratchpadDeleteManyFn>,
     scratchpad_clear: Option<ScratchpadClearFn>,
+    /// Tool-usage cost aggregate (#599). Absent when no Postgres pool is
+    /// configured; the command then reports it is unavailable rather than
+    /// pretending the conversation used no tools.
+    tool_usage: Option<desktop_assistant_core::ports::tool_usage::ToolUsageFn>,
     /// Optional idempotency-key store (#204). When attached, a `SendMessage`
     /// carrying an `idempotency_key` whose turn already completed replays the
     /// stored reply instead of re-running the LLM/tools (crash-safe
@@ -524,6 +528,7 @@ where
             scratchpad_list: None,
             scratchpad_delete_many: None,
             scratchpad_clear: None,
+            tool_usage: None,
             idempotency: None,
             inflight: Arc::new(InFlightRegistry::default()),
             client_tools: None,
@@ -552,6 +557,16 @@ where
     /// `GetConversationScratchpad` / `SetScratchpadNote` / `DeleteScratchpadNotes`
     /// commands are served. The daemon passes the same store-backed closures the
     /// builtin tools use (with mutating ones wrapped to emit `ScratchpadChanged`).
+    /// Wire the tool-usage aggregate (#599). Additive: without it the command
+    /// reports unavailable rather than answering zero.
+    pub fn with_tool_usage(
+        mut self,
+        tool_usage: desktop_assistant_core::ports::tool_usage::ToolUsageFn,
+    ) -> Self {
+        self.tool_usage = Some(tool_usage);
+        self
+    }
+
     pub fn with_scratchpad(
         mut self,
         write: ScratchpadWriteFn,
@@ -1304,6 +1319,27 @@ fn map_client_tool_resolution_err(e: ClientToolResolutionError) -> ApiError {
     }
 }
 
+/// Map the domain aggregate to its wire view, computing the token estimate at
+/// the boundary so every client shows the same number rather than each deriving
+/// its own from bytes.
+fn tool_usage_to_view(
+    u: desktop_assistant_core::ports::tool_usage::ToolUsage,
+) -> api::ToolUsageView {
+    api::ToolUsageView {
+        result_tokens: u.result_tokens(),
+        tool_name: u.tool_name,
+        namespace: u.namespace,
+        call_count: u.call_count,
+        result_bytes: u.result_bytes,
+        max_result_bytes: u.max_result_bytes,
+        evicted_results: u.evicted_results,
+        first_ordinal: u.first_ordinal,
+        last_ordinal: u.last_ordinal,
+        first_used_at: u.first_used_at,
+        last_used_at: u.last_used_at,
+    }
+}
+
 fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
     api::KnowledgeEntryView {
         id: e.id,
@@ -1761,6 +1797,19 @@ where
             }
 
             // Knowledge base management (issue #73)
+            api::Command::GetToolUsage { conversation_id } => {
+                let usage = self.tool_usage.as_ref().ok_or_else(|| {
+                    // Explicit unavailability rather than an empty vec: "no tool
+                    // usage recorded" and "this deployment cannot answer" are
+                    // different answers, and a cost view that silently reports
+                    // zero is worse than one that says it does not know.
+                    ApiError::Unsupported
+                })?;
+                let rows = usage(conversation_id).await.map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::ToolUsage(
+                    rows.into_iter().map(tool_usage_to_view).collect(),
+                ))
+            }
             api::Command::ListKnowledgeEntries {
                 limit,
                 offset,

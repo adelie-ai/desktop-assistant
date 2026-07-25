@@ -291,6 +291,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // #599: recover a message's creation time from its UUIDv7 id, so "when did
+    // this happen" needs no timestamp column and works on existing rows.
+    sqlx::raw_sql(include_str!("../migrations/037_uuidv7_timestamp_fn.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 
