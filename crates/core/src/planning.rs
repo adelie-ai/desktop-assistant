@@ -481,6 +481,10 @@ pub(crate) fn freeform_note_keys<'a>(notes: &[RawNote<'a>]) -> Vec<&'a str> {
             n.note_type == OUTCOME_NOTE_TYPE
                 && n.key != SCRATCHPAD_GOAL_KEY
                 && !n.key.starts_with(OUTCOME_KEY_PREFIX)
+                // A pinned note's full content is already in `[Pinned]`;
+                // listing its key again in the index would spend tokens
+                // pointing at something the model can already read (#597).
+                && !n.pinned
         })
         .map(|n| n.key)
         .collect()
@@ -508,6 +512,81 @@ pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option
         out.push_str(&format!(" … and {} more.", total - shown));
     } else {
         out.push('.');
+    }
+    Some(out)
+}
+
+/// Render the per-turn `[Pinned]` block: the full content of every pinned note
+/// (#597).
+///
+/// Why content and not keys: this is the deliberate opposite of
+/// [`render_scratchpad_index`]. The index trades content for affordability —
+/// recognition, then a search round to read a note back. That is right for the
+/// long tail, and wrong for the handful of facts that stay load-bearing for the
+/// rest of a task, where the search round is paid over and over and a forgotten
+/// one means working from a stale assumption. Pinning buys those few notes out
+/// of the trade, which is why it is capped
+/// ([`MAX_PINNED_NOTES`](crate::ports::scratchpad::MAX_PINNED_NOTES)) rather
+/// than merely discouraged.
+///
+/// Notes are ordered by key, not by recency: the block is re-emitted every turn,
+/// so a stable order keeps the prompt prefix byte-identical between turns
+/// instead of reshuffling and defeating provider prompt caching.
+///
+/// `budget` bounds the whole block. Truncation is always explicit — a
+/// `… (truncated)` marker on an over-long note, and a trailing count of notes
+/// that did not fit — because a silently dropped pin is exactly the failure this
+/// feature exists to prevent. Returns `None` when nothing is pinned.
+pub(crate) fn render_pinned(notes: &[RawNote<'_>], budget: usize) -> Option<String> {
+    let mut pinned: Vec<&RawNote<'_>> = notes.iter().filter(|n| n.pinned).collect();
+    if pinned.is_empty() {
+        return None;
+    }
+    pinned.sort_by_key(|n| (n.owner_todo, n.key));
+    pinned.dedup_by_key(|n| (n.owner_todo, n.key));
+
+    let total = pinned.len();
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for note in &pinned {
+        // Reserve room for the "- key: " prefix so a single huge note is
+        // trimmed to fit rather than blowing past the budget on its own.
+        let overhead = note.key.len() + 4;
+        let remaining = budget.saturating_sub(used + overhead);
+        if remaining == 0 {
+            break;
+        }
+        let content = if note.content.len() > remaining {
+            format!(
+                "{}… (truncated)",
+                truncate_on_char_boundary(note.content, remaining)
+            )
+        } else {
+            note.content.to_string()
+        };
+        used += overhead + content.len();
+        lines.push(format!("- {}: {}", note.key, content));
+    }
+
+    // NB: `lines` may be empty here if even one note could not be trimmed to
+    // fit. That must still produce a block — a pin that vanishes without a word
+    // is the single failure mode this feature exists to prevent, so the model
+    // is told its pins exist and could not be shown rather than silently
+    // losing them.
+    let mut out = String::from(
+        "Notes you pinned to keep in view — already current, no need to re-read them. \
+         Unpin with builtin_scratchpad_pin once one stops mattering.\n",
+    );
+    out.push_str(&lines.join("\n"));
+    let dropped = total - lines.len();
+    if dropped > 0 {
+        if !lines.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "({dropped} pinned note(s) did not fit here; unpin some or shorten them, \
+             or read them with builtin_scratchpad_search.)"
+        ));
     }
     Some(out)
 }
@@ -592,6 +671,8 @@ pub(crate) struct RawNote<'a> {
     pub content: &'a str,
     pub note_type: &'a str,
     pub done: bool,
+    /// Whether this note's content is re-surfaced in full every turn (#597).
+    pub pinned: bool,
 }
 
 /// Build the plan surface from a conversation's scratchpad notes (#240).
@@ -710,20 +791,8 @@ pub(crate) fn complete_step_tool() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::scratchpad::PINNED_BLOCK_BYTE_BUDGET;
     use crate::domain::{Message, Role, ToolCall};
-
-    /// A pinned `note`-typed note, for the `[Pinned]` block tests (#597).
-    fn raw_pinned<'a>(key: &'a str, content: &'a str) -> RawNote<'a> {
-        RawNote {
-            key,
-            owner_todo: "",
-            content,
-            note_type: OUTCOME_NOTE_TYPE,
-            done: false,
-            pinned: true,
-        }
-    }
+    use crate::ports::scratchpad::PINNED_BLOCK_BYTE_BUDGET;
 
     #[test]
     fn stack_auto_numbers_roots_and_nested_children() {
@@ -1144,6 +1213,19 @@ mod tests {
             content,
             note_type: ty,
             done,
+            pinned: false,
+        }
+    }
+
+    /// A pinned `note`-typed note, for the `[Pinned]` block tests (#597).
+    fn raw_pinned<'a>(key: &'a str, content: &'a str) -> RawNote<'a> {
+        RawNote {
+            key,
+            owner_todo: "",
+            content,
+            note_type: OUTCOME_NOTE_TYPE,
+            done: false,
+            pinned: true,
         }
     }
 
@@ -1262,6 +1344,30 @@ mod tests {
             out.contains("did not fit"),
             "notes beyond the budget must be reported: {out}"
         );
+    }
+
+    #[test]
+    fn render_pinned_truncates_multibyte_content_without_panicking() {
+        // This codebase has had a real UTF-8 slice panic in a truncation path
+        // (DA-2), so cutting at a BYTE budget must land on a char boundary.
+        // Each emoji is 4 bytes, so a budget that lands mid-character is the
+        // case that would panic on a naive slice.
+        let emoji = "🐧".repeat(64);
+        for budget in 8..40 {
+            let notes = vec![raw_pinned("penguins", &emoji)];
+            let out =
+                render_pinned(&notes, budget).expect("something is pinned, so a block is owed");
+            assert!(
+                out.is_char_boundary(out.len()),
+                "output must stay valid UTF-8"
+            );
+            // Whatever the budget, the pin is never silently dropped: either its
+            // content is shown, or the block says it could not be.
+            assert!(
+                out.contains("penguins") || out.contains("did not fit"),
+                "a pin must never vanish without a word (budget {budget}): {out}"
+            );
+        }
     }
 
     #[test]

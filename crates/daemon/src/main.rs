@@ -1634,6 +1634,22 @@ async fn main() -> Result<()> {
             Arc::clone(&clear_fn),
         );
 
+        // #597: pin / unpin. Emits the same scratchpad-changed notification as
+        // the other mutating closures so a client's side pane reflects a pin.
+        let sp_pin = Arc::clone(&sp_store);
+        let reg_pin = Arc::clone(&background_task_registry);
+        let set_pinned_fn: desktop_assistant_core::ports::scratchpad::ScratchpadSetPinnedFn =
+            Arc::new(move |conv: String, keys: Vec<String>, pinned: bool| {
+                let store = Arc::clone(&sp_pin);
+                let reg = Arc::clone(&reg_pin);
+                Box::pin(async move {
+                    let changed = store.set_pinned(&conv, &keys, pinned).await?;
+                    reg.notify_scratchpad_changed(&current_user_id(), conv);
+                    Ok(changed)
+                })
+            });
+        builtin_tools = builtin_tools.with_scratchpad_pin(set_pinned_fn);
+
         // #287: subtree-delete (for the complete_step cascade) + the
         // descendant-task lifecycle probe (so the cascade defers while a
         // wait=false subagent under the step is still running). Both read the

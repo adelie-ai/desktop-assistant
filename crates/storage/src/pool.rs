@@ -285,6 +285,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // #597: a note can be pinned so its content is re-surfaced every turn,
+    // rather than only its key appearing in the `[Scratchpad]` index.
+    sqlx::raw_sql(include_str!("../migrations/036_scratchpad_pinned.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 

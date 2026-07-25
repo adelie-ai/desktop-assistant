@@ -14,9 +14,10 @@ use desktop_assistant_core::ports::knowledge::{
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
-    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_RESULTS_CEILING, NewScratchpadNote,
-    RESPONSE_BYTE_BUDGET, ScratchpadClearFn, ScratchpadDeleteManyFn, ScratchpadGetManyFn,
-    ScratchpadListFn, ScratchpadSearchFn, ScratchpadWriteFn,
+    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_PINNED_NOTES, MAX_RESULTS_CEILING,
+    NewScratchpadNote, RESPONSE_BYTE_BUDGET, ScratchpadClearFn, ScratchpadDeleteManyFn,
+    ScratchpadGetManyFn, ScratchpadListFn, ScratchpadSearchFn, ScratchpadSetPinnedFn,
+    ScratchpadWriteFn, plan_pin,
 };
 use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
@@ -37,6 +38,7 @@ const TOOL_CONV_SEARCH: &str = "builtin_conversation_search";
 const TOOL_SCRATCHPAD_WRITE: &str = "builtin_scratchpad_write";
 const TOOL_SCRATCHPAD_SEARCH: &str = "builtin_scratchpad_search";
 const TOOL_SCRATCHPAD_DELETE: &str = "builtin_scratchpad_delete";
+const TOOL_SCRATCHPAD_PIN: &str = "builtin_scratchpad_pin";
 const TOOL_SKILL_SEARCH: &str = "builtin_skill_search";
 const TOOL_SKILL_GET: &str = "builtin_skill_get";
 
@@ -66,6 +68,7 @@ pub struct BuiltinToolService {
     scratchpad_search_fn: Option<ScratchpadSearchFn>,
     scratchpad_delete_many_fn: Option<ScratchpadDeleteManyFn>,
     scratchpad_clear_fn: Option<ScratchpadClearFn>,
+    scratchpad_set_pinned_fn: Option<ScratchpadSetPinnedFn>,
     notify_fn: Option<NotifyFn>,
     skill_search_fn: Option<SkillSearchFn>,
     skill_get_fn: Option<SkillGetFn>,
@@ -99,6 +102,7 @@ impl BuiltinToolService {
             scratchpad_search_fn: None,
             scratchpad_delete_many_fn: None,
             scratchpad_clear_fn: None,
+            scratchpad_set_pinned_fn: None,
             notify_fn: None,
             skill_search_fn: None,
             skill_get_fn: None,
@@ -225,6 +229,14 @@ impl BuiltinToolService {
         self.scratchpad_search_fn = Some(search_fn);
         self.scratchpad_delete_many_fn = Some(delete_many_fn);
         self.scratchpad_clear_fn = Some(clear_fn);
+        self
+    }
+
+    /// Wire the pin/unpin write (#597). Additive and separate from
+    /// [`Self::with_scratchpad`] so an embedder that predates pinning keeps
+    /// compiling; without it, the pin tool is simply not advertised.
+    pub fn with_scratchpad_pin(mut self, set_pinned_fn: ScratchpadSetPinnedFn) -> Self {
+        self.scratchpad_set_pinned_fn = Some(set_pinned_fn);
         self
     }
 
@@ -585,6 +597,37 @@ impl BuiltinToolService {
             ),
         ];
 
+        // Capability-gated: only advertise pinning when the write is wired, so
+        // an embedder that predates #597 never sees a tool it cannot service.
+        if self.scratchpad_set_pinned_fn.is_some() {
+            defs.push(ToolDefinition::new(
+                TOOL_SCRATCHPAD_PIN,
+                "Pin (or unpin) scratchpad notes by key. A pinned note's full content is \
+                 repeated back to you every turn under [Pinned], so you never spend a search \
+                 to re-read it and can never work from a stale copy. Pin sparingly: only a \
+                 fact you will need repeatedly for the REST of this task and that would be \
+                 harmful to get wrong — not something merely interesting. Unpin the moment it \
+                 stops mattering; a stale pin costs you context every single turn. At most 5 \
+                 notes can be pinned at once, and hitting that is the signal to unpin \
+                 something, not to shuffle.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Keys of existing notes to pin or unpin."
+                        },
+                        "pinned": {
+                            "type": "boolean",
+                            "description": "true to pin, false to unpin. Defaults to true."
+                        }
+                    },
+                    "required": ["keys"]
+                }),
+            ));
+        }
+
         // Capability-gated: only advertise the notification tool when a
         // notification service was wired (present on the session bus).
         if self.notify_fn.is_some() {
@@ -761,9 +804,10 @@ impl BuiltinToolService {
     pub fn provider_group(tool_name: &str) -> Option<&'static str> {
         match tool_name {
             TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST => Some("knowledge"),
-            TOOL_SCRATCHPAD_WRITE | TOOL_SCRATCHPAD_SEARCH | TOOL_SCRATCHPAD_DELETE => {
-                Some("scratchpad")
-            }
+            TOOL_SCRATCHPAD_WRITE
+            | TOOL_SCRATCHPAD_SEARCH
+            | TOOL_SCRATCHPAD_DELETE
+            | TOOL_SCRATCHPAD_PIN => Some("scratchpad"),
             TOOL_DB_QUERY => Some("database"),
             TOOL_CONV_SEARCH => Some("recall"),
             TOOL_SYS_PROPS | TOOL_NOTIFY => Some("system"),
@@ -800,6 +844,7 @@ impl BuiltinToolService {
             TOOL_SCRATCHPAD_WRITE => self.scratchpad_write(arguments).await,
             TOOL_SCRATCHPAD_SEARCH => self.scratchpad_search(arguments).await,
             TOOL_SCRATCHPAD_DELETE => self.scratchpad_delete(arguments).await,
+            TOOL_SCRATCHPAD_PIN => self.scratchpad_pin(arguments).await,
             TOOL_SKILL_SEARCH => self.skill_search(arguments).await,
             TOOL_SKILL_GET => self.skill_get(arguments).await,
             _ => Err(CoreError::ToolExecution(format!(
@@ -1562,6 +1607,9 @@ impl BuiltinToolService {
                 "type": note.note_type,
                 "sequence": note.sequence,
                 "done": note.done,
+                // So the model can see what it has already pinned without a
+                // second call — the cap makes that worth knowing (#597).
+                "pinned": note.pinned,
                 "updated_at": note.updated_at,
             });
             let size = entry.to_string().len();
@@ -1581,6 +1629,99 @@ impl BuiltinToolService {
             response["message"] = serde_json::json!(
                 "results were truncated; narrow with a `query`, fewer `keys`, or a smaller scope"
             );
+        }
+        Ok(response.to_string())
+    }
+
+    /// Pin / unpin notes by key (#597).
+    ///
+    /// The cap is enforced against storage's current state, not against what
+    /// this call asks for, so a model that has lost track of its own pins still
+    /// gets an accurate refusal naming what is already pinned.
+    async fn scratchpad_pin(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let conversation_id = Self::scratchpad_conversation()?;
+        let set_pinned = self
+            .scratchpad_set_pinned_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("scratchpad not configured".to_string()))?;
+        let list = self
+            .scratchpad_list_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("scratchpad not configured".to_string()))?;
+
+        // Default to pinning: `pinned` is the less-used half of the tool, and
+        // an omitted flag reads as "pin these".
+        let pinned = arguments
+            .get("pinned")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let keys = optional_string_array(&arguments, "keys");
+        if keys.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "scratchpad_pin requires `keys: [...]`".to_string(),
+            ));
+        }
+        let requested = keys.len();
+        let mut keys = keys;
+        let mut truncated = false;
+        if keys.len() > MAX_KEYS_PER_CALL {
+            truncated = true;
+            keys.truncate(MAX_KEYS_PER_CALL);
+        }
+
+        // Read current state for both the cap check and unknown-key reporting.
+        // Bounded by the same ceiling every scratchpad read uses.
+        let existing = list(conversation_id.clone(), None, MAX_RESULTS_CEILING).await?;
+        let known: Vec<&str> = existing.iter().map(|n| n.key.as_str()).collect();
+        let unknown: Vec<String> = keys
+            .iter()
+            .filter(|k| !known.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        let currently_pinned: Vec<String> = existing
+            .iter()
+            .filter(|n| n.pinned)
+            .map(|n| n.key.clone())
+            .collect();
+
+        // Only keys that actually exist count toward the cap — asking to pin a
+        // typo'd key must not consume budget or trip the limit.
+        let effective: Vec<String> = keys
+            .iter()
+            .filter(|k| known.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        if effective.is_empty() {
+            return Ok(serde_json::json!({
+                "ok": true,
+                "changed": 0,
+                "requested": requested,
+                "unknown_keys": unknown,
+                "message": "no matching notes; nothing was pinned or unpinned",
+            })
+            .to_string());
+        }
+        let to_set = plan_pin(&currently_pinned, &effective, pinned)
+            .map_err(|e| CoreError::ToolExecution(format!("scratchpad_pin: {e}")))?;
+
+        let changed = set_pinned(conversation_id, to_set, pinned).await?;
+        let mut response = serde_json::json!({
+            "ok": true,
+            "pinned": pinned,
+            "changed": changed,
+            "requested": requested,
+            "max_pinned": MAX_PINNED_NOTES,
+        });
+        if !unknown.is_empty() {
+            // Reported, not an error: a key that no longer exists is worth
+            // knowing about but must not fail the pins that did apply.
+            response["unknown_keys"] = serde_json::json!(unknown);
+        }
+        if truncated {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(format!(
+                "only the first {MAX_KEYS_PER_CALL} keys were processed; call again for the rest"
+            ));
         }
         Ok(response.to_string())
     }
@@ -2185,14 +2326,40 @@ mod tests {
             })
         });
 
-        let service = BuiltinToolService::new().with_scratchpad(
-            write_fn,
-            get_many_fn,
-            list_fn,
-            search_fn,
-            delete_many_fn,
-            clear_fn,
-        );
+        // #597 pin/unpin against the same in-memory pad. Mirrors the store's
+        // semantics: only notes that exist change, and the count returned is
+        // of notes actually CHANGED so a re-pin reports 0.
+        let sp = Arc::clone(&store);
+        let set_pinned_fn: ScratchpadSetPinnedFn =
+            Arc::new(move |conv: String, keys: Vec<String>, pinned: bool| {
+                let store = Arc::clone(&sp);
+                Box::pin(async move {
+                    let mut guard = store.lock().unwrap();
+                    let mut changed = 0u64;
+                    for note in guard
+                        .iter_mut()
+                        .filter(|n| n.conversation_id == conv && keys.contains(&n.key))
+                    {
+                        if note.pinned != pinned {
+                            note.pinned = pinned;
+                            changed += 1;
+                        }
+                    }
+                    Ok(changed)
+                })
+                    as Pin<Box<dyn std::future::Future<Output = Result<u64, CoreError>> + Send>>
+            });
+
+        let service = BuiltinToolService::new()
+            .with_scratchpad(
+                write_fn,
+                get_many_fn,
+                list_fn,
+                search_fn,
+                delete_many_fn,
+                clear_fn,
+            )
+            .with_scratchpad_pin(set_pinned_fn);
         (service, store)
     }
 

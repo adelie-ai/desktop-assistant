@@ -18,8 +18,8 @@ use crate::ports::llm::{
     current_context_budget, current_tool_allowlist,
 };
 use crate::ports::scratchpad::{
-    MAX_NOTE_BYTES, NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadDeleteSubtreeFn,
-    ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
+    MAX_NOTE_BYTES, NewScratchpadNote, PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY,
+    ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
 use crate::ports::scratchpad_scope::{
     SPAWN_SUBAGENT_TOOL, SubagentScope, current_ancestors, current_owner_todo,
@@ -311,6 +311,10 @@ struct ScratchpadSurfaces {
     scratchpad_index: Option<String>,
     /// `[Working state]` — the counts behind the always-on nudge (#598).
     working_state: planning::WorkingState,
+    /// `[Pinned]` — full content of the pinned notes (#597), or `None` when
+    /// nothing is pinned. Unlike the index this is not gated: it renders every
+    /// turn it is `Some`.
+    pinned: Option<String>,
 }
 
 impl<S, L, T> ConversationHandler<S, L, T> {
@@ -673,6 +677,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 content: n.content.as_str(),
                 note_type: n.note_type.as_str(),
                 done: n.done,
+                pinned: n.pinned,
             })
             .collect();
 
@@ -684,6 +689,11 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 planning::MAX_SCRATCHPAD_INDEX_KEYS,
             ),
             working_state: planning::WorkingState::from_notes(&raw),
+            // Free: rendered from the notes already in hand, so the always-on
+            // block costs no extra storage round-trip. `list` orders pinned
+            // first, so the pinned set is always inside the row limit however
+            // many notes the conversation has accrued.
+            pinned: planning::render_pinned(&raw, PINNED_BLOCK_BYTE_BUDGET),
         }
     }
 
@@ -1188,6 +1198,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     plan: surfaces.plan.as_deref(),
                     scratchpad_index: surfaces.scratchpad_index.as_deref(),
                     working_state: surfaces.working_state,
+                    pinned: surfaces.pinned.as_deref(),
                     tool_rounds_since_anchor,
                 },
                 target_window,
@@ -1866,6 +1877,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     plan: wind_down_surfaces.plan.as_deref(),
                     scratchpad_index: wind_down_surfaces.scratchpad_index.as_deref(),
                     working_state: wind_down_surfaces.working_state,
+                    pinned: wind_down_surfaces.pinned.as_deref(),
                     tool_rounds_since_anchor: u32::MAX,
                 },
                 target_window,

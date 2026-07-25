@@ -31,6 +31,14 @@ pub struct ScratchpadNote {
     /// note off. Orthogonal to `note_type`; a checked-off `todo` stays
     /// visible so completed work isn't redone.
     pub done: bool,
+    /// Whether this note's **content** is re-surfaced in full every turn as a
+    /// `[Pinned]` block (#597), rather than only its key appearing in the
+    /// `[Scratchpad]` index. The model sets it for the handful of facts that
+    /// stay load-bearing for the rest of a task, so it never spends a search
+    /// round re-reading them — the generalization of the reserved `goal` key.
+    /// Bounded by [`crate::ports::scratchpad::MAX_PINNED_NOTES`]; only the
+    /// dedicated pin path changes it, so rewriting a note never clears its pin.
+    pub pinned: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -58,6 +66,7 @@ impl ScratchpadNote {
             note_type: DEFAULT_NOTE_TYPE.to_string(),
             sequence: None,
             done: false,
+            pinned: false,
             created_at: String::new(),
             updated_at: String::new(),
         }
