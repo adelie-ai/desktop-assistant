@@ -154,6 +154,43 @@ pub struct DaemonConfig {
     /// (#573). Absent section => defaults (enabled, platform-default roots).
     #[serde(default, skip_serializing_if = "SkillsConfig::is_default")]
     pub skills: SkillsConfig,
+    /// `[subagents]` — multi-agent behaviour knobs (#668). Absent section =>
+    /// defaults (parent-wake on).
+    #[serde(default, skip_serializing_if = "SubagentsConfig::is_default")]
+    pub subagents: SubagentsConfig,
+}
+
+/// `[subagents]` configuration: multi-agent behaviour knobs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubagentsConfig {
+    /// Whether a subagent finishing wakes its parent conversation with an
+    /// autonomous turn (issue #668). On by default: a `spawn_subagent`
+    /// { wait: false } that finishes re-engages the parent so it reviews the
+    /// result instead of the turn silently ending. Set `false` to disable the
+    /// wake globally (the parent then only sees results if it polls or the user
+    /// re-prompts, the pre-#668 behaviour).
+    #[serde(default = "default_wake_parent")]
+    pub wake_parent: bool,
+}
+
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        Self {
+            wake_parent: default_wake_parent(),
+        }
+    }
+}
+
+impl SubagentsConfig {
+    /// Whether this equals the default section, so a default `[subagents]` is
+    /// not serialized (keeping migrated `daemon.toml` output stable).
+    fn is_default(&self) -> bool {
+        self.wake_parent == default_wake_parent()
+    }
+}
+
+fn default_wake_parent() -> bool {
+    true
 }
 
 /// `[skills]` configuration: whether to index on-disk skills, and which global

@@ -5103,7 +5103,7 @@ mod tests {
         assert!(
             ascii_after.content.starts_with("<tool output omitted"),
             "token-estimate picker should target the ASCII result, got: {:?}",
-            &ascii_after.content
+            ascii_after.content
         );
         assert_eq!(
             emoji_after.content, emoji_payload,
@@ -5560,7 +5560,7 @@ mod tests {
         assert!(
             big.content.starts_with("<tool output omitted"),
             "expected truncation notice, got: {:?}",
-            &big.content
+            big.content
         );
         assert!(
             big.content

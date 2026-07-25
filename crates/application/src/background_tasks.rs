@@ -43,7 +43,7 @@
 //! because that would leak existence (#105 contract).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_auth_jwt::UserId;
@@ -232,6 +232,50 @@ pub struct SpawnMeta {
     pub spawn_marker: Option<String>,
 }
 
+/// Fires when a `TaskKind::Subagent` task reaches a terminal state, so a
+/// parent-wake coordinator can re-engage the parent conversation without
+/// polling (parent-wake feature; see `docs/design/subagent-parent-wake.md`).
+///
+/// The child's final answer is NOT carried here — it is already written to the
+/// session scratchpad as a `result` note under [`owner_todo`](Self::owner_todo)
+/// (#607). This payload carries the *references* a wake message hands the
+/// parent, plus enough context to run and target a wake turn.
+#[derive(Debug, Clone)]
+pub struct SubagentCompletion {
+    /// Owning tenant — the wake turn runs under this user's scope.
+    pub user_id: UserId,
+    /// The parent task that spawned this child (its `spawn_subagent` call).
+    pub parent_task_id: api::TaskId,
+    /// The child's own conversation (its private transcript), for UI drill-in.
+    pub child_conversation_id: String,
+    /// The top-level session conversation the child shares its scratchpad with
+    /// (#287): where the child's `result` note lives and the conversation a
+    /// wake turn should run on so it renders for the user.
+    pub session_conversation_id: String,
+    /// The child's task id — the `get_subagent_status(task_id)` handle.
+    pub child_task_id: api::TaskId,
+    /// Human-friendly label the parent gave the child at spawn time.
+    pub child_name: String,
+    /// The child's scratchpad namespace: its `result` note is stored under this
+    /// `owner_todo` on the session pad. The concrete scratchpad reference the
+    /// wake message points the parent at.
+    pub owner_todo: String,
+    /// Terminal status — fires for `Completed`, `Failed`, and `Cancelled` so the
+    /// parent is woken to react rather than waiting forever on a dead child.
+    pub status: api::TaskStatus,
+    /// How many sibling subagents under the same parent were still non-terminal
+    /// at the instant this child finalized. `0` means this was the last one —
+    /// the coordinator's cue for a holistic review of the whole result set.
+    pub siblings_remaining: usize,
+}
+
+/// Late-set observer invoked on subagent terminal transitions. Boxed `Fn` (not a
+/// dedicated trait) so a coordinator can be a closure over its own handles; must
+/// not block or re-enter the registry synchronously — the registry invokes it
+/// after releasing every lock, but a well-behaved observer still returns
+/// promptly and moves real work (a wake turn) onto its own task.
+pub type SubagentCompletionObserver = Arc<dyn Fn(SubagentCompletion) + Send + Sync>;
+
 /// In-memory, user-scoped task registry.
 ///
 /// Cheap to `Clone` (it's `Arc`-wrapped internally) so a single
@@ -275,7 +319,23 @@ impl BackgroundTaskRegistry {
                 user_channels: Mutex::new(HashMap::new()),
                 completion_notify: Mutex::new(HashMap::new()),
                 store: None,
+                subagent_observer: OnceLock::new(),
             }),
+        }
+    }
+
+    /// Install the observer invoked when a `TaskKind::Subagent` task reaches a
+    /// terminal state (parent-wake feature). Late-set — the coordinator that
+    /// consumes it is constructed after the registry (it needs the send-message
+    /// handler), so the daemon `set`s it once during wiring, mirroring the
+    /// `Weak` conversation slot in `SubagentAwareToolExecutor`.
+    ///
+    /// Set-once: a second call is ignored (logged), because two live observers
+    /// would double-wake a parent. `&self` (not `&mut`) so it can be set through
+    /// a shared `Arc<BackgroundTaskRegistry>` clone after construction.
+    pub fn set_subagent_observer(&self, observer: SubagentCompletionObserver) {
+        if self.inner.subagent_observer.set(observer).is_err() {
+            warn!("subagent completion observer already set; ignoring second registration");
         }
     }
 
@@ -1047,6 +1107,10 @@ struct Inner {
     /// are mirrored to the DB so a daemon restart can sweep abandoned
     /// rows. `None` keeps the registry purely in-memory (the default).
     store: Option<Arc<dyn BackgroundTaskStore>>,
+    /// Late-set parent-wake observer, invoked from `finalize` when a
+    /// `TaskKind::Subagent` task terminates. Unset by default (a plain
+    /// in-memory registry / every existing test path fires nothing).
+    subagent_observer: OnceLock<SubagentCompletionObserver>,
 }
 
 impl Inner {
@@ -1167,7 +1231,7 @@ impl Inner {
         user_id: &UserId,
         result: anyhow::Result<()>,
     ) {
-        let (status, last_error, progress_hint, ended_at, parent_id) = {
+        let (status, last_error, progress_hint, ended_at, parent_id, kind, owner_todo) = {
             let mut tasks = self.tasks.lock().expect("tasks poisoned");
             let Some(state) = tasks.get_mut(task_id) else {
                 return;
@@ -1200,6 +1264,8 @@ impl Inner {
                 state.view.progress_hint.clone(),
                 ended_at,
                 state.view.parent.clone(),
+                state.view.kind.clone(),
+                state.view.owner_todo.clone(),
             )
         };
 
@@ -1235,15 +1301,38 @@ impl Inner {
         //
         // Done before notify_waiters so that any `wait`er that loops
         // back into `get`/`list` immediately observes the eviction.
-        {
+        // Count non-terminal sibling subagents under the same parent BEFORE
+        // evicting this task, so the parent-wake signal can tell the parent how
+        // many children are still outstanding. This task is already terminal in
+        // the map, so the non-terminal filter excludes it. Only meaningful for a
+        // subagent; 0 for every other kind.
+        let siblings_remaining = {
             let mut tasks = self.tasks.lock().expect("tasks poisoned");
+            let remaining = match &kind {
+                api::TaskKind::Subagent { parent_task_id, .. } => tasks
+                    .values()
+                    .filter(|s| {
+                        !matches!(
+                            s.view.status,
+                            api::TaskStatus::Completed
+                                | api::TaskStatus::Failed
+                                | api::TaskStatus::Cancelled
+                        ) && matches!(
+                            &s.view.kind,
+                            api::TaskKind::Subagent { parent_task_id: p, .. } if p == parent_task_id
+                        )
+                    })
+                    .count(),
+                _ => 0,
+            };
             tasks.remove(task_id);
             if let Some(parent_id) = &parent_id
                 && let Some(parent) = tasks.get_mut(parent_id)
             {
                 parent.view.children.retain(|c| c != task_id);
             }
-        }
+            remaining
+        };
 
         // Wake waiters.
         let waiter = {
@@ -1252,6 +1341,34 @@ impl Inner {
         };
         if let Some(notify) = waiter {
             notify.notify_waiters();
+        }
+
+        // Parent-wake signal (see `docs/design/subagent-parent-wake.md`): a
+        // terminated subagent notifies the late-set observer so the parent
+        // conversation can be re-engaged without polling. Fired LAST — after
+        // every lock is released, after the `TaskCompleted` broadcast, and after
+        // eviction — so an observer is free to read registry state or drive a
+        // wake turn without deadlocking or seeing a half-finalized world. A
+        // non-subagent kind and an unset observer are both no-ops.
+        if let api::TaskKind::Subagent {
+            parent_task_id,
+            conversation_id,
+            name,
+            session_conversation_id,
+        } = kind
+            && let Some(observer) = self.subagent_observer.get()
+        {
+            observer(SubagentCompletion {
+                user_id: user_id.clone(),
+                parent_task_id,
+                child_conversation_id: conversation_id,
+                session_conversation_id,
+                child_task_id: task_id.clone(),
+                child_name: name,
+                owner_todo,
+                status,
+                siblings_remaining,
+            });
         }
     }
 }
