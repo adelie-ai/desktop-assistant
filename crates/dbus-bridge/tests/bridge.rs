@@ -24,15 +24,20 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{DaemonScript, StubDaemonHandle, spawn_stub_daemon, unique_socket_path};
+use common::{
+    DaemonScript, StubDaemonHandle, socket_tempdir, spawn_stub_daemon, unique_socket_path,
+};
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{ConnectionConfig, Connector, SignalEvent, TransportMode};
 use desktop_assistant_dbus_bridge::adapter::event_forwarder::{ForwardAction, translate};
 use desktop_assistant_dbus_bridge::transport::{BridgeTransport, ConnectorBridgeTransport};
 use tempfile::TempDir;
 
+/// Temp dir for these tests. Delegates to [`socket_tempdir`] because every one
+/// of them roots an AF_UNIX socket here, and the default `$TMPDIR` is too long
+/// on macOS to fit `sun_path` (#672).
 fn tempdir() -> TempDir {
-    tempfile::tempdir().expect("tempdir")
+    socket_tempdir()
 }
 
 /// Build a bridge Connector pointed at the given daemon socket (UDS, tokenless —
