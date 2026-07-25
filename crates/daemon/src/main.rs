@@ -1526,6 +1526,8 @@ async fn main() -> Result<()> {
         desktop_assistant_core::ports::scratchpad::ScratchpadClearFn,
     );
     let mut scratchpad_handler_fns: Option<SpHandlerFns> = None;
+    // #599: tool-usage cost aggregate; only available with a Postgres pool.
+    let mut tool_usage_fn: Option<desktop_assistant_core::ports::tool_usage::ToolUsageFn> = None;
 
     if let Some(pool) = &pg_pool {
         tracing::info!("wiring database query into builtin tools");
@@ -1548,6 +1550,16 @@ async fn main() -> Result<()> {
                 let store = Arc::clone(&cs_store);
                 Box::pin(async move { store.search_messages(&query, limit, role_filter).await })
             }));
+
+        // Issue #599: wire the tool-usage cost aggregate. Read-only and derived
+        // from rows that already exist, so there is nothing to keep in sync.
+        let tu_store =
+            Arc::new(desktop_assistant_storage::tool_usage::PgToolUsageStore::new(pool.clone()));
+        use desktop_assistant_core::ports::tool_usage::ToolUsageStore;
+        tool_usage_fn = Some(Arc::new(move |conversation_id: String| {
+            let store = Arc::clone(&tu_store);
+            Box::pin(async move { store.tool_usage(&conversation_id).await })
+        }));
 
         // Issue #184: wire the per-conversation scratchpad store.
         use desktop_assistant_core::ports::scratchpad::ScratchpadStore;
@@ -2590,6 +2602,9 @@ async fn main() -> Result<()> {
     .with_conversation_subscriptions(Arc::new(
         desktop_assistant_application::conversation_subs::ConversationSubscriptions::new(),
     ));
+    if let Some(tu) = tool_usage_fn {
+        api_handler_impl = api_handler_impl.with_tool_usage(tu);
+    }
     if let Some((write, get_many, list, delete_many, clear)) = scratchpad_handler_fns {
         api_handler_impl =
             api_handler_impl.with_scratchpad(write, get_many, list, delete_many, clear);

@@ -79,6 +79,7 @@ pub mod client_tools;
 /// live activity feed (e.g. the background-task panel) without threading a
 /// sink through the `send_prompt` trait surface.
 pub mod tool_observer;
+pub mod tool_usage;
 
 #[cfg(test)]
 mod tests {

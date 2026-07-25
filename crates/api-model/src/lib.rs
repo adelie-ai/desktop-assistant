@@ -306,6 +306,11 @@ pub enum Command {
     },
 
     // Knowledge base management (issue #73).
+    /// Per-tool cost aggregate for one conversation (#599). Read-only and
+    /// derived, so it is safe to call at any time and works retroactively.
+    GetToolUsage {
+        conversation_id: String,
+    },
     ListKnowledgeEntries {
         #[serde(default = "default_kb_limit")]
         limit: u32,
@@ -608,6 +613,7 @@ pub enum CommandResult {
     Purposes(Box<PurposesView>),
 
     KnowledgeEntries(Vec<KnowledgeEntryView>),
+    ToolUsage(Vec<ToolUsageView>),
     KnowledgeEntry(Option<KnowledgeEntryView>),
     KnowledgeEntryWritten(KnowledgeEntryView),
 
@@ -685,6 +691,40 @@ pub enum CommandResult {
 
 /// Wire-format view of a knowledge base entry. Mirrors
 /// `desktop_assistant_core::domain::KnowledgeEntry` but lives here so
+/// Per-tool cost for one conversation — the Context Inspector's tool-usage view
+/// (#599).
+///
+/// Carries BOTH axes because neither implies the other: a tool called forty
+/// times is a signal in itself, and a tool called twice that returned 40 KiB
+/// costs far more context. Clients sort by whichever question they are asking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolUsageView {
+    pub tool_name: String,
+    /// `builtin` or the MCP server hosting the tool, when resolvable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Invocations the model requested (failures and never-executed calls
+    /// included — the request is what spent the round).
+    pub call_count: u32,
+    /// Result bytes still resident in the conversation.
+    pub result_bytes: u64,
+    /// Estimated tokens for `result_bytes`, using the same rule as the context
+    /// budget's estimator so the figures are comparable. Bytes are measured,
+    /// tokens are estimated; both are exposed so the estimate stays auditable.
+    pub result_tokens: u64,
+    /// Largest single resident result — distinguishes a steady trickle from one
+    /// enormous dump.
+    pub max_result_bytes: u64,
+    /// Results compacted away to the scratchpad. Their original size is NOT
+    /// recoverable, so a non-zero count means `result_bytes` under-reports what
+    /// this tool actually cost (see #675).
+    pub evicted_results: u32,
+    /// Message ordinals of the first and last call, so a client can navigate to
+    /// where the tool entered the conversation.
+    pub first_ordinal: i32,
+    pub last_ordinal: i32,
+}
+
 /// transports and clients depend only on `api-model`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KnowledgeEntryView {
