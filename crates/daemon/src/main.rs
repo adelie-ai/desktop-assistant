@@ -23,6 +23,7 @@ mod maintenance_service;
 mod mcp_token_store;
 mod model_defaults;
 mod notifications;
+mod parent_wake;
 mod provider_reindex;
 mod purposes;
 mod registry;
@@ -2612,6 +2613,36 @@ async fn main() -> Result<()> {
     );
     let api_handler: Arc<dyn desktop_assistant_application::AssistantApiHandler> =
         Arc::new(api_handler_impl);
+
+    // Parent-wake (#668): re-engage a parent conversation when its subagents
+    // finish, without polling. The adapter drives a fan-out wake turn through
+    // the handler; the coordinator (in `application`) owns the coalescing +
+    // serialisation and is installed as the registry's subagent-completion
+    // observer. Default-on; `[subagents] wake_parent = false` disables it.
+    //
+    // `parent_waker` and `parent_wake_coordinator` are held as long-lived locals
+    // for the rest of `main`: the registry keeps only a `Weak` to the
+    // coordinator (via its observer), and the coordinator only a `Weak` to the
+    // waker, so dropping these strong refs would silence the wake immediately.
+    // The back-references are all `Weak`, so nothing leaks.
+    let wake_parent_enabled = daemon_config
+        .as_ref()
+        .map(|c| c.subagents.wake_parent)
+        .unwrap_or(true);
+    let parent_waker: Arc<dyn desktop_assistant_application::parent_wake::ParentWaker> = Arc::new(
+        parent_wake::HandlerParentWaker::new(Arc::downgrade(&api_handler)),
+    );
+    let parent_wake_coordinator = Arc::new(
+        desktop_assistant_application::parent_wake::ParentWakeCoordinator::new(
+            Arc::downgrade(&parent_waker),
+            wake_parent_enabled,
+        ),
+    );
+    background_task_registry.set_subagent_observer(parent_wake_coordinator.observer());
+    tracing::info!(
+        enabled = wake_parent_enabled,
+        "parent-wake coordinator wired to the background-task registry"
+    );
 
     // No in-process D-Bus surface (cutover complete — #281/#319): the standalone
     // adelie-dbus-bridge owns `org.desktopAssistant`, talking to this daemon over

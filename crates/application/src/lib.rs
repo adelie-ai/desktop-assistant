@@ -7,6 +7,7 @@ pub mod background_tasks;
 pub mod client_tools;
 pub mod conversation_subs;
 mod inflight;
+pub mod parent_wake;
 pub mod subagent_executor;
 pub mod subagent_tools;
 
