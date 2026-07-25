@@ -553,14 +553,23 @@ done
         }
     }
 
+    /// True when the process exists and is not a zombie.
+    ///
+    /// Uses `ps` rather than `/proc/<pid>/stat`: procfs is Linux-only, so on
+    /// macOS the read always failed and this reported every process as dead,
+    /// silently inverting the liveness assertions that use it (#669).
+    /// `ps -o state=` is portable across Linux and macOS. A zombie counts as NOT
+    /// running, preserving the original procfs semantics.
     fn pid_running(pid: u32) -> bool {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                let after_comm = stat.rsplit(')').next().unwrap_or("");
-                !after_comm.trim_start().starts_with('Z')
-            }
-            Err(_) => false,
-        }
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let state = String::from_utf8_lossy(&out.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     #[test]

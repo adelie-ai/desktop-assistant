@@ -131,15 +131,52 @@ fn pid_from_file(path: &Path) -> u32 {
 }
 
 /// True when the process exists and is not a zombie.
+///
+/// Uses `ps` rather than `/proc/<pid>/stat`: procfs is Linux-only, so on macOS
+/// the read always failed and this reported *every* process as dead. That made
+/// the liveness assertions here vacuously... fail — `dropped_client_kills_child_process`
+/// died on its pre-drop "server should be alive" check and never exercised
+/// kill-on-drop at all (#669). `ps -o state=` is portable across Linux and macOS.
+///
+/// A zombie counts as NOT running, preserving the original procfs semantics: a
+/// killed-but-unreaped child still holds a pid-table entry, and what these tests
+/// mean by "the child is gone" is that it stopped executing, not that its parent
+/// has got round to reaping it.
 fn pid_running(pid: u32) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => {
-            // Field 3 (after the parenthesised comm) is the state.
-            let after_comm = stat.rsplit(')').next().unwrap_or("");
-            !after_comm.trim_start().starts_with('Z')
-        }
-        Err(_) => false,
-    }
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+    else {
+        // No `ps` on PATH: report "not running" rather than panicking, matching
+        // the old unreadable-procfs branch.
+        return false;
+    };
+    let state = String::from_utf8_lossy(&out.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+/// Guards the guard: `pid_running` must actually discriminate live from dead.
+///
+/// This exists because the previous procfs implementation silently answered
+/// "dead" for everything on macOS, which did not announce itself as a broken
+/// helper — it surfaced as a confusing failure in an unrelated-looking assertion,
+/// and any assertion of the form "must eventually die" would have passed
+/// vacuously (#669). If this test fails, every pid assertion in this file is
+/// meaningless, so it should be read first.
+#[test]
+fn pid_running_discriminates_live_from_dead() {
+    assert!(
+        pid_running(std::process::id()),
+        "pid_running must report the currently-running test process as alive"
+    );
+    // A pid that cannot plausibly be live. Not merely "unused": we want a value
+    // that is out of range on both platforms rather than one that could be
+    // recycled onto a real process mid-test.
+    assert!(
+        !pid_running(u32::MAX),
+        "pid_running must report an impossible pid as not running"
+    );
 }
 
 async fn wait_for_pid_death(pid: u32, within: Duration) -> bool {
