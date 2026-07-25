@@ -52,6 +52,44 @@ pub struct ChatMessage {
     /// `None` for every daemon-sourced message (they carry a real `id`) and for
     /// keyless send paths.
     pub idempotency_key: Option<String>,
+    /// When the message was created, as Unix epoch milliseconds — recovered
+    /// from `id`, not stored (see [`uuidv7_millis`]). `None` when the id is not
+    /// a UUIDv7 (a pre-id daemon's row), so a client shows no time rather than
+    /// a fabricated epoch.
+    ///
+    /// Epoch millis rather than a formatted string because this crate is
+    /// deliberately dependency-minimal to stay wasm-clean (no date library), and
+    /// because every client must localise for display anyway — handing over a
+    /// number avoids a parse-then-reformat round trip and leaves no room for two
+    /// clients to disagree about timezone rendering.
+    pub created_at_ms: Option<u64>,
+}
+
+/// Recover a UUIDv7's embedded creation time as Unix epoch milliseconds.
+///
+/// A UUIDv7's first 48 bits *are* the creation timestamp, so a message's time is
+/// already carried by its id — no timestamp column, no backfill, and it works on
+/// every row ever stored. Message ids have been UUIDv7 since the daemon's
+/// migration 005.
+///
+/// Returns `None` for anything that is not a UUIDv7 — an empty id from a pre-id
+/// daemon, a v4 id, or a malformed string — so callers degrade to "unknown time"
+/// instead of inventing one. Hand-rolled rather than pulling in the `uuid` crate
+/// because this crate stays dependency-minimal for the wasm client (#377).
+pub fn uuidv7_millis(id: &str) -> Option<u64> {
+    let b = id.as_bytes();
+    // 8-4-4-4-12 with dashes; the version nibble sits at index 14.
+    if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[14] != b'7' {
+        return None;
+    }
+    let mut millis: u64 = 0;
+    // The timestamp is the first 48 bits: 12 hex digits spanning [0..8) and
+    // [9..13), i.e. either side of the first dash.
+    for &c in b[0..8].iter().chain(&b[9..13]) {
+        let digit = (c as char).to_digit(16)?;
+        millis = (millis << 4) | u64::from(digit);
+    }
+    Some(millis)
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +117,7 @@ impl From<api::ConversationSummary> for ConversationSummary {
 impl From<api::MessageView> for ChatMessage {
     fn from(value: api::MessageView) -> Self {
         Self {
+            created_at_ms: uuidv7_millis(&value.id),
             id: value.id,
             role: value.role,
             content: value.content,
@@ -89,6 +128,9 @@ impl From<api::MessageView> for ChatMessage {
             // carries the client's key, so a transcript reload/reconnect dedups
             // an echoed `UserMessageAdded` by exact match rather than a
             // content compare. `None` for assistant/tool rows and keyless sends.
+            // Derived at the one projection every client shares, rather than in
+            // each client: four independent UUIDv7 decoders would be four
+            // chances to disagree about what time a message happened.
             idempotency_key: value.idempotency_key,
         }
     }
@@ -150,5 +192,59 @@ mod tests {
             Some("k1"),
             "a persisted key must pass through From<MessageView> onto the ChatMessage"
         );
+    }
+}
+
+#[cfg(test)]
+mod created_at_tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_carries_created_at_from_uuidv7() {
+        // A UUIDv7 whose first 48 bits are 0x0193C7B2A400 ms since the epoch.
+        // The time is recovered from the id, so no column and no backfill.
+        let id = "0193c7b2-a400-7abc-8def-0123456789ab";
+        assert_eq!(uuidv7_millis(id), Some(0x0193_C7B2_A400));
+    }
+
+    #[test]
+    fn created_at_absent_for_non_uuidv7_id() {
+        // Each must yield None, never a fabricated epoch: an empty id from a
+        // pre-id daemon, a v4 id, a malformed string, and a non-hex body.
+        for id in [
+            "",
+            "not-a-uuid",
+            "0193c7b2-a400-4abc-8def-0123456789ab", // v4, not v7
+            "0193c7b2-a400-7abc-8def-0123456789",   // too short
+            "0193c7b2xa400-7abc-8def-0123456789ab", // dash in the wrong place
+            "zzzzzzzz-a400-7abc-8def-0123456789ab", // non-hex timestamp
+        ] {
+            assert_eq!(uuidv7_millis(id), None, "must not invent a time for {id:?}");
+        }
+    }
+
+    #[test]
+    fn created_at_is_monotonic_with_uuidv7_ordering() {
+        // UUIDv7 ids sort by time, so the recovered times must agree with that
+        // ordering — otherwise a transcript sorted by id would show times out
+        // of order.
+        let earlier = uuidv7_millis("0193c7b2-a400-7abc-8def-0123456789ab").unwrap();
+        let later = uuidv7_millis("0193c7b2-a401-7abc-8def-0123456789ab").unwrap();
+        assert!(later > earlier);
+    }
+
+    #[test]
+    fn created_at_is_stable_across_reprojection() {
+        // Derived from the id, so the same message re-fetched can never drift.
+        let view = api::MessageView {
+            id: "0193c7b2-a400-7abc-8def-0123456789ab".to_string(),
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            idempotency_key: None,
+        };
+        let first = ChatMessage::from(view.clone()).created_at_ms;
+        let second = ChatMessage::from(view).created_at_ms;
+        assert_eq!(first, second);
+        assert!(first.is_some());
     }
 }
