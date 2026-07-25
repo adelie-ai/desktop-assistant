@@ -419,6 +419,31 @@ mod tests {
     }
 
     #[test]
+    fn prompt_advertises_pin_tool() {
+        // A tool the model is never told about is a tool it never uses, so the
+        // pin mechanism lives or dies on this section (#597).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("builtin_scratchpad_pin"),
+            "the pin tool must be named in the always-present prompt"
+        );
+        assert!(
+            assembled.contains("[Pinned]"),
+            "the model must know which block carries its pinned notes"
+        );
+        // The two halves that keep pinning from degrading into "pin everything":
+        // a high bar to pin, and an explicit duty to unpin.
+        assert!(
+            assembled.contains("Pin sparingly"),
+            "the prompt must set a high bar for pinning"
+        );
+        assert!(
+            assembled.contains("Unpin the moment it stops mattering"),
+            "the prompt must make unpinning an explicit duty"
+        );
+    }
+
+    #[test]
     fn assembled_prompt_directs_scratchpad_hygiene() {
         // Adele must keep the pad clean, not just write to it: update a note in
         // place rather than spawning a near-duplicate, and finish with a

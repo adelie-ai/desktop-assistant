@@ -63,6 +63,58 @@ pub const MAX_RESULTS_CEILING: usize = 100;
 /// one tool call can't blow out the model's context window.
 pub const RESPONSE_BYTE_BUDGET: usize = 20 * 1024;
 
+/// Maximum number of notes that may be pinned at once (#597).
+///
+/// A pinned note's full content is re-injected every single turn, so pinning
+/// is the model spending its own context budget. The cap is deliberately small:
+/// hitting it is the signal to unpin something that has stopped mattering, not
+/// an obstacle to route around. Exceeding it is a hard error rather than a
+/// silent eviction — the model must not lose a fact it believes is pinned.
+pub const MAX_PINNED_NOTES: usize = 5;
+
+/// Soft byte budget for the rendered `[Pinned]` block (#597). Pinned content
+/// is repeated every turn, so the block is truncated (with an explicit marker,
+/// never silently) once it exceeds this, bounding the per-turn cost even if
+/// individual notes are near [`MAX_NOTE_BYTES`].
+pub const PINNED_BLOCK_BYTE_BUDGET: usize = 4 * 1024;
+
+/// Decide which keys a pin request may set, enforcing [`MAX_PINNED_NOTES`].
+///
+/// Pure so the cap is testable without a database. `currently_pinned` is the
+/// conversation's pinned keys as storage sees them now; `keys` is the request.
+///
+/// Unpinning (`pinned == false`) is always allowed — it can only free budget.
+/// Pinning is rejected as a whole when the resulting set would exceed the cap,
+/// and the error names the keys already pinned so the model can choose what to
+/// release. Keys already in the requested state are counted, not double-added,
+/// so re-pinning an already-pinned note is a no-op rather than a cap error.
+pub fn plan_pin(
+    currently_pinned: &[String],
+    keys: &[String],
+    pinned: bool,
+) -> Result<Vec<String>, String> {
+    if !pinned {
+        return Ok(keys.to_vec());
+    }
+    let mut resulting: Vec<&str> = currently_pinned.iter().map(String::as_str).collect();
+    for key in keys {
+        if !resulting.contains(&key.as_str()) {
+            resulting.push(key.as_str());
+        }
+    }
+    if resulting.len() > MAX_PINNED_NOTES {
+        let mut already: Vec<&str> = currently_pinned.iter().map(String::as_str).collect();
+        already.sort_unstable();
+        return Err(format!(
+            "at most {MAX_PINNED_NOTES} notes can be pinned at once; already pinned: [{}]. \
+             Unpin one you no longer need (builtin_scratchpad_pin with pinned: false), \
+             then pin this.",
+            already.join(", ")
+        ));
+    }
+    Ok(keys.to_vec())
+}
+
 /// Outbound port for the per-conversation scratchpad (ephemeral notes).
 ///
 /// All methods are scoped to a single `conversation_id`; the adapter
@@ -116,6 +168,22 @@ pub trait ScratchpadStore: Send + Sync {
         &self,
         conversation_id: &str,
         keys: &[String],
+    ) -> impl Future<Output = Result<u64, CoreError>> + Send;
+
+    /// Set (or clear) the `pinned` flag on the notes for the given keys (#597),
+    /// returning the number of notes changed. Keys with no matching note are
+    /// skipped rather than erroring — the caller reports them back.
+    ///
+    /// Why a dedicated write rather than a field on [`NewScratchpadNote`]:
+    /// [`Self::write`] is an upsert, so carrying `pinned` there would make an
+    /// ordinary content rewrite silently clear a pin the model is relying on.
+    /// Keeping the flag on its own path makes that impossible, and makes
+    /// pin/unpin cheap — it never restates the note's content.
+    fn set_pinned(
+        &self,
+        conversation_id: &str,
+        keys: &[String],
+        pinned: bool,
     ) -> impl Future<Output = Result<u64, CoreError>> + Send;
 
     /// Delete every note for a conversation. Returns the number deleted.
@@ -195,6 +263,17 @@ pub type ScratchpadClearFn = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>> + Send + Sync,
 >;
 
+/// Boxed async closure for pinning / unpinning notes by key (#597).
+pub type ScratchpadSetPinnedFn = Arc<
+    dyn Fn(
+            String,
+            Vec<String>,
+            bool,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Boxed async closure for cascade-deleting an `owner_todo` subtree (the
 /// namespace and all its descendants). Args: `(conversation_id, owner_todo)`;
 /// returns the count deleted. Used by the #287 roll-up cascade through
@@ -208,6 +287,61 @@ pub type ScratchpadDeleteSubtreeFn = Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pin_respects_max_pinned_notes() {
+        // At the cap, one more pin is refused as a whole and the error names
+        // what is already pinned so the model can choose what to release.
+        let at_cap = keys(&["a", "b", "c", "d", "e"]);
+        assert_eq!(at_cap.len(), MAX_PINNED_NOTES, "precondition: at the cap");
+        let err = plan_pin(&at_cap, &keys(&["f"]), true).expect_err("must refuse past the cap");
+        assert!(err.contains("at most 5"), "{err}");
+        for k in ["a", "b", "c", "d", "e"] {
+            assert!(err.contains(k), "error must name already-pinned {k}: {err}");
+        }
+    }
+
+    #[test]
+    fn pin_below_the_cap_is_allowed() {
+        let planned = plan_pin(&keys(&["a", "b"]), &keys(&["c"]), true).expect("under the cap");
+        assert_eq!(planned, keys(&["c"]));
+    }
+
+    #[test]
+    fn repinning_an_already_pinned_note_is_not_a_cap_error() {
+        // Otherwise a harmless no-op would look like the model overspending.
+        let at_cap = keys(&["a", "b", "c", "d", "e"]);
+        let planned =
+            plan_pin(&at_cap, &keys(&["c"]), true).expect("re-pin is a no-op, not a cap breach");
+        assert_eq!(planned, keys(&["c"]));
+    }
+
+    #[test]
+    fn unpinning_is_always_allowed_even_at_the_cap() {
+        // Unpinning can only free budget, so it must never be blocked.
+        let at_cap = keys(&["a", "b", "c", "d", "e"]);
+        let planned = plan_pin(&at_cap, &keys(&["a"]), false).expect("unpin must be allowed");
+        assert_eq!(planned, keys(&["a"]));
+    }
+
+    #[test]
+    fn pinning_a_whole_batch_past_the_cap_is_refused_atomically() {
+        // Partial application would leave the model unsure what is pinned.
+        let err = plan_pin(&keys(&["a", "b", "c"]), &keys(&["d", "e", "f"]), true)
+            .expect_err("3 + 3 exceeds the cap of 5");
+        assert!(err.contains("at most 5"), "{err}");
+    }
+
+    #[test]
+    fn pinning_from_empty_up_to_the_cap_is_allowed() {
+        let planned = plan_pin(&[], &keys(&["a", "b", "c", "d", "e"]), true)
+            .expect("exactly the cap must fit");
+        assert_eq!(planned.len(), MAX_PINNED_NOTES);
+    }
 
     struct MockScratchpadStore;
 
@@ -269,6 +403,15 @@ mod tests {
 
         async fn clear(&self, _conversation_id: &str) -> Result<u64, CoreError> {
             Ok(0)
+        }
+
+        async fn set_pinned(
+            &self,
+            _conversation_id: &str,
+            keys: &[String],
+            _pinned: bool,
+        ) -> Result<u64, CoreError> {
+            Ok(keys.len() as u64)
         }
 
         async fn delete_owner_subtree(

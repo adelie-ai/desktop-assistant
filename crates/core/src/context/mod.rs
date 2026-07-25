@@ -193,6 +193,10 @@ pub(crate) struct TurnAnchors<'a> {
     pub active_task: Option<&'a str>,
     pub plan: Option<&'a str>,
     pub scratchpad_index: Option<&'a str>,
+    /// Rendered `[Pinned]` block (#597): the full content of the notes the
+    /// model pinned. Ungated — unlike `scratchpad_index`, it renders every turn
+    /// whenever anything is pinned.
+    pub pinned: Option<&'a str>,
     /// Counts behind the always-on `[Working state]` nudge (#598), carried as
     /// counts rather than a rendered line so the block can drop whichever half
     /// a fuller block covers on this particular turn.
@@ -845,6 +849,9 @@ fn system_block(
 ///   every turn either count is non-zero, minus whichever half a fuller block
 ///   below already covers.
 /// - `[Plan]` — the open todo tree, whenever one exists.
+/// - `[Pinned]` — the full content of the model's pinned notes, whenever any
+///   are pinned. Deliberately ungated: the point of a pin is that the fact stays
+///   in view without the model having to notice context is under pressure.
 /// - `[Scratchpad]` — the free-form note-key index, gated on the same
 ///   "context is dropping" signal as `[Current task]`.
 fn surfaced_blocks(
@@ -938,6 +945,14 @@ fn surfaced_blocks(
 
     if let Some(plan) = plan {
         blocks.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
+    }
+
+    // Pinned note content (#597). No gate: `[Scratchpad]` is deliberately quiet
+    // until context starts dropping because it is a recall aid, but a pin exists
+    // precisely so a load-bearing fact is never one forgotten search away. The
+    // cap and byte budget - not a visibility gate - are what bound its cost.
+    if let Some(pinned) = anchors.pinned.filter(|p| !p.is_empty()) {
+        blocks.push(Message::new(Role::System, format!("[Pinned]\n{pinned}")));
     }
 
     if let Some(index) = scratchpad_index {
@@ -2852,6 +2867,124 @@ mod tests {
             .map(|m| m.content.as_str())
     }
 
+    fn pinned_text(result: &[Message]) -> Option<&str> {
+        result
+            .iter()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Pinned]"))
+            .map(|m| m.content.as_str())
+    }
+
+    // --- #597 [Pinned] block -------------------------------------------------
+
+    #[test]
+    fn pinned_block_not_gated_on_context_pressure() {
+        // The defining difference from [Scratchpad]: a pin must be in view
+        // without the model having to notice context is dropping first.
+        let msgs = vec![
+            Message::new(Role::User, "do a thing"),
+            Message::new(Role::Assistant, "on it"),
+        ];
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): foo.";
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("do a thing"),
+                scratchpad_index: Some(index),
+                pinned: Some("- deploy-target: k3s at 192.168.1.2"),
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+        assert!(
+            scratchpad_index_text(&result).is_none(),
+            "precondition: [Scratchpad] is gated silent on a short, visible turn"
+        );
+        let text = pinned_text(&result).expect("[Pinned] must render ungated, from turn one");
+        assert!(text.contains("k3s at 192.168.1.2"), "{text}");
+    }
+
+    #[test]
+    fn pin_surfaces_note_content_every_turn() {
+        // Same pin, two very different turns: still live, and windowed out.
+        let pinned = "- api-quirk: /login is form-encoded, not JSON";
+        let short = vec![
+            Message::new(Role::User, "trace it"),
+            Message::new(Role::Assistant, "ok"),
+        ];
+        let visible = assemble_for_test(
+            &ConversationView {
+                messages: &short,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("trace it"),
+                pinned: Some(pinned),
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+        assert!(
+            pinned_text(&visible).is_some_and(|t| t.contains("form-encoded")),
+            "pinned content must be present while the writing message is still live"
+        );
+
+        let long: Vec<Message> = (0..80)
+            .map(|i| Message::new(Role::Assistant, format!("filler {i}")))
+            .collect();
+        let windowed = assemble_for_test(
+            &ConversationView {
+                messages: &long,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("trace it"),
+                pinned: Some(pinned),
+                tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+        assert!(
+            pinned_text(&windowed).is_some_and(|t| t.contains("form-encoded")),
+            "pinned content must survive into a long, windowed turn — that is the point"
+        );
+    }
+
+    #[test]
+    fn unpin_removes_note_from_context() {
+        // Nothing pinned ⇒ no block at all, not an empty one.
+        let msgs = vec![Message::new(Role::User, "go")];
+        for pinned in [None, Some("")] {
+            let result = assemble_for_test(
+                &ConversationView {
+                    messages: &msgs,
+                    ..Default::default()
+                },
+                &ToolContext::default(),
+                &TurnAnchors {
+                    active_task: Some("go"),
+                    pinned,
+                    ..Default::default()
+                },
+                None,
+                &default_estimate,
+            );
+            assert!(
+                pinned_text(&result).is_none(),
+                "no [Pinned] block when nothing is pinned (pinned = {pinned:?})"
+            );
+        }
+    }
+
     #[test]
     fn working_state_renders_before_windowing() {
         // The gap the nudge exists to close: a short, unwindowed turn with zero
@@ -2959,6 +3092,7 @@ mod tests {
                 plan: Some("- [ ] 1 do the thing"),
                 scratchpad_index: Some(index),
                 working_state,
+                pinned: None,
                 tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
             },
             None,

@@ -64,6 +64,7 @@ struct SpRow {
     note_type: String,
     seq: Option<i32>,
     done: bool,
+    pinned: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -79,6 +80,7 @@ impl SpRow {
             note_type: self.note_type,
             sequence: self.seq,
             done: self.done,
+            pinned: self.pinned,
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
         }
@@ -126,7 +128,7 @@ impl ScratchpadStore for PgScratchpadStore {
              ON CONFLICT (conversation_id, owner_todo, note_key) \
              DO UPDATE SET content = EXCLUDED.content, note_type = EXCLUDED.note_type, \
                            seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW() \
-             RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
+             RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
                        created_at, updated_at",
         )
         .bind(&ids)
@@ -157,7 +159,7 @@ impl ScratchpadStore for PgScratchpadStore {
         let user_id = current_user_id();
         let (vb, me, ancestors) = read_snapshot();
         let rows: Vec<SpRow> = sqlx::query_as(
-            "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
+            "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
                     created_at, updated_at \
              FROM scratchpads \
              WHERE user_id = $1 AND conversation_id = $2 AND note_key = ANY($3) \
@@ -190,14 +192,14 @@ impl ScratchpadStore for PgScratchpadStore {
         // `note_type` filter rides a single static query via `IS NULL OR`.
         let (vb, me, ancestors) = read_snapshot();
         let rows: Vec<SpRow> = sqlx::query_as(
-            "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
+            "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
                     created_at, updated_at \
              FROM scratchpads \
              WHERE user_id = $1 AND conversation_id = $2 \
                AND ($3::text IS NULL OR note_type = $3) \
                AND ($5::text IS NULL OR (owner_todo = $6 OR owner_todo LIKE $6 || '.%' \
                     OR (id COLLATE \"C\" < $5 AND owner_todo = ANY($7::text[])))) \
-             ORDER BY note_type ASC, seq ASC NULLS LAST, updated_at DESC LIMIT $4",
+             ORDER BY pinned DESC, note_type ASC, seq ASC NULLS LAST, updated_at DESC LIMIT $4",
         )
         .bind(user_id.as_str())
         .bind(conversation_id)
@@ -226,7 +228,7 @@ impl ScratchpadStore for PgScratchpadStore {
         let (vb, me, ancestors) = read_snapshot();
         let rows: Vec<SpRow> = sqlx::query_as(
             "WITH q AS (SELECT plainto_tsquery('english', $3) AS query) \
-             SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
+             SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
                     created_at, updated_at \
              FROM scratchpads, q \
              WHERE user_id = $1 AND conversation_id = $2 AND tsv @@ q.query \
@@ -267,6 +269,40 @@ impl ScratchpadStore for PgScratchpadStore {
         .bind(conversation_id)
         .bind(&me)
         .bind(keys)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn set_pinned(
+        &self,
+        conversation_id: &str,
+        keys: &[String],
+        pinned: bool,
+    ) -> Result<u64, CoreError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let user_id = current_user_id();
+        // Confined to the caller's own namespace, exactly as `delete_many` is: a
+        // subagent may pin its own notes but never reach into the parent's or a
+        // sibling's context budget (#287).
+        let me = current_namespace();
+        // `pinned IS DISTINCT FROM $5` makes `rows_affected` the count of notes
+        // actually CHANGED, so re-pinning an already-pinned note reports 0 and
+        // the caller can tell a real change from a no-op.
+        let result = sqlx::query(
+            "UPDATE scratchpads SET pinned = $5, updated_at = NOW() \
+             WHERE user_id = $1 AND conversation_id = $2 \
+               AND owner_todo = $3 AND note_key = ANY($4) \
+               AND pinned IS DISTINCT FROM $5",
+        )
+        .bind(user_id.as_str())
+        .bind(conversation_id)
+        .bind(&me)
+        .bind(keys)
+        .bind(pinned)
         .execute(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
