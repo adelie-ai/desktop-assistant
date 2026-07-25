@@ -188,10 +188,18 @@ mod tests {
 
     #[test]
     fn implausible_uid_has_no_entry() {
-        // A UID near u32::MAX is reserved/unused on real systems, so the lookup
-        // must succeed at the syscall level but report "no such user" (None),
-        // not error.
-        let resolved = username_for_uid(u32::MAX - 1).expect("syscall should not fail");
+        // The lookup must succeed at the syscall level but report "no such user"
+        // (None) rather than erroring, so callers can tell the two apart.
+        //
+        // Choosing the uid is the subtle part — the obvious "huge number"
+        // picks are real accounts:
+        //   * `u32::MAX - 1` is uid -2, which IS `nobody` on macOS (this test
+        //     used that value and so failed on Darwin).
+        //   * `65534` is `nobody` on most Linux distributions.
+        // 4_000_000_000 sits above any normal allocation and is not one of the
+        // negative-uid special values, so it is unassigned on both platforms.
+        const UNASSIGNED_UID: u32 = 4_000_000_000;
+        let resolved = username_for_uid(UNASSIGNED_UID).expect("syscall should not fail");
         assert!(
             resolved.is_none(),
             "an unused uid should resolve to None, got {resolved:?}"
