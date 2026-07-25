@@ -11,6 +11,7 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 use desktop_assistant_dbus_bridge::transport::{read_frame, write_frame};
 use serde_json::Value;
+use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -193,9 +194,97 @@ async fn handle_daemon_connection(
     }
 }
 
+/// Longest an AF_UNIX socket path may be, in bytes.
+///
+/// `sockaddr_un::sun_path` is a fixed-size array — 104 bytes on macOS/BSD, 108
+/// on Linux, NUL terminator included — and `bind` rejects anything longer with a
+/// bare `InvalidInput`. We hold to the *smaller* of the two on every platform so
+/// a path that binds on Linux also binds on macOS; that is also why this needs no
+/// `cfg(target_os)`, which would let the two diverge silently.
+const MAX_SOCKET_PATH: usize = 104;
+
+/// A temp dir short enough to root AF_UNIX socket paths in.
+///
+/// `tempfile::tempdir()` honours `$TMPDIR`, and macOS sets that to a ~49-byte
+/// per-user path (`/var/folders/<hash>/T/`). Adding tempfile's own segment and a
+/// socket filename overran `sun_path` by a handful of bytes, so the bridge tests
+/// could not bind at all (#672). Rooting at `/tmp` — short, and present on both
+/// Linux and macOS — leaves ample headroom.
+///
+/// Falls back to the default location when `/tmp` is unusable (an unusual
+/// sandbox); [`unique_socket_path`] still checks the budget, so the failure is a
+/// clear assertion rather than a cryptic `bind` error.
+pub fn socket_tempdir() -> TempDir {
+    TempDir::new_in("/tmp")
+        .or_else(|_| TempDir::new())
+        .expect("create a temp dir for sockets")
+}
+
 /// Return a unique tempdir-rooted path to use for one of the stub
 /// sockets. Caller is responsible for keeping the tempdir alive.
+///
+/// The suffix is deliberately short (8 hex chars, not a full 36-char UUID):
+/// every byte counts against [`MAX_SOCKET_PATH`], and uniqueness only has to
+/// hold among a handful of sockets within one temp dir.
 pub fn unique_socket_path(dir: &Path, name: &str) -> PathBuf {
-    let id = uuid::Uuid::new_v4();
-    dir.join(format!("{name}-{id}.sock"))
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let path = dir.join(format!("{name}-{}.sock", &id[..8]));
+    // Fail loudly and specifically here rather than letting `bind` return an
+    // opaque InvalidInput several frames away from the actual cause.
+    assert!(
+        path.as_os_str().len() < MAX_SOCKET_PATH,
+        "socket path is {} bytes, over the {MAX_SOCKET_PATH}-byte AF_UNIX limit: {}",
+        path.as_os_str().len(),
+        path.display(),
+    );
+    path
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    use super::*;
+
+    /// The generated path must fit `sun_path` with room to spare — not merely
+    /// squeak under it. Before #672 this was over by 4 bytes on macOS, which is
+    /// the kind of margin that breaks again on the next slightly-deeper $TMPDIR.
+    #[test]
+    fn generated_socket_path_has_headroom() {
+        let dir = socket_tempdir();
+        let path = unique_socket_path(dir.path(), "daemon");
+        let len = path.as_os_str().len();
+        assert!(
+            len < MAX_SOCKET_PATH,
+            "path {len} bytes exceeds the {MAX_SOCKET_PATH}-byte limit: {}",
+            path.display()
+        );
+        // A third of the budget free, so a deeper temp root or a longer stub
+        // name does not silently put us back on the edge.
+        assert!(
+            len < MAX_SOCKET_PATH * 2 / 3,
+            "path {len} bytes leaves too little headroom under {MAX_SOCKET_PATH}: {}",
+            path.display()
+        );
+    }
+
+    /// The end-to-end property that actually failed: a socket at the generated
+    /// path can be bound. Asserting on length alone would not catch a wrong
+    /// limit, so bind a real listener.
+    #[test]
+    fn generated_socket_path_can_be_bound() {
+        let dir = socket_tempdir();
+        let path = unique_socket_path(dir.path(), "daemon");
+        let listener = std::os::unix::net::UnixListener::bind(&path)
+            .unwrap_or_else(|e| panic!("bind {} failed: {e}", path.display()));
+        drop(listener);
+    }
+
+    /// Two sockets in the same dir must not collide — the short suffix still has
+    /// to do its job.
+    #[test]
+    fn socket_paths_are_unique_within_a_dir() {
+        let dir = socket_tempdir();
+        let a = unique_socket_path(dir.path(), "daemon");
+        let b = unique_socket_path(dir.path(), "daemon");
+        assert_ne!(a, b, "two generated socket paths must differ");
+    }
 }
