@@ -30,6 +30,8 @@ struct ToolUsageRow {
     evicted_results: i64,
     first_ordinal: i32,
     last_ordinal: i32,
+    first_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ToolUsageRow {
@@ -47,6 +49,8 @@ impl ToolUsageRow {
             evicted_results: self.evicted_results.max(0) as u32,
             first_ordinal: self.first_ordinal,
             last_ordinal: self.last_ordinal,
+            first_used_at: self.first_used_at.map(|t| t.to_rfc3339()),
+            last_used_at: self.last_used_at.map(|t| t.to_rfc3339()),
         }
     }
 }
@@ -69,7 +73,8 @@ impl ToolUsageStore for PgToolUsageStore {
             "WITH calls AS ( \
                  SELECT tc->>'name' AS tool_name, \
                         tc->>'id'   AS call_id, \
-                        m.ordinal   AS ordinal \
+                        m.ordinal   AS ordinal, \
+                        m.id        AS message_id \
                  FROM messages m \
                  CROSS JOIN LATERAL jsonb_array_elements(m.tool_calls) AS tc \
                  WHERE m.user_id = $1 AND m.conversation_id = $2 \
@@ -80,7 +85,9 @@ impl ToolUsageStore for PgToolUsageStore {
                  SELECT tool_name, \
                         COUNT(*)     AS call_count, \
                         MIN(ordinal) AS first_ordinal, \
-                        MAX(ordinal) AS last_ordinal \
+                        MAX(ordinal) AS last_ordinal, \
+                        MIN(uuidv7_ts(message_id)) AS first_used_at, \
+                        MAX(uuidv7_ts(message_id)) AS last_used_at \
                  FROM calls WHERE tool_name IS NOT NULL GROUP BY tool_name \
              ), \
              result_agg AS ( \
@@ -103,7 +110,9 @@ impl ToolUsageStore for PgToolUsageStore {
                     COALESCE(ra.max_result_bytes, 0)::bigint AS max_result_bytes, \
                     COALESCE(ra.evicted_results, 0)::bigint  AS evicted_results, \
                     ca.first_ordinal::int                    AS first_ordinal, \
-                    ca.last_ordinal::int                     AS last_ordinal \
+                    ca.last_ordinal::int                     AS last_ordinal, \
+                    ca.first_used_at                         AS first_used_at, \
+                    ca.last_used_at                          AS last_used_at \
              FROM call_agg ca \
              LEFT JOIN result_agg ra ON ra.tool_name = ca.tool_name \
              ORDER BY ca.call_count DESC, ca.tool_name ASC",

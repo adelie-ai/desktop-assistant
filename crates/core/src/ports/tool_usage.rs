@@ -65,6 +65,15 @@ pub struct ToolUsage {
     /// handle anyway, since it addresses a position the UI can navigate to.
     pub first_ordinal: i32,
     pub last_ordinal: i32,
+    /// Wall-clock of the first / last call, RFC3339, or `None` for a message
+    /// predating UUIDv7 ids.
+    ///
+    /// Not a stored column: message ids ARE UUIDv7 (migration 005), whose first
+    /// 48 bits are the creation time in milliseconds — so the timestamp is
+    /// recovered from the id rather than requiring a migration, and works
+    /// retroactively on every message already stored.
+    pub first_used_at: Option<String>,
+    pub last_used_at: Option<String>,
 }
 
 impl ToolUsage {
@@ -124,6 +133,8 @@ mod tests {
             evicted_results: 0,
             first_ordinal: 0,
             last_ordinal: 0,
+            first_used_at: None,
+            last_used_at: None,
         }
     }
 

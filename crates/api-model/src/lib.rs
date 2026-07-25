@@ -723,6 +723,12 @@ pub struct ToolUsageView {
     /// where the tool entered the conversation.
     pub first_ordinal: i32,
     pub last_ordinal: i32,
+    /// Wall-clock of the first / last call (RFC3339), recovered from the
+    /// message's UUIDv7 id. `None` for messages predating UUIDv7 ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_used_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
 }
 
 /// transports and clients depend only on `api-model`.

@@ -303,6 +303,38 @@ async fn tool_usage_empty_conversation() {
 }
 
 #[tokio::test]
+async fn tool_usage_recovers_wall_clock_from_uuidv7_ids() {
+    let Some(fx) = Fixture::try_new().await else {
+        eprintln!("skipping: TEST_DATABASE_URL unset");
+        return;
+    };
+    let store = PgToolUsageStore::new(fx.pool.clone());
+    with_user_id(UserId::from("u1"), async {
+        seed(&fx.pool, "c1", &[("a1", "search")], &[])
+            .await
+            .expect("seed");
+        let rows = store.tool_usage("c1").await.expect("aggregate");
+        let search = by_name(&rows, "search");
+        // Messages carry no timestamp column; the time is recovered from the
+        // message's UUIDv7 id, so this works with no migration and retroactively.
+        let first = search
+            .first_used_at
+            .as_deref()
+            .expect("a UUIDv7 id must yield a wall-clock time");
+        let parsed = chrono::DateTime::parse_from_rfc3339(first)
+            .expect("must be RFC3339 so clients can parse it");
+        let now = chrono::Utc::now();
+        let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+        assert!(
+            age.num_seconds().abs() < 300,
+            "a just-written message should timestamp to about now, got {first}"
+        );
+    })
+    .await;
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn tool_usage_reports_first_and_last_ordinal() {
     let Some(fx) = Fixture::try_new().await else {
         eprintln!("skipping: TEST_DATABASE_URL unset");

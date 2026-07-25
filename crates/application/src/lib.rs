@@ -1335,6 +1335,8 @@ fn tool_usage_to_view(
         evicted_results: u.evicted_results,
         first_ordinal: u.first_ordinal,
         last_ordinal: u.last_ordinal,
+        first_used_at: u.first_used_at,
+        last_used_at: u.last_used_at,
     }
 }
 
