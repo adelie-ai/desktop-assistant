@@ -499,6 +499,9 @@ impl DbusClient {
                     // D-Bus transcripts are daemon-sourced, not optimistic
                     // client bubbles, so they carry no idempotency stamp (#570).
                     idempotency_key: None,
+                    // No id ⇒ no recoverable time. `None` rather than a
+                    // fabricated one: this transport genuinely does not know.
+                    created_at_ms: None,
                 })
                 .collect(),
             model_selection: None,
