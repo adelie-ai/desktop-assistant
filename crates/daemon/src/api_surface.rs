@@ -3440,6 +3440,190 @@ api_key_env = "{unused}"
                 handle.client_for(&id).is_some(),
                 "a refused reload keeps the last-good registry"
             );
+            // A refused reload must not invent a restart requirement either:
+            // the rejected edit touched only [connections], which is hot.
+            assert!(
+                handle.restart_required().is_empty(),
+                "a refused connections-only reload reports no restart requirement: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // ----- Restart-required reporting (#686) -----------------------
+        //
+        // `restart_required` answers "what is in the config file that the
+        // *running process* does not have?" by diffing the config the daemon
+        // booted with against the config on disk. That baseline is what makes
+        // it correct on the daemon-authored write path, where the file watcher
+        // sees a genuine no-op because `mutate_config` already updated the
+        // in-memory config before the watcher fired.
+
+        /// An ollama connection plus a named interactive purpose, so purpose
+        /// edits load and validate.
+        const OLLAMA_WITH_PURPOSES: &str = r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[purposes.interactive]
+connection = "local"
+model = "llama3"
+
+[purposes.embedding]
+connection = "local"
+model = "nomic-embed-text"
+"#;
+
+        #[test]
+        fn nothing_changed_since_boot_needs_no_restart() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            assert!(
+                handle.restart_required().is_empty(),
+                "a freshly booted daemon whose config is untouched needs no restart: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn daemon_authored_embedding_purpose_write_is_reported_despite_an_empty_watcher_diff() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+
+            // A daemon-authored write: `mutate_config` saves the file AND
+            // refreshes the in-memory config in one step.
+            handle
+                .mutate_config(|cfg| {
+                    cfg.purposes.set(
+                        crate::purposes::PurposeKind::Embedding,
+                        Some(PurposeConfig {
+                            connection: ConnectionRef::Named(
+                                ConnectionId::new("local").expect("test slug is valid"),
+                            ),
+                            model: ModelRef::Named("amazon.titan-embed-text-v2:0".to_string()),
+                            effort: None,
+                            max_context_tokens: None,
+                        }),
+                    );
+                    Ok(())
+                })
+                .expect("a valid purpose write succeeds");
+
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::Embeddings),
+                "a daemon-authored embedding-purpose write must report a restart requirement: {:?}",
+                handle.restart_required()
+            );
+
+            // The file watcher fires next and finds nothing to do, which is
+            // precisely why the write path has to be the one that reports.
+            let plan = handle
+                .apply_reload()
+                .expect("the watcher's re-read of our own write applies");
+            assert!(
+                plan.is_empty(),
+                "the watcher diff after a daemon-authored write is a genuine no-op: {plan:?}"
+            );
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::Embeddings),
+                "the no-op watcher pass must not clear the outstanding restart requirement"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn ws_auth_edit_is_reported_before_any_reload_runs() {
+            // `set_ws_auth_settings` writes the file directly and never touches
+            // the registry, so the answer has to come from the file.
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                format!("{OLLAMA_WITH_PURPOSES}\n[ws_auth]\nmethods = [\"oidc\"]\n"),
+            )
+            .expect("write ws_auth edit");
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::WsAuth),
+                "a [ws_auth] edit must be reported without waiting for a reload: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn tls_edit_is_reported_before_any_reload_runs() {
+            // Certificate rotation is a file-only edit with no client-facing
+            // setter at all, so the on-disk diff is the only honest source.
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                format!("{OLLAMA_WITH_PURPOSES}\n[tls]\nenabled = false\n"),
+            )
+            .expect("write tls edit");
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::Tls),
+                "a [tls] edit must be reported without waiting for a reload: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn hot_applicable_edit_reports_no_restart_requirement() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                OLLAMA_WITH_PURPOSES.replace("http://localhost:11434", "http://localhost:9999"),
+            )
+            .expect("write connection edit");
+            let plan = handle.apply_reload().expect("valid reload applies");
+            assert!(plan.rebuild_registry);
+            assert!(
+                handle.restart_required().is_empty(),
+                "a hot-applicable edit must not claim a restart is needed: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn reverting_a_restart_bound_edit_clears_the_report() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                format!("{OLLAMA_WITH_PURPOSES}\n[tls]\nenabled = false\n"),
+            )
+            .expect("write tls edit");
+            assert!(!handle.restart_required().is_empty());
+
+            std::fs::write(&path, OLLAMA_WITH_PURPOSES).expect("revert the edit");
+            assert!(
+                handle.restart_required().is_empty(),
+                "reverting the edit puts the file back in step with the running process: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn unparseable_config_falls_back_to_the_last_good_report() {
+            // A broken file must not panic the report or invent areas out of a
+            // config nobody can read. The daemon keeps running the last-good
+            // config, so that is what the report describes.
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(&path, "this is not = valid toml [[[").expect("write garbage");
+            assert!(
+                handle.restart_required().is_empty(),
+                "an unreadable config reports against the running config, not the garbage: {:?}",
+                handle.restart_required()
+            );
             let _ = std::fs::remove_file(&path);
         }
     }

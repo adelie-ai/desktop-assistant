@@ -107,7 +107,8 @@ fn areas_eq<T: serde::Serialize>(a: &T, b: &T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::{ConnectionConfig, OllamaConnection};
+    use crate::connections::{ConnectionConfig, ConnectionId, OllamaConnection};
+    use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, PurposeKind};
 
     fn cfg_with_ollama(id: &str, base: &str) -> DaemonConfig {
         let mut cfg = DaemonConfig::default();
@@ -117,6 +118,39 @@ mod tests {
                 base_url: Some(base.to_string()),
                 ..Default::default()
             }),
+        );
+        cfg
+    }
+
+    /// A fully-named purpose binding (no `primary` inheritance).
+    fn named_purpose(connection: &str, model: &str) -> PurposeConfig {
+        PurposeConfig {
+            connection: ConnectionRef::Named(
+                ConnectionId::new(connection).expect("test slug is valid"),
+            ),
+            model: ModelRef::Named(model.to_string()),
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    /// A purpose binding that inherits both halves from `interactive`.
+    fn inheriting_purpose() -> PurposeConfig {
+        PurposeConfig {
+            connection: ConnectionRef::Primary,
+            model: ModelRef::Primary,
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    /// A config with one ollama connection and a named `interactive` purpose,
+    /// which is the anchor every other purpose may inherit from.
+    fn cfg_with_interactive(model: &str) -> DaemonConfig {
+        let mut cfg = cfg_with_ollama("local", "http://localhost:11434");
+        cfg.purposes.set(
+            PurposeKind::Interactive,
+            Some(named_purpose("local", model)),
         );
         cfg
     }
@@ -169,7 +203,7 @@ mod tests {
         let plan = plan_reload(&old, &new);
         assert!(plan.needs_restart());
         assert!(
-            plan.restart_required.iter().any(|s| s == "database"),
+            plan.restart_required.contains(&RestartArea::Database),
             "database edits must be flagged restart-required: {:?}",
             plan.restart_required
         );
@@ -186,7 +220,7 @@ mod tests {
         // The hot knob in the same edit still applies …
         assert!(plan.rebuild_registry);
         // … while the restart-only knob is flagged.
-        assert!(plan.restart_required.iter().any(|s| s == "database"));
+        assert!(plan.restart_required.contains(&RestartArea::Database));
     }
 
     #[test]
@@ -196,8 +230,173 @@ mod tests {
         new.embeddings.connector = Some("ollama".to_string());
         new.tls.enabled = !old.tls.enabled;
         let plan = plan_reload(&old, &new);
-        assert!(plan.restart_required.iter().any(|s| s == "embeddings"));
-        assert!(plan.restart_required.iter().any(|s| s == "tls"));
+        assert!(plan.restart_required.contains(&RestartArea::Embeddings));
+        assert!(plan.restart_required.contains(&RestartArea::Tls));
         assert!(!plan.rebuild_registry);
+    }
+
+    #[test]
+    fn ws_auth_change_is_restart_required() {
+        // Changing the allowed authentication methods is exactly the edit an
+        // operator makes under pressure; the method set is wired into the
+        // listener once at startup, so it cannot take effect until a restart.
+        let old = DaemonConfig::default();
+        let mut new = old.clone();
+        new.ws_auth.methods = vec!["oidc".to_string()];
+        let plan = plan_reload(&old, &new);
+        assert!(
+            plan.restart_required.contains(&RestartArea::WsAuth),
+            "a [ws_auth] edit must be flagged restart-required: {:?}",
+            plan.restart_required
+        );
+        assert!(!plan.rebuild_registry);
+    }
+
+    // --- [purposes.embedding] classification (#686) -----------------------
+    //
+    // The embedding client is built once in `main` and is NOT in the
+    // connection registry, so the registry rebuild every `[purposes]` edit
+    // triggers does nothing for it. Until #685 hot-applies the embedding
+    // backend, an embedding-purpose edit needs a restart to take effect.
+
+    #[test]
+    fn embedding_purpose_change_is_restart_required() {
+        let old = {
+            let mut cfg = cfg_with_interactive("llama3");
+            cfg.purposes.set(
+                PurposeKind::Embedding,
+                Some(named_purpose("local", "nomic-embed-text")),
+            );
+            cfg
+        };
+        let new = {
+            let mut cfg = cfg_with_interactive("llama3");
+            cfg.purposes.set(
+                PurposeKind::Embedding,
+                Some(named_purpose("local", "amazon.titan-embed-text-v2:0")),
+            );
+            cfg
+        };
+        let plan = plan_reload(&old, &new);
+        assert!(
+            plan.restart_required.contains(&RestartArea::Embeddings),
+            "a [purposes.embedding] model swap must be flagged restart-required: {:?}",
+            plan.restart_required
+        );
+        // The registry rebuild still happens in the same edit; it just does
+        // nothing for the embedding client, which is the whole bug.
+        assert!(
+            plan.rebuild_registry,
+            "a [purposes] edit still rebuilds the registry"
+        );
+    }
+
+    #[test]
+    fn adding_an_embedding_purpose_is_restart_required() {
+        let old = cfg_with_interactive("llama3");
+        let mut new = old.clone();
+        new.purposes.set(
+            PurposeKind::Embedding,
+            Some(named_purpose("local", "nomic-embed-text")),
+        );
+        let plan = plan_reload(&old, &new);
+        assert!(
+            plan.restart_required.contains(&RestartArea::Embeddings),
+            "configuring the embedding purpose for the first time needs a restart: {:?}",
+            plan.restart_required
+        );
+    }
+
+    #[test]
+    fn removing_an_embedding_purpose_is_restart_required() {
+        let mut old = cfg_with_interactive("llama3");
+        old.purposes.set(
+            PurposeKind::Embedding,
+            Some(named_purpose("local", "nomic-embed-text")),
+        );
+        let mut new = old.clone();
+        new.purposes.set(PurposeKind::Embedding, None);
+        let plan = plan_reload(&old, &new);
+        assert!(
+            plan.restart_required.contains(&RestartArea::Embeddings),
+            "clearing the embedding purpose falls back to [embeddings], which also needs \
+             a restart: {:?}",
+            plan.restart_required
+        );
+    }
+
+    #[test]
+    fn inheriting_embedding_purpose_tracks_interactive_changes() {
+        // `connection = "primary"` / `model = "primary"` resolves through the
+        // interactive purpose, so an interactive edit silently re-points the
+        // embedding backend too.
+        let mut old = cfg_with_interactive("llama3");
+        old.purposes
+            .set(PurposeKind::Embedding, Some(inheriting_purpose()));
+        let mut new = cfg_with_interactive("mistral");
+        new.purposes
+            .set(PurposeKind::Embedding, Some(inheriting_purpose()));
+        let plan = plan_reload(&old, &new);
+        assert!(
+            plan.restart_required.contains(&RestartArea::Embeddings),
+            "an inheriting embedding purpose must follow the interactive purpose: {:?}",
+            plan.restart_required
+        );
+    }
+
+    #[test]
+    fn interactive_purpose_change_alone_needs_no_restart() {
+        // The hot-applicable case: no embedding purpose is configured, so
+        // re-pointing interactive is a pure registry rebuild.
+        let old = cfg_with_interactive("llama3");
+        let new = cfg_with_interactive("mistral");
+        let plan = plan_reload(&old, &new);
+        assert!(plan.rebuild_registry, "a [purposes] edit hot-applies");
+        assert!(
+            !plan.needs_restart(),
+            "an interactive-only purpose edit must not claim a restart is needed: {:?}",
+            plan.restart_required
+        );
+    }
+
+    #[test]
+    fn embedding_backend_edits_report_a_single_area() {
+        // The legacy `[embeddings]` block and `[purposes.embedding]` are two
+        // ways to configure one backend; changing both at once must not report
+        // the same restart twice.
+        let mut old = cfg_with_interactive("llama3");
+        old.purposes.set(
+            PurposeKind::Embedding,
+            Some(named_purpose("local", "nomic-embed-text")),
+        );
+        let mut new = old.clone();
+        new.embeddings.connector = Some("ollama".to_string());
+        new.purposes.set(
+            PurposeKind::Embedding,
+            Some(named_purpose("local", "mxbai-embed-large")),
+        );
+        let plan = plan_reload(&old, &new);
+        let embedding_entries = plan
+            .restart_required
+            .iter()
+            .filter(|area| **area == RestartArea::Embeddings)
+            .count();
+        assert_eq!(
+            embedding_entries, 1,
+            "one backend, one restart entry: {:?}",
+            plan.restart_required
+        );
+    }
+
+    #[test]
+    fn restart_area_keys_are_stable_wire_identifiers() {
+        // These keys cross the wire to clients; renaming one silently breaks a
+        // settings UI that matches on them.
+        assert_eq!(RestartArea::Database.as_key(), "database");
+        assert_eq!(RestartArea::Embeddings.as_key(), "embeddings");
+        assert_eq!(RestartArea::Persistence.as_key(), "persistence");
+        assert_eq!(RestartArea::WsAuth.as_key(), "ws_auth");
+        assert_eq!(RestartArea::Tls.as_key(), "tls");
+        assert_eq!(RestartArea::Profiling.as_key(), "profiling");
     }
 }

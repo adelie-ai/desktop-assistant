@@ -711,4 +711,102 @@ mod tests {
             "no probe handle must report Unknown, never a false-green Ok"
         );
     }
+
+    // --- Restart-required reporting (#686) --------------------------------
+
+    /// A daemon settings service backed by a registry booted from `toml`, with
+    /// the config file left on disk so later edits are visible to the report.
+    fn service_booted_from(toml: &str) -> (DaemonSettingsService, PathBuf) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "desktop-assistant-restart-686-{}.toml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, toml).expect("write boot config");
+        let cfg = crate::config::load_daemon_config(&path)
+            .expect("boot config parses")
+            .expect("boot config present");
+        let registry = crate::registry::build_registry(&cfg);
+        let handle = Arc::new(RegistryHandle::new(cfg, registry).with_config_path(path.clone()));
+        let service = DaemonSettingsService::new(path.clone()).with_registry(handle);
+        (service, path)
+    }
+
+    const BOOT_CONFIG: &str = r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+"#;
+
+    #[tokio::test]
+    async fn restart_required_is_empty_when_the_running_config_is_current() {
+        let (service, path) = service_booted_from(BOOT_CONFIG);
+        assert_eq!(
+            service
+                .restart_required()
+                .await
+                .expect("reporting restart areas succeeds"),
+            Vec::<String>::new()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn restart_required_reports_ws_auth_as_a_stable_area_key() {
+        let (service, path) = service_booted_from(BOOT_CONFIG);
+        std::fs::write(
+            &path,
+            format!("{BOOT_CONFIG}\n[ws_auth]\nmethods = [\"oidc\"]\n"),
+        )
+        .expect("write ws_auth edit");
+        assert_eq!(
+            service
+                .restart_required()
+                .await
+                .expect("reporting restart areas succeeds"),
+            vec!["ws_auth".to_string()],
+            "the report carries area keys only"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn restart_required_never_echoes_configured_values() {
+        // ws_auth and tls are security-relevant: the report says WHICH area is
+        // stale, never what it was set to.
+        let (service, path) = service_booted_from(BOOT_CONFIG);
+        std::fs::write(
+            &path,
+            format!(
+                "{BOOT_CONFIG}\n[ws_auth]\nmethods = [\"oidc\"]\nallowed_origins = \
+                 [\"https://secret.example\"]\n\n[ws_auth.oidc]\nissuer_url = \
+                 \"https://issuer.example\"\nauthorization_endpoint = \"\"\ntoken_endpoint = \
+                 \"\"\nclient_id = \"super-secret-client\"\nscopes = \"openid\"\njwks_uri = \
+                 \"\"\naudience = \"\"\n"
+            ),
+        )
+        .expect("write ws_auth edit");
+        let report = service
+            .restart_required()
+            .await
+            .expect("reporting restart areas succeeds");
+        let joined = report.join(",");
+        assert!(
+            !joined.contains("secret.example") && !joined.contains("super-secret-client"),
+            "the restart report must not disclose configuration values: {report:?}"
+        );
+        assert_eq!(report, vec!["ws_auth".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn restart_required_without_a_registry_is_an_explicit_error() {
+        // No registry means the daemon cannot know what it booted with;
+        // answering "nothing" would be a false green.
+        let service = DaemonSettingsService::new(available_config_path());
+        assert!(
+            service.restart_required().await.is_err(),
+            "an unwired service must not claim the running config is current"
+        );
+    }
 }

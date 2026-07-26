@@ -533,3 +533,126 @@ async fn empty_per_turn_client_context_keeps_connection_context() {
         "an empty per-turn context must fall back to the connection context"
     );
 }
+
+// --- Restart-required reporting (#686) --------------------------------------
+//
+// `SetWsAuthSettings` answers with a bare `Ack` and its wire shape is frozen
+// (older clients match on `Ack`), so the dispatcher tells the caller the same
+// way a `SetConfig` already does: it follows the result with a `ConfigChanged`
+// event carrying the config, whose `restart_required` names the areas that
+// cannot take effect until the daemon restarts.
+
+struct WsAuthHandler;
+
+fn config_with_restart_required(areas: &[&str]) -> api::Config {
+    api::Config {
+        embeddings: api::EmbeddingsSettingsView {
+            connector: "ollama".into(),
+            model: "nomic-embed-text".into(),
+            base_url: "http://localhost:11434".into(),
+            has_api_key: false,
+            available: true,
+            is_default: false,
+            health: api::EmbeddingHealth::Ok,
+        },
+        persistence: api::PersistenceSettingsView {
+            enabled: false,
+            remote_url: String::new(),
+            remote_name: "origin".into(),
+            push_on_update: false,
+        },
+        personality: api::PersonalitySettingsView::default(),
+        restart_required: areas.iter().map(|a| (*a).to_string()).collect(),
+    }
+}
+
+#[async_trait::async_trait]
+impl AssistantApiHandler for WsAuthHandler {
+    async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult> {
+        match cmd {
+            api::Command::SetWsAuthSettings { .. } => Ok(api::CommandResult::Ack),
+            api::Command::GetConfig => {
+                Ok(api::CommandResult::Config(config_with_restart_required(&[
+                    "ws_auth",
+                ])))
+            }
+            _ => Err(ApiError::Unsupported),
+        }
+    }
+
+    async fn handle_send_message(
+        &self,
+        _conversation_id: String,
+        _content: String,
+        _request_id: String,
+        _sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        Err(ApiError::Unsupported)
+    }
+}
+
+/// Drive one command through the dispatcher and collect every frame it emits.
+async fn frames_for(handler: Arc<dyn AssistantApiHandler>, command: api::Command) -> Vec<WsFrame> {
+    use futures::StreamExt;
+    let req = WsRequest {
+        id: "wsa-1".into(),
+        command,
+    };
+    let inbound = stream::iter(vec![Ok::<_, anyhow::Error>(req)]);
+    let (out_tx, mut out_rx) = mpsc::channel::<WsFrame>(8);
+    let dispatch = tokio::spawn(dispatch_loop(
+        handler,
+        AuthContext::anonymous(),
+        inbound,
+        out_tx,
+    ));
+    let mut frames = Vec::new();
+    while let Ok(Some(frame)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.next()).await
+    {
+        frames.push(frame);
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), dispatch)
+        .await
+        .expect("dispatch task did not exit after inbound ended");
+    frames
+}
+
+#[tokio::test]
+async fn set_ws_auth_settings_tells_the_caller_a_restart_is_required() {
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(WsAuthHandler);
+    let frames = frames_for(
+        handler,
+        api::Command::SetWsAuthSettings {
+            methods: vec!["oidc".into()],
+            oidc_issuer: "https://issuer.example".into(),
+            oidc_auth_endpoint: String::new(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: "client-1".into(),
+            oidc_scopes: String::new(),
+        },
+    )
+    .await;
+
+    // The result frame is unchanged, so an older client is unaffected.
+    match frames.first() {
+        Some(WsFrame::Result { id, result }) => {
+            assert_eq!(id, "wsa-1");
+            assert_eq!(*result, api::CommandResult::Ack);
+        }
+        other => panic!("expected an Ack result frame first, got {other:?}"),
+    }
+
+    let restart_areas = frames.iter().find_map(|frame| match frame {
+        WsFrame::Event {
+            event: api::Event::ConfigChanged { config },
+        } => Some(config.restart_required.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        restart_areas,
+        Some(vec!["ws_auth".to_string()]),
+        "a ws_auth write must report the restart requirement to the client that made it: \
+         {frames:?}"
+    );
+}
