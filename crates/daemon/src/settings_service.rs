@@ -101,6 +101,22 @@ impl DaemonSettingsService {
 }
 
 impl SettingsService for DaemonSettingsService {
+    /// Report the config areas the running process is behind on (#686).
+    ///
+    /// Answered by the registry handle, which holds the config the daemon
+    /// booted from: the only baseline that stays honest whether the change
+    /// arrived via a client write, a daemon-authored write, or a hand edit.
+    /// Requires the registry: without it the daemon has no boot snapshot, and
+    /// answering "nothing" would be a false green.
+    async fn restart_required(&self) -> Result<Vec<String>, CoreError> {
+        Ok(self
+            .registry()?
+            .restart_required()
+            .into_iter()
+            .map(|area| area.as_key().to_string())
+            .collect())
+    }
+
     async fn get_llm_settings(&self) -> Result<LlmSettingsView, CoreError> {
         let view = config::get_llm_settings_view(&self.config_path)
             .map_err(|error| CoreError::SystemService(error.to_string()))?;

@@ -21,8 +21,55 @@
 //!   TLS, and profiling. A reload still applies every hot knob in the same
 //!   edit; these are flagged in the plan so the daemon logs that a restart is
 //!   needed for them to take effect, rather than silently ignoring them.
+//!
+//! The embedding backend is a purpose-driven knob that lands in the *hot*
+//! arm's diff (`[purposes]`) but is not hot-applicable: the embedding client is
+//! built once in `main` and is not in the connection registry, so the rebuild
+//! does nothing for it. It is classified restart-required here until #685
+//! rebuilds it live (see [`embedding_backend_changed`]).
 
 use super::DaemonConfig;
+use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, PurposeKind};
+
+/// A config area whose value is wired once at process start, so an edit to it
+/// cannot take effect until the daemon restarts.
+///
+/// A closed set rather than free strings because [`Self::as_key`] crosses the
+/// wire to clients (`api-model`'s `Config::restart_required`): a typo in a
+/// classifier would silently break a settings UI that matches on these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartArea {
+    /// `[database]`: the pool and URL are opened once at startup.
+    Database,
+    /// The embedding backend, whether configured via the legacy `[embeddings]`
+    /// block or `[purposes.embedding]`. Removed by #685.
+    Embeddings,
+    /// `[persistence]`: the git-backed history mirror is wired once.
+    Persistence,
+    /// `[ws_auth]`: the allowed authentication methods, OIDC discovery, and
+    /// permitted browser origins are read into the listener once.
+    WsAuth,
+    /// `[tls]`: the certificate resolver is built once, so rotation needs a
+    /// restart.
+    Tls,
+    /// `[profiling]`: the profiler is installed (or not) at startup.
+    Profiling,
+}
+
+impl RestartArea {
+    /// Stable identifier for this area, safe to put on the wire and to match on
+    /// in a client. Never carries a configured *value*, only the area name.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::Embeddings => "embeddings",
+            Self::Persistence => "persistence",
+            Self::WsAuth => "ws_auth",
+            Self::Tls => "tls",
+            Self::Profiling => "profiling",
+        }
+    }
+}
 
 /// The work a reload implies, derived purely from the old/new
 /// [`DaemonConfig`]. Pure and side-effect-free.
@@ -31,10 +78,10 @@ pub struct ReloadPlan {
     /// Rebuild the connection registry: `[connections]`, `[purposes]`, or the
     /// legacy `[llm]` block changed. New turns route through the new clients.
     pub rebuild_registry: bool,
-    /// Knobs that only take effect on a full process restart (database,
-    /// embeddings, persistence, ws-auth, TLS, profiling). Human-readable
-    /// labels for the log; applying a reload does not act on them.
-    pub restart_required: Vec<String>,
+    /// Areas that only take effect on a full process restart. Applying a reload
+    /// does not act on them; they are reported so the daemon logs, and tells
+    /// the client that made the change, that a restart is still needed.
+    pub restart_required: Vec<RestartArea>,
 }
 
 impl ReloadPlan {
@@ -47,15 +94,22 @@ impl ReloadPlan {
     pub fn needs_restart(&self) -> bool {
         !self.restart_required.is_empty()
     }
+
+    /// The restart-required areas as stable wire/log identifiers.
+    pub fn restart_required_keys(&self) -> Vec<String> {
+        self.restart_required
+            .iter()
+            .map(|area| area.as_key().to_string())
+            .collect()
+    }
 }
 
 /// Diff two [`DaemonConfig`] snapshots into the concrete work a reload implies.
 ///
 /// - `[connections]` / `[purposes]` / `[llm]` changes set `rebuild_registry`
 ///   (hot-applied by swapping the registry under its lock).
-/// - `[database]` / `[embeddings]` / `[persistence]` / `[ws_auth]` / `[tls]` /
-///   `[profiling]` changes are flagged in `restart_required` because those
-///   subsystems are constructed once at daemon startup.
+/// - Edits to any [`RestartArea`] are reported in `restart_required` because
+///   those subsystems are constructed once at daemon startup.
 pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
     let mut plan = ReloadPlan::default();
 
@@ -72,25 +126,65 @@ pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
 
     // Restart-required: subsystems wired once at startup.
     if !areas_eq(&old.database, &new.database) {
-        plan.restart_required.push("database".to_string());
+        plan.restart_required.push(RestartArea::Database);
     }
-    if !areas_eq(&old.embeddings, &new.embeddings) {
-        plan.restart_required.push("embeddings".to_string());
+    // Until #685 rebuilds the embedding client live, every way of configuring
+    // it is restart-bound. Reported as ONE area because it is one backend.
+    if embedding_backend_changed(old, new) {
+        plan.restart_required.push(RestartArea::Embeddings);
     }
     if !areas_eq(&old.persistence, &new.persistence) {
-        plan.restart_required.push("persistence (git)".to_string());
+        plan.restart_required.push(RestartArea::Persistence);
     }
     if !areas_eq(&old.ws_auth, &new.ws_auth) {
-        plan.restart_required.push("ws_auth".to_string());
+        plan.restart_required.push(RestartArea::WsAuth);
     }
     if !areas_eq(&old.tls, &new.tls) {
-        plan.restart_required.push("tls".to_string());
+        plan.restart_required.push(RestartArea::Tls);
     }
     if !areas_eq(&old.profiling, &new.profiling) {
-        plan.restart_required.push("profiling".to_string());
+        plan.restart_required.push(RestartArea::Profiling);
     }
 
     plan
+}
+
+/// Whether the embedding backend the daemon would build differs between the two
+/// configs. Removed by #685 along with its call site.
+///
+/// Three inputs feed `resolve_embeddings_config`, so all three are compared:
+/// the legacy `[embeddings]` block, the `[purposes.embedding]` entry that
+/// overrides it, and, when that entry inherits via the `primary` sentinel,
+/// the `[purposes.interactive]` entry it inherits from.
+///
+/// Deliberately structural rather than calling the resolver: resolution reads
+/// API keys out of the secret backend, and `plan_reload` must stay pure.
+fn embedding_backend_changed(old: &DaemonConfig, new: &DaemonConfig) -> bool {
+    if !areas_eq(&old.embeddings, &new.embeddings) {
+        return true;
+    }
+
+    let old_embedding = old.purposes.get(PurposeKind::Embedding);
+    let new_embedding = new.purposes.get(PurposeKind::Embedding);
+    if old_embedding != new_embedding {
+        return true;
+    }
+
+    if inherits_from_interactive(old_embedding) {
+        return old.purposes.get(PurposeKind::Interactive)
+            != new.purposes.get(PurposeKind::Interactive);
+    }
+
+    false
+}
+
+/// Whether a purpose entry resolves through the `interactive` purpose. A mixed
+/// pair is refused on the write path, but a config already on disk can carry
+/// one, so either half counts.
+fn inherits_from_interactive(purpose: Option<&PurposeConfig>) -> bool {
+    purpose.is_some_and(|cfg| {
+        matches!(cfg.connection, ConnectionRef::Primary) || matches!(cfg.model, ModelRef::Primary)
+    })
 }
 
 /// Structural equality of two config sub-areas via their TOML form. The config

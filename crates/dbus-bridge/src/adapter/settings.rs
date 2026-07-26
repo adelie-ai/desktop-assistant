@@ -1062,6 +1062,7 @@ mod tests {
                 push_on_update: false,
             },
             personality: api::PersonalitySettingsView::default(),
+            restart_required: Vec::new(),
         };
         let data = config_from_wire(&wire);
         assert_eq!(data.embeddings_connector, "openai");
@@ -1195,6 +1196,7 @@ mod tests {
                 push_on_update: true,
             },
             personality: api::PersonalitySettingsView::default(),
+            restart_required: Vec::new(),
         }));
         let data = settings(Arc::clone(&t)).get_config().await.unwrap();
         assert_eq!(data.embeddings_connector, "openai");

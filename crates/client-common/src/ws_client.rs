@@ -785,6 +785,7 @@ mod tests {
                     push_on_update: true,
                 },
                 personality: api::PersonalitySettingsView::default(),
+                restart_required: Vec::new(),
             },
         });
         assert!(event.is_none());

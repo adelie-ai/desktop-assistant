@@ -964,6 +964,24 @@ pub struct Config {
     /// [`PersonalitySettingsView`]).
     #[serde(default)]
     pub personality: PersonalitySettingsView,
+    /// Config areas whose configured value cannot take effect until the daemon
+    /// is restarted (#686). Empty means every configured value is live.
+    ///
+    /// Entries are stable area keys - `"database"`, `"embeddings"`,
+    /// `"persistence"`, `"ws_auth"`, `"tls"`, `"profiling"` - deliberately an
+    /// open set so a daemon that learns a new area does not break an older
+    /// client. Clients should render unrecognized keys verbatim rather than
+    /// dropping them.
+    ///
+    /// SECURITY: area names only. A pending `[ws_auth]` or `[tls]` change is
+    /// reported without disclosing what it was changed to.
+    ///
+    /// Additive and backward-compatible: `#[serde(default)]` means a payload
+    /// from an older daemon that omits the field still deserializes, and an
+    /// empty report is omitted on the wire so an older client sees exactly the
+    /// payload it saw before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_required: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

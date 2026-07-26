@@ -721,15 +721,27 @@ pub async fn dispatch_loop<R, W>(
             }
 
             other => {
+                // A ws-auth write is restart-bound: the allowed methods, OIDC
+                // discovery, and permitted origins are read into the listener
+                // once at startup. Its result shape is a bare `Ack` and is
+                // frozen (older clients match on it), so the caller is told the
+                // way `SetConfig` already tells it: follow the ack with a
+                // `ConfigChanged` whose `restart_required` names what is still
+                // pending (#686).
+                let report_config_after = matches!(other, api::Command::SetWsAuthSettings { .. });
                 let res = with_user_id(
                     user_id.clone(),
                     with_session_id(session_id.clone(), handler.handle_command(other)),
                 )
                 .await;
+                let applied = res.is_ok();
                 match res {
                     Ok(result) => {
                         if out_tx
-                            .send(WsFrame::Result { id: req.id, result })
+                            .send(WsFrame::Result {
+                                id: req.id.clone(),
+                                result,
+                            })
                             .await
                             .is_err()
                         {
@@ -759,6 +771,29 @@ pub async fn dispatch_loop<R, W>(
                         {
                             break;
                         }
+                    }
+                }
+                // Best-effort follow-up: a config read that fails must not turn
+                // a write the daemon already applied into a client-visible
+                // error, so an unreadable config just means no event.
+                if report_config_after && applied {
+                    let config = with_user_id(
+                        user_id.clone(),
+                        with_session_id(
+                            session_id.clone(),
+                            handler.handle_command(api::Command::GetConfig),
+                        ),
+                    )
+                    .await;
+                    if let Ok(api::CommandResult::Config(config)) = config
+                        && out_tx
+                            .send(WsFrame::Event {
+                                event: api::Event::ConfigChanged { config },
+                            })
+                            .await
+                            .is_err()
+                    {
+                        break;
                     }
                 }
             }

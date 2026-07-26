@@ -806,6 +806,15 @@ where
             .get_personality_settings()
             .await
             .map_err(Self::map_core_err)?;
+        // #686: which configured values the running process does not yet have.
+        // Reported on every config read AND on the `SetConfig` reply, so the
+        // client that made a restart-bound change learns it needs a restart
+        // instead of seeing a bare success.
+        let restart_required = self
+            .settings
+            .restart_required()
+            .await
+            .map_err(Self::map_core_err)?;
 
         Ok(api::Config {
             embeddings: api::EmbeddingsSettingsView {
@@ -833,6 +842,7 @@ where
             // `PersonalitySettingsView` is the core `Personality` type in both
             // the port and the api-model, so this is the identity conversion.
             personality,
+            restart_required,
         })
     }
 
