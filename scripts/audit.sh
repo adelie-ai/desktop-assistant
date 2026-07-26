@@ -101,6 +101,24 @@ if [ "$scan_status" -ne 0 ]; then
         '"Security review"). Never ship past one silently.'
 fi
 
+# A configured ignore list makes cargo-audit report "found":false and exit 0
+# for an advisory that is really there, which is the #706 shape again: the gate
+# says clean because it was told not to look. Suppression is a legitimate,
+# reviewed decision, so it does not fail the step - but it is never silent.
+suppressed=''
+ignored="$(grep -o '"ignore":\[[^]]*\]' "$report" | head -1 | sed 's/^"ignore":\[//; s/\]$//' || true)"
+if [ -n "$ignored" ]; then
+    loud 'DEPENDENCY SCAN: advisories suppressed by configuration' \
+        'cargo-audit was configured to ignore these advisories, so the result' \
+        'below does not account for them:' \
+        '' \
+        "    $ignored" \
+        '' \
+        'They come from an `[advisories] ignore` list in an audit.toml. Drop the' \
+        'entry, or say in the PR why the advisory cannot reach this code.'
+    suppressed=', with advisories suppressed by configuration'
+fi
+
 # Informational advisories (unmaintained / unsound / yanked) do not fail the
 # scan by default, but they are review items, so they do not slip past silently.
 outcome='clean'
@@ -118,5 +136,5 @@ field() { # field <json-key> - best-effort, cosmetic only
     value="$(grep -o "\"$1\":[0-9]*" "$report" | head -1 | cut -d: -f2 || true)"
     printf '%s' "${value:-?}"
 }
-printf 'audit: %s - %s dependencies scanned against %s advisories\n' \
-    "$outcome" "$(field dependency-count)" "$(field advisory-count)"
+printf 'audit: %s%s - %s dependencies scanned against %s advisories\n' \
+    "$outcome" "$suppressed" "$(field dependency-count)" "$(field advisory-count)"

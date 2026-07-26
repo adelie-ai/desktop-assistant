@@ -11,7 +11,9 @@
 #   start            provision a container, print its settings as shell exports
 #   run -- CMD...    provision, run CMD with TEST_DATABASE_URL set, tear down
 #   stop NAME...     remove named containers (refuses anything foreign)
-#   prune            remove containers left behind by killed invocations
+#   prune            remove every container of this harness that no live run
+#                    owns - a `run` in flight keeps its database, a container
+#                    from `start` has no live owner and is swept
 #
 # Environment:
 #   CONTAINER_CLI            podman|docker (auto-detected when unset)
@@ -125,13 +127,35 @@ start_container() {
     trap remove_created EXIT
     trap 'remove_created; exit 130' INT TERM
 
-    CREATED_PORT="$("$CLI" port "$name" 5432/tcp 2>/dev/null | head -1 | sed 's/.*://')"
+    # Capture the status rather than letting the pipeline carry it: under
+    # `set -euo pipefail` a failing `port` aborts at the assignment, which took
+    # the diagnostic below with it. That is the case that most needs one - the
+    # container died right after `run` and `--rm` already removed it.
+    local port_out port_err port_status=0
+    port_err="$(mktemp)"
+    port_out="$("$CLI" port "$name" 5432/tcp 2>"$port_err")" || port_status=$?
+    # First line, then whatever follows the last colon - `podman port` answers
+    # with one line per binding, and an IPv6 one has colons of its own. Done
+    # with expansions rather than `head | sed`, so a multi-line answer cannot
+    # hand the assignment an EPIPE and abort the script instead of reporting.
+    CREATED_PORT="${port_out%%$'\n'*}"
+    CREATED_PORT="${CREATED_PORT##*:}"
+    local bad_port=''
     case "$CREATED_PORT" in
-        '' | *[!0-9]*)
-            die "could not read the published host port of $name" \
-                "'$CLI port $name 5432/tcp' did not report a port."
-            ;;
+        '' | *[!0-9]*) bad_port=1 ;;
     esac
+    if [ "$port_status" -ne 0 ] || [ -n "$bad_port" ]; then
+        local port_detail
+        port_detail="$( { [ -z "$port_out" ] || printf '%s\n' "$port_out"; cat "$port_err"; } |
+            sed 's/^/  /' | head -10 || true)"
+        rm -f "$port_err"
+        die "could not read the published host port of $name" \
+            "'$CLI port $name 5432/tcp' exited $port_status and reported:" \
+            "$port_detail" \
+            'A container that has already exited is the usual cause; --rm then' \
+            'removes it before it can be inspected.'
+    fi
+    rm -f "$port_err"
 
     wait_for_postgres "$name"
     log "$name is ready on 127.0.0.1:$CREATED_PORT"
@@ -167,6 +191,9 @@ cmd_start() {
     # The caller keeps the container, so drop the teardown this invocation
     # installed; `just test-db-down` removes it.
     trap - EXIT INT TERM
+    # No process owns this container once this one exits, so `prune` will sweep
+    # it - along with any other session's. Name it and only it comes down.
+    log "tear down with: just test-db-down $CREATED_NAME"
     printf "export ADELE_TEST_DB_CONTAINER='%s'\n" "$CREATED_NAME"
     printf "export TEST_DATABASE_URL='%s'\n" "$(database_url)"
     CREATED_NAME=''
@@ -200,20 +227,35 @@ cmd_stop() {
 
 cmd_prune() {
     resolve_cli
-    local names name pruned=0
+    local names name pid pruned=0 kept=0
     names="$("$CLI" ps -a --filter "label=$LABEL" --format '{{.Names}}' 2>/dev/null || true)"
-    # Deliberately unquoted: one container name per line.
-    # shellcheck disable=SC2086
-    for name in $names; do
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
         case "$name" in
             "$NAME_PREFIX"-*) ;;
             *) continue ;;
         esac
+        # The name carries the pid of the invocation that created the
+        # container, and a live pid means the container is in use rather than
+        # left behind. Removing that one is #662 again: a database vanishing
+        # mid-test, seen from the other session as a flake in an unrelated
+        # suite. Where the check is inexact it errs towards keeping - a
+        # recycled pid costs a leftover one more sweep, and unique names mean a
+        # leftover never blocks a run. A name with no numeric pid cannot have
+        # come from this script, so nothing owns it. (Another user's pid is not
+        # signalable, so a shared rootful daemon would still sweep theirs.)
+        pid="${name#"$NAME_PREFIX"-}"
+        pid="${pid%%-*}"
+        if [ -n "$pid" ] && [ -z "${pid//[0-9]/}" ] && kill -0 "$pid" 2>/dev/null; then
+            log "keeping $name - its run (pid $pid) is still going"
+            kept=$((kept + 1))
+            continue
+        fi
         "$CLI" rm -f "$name" >/dev/null 2>&1 || true
         log "removed leftover $name"
         pruned=$((pruned + 1))
-    done
-    log "pruned $pruned leftover container(s)"
+    done <<<"$names"
+    log "pruned $pruned leftover container(s), kept $kept still in use"
 }
 
 case "${1:-}" in
