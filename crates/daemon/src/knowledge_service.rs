@@ -424,6 +424,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_authored_create_is_explicit() {
+        // A user creating an entry from a client is deliberate authorship, so
+        // it carries the same provenance the builtin `knowledge_base` tool
+        // stamps on its own writes.
+        let store = Arc::new(InMemoryStore::default());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store)).with_id_generator(|| "kb-p".into());
+
+        let entry = service
+            .create_entry("a deliberate fact".into(), vec![], serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entry.source.as_deref(),
+            Some("explicit"),
+            "client-authored create must return provenance explicit"
+        );
+        let stored = store.entries.lock().unwrap();
+        assert_eq!(
+            stored[0].source.as_deref(),
+            Some("explicit"),
+            "client-authored create must persist provenance explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_driven_update_is_explicit_without_duplicating() {
+        // Editing an entry from a client is authorship too: it promotes
+        // provenance to explicit, and still upserts on id rather than
+        // appending a second row.
+        let store = Arc::new(InMemoryStore::default());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store)).with_id_generator(|| "kb-q".into());
+
+        store
+            .write(
+                KnowledgeEntry::new("kb-q", "learned by extraction", vec![])
+                    .with_source("extraction"),
+            )
+            .await
+            .unwrap();
+
+        let entry = service
+            .update_entry(
+                "kb-q".into(),
+                "corrected by the user".into(),
+                vec![],
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entry.source.as_deref(),
+            Some("explicit"),
+            "client-driven update must return provenance explicit"
+        );
+        let stored = store.entries.lock().unwrap();
+        assert_eq!(stored.len(), 1, "update must not create a duplicate");
+        assert_eq!(
+            stored[0].source.as_deref(),
+            Some("explicit"),
+            "client-driven update must persist provenance explicit"
+        );
+        assert_eq!(stored[0].content, "corrected by the user");
+    }
+
+    #[tokio::test]
     async fn unconfigured_service_returns_storage_error() {
         let svc = UnconfiguredKnowledgeService;
         let err = svc.list_entries(10, 0, None).await.unwrap_err();
