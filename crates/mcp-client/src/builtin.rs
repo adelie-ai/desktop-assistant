@@ -52,11 +52,11 @@ const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// The active embedding backend: the function that turns a query into a vector,
 /// together with the identifier of the model behind it.
 ///
-/// One field rather than two so a caller reads them in a single load and cannot
-/// pair a vector with the wrong model's name. That matters for a live backend
-/// swap: the searches scope their vector arm to the model that produced the
-/// query vector, and a torn read of the pair would compare vectors of different
-/// dimensions.
+/// One field rather than two because the searches scope their vector arm to the
+/// model that produced the query vector, so a vector paired with another
+/// model's identifier searches the wrong rows -- and across a dimension change,
+/// raises. Holding the pair in one place means it can only ever be replaced as
+/// a unit.
 struct EmbeddingBackend {
     embed: EmbedFn,
     model: String,
@@ -1811,24 +1811,30 @@ impl BuiltinToolService {
 
     /// Embed a query and report which model produced the vector.
     ///
+    /// Both come from one read of the active backend, so the vector and the
+    /// model identifier a search filters on always describe the same backend.
     /// The vector is empty when embeddings are unavailable or the backend
     /// stalled, which every search reads as "take the full-text path"; the
-    /// model identifier is then unused. Returned as one value so the two can
-    /// never be read from different backends.
+    /// model identifier is then unused.
     async fn embed_query(&self, text: &str) -> (Vec<f32>, String) {
-        let model = self
-            .embedding
-            .as_ref()
-            .map(|e| e.model.clone())
+        let Some(backend) = self.embedding.as_ref() else {
+            return (Vec::new(), String::new());
+        };
+        let vector = Self::embed_with(&backend.embed, text)
+            .await
             .unwrap_or_default();
-        (self.embed_text(text).await.unwrap_or_default(), model)
+        (vector, backend.model.clone())
     }
 
     /// Embed a single text string, returning None if embeddings are unavailable.
     /// Used for search queries which are always short and don't need chunking.
     async fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
-        let embed_fn = &self.embedding.as_ref()?.embed;
-        match tokio::time::timeout(EMBED_TIMEOUT, embed_fn(vec![text.to_string()])).await {
+        Self::embed_with(&self.embedding.as_ref()?.embed, text).await
+    }
+
+    /// Embed one short text through `embed`, bounded by [`EMBED_TIMEOUT`].
+    async fn embed_with(embed: &EmbedFn, text: &str) -> Option<Vec<f32>> {
+        match tokio::time::timeout(EMBED_TIMEOUT, embed(vec![text.to_string()])).await {
             Ok(Ok(mut vecs)) => vecs.pop(),
             Ok(Err(e)) => {
                 tracing::warn!("failed to embed text: {e}");

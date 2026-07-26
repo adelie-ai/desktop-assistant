@@ -122,10 +122,20 @@ impl PgSkillIndexStore {
         &self,
         query: &str,
         query_embedding: Vec<f32>,
-        _embedding_model: &str,
+        embedding_model: &str,
         limit: usize,
     ) -> Result<Vec<IndexedSkill>, CoreError> {
         let user = current_user_id();
+        // $6 = the model that produced $2. Only rows embedded by that model can
+        // be compared against it (a cross-model comparison is a cross-dimension
+        // comparison, which raises rather than missing), so the predicate sits
+        // on `vector_ranked` alone -- `tr` below stays model-blind so a model
+        // change degrades to full-text recall instead of hiding skills.
+        //
+        // Sameness is decided on the digest half of the `<name>@<digest>` stamp
+        // wherever both sides carry one, matching
+        // `embedding_backfill::invalidate_stale_embeddings`, so a cosmetic
+        // rename does not blank search until the sweep restamps the rows.
         let rows: Vec<SkillRow> = sqlx::query_as(
             "WITH scope AS ( \
                  SELECT * FROM skill_index \
@@ -135,6 +145,11 @@ impl PgSkillIndexStore {
                  SELECT name, owner_key, MIN(chunk <=> $2) AS dist \
                  FROM scope, unnest(embedding) AS chunk \
                  WHERE embedding IS NOT NULL \
+                   AND embedding_model IS NOT NULL \
+                   AND (embedding_model = $6 \
+                        OR (split_part($6, '@', 2) <> '' \
+                            AND split_part(embedding_model, '@', 2) \
+                                = split_part($6, '@', 2))) \
                  GROUP BY name, owner_key \
              ), \
              vr AS ( \
@@ -167,6 +182,7 @@ impl PgSkillIndexStore {
         .bind(query)
         .bind((limit * 2) as i64)
         .bind(limit as i64)
+        .bind(embedding_model)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

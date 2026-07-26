@@ -74,7 +74,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         &self,
         query: &str,
         query_embedding: Vec<f32>,
-        _embedding_model: &str,
+        embedding_model: &str,
         tags: Option<Vec<String>>,
         exclude_tags: Option<Vec<String>>,
         limit: usize,
@@ -101,6 +101,22 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         let result_limit = limit as i64;
 
         // $7 = exclude_tags: drop any row carrying one of these tags.
+        //
+        // $8 = the model that produced $1. Only rows embedded by that model can
+        // be compared against it, so the predicate belongs on this branch and
+        // this branch alone: `text_ranked` below stays model-blind, which is
+        // what turns a model change into degraded (lexical-only) recall instead
+        // of content that cannot be found at all.
+        //
+        // Sameness is decided on the digest half of the `<name>@<digest>` stamp
+        // wherever both sides carry one, matching
+        // `embedding_backfill::invalidate_stale_embeddings`: a purely cosmetic
+        // rename leaves usable vectors in place, and hiding them until the
+        // sweep restamps them would blank semantic search for no reason.
+        // `split_part(x, '@', 2)` yields '' when there is no '@', so the
+        // non-empty test doubles as "both sides carry a digest". A NULL stamp is
+        // a vector of unknown provenance, hence unknown dimension, and is
+        // excluded.
         let rows: Vec<KbSearchRow> = sqlx::query_as(
             "WITH chunk_distances AS (
                 SELECT id, content, tags, metadata, created_at, updated_at,
@@ -111,6 +127,11 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                   AND ($2::text[] IS NULL OR tags && $2)
                   AND ($7::text[] IS NULL OR NOT (tags && $7))
                   AND embedding IS NOT NULL
+                  AND embedding_model IS NOT NULL
+                  AND (embedding_model = $8
+                       OR (split_part($8, '@', 2) <> ''
+                           AND split_part(embedding_model, '@', 2)
+                               = split_part($8, '@', 2)))
                 GROUP BY id, content, tags, metadata, created_at, updated_at
             ),
             vector_ranked AS (
@@ -153,6 +174,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(result_limit)
         .bind(user_id.as_str())
         .bind(&exclude_tags)
+        .bind(embedding_model)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

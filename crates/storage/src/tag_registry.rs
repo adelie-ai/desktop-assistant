@@ -160,15 +160,28 @@ pub async fn create_or_match_tag(
         .ok_or_else(|| CoreError::Storage("tag_registry: embed returned no vectors".to_string()))?;
     let query_vec = Vector::from(vector);
 
+    // $3 = the model that produced $1. Only rows embedded by that model can be
+    // compared against it: a stored vector from another model has another
+    // dimension, and `<=>` answers that with an error rather than a distance,
+    // which would fail every tag creation instead of degrading the dedup check.
+    // Sameness is decided on the digest half of the `<name>@<digest>` stamp
+    // wherever both sides carry one, matching
+    // `embedding_backfill::invalidate_stale_embeddings`, so a cosmetic rename
+    // keeps the vocabulary deduplicating against its own vectors.
     let nearest: Option<(String, String, serde_json::Value, Vec<String>, f64)> = sqlx::query_as(
         "SELECT name, description, examples, distinguish_from, (embedding <=> $1) AS distance \
          FROM tag_registry \
          WHERE user_id = $2 AND deprecated_for_tag IS NULL AND embedding IS NOT NULL \
+           AND embedding_model IS NOT NULL \
+           AND (embedding_model = $3 \
+                OR (split_part($3, '@', 2) <> '' \
+                    AND split_part(embedding_model, '@', 2) = split_part($3, '@', 2))) \
          ORDER BY embedding <=> $1 \
          LIMIT 1",
     )
     .bind(&query_vec)
     .bind(user_id.as_str())
+    .bind(embedding_model)
     .fetch_optional(pool)
     .await
     .map_err(|e| CoreError::Storage(format!("tag_registry: nearest search failed: {e}")))?;

@@ -25,6 +25,26 @@ current model (`invalidate_stale_embeddings`). The **Recalculate Embeddings**
 button is the force escape hatch for out-of-band cases (rows edited by raw SQL,
 corrupted vectors).
 
+Correctness across a model change does not rest on that sweep. Three of the four
+vector searches - knowledge, skills, and the tag-registry dedup check - also
+filter on `embedding_model`, admitting only rows embedded by the model that
+produced the query vector, because pgvector answers a comparison across vector
+dimensions with an error rather than a miss. Those tables therefore stay
+queryable while they hold two models' vectors at once: mid-reindex, after a
+failed sweep, or across a live backend swap. The sweep is what shortens that
+degraded window, not what prevents the error.
+
+The fourth, tool search over `tool_definitions`, has no such predicate yet and
+still depends on the sweep having completed (#703). It is the table most likely
+to be caught mid-reindex, because `backfill_tool_embeddings` updates in place.
+
+Two boundaries hold the degradation sane: the full-text arm
+of each hybrid query is never model-scoped, so recall falls back to lexical
+matching instead of vanishing; and a stamp whose digest matches the current
+model is treated as the same model even when the name is spelled differently, so
+a cosmetic rename costs nothing (see `crates/storage/tests/embedding_fingerprint.rs`
+and `crates/storage/tests/search_embedding_model_scope.rs`).
+
 ## What consolidation may and may not do
 
 The model sees the whole active store and returns a plan. The plan is not applied
