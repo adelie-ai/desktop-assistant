@@ -55,6 +55,47 @@ pub const MAX_HOLISTIC_PROMPT_CHARS: usize = 200_000;
 /// are dropped with a warning.
 pub const MAX_DELETE_FRACTION: f64 = 0.5;
 
+/// Upper bound on the stored length of a model-supplied delete reason.
+///
+/// Why: the reason is free text straight from the model and is persisted on the
+/// tombstone (and logged). Bounding it keeps a malformed or adversarial
+/// response from writing an unbounded blob into a row that nothing else limits.
+pub const MAX_DELETE_REASON_CHARS: usize = 500;
+
+/// `knowledge_base.source` for an entry that was promoted deliberately -- the
+/// user asked for it, or Adele decided in the moment that it was worth keeping.
+///
+/// Consolidation may rewrite or merge such an entry, but never prunes one: a
+/// fact a person entered on purpose is not the model's to remove.
+pub const SOURCE_EXPLICIT: &str = "explicit";
+
+/// Why consolidation soft-deleted a row, recorded on the row itself.
+///
+/// Merge and prune are very different outcomes -- one relocates the content
+/// into a canonical row, the other destroys it -- and used to write an
+/// identical row change, so no query could tell them apart. Stored in
+/// `knowledge_base.deleted_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KbDeleteKind {
+    /// The content was carried forward into a canonical row, named by
+    /// `knowledge_base.superseded_by`.
+    Merge,
+    /// The model judged the entry not worth keeping. Nothing supersedes it; the
+    /// stated reason is in `knowledge_base.deleted_reason`.
+    Prune,
+}
+
+impl KbDeleteKind {
+    /// Stable on-disk spelling. Must match the `knowledge_base_deleted_kind_chk`
+    /// CHECK constraint in migration 038.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Prune => "prune",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConsolidationStats {
     pub reviewed: usize,
@@ -62,4 +103,11 @@ pub struct ConsolidationStats {
     pub merged_clusters: usize,
     pub soft_deleted: usize,
     pub scope_added: usize,
+    /// Proposed deletes refused because the entry carries
+    /// [`SOURCE_EXPLICIT`]. Reported so an operator can see that the model
+    /// keeps asking, even though the answer is always no.
+    pub protected_from_delete: usize,
+    /// Proposed edits and merges refused because the entry has already been
+    /// rewritten [`MAX_REVIEW_GENERATION`] times, so its prose is settled.
+    pub settled_unchanged: usize,
 }

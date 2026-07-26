@@ -297,6 +297,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Tombstones record why they were retired: merge (with the superseding id)
+    // or prune (with the model's stated reason).
+    sqlx::raw_sql(include_str!("../migrations/038_kb_delete_provenance.sql"))
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 
