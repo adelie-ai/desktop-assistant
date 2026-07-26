@@ -112,6 +112,16 @@ Current command variants:
 - `ping`
 - `get_status`
 - `get_config`
+  - The config view carries `restart_required`: the config areas whose
+    configured value cannot take effect until the daemon is restarted, as
+    stable area keys (`"database"`, `"embeddings"`, `"persistence"`,
+    `"ws_auth"`, `"tls"`, `"profiling"`). Absent or empty means every
+    configured value is live. It reports *area names only* and never the
+    configured value, so a pending `[ws_auth]` or `[tls]` change is visible
+    without disclosing what it was changed to. Treat the set as open and render
+    an unrecognized key verbatim rather than dropping it. Additive and
+    backward-compatible: an older daemon that omits the field deserializes as
+    empty, and an empty report is omitted on the wire.
 - `set_config { changes }`
 - `create_conversation { title }`
 - `list_conversations { max_age_days }`
@@ -188,6 +198,10 @@ Current event variants:
 - Expect:
   - `result -> config`
   - followed by `event -> config_changed` with the same config snapshot.
+- `set_ws_auth_settings` still answers with a bare `ack`, and is followed by an
+  `event -> config_changed`. Its `restart_required` is how the client that made
+  the change learns that the new authentication methods, OIDC config, or allowed
+  origins are written but not yet in force.
 
 ## Notes
 

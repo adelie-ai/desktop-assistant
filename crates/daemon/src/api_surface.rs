@@ -70,10 +70,17 @@ use crate::registry::{ConnectionHealth, ConnectionRegistry, build_registry};
 /// from racing (read-modify-write on the config) and losing an update, while
 /// still computing the new config/registry off the data lock and grabbing the
 /// data write lock only for the final swap.
+///
+/// `booted_config` is the config the process was wired from and never changes
+/// for the life of the handle. It is the baseline for
+/// [`Self::restart_required`]: restart-bound subsystems (TLS, WS auth, the
+/// embedding client) hold values taken from *that* snapshot, so it is the only
+/// thing a candidate config can honestly be compared against.
 pub struct RegistryHandle {
     state: RwLock<RegistryState>,
     write_serializer: Mutex<()>,
     config_path: std::path::PathBuf,
+    booted_config: DaemonConfig,
 }
 
 struct RegistryState {
@@ -84,6 +91,7 @@ struct RegistryState {
 impl RegistryHandle {
     pub fn new(config: DaemonConfig, registry: ConnectionRegistry) -> Self {
         Self {
+            booted_config: config.clone(),
             state: RwLock::new(RegistryState { config, registry }),
             write_serializer: Mutex::new(()),
             config_path: default_daemon_config_path(),
@@ -237,6 +245,12 @@ impl RegistryHandle {
     /// config and clobber each other's change (lost update). Readers are never
     /// blocked by it — it guards mutators only. If a previous mutator panicked,
     /// `parking_lot::Mutex` does not poison, so recovery is automatic.
+    ///
+    /// A write that touches a restart-bound area is logged here rather than
+    /// left to the config-file watcher: this path refreshes the in-memory
+    /// config *before* the watcher fires, so by the time the watcher diffs the
+    /// file it is a genuine no-op and has nothing to report (#686).
+    /// [`Self::restart_required`] is what carries the same fact to a client.
     fn mutate_config<F>(&self, op: F) -> Result<(), CoreError>
     where
         F: FnOnce(&mut DaemonConfig) -> Result<(), String>,
@@ -258,8 +272,17 @@ impl RegistryHandle {
         // Final swap: take the write lock only long enough to install the new
         // state. No I/O, no rebuild, no user closure under the lock.
         let mut state = self.state.write();
+        let plan = crate::config::plan_reload(&state.config, &new_config);
         state.config = new_config;
         state.registry = registry;
+        drop(state);
+
+        if plan.needs_restart() {
+            tracing::warn!(
+                "config write applied, but these changes need a daemon restart to take effect: {}",
+                plan.restart_required_keys().join(", ")
+            );
+        }
         Ok(())
     }
 
@@ -267,6 +290,55 @@ impl RegistryHandle {
     /// and model-listing paths.
     pub fn snapshot_config(&self) -> DaemonConfig {
         self.state.read().config.clone()
+    }
+
+    /// Config areas whose value in the config *file* cannot take effect until
+    /// the daemon restarts (#686). Empty means everything on disk is live.
+    ///
+    /// Diffs the config the daemon booted with against the config on disk,
+    /// which is the only baseline that stays honest across every write path:
+    ///
+    /// - A daemon-authored write ([`Self::mutate_config`]) refreshes the
+    ///   in-memory config before the watcher runs, so a current-vs-disk diff
+    ///   would be empty even though the running subsystem is stale.
+    /// - A settings write that only touches the file (`set_ws_auth_settings`)
+    ///   is reported immediately, without waiting for the debounced watcher.
+    /// - A hand edit to `daemon.toml`, the only way to rotate `[tls]` today,
+    ///   is reported the same way.
+    /// - Reverting an edit clears the report, because the file is back in step
+    ///   with what the process is running.
+    ///
+    /// Carries area names only, never configured values: `[ws_auth]` and
+    /// `[tls]` are security-relevant, and a caller allowed to learn *that* a
+    /// restart is pending is not thereby allowed to read the new settings.
+    ///
+    /// Degrades rather than failing when the file cannot be read or parsed: the
+    /// daemon is still running its last-good config, so the report is computed
+    /// against that instead and the parse failure is logged. `apply_reload` is
+    /// the path that refuses a bad config; this one only describes state.
+    pub fn restart_required(&self) -> Vec<crate::config::RestartArea> {
+        let candidate = match load_daemon_config(&self.config_path) {
+            Ok(Some(config)) => Some(config),
+            // No file (or an empty one) means nothing on disk contradicts the
+            // running process.
+            Ok(None) => None,
+            // Deliberately without the parse error: this path can run per
+            // settings read, and a TOML error quotes the offending line, which
+            // in daemon.toml can be a credential reference. The reload path
+            // logs the cause once when it refuses the file.
+            Err(_) => {
+                tracing::warn!(
+                    "restart-required report: {} could not be parsed; reporting against the \
+                     running config instead (see the config reload log for the cause)",
+                    self.config_path.display()
+                );
+                None
+            }
+        };
+
+        let state = self.state.read();
+        let candidate = candidate.as_ref().unwrap_or(&state.config);
+        crate::config::plan_reload(&self.booted_config, candidate).restart_required
     }
 
     /// The active assistant personality (issue #226). Read from the in-memory
@@ -392,7 +464,7 @@ impl RegistryHandle {
         if plan.needs_restart() {
             tracing::warn!(
                 "config reload: these changes need a daemon restart to take effect: {}",
-                plan.restart_required.join(", ")
+                plan.restart_required_keys().join(", ")
             );
         }
         Ok(plan)
@@ -3439,6 +3511,190 @@ api_key_env = "{unused}"
             assert!(
                 handle.client_for(&id).is_some(),
                 "a refused reload keeps the last-good registry"
+            );
+            // A refused reload must not invent a restart requirement either:
+            // the rejected edit touched only [connections], which is hot.
+            assert!(
+                handle.restart_required().is_empty(),
+                "a refused connections-only reload reports no restart requirement: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // ----- Restart-required reporting (#686) -----------------------
+        //
+        // `restart_required` answers "what is in the config file that the
+        // *running process* does not have?" by diffing the config the daemon
+        // booted with against the config on disk. That baseline is what makes
+        // it correct on the daemon-authored write path, where the file watcher
+        // sees a genuine no-op because `mutate_config` already updated the
+        // in-memory config before the watcher fired.
+
+        /// An ollama connection plus a named interactive purpose, so purpose
+        /// edits load and validate.
+        const OLLAMA_WITH_PURPOSES: &str = r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[purposes.interactive]
+connection = "local"
+model = "llama3"
+
+[purposes.embedding]
+connection = "local"
+model = "nomic-embed-text"
+"#;
+
+        #[test]
+        fn nothing_changed_since_boot_needs_no_restart() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            assert!(
+                handle.restart_required().is_empty(),
+                "a freshly booted daemon whose config is untouched needs no restart: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn daemon_authored_embedding_purpose_write_is_reported_despite_an_empty_watcher_diff() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+
+            // A daemon-authored write: `mutate_config` saves the file AND
+            // refreshes the in-memory config in one step.
+            handle
+                .mutate_config(|cfg| {
+                    cfg.purposes.set(
+                        crate::purposes::PurposeKind::Embedding,
+                        Some(PurposeConfig {
+                            connection: ConnectionRef::Named(
+                                ConnectionId::new("local").expect("test slug is valid"),
+                            ),
+                            model: ModelRef::Named("amazon.titan-embed-text-v2:0".to_string()),
+                            effort: None,
+                            max_context_tokens: None,
+                        }),
+                    );
+                    Ok(())
+                })
+                .expect("a valid purpose write succeeds");
+
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::Embeddings),
+                "a daemon-authored embedding-purpose write must report a restart requirement: {:?}",
+                handle.restart_required()
+            );
+
+            // The file watcher fires next and finds nothing to do, which is
+            // precisely why the write path has to be the one that reports.
+            let plan = handle
+                .apply_reload()
+                .expect("the watcher's re-read of our own write applies");
+            assert!(
+                plan.is_empty(),
+                "the watcher diff after a daemon-authored write is a genuine no-op: {plan:?}"
+            );
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::Embeddings),
+                "the no-op watcher pass must not clear the outstanding restart requirement"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn ws_auth_edit_is_reported_before_any_reload_runs() {
+            // `set_ws_auth_settings` writes the file directly and never touches
+            // the registry, so the answer has to come from the file.
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                format!("{OLLAMA_WITH_PURPOSES}\n[ws_auth]\nmethods = [\"oidc\"]\n"),
+            )
+            .expect("write ws_auth edit");
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::WsAuth),
+                "a [ws_auth] edit must be reported without waiting for a reload: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn tls_edit_is_reported_before_any_reload_runs() {
+            // Certificate rotation is a file-only edit with no client-facing
+            // setter at all, so the on-disk diff is the only honest source.
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                format!("{OLLAMA_WITH_PURPOSES}\n[tls]\nenabled = false\n"),
+            )
+            .expect("write tls edit");
+            assert!(
+                handle
+                    .restart_required()
+                    .contains(&crate::config::RestartArea::Tls),
+                "a [tls] edit must be reported without waiting for a reload: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn hot_applicable_edit_reports_no_restart_requirement() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                OLLAMA_WITH_PURPOSES.replace("http://localhost:11434", "http://localhost:9999"),
+            )
+            .expect("write connection edit");
+            let plan = handle.apply_reload().expect("valid reload applies");
+            assert!(plan.rebuild_registry);
+            assert!(
+                handle.restart_required().is_empty(),
+                "a hot-applicable edit must not claim a restart is needed: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn reverting_a_restart_bound_edit_clears_the_report() {
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(
+                &path,
+                format!("{OLLAMA_WITH_PURPOSES}\n[tls]\nenabled = false\n"),
+            )
+            .expect("write tls edit");
+            assert!(!handle.restart_required().is_empty());
+
+            std::fs::write(&path, OLLAMA_WITH_PURPOSES).expect("revert the edit");
+            assert!(
+                handle.restart_required().is_empty(),
+                "reverting the edit puts the file back in step with the running process: {:?}",
+                handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn unparseable_config_falls_back_to_the_last_good_report() {
+            // A broken file must not panic the report or invent areas out of a
+            // config nobody can read. The daemon keeps running the last-good
+            // config, so that is what the report describes.
+            let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
+            std::fs::write(&path, "this is not = valid toml [[[").expect("write garbage");
+            assert!(
+                handle.restart_required().is_empty(),
+                "an unreadable config reports against the running config, not the garbage: {:?}",
+                handle.restart_required()
             );
             let _ = std::fs::remove_file(&path);
         }

@@ -964,6 +964,24 @@ pub struct Config {
     /// [`PersonalitySettingsView`]).
     #[serde(default)]
     pub personality: PersonalitySettingsView,
+    /// Config areas whose configured value cannot take effect until the daemon
+    /// is restarted (#686). Empty means every configured value is live.
+    ///
+    /// Entries are stable area keys - `"database"`, `"embeddings"`,
+    /// `"persistence"`, `"ws_auth"`, `"tls"`, `"profiling"` - deliberately an
+    /// open set so a daemon that learns a new area does not break an older
+    /// client. Clients should render unrecognized keys verbatim rather than
+    /// dropping them.
+    ///
+    /// SECURITY: area names only. A pending `[ws_auth]` or `[tls]` change is
+    /// reported without disclosing what it was changed to.
+    ///
+    /// Additive and backward-compatible: `#[serde(default)]` means a payload
+    /// from an older daemon that omits the field still deserializes, and an
+    /// empty report is omitted on the wire so an older client sees exactly the
+    /// payload it saw before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_required: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -3424,12 +3442,77 @@ mod tests {
                 push_on_update: false,
             },
             personality: PersonalitySettingsView::default(),
+            restart_required: Vec::new(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
         assert_eq!(back.personality.professionalism, PersonalityLevel::Always);
         assert_eq!(back.personality.humor, PersonalityLevel::Sometimes);
+    }
+
+    // --- Restart-required reporting (#686) ---------------------------------
+
+    fn config_fixture(restart_required: Vec<String>) -> Config {
+        Config {
+            embeddings: EmbeddingsSettingsView {
+                connector: "ollama".into(),
+                model: "nomic-embed-text".into(),
+                base_url: "http://localhost:11434".into(),
+                has_api_key: false,
+                available: true,
+                is_default: false,
+                health: EmbeddingHealth::Ok,
+            },
+            persistence: PersistenceSettingsView {
+                enabled: false,
+                remote_url: String::new(),
+                remote_name: "origin".into(),
+                push_on_update: false,
+            },
+            personality: PersonalitySettingsView::default(),
+            restart_required,
+        }
+    }
+
+    #[test]
+    fn config_restart_required_is_additive_for_older_peers() {
+        // A payload from a daemon that predates the field must still
+        // deserialize, as "nothing is waiting on a restart".
+        let legacy = r#"{
+            "embeddings": {
+                "connector": "ollama",
+                "model": "nomic-embed-text",
+                "base_url": "http://localhost:11434",
+                "has_api_key": false,
+                "available": true,
+                "is_default": false
+            },
+            "persistence": {
+                "enabled": false,
+                "remote_url": "",
+                "remote_name": "origin",
+                "push_on_update": false
+            }
+        }"#;
+        let view: Config = serde_json::from_str(legacy).expect("legacy Config still parses");
+        assert!(view.restart_required.is_empty());
+
+        // And an empty list is omitted on the wire, so an older client sees
+        // exactly the payload it saw before.
+        let json = serde_json::to_string(&config_fixture(Vec::new())).unwrap();
+        assert!(
+            !json.contains("restart_required"),
+            "an empty report must not appear on the wire: {json}"
+        );
+    }
+
+    #[test]
+    fn config_restart_required_round_trips_area_keys() {
+        let cfg = config_fixture(vec!["ws_auth".to_string(), "tls".to_string()]);
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.restart_required, vec!["ws_auth", "tls"]);
     }
 
     #[test]

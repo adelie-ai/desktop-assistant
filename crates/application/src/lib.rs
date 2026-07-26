@@ -806,6 +806,15 @@ where
             .get_personality_settings()
             .await
             .map_err(Self::map_core_err)?;
+        // #686: which configured values the running process does not yet have.
+        // Reported on every config read AND on the `SetConfig` reply, so the
+        // client that made a restart-bound change learns it needs a restart
+        // instead of seeing a bare success.
+        let restart_required = self
+            .settings
+            .restart_required()
+            .await
+            .map_err(Self::map_core_err)?;
 
         Ok(api::Config {
             embeddings: api::EmbeddingsSettingsView {
@@ -833,6 +842,7 @@ where
             // `PersonalitySettingsView` is the core `Personality` type in both
             // the port and the api-model, so this is the identity conversion.
             personality,
+            restart_required,
         })
     }
 
@@ -3962,6 +3972,8 @@ mod tests {
         backend_tasks: BackendTasksSettingsView,
         ws_auth: desktop_assistant_core::ports::inbound::WsAuthSettingsView,
         mcp_servers: Vec<desktop_assistant_core::ports::inbound::McpServerView>,
+        /// Config areas the daemon reports as needing a restart (#686).
+        restart_required: Vec<String>,
     }
 
     struct ConfigurableSettings {
@@ -4021,8 +4033,17 @@ mod tests {
                         oidc_scopes: String::new(),
                     },
                     mcp_servers: vec![],
+                    restart_required: Vec::new(),
                 }),
             }
+        }
+
+        /// Stand in for a daemon whose running process is behind the config
+        /// file in the given areas.
+        fn with_restart_required(self, areas: &[&str]) -> Self {
+            self.state.lock().unwrap().restart_required =
+                areas.iter().map(|a| (*a).to_string()).collect();
+            self
         }
 
         #[allow(dead_code)]
@@ -4032,6 +4053,10 @@ mod tests {
     }
 
     impl SettingsService for ConfigurableSettings {
+        async fn restart_required(&self) -> Result<Vec<String>, CoreError> {
+            Ok(self.state.lock().unwrap().restart_required.clone())
+        }
+
         async fn get_llm_settings(&self) -> Result<LlmSettingsView, CoreError> {
             Ok(self.state.lock().unwrap().llm.clone())
         }
@@ -5245,6 +5270,51 @@ mod tests {
         assert_eq!(config.embeddings.model, "text-embedding-3-large");
         assert_eq!(config.persistence.remote_name, "upstream");
         assert!(!config.persistence.push_on_update);
+        assert!(
+            config.restart_required.is_empty(),
+            "a hot-applicable write must not report a restart requirement"
+        );
+    }
+
+    // --- Restart-required reporting (#686) ---------------------------------
+
+    #[tokio::test]
+    async fn get_config_reports_the_areas_awaiting_a_restart() {
+        let settings =
+            Arc::new(ConfigurableSettings::new().with_restart_required(&["ws_auth", "tls"]));
+        let h = handler_with(Arc::clone(&settings));
+
+        let res = h
+            .handle_command(api::Command::GetConfig)
+            .await
+            .expect("GetConfig succeeds");
+        let api::CommandResult::Config(config) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(config.restart_required, vec!["ws_auth", "tls"]);
+    }
+
+    #[tokio::test]
+    async fn set_config_returns_the_restart_requirement_to_the_caller() {
+        // The write path is where the client is waiting for an answer, so a
+        // config write reports the outstanding restart areas rather than a
+        // bare success.
+        let settings = Arc::new(ConfigurableSettings::new().with_restart_required(&["embeddings"]));
+        let h = handler_with(Arc::clone(&settings));
+
+        let res = h
+            .handle_command(api::Command::SetConfig {
+                changes: api::ConfigChanges {
+                    embeddings_model: Some("nomic-embed-text".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("SetConfig succeeds");
+        let api::CommandResult::Config(config) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(config.restart_required, vec!["embeddings"]);
     }
 
     // --- #314 bridge cutover (2/7): database / backend-tasks / ws-auth ------
