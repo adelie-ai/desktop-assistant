@@ -117,12 +117,16 @@ pub async fn run_consolidation_scan(
         || stats.scope_added > 0
     {
         tracing::info!(
-            "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, soft-deleted {}",
+            "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, \
+             soft-deleted {}; refused {} prune(s) of user-entered entries and {} \
+             mutation(s) of settled ones",
             stats.reviewed,
             stats.merged_clusters,
             stats.updated,
             stats.scope_added,
             stats.soft_deleted,
+            stats.protected_from_delete,
+            stats.settled_unchanged,
         );
     } else {
         tracing::debug!(
