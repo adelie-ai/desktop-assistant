@@ -1267,10 +1267,12 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok((kb, tools)) if kb > 0 || tools > 0 => {
+            Ok(swept) if !swept.is_empty() => {
                 tracing::warn!(
-                    "embedding model changed to {}: invalidated {kb} knowledge + {tools} tool embeddings (will re-embed in background)",
-                    embedding_model_id
+                    "embedding model changed to {}: invalidated {} embedding(s) [{}] (will re-embed in background)",
+                    embedding_model_id,
+                    swept.total(),
+                    swept.summary()
                 );
             }
             Ok(_) => {}
@@ -1933,6 +1935,16 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => tracing::info!("backfilled {n} skill embedding(s)"),
                     Ok(_) => tracing::debug!("no skill embeddings to backfill"),
                     Err(e) => tracing::warn!("skill embedding backfill failed: {e}"),
+                }
+
+                match desktop_assistant_storage::embedding_backfill::backfill_tag_embeddings(
+                    &pool, &embed_fn, &model,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::info!("backfilled {n} tag embedding(s)"),
+                    Ok(_) => tracing::debug!("no tag embeddings to backfill"),
+                    Err(e) => tracing::warn!("tag embedding backfill failed: {e}"),
                 }
 
                 tokio::select! {

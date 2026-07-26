@@ -6,6 +6,7 @@ pub mod conversation;
 pub mod conversation_search;
 pub mod database;
 pub mod dreaming;
+pub mod embedded_tables;
 pub mod embedding_backfill;
 pub mod error_classifications;
 pub mod idempotency_keys;

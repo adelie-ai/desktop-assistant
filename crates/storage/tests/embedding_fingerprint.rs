@@ -194,11 +194,15 @@ async fn identical_fingerprint_is_untouched() {
     let current = format!("nomic-embed-text@{DIGEST}");
     embedded_row(&fx.pool, "row", &current).await;
 
-    let (kb, _) = invalidate_stale_embeddings(&fx.pool, &current)
+    let swept = invalidate_stale_embeddings(&fx.pool, &current)
         .await
         .expect("invalidate");
 
-    assert_eq!(kb, 0, "the happy path must report no work done");
+    assert!(
+        swept.is_empty(),
+        "the happy path must report no work done, got {}",
+        swept.summary()
+    );
     let (has_embedding, model) = stored(&fx.pool, "row").await;
     assert!(has_embedding);
     assert_eq!(model.as_deref(), Some(current.as_str()));
