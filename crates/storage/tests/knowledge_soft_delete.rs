@@ -47,6 +47,9 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 const USER: &str = "kb-owner";
+/// The model the rows below are stamped with, and the one each search passes:
+/// the vector arm only considers rows embedded by the query's own model.
+const MODEL: &str = "model-A";
 
 /// Stamp a `vector[]` embedding onto a row. Writes never embed inline (the
 /// background backfill does), so tests populate the column directly to make
@@ -130,7 +133,7 @@ async fn semantic_search_excludes_soft_deleted() {
     // predicate can separate them.
     let hits = with_user_id(UserId::new(USER), async {
         store
-            .search("nomatchterm", vec![1.0, 0.0, 0.0], None, None, 10)
+            .search("nomatchterm", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
             .await
     })
     .await
@@ -194,7 +197,7 @@ async fn hybrid_search_excludes_soft_deleted_matched_by_both_branches() {
 
     let hits = with_user_id(UserId::new(USER), async {
         store
-            .search("flywheel", vec![1.0, 0.0, 0.0], None, None, 10)
+            .search("flywheel", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
             .await
     })
     .await
@@ -223,7 +226,7 @@ async fn soft_deleting_the_only_match_yields_empty_results() {
     // Boundary: an empty result set, not an error.
     let hits = with_user_id(UserId::new(USER), async {
         store
-            .search("quokka", vec![1.0, 0.0, 0.0], None, None, 10)
+            .search("quokka", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
             .await
     })
     .await
@@ -247,7 +250,7 @@ async fn restored_entry_becomes_searchable_again() {
 
     let hits = with_user_id(UserId::new(USER), async {
         store
-            .search("marmot", vec![1.0, 0.0, 0.0], None, None, 10)
+            .search("marmot", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
             .await
     })
     .await

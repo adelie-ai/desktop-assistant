@@ -24,10 +24,18 @@ pub trait KnowledgeBaseStore: Send + Sync {
     /// The caller generates the embedding; Postgres runs both searches.
     /// `tags` requires at least one matching tag (overlap); `exclude_tags`
     /// removes any row carrying one of those tags.
+    ///
+    /// `embedding_model` identifies the model that produced `query_embedding`
+    /// and travels with it: only rows embedded by that model take part in the
+    /// vector arm, because a comparison across models is a comparison across
+    /// vector dimensions, which the database answers with an error rather than
+    /// a miss. The full-text arm is deliberately unscoped, so a model change
+    /// degrades semantic recall to lexical search instead of hiding content.
     fn search(
         &self,
         query: &str,
         query_embedding: Vec<f32>,
+        embedding_model: &str,
         tags: Option<Vec<String>>,
         exclude_tags: Option<Vec<String>>,
         limit: usize,
@@ -86,11 +94,14 @@ pub type KnowledgeWriteFn = Arc<
 >;
 
 /// Boxed async closure for searching the knowledge base. Args:
-/// `(query, query_embedding, include_tags, exclude_tags, limit)`.
+/// `(query, query_embedding, embedding_model, include_tags, exclude_tags, limit)`,
+/// where `embedding_model` identifies the model that produced `query_embedding`
+/// (see [`KnowledgeBaseStore::search`]).
 pub type KnowledgeSearchFn = Arc<
     dyn Fn(
             String,
             Vec<f32>,
+            String,
             Option<Vec<String>>,
             Option<Vec<String>>,
             usize,
@@ -184,6 +195,7 @@ mod tests {
             &self,
             _query: &str,
             _query_embedding: Vec<f32>,
+            _embedding_model: &str,
             _tags: Option<Vec<String>>,
             _exclude_tags: Option<Vec<String>>,
             _limit: usize,
@@ -238,7 +250,7 @@ mod tests {
     async fn mock_knowledge_store_search_returns_empty() {
         let store = MockKnowledgeStore;
         let results = store
-            .search("test", vec![0.0], None, None, 10)
+            .search("test", vec![0.0], "test-model", None, None, 10)
             .await
             .unwrap();
         assert!(results.is_empty());

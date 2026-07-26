@@ -314,6 +314,7 @@ mod tests {
             &self,
             _query: &str,
             _query_embedding: Vec<f32>,
+            _embedding_model: &str,
             _tags: Option<Vec<String>>,
             _exclude_tags: Option<Vec<String>>,
             _limit: usize,

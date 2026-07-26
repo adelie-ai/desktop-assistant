@@ -74,6 +74,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         &self,
         query: &str,
         query_embedding: Vec<f32>,
+        _embedding_model: &str,
         tags: Option<Vec<String>>,
         exclude_tags: Option<Vec<String>>,
         limit: usize,

@@ -124,14 +124,14 @@ async fn fts_search_finds_by_keyword_ignoring_embedding() {
     // A non-empty embedding is ignored on SQLite; FTS matches by keyword, and
     // porter stemming means "invoice" matches "invoices".
     let hits = s
-        .search("invoice", vec![0.1, 0.2, 0.3], 10)
+        .search("invoice", vec![0.1, 0.2, 0.3], "test-model", 10)
         .await
         .expect("search");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].name, "invoice-run");
 
     // Matches on the body too, and respects the limit.
-    let body_hit = s.search("billing", vec![], 10).await.unwrap();
+    let body_hit = s.search("billing", vec![], "test-model", 10).await.unwrap();
     assert_eq!(body_hit.len(), 1);
     assert_eq!(body_hit[0].name, "invoice-run");
 }
@@ -141,14 +141,24 @@ async fn search_returns_empty_for_no_match_or_blank_query() {
     let s = store().await;
     seed(&s, vec![skill("a", "alpha", "body")]).await;
     assert!(
-        s.search("zzzznotaword", vec![], 10)
+        s.search("zzzznotaword", vec![], "test-model", 10)
             .await
             .unwrap()
             .is_empty()
     );
     // A query with no usable tokens must not issue an invalid MATCH.
-    assert!(s.search("   ", vec![], 10).await.unwrap().is_empty());
-    assert!(s.search("!!! @@@", vec![], 10).await.unwrap().is_empty());
+    assert!(
+        s.search("   ", vec![], "test-model", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.search("!!! @@@", vec![], "test-model", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -161,7 +171,7 @@ async fn upsert_keeps_the_fts_index_in_sync() {
     seed(&s, vec![skill("runbook", "renewed description", "body")]).await;
 
     assert!(
-        s.search("renewed", vec![], 10)
+        s.search("renewed", vec![], "test-model", 10)
             .await
             .unwrap()
             .iter()
@@ -169,7 +179,10 @@ async fn upsert_keeps_the_fts_index_in_sync() {
         "the updated description is searchable"
     );
     assert!(
-        s.search("old", vec![], 10).await.unwrap().is_empty(),
+        s.search("old", vec![], "test-model", 10)
+            .await
+            .unwrap()
+            .is_empty(),
         "and the superseded one is gone from the index"
     );
 }

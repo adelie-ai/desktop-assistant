@@ -231,10 +231,11 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         &self,
         query: &str,
         _query_embedding: Vec<f32>,
+        _embedding_model: &str,
         limit: usize,
     ) -> Result<Vec<IndexedSkill>, CoreError> {
         // Full-text only: the SQLite adapter has no vector column yet, so the
-        // embedding is ignored.
+        // embedding and the model that produced it are both ignored.
         let Some(match_query) = fts_match(query) else {
             return Ok(Vec::new());
         };

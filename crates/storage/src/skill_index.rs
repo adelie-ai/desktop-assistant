@@ -122,6 +122,7 @@ impl PgSkillIndexStore {
         &self,
         query: &str,
         query_embedding: Vec<f32>,
+        _embedding_model: &str,
         limit: usize,
     ) -> Result<Vec<IndexedSkill>, CoreError> {
         let user = current_user_id();
@@ -231,6 +232,7 @@ impl SkillIndexStore for PgSkillIndexStore {
         &self,
         query: &str,
         query_embedding: Vec<f32>,
+        embedding_model: &str,
         limit: usize,
     ) -> Result<Vec<IndexedSkill>, CoreError> {
         // Empty embedding (backend down/unavailable) -> full-text only, exactly
@@ -240,7 +242,8 @@ impl SkillIndexStore for PgSkillIndexStore {
         if query_embedding.is_empty() {
             self.search_fts_only(query, limit).await
         } else {
-            self.search_hybrid(query, query_embedding, limit).await
+            self.search_hybrid(query, query_embedding, embedding_model, limit)
+                .await
         }
     }
 

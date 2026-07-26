@@ -117,6 +117,10 @@ where
     fx.cleanup().await;
 }
 
+/// The model every seeded row is stamped with, and the one every search below
+/// passes: the vector arm only considers rows embedded by the query's own model.
+const MODEL: &str = "test-model";
+
 /// Stamp a `vector[]` embedding onto a knowledge row by id (writes never embed
 /// inline — the background backfill does — so tests populate the column
 /// directly to exercise the search vector branch). Mirrors the raw SQL in
@@ -196,7 +200,7 @@ async fn knowledge_hybrid_search_is_user_scoped() {
         // The vector branch runs; scoping must keep it to Bob's own rows.
         let bob_hits = with_user_id(UserId::new("bob"), async {
             store
-                .search("widget", vec![1.0, 0.0, 0.0], None, None, 10)
+                .search("widget", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
                 .await
         })
         .await
@@ -212,7 +216,7 @@ async fn knowledge_hybrid_search_is_user_scoped() {
         // branch — proving the branch ran (positive control).
         let alice_hits = with_user_id(UserId::new("alice"), async {
             store
-                .search("nomatchterm", vec![1.0, 0.0, 0.0], None, None, 10)
+                .search("nomatchterm", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
                 .await
         })
         .await
@@ -271,6 +275,7 @@ async fn knowledge_hybrid_search_excludes_tags() {
                 .search(
                     "widget",
                     vec![1.0, 0.0, 0.0],
+                    MODEL,
                     None,
                     Some(vec!["secret".into()]),
                     10,
@@ -345,7 +350,7 @@ async fn knowledge_hybrid_search_rrf_orders_by_fused_rank() {
 
             let hits = with_user_id(UserId::new("alice"), async {
                 store
-                    .search("quantum widget", vec![1.0, 0.0, 0.0], None, None, 10)
+                    .search("quantum widget", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
                     .await
             })
             .await
@@ -804,6 +809,7 @@ async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
                     .search(
                         "deploy",
                         vec![],
+                        MODEL,
                         None,
                         Some(vec!["PROJECT:Adelie-AI".into()]),
                         10,
@@ -827,6 +833,7 @@ async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
                     .search(
                         "deploy",
                         vec![1.0, 0.0, 0.0],
+                        MODEL,
                         Some(vec!["Project:Adelie-AI".into()]),
                         None,
                         10,
