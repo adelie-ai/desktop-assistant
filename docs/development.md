@@ -17,7 +17,11 @@ just audit                  # RustSec advisory scan of Cargo.lock
 
 `just check` needs `cargo-audit` (`cargo install cargo-audit --locked`) and
 network access for the advisory database; it fails loudly without either rather
-than skipping the scan.
+than skipping the scan. Its last step also boots two throwaway databases, to
+check that the harness below really is parallel-safe; with no container runtime
+reachable that one criterion skips and says so. The pre-push hook runs all of
+this, so a push with the runtime up costs about half a minute more than one
+without.
 
 It does **not** run the DB-gated `crates/storage` isolation suites, which
 pass-skip without `TEST_DATABASE_URL`:
@@ -26,11 +30,16 @@ pass-skip without `TEST_DATABASE_URL`:
 just test-db                          # boot a throwaway pgvector, run the suites, tear it down
 just test-db --test knowledge_trash   # extra args go to cargo test
 eval "$(just test-db-up)"             # keep one running for iterative work
-just test-db-down                     # sweep anything the harness left behind
+just test-db-down "$ADELE_TEST_DB_CONTAINER"   # tear that one down
+just test-db-down                     # sweep every one no live run owns
 ```
 
 Each invocation provisions its own container on its own host port, so several
-worktrees can run the suites at the same time.
+worktrees can run the suites at the same time. A `just test-db` in flight is
+safe from the bare `test-db-down`, which spares any container whose run is
+still going. A container from `test-db-up` has no such owner - it outlives the
+command that made it - so name yours when another session may be holding one of
+its own.
 
 ## Run Components
 

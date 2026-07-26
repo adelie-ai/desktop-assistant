@@ -69,20 +69,31 @@ The daemon is built and run as `cargo run -p desktop-assistant-daemon`. Operatio
 
 The workspace is held to:
 
+- a RustSec advisory scan of `Cargo.lock` (`scripts/audit.sh`)
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
-- a RustSec advisory scan of `Cargo.lock` (`scripts/audit.sh`)
 
-`just check` runs exactly those, in that order plus `build`, and finishes with
-`just test-scripts` (the named tests for the gate's own shell steps, under
-`scripts/tests/`). The advisory scan runs first because build scripts execute at
-first compile - under `clippy` as much as under `build`.
+`just check` runs exactly those, in that order, with `build` before the tests,
+and finishes with `just test-scripts` (the named tests for the gate's own shell
+steps, under `scripts/tests/`). The advisory scan is first because build scripts
+execute at first compile - under `clippy` as much as under `build`.
 
-What `just check` does **not** cover: the DB-gated `crates/storage` isolation
-suites. They pass-skip without `TEST_DATABASE_URL`, so a green `just check`
-proves nothing about multi-tenant safety - run `just test-db` for that, and say
-in the PR which of the two you ran.
+What `just check` does **not** cover:
+
+- The DB-gated `crates/storage` isolation suites. They pass-skip without
+  `TEST_DATABASE_URL`, so a green `just check` proves nothing about
+  multi-tenant safety - run `just test-db` for that, and say in the PR which of
+  the two you ran.
+- The parallel-safety of `just test-db` itself, unless a container runtime is
+  reachable. That criterion provisions two real databases; with no
+  podman/docker it skips, loudly and by name, so a green `just check` on a
+  machine without one has not verified it.
+
+So the gate wants a reachable podman/docker and the network - the advisory scan
+fetches, and runs offline only under the `ADELE_AUDIT_ALLOW_STALE=1` opt-in
+described below. That goes for `git push` too: the pre-push hook runs the same
+`just check`.
 
 New code keeps it there. Warnings-as-errors is enforced **mechanically**, not by reviewer vigilance: the root `Cargo.toml` sets `[workspace.lints] rust.warnings = "deny"` and `clippy.all = "deny"`, and every member inherits via `[lints] workspace = true`, so a plain `cargo build`/`test`/`clippy` hard-fails on any warning. See the **Warnings are failures** standard below for the posture.
 
@@ -102,6 +113,9 @@ Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`
 - **Vulnerability reported** - hard failure (see **Security review** below).
 - **Informational advisory** (unmaintained, unsound, yanked) - reported loudly,
   does not fail the gate; treat it as a review item.
+- **Advisory suppressed by an audit.toml `ignore` list** - named in the output
+  and in the summary line, and does not fail the gate: suppressing one is a
+  reviewed decision, but the gate never presents it as a clean scan.
 
 ## Cross-project engineering standards
 
