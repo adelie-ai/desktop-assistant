@@ -31,6 +31,21 @@ created_name() {
     grep -m1 '^run ' "$FAKE_CLI_LOG" | tr ' ' '\n' | grep -A1 -x -- '--name' | tail -1
 }
 
+# `prune` decides what to remove from whether the pid in a container's name is
+# still alive, so these tests need real pids rather than literals. Both helpers
+# detach the process from the captured streams: a background job holding the
+# harness' output pipe open would hang the whole suite.
+start_live_process() { # sets LIVE_PID to a process that outlives the test
+    sleep 30 >/dev/null 2>&1 &
+    LIVE_PID=$!
+}
+
+start_exited_process() { # sets DEAD_PID to a pid that has already been reaped
+    sh -c 'exit 0' >/dev/null 2>&1 &
+    DEAD_PID=$!
+    wait "$DEAD_PID" 2>/dev/null || true
+}
+
 cli_log() { cat "$FAKE_CLI_LOG"; }
 
 test_db_uses_a_unique_container_name_per_invocation() {
@@ -105,14 +120,54 @@ test_db_reports_a_clear_error_when_no_free_port_is_available() {
     assert_eq 0 "$(cli_log | grep -c '^rm ' || true)" 'nothing was created, so nothing is removed'
 }
 
-test_db_down_removes_only_leftover_harness_containers() {
+test_db_reports_a_clear_error_when_the_published_port_cannot_be_read() {
     with_fake_cli
-    export FAKE_PS_NAMES="adele-testdb-1234-abcd
+    # The container died between `run` and `port`, so `--rm` already took it
+    # away - exactly when the operator needs to be told what happened.
+    export FAKE_PORT_STATUS=1
+    run_cmd "$TEST_DB_SH" run -- touch "$TEST_TMP/payload-ran"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'an unreadable published port must fail the run'
+    assert_contains "$RUN_ERR" 'published host port' 'says which lookup failed'
+    [ ! -e "$TEST_TMP/payload-ran" ] || fail 'the payload must not run without a database'
+
+    # And when the lookup succeeds but reports something that is not a port.
+    : >"$FAKE_CLI_LOG"
+    unset FAKE_PORT_STATUS
+    export FAKE_PORT=notaport
+    run_cmd "$TEST_DB_SH" run -- true
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a non-numeric published port must fail the run'
+    assert_contains "$RUN_ERR" 'published host port' 'says which lookup failed'
+    assert_contains "$RUN_ERR" 'notaport' 'quotes what the runtime reported'
+}
+
+test_db_down_removes_a_leftover_whose_run_has_exited() {
+    with_fake_cli
+    start_exited_process
+    export FAKE_PS_NAMES="adele-testdb-$DEAD_PID-abcd
 $LEGACY_FIXED_NAME"
     run_cmd "$TEST_DB_SH" prune
     assert_eq 0 "$RUN_STATUS" 'prune'
-    assert_contains "$(cli_log)" 'rm -f adele-testdb-1234-abcd' 'sweeps its own leftovers'
+    assert_contains "$(cli_log)" "rm -f adele-testdb-$DEAD_PID-abcd" 'sweeps its own leftovers'
     assert_not_contains "$(cli_log)" "rm -f $LEGACY_FIXED_NAME" 'leaves foreign containers alone'
+    assert_contains "$RUN_ERR" 'pruned 1' 'and counts what it swept'
+}
+
+test_db_down_spares_a_container_whose_run_is_still_live() {
+    with_fake_cli
+    start_live_process
+    local live="adele-testdb-$LIVE_PID-abcd"
+    export FAKE_PS_NAMES="$live"
+    run_cmd "$TEST_DB_SH" prune
+    kill "$LIVE_PID" 2>/dev/null || true
+    assert_eq 0 "$RUN_STATUS" 'prune'
+    # Removing this one is #662 again: a database vanishing mid-run, seen from
+    # the other session as a flake in whatever test happened to be executing.
+    assert_not_contains "$(cli_log)" "rm -f $live" 'a run in flight keeps its database'
+    # The counts, not just the absence of a removal: the pid is in the name, so
+    # a removal line would mention it too.
+    assert_contains "$RUN_ERR" 'pruned 0' 'nothing was swept'
+    assert_contains "$RUN_ERR" 'kept 1' 'and prune says it kept one in use'
+    assert_contains "$RUN_ERR" "$LIVE_PID" 'naming the run that holds it'
 }
 
 two_concurrent_test_db_runs_both_pass() {
@@ -151,7 +206,9 @@ run_test test_db_exports_the_url_of_the_container_it_created
 run_test test_db_cleans_up_its_own_container_on_success_and_on_failure
 run_test test_db_does_not_remove_a_container_it_did_not_create
 run_test test_db_reports_a_clear_error_when_no_free_port_is_available
-run_test test_db_down_removes_only_leftover_harness_containers
+run_test test_db_reports_a_clear_error_when_the_published_port_cannot_be_read
+run_test test_db_down_removes_a_leftover_whose_run_has_exited
+run_test test_db_down_spares_a_container_whose_run_is_still_live
 if container_runtime_available; then
     run_test two_concurrent_test_db_runs_both_pass
 else

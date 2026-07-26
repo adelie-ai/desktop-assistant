@@ -12,9 +12,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 AUDIT_SH="$SCRIPT_TESTS_ROOT/scripts/audit.sh"
 
-CLEAN_REPORT='{"database":{"advisory-count":1169,"last-commit":null,"last-updated":null},"lockfile":{"dependency-count":496},"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}'
-VULNERABLE_REPORT='{"database":{"advisory-count":1169},"lockfile":{"dependency-count":496},"vulnerabilities":{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2020-0071","package":"time"}}]},"warnings":{}}'
-WARNING_REPORT='{"database":{"advisory-count":1169},"lockfile":{"dependency-count":496},"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{"unmaintained":[{"kind":"unmaintained","package":{"name":"proc-macro-error"}}]}}'
+CLEAN_REPORT='{"database":{"advisory-count":1169,"last-commit":null,"last-updated":null},"lockfile":{"dependency-count":496},"settings":{"ignore":[],"severity":null},"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}'
+VULNERABLE_REPORT='{"database":{"advisory-count":1169},"lockfile":{"dependency-count":496},"settings":{"ignore":[]},"vulnerabilities":{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2020-0071","package":"time"}}]},"warnings":{}}'
+WARNING_REPORT='{"database":{"advisory-count":1169},"lockfile":{"dependency-count":496},"settings":{"ignore":[]},"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{"unmaintained":[{"kind":"unmaintained","package":{"name":"proc-macro-error"}}]}}'
+IGNORING_REPORT='{"database":{"advisory-count":1169},"lockfile":{"dependency-count":496},"settings":{"ignore":["RUSTSEC-2020-0071"]},"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}'
 
 # Put a fake cargo-audit on PATH and point the knobs at this test's temp dir.
 with_fake_cargo_audit() {
@@ -59,9 +60,38 @@ audit_fails_when_the_advisory_database_cannot_be_fetched() {
     export FAKE_AUDIT_STDERR='error: couldn'"'"'t fetch advisory database: network unreachable'
     run_cmd "$AUDIT_SH"
     [ "$RUN_STATUS" -ne 0 ] || fail 'an unusable advisory database must fail the step'
+    # The headline, not just the text: "did not run" and "found advisories" are
+    # different outcomes, and only one of them is true here. Asserting on the
+    # passed-through stderr alone is satisfied by any path that re-prints it.
+    assert_contains "$RUN_ERR" 'DEPENDENCY SCAN DID NOT RUN' 'names the real outcome'
     assert_contains "$RUN_ERR" 'advisory database' 'names the advisory database'
     assert_contains "$RUN_ERR" 'network unreachable' 'passes through what cargo-audit said'
     assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
+}
+
+audit_fails_when_cargo_audit_reports_nothing_but_exits_zero() {
+    with_fake_cargo_audit
+    # The #706 failure mode itself: a scanner that checked nothing and exited 0
+    # is indistinguishable in the log from a scan that found nothing, unless the
+    # step insists on seeing a report. The exit status alone is not proof.
+    export FAKE_AUDIT_STDOUT='' FAKE_AUDIT_STATUS=0
+    run_cmd "$AUDIT_SH"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a scan that produced no report must fail the step'
+    assert_contains "$RUN_ERR" 'DEPENDENCY SCAN DID NOT RUN' 'names the real outcome'
+    # No summary line at all: any wording of one would be a claim about a scan
+    # that never happened.
+    assert_not_contains "$RUN_OUT" 'audit:' 'and reports no scan result'
+}
+
+audit_says_so_when_configuration_suppresses_advisories() {
+    with_fake_cargo_audit
+    # An audit.toml `ignore` list makes cargo-audit exit 0 with "found":false,
+    # so the gate would otherwise call a suppressed advisory a clean scan.
+    export FAKE_AUDIT_STDOUT="$IGNORING_REPORT" FAKE_AUDIT_STATUS=0
+    run_cmd "$AUDIT_SH"
+    assert_eq 0 "$RUN_STATUS" 'a configured ignore is a review item, not a failure'
+    assert_contains "$RUN_ERR" 'RUSTSEC-2020-0071' 'names the suppressed advisory'
+    assert_contains "$RUN_OUT" 'suppressed by configuration' 'the summary says so too'
 }
 
 audit_offline_optin_uses_the_cached_database_and_says_so() {
@@ -102,7 +132,9 @@ run_test audit_passes_when_no_advisory_is_reported
 run_test audit_fails_when_an_advisory_is_reported
 run_test audit_fails_loudly_when_cargo_audit_is_not_installed
 run_test audit_fails_when_the_advisory_database_cannot_be_fetched
+run_test audit_fails_when_cargo_audit_reports_nothing_but_exits_zero
 run_test audit_offline_optin_uses_the_cached_database_and_says_so
 run_test audit_reports_informational_advisories_without_failing
+run_test audit_says_so_when_configuration_suppresses_advisories
 run_test check_gate_runs_the_dependency_scan_before_the_first_build
 finish_tests 'audit-gate'
