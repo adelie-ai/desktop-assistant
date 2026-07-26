@@ -3,7 +3,8 @@
 //! Adapts the [`KnowledgeBaseStore`] outbound port + the configured
 //! embedding closure into a client-facing inbound port. Mirrors the
 //! `builtin_knowledge_base_*` write path so client-authored entries
-//! remain discoverable via the LLM tool.
+//! remain discoverable via the LLM tool, provenance included: both
+//! write paths stamp `source = "explicit"`.
 //!
 //! When no Postgres pool is configured at startup, every method
 //! returns `CoreError::Storage("knowledge base not configured")` —
@@ -16,6 +17,12 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::inbound::KnowledgeService;
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+
+/// Provenance stamped on every write that originates from a client, i.e.
+/// from a person editing the knowledge base directly. Same vocabulary value
+/// the builtin `knowledge_base` tool writes, so the two authored-by-a-human
+/// paths are indistinguishable downstream.
+const EXPLICIT_SOURCE: &str = "explicit";
 
 /// Concrete [`KnowledgeService`] backed by a Postgres-backed
 /// [`KnowledgeBaseStore`] (or an in-memory test double).
@@ -85,7 +92,11 @@ where
         metadata: serde_json::Value,
     ) -> Result<KnowledgeEntry, CoreError> {
         let id = (self.id_generator)();
-        let mut entry = KnowledgeEntry::new(id, content, tags);
+        // Why `explicit`: a client-authored write is deliberate user
+        // authorship, the same provenance the builtin `knowledge_base` tool
+        // stamps. Leaving it unset would make a fact the user wrote
+        // indistinguishable from one of unknown origin.
+        let mut entry = KnowledgeEntry::new(id, content, tags).with_source(EXPLICIT_SOURCE);
         entry.metadata = metadata;
         self.store.write(entry).await
     }
@@ -97,7 +108,10 @@ where
         tags: Vec<String>,
         metadata: serde_json::Value,
     ) -> Result<KnowledgeEntry, CoreError> {
-        let mut entry = KnowledgeEntry::new(id, content, tags);
+        // A client-driven edit promotes provenance to explicit for the same
+        // reason a create sets it: the user has taken ownership of the
+        // content, whatever originally produced it.
+        let mut entry = KnowledgeEntry::new(id, content, tags).with_source(EXPLICIT_SOURCE);
         entry.metadata = metadata;
         // The store's `write` upserts on id collision, which is exactly
         // the update semantics we want; created_at is preserved by the
@@ -421,6 +435,75 @@ mod tests {
         assert_eq!(stored.len(), 1, "update must not create a duplicate");
         assert_eq!(stored[0].content, "updated");
         assert_eq!(stored[0].tags, vec!["t"]);
+    }
+
+    #[tokio::test]
+    async fn client_authored_create_is_explicit() {
+        // A user creating an entry from a client is deliberate authorship, so
+        // it carries the same provenance the builtin `knowledge_base` tool
+        // stamps on its own writes.
+        let store = Arc::new(InMemoryStore::default());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store)).with_id_generator(|| "kb-p".into());
+
+        let entry = service
+            .create_entry("a deliberate fact".into(), vec![], serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entry.source.as_deref(),
+            Some("explicit"),
+            "client-authored create must return provenance explicit"
+        );
+        let stored = store.entries.lock().unwrap();
+        assert_eq!(
+            stored[0].source.as_deref(),
+            Some("explicit"),
+            "client-authored create must persist provenance explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_driven_update_is_explicit_without_duplicating() {
+        // Editing an entry from a client is authorship too: it promotes
+        // provenance to explicit, and still upserts on id rather than
+        // appending a second row.
+        let store = Arc::new(InMemoryStore::default());
+        let service =
+            DaemonKnowledgeService::new(Arc::clone(&store)).with_id_generator(|| "kb-q".into());
+
+        store
+            .write(
+                KnowledgeEntry::new("kb-q", "learned by extraction", vec![])
+                    .with_source("extraction"),
+            )
+            .await
+            .unwrap();
+
+        let entry = service
+            .update_entry(
+                "kb-q".into(),
+                "corrected by the user".into(),
+                vec![],
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entry.source.as_deref(),
+            Some("explicit"),
+            "client-driven update must return provenance explicit"
+        );
+        let stored = store.entries.lock().unwrap();
+        assert_eq!(stored.len(), 1, "update must not create a duplicate");
+        assert_eq!(
+            stored[0].source.as_deref(),
+            Some("explicit"),
+            "client-driven update must persist provenance explicit"
+        );
+        assert_eq!(stored[0].content, "corrected by the user");
     }
 
     #[tokio::test]
