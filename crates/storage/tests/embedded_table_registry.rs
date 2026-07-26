@@ -216,44 +216,36 @@ async fn stale_sweep_invalidates_skill_index_embeddings() {
     fx.cleanup().await;
 }
 
-/// Acceptance: tombstones are swept too. A soft-deleted row is invisible to
-/// search, so its stale vector looks harmless -- until the row is restored from
-/// the trash carrying a vector of the wrong dimension.
+/// Acceptance: a tag the embedder cannot handle loses its stale vector rather
+/// than having it relabelled as current. Relabelling would declare a
+/// wrong-dimension vector fresh and put it beyond the stale sweep, which only
+/// looks at mismatched stamps -- turning a transient embed failure into a
+/// permanent search error.
 #[tokio::test]
-async fn soft_deleted_knowledge_rows_are_swept_so_restore_cannot_resurrect_a_stale_vector() {
-    let Some(fx) = fixture("reg682h").await else {
+async fn tag_backfill_failure_clears_the_vector_rather_than_relabelling_it() {
+    let Some(fx) = fixture("reg682i").await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let vecs: Vec<Vector> = vec![Vector::from(vec![0.1_f32, 0.2, 0.3])];
-    sqlx::query(
-        "INSERT INTO knowledge_base \
-            (id, user_id, content, tags, embedding, embedding_model, deleted_at) \
-         VALUES ($1, $2, $3, '{}', $4::vector[], $5, NOW())",
-    )
-    .bind("tombstone")
-    .bind(USER)
-    .bind("deleted but restorable")
-    .bind(&vecs)
-    .bind(old_model())
-    .execute(&fx.pool)
-    .await
-    .expect("seed soft-deleted row");
+    // Stale stamp, vector still present -- the state a hot model swap leaves
+    // behind before any sweep has run.
+    embedded_tag(&fx.pool, "billing", &old_model(), 3).await;
 
-    invalidate_stale_embeddings(&fx.pool, &new_model())
+    let failing: BackfillEmbedFn =
+        Box::new(|_| Box::pin(async { Err("embedder unavailable".to_string()) }));
+    backfill_tag_embeddings(&fx.pool, &failing, &new_model())
         .await
-        .expect("invalidate");
+        .expect("backfill reports success even when individual rows fail");
 
-    let (has_embedding,): (bool,) =
-        sqlx::query_as("SELECT embedding IS NOT NULL FROM knowledge_base WHERE id = $1")
-            .bind("tombstone")
-            .fetch_one(&fx.pool)
-            .await
-            .expect("probe tombstone");
+    let (has_embedding, model) = tag_state(&fx.pool, "billing").await;
     assert!(
         !has_embedding,
-        "a soft-deleted row keeps its vector today; restoring it after a model change \
-         puts a wrong-dimension vector back into search"
+        "a failed embed must clear the superseded vector, not keep it"
+    );
+    assert_eq!(
+        model.as_deref(),
+        Some(new_model().as_str()),
+        "the row must be stamped attempted so it is not retried in a tight loop"
     );
 
     fx.cleanup().await;
@@ -307,9 +299,13 @@ async fn tag_backfill_re_embeds_invalidated_rows() {
         .expect("invalidate");
 
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let embedded = backfill_tag_embeddings(&fx.pool, &recording_embed(Arc::clone(&seen), 4), &new_model())
-        .await
-        .expect("backfill tags");
+    let embedded = backfill_tag_embeddings(
+        &fx.pool,
+        &recording_embed(Arc::clone(&seen), 4),
+        &new_model(),
+    )
+    .await
+    .expect("backfill tags");
 
     assert_eq!(embedded, 1, "the invalidated tag must be re-embedded");
     let (has_embedding, model) = tag_state(&fx.pool, "billing").await;
@@ -340,9 +336,13 @@ async fn tag_backfill_reproduces_the_creation_embed_text() {
     .expect("seed unembedded tag");
 
     let seen = Arc::new(Mutex::new(Vec::new()));
-    backfill_tag_embeddings(&fx.pool, &recording_embed(Arc::clone(&seen), 4), &new_model())
-        .await
-        .expect("backfill tags");
+    backfill_tag_embeddings(
+        &fx.pool,
+        &recording_embed(Arc::clone(&seen), 4),
+        &new_model(),
+    )
+    .await
+    .expect("backfill tags");
 
     let texts = seen.lock().expect("read recorded texts").clone();
     assert_eq!(

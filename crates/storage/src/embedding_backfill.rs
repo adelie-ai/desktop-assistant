@@ -13,6 +13,8 @@ use pgvector::Vector;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use crate::embedded_tables::EMBEDDED_TABLES;
+
 /// Boxed async embedding function: takes a list of texts, returns a list of vectors.
 pub type BackfillEmbedFn = Box<
     dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>, String>> + Send>>
@@ -21,6 +23,43 @@ pub type BackfillEmbedFn = Box<
 >;
 
 const BATCH_SIZE: i64 = 32;
+
+/// What a stale-embedding sweep cleared, per table.
+///
+/// Reported per table rather than as one number so an operator can tell "the
+/// model changed and 781 knowledge rows are re-embedding" from "26 tags are",
+/// which have very different costs and very different recovery times.
+#[derive(Debug, Default, Clone)]
+pub struct StaleInvalidation {
+    /// Rows invalidated in each table, in [`EMBEDDED_TABLES`] order.
+    pub per_table: Vec<(&'static str, u64)>,
+    /// Rows whose stamp was rewritten to the current spelling because the
+    /// digest already matched, so their vectors were kept.
+    pub restamped: u64,
+}
+
+impl StaleInvalidation {
+    /// Total rows invalidated across every table.
+    pub fn total(&self) -> u64 {
+        self.per_table.iter().map(|(_, n)| n).sum()
+    }
+
+    /// Whether the sweep found nothing to do.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// Per-table breakdown for a log line, listing only tables that lost rows:
+    /// `knowledge_base=781, tag_registry=26`.
+    pub fn summary(&self) -> String {
+        self.per_table
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(table, n)| format!("{table}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 /// Invalidate (NULL-out) embeddings whose model stamp doesn't match the current model.
 ///
@@ -32,7 +71,12 @@ const BATCH_SIZE: i64 = 32;
 /// Also cleans up orphaned state where `embedding_model` is set but `embedding`
 /// is NULL (e.g. from a previous interrupted invalidation or failed backfill).
 ///
-/// Returns `(knowledge_count, tool_count)` of invalidated rows.
+/// Sweeps every table in [`EMBEDDED_TABLES`], including soft-deleted knowledge
+/// rows: a tombstone is invisible to search, so its stale vector looks harmless
+/// until the row is restored from the trash still carrying it. Only rows whose
+/// stamp is already superseded are cleared, so nothing usable is discarded, and
+/// the knowledge backfill still skips tombstones (#656) -- a cleared one is not
+/// re-embedded until it is actually restored.
 ///
 /// # Staleness is decided on the digest
 ///
@@ -51,98 +95,67 @@ const BATCH_SIZE: i64 = 32;
 pub async fn invalidate_stale_embeddings(
     pool: &PgPool,
     current_model: &str,
-) -> Result<(u64, u64), String> {
-    // Adopt the current spelling wherever the digest already matches. Must run
-    // BEFORE the invalidation below, which would otherwise clear these rows.
-    // `split_part(x, '@', 2)` yields '' when there is no '@', so the non-empty
-    // test doubles as "both sides carry a digest".
-    let kb_restamped = sqlx::query(
-        "UPDATE knowledge_base
-         SET embedding_model = $1
-         WHERE embedding IS NOT NULL
-           AND embedding_model IS NOT NULL
-           AND embedding_model <> $1
-           AND deleted_at IS NULL
-           AND split_part($1, '@', 2) <> ''
-           AND split_part(embedding_model, '@', 2) = split_part($1, '@', 2)",
-    )
-    .bind(current_model)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+) -> Result<StaleInvalidation, String> {
+    let mut outcome = StaleInvalidation::default();
 
-    let tool_restamped = sqlx::query(
-        "UPDATE tool_definitions
-         SET embedding_model = $1
-         WHERE embedding IS NOT NULL
-           AND embedding_model IS NOT NULL
-           AND embedding_model <> $1
-           AND split_part($1, '@', 2) <> ''
-           AND split_part(embedding_model, '@', 2) = split_part($1, '@', 2)",
-    )
-    .bind(current_model)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    for table in EMBEDDED_TABLES {
+        // Adopt the current spelling wherever the digest already matches. Must
+        // run BEFORE the invalidation below, which would otherwise clear these
+        // rows. `split_part(x, '@', 2)` yields '' when there is no '@', so the
+        // non-empty test doubles as "both sides carry a digest".
+        let restamped = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table}
+             SET embedding_model = $1
+             WHERE embedding IS NOT NULL
+               AND embedding_model IS NOT NULL
+               AND embedding_model <> $1
+               AND split_part($1, '@', 2) <> ''
+               AND split_part(embedding_model, '@', 2) = split_part($1, '@', 2)"
+        )))
+        .bind(current_model)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        outcome.restamped += restamped.rows_affected();
 
-    let restamped = kb_restamped.rows_affected() + tool_restamped.rows_affected();
-    if restamped > 0 {
+        // Invalidate stale model embeddings (model mismatch).
+        let stale = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table}
+             SET embedding = NULL, embedding_model = NULL
+             WHERE embedding IS NOT NULL
+               AND embedding_model IS NOT NULL
+               AND embedding_model != $1"
+        )))
+        .bind(current_model)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Clean up orphaned state: model is set but embedding is NULL.
+        let orphan = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table}
+             SET embedding_model = NULL
+             WHERE embedding IS NULL
+               AND embedding_model IS NOT NULL"
+        )))
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        outcome
+            .per_table
+            .push((table, stale.rows_affected() + orphan.rows_affected()));
+    }
+
+    if outcome.restamped > 0 {
         tracing::info!(
             "embedding model renamed to {current_model} with an unchanged digest; \
-             restamped {restamped} row(s) instead of re-embedding them"
+             restamped {} row(s) instead of re-embedding them",
+            outcome.restamped
         );
     }
 
-    // Invalidate stale model embeddings (model mismatch).
-    let kb_stale = sqlx::query(
-        "UPDATE knowledge_base
-         SET embedding = NULL, embedding_model = NULL
-         WHERE embedding IS NOT NULL
-           AND embedding_model IS NOT NULL
-           AND embedding_model != $1
-           AND deleted_at IS NULL",
-    )
-    .bind(current_model)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Clean up orphaned state: model is set but embedding is NULL.
-    let kb_orphan = sqlx::query(
-        "UPDATE knowledge_base
-         SET embedding_model = NULL
-         WHERE embedding IS NULL
-           AND embedding_model IS NOT NULL",
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let tool_stale = sqlx::query(
-        "UPDATE tool_definitions
-         SET embedding = NULL, embedding_model = NULL
-         WHERE embedding IS NOT NULL
-           AND embedding_model IS NOT NULL
-           AND embedding_model != $1",
-    )
-    .bind(current_model)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let tool_orphan = sqlx::query(
-        "UPDATE tool_definitions
-         SET embedding_model = NULL
-         WHERE embedding IS NULL
-           AND embedding_model IS NOT NULL",
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let kb_total = kb_stale.rows_affected() + kb_orphan.rows_affected();
-    let tool_total = tool_stale.rows_affected() + tool_orphan.rows_affected();
-    Ok((kb_total, tool_total))
+    Ok(outcome)
 }
 
 /// Invalidate (NULL-out) the embedding on EVERY active `knowledge_base` row,
@@ -561,4 +574,128 @@ pub async fn backfill_skill_embeddings(
     }
 
     Ok(total)
+}
+
+/// Backfill embeddings for tags whose stamp is missing or superseded.
+///
+/// Tags are short, so unlike the knowledge/tool/skill backfills there is no
+/// chunking: one embedding per tag, stored in a scalar `vector` column rather
+/// than a `vector[]`.
+///
+/// The embed text must stay byte-identical to the one
+/// [`crate::tag_registry::create_or_match_tag`] builds when it looks for a
+/// near-duplicate. A backfilled vector is compared directly against vectors
+/// produced by that path, so embedding a different string here would make the
+/// dedup distances meaningless rather than merely imprecise.
+///
+/// Deprecated tags are skipped: they are excluded from the dedup search, so
+/// re-embedding them is spend with no reader.
+pub async fn backfill_tag_embeddings(
+    pool: &PgPool,
+    embed_fn: &BackfillEmbedFn,
+    current_model: &str,
+) -> Result<usize, String> {
+    let mut total = 0usize;
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT user_id, name, name || ': ' || description AS text \
+             FROM tag_registry \
+             WHERE deprecated_for_tag IS NULL \
+               AND (embedding IS NULL \
+                 OR embedding_model IS NULL \
+                 OR embedding_model != $1) \
+             LIMIT $2",
+        )
+        .bind(current_model)
+        .bind(BATCH_SIZE)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let texts: Vec<String> = rows.iter().map(|(_, _, text)| text.clone()).collect();
+        match embed_fn(texts).await {
+            Ok(embeddings) => {
+                consecutive_failures = 0;
+                for ((user_id, name, _), embedding) in rows.iter().zip(embeddings) {
+                    write_tag_embedding(pool, user_id, name, Some(embedding), current_model)
+                        .await?;
+                }
+                total += rows.len();
+            }
+            Err(e) => {
+                tracing::warn!("tag embedding batch failed, retrying individually: {e}");
+                let mut any_succeeded = false;
+                for (user_id, name, text) in &rows {
+                    match embed_fn(vec![text.clone()]).await {
+                        Ok(embeddings) => {
+                            let embedding = embeddings.into_iter().next();
+                            write_tag_embedding(pool, user_id, name, embedding, current_model)
+                                .await?;
+                            total += 1;
+                            any_succeeded = true;
+                        }
+                        Err(e2) => {
+                            // Stamp the model without a vector so a permanently
+                            // failing tag is retried once per model change
+                            // rather than on every pass.
+                            tracing::warn!("skipping tag {name}: {e2}");
+                            write_tag_embedding(pool, user_id, name, None, current_model).await?;
+                        }
+                    }
+                }
+                if any_succeeded {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        tracing::error!(
+                            "tag embedding backfill aborting after {consecutive_failures} consecutive failures"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total)
+}
+
+/// Write one tag's vector and model stamp.
+///
+/// `embedding: None` records a failed attempt: the vector is cleared and the
+/// model stamped, which marks the row attempted so it is not retried in a tight
+/// loop. Clearing rather than keeping the old vector matters -- a row only
+/// reaches the backfill when its embedding is absent or its stamp superseded,
+/// so whatever is there cannot be compared against a current-model query
+/// anyway. Stamping the current model over a retained stale vector would
+/// declare it current and put it permanently beyond
+/// [`invalidate_stale_embeddings`], which only looks at mismatched stamps.
+async fn write_tag_embedding(
+    pool: &PgPool,
+    user_id: &str,
+    name: &str,
+    embedding: Option<Vec<f32>>,
+    current_model: &str,
+) -> Result<(), String> {
+    let vector = embedding.map(Vector::from);
+    sqlx::query(
+        "UPDATE tag_registry \
+         SET embedding = $1, embedding_model = $2 \
+         WHERE user_id = $3 AND name = $4",
+    )
+    .bind(&vector)
+    .bind(current_model)
+    .bind(user_id)
+    .bind(name)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }

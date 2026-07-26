@@ -13,6 +13,14 @@
 //! row-selection query did not -- so every model change re-embedded the
 //! tombstones too.
 //!
+//! The guard against that churn is the backfill's own `deleted_at IS NULL`
+//! row selection, pinned by `backfill_skips_soft_deleted` below. Stale
+//! invalidation no longer skips tombstones (#682): it only clears rows whose
+//! stamp is already superseded, whose vectors are therefore unusable against a
+//! current-model query, and keeping them meant a restore could put a
+//! wrong-dimension vector back into search. Cleared tombstones are not
+//! re-embedded while they stay deleted, so the #656 saving holds.
+//!
 //! ## Running locally
 //!
 //! ```sh
@@ -333,7 +341,7 @@ async fn get_returns_none_for_soft_deleted() {
 // --- embedding pipeline -----------------------------------------------------
 
 #[tokio::test]
-async fn stale_invalidation_skips_soft_deleted() {
+async fn stale_invalidation_clears_soft_deleted_vectors_so_restore_is_safe() {
     let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
@@ -344,8 +352,7 @@ async fn stale_invalidation_skips_soft_deleted() {
     set_embedding(&fx.pool, "retired", vec![vec![1.0, 0.0, 0.0]]).await;
     soft_delete(&fx.pool, "retired").await;
 
-    // Model changed: 'model-A' -> 'model-B'. The tombstone is not searchable,
-    // so clearing its vector is pure churn (on prod this re-embedded 681 rows).
+    // Model changed: 'model-A' -> 'model-B'.
     invalidate_stale_embeddings(&fx.pool, "model-B")
         .await
         .expect("invalidate");
@@ -357,8 +364,10 @@ async fn stale_invalidation_skips_soft_deleted() {
             .expect("probe");
     assert_eq!(
         still.map(|r| r.0),
-        Some(true),
-        "a soft-deleted row's embedding must be left alone by stale invalidation"
+        Some(false),
+        "a tombstone whose stamp is already superseded holds a vector that cannot be \
+         compared against a current-model query without erroring; leaving it in place \
+         only means a restore puts a wrong-dimension vector straight back into search"
     );
     fx.cleanup().await;
 }
