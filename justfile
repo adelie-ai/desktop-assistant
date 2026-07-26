@@ -76,6 +76,11 @@ test:
 test-integration:
     cargo test --workspace -- --ignored
 
+# Named tests for the shell-level gate steps under scripts/ (the gate's own
+# plumbing: the dependency scan and the throwaway-Postgres harness).
+test-scripts:
+    ./scripts/tests/run.sh
+
 # --- DB-gated storage isolation suites (#444) ------------------------------
 # The `crates/storage` isolation suites pass-skip when TEST_DATABASE_URL is
 # unset, so a bare `cargo test` proves nothing about multi-tenant safety.
