@@ -31,8 +31,11 @@ Any client that can reach the daemon reconfigures it for every tenant. This is a
 authorization gap, not only a modeling one.
 
 **Credentials.** Secrets resolve as `(service, account)` where the account derives
-from the connector name, so one provider key serves the entire instance. Every
-tenant's spend lands on it, and any client can rotate it away from everyone else.
+from the connector name, so one provider key serves the entire instance. Decision 8
+accepts the sharing: users in one organization share the organization's account. The
+defect is narrower. Any client can rotate that key away from everyone else, because
+`set_api_key` takes no caller identity. That is the operator/tenant gap above, not a
+missing per-tenant credential store.
 
 **Tool execution.** `terminal`, `command`, `fileio`, and `skills` run inside the
 daemon process, as one uid, against one filesystem. On the desktop that is exactly
@@ -148,36 +151,83 @@ item, replaced by a policy list. The MCP OAuth ownership problem mostly follows 
 per-user servers that carry the tokens. Skill scanning's user-roots path simply does
 not run where it does not apply.
 
-`[purposes.embedding]` turns out to be two settings under one name. A per-user
-knowledge-base embedder is viable, because `knowledge_base` is user-scoped and its
-rows already carry an `embedding_model` stamp. The tool and skill index embedder
-cannot be, because `tool_definitions` and `skill_index` are deliberately host-global.
-Splitting them is a prerequisite for making either one configurable per user.
+`[purposes.embedding]` describes two things under one name. A per-user knowledge-base
+embedder is technically viable, because `knowledge_base` is user-scoped and its rows
+already carry an `embedding_model` stamp. The tool and skill index embedder is not,
+because `tool_definitions` and `skill_index` are deliberately host-global.
+
+Decision 9 makes the split unnecessary for now: one embedder serves the instance. The
+observation still matters in one place. A force rebuild must re-embed the rows a user
+owns without rebuilding the host-global indexes, because those affect every user and
+cost the operator money.
+
+### 7. The tenant boundary is intra-organization, not hostile isolation
+
+Multiple users share one instance. They belong to one organization. They are not
+adversaries.
+
+This sets the bar for every other decision here. The goal is that one user does not
+see or disturb another user's data and settings. The goal is not to defend against a
+tenant who attacks the instance. When two groups need real separation, run a second
+instance in Kubernetes. That is cheaper and stronger than building hostile isolation
+into one process.
+
+### 8. Connectors and credentials stay global
+
+One provider credential serves the instance. The operator owns it and pays for it.
+
+Per-tenant credentials would change the connection registry, the secret store, the
+purpose resolver, and every call site that resolves a client. That is a large
+architectural change. Decision 7 makes it unnecessary: users in one organization can
+share the organization's provider account. Revisit this if a real per-user billing or
+per-user provider-account requirement appears.
+
+### 9. Purposes stay global
+
+The model for each purpose - interactive, dreaming, embedding, and the rest - is one
+setting for the instance. The operator sets it.
+
+Per-user purposes would need a resolution chain on the hot path of every turn, and
+per-user embedders would split the vector space. The cost is high and the benefit is
+small inside one organization. Personality and speech mode are still good candidates
+for the per-user override layer in decision 1, because they are cheap and personal.
+
+### 10. Daemon-hosted stateful servers get a per-user data root
+
+`timeclock`, `tasks`, and `homeassistant` stay in the daemon. Each user gets a
+private data directory. The server is told which root to use for the current user.
+
+This keeps the property that makes central hosting worth it: one dataset, reachable
+from the TUI, the GTK client, or a phone. It also gives `web-mcp` somewhere to put
+per-user Chromium profile data, which is per-user state that is shared today.
 
 ## Open questions
 
-**Credential model.** Per-tenant BYO keys, or operator-pays with quota? Both are
-defensible and the choice determines the schema.
+**Headless work has no client runner.** Dreaming and consolidation do not need one -
+they only read and write the database. Scheduled routines (#413) are different. A
+routine runs a full agent turn on a timer with no client attached. If file and shell
+tools only run client-side, a routine cannot use them. Decision 10 suggests an
+answer: give routines the same per-user data root. That needs a decision before
+routines ship.
 
-**Runner for clients that cannot host tools.** The wasm web client and the voice
-client cannot host in-process `fileio` or `terminal`. Where an operator denies
-daemon-side file access, those surfaces have no runner at all. Candidates: borrow a
-runner from the same user's other registered client, add a per-user server-side
-root, or accept the gap. Borrowing needs tool scoping keyed to (user, host) rather
-than (user, session), and #260 deliberately made registration session-scoped to stop
-the voice `say_this` leak - so the distinction to draw is between session-affine
-capabilities, which stay scoped, and host-affine ones, which belong to a machine.
+**Runner push-down to a desktop client** is deferred, not rejected. See "Deferred"
+below.
 
-**Centrally-hosted stateful servers.** `timeclock`, `tasks`, and `homeassistant`
-genuinely want to stay central: a single-user self-hoster reaches the same data from
-the TUI, the GTK client, or a phone, and a phone cannot run them at all. Scope
-inside each server, or give each a per-user data root?
+## Deferred
 
-**Do embeddings go per-user at all,** or does the operator choose the embedder for
-everyone?
+**Linking Adelie daemons and pushing work down to a desktop client.** A voice or web
+session cannot host `fileio` or `terminal` in-process. Borrowing a runner from the
+same user's desktop client would fix that, and it is a useful feature in its own
+right - ask by voice, act on your desktop.
 
-**Headless work has no client runner.** Dreaming and consolidation do not need one.
-Scheduled routines (#413) plausibly will.
+It needs three things this epic does not cover: a permission model for one surface
+acting on another, tool scoping keyed to (user, host) rather than (user, session)
+- #260 deliberately made registration session-scoped to stop the voice `say_this`
+leak, so the distinction to draw is between session-affine capabilities and
+host-affine ones - and the remote-daemon link itself, which has an unused KCM today.
+
+That is a separate effort. Until it lands, a surface that cannot host a tool reports
+the capability as unavailable and names the runner that would provide it.
 
 ## Rejected alternatives
 
