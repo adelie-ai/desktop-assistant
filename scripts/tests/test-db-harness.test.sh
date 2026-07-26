@@ -102,7 +102,7 @@ test_db_reports_a_clear_error_when_no_free_port_is_available() {
     assert_contains "$RUN_ERR" 'port' 'the message is about the port'
     assert_contains "$RUN_ERR" 'Address already in use' 'passes through what the runtime said'
     [ ! -e "$TEST_TMP/payload-ran" ] || fail 'the payload must not run without a database'
-    assert_not_contains "$(cli_log)" 'rm ' 'nothing was created, so nothing is removed'
+    assert_eq 0 "$(cli_log | grep -c '^rm ' || true)" 'nothing was created, so nothing is removed'
 }
 
 test_db_down_removes_only_leftover_harness_containers() {

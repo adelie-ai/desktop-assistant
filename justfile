@@ -47,8 +47,17 @@ build:
 # We run these locally instead of GitHub Actions. `install-hooks` wires `check`
 # into a git pre-push hook so it runs automatically before every push.
 
-# Full local gate: formatting, lints, build, tests (on the pinned toolchain)
-check: fmt-check lint build test
+# Full local gate: dependency scan, formatting, lints, build, tests, and the
+# tests for the gate's own shell steps (on the pinned toolchain).
+# `audit` comes first on purpose: build scripts execute at first compile - under
+# `clippy` as much as under `build` - so the advisory scan has to precede both.
+check: audit fmt-check lint build test test-scripts
+
+# RustSec advisory scan of Cargo.lock. Fails loudly when cargo-audit is missing
+# or the advisory database cannot be fetched, rather than passing on silence
+# (#706); see scripts/audit.sh for the offline opt-in.
+audit:
+    ./scripts/audit.sh
 
 # Verify formatting without modifying files
 fmt-check:
@@ -88,68 +97,33 @@ test-scripts:
 # pre-created by the auto-loaded init fixture under
 # crates/storage/tests/fixtures/initdb/), so a real isolation run is one
 # command. Honors CONTAINER_CLI, else auto-detects podman/docker.
-test_db_image := env_var_or_default("TEST_DB_IMAGE", "docker.io/pgvector/pgvector:pg17")
-test_db_name := "adele-storage-testdb"
-test_db_port := env_var_or_default("TEST_DB_PORT", "55432")
-test_db_initdb := justfile_directory() / "crates/storage/tests/fixtures/initdb"
+#
+# Each invocation provisions its OWN container and its OWN host port and removes
+# only what it created, so parallel worktrees can run the suites at the same
+# time (#662). The mechanics live in scripts/test-db.sh; see its header for the
+# environment knobs (TEST_DB_IMAGE, TEST_DB_PORT, TEST_DB_MAX_CONNECTIONS, ...).
 
 # Boot an ephemeral Postgres, run the storage suite against it, tear it down.
 # Extra args pass through to `cargo test` (e.g. `just test-db -- --nocapture`).
 test-db *ARGS:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cli="${CONTAINER_CLI:-}"
-    if [ -z "$cli" ]; then
-      if podman info >/dev/null 2>&1; then cli=podman
-      elif docker info >/dev/null 2>&1; then cli=docker
-      else echo "no reachable container runtime (podman/docker); set CONTAINER_CLI" >&2; exit 1; fi
-    fi
-    echo "test-db: using container runtime '$cli'"
-    "$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true
-    trap '"$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true' EXIT
-    "$cli" run --rm -d --name {{test_db_name}} \
-      -e POSTGRES_PASSWORD=test -e POSTGRES_DB=postgres \
-      -p {{test_db_port}}:5432 \
-      -v "{{test_db_initdb}}:/docker-entrypoint-initdb.d:ro,z" \
-      {{test_db_image}} >/dev/null
-    printf 'test-db: waiting for postgres'
-    for i in $(seq 1 60); do
-      if "$cli" exec {{test_db_name}} pg_isready -U postgres -q 2>/dev/null; then echo ' ready'; break; fi
-      printf '.'; sleep 1
-      if [ "$i" -eq 60 ]; then echo ' timed out' >&2; exit 1; fi
-    done
-    export TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:{{test_db_port}}/postgres"
-    cargo test -p desktop-assistant-storage {{ARGS}}
+    ./scripts/test-db.sh run -- cargo test -p desktop-assistant-storage {{ARGS}}
 
 # Boot the ephemeral Postgres and leave it running for iterative test runs;
-# prints the TEST_DATABASE_URL to export. Tear down with `just test-db-down`.
+# prints the settings to export. Tear down with `just test-db-down`:
+#   eval "$(just test-db-up)"
 test-db-up:
+    @./scripts/test-db.sh start
+
+# Remove ephemeral Postgres containers started by test-db-up. With no argument,
+# sweeps every container this harness left behind (e.g. from a killed run).
+test-db-down *NAMES:
     #!/usr/bin/env bash
     set -euo pipefail
-    cli="${CONTAINER_CLI:-}"
-    if [ -z "$cli" ]; then
-      if podman info >/dev/null 2>&1; then cli=podman
-      elif docker info >/dev/null 2>&1; then cli=docker
-      else echo "no reachable container runtime (podman/docker); set CONTAINER_CLI" >&2; exit 1; fi
+    if [ -z "{{NAMES}}" ]; then
+      ./scripts/test-db.sh prune
+    else
+      ./scripts/test-db.sh stop {{NAMES}}
     fi
-    "$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true
-    "$cli" run --rm -d --name {{test_db_name}} \
-      -e POSTGRES_PASSWORD=test -e POSTGRES_DB=postgres \
-      -p {{test_db_port}}:5432 \
-      -v "{{test_db_initdb}}:/docker-entrypoint-initdb.d:ro,z" \
-      {{test_db_image}} >/dev/null
-    for i in $(seq 1 60); do
-      "$cli" exec {{test_db_name}} pg_isready -U postgres -q 2>/dev/null && break
-      sleep 1
-    done
-    echo 'export TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:{{test_db_port}}/postgres"'
-
-# Remove the ephemeral Postgres started by test-db-up.
-test-db-down:
-    #!/usr/bin/env bash
-    cli="${CONTAINER_CLI:-podman}"
-    "$cli" rm -f {{test_db_name}} >/dev/null 2>&1 || true
-    echo "test-db: removed {{test_db_name}}"
 
 # Rebase onto latest origin/main then run the gate (catches clean-rebase-but-broken-build)
 premerge:

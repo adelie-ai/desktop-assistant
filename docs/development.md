@@ -5,15 +5,32 @@ The assistant persona is named **Adele**, in reference to the **Adélie penguin*
 ## Day-to-day Commands
 
 ```bash
-# format
+# the whole gate: dependency scan, format, lints, build, tests
+just check
+
+# individual steps
 cargo fmt
-
-# full test suite
 cargo test --workspace
-
-# strict lints
 cargo clippy --workspace --all-targets -- -D warnings
+just audit                  # RustSec advisory scan of Cargo.lock
 ```
+
+`just check` needs `cargo-audit` (`cargo install cargo-audit --locked`) and
+network access for the advisory database; it fails loudly without either rather
+than skipping the scan.
+
+It does **not** run the DB-gated `crates/storage` isolation suites, which
+pass-skip without `TEST_DATABASE_URL`:
+
+```bash
+just test-db                          # boot a throwaway pgvector, run the suites, tear it down
+just test-db --test knowledge_trash   # extra args go to cargo test
+eval "$(just test-db-up)"             # keep one running for iterative work
+just test-db-down                     # sweep anything the harness left behind
+```
+
+Each invocation provisions its own container on its own host port, so several
+worktrees can run the suites at the same time.
 
 ## Run Components
 

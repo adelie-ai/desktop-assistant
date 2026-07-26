@@ -72,12 +72,36 @@ The workspace is held to:
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
+- a RustSec advisory scan of `Cargo.lock` (`scripts/audit.sh`)
+
+`just check` runs exactly those, in that order plus `build`, and finishes with
+`just test-scripts` (the named tests for the gate's own shell steps, under
+`scripts/tests/`). The advisory scan runs first because build scripts execute at
+first compile - under `clippy` as much as under `build`.
+
+What `just check` does **not** cover: the DB-gated `crates/storage` isolation
+suites. They pass-skip without `TEST_DATABASE_URL`, so a green `just check`
+proves nothing about multi-tenant safety - run `just test-db` for that, and say
+in the PR which of the two you ran.
 
 New code keeps it there. Warnings-as-errors is enforced **mechanically**, not by reviewer vigilance: the root `Cargo.toml` sets `[workspace.lints] rust.warnings = "deny"` and `clippy.all = "deny"`, and every member inherits via `[lints] workspace = true`, so a plain `cargo build`/`test`/`clippy` hard-fails on any warning. See the **Warnings are failures** standard below for the posture.
 
 ## Dependency safety
 
 Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`/`add`/`rm`), `cargo-audit`, `cargo-outdated`, `cargo-deny`; prefer built-in cargo for trivial one-line edits, and avoid obscure/unmaintained single-author plugins without checking first. The `cve-mcp` MCP server's `scan_packages` tool is wired up; the **Security review** standard below covers when and how to use it. Repo-specific note: build scripts (`build.rs`) execute on first build, so the scan happens between lockfile change and first `cargo build`, not after.
+
+`cargo-audit` is therefore a prerequisite of the gate, not an optional extra:
+`cargo install cargo-audit --locked`. The scan step (`just audit`,
+`scripts/audit.sh`) is deliberately unable to pass by accident (#706):
+
+- **cargo-audit not installed** - hard failure, with the install command.
+- **Advisory database unfetchable** (offline, blocked proxy) - hard failure. It
+  will not fall back to a cached database silently. If you accept a possibly
+  stale database, opt in with `ADELE_AUDIT_ALLOW_STALE=1`; the run then prints a
+  loud banner naming the database and its age, and you say so in the PR.
+- **Vulnerability reported** - hard failure (see **Security review** below).
+- **Informational advisory** (unmaintained, unsound, yanked) - reported loudly,
+  does not fail the gate; treat it as a review item.
 
 ## Cross-project engineering standards
 
@@ -87,7 +111,7 @@ These apply to every repo under `github.com/adelie-ai`. They're embedded in each
 - `main` is the release: at any commit it must build, test, and run.
 - Merge a green change as soon as it's independently shippable — additive, behavior-preserving, or behind a default that preserves the old path. Don't hold green work hostage to a coordinated release.
 - Co-dependent changes land together; name the interlock ("blocked-by #X" / "must merge with #Y") so it's visible without reading the diff.
-- "Green" is more than CI: review passed, tests cover the new behavior (not just "no panic"), warnings clean, security pass done, change stands on its own. With no active CI in these repos, "green" rests on local `cargo test --workspace` + `fmt` + `clippy` + `cargo audit` (`just check`), run by the author.
+- "Green" is more than CI: review passed, tests cover the new behavior (not just "no panic"), warnings clean, security pass done, change stands on its own. With no active CI in these repos, "green" rests on local `cargo test --workspace` + `fmt` + `clippy` + `cargo audit`, all of which `just check` runs (see **Build hygiene** for exactly what it does and does not cover), run by the author.
 - When in doubt, hold. A half-coupled "fix-forward" merge breaks `main` for everyone.
 
 ### Tests are spec-driven (TDD)
@@ -128,3 +152,4 @@ These apply to every repo under `github.com/adelie-ai`. They're embedded in each
 ### Worktrees
 - Do code work in a git worktree on its own branch off `origin/main`, never the primary checkout, so concurrent sessions don't collide. Convention: `~/Projects/adelie-ai/.worktrees/<repo>/issue-N-slug/`, branch mirroring the slug.
 - Run independent tasks in parallel worktrees, but check first for shared files / shared `Cargo.toml` dep edits / shared migration ordinals — if they overlap, serialize. Brief each parallel agent on its scope ("own crate X, don't touch Y").
+- Local tooling has to survive that. `just test-db` gives every invocation its own container and its own host port and removes only what it created, so two sessions can run the storage suites at once (#662). If you add another recipe that provisions something shared, hold it to the same bar - a fixed name or a fixed port turns a second session into a plausible-looking flake in an unrelated test.

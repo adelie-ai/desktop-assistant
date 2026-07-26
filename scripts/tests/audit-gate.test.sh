@@ -4,7 +4,7 @@
 # The point of the step is that it cannot pass by accident: not when
 # cargo-audit is missing, and not when the advisory database could not be
 # fetched. Those outcomes are driven here by putting a fake `cargo-audit` on
-# PATH — the same mechanism cargo itself uses to find the subcommand — so the
+# PATH - the same mechanism cargo itself uses to find the subcommand - so the
 # script under test runs unmodified.
 set -euo pipefail
 # shellcheck source=scripts/tests/lib.sh
@@ -71,7 +71,7 @@ audit_offline_optin_uses_the_cached_database_and_says_so() {
     run_cmd "$AUDIT_SH"
     assert_eq 0 "$RUN_STATUS" 'explicit offline opt-in still completes'
     assert_contains "$(cat "$FAKE_AUDIT_LOG")" '--no-fetch' 'opt-in skips the fetch'
-    assert_contains "$RUN_ERR" 'stale' 'opt-in is loud about what it did'
+    assert_contains "$RUN_ERR" 'STALE ADVISORY DATABASE' 'opt-in is loud about what it did'
 }
 
 audit_reports_informational_advisories_without_failing() {
@@ -80,11 +80,12 @@ audit_reports_informational_advisories_without_failing() {
     run_cmd "$AUDIT_SH"
     assert_eq 0 "$RUN_STATUS" 'informational advisories are not a gate failure'
     assert_contains "$RUN_ERR" 'informational' 'but they are surfaced'
+    assert_not_contains "$RUN_OUT" 'clean' 'and the summary does not call the scan clean'
 }
 
 check_gate_runs_the_dependency_scan_before_the_first_build() {
     # `just -n check` prints the plan it would execute, in order. Build scripts
-    # run at first compile — including under clippy — so the scan has to come
+    # run at first compile - including under clippy - so the scan has to come
     # before any of them, not after `test` (AGENTS.md, "Security review").
     local plan
     plan="$(cd "$SCRIPT_TESTS_ROOT" && just -n check 2>&1)"

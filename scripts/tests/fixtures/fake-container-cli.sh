@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fake podman/docker for the test-db harness tests. Injected through
 # CONTAINER_CLI (the same knob operators use), so scripts/test-db.sh runs its
-# real control flow — naming, port readback, readiness polling, teardown —
+# real control flow - naming, port readback, readiness polling, teardown -
 # without a container runtime, a network, or a 10-second Postgres boot.
 #
 # Every invocation's arguments are appended to $FAKE_CLI_LOG, so a test can

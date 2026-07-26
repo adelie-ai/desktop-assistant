@@ -47,7 +47,7 @@ skip_test() {
     local name="$1" why="$2"
     _tests_total=$((_tests_total + 1))
     _tests_skipped=$((_tests_skipped + 1))
-    _skip_hints+=("$name — $why")
+    _skip_hints+=("$name - $why")
     printf 'SKIPPED  %s\n' "$name"
 }
 
@@ -57,7 +57,7 @@ finish_tests() {
     if [ "${#_skip_hints[@]}" -gt 0 ]; then
         {
             printf '\n'
-            printf '!!  %s: %d test(s) did NOT run — this suite verified nothing about them:\n' \
+            printf '!!  %s: %d test(s) did NOT run - this suite verified nothing about them:\n' \
                 "$suite" "$_tests_skipped"
             printf '!!    %s\n' "${_skip_hints[@]}"
         } >&2
