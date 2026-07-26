@@ -5,8 +5,21 @@
 //! to recompute what it should look like — pruning trivia, merging duplicates,
 //! tightening verbose entries — emitting explicit operations against existing
 //! ids. The operations are applied transactionally with soft-delete via
-//! [`reconcile::apply_ops`]; a deletion cap and a logged op-diff guard against
-//! a bad run gutting the store.
+//! [`reconcile::apply_ops`].
+//!
+//! The plan is not applied verbatim. Three rules bound what one night's
+//! judgment can do, because that judgment is formed from prose alone with no
+//! signal about whether an entry was ever retrieved or cited:
+//!
+//! 1. A deliberately promoted entry ([`SOURCE_EXPLICIT`]) is never pruned. It
+//!    may be rewritten or merged, and the provenance follows it, so the
+//!    protection cannot be laundered away over successive runs.
+//! 2. An entry already rewritten [`MAX_REVIEW_GENERATION`] times is settled:
+//!    consolidation re-reads its own output every pass, so without a stop the
+//!    store drifts from what was observed toward paraphrase of paraphrase. A
+//!    settled entry stays prunable - the cap settles its prose, not the store.
+//! 3. Outright prunes are capped at [`MAX_DELETE_FRACTION`] of the active set
+//!    per run. Merges do not count: their content survives in a canonical row.
 //!
 //! When a user's KB is too large for a single prompt it is sliced into
 //! tag-grouped chunks under a character budget and each chunk is recomputed
@@ -25,7 +38,7 @@ use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
     ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_FRACTION,
-    MAX_HOLISTIC_PROMPT_CHARS,
+    MAX_DELETE_REASON_CHARS, MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION, SOURCE_EXPLICIT,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 
@@ -35,6 +48,26 @@ struct KbEntry {
     content: String,
     tags: Vec<String>,
     metadata: KbMetadata,
+    /// Provenance (`extraction` | `consolidation` | `explicit`, or NULL on rows
+    /// written before the column existed). Gates the never-prune rule.
+    source: Option<String>,
+    /// How many times consolidation has already rewritten this entry.
+    review_generation: i16,
+}
+
+impl KbEntry {
+    /// Deliberately promoted by a person, so consolidation may rewrite or merge
+    /// it but never prune it.
+    fn is_protected(&self) -> bool {
+        self.source.as_deref() == Some(SOURCE_EXPLICIT)
+    }
+
+    /// Rewritten as many times as the review cap allows. Its prose is settled:
+    /// consolidation re-reads its own output every pass, so without a stop the
+    /// entry drifts from what was observed toward paraphrase of paraphrase.
+    fn is_settled(&self) -> bool {
+        self.review_generation >= MAX_REVIEW_GENERATION
+    }
 }
 
 /// Entry point for the consolidation scan. Recomputes each user's active
@@ -80,6 +113,8 @@ pub async fn run_consolidation_phase(
                 total.updated += stats.updated;
                 total.scope_added += stats.scope_added;
                 total.soft_deleted += stats.soft_deleted;
+                total.protected_from_delete += stats.protected_from_delete;
+                total.settled_unchanged += stats.settled_unchanged;
                 // Live refresh: if this user's KB actually changed, let connected
                 // panels refetch as the scan progresses.
                 if (stats.merged_clusters > 0
@@ -141,7 +176,11 @@ async fn consolidate_user(
         std::collections::HashMap::new();
     // Deletes are collected across slices so the per-run deletion cap applies
     // to the user's whole KB, not each slice.
-    let mut delete_ops: Vec<(String, String)> = Vec::new();
+    let mut delete_ops: Vec<(String, Option<String>)> = Vec::new();
+    // Refusals, reported so an operator can see what the model keeps asking
+    // for and the guards keep declining.
+    let mut protected_from_delete = 0usize;
+    let mut settled_unchanged = 0usize;
     // Track per-slice LLM/parse failures so a pass where EVERY slice failed
     // (e.g. the consolidation model is unauthorized or unreachable) surfaces as
     // an error instead of a silent "0 changes" success.
@@ -155,6 +194,16 @@ async fn consolidate_user(
             break;
         }
         let valid: HashSet<&str> = slice.iter().map(|e| e.id.as_str()).collect();
+        let protected: HashSet<&str> = slice
+            .iter()
+            .filter(|e| e.is_protected())
+            .map(|e| e.id.as_str())
+            .collect();
+        let settled: HashSet<&str> = slice
+            .iter()
+            .filter(|e| e.is_settled())
+            .map(|e| e.id.as_str())
+            .collect();
 
         let response = match llm_fn(build_system_prompt(), build_user_prompt(slice)).await {
             Ok(r) => r,
@@ -180,11 +229,21 @@ async fn consolidate_user(
             match op {
                 RawOp::Delete { ids, id, reason } => {
                     for did in ids.into_iter().chain(id) {
-                        if valid.contains(did.as_str()) {
-                            delete_ops.push((did, reason.clone()));
-                        } else {
+                        if !valid.contains(did.as_str()) {
                             tracing::debug!("dreaming: ignoring delete of unknown id {did}");
+                            continue;
                         }
+                        // A fact someone entered on purpose is not the model's
+                        // to remove. It may still be rewritten or merged, so
+                        // this refuses the prune, not the entry.
+                        if protected.contains(did.as_str()) {
+                            protected_from_delete += 1;
+                            tracing::debug!(
+                                "dreaming: refusing to prune deliberately-entered entry {did}"
+                            );
+                            continue;
+                        }
+                        delete_ops.push((did, clamp_delete_reason(&reason)));
                     }
                 }
                 RawOp::Merge {
@@ -198,6 +257,15 @@ async fn consolidate_user(
                         .collect();
                     if members.len() < 2 {
                         tracing::debug!("dreaming: skipping merge with <2 valid members");
+                        continue;
+                    }
+                    // The whole merge is dropped, not just the settled member:
+                    // the synthesized content was written to stand for every
+                    // member, so applying it while one of them stays live would
+                    // duplicate that entry rather than unify it.
+                    if let Some(id) = members.iter().find(|i| settled.contains(i.as_str())) {
+                        tracing::debug!("dreaming: skipping merge touching settled entry {id}");
+                        settled_unchanged += 1;
                         continue;
                     }
                     // Chain pairwise merges so the union-find groups the members;
@@ -217,11 +285,19 @@ async fn consolidate_user(
                         continue;
                     }
                     if let Some(content) = content {
-                        buffer.absorb(ProposedOp::Update {
-                            id: id.clone(),
-                            new_content: content,
-                        });
+                        if settled.contains(id.as_str()) {
+                            settled_unchanged += 1;
+                            tracing::debug!("dreaming: skipping rewrite of settled entry {id}");
+                        } else {
+                            buffer.absorb(ProposedOp::Update {
+                                id: id.clone(),
+                                new_content: content,
+                            });
+                        }
                     }
+                    // Attaching a scope is metadata, not paraphrase: it does not
+                    // advance the review generation and cannot drift the prose,
+                    // so a settled entry can still be filed more precisely.
                     if let Some(scope) = scope.filter(|s| !s.is_empty()) {
                         buffer.absorb(ProposedOp::AddScope { id, scope });
                     }
@@ -271,7 +347,10 @@ async fn consolidate_user(
         });
     }
 
-    // Deletion cap over the whole KB.
+    // Deletion cap over the whole KB. Protected ids never reach `delete_ops`,
+    // so refusing them does not consume the budget. The `.max(1)` floor keeps a
+    // genuinely bad entry removable from a tiny store, where the fraction would
+    // otherwise round to zero.
     let cap = ((total_entries as f64) * MAX_DELETE_FRACTION).ceil() as usize;
     let cap = cap.max(1);
     if delete_ops.len() > cap {
@@ -283,7 +362,10 @@ async fn consolidate_user(
         delete_ops.truncate(cap);
     }
     for (id, reason) in &delete_ops {
-        tracing::debug!("dreaming: consolidation delete {id}: {reason}");
+        tracing::debug!(
+            "dreaming: consolidation prune {id}: {}",
+            reason.as_deref().unwrap_or("(no reason given)")
+        );
         buffer.absorb(ProposedOp::Delete {
             id: id.clone(),
             reason: reason.clone(),
@@ -292,13 +374,31 @@ async fn consolidate_user(
 
     tracing::info!(
         "dreaming: holistic consolidation plan for {total_entries} entries — \
-         {} merge(s), {} edit(s)/scope-add(s), {} delete(s)",
+         {} merge(s), {} edit(s)/scope-add(s), {} prune(s); \
+         {protected_from_delete} protected, {settled_unchanged} settled",
         synthesized.len(),
         buffer.standalone_updates().len() + buffer.standalone_scope_adds().len(),
         delete_ops.len(),
     );
 
-    apply_ops(pool, &buffer, &synthesized, soft_delete_retention_days).await
+    let mut stats = apply_ops(pool, &buffer, &synthesized, soft_delete_retention_days).await?;
+    stats.protected_from_delete = protected_from_delete;
+    stats.settled_unchanged = settled_unchanged;
+    Ok(stats)
+}
+
+/// The model's stated delete reason, normalized for storage: trimmed, bounded,
+/// and `None` when it amounts to nothing.
+///
+/// Why: the reason is free text from the model that lands in a TEXT column and
+/// a log line, neither of which limits it. Truncation is by characters, not
+/// bytes, so a multi-byte reason cannot be cut mid-codepoint.
+fn clamp_delete_reason(reason: &str) -> Option<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_DELETE_REASON_CHARS).collect())
 }
 
 /// Distinct users that have at least one non-deleted KB entry. Audit-allowlisted
@@ -317,8 +417,16 @@ async fn load_user_ids_with_active_entries(pool: &PgPool) -> Result<Vec<String>,
 /// (when needed) groups likely-related entries together.
 async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
     let user_id = current_user_id();
-    let rows: Vec<(String, String, Vec<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, content, tags, metadata \
+    type Row = (
+        String,
+        String,
+        Vec<String>,
+        serde_json::Value,
+        Option<String>,
+        i16,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, content, tags, metadata, source, review_generation \
          FROM knowledge_base \
          WHERE user_id = $1 AND deleted_at IS NULL \
          ORDER BY tags, created_at ASC",
@@ -330,12 +438,16 @@ async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, content, tags, md)| KbEntry {
-            id,
-            content,
-            tags,
-            metadata: KbMetadata::from_json(&md),
-        })
+        .map(
+            |(id, content, tags, md, source, review_generation)| KbEntry {
+                id,
+                content,
+                tags,
+                metadata: KbMetadata::from_json(&md),
+                source,
+                review_generation,
+            },
+        )
         .collect())
 }
 
@@ -488,6 +600,8 @@ mod tests {
             content: content.to_string(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
             metadata: KbMetadata::default(),
+            source: None,
+            review_generation: 0,
         }
     }
 
@@ -537,6 +651,24 @@ mod tests {
         // Every entry is preserved across slices.
         let total: usize = slices.iter().map(|s| s.len()).sum();
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn clamp_delete_reason_treats_blank_as_unstated() {
+        assert_eq!(clamp_delete_reason(""), None);
+        assert_eq!(clamp_delete_reason("   \n\t "), None);
+        assert_eq!(
+            clamp_delete_reason("  trivial  ").as_deref(),
+            Some("trivial")
+        );
+    }
+
+    #[test]
+    fn clamp_delete_reason_bounds_length_on_char_boundaries() {
+        let over_long = "é".repeat(MAX_DELETE_REASON_CHARS + 10);
+        let clamped = clamp_delete_reason(&over_long).expect("a non-blank reason survives");
+        assert_eq!(clamped.chars().count(), MAX_DELETE_REASON_CHARS);
+        assert!(clamped.chars().all(|c| c == 'é'), "no partial codepoint");
     }
 
     #[test]

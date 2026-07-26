@@ -15,7 +15,7 @@ All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backf
 | Pass | Entry point | What it does | Cadence |
 | ---- | ----------- | ------------ | ------- |
 | **Extraction** | `run_dreaming_scan` | Scans conversations past their watermark, asks an LLM to extract durable facts, writes them (+ archival of long-quiet conversations). | frequent (hourly) |
-| **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (prune / merge / tighten) with a stronger model, applied transactionally with soft-delete. | slow (daily) |
+| **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (prune / merge / tighten) with a stronger model, applied transactionally with soft-delete and bounded by the rules below. | slow (daily) |
 | **Embedding recompute** | `backfill_knowledge_embeddings` | Re-embeds rows. The periodic backfill only touches NULL/stale/model-mismatched rows; the **force** path (`invalidate_all_knowledge_embeddings` → backfill) re-embeds everything. | periodic + on-demand |
 | **Trash sweep** | `sweep_expired_trash` | Frees soft-deleted entries past their retention window. No LLM, no embeddings — a single indexed DELETE per user. | frequent (hourly) |
 
@@ -24,6 +24,33 @@ Embedding model changes are handled automatically: each row stamps its
 current model (`invalidate_stale_embeddings`). The **Recalculate Embeddings**
 button is the force escape hatch for out-of-band cases (rows edited by raw SQL,
 corrupted vectors).
+
+## What consolidation may and may not do
+
+The model sees the whole active store and returns a plan. The plan is not applied
+verbatim, because the judgment behind it is formed from prose alone with no
+signal about whether an entry was ever retrieved or cited. Three rules bound it
+(`crates/storage/src/dreaming/consolidation.rs`):
+
+1. **A deliberately promoted entry is never pruned.** Rows written during a live
+   turn carry `source = 'explicit'` - the user asked, or Adele decided in the
+   moment that a fact was worth keeping. Consolidation may rewrite or merge such
+   an entry, but a proposed delete is refused and counted in the run's stats. The
+   provenance follows the content: an edit keeps it, and a merge stamps the
+   surviving canonical row `explicit` if any member was, so the protection cannot
+   be laundered away over successive nights.
+2. **Settled prose is left alone.** `review_generation` counts how many times
+   consolidation has rewritten an entry. At `MAX_REVIEW_GENERATION` (2) the entry
+   is settled: further edits and merges touching it are refused, because
+   consolidation re-reads its own output every pass and an uncapped entry becomes
+   a paraphrase of a paraphrase, drifting from what was observed toward what the
+   model believes. This settles individual entries, not the store - extraction
+   keeps adding generation-0 rows, scope can still be attached, and a settled
+   entry stays prunable, so consolidation's own output never becomes permanent.
+3. **Outright prunes are capped per run** at `MAX_DELETE_FRACTION` (0.1) of the
+   active set, floor 1, with the excess dropped and a warning logged. Merges do
+   not count against it: their content survives in the canonical row. The cap is
+   a blast-radius bound on one night's unreviewed opinion.
 
 ## The trash: soft delete, retention, reaping
 
@@ -55,6 +82,36 @@ Every one of these is scoped to a single `user_id`: one user's sweep, empty, or
 count never touches another's rows. The only cross-user statement is the
 sweep's "which users hold tombstones" scan, which installs a per-user scope
 before deleting anything.
+
+### What a tombstone records
+
+Retiring a row is two very different outcomes wearing the same shape: a **merge**
+relocates the content into a canonical row, a **prune** destroys it. Both used to
+write nothing but `deleted_at`, so no query could tell them apart and "was this
+fact relocated or thrown away?" was unanswerable. Three columns close that
+(migration 038):
+
+| Column | Merge member | Prune |
+| ------ | ------------ | ----- |
+| `deleted_kind` | `'merge'` | `'prune'` |
+| `superseded_by` | id of the canonical row that absorbed it | NULL |
+| `deleted_reason` | NULL (the model states none per member; `superseded_by` is the reason) | the model's stated reason, trimmed and clamped to `MAX_DELETE_REASON_CHARS` |
+
+All three are NULL on tombstones written before the migration and on deletes that
+did not come from consolidation. `superseded_by` is intentionally not a foreign
+key: tombstones are hard-reaped once past retention, so the target can legitimately
+disappear, and an FK would either block the reap or erase the audit link. A
+dangling id is expected - the same contract `metadata.source_conversation_id`
+already carries against archival hard-deletes.
+
+Splitting a period's tombstones by outcome is then a plain query:
+
+```sql
+SELECT deleted_kind, COUNT(*)
+FROM knowledge_base
+WHERE user_id = $1 AND deleted_at IS NOT NULL
+GROUP BY deleted_kind;
+```
 
 ## On-demand trigger path
 

@@ -5,6 +5,11 @@
 //! aggregates them, computes merge clusters (`merge(A,B)` + `merge(B,C)` →
 //! cluster `{A,B,C}`), and applies everything in a single transaction with
 //! soft-delete semantics for retired entries.
+//!
+//! A retired row records *why* it was retired: a merge member names the
+//! canonical row that absorbed it, a prune carries the model's stated reason.
+//! The two outcomes are very different - one relocates the content, the other
+//! destroys it - so they must be separable on disk, not just in the logs.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -12,16 +17,31 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::current_user_id;
 use sqlx::PgPool;
 
-use super::types::{ConsolidationStats, MAX_REVIEW_GENERATION};
+use super::types::{ConsolidationStats, KbDeleteKind, MAX_REVIEW_GENERATION, SOURCE_EXPLICIT};
 use crate::kb_metadata::{KbMetadata, KbScope};
 
 /// Operations a per-memory review can propose.
 #[derive(Debug, Clone)]
 pub enum ProposedOp {
-    Update { id: String, new_content: String },
-    AddScope { id: String, scope: KbScope },
-    Merge { a: String, b: String },
-    Delete { id: String, reason: String },
+    Update {
+        id: String,
+        new_content: String,
+    },
+    AddScope {
+        id: String,
+        scope: KbScope,
+    },
+    Merge {
+        a: String,
+        b: String,
+    },
+    Delete {
+        id: String,
+        /// The model's stated reason, already bounded by the caller. `None`
+        /// when it gave none: a tombstone reads better as "unstated" than as
+        /// an empty string.
+        reason: Option<String>,
+    },
 }
 
 /// Synthesized result of merging a cluster, produced by an LLM synthesis call.
@@ -40,7 +60,7 @@ pub struct OpBuffer {
     merge_pairs: BTreeSet<(String, String)>,
     updates: HashMap<String, String>,
     scope_adds: HashMap<String, KbScope>,
-    deletes: HashMap<String, String>,
+    deletes: HashMap<String, Option<String>>,
     /// All ids touched by any op (focal memories), used to mark reviewed.
     reviewed_ids: BTreeSet<String>,
 }
@@ -155,7 +175,7 @@ impl OpBuffer {
             .collect()
     }
 
-    pub fn standalone_deletes(&self) -> Vec<(String, String)> {
+    pub fn standalone_deletes(&self) -> Vec<(String, Option<String>)> {
         let in_cluster = self.clustered_ids();
         self.deletes
             .iter()
@@ -202,39 +222,56 @@ pub async fn apply_ops(
     // canonical row's embedding is left stale (not regenerated here) — the
     // bumped `updated_at` marks it for the background embedding-backfill task.
     for merge in synthesized {
-        // Preserve source_conversation_id of the canonical row but apply
-        // the new scope.
-        let existing_metadata: Option<(serde_json::Value,)> =
-            sqlx::query_as("SELECT metadata FROM knowledge_base WHERE user_id = $1 AND id = $2")
-                .bind(user_id.as_str())
-                .bind(&merge.canonical_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| CoreError::Storage(format!("dreaming: metadata fetch failed: {e}")))?;
+        // One read for the whole cluster: the canonical row's metadata (its
+        // source_conversation_id must survive the merge) and every member's
+        // provenance.
+        let member_rows: Vec<(String, Option<String>, serde_json::Value)> = sqlx::query_as(
+            "SELECT id, source, metadata FROM knowledge_base \
+             WHERE user_id = $1 AND id = ANY($2)",
+        )
+        .bind(user_id.as_str())
+        .bind(&merge.member_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(format!("dreaming: cluster fetch failed: {e}")))?;
 
-        let mut metadata = existing_metadata
-            .map(|(v,)| KbMetadata::from_json(&v))
+        let mut metadata = member_rows
+            .iter()
+            .find(|(id, _, _)| id == &merge.canonical_id)
+            .map(|(_, _, value)| KbMetadata::from_json(value))
             .unwrap_or_default();
         metadata.scope = merge.new_scope.clone();
 
+        // A deliberately-entered fact absorbed by a merge keeps its provenance
+        // on the surviving row. Stamping the canonical 'consolidation' would
+        // strip the never-prune protection, and the next night's pass would be
+        // free to delete a fact the user entered on purpose.
+        let cluster_is_explicit = member_rows
+            .iter()
+            .any(|(_, source, _)| source.as_deref() == Some(SOURCE_EXPLICIT));
+
         sqlx::query(
             "UPDATE knowledge_base \
-             SET content = $1, metadata = $2, source = 'consolidation', \
+             SET content = $1, metadata = $2, \
+                 source = CASE WHEN $3 THEN 'explicit' ELSE 'consolidation' END, \
                  updated_at = NOW(), \
                  reviewed_at = NOW(), \
-                 review_generation = LEAST(review_generation + 1, $3) \
-             WHERE user_id = $5 AND id = $4",
+                 review_generation = LEAST(review_generation + 1, $4) \
+             WHERE user_id = $5 AND id = $6",
         )
         .bind(&merge.new_content)
         .bind(metadata.to_json())
+        .bind(cluster_is_explicit)
         .bind(MAX_REVIEW_GENERATION)
-        .bind(&merge.canonical_id)
         .bind(user_id.as_str())
+        .bind(&merge.canonical_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(format!("dreaming: merge canonical update failed: {e}")))?;
 
-        // Soft-delete the rest of the cluster.
+        // Soft-delete the rest of the cluster, each member pointing at the row
+        // that absorbed it. No reason is written: the model states none per
+        // member, and `superseded_by` already says where the content went.
         let to_delete: Vec<String> = merge
             .member_ids
             .iter()
@@ -242,19 +279,24 @@ pub async fn apply_ops(
             .cloned()
             .collect();
         if !to_delete.is_empty() {
-            sqlx::query(
+            let result = sqlx::query(
                 "UPDATE knowledge_base \
-                 SET deleted_at = NOW(), reviewed_at = NOW() \
+                 SET deleted_at = NOW(), reviewed_at = NOW(), \
+                     deleted_kind = $3, superseded_by = $4 \
                  WHERE user_id = $2 AND id = ANY($1) AND deleted_at IS NULL",
             )
             .bind(&to_delete)
             .bind(user_id.as_str())
+            .bind(KbDeleteKind::Merge.as_str())
+            .bind(&merge.canonical_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
                 CoreError::Storage(format!("dreaming: cluster soft-delete failed: {e}"))
             })?;
-            stats.soft_deleted += to_delete.len();
+            // Count rows the statement actually retired, so a member already
+            // tombstoned by an earlier op is not counted twice.
+            stats.soft_deleted += result.rows_affected() as usize;
         }
 
         stats.merged_clusters += 1;
@@ -263,9 +305,14 @@ pub async fn apply_ops(
     // Standalone updates (not in any merge cluster). Embedding left stale for
     // the background backfill task; only content + watermarks change here.
     for (id, new_content) in buffer.standalone_updates() {
+        // As with a merge canonical: tightening the prose of a deliberately-
+        // entered fact must not relabel it as the model's own output.
         sqlx::query(
             "UPDATE knowledge_base \
-             SET content = $1, source = 'consolidation', updated_at = NOW(), \
+             SET content = $1, \
+                 source = CASE WHEN source = 'explicit' THEN 'explicit' \
+                               ELSE 'consolidation' END, \
+                 updated_at = NOW(), \
                  reviewed_at = NOW(), \
                  review_generation = LEAST(review_generation + 1, $2) \
              WHERE user_id = $4 AND id = $3",
@@ -310,19 +357,28 @@ pub async fn apply_ops(
         }
     }
 
-    // Standalone soft-deletes.
-    for (id, _reason) in buffer.standalone_deletes() {
-        sqlx::query(
+    // Standalone prunes: nothing supersedes them, so the model's stated reason
+    // is the only record of why the entry is gone. The `source` predicate is a
+    // backstop: consolidation already filters protected ids out of the plan,
+    // but the row itself refuses too, so no future caller of `apply_ops` can
+    // prune a deliberately-entered fact by forgetting the filter.
+    for (id, reason) in buffer.standalone_deletes() {
+        let result = sqlx::query(
             "UPDATE knowledge_base \
-             SET deleted_at = NOW(), reviewed_at = NOW() \
-             WHERE user_id = $2 AND id = $1 AND deleted_at IS NULL",
+             SET deleted_at = NOW(), reviewed_at = NOW(), \
+                 deleted_kind = $3, deleted_reason = $4 \
+             WHERE user_id = $2 AND id = $1 \
+               AND deleted_at IS NULL \
+               AND source IS DISTINCT FROM 'explicit'",
         )
         .bind(&id)
         .bind(user_id.as_str())
+        .bind(KbDeleteKind::Prune.as_str())
+        .bind(reason.as_deref())
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(format!("dreaming: soft-delete failed: {e}")))?;
-        stats.soft_deleted += 1;
+        stats.soft_deleted += result.rows_affected() as usize;
     }
 
     // Any reviewed id that didn't already get its reviewed_at touched

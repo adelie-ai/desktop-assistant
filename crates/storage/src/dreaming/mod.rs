@@ -31,7 +31,9 @@ use tokio_util::sync::CancellationToken;
 
 pub use trash::{empty_trash, reap_expired_trash, sweep_expired_trash, trash_count};
 pub use types::{
-    BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, SOFT_DELETE_TTL_DAYS,
+    BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KbDeleteKind, KnowledgeChangeFn,
+    MAX_DELETE_FRACTION, MAX_DELETE_REASON_CHARS, MAX_REVIEW_GENERATION, SOFT_DELETE_TTL_DAYS,
+    SOURCE_EXPLICIT,
 };
 
 /// Surfaced for the DB-gated watermark-scoping integration test (#435). The
@@ -115,12 +117,16 @@ pub async fn run_consolidation_scan(
         || stats.scope_added > 0
     {
         tracing::info!(
-            "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, soft-deleted {}",
+            "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, \
+             soft-deleted {}; refused {} prune(s) of user-entered entries and {} \
+             mutation(s) of settled ones",
             stats.reviewed,
             stats.merged_clusters,
             stats.updated,
             stats.scope_added,
             stats.soft_deleted,
+            stats.protected_from_delete,
+            stats.settled_unchanged,
         );
     } else {
         tracing::debug!(
