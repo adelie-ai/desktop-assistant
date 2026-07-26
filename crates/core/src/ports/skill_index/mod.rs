@@ -24,11 +24,14 @@ use crate::CoreError;
 use crate::domain::{IndexedSkill, SkillScope};
 
 /// Boxed-closure boundary for skill search, wired by the daemon over a
-/// [`SkillIndexStore`]. Args: `(query, query_embedding, limit)`.
+/// [`SkillIndexStore`]. Args: `(query, query_embedding, embedding_model, limit)`,
+/// where `embedding_model` identifies the model that produced `query_embedding`
+/// (see [`SkillIndexStore::search`]).
 pub type SkillSearchFn = Arc<
     dyn Fn(
             String,
             Vec<f32>,
+            String,
             usize,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedSkill>, CoreError>> + Send>>
         + Send
@@ -109,10 +112,19 @@ pub trait SkillIndexStore: Send + Sync {
     /// vector selects full-text-only search (used when the embedding backend is
     /// unavailable, and always on the SQLite adapter). Results are scoped to the
     /// caller: global skills plus the current user's own.
+    ///
+    /// `embedding_model` identifies the model that produced `query_embedding`
+    /// and travels with it: an implementation that ranks by vector distance
+    /// must restrict itself to rows embedded by that model, because comparing
+    /// across models means comparing across vector dimensions, which the
+    /// database answers with an error rather than a miss. Full-text matching is
+    /// deliberately unscoped, so a model change degrades to lexical search
+    /// instead of hiding content.
     async fn search(
         &self,
         query: &str,
         query_embedding: Vec<f32>,
+        embedding_model: &str,
         limit: usize,
     ) -> Result<Vec<IndexedSkill>, CoreError>;
 
@@ -195,6 +207,7 @@ mod tests {
             &self,
             query: &str,
             _query_embedding: Vec<f32>,
+            _embedding_model: &str,
             limit: usize,
         ) -> Result<Vec<IndexedSkill>, CoreError> {
             let needle = query.to_lowercase();

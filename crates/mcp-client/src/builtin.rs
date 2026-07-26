@@ -49,8 +49,21 @@ const TOOL_SKILL_GET: &str = "builtin_skill_get";
 /// cycle to fill in later.
 const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The active embedding backend: the function that turns a query into a vector,
+/// together with the identifier of the model behind it.
+///
+/// One field rather than two because the searches scope their vector arm to the
+/// model that produced the query vector, so a vector paired with another
+/// model's identifier searches the wrong rows -- and across a dimension change,
+/// raises. Holding the pair in one place means it can only ever be replaced as
+/// a unit.
+struct EmbeddingBackend {
+    embed: EmbedFn,
+    model: String,
+}
+
 pub struct BuiltinToolService {
-    embed_fn: Option<EmbedFn>,
+    embedding: Option<EmbeddingBackend>,
     kb_write_fn: Option<KnowledgeWriteFn>,
     kb_search_fn: Option<KnowledgeSearchFn>,
     kb_delete_fn: Option<KnowledgeDeleteFn>,
@@ -85,7 +98,7 @@ impl BuiltinToolService {
     /// KB and tool_search calls will return errors until closures are configured.
     pub fn new() -> Self {
         Self {
-            embed_fn: None,
+            embedding: None,
             kb_write_fn: None,
             kb_search_fn: None,
             kb_delete_fn: None,
@@ -109,9 +122,17 @@ impl BuiltinToolService {
         }
     }
 
-    /// Configure the embedding function for generating query vectors.
-    pub fn with_embedding(mut self, embed_fn: EmbedFn) -> Self {
-        self.embed_fn = Some(embed_fn);
+    /// Configure the embedding function for generating query vectors, and the
+    /// identifier of the model behind it.
+    ///
+    /// The two are set together because every vector search scopes itself to
+    /// the model that produced its query vector; a function paired with another
+    /// model's identifier would silently search the wrong rows.
+    pub fn with_embedding(mut self, embed_fn: EmbedFn, model_identifier: String) -> Self {
+        self.embedding = Some(EmbeddingBackend {
+            embed: embed_fn,
+            model: model_identifier,
+        });
         self
     }
 
@@ -1060,9 +1081,17 @@ impl BuiltinToolService {
 
         tracing::info!(query = %query, ?tags, ?exclude_tags, limit, "knowledge base search");
 
-        let query_embedding = self.embed_text(&query).await.unwrap_or_default();
+        let (query_embedding, embedding_model) = self.embed_query(&query).await;
 
-        let results = search_fn(query, query_embedding, tags, exclude_tags, limit).await?;
+        let results = search_fn(
+            query,
+            query_embedding,
+            embedding_model,
+            tags,
+            exclude_tags,
+            limit,
+        )
+        .await?;
 
         let items: Vec<serde_json::Value> = results
             .into_iter()
@@ -1105,14 +1134,14 @@ impl BuiltinToolService {
 
         tracing::info!(query = %query, ?kind_filter, limit, "skill search");
 
-        let query_embedding = self.embed_text(&query).await.unwrap_or_default();
+        let (query_embedding, embedding_model) = self.embed_query(&query).await;
         // Over-fetch when filtering by kind, then trim to the requested limit.
         let fetch = if kind_filter.is_some() {
             limit.saturating_mul(3)
         } else {
             limit
         };
-        let mut results = search_fn(query, query_embedding, fetch).await?;
+        let mut results = search_fn(query, query_embedding, embedding_model, fetch).await?;
         if let Some(kind) = &kind_filter {
             results.retain(|s| s.kind.as_str() == kind);
         }
@@ -1780,11 +1809,32 @@ impl BuiltinToolService {
         Ok(response.to_string())
     }
 
+    /// Embed a query and report which model produced the vector.
+    ///
+    /// Both come from one read of the active backend, so the vector and the
+    /// model identifier a search filters on always describe the same backend.
+    /// The vector is empty when embeddings are unavailable or the backend
+    /// stalled, which every search reads as "take the full-text path"; the
+    /// model identifier is then unused.
+    async fn embed_query(&self, text: &str) -> (Vec<f32>, String) {
+        let Some(backend) = self.embedding.as_ref() else {
+            return (Vec::new(), String::new());
+        };
+        let vector = Self::embed_with(&backend.embed, text)
+            .await
+            .unwrap_or_default();
+        (vector, backend.model.clone())
+    }
+
     /// Embed a single text string, returning None if embeddings are unavailable.
     /// Used for search queries which are always short and don't need chunking.
     async fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
-        let embed_fn = self.embed_fn.as_ref()?;
-        match tokio::time::timeout(EMBED_TIMEOUT, embed_fn(vec![text.to_string()])).await {
+        Self::embed_with(&self.embedding.as_ref()?.embed, text).await
+    }
+
+    /// Embed one short text through `embed`, bounded by [`EMBED_TIMEOUT`].
+    async fn embed_with(embed: &EmbedFn, text: &str) -> Option<Vec<f32>> {
+        match tokio::time::timeout(EMBED_TIMEOUT, embed(vec![text.to_string()])).await {
             Ok(Ok(mut vecs)) => vecs.pop(),
             Ok(Err(e)) => {
                 tracing::warn!("failed to embed text: {e}");
@@ -3303,7 +3353,7 @@ mod tests {
 
         let search_store = Arc::clone(&store);
         let search_fn: KnowledgeSearchFn =
-            Arc::new(move |_query, _emb, _tags, _exclude_tags, limit| {
+            Arc::new(move |_query, _emb, _model, _tags, _exclude_tags, limit| {
                 let s = Arc::clone(&search_store);
                 Box::pin(async move {
                     let entries = s.lock().unwrap();
@@ -3471,7 +3521,7 @@ mod tests {
             }
         }
 
-        let search_fn: SkillSearchFn = Arc::new(|_q, _emb, _limit| {
+        let search_fn: SkillSearchFn = Arc::new(|_q, _emb, _model, _limit| {
             Box::pin(async {
                 Ok(vec![
                     sample("invoicing", SkillKind::Workflow),
@@ -3637,7 +3687,7 @@ mod tests {
         let def_fn: ToolDefinitionFn = Arc::new(|_name| Box::pin(async { Ok(None) }));
 
         let service = BuiltinToolService::new()
-            .with_embedding(embed_fn)
+            .with_embedding(embed_fn, "test-model".to_string())
             .with_tool_registry(search_fn, def_fn);
 
         let result = service

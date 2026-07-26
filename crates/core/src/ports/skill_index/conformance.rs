@@ -271,7 +271,7 @@ pub async fn absent_skills_are_still_searchable(store: &dyn SkillIndexStore) {
         .expect("empty scan");
 
     let hits = store
-        .search("invoices", Vec::new(), 10)
+        .search("invoices", Vec::new(), "test-model", 10)
         .await
         .expect("search");
     let hit = hits

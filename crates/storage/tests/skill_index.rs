@@ -237,7 +237,10 @@ async fn fts_search_finds_by_keyword_and_get_is_owner_scoped() {
         .await;
 
         // Empty embedding -> FTS-only path.
-        let hits = store.search("invoice", vec![], 10).await.expect("search");
+        let hits = store
+            .search("invoice", vec![], "test-model", 10)
+            .await
+            .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "invoice-run");
 

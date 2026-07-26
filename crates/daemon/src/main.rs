@@ -1410,7 +1410,7 @@ async fn main() -> Result<()> {
             "enabling built-in vector search with model={}",
             embedding_model_id
         );
-        builtin_tools = builtin_tools.with_embedding(embed_fn);
+        builtin_tools = builtin_tools.with_embedding(embed_fn, embedding_model_id.clone());
     } else {
         tracing::info!("built-in vector search disabled (no embedding backend available)");
     }
@@ -1428,14 +1428,23 @@ async fn main() -> Result<()> {
                 let store = Arc::clone(&kb_w);
                 Box::pin(async move { store.write(entry).await })
             }),
-            Arc::new(move |query, embedding, tags, exclude_tags, limit| {
-                let store = Arc::clone(&kb_s);
-                Box::pin(async move {
-                    store
-                        .search(&query, embedding, tags, exclude_tags, limit)
-                        .await
-                })
-            }),
+            Arc::new(
+                move |query, embedding, embedding_model, tags, exclude_tags, limit| {
+                    let store = Arc::clone(&kb_s);
+                    Box::pin(async move {
+                        store
+                            .search(
+                                &query,
+                                embedding,
+                                &embedding_model,
+                                tags,
+                                exclude_tags,
+                                limit,
+                            )
+                            .await
+                    })
+                },
+            ),
             Arc::new(move |ids| {
                 let store = Arc::clone(&kb_d);
                 Box::pin(async move { store.delete_many(&ids).await })
@@ -1747,9 +1756,13 @@ async fn main() -> Result<()> {
         let si_get = Arc::clone(si);
         use desktop_assistant_core::ports::skill_index::SkillIndexStore;
         builtin_tools = builtin_tools.with_skills(
-            Arc::new(move |query, embedding, limit| {
+            Arc::new(move |query, embedding, embedding_model: String, limit| {
                 let store = Arc::clone(&si_search);
-                Box::pin(async move { store.search(&query, embedding, limit).await })
+                Box::pin(async move {
+                    store
+                        .search(&query, embedding, &embedding_model, limit)
+                        .await
+                })
             }),
             Arc::new(move |name, owner| {
                 let store = Arc::clone(&si_get);
