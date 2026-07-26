@@ -397,3 +397,116 @@ async fn tag_creation_survives_a_superseded_model_in_the_registry() {
 
     fx.cleanup().await;
 }
+
+/// Acceptance: an embedder that returns fewer vectors than it was given texts
+/// must not strand the unmatched rows. They still match the backfill's own
+/// SELECT, so leaving them unwritten would re-select them on every pass -- an
+/// unbounded loop that bills a metered provider for each attempt.
+#[tokio::test]
+async fn tag_backfill_short_batch_does_not_strand_rows() {
+    let Some(fx) = fixture("reg682j").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    for name in ["billing", "invoicing", "payroll"] {
+        sqlx::query(
+            "INSERT INTO tag_registry (user_id, name, description, examples, distinguish_from) \
+             VALUES ($1, $2, 'seeded', '[]'::jsonb, '{}')",
+        )
+        .bind(USER)
+        .bind(name)
+        .execute(&fx.pool)
+        .await
+        .expect("seed tag");
+    }
+
+    // Honours the port's contract for a single text, violates it for a batch --
+    // the shape a provider that silently caps batch size produces.
+    let short: BackfillEmbedFn = Box::new(|texts: Vec<String>| {
+        Box::pin(async move {
+            if texts.len() == 1 {
+                Ok(vec![vec![0.5_f32; 4]])
+            } else {
+                Ok(Vec::new())
+            }
+        })
+    });
+
+    let embedded = backfill_tag_embeddings(&fx.pool, &short, &new_model())
+        .await
+        .expect("backfill must return rather than loop");
+
+    assert_eq!(
+        embedded, 3,
+        "every row must be accounted for, via the retry path"
+    );
+    for name in ["billing", "invoicing", "payroll"] {
+        let (has_embedding, model) = tag_state(&fx.pool, name).await;
+        assert!(
+            has_embedding,
+            "{name} must be embedded by the per-row retry"
+        );
+        assert_eq!(model.as_deref(), Some(new_model().as_str()));
+    }
+
+    fx.cleanup().await;
+}
+
+/// Acceptance: the backfill writes only within one tenant. `name` alone looks
+/// like a key and was the primary key before migration 016, so the `user_id`
+/// half of the predicate is the only thing stopping a maintenance sweep from
+/// overwriting another tenant's vector with text embedded from this one's.
+#[tokio::test]
+async fn tag_backfill_scopes_writes_per_user() {
+    let Some(fx) = fixture("reg682k").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    for (user, description) in [("alice", "alice invoices"), ("bob", "bob timesheets")] {
+        sqlx::query(
+            "INSERT INTO tag_registry (user_id, name, description, examples, distinguish_from) \
+             VALUES ($1, 'billing', $2, '[]'::jsonb, '{}')",
+        )
+        .bind(user)
+        .bind(description)
+        .execute(&fx.pool)
+        .await
+        .expect("seed tag");
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    backfill_tag_embeddings(
+        &fx.pool,
+        &recording_embed(Arc::clone(&seen), 4),
+        &new_model(),
+    )
+    .await
+    .expect("backfill tags");
+
+    let mut texts = seen.lock().expect("read recorded texts").clone();
+    texts.sort();
+    assert_eq!(
+        texts,
+        vec![
+            "billing: alice invoices".to_string(),
+            "billing: bob timesheets".to_string()
+        ],
+        "each tenant's row must be embedded from its own description"
+    );
+
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT user_id, embedding_model FROM tag_registry ORDER BY user_id")
+            .fetch_all(&fx.pool)
+            .await
+            .expect("probe both tenants");
+    assert_eq!(rows.len(), 2, "both rows must survive the sweep");
+    for (user, model) in rows {
+        assert_eq!(
+            model.as_deref(),
+            Some(new_model().as_str()),
+            "{user}'s row must be stamped"
+        );
+    }
+
+    fx.cleanup().await;
+}

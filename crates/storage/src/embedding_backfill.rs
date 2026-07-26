@@ -36,6 +36,16 @@ pub struct StaleInvalidation {
     /// Rows whose stamp was rewritten to the current spelling because the
     /// digest already matched, so their vectors were kept.
     pub restamped: u64,
+    /// Tables the sweep could not complete, with the reason. A table listed
+    /// here may still hold vectors from a superseded model, so searches over it
+    /// can fail on a dimension mismatch until the next successful sweep.
+    pub failed: Vec<(&'static str, String)>,
+}
+
+/// One table's contribution to a sweep.
+struct TableSweep {
+    restamped: u64,
+    invalidated: u64,
 }
 
 impl StaleInvalidation {
@@ -73,7 +83,10 @@ impl StaleInvalidation {
 ///
 /// Sweeps every table in [`EMBEDDED_TABLES`], including soft-deleted knowledge
 /// rows: a tombstone is invisible to search, so its stale vector looks harmless
-/// until the row is restored from the trash still carrying it. Only rows whose
+/// until the row comes back still carrying it. No restore path exists today --
+/// `dreaming::trash` only lists, counts and hard-reaps - so that is a guard
+/// against a future one rather than a live scenario, and it costs nothing
+/// meanwhile. Only rows whose
 /// stamp is already superseded are cleared, so nothing usable is discarded, and
 /// the knowledge backfill still skips tombstones (#656) -- a cleared one is not
 /// re-embedded until it is actually restored.
@@ -98,53 +111,27 @@ pub async fn invalidate_stale_embeddings(
 ) -> Result<StaleInvalidation, String> {
     let mut outcome = StaleInvalidation::default();
 
+    // Every table is attempted even if an earlier one fails. Aborting the loop
+    // on the first error would leave the remaining tables holding vectors of a
+    // superseded dimension, which is exactly the breakage this sweep exists to
+    // prevent -- and the tables added last are the ones that had no coverage
+    // before, so a bail-out would silently restore the original bug behind a
+    // single warning. Failures are named on the outcome for the caller to log.
     for table in EMBEDDED_TABLES {
-        // Adopt the current spelling wherever the digest already matches. Must
-        // run BEFORE the invalidation below, which would otherwise clear these
-        // rows. `split_part(x, '@', 2)` yields '' when there is no '@', so the
-        // non-empty test doubles as "both sides carry a digest".
-        let restamped = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {table}
-             SET embedding_model = $1
-             WHERE embedding IS NOT NULL
-               AND embedding_model IS NOT NULL
-               AND embedding_model <> $1
-               AND split_part($1, '@', 2) <> ''
-               AND split_part(embedding_model, '@', 2) = split_part($1, '@', 2)"
-        )))
-        .bind(current_model)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        outcome.restamped += restamped.rows_affected();
+        match sweep_one_table(pool, table, current_model).await {
+            Ok(swept) => {
+                outcome.restamped += swept.restamped;
+                outcome.per_table.push((table, swept.invalidated));
+            }
+            Err(e) => outcome.failed.push((table, e)),
+        }
+    }
 
-        // Invalidate stale model embeddings (model mismatch).
-        let stale = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {table}
-             SET embedding = NULL, embedding_model = NULL
-             WHERE embedding IS NOT NULL
-               AND embedding_model IS NOT NULL
-               AND embedding_model != $1"
-        )))
-        .bind(current_model)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        // Clean up orphaned state: model is set but embedding is NULL.
-        let orphan = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {table}
-             SET embedding_model = NULL
-             WHERE embedding IS NULL
-               AND embedding_model IS NOT NULL"
-        )))
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        outcome
-            .per_table
-            .push((table, stale.rows_affected() + orphan.rows_affected()));
+    for (table, error) in &outcome.failed {
+        tracing::error!(
+            "embedding sweep failed for {table}: {error}; rows there may still hold vectors \
+             from a superseded model, and searches over them can fail on dimension mismatch"
+        );
     }
 
     if outcome.restamped > 0 {
@@ -576,6 +563,63 @@ pub async fn backfill_skill_embeddings(
     Ok(total)
 }
 
+/// Sweep one table: restamp what only needs relabelling, invalidate what is
+/// genuinely stale, and clear orphaned stamps. Table names come from
+/// [`EMBEDDED_TABLES`], which holds compile-time constants and never external
+/// input -- that is what makes interpolating them here safe.
+async fn sweep_one_table(
+    pool: &PgPool,
+    table: &str,
+    current_model: &str,
+) -> Result<TableSweep, String> {
+    // Adopt the current spelling wherever the digest already matches. Must run
+    // BEFORE the invalidation below, which would otherwise clear these rows.
+    // `split_part(x, '@', 2)` yields '' when there is no '@', so the non-empty
+    // test doubles as "both sides carry a digest".
+    let restamped = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table}
+         SET embedding_model = $1
+         WHERE embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND embedding_model <> $1
+           AND split_part($1, '@', 2) <> ''
+           AND split_part(embedding_model, '@', 2) = split_part($1, '@', 2)"
+    )))
+    .bind(current_model)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Invalidate stale model embeddings (model mismatch).
+    let stale = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table}
+         SET embedding = NULL, embedding_model = NULL
+         WHERE embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND embedding_model != $1"
+    )))
+    .bind(current_model)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Clean up orphaned state: model is set but embedding is NULL.
+    let orphan = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table}
+         SET embedding_model = NULL
+         WHERE embedding IS NULL
+           AND embedding_model IS NOT NULL"
+    )))
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(TableSweep {
+        restamped: restamped.rows_affected(),
+        invalidated: stale.rows_affected() + orphan.rows_affected(),
+    })
+}
+
 /// Backfill embeddings for tags whose stamp is missing or superseded.
 ///
 /// Tags are short, so unlike the knowledge/tool/skill backfills there is no
@@ -619,7 +663,23 @@ pub async fn backfill_tag_embeddings(
         }
 
         let texts: Vec<String> = rows.iter().map(|(_, _, text)| text.clone()).collect();
-        match embed_fn(texts).await {
+        // A short batch is a failed batch, not a partial success. The port's
+        // contract is one vector per input text, but no provider client
+        // enforces it, and a `zip` against a short vec would leave the
+        // unmatched rows unwritten -- still matching this loop's own SELECT, so
+        // it would re-select them forever, spending on every pass. Route a
+        // mismatch through the per-row retry below, which stamps every row it
+        // touches and therefore always converges.
+        let batch = match embed_fn(texts).await {
+            Ok(embeddings) if embeddings.len() == rows.len() => Ok(embeddings),
+            Ok(embeddings) => Err(format!(
+                "embedder returned {} vector(s) for {} text(s)",
+                embeddings.len(),
+                rows.len()
+            )),
+            Err(e) => Err(e),
+        };
+        match batch {
             Ok(embeddings) => {
                 consecutive_failures = 0;
                 for ((user_id, name, _), embedding) in rows.iter().zip(embeddings) {
