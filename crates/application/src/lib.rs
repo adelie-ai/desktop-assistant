@@ -790,6 +790,15 @@ where
         })
     }
 
+    /// Decide what to store for a client-submitted connection URL, given the
+    /// one currently stored. Settings reads redact the password
+    /// ([`api::secret_url`]), so a client re-posting a form it only ever saw
+    /// redacted submits the placeholder back; that keeps the stored
+    /// credential, while a placeholder attached to any other URL is refused.
+    fn resolve_submitted_url(submitted: &str, stored: &str) -> ApiResult<String> {
+        api::secret_url::resolve_submitted(submitted, stored).map_err(Self::map_core_err)
+    }
+
     async fn get_config(&self) -> ApiResult<api::Config> {
         let embeddings = self
             .settings
@@ -835,7 +844,7 @@ where
             },
             persistence: api::PersistenceSettingsView {
                 enabled: persistence.enabled,
-                remote_url: persistence.remote_url,
+                remote_url: api::secret_url::redact_password(&persistence.remote_url),
                 remote_name: persistence.remote_name,
                 push_on_update: persistence.push_on_update,
             },
@@ -900,19 +909,29 @@ where
             || persistence_remote_name.is_some()
             || persistence_push_on_update.is_some();
         if persistence_changed {
-            let enabled = persistence_enabled.unwrap_or(current.persistence.enabled);
-            let remote_url = if persistence_remote_url.is_some() {
-                Self::normalize_optional_string(persistence_remote_url)
-            } else {
-                Some(current.persistence.remote_url.clone())
+            // Read the stored view rather than reusing `current`: the latter
+            // came from `get_config`, whose `remote_url` is redacted, so
+            // carrying it forward would overwrite the credential with the
+            // placeholder.
+            let stored = self
+                .settings
+                .get_persistence_settings()
+                .await
+                .map_err(Self::map_core_err)?;
+
+            let enabled = persistence_enabled.unwrap_or(stored.enabled);
+            let remote_url = match persistence_remote_url {
+                Some(submitted) => Self::normalize_optional_string(Some(
+                    Self::resolve_submitted_url(&submitted, &stored.remote_url)?,
+                )),
+                None => Some(stored.remote_url.clone()),
             };
             let remote_name = if persistence_remote_name.is_some() {
                 Self::normalize_optional_string(persistence_remote_name)
             } else {
-                Some(current.persistence.remote_name.clone())
+                Some(stored.remote_name.clone())
             };
-            let push_on_update =
-                persistence_push_on_update.unwrap_or(current.persistence.push_on_update);
+            let push_on_update = persistence_push_on_update.unwrap_or(stored.push_on_update);
 
             self.settings
                 .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
@@ -1667,7 +1686,7 @@ where
                 Ok(api::CommandResult::PersistenceSettings(
                     api::PersistenceSettingsView {
                         enabled: p.enabled,
-                        remote_url: p.remote_url,
+                        remote_url: api::secret_url::redact_password(&p.remote_url),
                         remote_name: p.remote_name,
                         push_on_update: p.push_on_update,
                     },
@@ -1680,6 +1699,17 @@ where
                 remote_name,
                 push_on_update,
             } => {
+                let remote_url = match remote_url {
+                    Some(submitted) => {
+                        let stored = self
+                            .settings
+                            .get_persistence_settings()
+                            .await
+                            .map_err(Self::map_core_err)?;
+                        Some(Self::resolve_submitted_url(&submitted, &stored.remote_url)?)
+                    }
+                    None => None,
+                };
                 self.settings
                     .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
                     .await
@@ -1689,10 +1719,9 @@ where
 
             // Database / backend-tasks / WS-auth settings (bridge cutover 2/7,
             // #314). Each mirrors the in-process D-Bus method of the same name:
-            // the getters return the same fields the D-Bus method returns (no
-            // new secret exposure — see the `Command` doc-comments), and the
-            // setters apply the same `empty-string clears` normalization the
-            // D-Bus methods apply before delegating to `SettingsService`.
+            // the getters return the same fields the D-Bus method returns, and
+            // the setters apply the same `empty-string clears` normalization
+            // the D-Bus methods apply before delegating to `SettingsService`.
             api::Command::GetDatabaseSettings => {
                 let s = self
                     .settings
@@ -1701,7 +1730,7 @@ where
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::DatabaseSettings(
                     api::DatabaseSettingsView {
-                        url: s.url,
+                        url: api::secret_url::redact_password(&s.url),
                         max_connections: s.max_connections,
                     },
                 ))
@@ -1711,6 +1740,12 @@ where
                 url,
                 max_connections,
             } => {
+                let stored = self
+                    .settings
+                    .get_database_settings()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                let url = Self::resolve_submitted_url(&url, &stored.url)?;
                 // Mirror the D-Bus `set_database_settings`: an empty/whitespace
                 // url clears the configured URL.
                 self.settings
@@ -4046,7 +4081,6 @@ mod tests {
             self
         }
 
-        #[allow(dead_code)]
         fn snapshot(&self) -> SettingsState {
             self.state.lock().unwrap().clone()
         }
@@ -5363,8 +5397,295 @@ mod tests {
         let api::CommandResult::DatabaseSettings(db) = res else {
             panic!("unexpected result variant");
         };
-        assert_eq!(db.url, "postgres://u:p@host/db");
+        assert_eq!(db.url, "postgres://u:***@host/db");
         assert_eq!(db.max_connections, 12);
+        assert_eq!(
+            settings.snapshot().database.url,
+            "postgres://u:p@host/db",
+            "the daemon still stores the real credential"
+        );
+    }
+
+    // --- #727: connection URLs leave the daemon without their password -----
+
+    #[tokio::test]
+    async fn get_database_settings_never_returns_the_password() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://adele:s3cr3t@postgres:5432/adele".into(),
+            max_connections: 5,
+        })
+        .await
+        .expect("seeding the stored URL succeeds");
+
+        let res = h
+            .handle_command(api::Command::GetDatabaseSettings)
+            .await
+            .expect("GetDatabaseSettings succeeds");
+        let api::CommandResult::DatabaseSettings(db) = res else {
+            panic!("unexpected result variant");
+        };
+        assert!(
+            !db.url.contains("s3cr3t"),
+            "the database password reached the client: {}",
+            db.url
+        );
+    }
+
+    #[tokio::test]
+    async fn get_database_settings_keeps_user_host_and_database_legible() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://adele:s3cr3t@postgres:5432/adele".into(),
+            max_connections: 5,
+        })
+        .await
+        .expect("seeding the stored URL succeeds");
+
+        let res = h
+            .handle_command(api::Command::GetDatabaseSettings)
+            .await
+            .expect("GetDatabaseSettings succeeds");
+        let api::CommandResult::DatabaseSettings(db) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(db.url, "postgres://adele:***@postgres:5432/adele");
+    }
+
+    #[tokio::test]
+    async fn set_database_settings_keeps_the_password_when_the_client_echoes_the_redacted_url() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://adele:s3cr3t@postgres:5432/adele".into(),
+            max_connections: 5,
+        })
+        .await
+        .expect("seeding the stored URL succeeds");
+
+        // A client that only ever saw the redacted URL saves an unrelated
+        // field and posts the whole form back.
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://adele:***@postgres:5432/adele".into(),
+            max_connections: 20,
+        })
+        .await
+        .expect("echoing the redacted URL back is accepted");
+
+        let stored = settings.snapshot().database;
+        assert_eq!(
+            stored.url, "postgres://adele:s3cr3t@postgres:5432/adele",
+            "echoing the placeholder back destroyed the stored credential"
+        );
+        assert_eq!(stored.max_connections, 20);
+    }
+
+    #[tokio::test]
+    async fn set_database_settings_refuses_a_redacted_url_aimed_at_another_host() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://adele:s3cr3t@postgres:5432/adele".into(),
+            max_connections: 5,
+        })
+        .await
+        .expect("seeding the stored URL succeeds");
+
+        let err = h
+            .handle_command(api::Command::SetDatabaseSettings {
+                url: "postgres://adele:***@attacker.example.com:5432/adele".into(),
+                max_connections: 5,
+            })
+            .await
+            .expect_err("the stored password must not be spliced into another host");
+        assert!(matches!(err, ApiError::Core(_)));
+        assert_eq!(
+            settings.snapshot().database.url,
+            "postgres://adele:s3cr3t@postgres:5432/adele",
+            "a refused write must leave the stored URL alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_database_settings_accepts_a_newly_typed_password() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://adele:s3cr3t@postgres:5432/adele".into(),
+            max_connections: 5,
+        })
+        .await
+        .expect("seeding the stored URL succeeds");
+        h.handle_command(api::Command::SetDatabaseSettings {
+            url: "postgres://adele:rotated@postgres:5432/adele".into(),
+            max_connections: 5,
+        })
+        .await
+        .expect("a real password is stored as submitted");
+
+        assert_eq!(
+            settings.snapshot().database.url,
+            "postgres://adele:rotated@postgres:5432/adele"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_persistence_settings_never_returns_the_remote_password() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetPersistenceSettings {
+            enabled: true,
+            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
+            remote_name: Some("origin".into()),
+            push_on_update: true,
+        })
+        .await
+        .expect("seeding the remote succeeds");
+
+        let res = h
+            .handle_command(api::Command::GetPersistenceSettings)
+            .await
+            .expect("GetPersistenceSettings succeeds");
+        let api::CommandResult::PersistenceSettings(p) = res else {
+            panic!("unexpected result variant");
+        };
+        assert_eq!(
+            p.remote_url,
+            "https://dave:***@github.com/adelie-ai/memory.git"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_config_never_returns_the_persistence_remote_password() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetPersistenceSettings {
+            enabled: true,
+            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
+            remote_name: Some("origin".into()),
+            push_on_update: true,
+        })
+        .await
+        .expect("seeding the remote succeeds");
+
+        let res = h
+            .handle_command(api::Command::GetConfig)
+            .await
+            .expect("GetConfig succeeds");
+        let api::CommandResult::Config(config) = res else {
+            panic!("unexpected result variant");
+        };
+        assert!(
+            !config.persistence.remote_url.contains("gh-token"),
+            "the git remote token reached the client: {}",
+            config.persistence.remote_url
+        );
+    }
+
+    #[tokio::test]
+    async fn set_config_keeps_the_persistence_password_when_another_field_changes() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetPersistenceSettings {
+            enabled: true,
+            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
+            remote_name: Some("origin".into()),
+            push_on_update: true,
+        })
+        .await
+        .expect("seeding the remote succeeds");
+
+        h.handle_command(api::Command::SetConfig {
+            changes: api::ConfigChanges {
+                persistence_push_on_update: Some(false),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("SetConfig succeeds");
+
+        let stored = settings.snapshot().persistence;
+        assert_eq!(
+            stored.remote_url, "https://dave:gh-token@github.com/adelie-ai/memory.git",
+            "carrying the redacted remote forward destroyed the stored credential"
+        );
+        assert!(!stored.push_on_update);
+    }
+
+    #[tokio::test]
+    async fn set_config_keeps_the_persistence_password_when_the_client_echoes_the_redacted_remote()
+    {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetPersistenceSettings {
+            enabled: true,
+            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
+            remote_name: Some("origin".into()),
+            push_on_update: true,
+        })
+        .await
+        .expect("seeding the remote succeeds");
+
+        h.handle_command(api::Command::SetConfig {
+            changes: api::ConfigChanges {
+                persistence_remote_url: Some(
+                    "https://dave:***@github.com/adelie-ai/memory.git".into(),
+                ),
+                persistence_remote_name: Some("upstream".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("echoing the redacted remote back is accepted");
+
+        let stored = settings.snapshot().persistence;
+        assert_eq!(
+            stored.remote_url,
+            "https://dave:gh-token@github.com/adelie-ai/memory.git"
+        );
+        assert_eq!(stored.remote_name, "upstream");
+    }
+
+    #[tokio::test]
+    async fn set_persistence_settings_refuses_a_redacted_remote_aimed_at_another_host() {
+        let settings = Arc::new(ConfigurableSettings::new());
+        let h = handler_with(Arc::clone(&settings));
+
+        h.handle_command(api::Command::SetPersistenceSettings {
+            enabled: true,
+            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
+            remote_name: Some("origin".into()),
+            push_on_update: true,
+        })
+        .await
+        .expect("seeding the remote succeeds");
+
+        let err = h
+            .handle_command(api::Command::SetPersistenceSettings {
+                enabled: true,
+                remote_url: Some("https://dave:***@attacker.example.com/memory.git".into()),
+                remote_name: Some("origin".into()),
+                push_on_update: true,
+            })
+            .await
+            .expect_err("the stored token must not be spliced into another host");
+        assert!(matches!(err, ApiError::Core(_)));
+        assert_eq!(
+            settings.snapshot().persistence.remote_url,
+            "https://dave:gh-token@github.com/adelie-ai/memory.git",
+            "a refused write must leave the stored remote alone"
+        );
     }
 
     #[tokio::test]

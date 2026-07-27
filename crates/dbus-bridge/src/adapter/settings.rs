@@ -24,13 +24,15 @@
 //! These are the only entries the parity gate is allowed to find missing; see
 //! the `Q2_DROPS` list in `tests/introspection.rs`.
 //!
-//! ## Database settings carry a secret
+//! ## Connection URLs arrive redacted
 //!
-//! `get_database_settings` returns the connection `url` verbatim, which for a
-//! password-auth deployment embeds the DB password. This faithfully mirrors
-//! the in-process method (no regression); removing the password from the
-//! returned URL is tracked in the secrets-hardening epic (#365), a prerequisite
-//! before this surface is exposed to any less-trusted (e.g. remote WS) client.
+//! `get_database_settings` and the persistence remote in `get_config` /
+//! `get_persistence_settings` return a URL whose password reads
+//! `api::secret_url::REDACTED_PASSWORD`. The bridge forwards what the daemon
+//! sends: redaction happens once, at the daemon's api mapping, so every
+//! transport inherits it. A settings UI can post the redacted URL back
+//! unchanged and keep the stored credential; editing any other part of the URL
+//! requires re-entering the password.
 
 use std::sync::Arc;
 
@@ -464,9 +466,8 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
 
     /// Return database settings: `(url, max_connections)`.
     ///
-    /// SECURITY: `url` is the raw connection string and, for password auth,
-    /// embeds the password inline — returned verbatim, exactly as the
-    /// in-process `get_database_settings` does (#314 / #365 walks this back).
+    /// `url` is redacted by the daemon: its password reads
+    /// `api::secret_url::REDACTED_PASSWORD`, the rest is intact.
     async fn get_database_settings(&self) -> fdo::Result<(String, u32)> {
         let result = self.dispatch(api::Command::GetDatabaseSettings).await?;
         match result {
@@ -479,7 +480,9 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
 
     /// Update database settings. An empty `url` clears it — the daemon's
     /// `SetDatabaseSettings` handler normalizes the empty string, so the
-    /// bridge forwards it verbatim (no client-side normalization).
+    /// bridge forwards it verbatim (no client-side normalization). Posting the
+    /// redacted `url` back unchanged keeps the stored password; the daemon
+    /// refuses a redacted `url` whose other parts were edited.
     async fn set_database_settings(&self, url: &str, max_connections: u32) -> fdo::Result<()> {
         let result = self
             .dispatch(api::Command::SetDatabaseSettings {

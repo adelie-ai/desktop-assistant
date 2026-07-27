@@ -616,9 +616,10 @@ pub trait AssistantCommands: Send + Sync {
     // (bridge cutover 2/7). Each is a thin default over `send_command`, so the
     // UDS, WS, and D-Bus clients all inherit it.
 
-    /// Read database settings (#314). SECURITY: the returned `url` is the raw
-    /// connection string and may embed a password inline — this mirrors the
-    /// D-Bus `GetDatabaseSettings` method, which returns it verbatim.
+    /// Read database settings (#314). The returned `url` is redacted: its
+    /// password reads `api::secret_url::REDACTED_PASSWORD` and the rest of the
+    /// connection string is intact, so it is safe to render but is not a
+    /// usable credential.
     async fn get_database_settings(&self) -> Result<api::DatabaseSettingsView> {
         let result = self.send_command(api::Command::GetDatabaseSettings).await?;
         let api::CommandResult::DatabaseSettings(view) = result else {
@@ -628,6 +629,12 @@ pub trait AssistantCommands: Send + Sync {
     }
 
     /// Update database settings (#314). An empty `url` clears it.
+    ///
+    /// A settings form may post back the redacted `url` it was given: that
+    /// keeps the stored password rather than overwriting it, so long as
+    /// nothing else in the URL was edited. Editing any other part requires
+    /// re-entering the password — the daemon refuses to splice its stored
+    /// credential into a URL the client has changed.
     async fn set_database_settings(&self, url: &str, max_connections: u32) -> Result<()> {
         let result = self
             .send_command(api::Command::SetDatabaseSettings {
