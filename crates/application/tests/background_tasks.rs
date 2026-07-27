@@ -1337,6 +1337,7 @@ async fn business_outcome_subagent_or_standalone_kinds_compile_and_are_listable_
             conversation_id: "conv-child".into(),
             name: "researcher".into(),
             session_conversation_id: "conv-session".into(),
+            notify_parent: false,
         },
         "subagent".into(),
         move |_ctx| async move {

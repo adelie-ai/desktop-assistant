@@ -240,6 +240,11 @@ pub struct SpawnMeta {
 /// session scratchpad as a `result` note under [`owner_todo`](Self::owner_todo)
 /// (#607). This payload carries the *references* a wake message hands the
 /// parent, plus enough context to run and target a wake turn.
+///
+/// The signal is unconditional: it fires for every terminal subagent, whatever
+/// the dispatch mode. [`notify_parent`](Self::notify_parent) says whether the
+/// parent is actually owed a wake; deciding what to do with that is the
+/// coordinator's job, not the registry's.
 #[derive(Debug, Clone)]
 pub struct SubagentCompletion {
     /// Owning tenant — the wake turn runs under this user's scope.
@@ -267,6 +272,12 @@ pub struct SubagentCompletion {
     /// at the instant this child finalized. `0` means this was the last one —
     /// the coordinator's cue for a holistic review of the whole result set.
     pub siblings_remaining: usize,
+    /// Whether the parent still needs telling. Mirrors the `notify_parent`
+    /// field of [`api::TaskKind::Subagent`]: `true` for a detached
+    /// (`wait: false`) child whose parent's turn ended without its answer,
+    /// `false` for a child the parent blocked on and already consumed inline.
+    /// The signal fires either way — a coordinator decides what to do with it.
+    pub notify_parent: bool,
 }
 
 /// Late-set observer invoked on subagent terminal transitions. Boxed `Fn` (not a
@@ -1355,6 +1366,7 @@ impl Inner {
             conversation_id,
             name,
             session_conversation_id,
+            notify_parent,
         } = kind
             && let Some(observer) = self.subagent_observer.get()
         {
@@ -1368,6 +1380,7 @@ impl Inner {
                 owner_todo,
                 status,
                 siblings_remaining,
+                notify_parent,
             });
         }
     }
@@ -1436,6 +1449,7 @@ mod tests {
                 conversation_id: "child".into(),
                 name: "n".into(),
                 session_conversation_id: session.into(),
+                notify_parent: false,
             },
             "t".into(),
             SpawnMeta {
@@ -1740,6 +1754,7 @@ mod tests {
                 conversation_id: "c-child".into(),
                 name: "sub".into(),
                 session_conversation_id: "c-session".into(),
+                notify_parent: false,
             },
             "child".into(),
             |_ctx| async move { Ok(()) },

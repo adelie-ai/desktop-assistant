@@ -6,9 +6,10 @@
 //! registry invokes a late-set observer with a `SubagentCompletion` carrying
 //! everything a parent-wake coordinator needs — the child's task id, name,
 //! session/child conversation ids, the `owner_todo` scratchpad reference, the
-//! terminal status, and how many sibling subagents are still running. The
-//! signal fires for completed / failed / cancelled children, never for
-//! non-subagent tasks, and is a safe no-op when no observer is set.
+//! terminal status, how many sibling subagents are still running, and whether
+//! the parent is owed a wake at all. The signal fires for completed / failed /
+//! cancelled children, never for non-subagent tasks, and is a safe no-op when
+//! no observer is set.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -32,11 +33,25 @@ fn unique_user(label: &str) -> UserId {
 }
 
 fn subagent_kind(parent: &str, name: &str, child_conv: &str, session: &str) -> api::TaskKind {
+    subagent_kind_with_dispatch(parent, name, child_conv, session, false)
+}
+
+/// As [`subagent_kind`], but pins the dispatch mode: `notify_parent` is `true`
+/// for a detached (`wait: false`) child and `false` for one the parent blocked
+/// on.
+fn subagent_kind_with_dispatch(
+    parent: &str,
+    name: &str,
+    child_conv: &str,
+    session: &str,
+    notify_parent: bool,
+) -> api::TaskKind {
     api::TaskKind::Subagent {
         parent_task_id: api::TaskId(parent.into()),
         conversation_id: child_conv.into(),
         name: name.into(),
         session_conversation_id: session.into(),
+        notify_parent,
     }
 }
 
@@ -99,6 +114,55 @@ async fn subagent_completion_fires_with_full_payload() {
     assert_eq!(
         done.siblings_remaining, 0,
         "the only child under its parent has no siblings remaining"
+    );
+}
+
+/// The completion echoes the dispatch mode recorded on the task at spawn
+/// (#724), so a coordinator can tell a detached child — whose parent's turn
+/// ended without its answer — from one the parent blocked on and already
+/// consumed inline. The signal fires for both; only the flag differs.
+#[tokio::test]
+async fn completion_echoes_notify_parent_from_task_kind() {
+    let registry = BackgroundTaskRegistry::new();
+    let (seen, observer) = capture();
+    registry.set_subagent_observer(observer);
+
+    let user = unique_user("dispatch-mode");
+    registry.spawn_with_meta(
+        user.clone(),
+        subagent_kind_with_dispatch("parent-6", "detached", "c6", "sess-6", true),
+        "Subagent: detached".into(),
+        SpawnMeta::default(),
+        |_ctx| async { Ok(()) },
+    );
+    registry.spawn_with_meta(
+        user.clone(),
+        subagent_kind_with_dispatch("parent-6", "inline", "c7", "sess-6", false),
+        "Subagent: inline".into(),
+        SpawnMeta::default(),
+        |_ctx| async { Ok(()) },
+    );
+
+    wait_until(
+        || seen.lock().expect("seen poisoned").len() == 2,
+        "both children fired",
+    )
+    .await;
+    let by_name = |name: &str| {
+        seen.lock()
+            .expect("seen poisoned")
+            .iter()
+            .find(|c| c.child_name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("completion for {name} present"))
+    };
+    assert!(
+        by_name("detached").notify_parent,
+        "a wait=false child's parent still needs telling"
+    );
+    assert!(
+        !by_name("inline").notify_parent,
+        "a wait=true child's parent already consumed the result inline"
     );
 }
 

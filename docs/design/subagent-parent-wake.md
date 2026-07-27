@@ -49,11 +49,20 @@ invokes a late-set `SubagentCompletionObserver` with a `SubagentCompletion`:
 | `owner_todo`             | scratchpad namespace of the child's `result` note          |
 | `status`                 | completed / failed / cancelled                             |
 | `siblings_remaining`     | non-terminal sibling subagents under the same parent       |
+| `notify_parent`          | whether the parent is owed a wake at all (see below)       |
 
 `siblings_remaining == 0` is the cue for the holistic pass. Fires for failed and
 cancelled children too, so the parent never waits forever on a child that died.
 The observer is a late-set slot (like `SubagentAwareToolExecutor`'s conversation
 `Weak`) because the coordinator that consumes it is built after the registry.
+
+`notify_parent` carries the **dispatch mode**, recorded on `TaskKind::Subagent`
+at spawn as `!wait`. Only a detached `spawn_subagent { wait: false }` leaves the
+parent uninformed; a blocking spawn (`wait: true`, the default) returns the
+child's answer straight into the still-running parent turn. The signal fires
+either way — the registry reports the fact, the coordinator decides. Persisted
+`kind_json` rows written before the field default to `false`, so an old row can
+never resurrect as an autonomous turn.
 
 ### 2. Parent-wake coordinator (slice 2, daemon)
 
@@ -74,6 +83,11 @@ Correctness constraints:
 - **Bound autonomy.** Only wake when the parent task is a top-level
   `Conversation` (the conversation the user actually sees). A nested subagent
   finishing does not spin up an autonomous turn on a hidden conversation.
+- **Detached children only.** Drop completions whose `notify_parent` is
+  `false`. The parent blocked on those and already delivered their results, so
+  a wake would queue a second turn behind the parent's own turn on the
+  per-conversation lock and then ask it to consolidate an answer it has already
+  given.
 
 ### 3. Wake message (slice 3)
 
@@ -94,4 +108,7 @@ Spec-driven per slice. Slice 1 lives entirely in `crates/application` and is
 unit/integration-testable with no LLM: assert the observer fires with the right
 payload for completed/failed/cancelled subagents, does *not* fire for
 `Conversation`/`Standalone`/`Maintenance` tasks, computes `siblings_remaining`
-correctly, and is a safe no-op when unset.
+correctly, echoes the dispatch mode as `notify_parent`, and is a safe no-op when
+unset. Slice 2 additionally asserts the negative: a default (`wait: true`)
+spawn drives no wake turn at all, while a `wait: false` spawn drives exactly
+one.

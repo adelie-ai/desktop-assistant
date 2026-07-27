@@ -648,6 +648,7 @@ async fn parent_child_links_preserved_across_restart() {
         conversation_id: "conv-c".into(),
         name: "child".into(),
         session_conversation_id: "conv-session".into(),
+        notify_parent: false,
     };
     let child_id = registry.spawn(
         user.clone(),
