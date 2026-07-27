@@ -13,7 +13,13 @@ cargo fmt
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 just audit                  # RustSec advisory scan of Cargo.lock
+just lint-sqlite            # clippy the SQLite adapter with --features sqlite
+just test-sqlite            # its own suite, which --workspace runs none of
 ```
+
+The two `-sqlite` steps exist because `crates/storage-sqlite` is entirely behind
+an off-by-default `sqlite` feature, so the `--workspace` commands above compile
+it as an empty crate and run zero of its tests.
 
 `just check` needs `cargo-audit` (`cargo install cargo-audit --locked`) and
 network access for the advisory database; it fails loudly without either rather

@@ -28,6 +28,11 @@
 //! Everything here is behind the **off-by-default** `sqlite` feature so the
 //! standard workspace build and the daemon are byte-unchanged and never pull
 //! the sqlite C library. Build/test the real adapter with `--features sqlite`.
+//!
+//! A `--workspace` clippy or test therefore covers none of this crate, so the
+//! gate carries dedicated `just lint-sqlite` / `just test-sqlite` steps that
+//! turn the feature on (#742). Run them before pushing a change to a
+//! `core::ports` trait: nothing else here will notice that it broke.
 
 // TODO(sqlite inc2): add the vector stores (KnowledgeBaseStore,
 // ToolRegistryStore) on sqlite-vec and the remaining FTS5 stores (ScratchpadStore

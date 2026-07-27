@@ -84,7 +84,9 @@ A hand-registered `include_str!` list applied idempotently at pool init
 migrations. Increment 1 ships one consolidated relational-backbone script
 (`001_relational_schema.sql`, all `IF NOT EXISTS`); later increments append
 ordinally-numbered scripts. A unit-test guard (`every_migration_is_registered`)
-fails the build if a `.sql` file is added but not wired in.
+fails the gate's `just test-sqlite` step if a `.sql` file is added but not wired
+in. It is a feature-gated test like every other one here, so it is that step -
+not `cargo test --workspace` - that runs it.
 
 ## Feature gate
 
@@ -94,7 +96,14 @@ pure-Rust and already in the workspace graph. Consequences:
 
 - `cargo build` / `cargo build --workspace` / the daemon build compile this
   crate as an empty shell — no `sqlx-sqlite`, byte-unchanged default build.
+- `cargo clippy --workspace` and `cargo test --workspace` do the same: they
+  type-check nothing here and run none of these tests.
 - Build and test the real adapter with `--features sqlite`.
+
+Because the workspace commands are blind to it, the gate runs the adapter under
+two dedicated steps - `just lint-sqlite` and `just test-sqlite`, both part of
+`just check` (#742). Without them a change to a `core::ports` trait can break
+this adapter and still push green.
 
 Tests build pools via the crate's own `create_memory_pool`, so the test target
 needs no `sqlx` dev-dependency (which would otherwise compile the sqlite C
