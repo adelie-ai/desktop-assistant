@@ -35,10 +35,25 @@ Interface: `org.desktopAssistant.Settings`
 - `GetConnectorDefaults(connector: s) -> (llm_model: s, llm_base_url: s, embeddings_model: s, embeddings_base_url: s, embeddings_available: b)`
   - Returns provider defaults for the requested connector (empty `connector` resolves to the default connector)
 - `GetConfig() -> (llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b, persistence_enabled: b, persistence_remote_url: s, persistence_remote_name: s, persistence_push_on_update: b)`
+  - `persistence_remote_url` is redacted: an inline password reads `***` (see
+    [Credentials in connection URLs](#credentials-in-connection-urls)).
 - `SetConfig(changes: ConfigPatchArgs) -> same tuple as GetConfig`
   - `ConfigPatchArgs` is a struct of `(set_*, value)` pairs so callers can change only selected fields.
   - String values are only applied when their corresponding `set_*` flag is `true`.
   - For optional string fields, passing an empty string with `set_* = true` clears the field where supported.
+
+### Credentials in connection URLs
+
+Every connection URL the daemon returns — the database `url`, the git
+`persistence_remote_url` — has its password replaced by `***`. The rest of the
+URL (scheme, user, host, port, database, options) is intact, so a settings UI
+can still show what is configured.
+
+Writes round-trip: posting back a URL that still carries the `***` placeholder
+keeps the stored password, provided nothing else in the URL changed. Editing
+any other part of the URL means re-entering the password — the daemon refuses
+to splice its stored credential into a URL a client has edited, and never
+stores the placeholder as if it were a password.
 
 ## Signals
 

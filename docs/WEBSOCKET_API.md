@@ -150,8 +150,32 @@ Current command variants:
 - `get_connector_defaults { connector }`
 - `get_persistence_settings`
 - `set_persistence_settings { enabled, remote_url?, remote_name?, push_on_update }`
+- `get_database_settings`
+- `set_database_settings { url, max_connections }`
 
 Result payloads are typed variants (`pong`, `status`, `conversation_id`, `conversations`, `conversation`, `config`, `ack`, etc.).
+
+### Credentials in connection URLs
+
+Every connection URL a reply carries — the database `url`, the git
+`remote_url` in `get_persistence_settings` and `get_config` — has its password
+replaced by `***`:
+
+```json
+{"result": {"database_settings": {"url": "postgres://adele:***@postgres:5432/adele", "max_connections": 5}}}
+```
+
+The rest of the URL (scheme, user, host, port, database, options) is intact, so
+a settings UI can still show what is configured. Both the inline
+`user:password@` form and the libpq `?password=` parameter are redacted.
+
+Writes round-trip. Posting back a URL that still carries the `***` placeholder
+keeps the stored password, provided nothing else in the URL changed — so a form
+that only ever saw the redacted value can still save an unrelated field.
+Editing any other part of the URL means re-entering the password: the daemon
+refuses such a write rather than splicing its stored credential into a URL the
+client has edited, and it never stores the placeholder as if it were a
+password.
 
 ## Events
 

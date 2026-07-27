@@ -77,6 +77,12 @@ pub struct ConnectorDefaultsView {
     pub hosted_tool_search_available: bool,
 }
 
+/// The configured git-persistence settings, as stored.
+///
+/// SECURITY: `remote_url` is the value the operator configured, credential
+/// included — an HTTPS remote can embed a token inline. It is an in-process
+/// value: the application layer redacts it before it reaches a client. Any new
+/// adapter that surfaces this view owes the same redaction.
 #[derive(Debug, Clone)]
 pub struct PersistenceSettingsView {
     pub enabled: bool,
@@ -86,6 +92,12 @@ pub struct PersistenceSettingsView {
     pub push_on_update: bool,
 }
 
+/// The configured database settings, as stored.
+///
+/// SECURITY: `url` is the raw connection string, password included, and that
+/// password belongs to the role that owns every table. It is an in-process
+/// value: the application layer redacts it before it reaches a client. Any new
+/// adapter that surfaces this view owes the same redaction.
 #[derive(Debug, Clone)]
 pub struct DatabaseSettingsView {
     /// Empty string means no URL is configured.

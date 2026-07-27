@@ -56,15 +56,24 @@ impl std::error::Error for RedactedUrlError {}
 /// Replace every password in `url` with [`REDACTED_PASSWORD`], leaving the
 /// rest of the URL untouched. A URL with no password is returned unchanged.
 pub fn redact_password(url: &str) -> String {
-    let _ = password_spans(url);
-    url.to_string()
+    let spans = password_spans(url);
+    if spans.is_empty() {
+        return url.to_string();
+    }
+    let mut redacted = url.to_string();
+    // Back to front so the earlier spans keep their offsets.
+    for span in spans.into_iter().rev() {
+        redacted.replace_range(span, REDACTED_PASSWORD);
+    }
+    redacted
 }
 
 /// Whether `url` carries [`REDACTED_PASSWORD`] where a password belongs —
 /// i.e. whether it is a redacted value a client is handing back.
 pub fn is_redacted(url: &str) -> bool {
-    let _ = password_spans(url);
-    false
+    password_spans(url)
+        .into_iter()
+        .any(|span| &url[span] == REDACTED_PASSWORD)
 }
 
 /// Decide what to store for a client-submitted connection URL.
@@ -75,17 +84,75 @@ pub fn is_redacted(url: &str) -> bool {
 /// is trimmed; an empty submission still means "clear the URL" and is returned
 /// as an empty string for the caller to normalize.
 pub fn resolve_submitted(submitted: &str, stored: &str) -> Result<String, RedactedUrlError> {
-    let _ = stored;
-    Ok(submitted.trim().to_string())
+    let submitted = submitted.trim();
+    if !is_redacted(submitted) {
+        return Ok(submitted.to_string());
+    }
+    let stored = stored.trim();
+    if redact_password(stored) == submitted {
+        return Ok(stored.to_string());
+    }
+    Err(RedactedUrlError::PlaceholderNotFromStoredUrl)
 }
 
 /// Byte ranges of every password value inside `url`: the userinfo password
 /// (`scheme://user:HERE@host`) and any `password=` query parameter (libpq's
-/// URI keyword form). Empty passwords yield no range — there is nothing to
-/// hide and replacing them would invent a credential that is not configured.
+/// URI keyword form), in ascending order. Empty passwords yield no range —
+/// there is nothing to hide and replacing one would invent a credential that
+/// is not configured.
+///
+/// `Why:` this splits the URL rather than parsing it. The daemon stores the
+/// connection string as the operator typed it and hands it to the driver
+/// verbatim, so redaction must work on strings a strict parser would reject
+/// (an unescaped `@` or `:` in a password, a driver-specific option) and must
+/// never rewrite anything but the password itself.
 fn password_spans(url: &str) -> Vec<Range<usize>> {
-    let _ = url;
-    Vec::new()
+    let mut spans = Vec::new();
+
+    // No `scheme://` means no authority component, so no userinfo and no
+    // query — e.g. an scp-style git remote (`git@host:path`).
+    let Some(scheme_end) = url.find("://") else {
+        return spans;
+    };
+    let authority_start = scheme_end + "://".len();
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| authority_start + i);
+
+    // Userinfo is everything before the LAST `@` of the authority: a password
+    // may contain an unescaped `@`, and taking the last one keeps the host
+    // out of the redacted span. Within it the password follows the FIRST `:`,
+    // because the user name cannot contain one.
+    let authority = &url[authority_start..authority_end];
+    if let Some(at) = authority.rfind('@')
+        && let Some(colon) = authority[..at].find(':')
+    {
+        let password = authority_start + colon + 1..authority_start + at;
+        if !password.is_empty() {
+            spans.push(password);
+        }
+    }
+
+    let tail = &url[authority_end..];
+    let fragment = tail.find('#').unwrap_or(tail.len());
+    if let Some(question) = tail[..fragment].find('?') {
+        let query_start = authority_end + question + 1;
+        let query_end = authority_end + fragment;
+        let mut pair_start = query_start;
+        for pair in url[query_start..query_end].split('&') {
+            if let Some(eq) = pair.find('=')
+                && pair[..eq].eq_ignore_ascii_case("password")
+            {
+                let password = pair_start + eq + 1..pair_start + pair.len();
+                if !password.is_empty() {
+                    spans.push(password);
+                }
+            }
+            pair_start += pair.len() + "&".len();
+        }
+    }
+
+    spans
 }
 
 #[cfg(test)]
@@ -178,6 +245,39 @@ mod tests {
     #[test]
     fn leaves_an_empty_url_unchanged() {
         assert_eq!(redact_password(""), "");
+    }
+
+    #[test]
+    fn redacts_a_non_ascii_password_without_splitting_a_character() {
+        assert_eq!(
+            redact_password("postgres://adèle:pässwörd@db.internal/adele"),
+            "postgres://adèle:***@db.internal/adele"
+        );
+    }
+
+    #[test]
+    fn leaves_malformed_input_unchanged_instead_of_panicking() {
+        for malformed in [
+            "://",
+            "postgres://",
+            "postgres://@",
+            "postgres://:@",
+            "postgres://:@/",
+            "postgres://u@h/db?",
+            "postgres://u@h/db?password",
+            "postgres://u@h/db?password=",
+            "not a url at all",
+            "@:",
+            "?",
+            "#",
+        ] {
+            assert_eq!(
+                redact_password(malformed),
+                malformed,
+                "there is no password in {malformed:?} to replace"
+            );
+            resolve_submitted(malformed, malformed).expect("a password-free URL is stored as-is");
+        }
     }
 
     #[test]

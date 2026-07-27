@@ -180,9 +180,18 @@ pub enum Command {
         connector: String,
     },
 
+    /// Read the git-persistence settings. Returns
+    /// [`CommandResult::PersistenceSettings`], whose `remote_url` is redacted
+    /// by [`secret_url`] — an HTTPS remote's token never crosses the wire.
     GetPersistenceSettings,
+    /// Update the git-persistence settings. `None` for `remote_url` /
+    /// `remote_name` clears that value.
     SetPersistenceSettings {
         enabled: bool,
+        /// A `remote_url` still carrying [`secret_url::REDACTED_PASSWORD`] is
+        /// accepted only when it is exactly the redaction of the stored
+        /// remote, and then keeps the stored credential; otherwise the write
+        /// is refused. See [`secret_url::resolve_submitted`].
         remote_url: Option<String>,
         remote_name: Option<String>,
         push_on_update: bool,
@@ -198,18 +207,24 @@ pub enum Command {
     /// Read database settings. Returns
     /// [`CommandResult::DatabaseSettings`].
     ///
-    /// SECURITY: the returned `url` is the raw PostgreSQL connection string,
-    /// which for a password-auth deployment embeds the password inline
-    /// (`postgres://user:pass@host/db`). This mirrors the D-Bus
-    /// `GetDatabaseSettings` method exactly, which returns `settings.url`
-    /// verbatim with no redaction. Wire-modeling makes this reachable over a
-    /// socket (incl. WS); the secret exposure is unchanged from today's D-Bus
-    /// surface but is now reachable by a remote WS client if one is configured.
+    /// SECURITY: the returned `url` is redacted by [`secret_url`] — its
+    /// password reads [`secret_url::REDACTED_PASSWORD`] and everything else
+    /// (scheme, user, host, port, database, options) is intact. This command
+    /// is reachable by any authenticated client on any transport, including a
+    /// remote WebSocket one, and the credential it would otherwise carry
+    /// belongs to the role that owns every table — a role the row-level
+    /// security backstop deliberately does not `FORCE` — so returning it would
+    /// hand any caller a way around the per-user scoping.
     GetDatabaseSettings,
     /// Update database settings. An empty `url` clears it (no database
     /// configured). Mirrors the D-Bus `SetDatabaseSettings` method.
     SetDatabaseSettings {
-        /// Empty string clears the configured URL.
+        /// Empty string clears the configured URL. A url still carrying
+        /// [`secret_url::REDACTED_PASSWORD`] is accepted only when it is
+        /// exactly the redaction of the stored url, and then keeps the stored
+        /// credential rather than overwriting it with the placeholder;
+        /// otherwise the write is refused. See
+        /// [`secret_url::resolve_submitted`].
         url: String,
         max_connections: u32,
     },
@@ -956,6 +971,12 @@ pub struct Status {
     pub version: String,
 }
 
+/// The aggregate config a `GetConfig` / `SetConfig` reply carries, and the
+/// payload of the `ConfigChanged` event.
+///
+/// SECURITY: carries no secret value. `embeddings` reports only whether an API
+/// key is set, and `persistence.remote_url` is redacted (see
+/// [`PersistenceSettingsView`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub embeddings: EmbeddingsSettingsView,
@@ -995,6 +1016,11 @@ pub struct ConfigChanges {
     pub embeddings_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_enabled: Option<bool>,
+    /// `None` leaves the stored remote (credential included) untouched. A
+    /// value still carrying [`secret_url::REDACTED_PASSWORD`] is accepted only
+    /// when it is exactly the redaction of the stored remote, and then keeps
+    /// the stored credential; otherwise the write is refused. See
+    /// [`secret_url::resolve_submitted`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_remote_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1166,10 +1192,16 @@ pub struct ConnectorDefaultsView {
     pub hosted_tool_search_available: bool,
 }
 
+/// Wire form of the git-persistence settings.
+///
+/// SECURITY: `remote_url` never carries a password. An HTTPS remote can embed
+/// a token inline (`https://user:token@host/repo.git`), so the application
+/// layer redacts it with [`secret_url::redact_password`] on the way out.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistenceSettingsView {
     pub enabled: bool,
-    /// Empty string means no remote is configured.
+    /// Redacted remote. Empty means no remote is configured; a password
+    /// component reads [`secret_url::REDACTED_PASSWORD`].
     pub remote_url: String,
     pub remote_name: String,
     pub push_on_update: bool,
@@ -1271,13 +1303,15 @@ pub struct ServiceAccountView {
 /// [`desktop_assistant_core::ports::inbound::DatabaseSettingsView`] but lives
 /// here (serializable) so it can travel over the socket transports.
 ///
-/// SECURITY: `url` is the raw PostgreSQL connection string and, for a
-/// password-auth deployment, embeds the password inline. It is returned
-/// verbatim, exactly as the in-process D-Bus `GetDatabaseSettings` method
-/// does — this view does NOT redact. See `Command::GetDatabaseSettings`.
+/// SECURITY: `url` never carries a password. The application layer redacts it
+/// with [`secret_url::redact_password`] on the way out, so a password-auth DSN
+/// arrives as `postgres://user:***@host/db`. See `Command::GetDatabaseSettings`
+/// for why, and `Command::SetDatabaseSettings` for how the value round-trips
+/// back without destroying the stored credential.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatabaseSettingsView {
-    /// Empty string means no URL is configured.
+    /// Redacted connection string. Empty means no URL is configured; a
+    /// password component reads [`secret_url::REDACTED_PASSWORD`].
     pub url: String,
     pub max_connections: u32,
 }

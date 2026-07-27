@@ -790,6 +790,15 @@ where
         })
     }
 
+    /// Decide what to store for a client-submitted connection URL, given the
+    /// one currently stored. Settings reads redact the password
+    /// ([`api::secret_url`]), so a client re-posting a form it only ever saw
+    /// redacted submits the placeholder back; that keeps the stored
+    /// credential, while a placeholder attached to any other URL is refused.
+    fn resolve_submitted_url(submitted: &str, stored: &str) -> ApiResult<String> {
+        api::secret_url::resolve_submitted(submitted, stored).map_err(Self::map_core_err)
+    }
+
     async fn get_config(&self) -> ApiResult<api::Config> {
         let embeddings = self
             .settings
@@ -835,7 +844,7 @@ where
             },
             persistence: api::PersistenceSettingsView {
                 enabled: persistence.enabled,
-                remote_url: persistence.remote_url,
+                remote_url: api::secret_url::redact_password(&persistence.remote_url),
                 remote_name: persistence.remote_name,
                 push_on_update: persistence.push_on_update,
             },
@@ -900,19 +909,29 @@ where
             || persistence_remote_name.is_some()
             || persistence_push_on_update.is_some();
         if persistence_changed {
-            let enabled = persistence_enabled.unwrap_or(current.persistence.enabled);
-            let remote_url = if persistence_remote_url.is_some() {
-                Self::normalize_optional_string(persistence_remote_url)
-            } else {
-                Some(current.persistence.remote_url.clone())
+            // Read the stored view rather than reusing `current`: the latter
+            // came from `get_config`, whose `remote_url` is redacted, so
+            // carrying it forward would overwrite the credential with the
+            // placeholder.
+            let stored = self
+                .settings
+                .get_persistence_settings()
+                .await
+                .map_err(Self::map_core_err)?;
+
+            let enabled = persistence_enabled.unwrap_or(stored.enabled);
+            let remote_url = match persistence_remote_url {
+                Some(submitted) => Self::normalize_optional_string(Some(
+                    Self::resolve_submitted_url(&submitted, &stored.remote_url)?,
+                )),
+                None => Some(stored.remote_url.clone()),
             };
             let remote_name = if persistence_remote_name.is_some() {
                 Self::normalize_optional_string(persistence_remote_name)
             } else {
-                Some(current.persistence.remote_name.clone())
+                Some(stored.remote_name.clone())
             };
-            let push_on_update =
-                persistence_push_on_update.unwrap_or(current.persistence.push_on_update);
+            let push_on_update = persistence_push_on_update.unwrap_or(stored.push_on_update);
 
             self.settings
                 .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
@@ -1667,7 +1686,7 @@ where
                 Ok(api::CommandResult::PersistenceSettings(
                     api::PersistenceSettingsView {
                         enabled: p.enabled,
-                        remote_url: p.remote_url,
+                        remote_url: api::secret_url::redact_password(&p.remote_url),
                         remote_name: p.remote_name,
                         push_on_update: p.push_on_update,
                     },
@@ -1680,6 +1699,17 @@ where
                 remote_name,
                 push_on_update,
             } => {
+                let remote_url = match remote_url {
+                    Some(submitted) => {
+                        let stored = self
+                            .settings
+                            .get_persistence_settings()
+                            .await
+                            .map_err(Self::map_core_err)?;
+                        Some(Self::resolve_submitted_url(&submitted, &stored.remote_url)?)
+                    }
+                    None => None,
+                };
                 self.settings
                     .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
                     .await
@@ -1689,10 +1719,9 @@ where
 
             // Database / backend-tasks / WS-auth settings (bridge cutover 2/7,
             // #314). Each mirrors the in-process D-Bus method of the same name:
-            // the getters return the same fields the D-Bus method returns (no
-            // new secret exposure — see the `Command` doc-comments), and the
-            // setters apply the same `empty-string clears` normalization the
-            // D-Bus methods apply before delegating to `SettingsService`.
+            // the getters return the same fields the D-Bus method returns, and
+            // the setters apply the same `empty-string clears` normalization
+            // the D-Bus methods apply before delegating to `SettingsService`.
             api::Command::GetDatabaseSettings => {
                 let s = self
                     .settings
@@ -1701,7 +1730,7 @@ where
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::DatabaseSettings(
                     api::DatabaseSettingsView {
-                        url: s.url,
+                        url: api::secret_url::redact_password(&s.url),
                         max_connections: s.max_connections,
                     },
                 ))
@@ -1711,6 +1740,12 @@ where
                 url,
                 max_connections,
             } => {
+                let stored = self
+                    .settings
+                    .get_database_settings()
+                    .await
+                    .map_err(Self::map_core_err)?;
+                let url = Self::resolve_submitted_url(&url, &stored.url)?;
                 // Mirror the D-Bus `set_database_settings`: an empty/whitespace
                 // url clears the configured URL.
                 self.settings
