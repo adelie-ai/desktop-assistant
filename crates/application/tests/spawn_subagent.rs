@@ -2266,3 +2266,258 @@ async fn get_subagent_status_hides_task_owned_by_another_user() {
         "never leak the other user's result content"
     );
 }
+
+// --------------------------------------------------------------------
+// #724: dispatch mode decides whether a finished subagent wakes the
+// parent. A child the parent blocked on (`wait=true`, the default) has
+// already handed its answer back inline, so it must NOT also queue an
+// autonomous wake turn on the user's conversation. Only a detached
+// (`wait=false`) child does.
+// --------------------------------------------------------------------
+
+/// Records every wake turn the coordinator drives, so a test can assert both
+/// that a wake happened (and on which conversation) and that one did not.
+#[derive(Default)]
+struct RecordingWaker {
+    /// `(conversation_id, prompt)` per wake, in the order they ran.
+    wakes: Mutex<Vec<(String, String)>>,
+}
+
+impl RecordingWaker {
+    fn wakes(&self) -> Vec<(String, String)> {
+        self.wakes.lock().expect("wakes poisoned").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl desktop_assistant_application::parent_wake::ParentWaker for RecordingWaker {
+    async fn wake(&self, _user_id: UserId, conversation_id: String, prompt: String) {
+        self.wakes
+            .lock()
+            .expect("wakes poisoned")
+            .push((conversation_id, prompt));
+    }
+}
+
+/// Live coordinator wired onto `registry`, exactly as the daemon wires it.
+/// The returned `Arc<dyn ParentWaker>` and coordinator must be held for the
+/// duration of the test — the coordinator holds the waker weakly, and the
+/// registry holds the coordinator weakly.
+type WiredWake = (
+    Arc<RecordingWaker>,
+    Arc<dyn desktop_assistant_application::parent_wake::ParentWaker>,
+    Arc<desktop_assistant_application::parent_wake::ParentWakeCoordinator>,
+);
+
+fn wire_parent_wake(registry: &BackgroundTaskRegistry) -> WiredWake {
+    use desktop_assistant_application::parent_wake::{ParentWakeCoordinator, ParentWaker};
+    let recorder = Arc::new(RecordingWaker::default());
+    let dynamic: Arc<dyn ParentWaker> = recorder.clone();
+    let coordinator = Arc::new(ParentWakeCoordinator::new(Arc::downgrade(&dynamic), true));
+    registry.set_subagent_observer(coordinator.observer());
+    (recorder, dynamic, coordinator)
+}
+
+/// The child scope the dispatch loop mints for a spawn: the session (top-level)
+/// conversation is distinct from the child's own, which is what makes a wake
+/// turn target the user's conversation.
+fn session_scope(
+    owner_todo: &str,
+) -> desktop_assistant_core::ports::scratchpad_scope::SubagentScope {
+    desktop_assistant_core::ports::scratchpad_scope::SubagentScope {
+        session_conversation_id: ConversationId::from("session-1"),
+        owner_todo: owner_todo.to_string(),
+        visible_before: "marker".to_string(),
+        ancestors: vec![String::new()],
+    }
+}
+
+/// Poll `pred` until true, or panic. Used to wait for an expected wake without
+/// a fixed sleep.
+async fn wake_until<F: FnMut() -> bool>(mut pred: F, label: &str) {
+    for _ in 0..300 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("predicate '{label}' never became true within timeout");
+}
+
+/// Grace period long enough for an erroneous wake to have been spawned and
+/// recorded, so "no wake" assertions are not vacuous.
+const WAKE_GRACE: Duration = Duration::from_millis(250);
+
+#[tokio::test]
+async fn default_wait_subagent_does_not_wake_the_parent_conversation() {
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let (recorder, _waker, _coordinator) = wire_parent_wake(&registry);
+    let conversations = Arc::new(FakeConversations::new("child answer"));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    let tools_for_body = tools.clone();
+    let user_for_body = user.clone();
+    let (_pid, result) = under_parent_task(&registry, user.clone(), "session-1", move |_pid| {
+        let tools = tools_for_body;
+        let user = user_for_body;
+        async move {
+            with_user_id(
+                user,
+                desktop_assistant_core::ports::scratchpad_scope::with_pending_child_scope(
+                    session_scope("1.1"),
+                    async move {
+                        tools
+                            .execute_tool(
+                                TOOL_SPAWN_SUBAGENT,
+                                // `wait` omitted -> defaults to true.
+                                serde_json::json!({"name": "researcher", "prompt": "go"}),
+                            )
+                            .await
+                    },
+                ),
+            )
+            .await
+        }
+    })
+    .await;
+
+    assert_eq!(
+        result.expect("spawn returned Ok"),
+        "child answer",
+        "the parent consumed the child's result inline"
+    );
+    tokio::time::sleep(WAKE_GRACE).await;
+    assert!(
+        recorder.wakes().is_empty(),
+        "a child the parent blocked on must not also run an autonomous wake turn; got {:?}",
+        recorder.wakes()
+    );
+}
+
+#[tokio::test]
+async fn wait_false_subagent_wakes_the_parent_conversation() {
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let (recorder, _waker, _coordinator) = wire_parent_wake(&registry);
+    let conversations = Arc::new(FakeConversations::new("child answer"));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    let tools_for_body = tools.clone();
+    let user_for_body = user.clone();
+    let (_pid, result) = under_parent_task(&registry, user.clone(), "session-1", move |_pid| {
+        let tools = tools_for_body;
+        let user = user_for_body;
+        async move {
+            with_user_id(
+                user,
+                desktop_assistant_core::ports::scratchpad_scope::with_pending_child_scope(
+                    session_scope("1.1"),
+                    async move {
+                        tools
+                            .execute_tool(
+                                TOOL_SPAWN_SUBAGENT,
+                                serde_json::json!({
+                                    "name": "researcher",
+                                    "prompt": "go",
+                                    "wait": false,
+                                }),
+                            )
+                            .await
+                    },
+                ),
+            )
+            .await
+        }
+    })
+    .await;
+
+    result.expect("spawn returned Ok");
+    wake_until(
+        || !recorder.wakes().is_empty(),
+        "detached child woke the parent",
+    )
+    .await;
+    let wakes = recorder.wakes();
+    assert_eq!(wakes.len(), 1, "exactly one wake turn: {wakes:?}");
+    assert_eq!(
+        wakes[0].0, "session-1",
+        "the wake runs on the user's session conversation"
+    );
+    assert!(
+        wakes[0].1.contains("researcher"),
+        "the wake prompt names the finished child: {}",
+        wakes[0].1
+    );
+}
+
+#[tokio::test]
+async fn mixed_dispatch_wakes_only_for_the_detached_child() {
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let (recorder, _waker, _coordinator) = wire_parent_wake(&registry);
+    let conversations = Arc::new(FakeConversations::new("child answer"));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    let tools_for_body = tools.clone();
+    let user_for_body = user.clone();
+    let (_pid, ()) = under_parent_task(&registry, user.clone(), "session-1", move |_pid| {
+        let tools = tools_for_body;
+        let user = user_for_body;
+        async move {
+            with_user_id(user, async move {
+                use desktop_assistant_core::ports::scratchpad_scope::with_pending_child_scope;
+                // Detached: the parent will not see this one's answer inline.
+                with_pending_child_scope(session_scope("1.1"), async {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "detached",
+                                "prompt": "go",
+                                "wait": false,
+                            }),
+                        )
+                        .await
+                        .expect("detached spawn ok");
+                })
+                .await;
+                // Blocking: its answer comes back inline to the parent.
+                with_pending_child_scope(session_scope("1.2"), async {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({"name": "inline", "prompt": "go"}),
+                        )
+                        .await
+                        .expect("inline spawn ok");
+                })
+                .await;
+            })
+            .await
+        }
+    })
+    .await;
+
+    wake_until(
+        || !recorder.wakes().is_empty(),
+        "detached child woke the parent",
+    )
+    .await;
+    tokio::time::sleep(WAKE_GRACE).await;
+    let wakes = recorder.wakes();
+    assert_eq!(
+        wakes.len(),
+        1,
+        "only the detached child wakes the parent: {wakes:?}"
+    );
+    let prompt = &wakes[0].1;
+    assert!(
+        prompt.contains("detached"),
+        "names the detached child: {prompt}"
+    );
+    assert!(
+        !prompt.contains("inline"),
+        "never names a child the parent already consumed inline: {prompt}"
+    );
+}
