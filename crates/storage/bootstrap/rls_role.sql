@@ -7,16 +7,23 @@
 -- here and are applied once, out of band, by an administrator.
 --
 -- What it provisions:
---   * `adele_query` — the role the db_query READ path assumes via
+--   * `adele_query` — the role BOTH db_query paths assume via
 --     `SET LOCAL ROLE`. NOLOGIN (entered only via SET ROLE, never connected
 --     to directly), NOBYPASSRLS + non-superuser + non-owner so the row-level
---     policies from migration 029 actually apply to it.
+--     policies from migration 029 actually apply to it. The write path uses
+--     the same role so an LLM-supplied statement runs with no ownership of,
+--     and no write privilege on, anything the application manages.
 --   * membership: the app role is granted `adele_query` so it can SET ROLE
 --     into it. WITH ADMIN OPTION so the grant is self-healing if re-run.
---   * SELECT on every current table + USAGE on the schema (the read path only
---     ever reads), plus DEFAULT PRIVILEGES so tables added by future
---     migrations (created by the app role) are readable without re-running
---     this script.
+--   * SELECT on every current table + USAGE on the schema (only the read path
+--     reads application tables), plus DEFAULT PRIVILEGES so tables added by
+--     future migrations (created by the app role) are readable without
+--     re-running this script.
+--
+-- Deliberately NOT provisioned here: the `scratch` write sandbox. The daemon
+-- creates that schema on demand and grants itself USAGE + CREATE on it, so a
+-- database that has run this script needs no further privileged step for
+-- writes to work.
 --
 -- Usage (defaults to the app role `adele_dave`; override with -v app_role=...):
 --

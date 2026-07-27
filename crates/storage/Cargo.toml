@@ -14,8 +14,13 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "js
 # - confirm a single statement,
 # - enforce SELECT-only on the read path,
 # - graft `WHERE user_id = $N` onto references to personal-data tables,
-# - reject writes that name personal-data tables qualified or otherwise.
-sqlparser = "0.62"
+# - confine writes to the `scratch` sandbox.
+#
+# `visitor` pulls in the derived `Visit` impls. The write-path checker needs a
+# walk that covers the WHOLE AST rather than the shapes someone remembered to
+# enumerate: the two escapes fixed in #721/#722 were both fields a hand-written
+# walker never descended into.
+sqlparser = { version = "0.62", features = ["visitor"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 serde.workspace = true
 serde_json = "1"

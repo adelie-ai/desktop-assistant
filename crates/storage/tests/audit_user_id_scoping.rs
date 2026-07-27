@@ -47,9 +47,10 @@
 //!   shared.
 //! - DDL-style statements (`CREATE`, `ALTER`, `SET`) — they don't
 //!   address user data.
-//! - The scratch-schema execution path in `database.rs` — it runs
-//!   user-authored read-only SQL inside a transaction that's already
-//!   per-user-scoped (see `execute_database_query`'s contract).
+//! - The tool execution paths in `database.rs` — they run user-authored
+//!   SQL inside a transaction that is already per-user-scoped on the read
+//!   side and confined to the `scratch` sandbox on the write side (see
+//!   `execute_database_query`'s contract).
 //!
 //! ## When the test fails
 //!

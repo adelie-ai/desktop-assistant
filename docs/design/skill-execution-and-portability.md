@@ -206,9 +206,10 @@ approval and a rootless builder — never a mounted container socket.
 the daemon has no business learning cluster APIs. But the model calls MCP tools
 directly, and a server that builds images and launches workloads would be the
 most powerful tool in the fleet. That is exactly the shape of the `builtin_db_query`
-self-blessing hole: a committing tool running as owner, reachable straight from
-the model's tool list. So the daemon decides that this skill at this hash may be
-built and run, and the server is reachable only through that decision.
+self-blessing hole: a committing tool that used to run as the schema owner,
+reachable straight from the model's tool list. So the daemon decides that this
+skill at this hash may be built and run, and the server is reachable only
+through that decision.
 
 **An orchestrator expressed as a skill must be global.** It cannot itself run in
 a container — it bootstraps them, holding registry and cluster credentials — and
