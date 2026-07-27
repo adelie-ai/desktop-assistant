@@ -165,11 +165,15 @@ pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSet
         .unwrap_or_else(|| default_base_url(&connector));
 
     // Resolve API key: reuse LLM secret config if connectors match, otherwise use env fallback
-    let api_key = if is_default || connector == llm_connector {
-        resolve_llm_config(config).api_key
+    // The profile travels with the key: both come from the shared LLM config
+    // when the embedding connector is the same one, and neither has an
+    // environment fallback that would make sense on its own.
+    let (api_key, aws_profile) = if is_default || connector == llm_connector {
+        let shared = resolve_llm_config(config);
+        (shared.api_key, shared.aws_profile)
     } else {
         let env_key = default_api_key_env(&connector);
-        std::env::var(env_key).unwrap_or_default()
+        (std::env::var(env_key).unwrap_or_default(), None)
     };
     let has_api_key = !api_key.trim().is_empty();
 
@@ -179,6 +183,7 @@ pub fn resolve_embeddings_config(config: Option<&DaemonConfig>) -> EmbeddingsSet
         base_url,
         api_key,
         has_api_key,
+        aws_profile,
         available,
         is_default,
     }
@@ -199,6 +204,7 @@ fn resolve_purpose_embeddings_view(
         base_url: resolved.base_url,
         api_key: resolved.api_key,
         has_api_key,
+        aws_profile: resolved.aws_profile,
         available,
         // Always `false` for purpose-driven config: the user explicitly chose
         // a connection/model, so this is no longer "the inferred default".
