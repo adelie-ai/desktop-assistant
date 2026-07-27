@@ -721,12 +721,16 @@ pub trait SettingsService: Send + Sync {
         max_connections: u32,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
-    /// Config areas whose configured value cannot take effect until the daemon
-    /// is restarted (#686), as stable area keys (`"tls"`, `"ws_auth"`, ...).
+    /// What is in the daemon's config file that the running process is not
+    /// acting on (#686), as stable area keys (`"tls"`, `"ws_auth"`, ...).
     ///
     /// Empty means every configured value is live. The keys name the area only
     /// and never carry a configured value, so this is safe to return to any
     /// caller allowed to read settings at all.
+    ///
+    /// `"config_load_failed"` means the file would not load at all, so the
+    /// daemon is running built-in defaults and refuses config-changing
+    /// commands rather than overwriting a file it could not read (#723).
     ///
     /// Default returns empty so test mocks and adapters with no config file to
     /// compare against opt out without boilerplate; the daemon's real service

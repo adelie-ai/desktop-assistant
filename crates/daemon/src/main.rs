@@ -887,14 +887,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    let daemon_config = match config::load_daemon_config(&config_path) {
-        Ok(config) => config,
+    // A config file that will not load must not stop the daemon: no daemon at
+    // all is worse than one running built-in defaults. It does, however, mean
+    // the process never held the user's settings, so the origin travels with
+    // the config into the registry handle (#723).
+    let (daemon_config, config_origin) = match config::load_daemon_config(&config_path) {
+        Ok(config) => (config, config::ConfigOrigin::File),
         Err(error) => {
-            tracing::warn!(
-                "failed to load daemon config at {}: {error}",
+            tracing::error!(
+                "failed to load daemon config at {}: {error}. Starting on built-in defaults; \
+                 config-changing commands are refused until the file loads, so the settings \
+                 you see are NOT the ones in that file",
                 config_path.display()
             );
-            None
+            (None, config::ConfigOrigin::DefaultsAfterFailedLoad)
         }
     };
 
@@ -2396,7 +2402,8 @@ async fn main() -> Result<()> {
             daemon_config.clone().unwrap_or_default(),
             connection_registry,
         )
-        .with_config_path(config_path.clone()),
+        .with_config_path(config_path.clone())
+        .with_config_origin(config_origin),
     );
 
     // State-preserving config hot-reload (#222). The D-Bus `Reload` method and

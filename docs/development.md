@@ -87,6 +87,19 @@ Default connector is `openai`.
 
 To opt into local Ollama, set `llm.connector = "ollama"` in `$XDG_CONFIG_HOME/desktop-assistant/daemon.toml` (or `~/.config/desktop-assistant/daemon.toml`).
 
+### When `daemon.toml` does not load
+
+A config file the daemon cannot parse or validate does not stop it: it starts on
+built-in defaults and logs the error at `error` level, naming the file. In that
+state it will **not** write the config file - connection, purpose and settings
+writes are refused with an error naming the file - because saving would replace
+your configuration with those defaults. Settings clients see the same fact as
+`config_load_failed` in the config view's `restart_required`, so an empty
+connections list reads as "could not load your config" rather than "you have
+none". Fix the file and the daemon picks it up automatically (the file watcher
+reloads it); areas wired at startup, such as `[database]` and `[ws_auth]`, still
+need a restart and keep being reported until then.
+
 For cloud connectors, set connector credentials:
 
 ```bash

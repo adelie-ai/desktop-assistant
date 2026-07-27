@@ -112,16 +112,24 @@ Current command variants:
 - `ping`
 - `get_status`
 - `get_config`
-  - The config view carries `restart_required`: the config areas whose
-    configured value cannot take effect until the daemon is restarted, as
-    stable area keys (`"database"`, `"embeddings"`, `"persistence"`,
-    `"ws_auth"`, `"tls"`, `"profiling"`). Absent or empty means every
-    configured value is live. It reports *area names only* and never the
-    configured value, so a pending `[ws_auth]` or `[tls]` change is visible
-    without disclosing what it was changed to. Treat the set as open and render
-    an unrecognized key verbatim rather than dropping it. Additive and
-    backward-compatible: an older daemon that omits the field deserializes as
-    empty, and an empty report is omitted on the wire.
+  - The config view carries `restart_required`: what is in the daemon's config
+    file that the running process is not acting on, as stable area keys
+    (`"database"`, `"embeddings"`, `"persistence"`, `"ws_auth"`, `"tls"`,
+    `"profiling"`). Absent or empty means every configured value is live. It
+    reports *area names only* and never the configured value, so a pending
+    `[ws_auth]` or `[tls]` change is visible without disclosing what it was
+    changed to. Treat the set as open and render an unrecognized key verbatim
+    rather than dropping it. Additive and backward-compatible: an older daemon
+    that omits the field deserializes as empty, and an empty report is omitted
+    on the wire.
+  - One key is not an area: `"config_load_failed"` means `daemon.toml` itself
+    would not load, so nothing in it is in force and the daemon is running
+    built-in defaults. A settings UI should show that state instead of
+    presenting the defaults as the user's configuration - an empty connections
+    list here means "could not read your config", not "you have none". While it
+    is reported, the daemon refuses config-changing commands (`set_config`,
+    connection and purpose writes) with an error naming the file, so it cannot
+    overwrite a file it could not read. It clears once the file loads again.
 - `set_config { changes }`
 - `create_conversation { title }`
 - `list_conversations { max_age_days }`

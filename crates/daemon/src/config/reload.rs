@@ -27,18 +27,34 @@
 //! built once in `main` and is not in the connection registry, so the rebuild
 //! does nothing for it. It is classified restart-required here until #685
 //! rebuilds it live (see [`embedding_backend_changed`]).
+//!
+//! [`RestartArea`] carries one member this diff never produces:
+//! `ConfigLoadFailed`, reported by the registry handle when the file will not
+//! load at all. It rides the same wire field because it answers the same client
+//! question - what in the file is not in force - and there is nothing to diff
+//! when the file did not parse.
 
 use super::DaemonConfig;
 use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, PurposeKind};
 
-/// A config area whose value is wired once at process start, so an edit to it
-/// cannot take effect until the daemon restarts.
+/// Something in the config file that the running process is not acting on and
+/// cannot pick up without a restart - in almost every case a config area whose
+/// value is wired once at process start.
 ///
 /// A closed set rather than free strings because [`Self::as_key`] crosses the
 /// wire to clients (`api-model`'s `Config::restart_required`): a typo in a
 /// classifier would silently break a settings UI that matches on these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartArea {
+    /// The whole file: it could not be loaded, so *nothing* in it is in force
+    /// and the daemon is running built-in defaults.
+    ///
+    /// The odd one out - not an area, and never produced by [`plan_reload`],
+    /// which diffs two configs that both parsed. It is reported by
+    /// `RegistryHandle::restart_required` so a settings panel can tell a
+    /// degraded daemon from a genuinely unconfigured one, and it clears when
+    /// the file loads again.
+    ConfigLoadFailed,
     /// `[database]`: the pool and URL are opened once at startup.
     Database,
     /// The embedding backend, whether configured via the legacy `[embeddings]`
@@ -61,6 +77,7 @@ impl RestartArea {
     /// in a client. Never carries a configured *value*, only the area name.
     pub fn as_key(self) -> &'static str {
         match self {
+            Self::ConfigLoadFailed => "config_load_failed",
             Self::Database => "database",
             Self::Embeddings => "embeddings",
             Self::Persistence => "persistence",

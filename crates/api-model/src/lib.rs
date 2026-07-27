@@ -986,8 +986,8 @@ pub struct Config {
     /// [`PersonalitySettingsView`]).
     #[serde(default)]
     pub personality: PersonalitySettingsView,
-    /// Config areas whose configured value cannot take effect until the daemon
-    /// is restarted (#686). Empty means every configured value is live.
+    /// What is in the daemon's config file that the running process is not
+    /// acting on (#686). Empty means every configured value is live.
     ///
     /// Entries are stable area keys - `"database"`, `"embeddings"`,
     /// `"persistence"`, `"ws_auth"`, `"tls"`, `"profiling"` - deliberately an
@@ -995,8 +995,17 @@ pub struct Config {
     /// client. Clients should render unrecognized keys verbatim rather than
     /// dropping them.
     ///
+    /// `"config_load_failed"` is the exception to "area": the config file
+    /// itself would not load, so *nothing* in it is in force and the daemon is
+    /// running built-in defaults (#723). A client that shows settings should
+    /// say so rather than presenting the defaults as the user's configuration,
+    /// because they are not: the daemon also refuses config-changing commands
+    /// while this is reported, so it cannot overwrite the file it could not
+    /// read.
+    ///
     /// SECURITY: area names only. A pending `[ws_auth]` or `[tls]` change is
-    /// reported without disclosing what it was changed to.
+    /// reported without disclosing what it was changed to, and a failed load
+    /// is reported without the parse error, which can quote a credential.
     ///
     /// Additive and backward-compatible: `#[serde(default)]` means a payload
     /// from an older daemon that omits the field still deserializes, and an
