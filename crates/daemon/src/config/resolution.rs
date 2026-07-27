@@ -20,17 +20,11 @@ use crate::purposes::PurposeKind;
 
 use super::secrets::read_secret_from_backend;
 use super::{
-    ConnectorExtras, DaemonConfig, EmbeddingsSettingsView, LlmConfig, ResolvedLlmConfig,
-    ResolvedPersistenceConfig, SecretConfig, default_api_key_env, default_base_url_env,
-    default_connector, default_database_max_connections, default_git_remote_name,
-    default_model_env, default_push_on_update,
+    AZURE_DEFAULT_API_KEY_ENV, ConnectorExtras, DaemonConfig, EmbeddingsSettingsView, LlmConfig,
+    ResolvedLlmConfig, ResolvedPersistenceConfig, SecretConfig, default_api_key_env,
+    default_base_url_env, default_connector, default_database_max_connections,
+    default_git_remote_name, default_model_env, default_push_on_update,
 };
-
-/// Azure's conventional key env var, used when a connection doesn't set an
-/// explicit `api_key_env`. The connector key `azure` derives `AZURE_API_KEY`
-/// (see [`default_api_key_env`]), but Azure OpenAI's documented variable is
-/// `AZURE_OPENAI_API_KEY`, so the resolver defaults to that instead.
-const AZURE_DEFAULT_API_KEY_ENV: &str = "AZURE_OPENAI_API_KEY";
 
 /// Resolve a value from the connection field first, then a prioritized list of
 /// environment variables, returning the first non-empty match. Used to fill

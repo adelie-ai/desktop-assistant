@@ -106,6 +106,8 @@ Connector key naming convention is generic:
 - Environment fallback defaults to `<CONNECTOR>_API_KEY`.
 - Connector names are normalized to alphanumeric/underscore (for example, `aws-bedrock` → `aws_bedrock_api_key` and `AWS_BEDROCK_API_KEY`).
 
+A connection's `api_key_env` names the variable the daemon reads that key from, and the daemon resolves it against its **own** process environment. `daemon.toml` is operator-owned, so an entry there may name any variable. A connection created or updated over the API (`CreateConnection` / `UpdateConnection`) may not: the name must be the connector's own `<CONNECTOR>_API_KEY`, or `AZURE_OPENAI_API_KEY` for Azure, matched exactly and case-sensitively. Re-sending the name a connection already reads is accepted, so an operator's custom variable still round-trips through a client edit. Any other name is rejected — otherwise a client could have the daemon read an unrelated deployment secret and send it as a bearer token to a `base_url` the same payload chooses. Credentials themselves never travel in the payload; use `SetConnectionSecret`.
+
 Secret backend default is `auto`:
 - `SetApiKey` writes to `$XDG_DATA_HOME/desktop-assistant/secrets/<connector>_api_key` (or `~/.local/share/desktop-assistant/secrets/...`).
 - Reads check that file first, then systemd credentials, then desktop keyrings, then environment variables.

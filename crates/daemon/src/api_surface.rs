@@ -495,7 +495,10 @@ impl ConnectionsService for DaemonConnectionsService {
     ) -> Result<(), CoreError> {
         let id_valid = ConnectionId::new(id.clone())
             .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
-        let new_conn = payload_to_connection(config);
+        let mut new_conn = payload_to_connection(config);
+        // Nothing to carry forward on a create, so the connector's own key
+        // variables are the only names accepted.
+        constrain_api_key_env(&mut new_conn, None).map_err(CoreError::Llm)?;
         self.registry.mutate_config(|cfg| {
             if cfg.connections.contains_key(id_valid.as_str()) {
                 return Err(format!("connection id {:?} already exists", id_valid));
@@ -518,6 +521,11 @@ impl ConnectionsService for DaemonConnectionsService {
             let Some(existing) = cfg.connections.get(id_valid.as_str()) else {
                 return Err(format!("connection id {:?} does not exist", id_valid));
             };
+
+            // Read the check against *this* connection's stored name, inside
+            // the mutator's serialized section, so a concurrent edit can't
+            // widen what this update is allowed to name.
+            constrain_api_key_env(&mut new_conn, existing.api_key_env())?;
 
             // The payload deliberately carries no credential material, so a
             // bare replace would drop the connection's secret coordinate and
@@ -1660,6 +1668,64 @@ pub fn map_effort_to_reasoning_level(e: Effort) -> ReasoningLevel {
 
 // --- Conversions between core payload / internal config types -------------
 
+/// Constrain the `api_key_env` a client-supplied connection carries, in place.
+///
+/// A blank name means "unset"; surrounding whitespace is trimmed (a padded
+/// name would name no variable at all). A name that survives that must be one
+/// of the connector's own documented key variables
+/// ([`crate::config::allowed_api_key_envs`]), matched exactly and
+/// case-sensitively — environment lookups are case-sensitive, so a folded or
+/// substring match would admit a *different* variable.
+///
+/// Why: the resolver reads the named variable from the daemon's own process
+/// environment and the connector sends it to the connection's `base_url` as a
+/// bearer token. Without this, an API client could name the deployment's
+/// database password and have the daemon post it to a host of the client's
+/// choosing.
+///
+/// `previous` is the name the stored connection already reads, on an update.
+/// Re-sending it is accepted even when it is outside the list: `daemon.toml`
+/// is operator-owned and may name a custom variable, the echoed connection
+/// view carries that name back to the client, and re-saving it grants no read
+/// the daemon was not already performing for this connection. Every other
+/// value must be on the list, so a client can never introduce a new name.
+fn constrain_api_key_env(
+    conn: &mut ConnectionConfig,
+    previous: Option<&str>,
+) -> Result<(), String> {
+    let Some(requested) = conn.api_key_env() else {
+        return Ok(());
+    };
+    let requested = requested.trim();
+
+    if requested.is_empty() {
+        return conn
+            .set_api_key_env(None)
+            .map_err(|e| format!("api_key_env: {e}"));
+    }
+
+    let unchanged = previous.is_some_and(|p| p.trim() == requested);
+    let allowed = crate::config::allowed_api_key_envs(conn.connector());
+    if !unchanged && !allowed.iter().any(|a| a == requested) {
+        return Err(format!(
+            "api_key_env {requested:?} is not permitted for the {connector} connector; \
+             use one of {allowed:?}, or store the credential with set_connection_secret",
+            connector = conn.connector_type(),
+        ));
+    }
+
+    conn.set_api_key_env(Some(requested.to_string()))
+        .map_err(|e| format!("api_key_env: {e}"))
+}
+
+/// Project a client-supplied [`ConnectionConfigPayload`] onto the stored
+/// [`ConnectionConfig`] shape.
+///
+/// Pure field mapping: every payload converts, and secrets never cross this
+/// boundary (`secret: None` throughout — they are set out-of-band via
+/// `set_connection_secret`). The one field that needs vetting rather than
+/// copying is `api_key_env`; `create_connection` / `update_connection` run
+/// [`constrain_api_key_env`] over the result before storing it.
 fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
     match payload {
         ConnectionConfigPayload::Anthropic {

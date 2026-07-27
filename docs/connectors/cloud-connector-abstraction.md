@@ -315,6 +315,13 @@ connector key (`config/mod.rs`), so the key `azure` derives `AZURE_API_KEY`, not
 set an explicit default `api_key_env` on their `*Connection` struct rather than
 relying on the derived name.
 
+A new connector's key variables also belong on `allowed_api_key_envs`
+(`config/mod.rs`): that list is what an API client may name in `api_key_env`,
+and the derived `<CONNECTOR>_API_KEY` is on it automatically. Add an entry only
+for a documented exception, as Azure has. Leave it alone and the connector still
+works from `daemon.toml`, a stored secret, or its derived variable — only a
+client-supplied custom name is refused.
+
 Docs: `docs/connectors/<provider>.md`, an entry in `docs/architecture.md`, and an
 onboarding section in `docs/cloud-providers.md` (console URL, credential-acquisition
 steps, privacy brief, and a copy-paste minimal `daemon.toml` block - the multi-field

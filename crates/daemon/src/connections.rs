@@ -155,6 +155,45 @@ impl ConnectionConfig {
         }
     }
 
+    /// The environment variable this connection reads its API key from, if the
+    /// connector carries the field and the connection sets it.
+    ///
+    /// Bedrock (AWS credential chain) and Ollama (no credential) have no such
+    /// field, so they always report `None`.
+    pub fn api_key_env(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(c) => c.api_key_env.as_deref(),
+            Self::OpenAi(c) => c.api_key_env.as_deref(),
+            Self::OpenRouter(c) => c.api_key_env.as_deref(),
+            Self::Azure(c) => c.api_key_env.as_deref(),
+            Self::Google(c) => c.api_key_env.as_deref(),
+            Self::Bedrock(_) | Self::Ollama(_) => None,
+        }
+    }
+
+    /// Set (or clear, with `None`) the environment variable this connection
+    /// reads its API key from.
+    ///
+    /// Bedrock and Ollama have no such field, so naming one for them is a
+    /// caller error rather than a silent no-op.
+    pub fn set_api_key_env(&mut self, api_key_env: Option<String>) -> Result<(), &'static str> {
+        match self {
+            Self::Anthropic(c) => c.api_key_env = api_key_env,
+            Self::OpenAi(c) => c.api_key_env = api_key_env,
+            Self::OpenRouter(c) => c.api_key_env = api_key_env,
+            Self::Azure(c) => c.api_key_env = api_key_env,
+            Self::Google(c) => c.api_key_env = api_key_env,
+            Self::Bedrock(_) | Self::Ollama(_) => {
+                if api_key_env.is_some() {
+                    return Err(
+                        "this connector does not read its key from an environment variable",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// This connection's secret-store coordinate, if the connector carries one.
     ///
     /// Ollama has no credential, so it always reports `None`.
@@ -879,6 +918,36 @@ mod tests {
         let map = ConnectionsMap::from_pairs(pairs).unwrap();
         let ids: Vec<_> = map.iter().map(|(id, _)| id.as_str().to_string()).collect();
         assert_eq!(ids, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn api_key_env_round_trips_on_connectors_that_carry_it() {
+        let mut conn = ConnectionConfig::OpenAi(OpenAiConnection::default());
+        assert_eq!(conn.api_key_env(), None, "a fresh connection names none");
+
+        conn.set_api_key_env(Some("OPENAI_API_KEY".to_string()))
+            .expect("openai reads its key from an environment variable");
+        assert_eq!(conn.api_key_env(), Some("OPENAI_API_KEY"));
+
+        conn.set_api_key_env(None)
+            .expect("clearing the name is always allowed");
+        assert_eq!(conn.api_key_env(), None);
+    }
+
+    #[test]
+    fn set_api_key_env_rejects_connectors_without_the_field() {
+        // Bedrock uses the AWS credential chain and Ollama has no credential,
+        // so naming a variable for them would be a silent no-op otherwise.
+        for mut conn in [
+            ConnectionConfig::Bedrock(BedrockConnection::default()),
+            ConnectionConfig::Ollama(OllamaConnection::default()),
+        ] {
+            assert_eq!(conn.api_key_env(), None);
+            conn.set_api_key_env(Some("AWS_BEDROCK_API_KEY".to_string()))
+                .expect_err("this connector has no api_key_env field");
+            conn.set_api_key_env(None)
+                .expect("clearing an absent name is a no-op, not an error");
+        }
     }
 
     #[test]
